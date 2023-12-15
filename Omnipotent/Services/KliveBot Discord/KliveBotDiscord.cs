@@ -1,6 +1,7 @@
 ﻿using DSharpPlus;
 using DSharpPlus.Entities;
 using Microsoft.Extensions.Logging;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
@@ -20,9 +21,11 @@ namespace Omnipotent.Services.KliveBot_Discord
         }
         protected override async void ServiceMain()
         {
+            string tokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveBotDiscordToken);
+            string token = await dataHandler.ReadDataFromFile(tokenPath);
             DiscordConfiguration connectionConfig = new DiscordConfiguration()
             {
-                Token = "OTg3NTA0MTA0NzIzMDgzMzM0.Gbj764.XsDsz9ClRQFFqPIYp87ipqVtbrIF-q7gpEdq2U",
+                Token = token,
                 ReconnectIndefinitely = true,
                 AutoReconnect = true,
                 MinimumLogLevel = LogLevel.None,

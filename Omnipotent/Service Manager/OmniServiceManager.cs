@@ -11,25 +11,32 @@ namespace Omnipotent.Service_Manager
 
     public enum ThreadAnteriority
     {
-        Critical,
-        High,
-        Standard,
         Low,
+        Standard,
+        High,
+        Critical,
     }
     public class OmniServiceManager
     {
         List<OmniService> activeServices;
         DataUtil fileHandlerService;
+        private OmniServiceMonitor monitor;
+        
         public OmniServiceManager()
         {
             activeServices = new List<OmniService>();
             fileHandlerService = new DataUtil();
+            monitor = new OmniServiceMonitor();
+            monitor.ReplaceDataHandler(this.fileHandlerService);
+            monitor.ReplaceDataManager(this);
             fileHandlerService.ServiceStart();
+            monitor.ServiceStart();
         }
 
         public void CreateAndStartNewMonitoredOmniService(OmniService service)
         {
             service.ReplaceDataHandler(fileHandlerService);
+            service.ReplaceDataManager(this);
             service.ServiceStart();
             activeServices.Add(service);
         }
@@ -38,7 +45,8 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
-                
+                var services = activeServices.Where(k => k.serviceID == id);
+                return services.ElementAt(0);
             }
             catch(Exception ex)
             {
@@ -46,13 +54,7 @@ namespace Omnipotent.Service_Manager
             }
             return null;
         }
-
-        public void BeginPerformanceMonitoring()
-        {
-
-        }
     }
-    /*
     public class OmniServiceMonitor : OmniService
     {
         public struct OmniMonitoredThread
@@ -60,39 +62,28 @@ namespace Omnipotent.Service_Manager
             public string name;
             public Thread monitoredThread;
             public int cpuUsage;
+            public int totalFileOperations;
         }
-
         public static OmniMonitoredThread ConvertOmniServiceToOmniMonitoredThread(OmniService service)
         {
             OmniMonitoredThread omniMonitoredThread = new OmniMonitoredThread();
             omniMonitoredThread.name = service.GetName();
-            omniMonitoredThread.threadID = service.;
+            omniMonitoredThread.monitoredThread = service.GetThread();
             omniMonitoredThread.cpuUsage = -1;
+            return omniMonitoredThread;
         }
         List<OmniMonitoredThread> monitoredThreads;
-
-        private bool IsMonitoring;
-        public void SetServicesToMonitor(string name, long threadID) 
+        public void SetServiceToMonitor(OmniMonitoredThread omniMonitored) 
         { 
-            OmniMonitoredThread omniMonitoredThread = new OmniMonitoredThread();
-            omniMonitoredThread.name = name;
-            omniMonitoredThread.threadID = threadID;
-            omniMonitoredThread.cpuUsage = -1;
-            monitoredThreads.Add(omniMonitoredThread);
+            monitoredThreads.Add(omniMonitored);
         }
         public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored{ get { return monitoredThreads; } }
-
-        public void BeginMonitoring()
+        protected override void ServiceMain()
         {
             foreach (var item in monitoredThreads)
             {
-                Thread.
+
             }
         }
-        public void StopMonitoring()
-        {
-
-        }
     }
-    */
 }

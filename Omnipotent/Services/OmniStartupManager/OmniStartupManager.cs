@@ -2,6 +2,7 @@
 using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
@@ -22,6 +23,9 @@ namespace Omnipotent.Services.OmniStartupManager
             try
             {
                 FieldInfo[] fi = typeof(OmniPaths.GlobalPaths).GetFields(BindingFlags.Static | BindingFlags.Public);
+                //seperate directories
+                List<string> directories = new();
+                List<string> files = new();
                 //Get each prerequisite path
                 foreach (FieldInfo info in fi)
                 {
@@ -30,22 +34,39 @@ namespace Omnipotent.Services.OmniStartupManager
                     {
                         //path
                         path = OmniPaths.GetPath(info.GetValue(null) as string);
+
                         //if empty, must be a directory
                         if (Path.GetExtension(path) == "")
                         {
-                            if (Directory.Exists(path) == false)
-                            {
-                                Directory.CreateDirectory(path);
-                            }
+                            directories.Append(path);
                         }
+                        //If not, probably a file
                         else
                         {
-                            File.Create(path);
+                            files.Append(path);
                         }
                     }
                     catch(Exception ex)
                     {
-                        LogError(ex, "Couldn't create prerequisite file: " + path);
+                        LogError(ex, "Couldn't translate prerequisite file: " + path);
+                    }
+                }
+                //Loop over directories first, make directories first
+                //Make sure top-level directories are made first, sorta ducttape
+                directories = directories.OrderBy(k => k.Length).ToList();
+                foreach(string dir in directories)
+                {
+                    if (Directory.Exists(dir) == false)
+                    {
+                        Directory.CreateDirectory(dir);
+                    }
+                }
+                //Now, make prereq files
+                foreach(string file in files)
+                {
+                    if (File.Exists(file) == false)
+                    {
+                        File.Create(file);
                     }
                 }
             }

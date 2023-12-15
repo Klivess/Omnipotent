@@ -15,8 +15,10 @@ namespace Omnipotent.Service_Manager
     {
         protected ThreadAnteriority threadAnteriority;
         protected string name;
+        public string serviceID;
         private Thread serviceThread;
         protected DataUtil dataHandler;
+        protected OmniServiceManager serviceManager;
 
         private bool ServiceActive;
         protected CancellationTokenSource cancellationToken;
@@ -24,6 +26,10 @@ namespace Omnipotent.Service_Manager
         public void ReplaceDataHandler(DataUtil util)
         {
             dataHandler = util;
+        }
+        public void ReplaceDataManager(OmniServiceManager manager)
+        {
+            serviceManager = manager;
         }
         public string GetName() { return name; }
         public ThreadAnteriority GetThreadAnteriority() {  return threadAnteriority; }
@@ -37,6 +43,7 @@ namespace Omnipotent.Service_Manager
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.
         public OmniService(string name, ThreadAnteriority anteriority)
         {
+            this.serviceID = RandomGeneration.GenerateRandomLengthOfNumbers(8);
             this.name = name;
             this.threadAnteriority = anteriority;
         }
@@ -62,6 +69,7 @@ namespace Omnipotent.Service_Manager
                     try { try { ServiceMain(); Task.Delay(-1); } catch (ThreadInterruptedException interrupt) { } } catch (Exception ex) { CatchError(ex); }
                 });
                 serviceThread.Start();
+                serviceThread.Priority = (ThreadPriority)(threadAnteriority+1);
             }
         }
 

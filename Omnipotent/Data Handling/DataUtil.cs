@@ -55,7 +55,7 @@ namespace Omnipotent.Data_Handling
         {
             if (File.Exists(path))
             {
-                return await CreateNewOperation(path, ReadWrite.Read).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+                return await CreateNewOperation(path, ReadWrite.Read).result.Task;
             }
             else
             {
