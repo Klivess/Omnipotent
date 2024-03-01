@@ -8,6 +8,9 @@ namespace Omnipotent.Data_Handling
 {
     public class OmniPaths
     {
+        public static ulong DiscordServerContainingKlives = 688114655910297736;
+        public static ulong KlivesDiscordAccountID = 976648966944989204;
+
         //surely theres a better way of doing this
         public struct GlobalPaths
         {

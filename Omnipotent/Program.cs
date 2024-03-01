@@ -25,6 +25,8 @@ namespace Omnipotent
             omniServiceManager.timeManager.CreateNewScheduledTask(DateTime.Now.AddSeconds(10), "testTask", "Testing", "-1", "Blah blah blah!",
                 embeddedFunction: new Action(()=> { omniServiceManager.logger.LogStatus("Testing", "TestTask Complete!"); }));
 
+            ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Hello!");
+
             //Main thread keep-alive very hacky probably wont cause problems hopefully probably
             Task.Delay(-1).Wait();
         }

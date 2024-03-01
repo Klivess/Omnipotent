@@ -43,5 +43,12 @@ namespace Omnipotent.Services.KliveBot_Discord
                 TerminateService();
             }
         }
+
+        public async void SendMessageToKlives(string message)
+        {
+            var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+            var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+            await member.SendMessageAsync(message);
+        }
     }
 }

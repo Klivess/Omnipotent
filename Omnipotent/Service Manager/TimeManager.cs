@@ -161,7 +161,10 @@ namespace Omnipotent.Service_Manager
                 TimeSpan timespan = task.GetTimespanRemaining();
                 await Task.Delay(timespan);
                 task.embeddedFunction.Invoke();
-                TaskDue.Invoke(this, task);
+                if (TaskDue != null)
+                {
+                    TaskDue.Invoke(this, task);
+                }
             });
             thread.Start();
             pendingTasks.Add(thread);

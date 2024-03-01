@@ -93,5 +93,11 @@ namespace Omnipotent.Logging
         {
             return $"Error: -| {ex.ErrorException.Message} |- Line: {ex.LineOfError} Method: {ex.methodName} Class: {ex.className}";
         }
+
+        public static string FormatErrorMessage(Exception e)
+        {
+            ErrorInformation ex = new ErrorInformation(e);
+            return $"Error: -| {ex.ErrorException.Message} |- Line: {ex.LineOfError} Method: {ex.methodName} Class: {ex.className}";
+        }
     }
 }

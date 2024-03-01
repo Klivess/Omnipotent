@@ -34,11 +34,18 @@ namespace Omnipotent.Service_Manager
         
         public OmniServiceManager()
         {
-            logger = new();
-            logger.ServiceStart();
+            //Initialise in order of priority
+
             activeServices = new List<OmniService>();
+            //Logger
+            logger = new();
+            logger.ReplaceDataHandler(this.fileHandlerService);
+            logger.ReplaceDataManager(this);
+            logger.ServiceStart();
             //Instantiate file handler service
             fileHandlerService = new DataUtil();
+            fileHandlerService.ReplaceDataManager(this);
+            fileHandlerService.ReplaceDataHandler(this.fileHandlerService);
             fileHandlerService.ServiceStart();
             //Instantiate service performance monitor
             monitor = new OmniServiceMonitor();
@@ -74,11 +81,24 @@ namespace Omnipotent.Service_Manager
             }
             catch(Exception ex)
             {
-                logger.LogError("Unknown", ex, "Couldn't get OmniService by ID");
+                logger.LogError("Omni Service Manager", ex, "Couldn't get OmniService by ID");
             }
             return null;
         }
 
+        public OmniService[] GetServiceByClassType<T>()
+        {
+            try
+            {
+                var services = activeServices.Where(k=>k.GetType().Name== typeof(T).Name);
+                return services.ToArray();
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Omni Service Manager", ex, "Couldn't get OmniService by class");
+            }
+            return null;
+        }
 
         [Route("api/omniservicemanager")]
         [Controller]
@@ -94,7 +114,7 @@ namespace Omnipotent.Service_Manager
                 catch (Exception ex)
                 {
                     LogErrorStatic("Omni Service Manager", ex, "Error fulfilling GetAllOmniServices endpoint request.");
-                    return new ContentResult { Content = OmniLogging.FormatErrorMessage(ex), StatusCode = (int)HttpStatusCode.InternalServerError };
+                    return new ContentResult { Content = OmniLogging.FormatErrorMessage(new OmniLogging.ErrorInformation(ex)), StatusCode = (int)HttpStatusCode.InternalServerError };
                 }
             }
         }
