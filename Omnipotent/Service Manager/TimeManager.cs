@@ -1,4 +1,5 @@
-﻿using Omnipotent.Data_Handling;
+﻿using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -24,11 +25,15 @@ namespace Omnipotent.Service_Manager
             public string reason;
             public bool isImportant;
             public string timeID;
+            public string randomidentifier;
             public Action embeddedFunction;
 
             public TimeSpan GetTimespanRemaining()
             {
-                return new TimeSpan(ticks: (dateTimeDue - DateTime.Now).Ticks);
+                long value = (dateTimeDue - DateTime.Now).Ticks;
+                if (value < 0)
+                    value = 0;
+                return new TimeSpan(ticks: value);
             }
 
             public bool HasTaskTimePassed()
@@ -38,13 +43,17 @@ namespace Omnipotent.Service_Manager
 
         }
 
-        public event EventHandler TaskDue;
+        public event EventHandler<ScheduledTask> TaskDue;
         public List<ScheduledTask> tasks;
+        private List<string> waitingTasks;
         private List<Thread> pendingTasks = new List<Thread>();
         public TimeManager()
         {
             name = "Time Management";
             threadAnteriority = ThreadAnteriority.High;
+            tasks = new();
+            pendingTasks = new List<Thread>();
+            waitingTasks = new();
         }
 
         public void CreateNewScheduledTask(DateTime dueDateTime, string nameIdentifier, string topic, string agentID, string reason = "", bool important = true, Action embeddedFunction = null)
@@ -57,6 +66,7 @@ namespace Omnipotent.Service_Manager
             task.agentID = agentID;
             task.reason = reason;
             task.isImportant = important;
+            task.randomidentifier = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             //Try get agent info
             var service = serviceManager.GetServiceByID(agentID);
             if(service != null )
@@ -78,7 +88,7 @@ namespace Omnipotent.Service_Manager
             }
             task.timeID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
             //Add task to tasks and save.
-            tasks.Append(task);
+            tasks.Add(task);
             SaveTaskToFile(task);
             //Log task creation
             LogStatus(name, $"New task made: {task.taskName} - '{task.reason}'");
@@ -125,13 +135,23 @@ namespace Omnipotent.Service_Manager
         protected override async void ServiceMain()
         {
             //First time startup
-            tasks = await GetAllUpcomingTasksFromDisk();
+            if (tasks.Any() == false)
+            {
+                tasks = tasks.Concat(await GetAllUpcomingTasksFromDisk()).ToList();
+            }
             //Begin task waiting loop
             //Begin waiting for each task, and checking for new tasks to appear.
-            foreach(var item in tasks)
+            foreach (var item in tasks)
             {
-                BeginWaitForTask(item);
+                if (!waitingTasks.Contains(item.randomidentifier))
+                {
+                    BeginWaitForTask(item);
+                    waitingTasks.Add(item.randomidentifier);
+                }
             }
+            await Task.Delay(2000);
+            GC.Collect();
+            ServiceMain();
         }
 
         private void BeginWaitForTask(ScheduledTask task)
@@ -140,7 +160,10 @@ namespace Omnipotent.Service_Manager
             {
                 TimeSpan timespan = task.GetTimespanRemaining();
                 await Task.Delay(timespan);
+                task.embeddedFunction.Invoke();
+                TaskDue.Invoke(this, task);
             });
+            thread.Start();
             pendingTasks.Add(thread);
         }
     }

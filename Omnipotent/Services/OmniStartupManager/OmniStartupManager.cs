@@ -48,7 +48,7 @@ namespace Omnipotent.Services.OmniStartupManager
                     }
                     catch(Exception ex)
                     {
-                        LogError(name, ex, "Couldn't translate prerequisite file: " + path);
+                        serviceManager.logger.LogError(name, ex, "Couldn't translate prerequisite file: " + path);
                     }
                 }
                 //Loop over directories first, make directories first
@@ -72,7 +72,7 @@ namespace Omnipotent.Services.OmniStartupManager
             }
             catch(Exception ex)
             {
-                LogError(name, ex, "Couldn't create prerequisites.");
+                serviceManager.logger.LogError(name, ex, "Couldn't create prerequisites.");
             }
 
             //When ALL startup tasks are done.

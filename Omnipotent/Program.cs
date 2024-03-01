@@ -1,5 +1,5 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
-
+using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
@@ -23,7 +23,7 @@ namespace Omnipotent
 
             //Create test tasks
             omniServiceManager.timeManager.CreateNewScheduledTask(DateTime.Now.AddSeconds(10), "testTask", "Testing", "-1", "Blah blah blah!",
-                embeddedFunction: new Action(()=> { LogStatus("Testing", "TestTask Complete!"); }));
+                embeddedFunction: new Action(()=> { omniServiceManager.logger.LogStatus("Testing", "TestTask Complete!"); }));
 
             //Main thread keep-alive very hacky probably wont cause problems hopefully probably
             Task.Delay(-1).Wait();
@@ -32,7 +32,7 @@ namespace Omnipotent
         private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
             //Notify Klives
-            LogError("Main Thread", (Exception)e.ExceptionObject, "Unhandled Error!");
+            OmniLogging.LogErrorStatic("Main Thread", (Exception)e.ExceptionObject, "Unhandled Error!");
         }
     }
 } 

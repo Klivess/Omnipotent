@@ -30,9 +30,12 @@ namespace Omnipotent.Service_Manager
         protected DataUtil fileHandlerService;
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
+        public OmniLogging logger;
         
         public OmniServiceManager()
         {
+            logger = new();
+            logger.ServiceStart();
             activeServices = new List<OmniService>();
             //Instantiate file handler service
             fileHandlerService = new DataUtil();
@@ -71,7 +74,7 @@ namespace Omnipotent.Service_Manager
             }
             catch(Exception ex)
             {
-                LogError("Unknown", ex, "Couldn't get OmniService by ID");
+                logger.LogError("Unknown", ex, "Couldn't get OmniService by ID");
             }
             return null;
         }
@@ -90,7 +93,7 @@ namespace Omnipotent.Service_Manager
                 }
                 catch (Exception ex)
                 {
-                    LogError("Omni Service Manager", ex, "Error fulfilling GetAllOmniServices endpoint request.");
+                    LogErrorStatic("Omni Service Manager", ex, "Error fulfilling GetAllOmniServices endpoint request.");
                     return new ContentResult { Content = OmniLogging.FormatErrorMessage(ex), StatusCode = (int)HttpStatusCode.InternalServerError };
                 }
             }

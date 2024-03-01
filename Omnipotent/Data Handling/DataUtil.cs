@@ -50,9 +50,10 @@ namespace Omnipotent.Data_Handling
             await CreateNewOperation(path, ReadWrite.Write, content).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
         }
 
+        //broken, self referential loop
         public async Task SerialiseObjectToFile(string path, object data, bool requeueIfFailed = true)
         {
-            string serialisedData = JsonConvert.SerializeObject(data);
+            string serialisedData = JsonConvert.SerializeObject(data, settings: new JsonSerializerSettings() { ReferenceLoopHandling = ReferenceLoopHandling.Ignore});
             await CreateNewOperation(path, ReadWrite.Write, serialisedData).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
         }
 

@@ -46,7 +46,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             catch(Exception ex)
             {
-                LogError(name, ex, "KliveAPI Failed!");
+                serviceManager.logger.LogError(name, ex, "KliveAPI Failed!");
             }
         }
     }

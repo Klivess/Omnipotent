@@ -39,7 +39,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
             catch(Exception ex)
             {
-                LogError(name, ex, "Discord Bot Crashed!");
+                serviceManager.logger.LogError(name, ex, "Discord Bot Crashed!");
                 TerminateService();
             }
         }

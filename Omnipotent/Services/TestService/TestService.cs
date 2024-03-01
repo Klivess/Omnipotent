@@ -26,7 +26,7 @@ namespace Omnipotent.Services.TestService
                 }
                 catch (Exception ex)
                 {
-                    LogStatus(name, "Exception: " + ex.Message);
+                    serviceManager.logger.LogStatus(name, "Exception: " + ex.Message);
                 }
             }
         }

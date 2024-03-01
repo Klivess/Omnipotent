@@ -60,11 +60,11 @@ namespace Omnipotent.Service_Manager
             {
                 name="Random Service "+RandomGeneration.GenerateRandomLengthOfNumbers(8);
                 threadAnteriority = ThreadAnteriority.Low;
-                LogStatus(name, "Service is unnamed, so filling in random name.");
+                serviceManager.logger.LogStatus(name, "Service is unnamed, so filling in random name.");
             }
             if (ServiceActive)
             {
-                LogStatus(name, "Service is already active.");                
+                serviceManager.logger.LogStatus(name, "Service is already active.");                
             }
             else
             {
@@ -76,7 +76,7 @@ namespace Omnipotent.Service_Manager
                 serviceThread.Start();
                 ServiceActive = true;
                 serviceThread.Priority = (ThreadPriority)(threadAnteriority+1);
-                LogStatus(name, "Started service.");
+                serviceManager.logger.LogStatus(name, "Started service.");
             }
         }
 
@@ -86,7 +86,7 @@ namespace Omnipotent.Service_Manager
         protected void CatchError(Exception ex)
         {
             //Replace with proper error handling.
-            LogStatus(name, $"ERROR! Task {name} has crashed due to: "+ex.Message.ToString());   
+            serviceManager.logger.LogStatus(name, $"ERROR! Task {name} has crashed due to: "+ex.Message.ToString());   
         }
 
         public OmniService()
@@ -98,7 +98,7 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
-                LogStatus(name, "Ending " + name + " service.");
+                serviceManager.logger.LogStatus(name, "Ending " + name + " service.");
                 ServiceActive = false;
                 serviceThread.Interrupt();
                 return true;
