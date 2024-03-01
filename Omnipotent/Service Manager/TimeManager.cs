@@ -91,7 +91,7 @@ namespace Omnipotent.Service_Manager
             tasks.Add(task);
             SaveTaskToFile(task);
             //Log task creation
-            LogStatus(name, $"New task made: {task.taskName} - '{task.reason}'");
+            serviceManager.logger.LogStatus(name, $"New task made: {task.taskName} - '{task.reason}'");
         }
 
         private string FormFilePathWithTask(ScheduledTask task)
@@ -121,7 +121,7 @@ namespace Omnipotent.Service_Manager
                 }
                 catch(Exception ex)
                 {
-                    LogError(name, ex, "Couldn't deserialise/read task.");
+                    serviceManager.logger.LogError(name, ex, "Couldn't deserialise/read task.");
                 }
             }
             return tasks;
