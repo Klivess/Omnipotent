@@ -14,10 +14,12 @@ namespace Omnipotent.Data_Handling
         //surely theres a better way of doing this
         public struct GlobalPaths
         {
-            public static string SavedDataDirectory = "SavedData";
-            public static string KliveBotDiscordBotDirectory = "SavedData/KliveBotDiscordBot";
-            public static string KliveBotDiscordTokenText = "SavedData/KliveBotDiscordToken.txt";
-            public static string TimeManagementTasksDirectory = "SavedData/TimeManager";
+            public static string SavedDataDirectory = $"SavedData";
+            public static string KliveBotDiscordBotDirectory = $"{SavedDataDirectory}/KliveBotDiscordBot";
+            public static string KliveBotDiscordTokenText = $"{SavedDataDirectory}/KliveBotDiscordToken.txt";
+            public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
+            public static string OmniscienceDirectory = $"{SavedDataDirectory}/Omniscience";
+            public static string OmniDiscordUsersDirectory = $"{OmniscienceDirectory}/OmniDiscordUsers";
         };
 
         public static string GetPath(string path)

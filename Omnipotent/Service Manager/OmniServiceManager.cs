@@ -27,7 +27,7 @@ namespace Omnipotent.Service_Manager
     public class OmniServiceManager
     {
         public readonly List<OmniService> activeServices;
-        protected DataUtil fileHandlerService;
+        public DataUtil fileHandlerService;
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
         public OmniLogging logger;

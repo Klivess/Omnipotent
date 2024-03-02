@@ -20,7 +20,9 @@ namespace Omnipotent.Data_Handling
         }
         private enum ReadWrite{
             Read,
-            Write
+            Write,
+            CreateDirectory,
+            AppendToFile
         }
         private struct FileOperation
         {
@@ -48,6 +50,16 @@ namespace Omnipotent.Data_Handling
         public async Task WriteToFile(string path, string content, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.Write, content).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        }
+
+        public async Task CreateDirectory(string path, bool requeueIfFailed = true)
+        {
+            await CreateNewOperation(path, ReadWrite.CreateDirectory).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+        }
+
+        public async Task AppendContentToFile(string path, string content, bool requeueIfFailed = true)
+        {
+            await CreateNewOperation(path, ReadWrite.AppendToFile, content).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
         }
 
         //broken, self referential loop
@@ -102,6 +114,16 @@ namespace Omnipotent.Data_Handling
                         else if (task.operation == ReadWrite.Read)
                         {
                             task.result.SetResult(await File.ReadAllTextAsync(task.path));
+                        }
+                        else if (task.operation == ReadWrite.CreateDirectory)
+                        {
+                            Directory.CreateDirectory(task.path);
+                            task.result.SetResult("Successful");
+                        }
+                        else if(task.operation == ReadWrite.AppendToFile)
+                        {
+                            await File.AppendAllTextAsync(task.path, task.content);
+                            task.result.SetResult("Successful");
                         }
                     }
                     catch(IOException exception)

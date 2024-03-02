@@ -5,6 +5,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -13,7 +14,7 @@ namespace Omnipotent.Services.KliveBot_Discord
 {
     public class KliveBotDiscord : OmniService
     {
-        private DiscordClient Client { get; set; }
+        public DiscordClient Client { get; set; }
         public KliveBotDiscord()
         {
             name = "KliveBot Discord Bot";
@@ -44,11 +45,40 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
-        public async void SendMessageToKlives(string message)
+        public async Task<DiscordMessage> SendMessageToKlives(string message)
         {
             var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
             var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
-            await member.SendMessageAsync(message);
+            return await member.SendMessageAsync(message);
+        }
+
+        public async Task<DiscordMessage> SendMessageToKlives(DiscordMessageBuilder builder)
+        {
+            var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+            var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+            return await member.SendMessageAsync(builder);
+        }
+
+        public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, string imagefilepath = "", int imagewidth = 0, int imageheight = 0)
+        {
+            DiscordMessageBuilder builder = new DiscordMessageBuilder();
+            DiscordEmbedBuilder discordEmbed = new DiscordEmbedBuilder();
+            discordEmbed.Title = title;
+            discordEmbed.Description = description;
+            discordEmbed.Color = color;
+            if (imagefilepath != "")
+            {
+                builder.AddFile(File.OpenRead(imagefilepath));
+                discordEmbed.WithThumbnail("attachment://" + Path.GetFileName(imagefilepath));
+            }
+            builder.AddEmbed(discordEmbed);
+            return builder;
+        }
+
+        public static Color DiscordColorToColor(DiscordColor discordColor)
+        {
+            Color color = Color.FromArgb(discordColor.R, discordColor.G, discordColor.B);
+            return color;
         }
     }
 }

@@ -3,6 +3,7 @@ using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
 using System;
@@ -20,12 +21,9 @@ namespace Omnipotent
             //Create services
             omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
             omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
+            omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
 
-            //Create test tasks
-            omniServiceManager.timeManager.CreateNewScheduledTask(DateTime.Now.AddSeconds(10), "testTask", "Testing", "-1", "Blah blah blah!",
-                embeddedFunction: new Action(()=> { omniServiceManager.logger.LogStatus("Testing", "TestTask Complete!"); }));
-
-            ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Hello!");
+            ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
 
             //Main thread keep-alive very hacky probably wont cause problems hopefully probably
             Task.Delay(-1).Wait();

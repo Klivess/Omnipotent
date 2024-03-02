@@ -20,6 +20,8 @@ namespace Omnipotent.Services.OmniStartupManager
 
         protected override void ServiceMain()
         {
+            int directoriesCreated = 0;
+            int filesCreated = 0;
             try
             {
                 FieldInfo[] fi = typeof(OmniPaths.GlobalPaths).GetFields(BindingFlags.Static | BindingFlags.Public);
@@ -73,6 +75,11 @@ namespace Omnipotent.Services.OmniStartupManager
             catch(Exception ex)
             {
                 serviceManager.logger.LogError(name, ex, "Couldn't create prerequisites.");
+            }
+
+            if (directoriesCreated > 0 || filesCreated > 0)
+            {
+                serviceManager.logger.LogStatus(this.name, $"Prerequisites process complete: {directoriesCreated} directories created, {filesCreated} files created.");
             }
 
             //When ALL startup tasks are done.

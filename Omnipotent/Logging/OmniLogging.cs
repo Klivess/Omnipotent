@@ -68,6 +68,15 @@ namespace Omnipotent.Logging
             Console.ForegroundColor = ConsoleColor.White;
         }
 
+        public void LogError(string serviceName, string error)
+        {
+            Console.ForegroundColor = ConsoleColor.Blue;
+            Console.Write($"{serviceName}");
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($" | Error: {error}");
+            Console.ForegroundColor = ConsoleColor.White;
+        }
+
 
         //Static variations
         // Q: "Why rename the function instead of creating an overload?" A: Creating an overload will most CERTAINLY cause me 7 hours of agony in the future
