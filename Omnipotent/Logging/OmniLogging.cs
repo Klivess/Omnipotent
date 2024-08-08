@@ -11,6 +11,11 @@ namespace Omnipotent.Logging
 {
     public class OmniLogging : OmniService
     {
+        public OmniLogging()
+        {
+            name = "OmniLogging";
+            threadAnteriority = ThreadAnteriority.Standard;
+        }
         public struct ErrorInformation
         {
             public Exception ErrorException;

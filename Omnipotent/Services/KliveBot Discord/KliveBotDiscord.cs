@@ -38,7 +38,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await Client.ConnectAsync(new DiscordActivity("Ran by Omnipotent!", ActivityType.ListeningTo));
                 await Task.Delay(-1);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 serviceManager.logger.LogError(name, ex, "Discord Bot Crashed!");
                 TerminateService();
@@ -47,6 +47,7 @@ namespace Omnipotent.Services.KliveBot_Discord
 
         public async Task<DiscordMessage> SendMessageToKlives(string message)
         {
+            while (Client == null) { }
             var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
             var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
             return await member.SendMessageAsync(message);

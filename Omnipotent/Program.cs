@@ -14,25 +14,41 @@ namespace Omnipotent
     {
         public static void Main(string[] args)
         {
-            //Error Handlers
-            AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
+            try
+            {
+                //Error Handlers
+                AppDomain.CurrentDomain.UnhandledException += CurrentDomain_UnhandledException;
 
-            OmniServiceManager omniServiceManager = new OmniServiceManager();
-            //Create services
-            omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
-            omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
-            omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
+                OmniServiceManager omniServiceManager = new OmniServiceManager();
+                //Create services
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
 
-            ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
+                Task.Delay(4000).Wait();
 
-            //Main thread keep-alive very hacky probably wont cause problems hopefully probably
-            Task.Delay(-1).Wait();
+                ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
+
+                //Main thread keep-alive very hacky probably wont cause problems hopefully probably
+                Task.Delay(-1).Wait();
+            }
+            catch(Exception ex)
+            {
+                CurrentDomain_UnhandledException(ex);
+                ExistentialBotUtilities.RestartBot();
+            }
         }
 
         private static void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
         {
             //Notify Klives
             OmniLogging.LogErrorStatic("Main Thread", (Exception)e.ExceptionObject, "Unhandled Error!");
+        }
+
+        private static void CurrentDomain_UnhandledException(Exception e)
+        {
+            //Notify Klives
+            OmniLogging.LogErrorStatic("Main Thread", (Exception)e, "Unhandled Error!");
         }
     }
 } 

@@ -20,6 +20,12 @@ namespace Omnipotent.Data_Handling
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
             public static string OmniscienceDirectory = $"{SavedDataDirectory}/Omniscience";
             public static string OmniDiscordUsersDirectory = $"{OmniscienceDirectory}/OmniDiscordUsers";
+            public static string OmniDiscordImageAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageImageAttachments";
+            public static string OmniDiscordVoiceAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVoiceAttachments";
+            public static string OmniDiscordVideoAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVideoAttachments";
+            public static string OmniDiscordDMMessages = $"{OmniscienceDirectory}/DMMessages";
+            public static string OmniDiscordDiscordServerMessages = $"{OmniscienceDirectory}/DiscordServerMessages";
+
         };
 
         public static string GetPath(string path)
