@@ -41,8 +41,9 @@ namespace Omnipotent.Services.Omniscience
                 int newMessagesCount = 0;
                 foreach (var dmchannel in allDMs)
                 {
-                    Thread channelThread = new Thread(() =>
+                    Task task = new(() =>
                     {
+                        Stopwatch individualDMStopwatch = Stopwatch.StartNew();
                         int messagesCount = 0;
                         serviceManager.logger.LogStatus("Omniscience", $"Downloading DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                         var messageDivision = downloadedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
@@ -52,37 +53,41 @@ namespace Omnipotent.Services.Omniscience
                         {
                             oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
                         }
+                        else
+                        {
+                            oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID).Result;
+                        }
                         foreach (var oldMessage in oldmessages)
                         {
                             if (!messageDivision.Select(k => k.MessageID).Contains(oldMessage.MessageID))
                             {
                                 SaveDiscordMessage(item, oldMessage).Wait();
+                                messagesCount++;
                             }
                         }
                         //Save memory by clearing lists
-                        messagesCount += oldmessages.Count;
                         oldmessages.Clear();
-                        GC.Collect();
                         List<OmniDiscordMessage> newMessages = new();
                         if (messageDivision.Any())
                         {
                             newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
-                        }
-                        foreach (var newMessage in newMessages)
-                        {
-                            if (!messageDivision.Select(k => k.MessageID).Contains(newMessage.MessageID))
+                            foreach (var newMessage in newMessages)
                             {
-                                SaveDiscordMessage(item, newMessage).Wait();
+                                if (!messageDivision.Select(k => k.MessageID).Contains(newMessage.MessageID))
+                                {
+                                    SaveDiscordMessage(item, newMessage).Wait();
+                                    messagesCount++;
+                                }
                             }
+                            newMessages.Clear();
                         }
-                        messagesCount += newMessages.Count;
-                        newMessages.Clear();
-                        GC.Collect();
                         newMessagesCount += messagesCount;
-                        serviceManager.logger.LogStatus("Omniscience", $"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                        individualDMStopwatch.Stop();
+                        serviceManager.logger.LogStatus("Omniscience", $"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
                     });
-                    channelThread.Start();
+                    task.Start();
                 }
+                stopwatch.Stop();
                 serviceManager.logger.LogStatus("Omniscience", $"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
             }
         }
@@ -100,6 +105,7 @@ namespace Omnipotent.Services.Omniscience
             {
                 var message = JsonConvert.DeserializeObject<OmniDiscordMessage>(await serviceManager.fileHandlerService.ReadDataFromFile(item));
                 messages.Add(message);
+                Console.WriteLine(messages.Count);
             }
             return messages;
         }

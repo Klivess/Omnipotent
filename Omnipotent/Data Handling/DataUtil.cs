@@ -18,7 +18,8 @@ namespace Omnipotent.Data_Handling
             name = "File Handler";
             threadAnteriority = ThreadAnteriority.Critical;
         }
-        private enum ReadWrite{
+        private enum ReadWrite
+        {
             Read,
             Write,
             CreateDirectory,
@@ -37,19 +38,26 @@ namespace Omnipotent.Data_Handling
 
         private FileOperation CreateNewOperation(string path, ReadWrite operation, string content = null)
         {
-            FileOperation fileOperation = new FileOperation();
-            fileOperation.path = path;
-            fileOperation.content = content;
-            fileOperation.operation = operation;
-            fileOperation.ID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-            fileOperation.result = new TaskCompletionSource<string>();
-            fileOperations.Enqueue(fileOperation);
-            return fileOperation;
+            try
+            {
+                FileOperation fileOperation = new FileOperation();
+                fileOperation.path = path;
+                fileOperation.content = content;
+                fileOperation.operation = operation;
+                fileOperation.ID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+                fileOperation.result = new TaskCompletionSource<string>();
+                fileOperations.Enqueue(fileOperation);
+                return fileOperation;
+            }
+            catch (ArgumentException ex)
+            {
+                return CreateNewOperation(path, operation, content);
+            }
         }
 
         public async Task WriteToFile(string path, string content, bool requeueIfFailed = true)
         {
-            await CreateNewOperation(path, ReadWrite.Write, content).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            CreateNewOperation(path, ReadWrite.Write, content).result.Task.Wait();
         }
 
         public async Task CreateDirectory(string path, bool requeueIfFailed = true)
@@ -65,7 +73,7 @@ namespace Omnipotent.Data_Handling
         //broken, self referential loop
         public async Task SerialiseObjectToFile(string path, object data, bool requeueIfFailed = true)
         {
-            string serialisedData = JsonConvert.SerializeObject(data, settings: new JsonSerializerSettings() { ReferenceLoopHandling = ReferenceLoopHandling.Ignore});
+            string serialisedData = JsonConvert.SerializeObject(data, settings: new JsonSerializerSettings() { ReferenceLoopHandling = ReferenceLoopHandling.Ignore });
             await CreateNewOperation(path, ReadWrite.Write, serialisedData).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
         }
 
@@ -120,22 +128,22 @@ namespace Omnipotent.Data_Handling
                             Directory.CreateDirectory(task.path);
                             task.result.SetResult("Successful");
                         }
-                        else if(task.operation == ReadWrite.AppendToFile)
+                        else if (task.operation == ReadWrite.AppendToFile)
                         {
                             await File.AppendAllTextAsync(task.path, task.content);
                             task.result.SetResult("Successful");
                         }
                     }
-                    catch(IOException exception)
+                    catch (IOException exception)
                     {
                         fileOperations.Enqueue(task);
                     }
                 }
             }
             //Replace this with proper waiting
-            while (fileOperations.Any() == false) { Task.Delay(100); }
+            while (fileOperations.Any() == false) { }
             //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
-            GC.Collect();
+            //GC.Collect();
             ServiceMain();
         }
 

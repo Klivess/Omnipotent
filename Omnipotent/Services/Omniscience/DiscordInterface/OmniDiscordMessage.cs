@@ -66,9 +66,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
     {
         public string ContentType;
         public string Filename;
-        public int ImageHeightpx;
-        public int ImageWidthpx;
-        public int ImageSizeBytes;
+        public int VideoSizeBytes;
         public string VideoTitle;
         public long AttachmentID;
         public string Placeholder;

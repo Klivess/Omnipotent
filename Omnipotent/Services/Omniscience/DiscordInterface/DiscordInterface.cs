@@ -168,30 +168,89 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             return client;
         }
 
-        public async Task<HttpResponseMessage> SendDiscordRequest(HttpClient client, HttpRequestMessage message)
+        public async Task<HttpResponseMessage> SendDiscordRequest(HttpClient client, HttpRequestMessage message, bool checkIfJsonParseable = true)
         {
-            var response = await client.SendAsync(message);
-            if (response.IsSuccessStatusCode)
+            try
             {
-                return response;
-            }
-            else
-            {
-                //If ratelimited
-                if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                var response = await client.SendAsync(message);
+                if (response.IsSuccessStatusCode)
                 {
-                    string responseData = await response.Content.ReadAsStringAsync();
-                    dynamic responseJson = JsonConvert.DeserializeObject(responseData);
-                    float retryAfter = responseJson.retry_after;
-                    TimeSpan time = TimeSpan.FromSeconds(retryAfter) + TimeSpan.FromMilliseconds(100);
-                    manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
-                    await Task.Delay(time);
-                    return await SendDiscordRequest(client, message);
+                    if (checkIfJsonParseable)
+                    {
+                        var content = await response.Content.ReadAsStringAsync();
+                        try
+                        {
+                            try
+                            {
+                                dynamic jsonned = JsonConvert.DeserializeObject(content);
+                            }
+                            catch (JsonReaderException jex)
+                            {
+                                HttpRequestMessage newMessage = new();
+                                newMessage.Content = message.Content;
+                                foreach (var header in message.Headers)
+                                {
+                                    newMessage.Headers.Add(header.Key, header.Value);
+                                }
+                                newMessage.RequestUri = message.RequestUri;
+                                newMessage.Method = message.Method;
+                                return await SendDiscordRequest(client, newMessage);
+                            }
+                        }
+                        catch (AggregateException ex)
+                        {
+                            HttpRequestMessage newMessage = new();
+                            newMessage.Content = message.Content;
+                            foreach (var header in message.Headers)
+                            {
+                                newMessage.Headers.Add(header.Key, header.Value);
+                            }
+                            newMessage.RequestUri = message.RequestUri;
+                            newMessage.Method = message.Method;
+                            return await SendDiscordRequest(client, newMessage);
+                        }
+                    }
+                    return response;
                 }
                 else
                 {
-                    throw new Exception($"Discord request failed! Reason: {response.ReasonPhrase}");
+                    //If ratelimited
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+                        string responseData = await response.Content.ReadAsStringAsync();
+                        dynamic responseJson = JsonConvert.DeserializeObject(responseData);
+                        float retryAfter = responseJson.retry_after;
+                        TimeSpan time = TimeSpan.FromSeconds(retryAfter * 1.75) + TimeSpan.FromMilliseconds(100);
+                        manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
+                        await Task.Delay(time);
+                        HttpRequestMessage newMessage = new();
+                        newMessage.Content = message.Content;
+                        foreach (var header in message.Headers)
+                        {
+                            newMessage.Headers.Add(header.Key, header.Value);
+                        }
+                        newMessage.RequestUri = message.RequestUri;
+                        newMessage.Method = message.Method;
+                        return await SendDiscordRequest(client, newMessage);
+                    }
+                    else
+                    {
+                        throw new Exception($"Discord request failed! Reason: {response.ReasonPhrase}");
+                    }
                 }
+            }
+            catch (InvalidOperationException ex)
+            {
+                manager.logger.LogStatus("Omniscience: Discord Interface", "Discord request failed! Reason: " + ex.Message);
+                HttpRequestMessage newMessage = new();
+                newMessage.Content = message.Content;
+                foreach (var header in message.Headers)
+                {
+                    newMessage.Headers.Add(header.Key, header.Value);
+                }
+                newMessage.RequestUri = message.RequestUri;
+                newMessage.Method = message.Method;
+                return await SendDiscordRequest(client, newMessage);
             }
         }
         public async Task SaveOmniDiscordUser(OmniDiscordUser user)

@@ -73,7 +73,18 @@ namespace Omnipotent.Service_Manager
                 //serviceTask = Task.Run(ServiceMain, cancellationToken.Token);
                 serviceThread = new Thread(() =>
                 {
-                    try { try { ServiceMain(); Task.Delay(-1); } catch (ThreadInterruptedException interrupt) { } } catch (Exception ex) { CatchError(ex); }
+                    try
+                    {
+                        try
+                        {
+                            ServiceMain(); Task.Delay(-1);
+                        }
+                        catch (ThreadInterruptedException interrupt) { }
+                    }
+                    catch (Exception ex)
+                    {
+                        CatchError(ex);
+                    }
                 });
                 serviceThread.Name = "OmniServiceThread_" + name;
                 serviceThread.Start();
