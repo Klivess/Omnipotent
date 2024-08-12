@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -21,6 +22,7 @@ namespace Omnipotent.Service_Manager
         private Thread serviceThread;
         protected DataUtil dataHandler;
         protected OmniServiceManager serviceManager;
+        public Stopwatch serviceUptime;
 
         private bool ServiceActive;
         protected CancellationTokenSource cancellationToken;
@@ -48,6 +50,7 @@ namespace Omnipotent.Service_Manager
             this.serviceID = RandomGeneration.GenerateRandomLengthOfNumbers(8);
             this.name = name;
             this.threadAnteriority = anteriority;
+            serviceUptime = Stopwatch.StartNew();
         }
 
         //DO NOT USE THIS (outside of this class)!!

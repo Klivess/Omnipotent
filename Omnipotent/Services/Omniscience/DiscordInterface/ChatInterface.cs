@@ -239,7 +239,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 }
                 catch (Exception tex)
                 {
-                    Console.WriteLine(1 + 1);
                 }
             }
             return messages;

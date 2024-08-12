@@ -32,7 +32,7 @@ namespace Omnipotent
                 //Main thread keep-alive very hacky probably wont cause problems hopefully probably
                 Task.Delay(-1).Wait();
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 CurrentDomain_UnhandledException(ex);
                 ExistentialBotUtilities.RestartBot();
@@ -51,4 +51,4 @@ namespace Omnipotent
             OmniLogging.LogErrorStatic("Main Thread", (Exception)e, "Unhandled Error!");
         }
     }
-} 
+}

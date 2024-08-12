@@ -33,5 +33,10 @@ namespace Omnipotent.Data_Handling
             return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, path);
         }
 
+        public static bool CheckIfOnServer()
+        {
+            return Environment.GetEnvironmentVariable("server") == "server";
+        }
+
     }
 }

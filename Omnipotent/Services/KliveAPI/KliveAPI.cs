@@ -41,6 +41,17 @@ namespace Omnipotent.Services.KliveAPI
                 var app = builder.Build();
                 app.UseHttpsRedirection();
                 app.UseAuthorization();
+
+                //Middleware
+                app.Use(async (context, next) =>
+                {
+                    //context.GetEndpoint().Metadata;
+                    var authorizationPassword = context.Request.Headers.Authorization;
+
+                    //Continue
+                    await next(context);
+                });
+
                 app.MapControllers();
                 app.Run();
             }

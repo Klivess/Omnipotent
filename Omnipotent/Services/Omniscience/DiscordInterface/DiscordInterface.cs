@@ -220,7 +220,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         string responseData = await response.Content.ReadAsStringAsync();
                         dynamic responseJson = JsonConvert.DeserializeObject(responseData);
                         float retryAfter = responseJson.retry_after;
-                        TimeSpan time = TimeSpan.FromSeconds(retryAfter * 1.75) + TimeSpan.FromMilliseconds(100);
+                        TimeSpan time = TimeSpan.FromSeconds(retryAfter) + TimeSpan.FromMilliseconds(10);
                         manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
                         await Task.Delay(time);
                         HttpRequestMessage newMessage = new();
@@ -509,10 +509,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 return $"{Username}-{UserID}";
             }
-
             public string CreateDMDirectoryPathString()
             {
                 string DMDirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMMessages), $"user{UserID}");
+                return DMDirectoryPath;
+            }
+            public string CreateDMPath()
+            {
+                string DMDirectoryPath = Path.Combine(CreateDMDirectoryPathString(), $"{UserID}messages.omnimessages");
                 return DMDirectoryPath;
             }
 
