@@ -29,6 +29,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         public List<OmniDiscordUser> LinkedDiscordAccounts;
         public ChatInterface ChatInterface;
 
+        public event Action<OmniDiscordUser> NewOmniDiscordUserAdded;
+
         public DiscordInterface(OmniServiceManager manager)
         {
             this.manager = manager;
@@ -79,6 +81,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 if (file.Any())
                 {
                     OmniDiscordUser user = await manager.fileHandlerService.ReadAndDeserialiseDataFromFile<OmniDiscordUser>(file.ToArray()[0]);
+                    Directory.CreateDirectory(user.CreateDMDirectoryPathString());
                     users.Add(user);
                 }
             }
@@ -168,6 +171,13 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             return client;
         }
 
+        public async Task<HttpResponseMessage> SendDiscordGetRequest(HttpClient client, Uri url, bool checkIfJsonParseable = true)
+        {
+            HttpRequestMessage message = new();
+            message.Method = HttpMethod.Get;
+            message.RequestUri = url;
+            return await SendDiscordRequest(client, message, checkIfJsonParseable);
+        }
         public async Task<HttpResponseMessage> SendDiscordRequest(HttpClient client, HttpRequestMessage message, bool checkIfJsonParseable = true)
         {
             try
@@ -282,11 +292,15 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             return response.IsSuccessStatusCode;
         }
 
+        public static string ConstructIconURL(string guildID, string iconID)
+        {
+            return $"https://cdn.discordapp.com/icons/{guildID}/{iconID}.png?size=1024";
+
+        }
         public static string ConstructAvatarURL(string userID, string avatarID)
         {
             return $"https://cdn.discordapp.com/avatars/{userID}/{avatarID}.png?size=1024";
         }
-
         //Kill me now
         public long GenerateDiscordSnowflake(object timestamp, int? shardId = null)
         {
@@ -368,13 +382,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 throw new Exception($"Couldn't get account information for {user.UserID}. Token does not work!");
             }
         }
-        public async Task<OmniDiscordUser> LoginToDiscord(string token)
+        public async Task<OmniDiscordUser> CreateNewOmniDiscordUserLink(string token)
         {
             OmniDiscordUser user = new();
             user.Token = token;
             if (await VerifyTokenWorks(user))
             {
                 user = await GetAccountInfo(user);
+                NewOmniDiscordUserAdded.Invoke(user);
             }
             else
             {
@@ -382,7 +397,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return user;
         }
-        public async Task<OmniDiscordUser> LoginToDiscord(string email, string password)
+        public async Task<OmniDiscordUser> CreateNewOmniDiscordUserLink(string email, string password)
         {
             OmniDiscordUser user = new();
 
@@ -450,6 +465,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             manager.logger.LogStatus("Discord Interface Utility", $"Logged into OmniDiscordAccount {user.Email}.");
                             user = await GetAccountInfo(user);
                             manager.logger.LogStatus("Discord Interface Utility", $"Acquired account info from {user.Email}: {user.GlobalName}.");
+                            NewOmniDiscordUserAdded.Invoke(user);
                             return user;
                         }
                         else
@@ -486,6 +502,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             [JsonIgnore]
             public HttpClient client = new();
+            [JsonIgnore]
+            public DiscordWebsocketInterface websocketInterface;
 
             public string UserID;
             public string Username;

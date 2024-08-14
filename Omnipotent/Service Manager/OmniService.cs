@@ -43,6 +43,10 @@ namespace Omnipotent.Service_Manager
             return serviceThread;
         }
 
+        public void ServiceLog(string message)
+        {
+            serviceManager.logger.LogStatus(name, message);
+        }
 
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.
         public OmniService(string name, ThreadAnteriority anteriority)

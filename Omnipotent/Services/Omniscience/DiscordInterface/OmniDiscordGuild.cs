@@ -1,10 +1,17 @@
-﻿namespace Omnipotent.Services.Omniscience.DiscordInterface
+﻿using Microsoft.AspNetCore.Mvc.ModelBinding.Binders;
+using static Omnipotent.Services.Omniscience.DiscordInterface.ChatInterface;
+
+namespace Omnipotent.Services.Omniscience.DiscordInterface
 {
     public struct OmniDiscordGuild
     {
-        public string Name;
-        public string ID;
-        public string Description;
+        public string GuildName;
+        public string GuildID;
+        public string GuildDescription;
+        public string IconID;
+        public string GuildIconURL;
+        public DateTime DataAcquired;
+        public string? OwnedByOmniDiscordUser;
     }
 
     public struct OmniDiscordChannel
@@ -15,27 +22,10 @@
         public long LastMessageID;
         public long ParentChannelID;
         public long GuildID;
-        public ChannelType ChannelType;
+        public OmniChannelType ChannelType;
         public ChannelFlags ChannelFlags;
         public int Position;
         public bool IsNSFW;
-    }
-
-    public enum ChannelType
-    {
-        GuildText = 0,
-        DM = 1,
-        GuildVoice = 2,
-        GroupDM = 3,
-        GuildCategory = 4,
-        GuildAnnouncement = 5,
-        AnnouncementThread = 10,
-        PublicThread = 11,
-        PrivateThread = 12,
-        GuildStageVoice = 13,
-        GuildDirectory = 14,
-        GuildForum = 15,
-        GuildMedia = 16
     }
 
     public enum ChannelFlags

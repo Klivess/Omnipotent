@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
+using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.OmniStartupManager;
 using ProtoBuf;
 using System;
@@ -31,13 +32,11 @@ namespace Omnipotent.Service_Manager
     }
     public class OmniServiceManager
     {
-        public readonly List<OmniService> activeServices;
+        public List<OmniService> activeServices;
         public DataUtil fileHandlerService;
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
         public OmniLogging logger;
-
-
         public OmniServiceManager()
         {
             //Initialise in order of priority
@@ -91,7 +90,6 @@ namespace Omnipotent.Service_Manager
             }
             return null;
         }
-
         public OmniService[] GetServiceByClassType<T>()
         {
             try
@@ -106,24 +104,11 @@ namespace Omnipotent.Service_Manager
             return null;
         }
 
-        [Route("api/omniservicemanager")]
-        [Controller]
-        public class OmniServiceManagerController
+        public KliveAPI GetKliveAPIService()
         {
-            [HttpGet("GetAllOmniServices")]
-            public IActionResult GetAllOmniServices()
-            {
-                try
-                {
-                    return new OkObjectResult(JsonConvert.SerializeObject(GetAllOmniServices(), Formatting.Indented));
-                }
-                catch (Exception ex)
-                {
-                    LogErrorStatic("Omni Service Manager", ex, "Error fulfilling GetAllOmniServices endpoint request.");
-                    return new ContentResult { Content = OmniLogging.FormatErrorMessage(new OmniLogging.ErrorInformation(ex)), StatusCode = (int)HttpStatusCode.InternalServerError };
-                }
-            }
+            return (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
         }
+
     }
     public class OmniServiceMonitor : OmniService
     {
@@ -166,22 +151,7 @@ namespace Omnipotent.Service_Manager
         public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored { get { return monitoredThreads; } }
         protected override async void ServiceMain()
         {
-            Process myProcess = Process.GetCurrentProcess();
-            ProcessThreadCollection threads = myProcess.Threads;
-            foreach (ProcessThread thread in threads)
-            {
-                if (monitoredThreads.Select(k => k.ManagedThreadID).Contains(thread.Id))
-                {
-                    //LogStatus(name, "Found thread!");
-                }
-                else
-                {
-                    //LogStatus(name, $"Did not find thread {thread.Id}. Monitored Threads: {string.Join("-", monitoredThreads.Select(k=>k.ManagedThreadID))}");
-                }
-            }
-            await Task.Delay(3000);
-            GC.Collect();
-            ServiceMain();
+
         }
     }
 }

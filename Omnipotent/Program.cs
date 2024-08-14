@@ -1,4 +1,5 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
+using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
@@ -27,8 +28,10 @@ namespace Omnipotent
 
                 Task.Delay(4000).Wait();
 
-                ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
-
+                if (OmniPaths.CheckIfOnServer())
+                {
+                    ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
+                }
                 //Main thread keep-alive very hacky probably wont cause problems hopefully probably
                 Task.Delay(-1).Wait();
             }

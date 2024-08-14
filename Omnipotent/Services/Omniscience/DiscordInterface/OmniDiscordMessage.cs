@@ -23,6 +23,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         public long? ReferencedMessageID;
         public bool IsInDM;
         public OmniMessagePastDMCall CallInformation;
+        public List<OmniDiscordUserInfo> ChannelRecipients;
+        public long? GuildID;
     }
 
     public struct OmniMessageReactions
@@ -120,7 +122,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         InteractionPremiumUpsell = 26,
         StageStart = 27,
         StageEnd = 28,
-        StageSpeaker= 29,
+        StageSpeaker = 29,
         StageTopic = 31,
         GuildApplicationPremiumSubscription = 32,
         GuildIncidentAlertModeEnabled = 36,

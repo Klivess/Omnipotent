@@ -24,7 +24,8 @@ namespace Omnipotent.Data_Handling
             public static string OmniDiscordVoiceAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVoiceAttachments";
             public static string OmniDiscordVideoAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVideoAttachments";
             public static string OmniDiscordDMMessages = $"{OmniscienceDirectory}/DMMessages";
-            public static string OmniDiscordDiscordServerMessages = $"{OmniscienceDirectory}/DiscordServerMessages";
+            public static string OmniDiscordServerMessages = $"{OmniscienceDirectory}/DiscordServerMessages";
+            public static string OmniDiscordGuilds = $"{OmniscienceDirectory}/DiscordGuilds";
 
         };
 

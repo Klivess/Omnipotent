@@ -77,10 +77,14 @@ namespace Omnipotent.Data_Handling
             await CreateNewOperation(path, ReadWrite.Write, serialisedData).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
         }
 
-        public async Task<string> ReadDataFromFile(string path)
+        public async Task<string> ReadDataFromFile(string path, bool NonQueued = false)
         {
             if (File.Exists(path))
             {
+                if (NonQueued)
+                {
+                    return await File.ReadAllTextAsync(path);
+                }
                 return await CreateNewOperation(path, ReadWrite.Read).result.Task;
             }
             else

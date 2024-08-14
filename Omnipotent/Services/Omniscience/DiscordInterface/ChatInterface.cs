@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc.Diagnostics;
 using Microsoft.AspNetCore.Mvc.Formatters.Xml;
 using Microsoft.AspNetCore.Routing.Matching;
+using Microsoft.CSharp.RuntimeBinder;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using System.Collections.Generic;
@@ -50,159 +51,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
                     foreach (var responseJson in responseJsonn)
                     {
-                        OmniDiscordMessage message = new();
-                        message.AuthorUsername = responseJson.author.username;
-                        message.AuthorID = responseJson.author.id;
-                        message.MessageID = responseJson.id;
-                        message.MessageContent = responseJson.content;
-                        message.IsTTS = responseJson.tts;
-                        message.TimeStamp = Convert.ToDateTime(responseJson.timestamp);
-                        message.MentionedEveryone = responseJson.mention_everyone;
-                        message.IsEdited = responseJson.edited_timestamp == null;
-                        List<OmniMessageImageAttachment> imageAttachments = new();
-                        List<OmniMessageVideoAttachment> videoAttachments = new();
-                        List<OmniMessageVoiceMessageAttachment> voiceAttachments = new();
-                        List<OmniMessageReactions> reactions = new();
-                        foreach (var item in responseJson.attachments)
-                        {
-                            if (item.content_type != null)
-                            {
-                                if (((string)item.content_type).StartsWith("image"))
-                                {
-                                    OmniMessageImageAttachment image = new();
-                                    image.ContentType = item.content_type;
-                                    image.Filename = item.filename;
-                                    image.ImageHeightpx = item.height;
-                                    image.ImageWidthpx = item.width;
-                                    image.ImageSizeBytes = item.size;
-                                    image.AttachmentID = item.id;
-                                    image.Placeholder = item.placeholder;
-                                    image.URL = item.url;
-                                    image.ProxyURL = item.proxy_url;
-                                    image.OriginalMessageID = message.MessageID;
-                                    image.AuthorID = message.AuthorID;
-                                    if (AutomaticallyDownloadAttachment)
-                                    {
-                                        try
-                                        {
-                                            string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordImageAttachmentsDirectory), $"{image.AttachmentID}-{image.OriginalMessageID}-{image.Filename}");
-                                            wc.DownloadFile(new Uri(image.URL), filePath);
-                                            image.FilePath = filePath;
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download image attachment {image.Filename} from {message.AuthorUsername} in channel {channelID}");
-                                        }
-                                    }
-                                    imageAttachments.Add(image);
-                                }
-                                else if (((string)item.content_type).StartsWith("audio"))
-                                {
-                                    OmniMessageVoiceMessageAttachment voiceMessage = new();
-                                    voiceMessage.ContentType = item.content_type;
-                                    voiceMessage.Filename = item.filename;
-                                    voiceMessage.AttachmentID = item.id;
-                                    voiceMessage.ImageSizeBytes = item.size;
-                                    voiceMessage.URL = item.url;
-                                    voiceMessage.ProxyURL = item.proxy_url;
-                                    try
-                                    {
-                                        voiceMessage.VoiceMessageDuration = TimeSpan.FromSeconds((float)item.duration_secs);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        voiceMessage.VoiceMessageDuration = TimeSpan.FromSeconds(-1);
-                                    }
-                                    voiceMessage.Waveform = item.waveform;
-                                    voiceMessage.OriginalMessageID = message.MessageID;
-                                    voiceMessage.AuthorID = message.AuthorID;
-                                    if (AutomaticallyDownloadAttachment)
-                                    {
-                                        try
-                                        {
-                                            string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordVoiceAttachmentsDirectory), $"{voiceMessage.AttachmentID}-{voiceMessage.OriginalMessageID}-{voiceMessage.Filename}");
-                                            wc.DownloadFile(new Uri(voiceMessage.URL), filePath);
-                                            voiceMessage.FilePath = filePath;
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download audio attachment {voiceMessage.Filename} from {message.AuthorUsername} in channel {channelID}");
-                                        }
-                                    }
-                                    voiceAttachments.Add(voiceMessage);
-                                }
-                                else if (((string)item.content_type).StartsWith("video"))
-                                {
-                                    OmniMessageVideoAttachment video = new();
-                                    video.ContentType = item.content_type;
-                                    video.Filename = item.filename;
-                                    video.VideoSizeBytes = item.size;
-                                    video.AttachmentID = item.id;
-                                    video.Placeholder = item.placeholder;
-                                    video.URL = item.url;
-                                    video.ProxyURL = item.proxy_url;
-                                    video.VideoTitle = item.title;
-                                    video.OriginalMessageID = message.MessageID;
-                                    video.AuthorID = message.AuthorID;
-                                    if (AutomaticallyDownloadAttachment)
-                                    {
-                                        try
-                                        {
-                                            string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordVideoAttachmentsDirectory), $"{video.AttachmentID}-{video.OriginalMessageID}-{video.Filename}");
-                                            wc.DownloadFile(new Uri(video.URL), filePath);
-                                            video.FilePath = filePath;
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download video attachment {video.Filename} from {message.AuthorUsername} in channel {channelID}");
-                                        }
-                                    }
-                                    videoAttachments.Add(video);
-                                }
-                            }
-                        }
-                        message.ImageAttachments = imageAttachments.ToArray();
-                        message.VoiceMessageAttachments = voiceAttachments.ToArray();
-                        try
-                        {
-                            if (responseJson.reactions != null)
-                            {
-                                foreach (var item in responseJson.reactions)
-                                {
-                                    OmniMessageReactions reaction = new();
-                                    reaction.EmojiID = item.emoji.id;
-                                    reaction.EmojiName = item.emoji.name;
-                                    reaction.Count = item.count;
-                                    reactions.Add(reaction);
-                                }
-                            }
-                        }
-                        catch (Exception ex) { }
-                        message.MessageReactions = reactions.ToArray();
-                        message.PostedInChannelID = responseJson.channel_id;
-                        message.MessageType = (OmniMessageType)(responseJson.type);
-                        message.MessageFlag = (OmniMessageFlag)(responseJson.flags);
-                        message.IsInDM = true;
-                        try
-                        {
-                            message.ReferencedMessageID = responseJson.referenced_message.id;
-                        }
-                        catch (Exception ex) { }
-                        try
-                        {
-                            if (message.MessageType == OmniMessageType.Call)
-                            {
-                                message.CallInformation.EndedTimestamp = DateTime.Parse(responseJson.call.ended_timestamp);
-                                List<long> participants = new();
-                                foreach (var item in responseJson.call.participants)
-                                {
-                                    participants.Add(item);
-                                }
-                                message.CallInformation.Participants = participants.ToArray();
-                            }
-                        }
-                        catch (Exception) { }
-                        messages.Add(message);
+                        messages.Add(await ProcessMessageJSONObjectToOmniDiscordMessage(responseJson.ToString(), true));
                     }
                 }
                 else
@@ -217,7 +66,191 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
             }
         }
-
+        public async Task<OmniDiscordMessage> ProcessMessageJSONObjectToOmniDiscordMessage(string messageText, bool isinDM, bool AutomaticallyDownloadAttachment = true)
+        {
+            WebClient wc = new();
+            dynamic responseJsonn = JsonConvert.DeserializeObject(messageText);
+            OmniDiscordMessage message = new();
+            message.AuthorUsername = responseJsonn.author.username;
+            message.AuthorID = responseJsonn.author.id;
+            message.MessageID = responseJsonn.id;
+            message.MessageContent = responseJsonn.content;
+            message.IsTTS = responseJsonn.tts;
+            message.TimeStamp = Convert.ToDateTime(responseJsonn.timestamp);
+            message.MentionedEveryone = responseJsonn.mention_everyone;
+            message.IsEdited = responseJsonn.edited_timestamp == null;
+            List<OmniMessageImageAttachment> imageAttachments = new();
+            List<OmniMessageVideoAttachment> videoAttachments = new();
+            List<OmniMessageVoiceMessageAttachment> voiceAttachments = new();
+            List<OmniMessageReactions> reactions = new();
+            foreach (var item in responseJsonn.attachments)
+            {
+                if (item.content_type != null)
+                {
+                    if (((string)item.content_type).StartsWith("image"))
+                    {
+                        OmniMessageImageAttachment image = new();
+                        image.ContentType = item.content_type;
+                        image.Filename = item.filename;
+                        image.ImageHeightpx = item.height;
+                        image.ImageWidthpx = item.width;
+                        image.ImageSizeBytes = item.size;
+                        image.AttachmentID = item.id;
+                        image.Placeholder = item.placeholder;
+                        image.URL = item.url;
+                        image.ProxyURL = item.proxy_url;
+                        image.OriginalMessageID = message.MessageID;
+                        image.AuthorID = message.AuthorID;
+                        if (AutomaticallyDownloadAttachment)
+                        {
+                            try
+                            {
+                                string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordImageAttachmentsDirectory), $"{image.AttachmentID}-{image.OriginalMessageID}-{image.Filename}");
+                                wc.DownloadFile(new Uri(image.URL), filePath);
+                                image.FilePath = filePath;
+                            }
+                            catch (Exception ex)
+                            {
+                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download image attachment {image.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                            }
+                        }
+                        imageAttachments.Add(image);
+                    }
+                    else if (((string)item.content_type).StartsWith("audio"))
+                    {
+                        OmniMessageVoiceMessageAttachment voiceMessage = new();
+                        voiceMessage.ContentType = item.content_type;
+                        voiceMessage.Filename = item.filename;
+                        voiceMessage.AttachmentID = item.id;
+                        voiceMessage.ImageSizeBytes = item.size;
+                        voiceMessage.URL = item.url;
+                        voiceMessage.ProxyURL = item.proxy_url;
+                        try
+                        {
+                            voiceMessage.VoiceMessageDuration = TimeSpan.FromSeconds((float)item.duration_secs);
+                        }
+                        catch (Exception ex)
+                        {
+                            voiceMessage.VoiceMessageDuration = TimeSpan.FromSeconds(-1);
+                        }
+                        voiceMessage.Waveform = item.waveform;
+                        voiceMessage.OriginalMessageID = message.MessageID;
+                        voiceMessage.AuthorID = message.AuthorID;
+                        if (AutomaticallyDownloadAttachment)
+                        {
+                            try
+                            {
+                                string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordVoiceAttachmentsDirectory), $"{voiceMessage.AttachmentID}-{voiceMessage.OriginalMessageID}-{voiceMessage.Filename}");
+                                wc.DownloadFile(new Uri(voiceMessage.URL), filePath);
+                                voiceMessage.FilePath = filePath;
+                            }
+                            catch (Exception ex)
+                            {
+                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download audio attachment {voiceMessage.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                            }
+                        }
+                        voiceAttachments.Add(voiceMessage);
+                    }
+                    else if (((string)item.content_type).StartsWith("video"))
+                    {
+                        OmniMessageVideoAttachment video = new();
+                        video.ContentType = item.content_type;
+                        video.Filename = item.filename;
+                        video.VideoSizeBytes = item.size;
+                        video.AttachmentID = item.id;
+                        video.Placeholder = item.placeholder;
+                        video.URL = item.url;
+                        video.ProxyURL = item.proxy_url;
+                        video.VideoTitle = item.title;
+                        video.OriginalMessageID = message.MessageID;
+                        video.AuthorID = message.AuthorID;
+                        if (AutomaticallyDownloadAttachment)
+                        {
+                            try
+                            {
+                                string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordVideoAttachmentsDirectory), $"{video.AttachmentID}-{video.OriginalMessageID}-{video.Filename}");
+                                wc.DownloadFile(new Uri(video.URL), filePath);
+                                video.FilePath = filePath;
+                            }
+                            catch (Exception ex)
+                            {
+                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download video attachment {video.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                            }
+                        }
+                        videoAttachments.Add(video);
+                    }
+                }
+            }
+            message.ImageAttachments = imageAttachments.ToArray();
+            message.VoiceMessageAttachments = voiceAttachments.ToArray();
+            try
+            {
+                if (responseJsonn.reactions != null)
+                {
+                    foreach (var item in responseJsonn.reactions)
+                    {
+                        OmniMessageReactions reaction = new();
+                        reaction.EmojiID = item.emoji.id;
+                        reaction.EmojiName = item.emoji.name;
+                        reaction.Count = item.count;
+                        reactions.Add(reaction);
+                    }
+                }
+            }
+            catch (Exception ex) { }
+            message.MessageReactions = reactions.ToArray();
+            message.PostedInChannelID = responseJsonn.channel_id;
+            message.MessageType = (OmniMessageType)(responseJsonn.type);
+            message.MessageFlag = (OmniMessageFlag)(responseJsonn.flags);
+            try
+            {
+                message.ReferencedMessageID = responseJsonn.referenced_message.id;
+            }
+            catch (Exception ex) { }
+            try
+            {
+                if (message.MessageType == OmniMessageType.Call)
+                {
+                    message.CallInformation.EndedTimestamp = DateTime.Parse(responseJsonn.call.ended_timestamp);
+                    List<long> participants = new();
+                    foreach (var item in responseJsonn.call.participants)
+                    {
+                        participants.Add(item);
+                    }
+                    message.CallInformation.Participants = participants.ToArray();
+                }
+            }
+            catch (Exception) { }
+            if (isinDM)
+            {
+                message.IsInDM = true;
+                message.ChannelRecipients = new();
+                try
+                {
+                    if (responseJsonn.channel.recipients != null)
+                    {
+                        foreach (var item in responseJsonn.channel.recipients)
+                        {
+                            OmniDiscordUserInfo userInfo = new();
+                            userInfo.UserID = item.id;
+                            userInfo.Username = item.username;
+                            userInfo.AvatarID = item.avatar;
+                            userInfo.AvatarURL = ConstructAvatarURL(userInfo.UserID.ToString(), userInfo.AvatarID);
+                            userInfo.Discriminator = item.discriminator;
+                            userInfo.Flags = (UserFlags)item.public_flags;
+                            userInfo.AccentColorHex = item.accent_color;
+                            userInfo.GlobalName = item.global_name;
+                            userInfo.BannerColorHex = item.banner_color;
+                            message.ChannelRecipients.Add(userInfo);
+                        }
+                    }
+                }
+                catch (RuntimeBinderException bex)
+                {
+                }
+            }
+            return message;
+        }
         public async Task<List<OmniDiscordMessage>> GetALLMessagesAsync(OmniDiscordUser user, long channelID, long? beforeMessage = null)
         {
             List<OmniDiscordMessage> messages = new();
@@ -262,7 +295,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return messages;
         }
-
         public async Task<OmniDMChannelLayout[]> GetAllDMChannels(OmniDiscordUser user)
         {
             var allAffinities = await GetAllAffinities(user);
@@ -273,7 +305,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return channels.ToArray();
         }
-
         public async Task<OmniDMChannelLayout> GetDMChannel(OmniDiscordUser user, long userID)
         {
             string messageEndpoint = $"https://discord.com/api/v9/users/@me/channels";
@@ -312,7 +343,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 throw new Exception("Failed to get DM channel. Response: " + response.ReasonPhrase);
             }
         }
-
         public async Task<OmniDiscordUserInfo> GetUser(OmniDiscordUser user, long userID)
         {
 
@@ -344,8 +374,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
 
         }
-
-
         public async Task<Dictionary<long, float>> GetAllAffinities(OmniDiscordUser user)
         {
             Dictionary<long, float> r = new Dictionary<long, float>();
@@ -372,7 +400,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return r;
         }
-
         public async Task<bool> DirectMessageUser(OmniDiscordUser user, long userIDOfUserToMessage, string message)
         {
             try
@@ -409,6 +436,47 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 return false;
             }
         }
+        public async Task<OmniDiscordChannel> GetGuildChannelInfo(OmniDiscordUser user, string channelID)
+        {
+            var response = await parentInterface.SendDiscordGetRequest(DiscordHttpClient(user), new Uri($"https://discord.com/api/v9/channels/{channelID}"));
+            string responseString = await response.Content.ReadAsStringAsync();
+            dynamic responseJson = JsonConvert.DeserializeObject(responseString);
+            OmniDiscordChannel channel = new();
+            channel.ChannelID = responseJson.id;
+            channel.ChannelName = responseJson.name;
+            channel.ChannelTopic = responseJson.topic;
+            channel.LastMessageID = responseJson.last_message_id;
+            channel.ParentChannelID = responseJson.parent_id;
+            channel.GuildID = responseJson.guild_id;
+            channel.ChannelType = ConvertChannelTypeToEnum((int)responseJson.type);
+            channel.ChannelFlags = (ChannelFlags)responseJson.flags;
+            channel.Position = responseJson.position;
+            channel.IsNSFW = responseJson.nsfw;
+            return channel;
+        }
+        public async Task<OmniDiscordGuild[]> GetAllUserGuilds(OmniDiscordUser user)
+        {
+            List<OmniDiscordGuild> guilds = new();
+            var response = await parentInterface.SendDiscordGetRequest(DiscordHttpClient(user), new Uri("https://discord.com/api/v9/users/@me/guilds"));
+            string responseString = await response.Content.ReadAsStringAsync();
+            dynamic responseJson = JsonConvert.DeserializeObject(responseString);
+            if (response.IsSuccessStatusCode)
+            {
+                foreach (var item in responseJson)
+                {
+                    OmniDiscordGuild guild = new();
+                    guild.GuildID = item.id;
+                    guild.GuildName = item.name;
+                    guild.GuildDescription = item.description;
+                    guild.IconID = item.icon;
+                    guild.GuildIconURL = ConstructIconURL(guild.GuildID.ToString(), guild.IconID);
+                    guild.DataAcquired = DateTime.Now;
+                    guild.OwnedByOmniDiscordUser = ((bool)item.owner ? user.UserID : null);
+                    guilds.Add(guild);
+                }
+            }
+            return guilds.ToArray();
+        }
 
         public enum OmniChannelType
         {
@@ -426,17 +494,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             GuildForum = 15,
             GuildMedia = 16
         }
-
         public static OmniChannelType ConvertChannelTypeToEnum(int channelType)
         {
             return (OmniChannelType)channelType;
         }
-
         private struct CreateDMPayload
         {
             public string[] recipients;
         }
-
         private struct MessagePayload
         {
             public string content;
@@ -445,7 +510,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             public string nonce;
             public bool tts;
         }
-
         public struct OmniDMChannelLayout
         {
             public long LastMessageID;

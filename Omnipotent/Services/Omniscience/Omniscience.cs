@@ -16,7 +16,7 @@ namespace Omnipotent.Services.Omniscience
         }
         protected override async void ServiceMain()
         {
-            DiscordCrawl crawl = new(serviceManager);
+            serviceManager.CreateAndStartNewMonitoredOmniService(new DiscordCrawl());
 
         }
     }
