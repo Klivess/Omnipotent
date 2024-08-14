@@ -59,15 +59,14 @@ namespace Omnipotent.Services.Omniscience
             //Set up controllers
             Action<KliveAPI.KliveAPI.UserRequest> getMessageCount = async (request) =>
             {
-                await request.ReturnResponse(RandomGeneration.GenerateRandomLengthOfNumbers(100));
+                await request.ReturnResponse(RandomGeneration.GenerateRandomLengthOfNumbers(100), "application/json");
             };
             Action<KliveAPI.KliveAPI.UserRequest> lengthyBuffer = async (request) =>
             {
-                await Task.Delay(10000);
-                await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10));
+                await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10), "application/json");
             };
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/buffer", lengthyBuffer);
+            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount, Profiles.KMProfileManager.KMPermissions.Anybody);
+            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/buffer", lengthyBuffer, Profiles.KMProfileManager.KMPermissions.Klives);
 
         }
 
@@ -177,7 +176,7 @@ namespace Omnipotent.Services.Omniscience
 
         public async Task SaveDiscordGuild(OmniDiscordGuild guild)
         {
-            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuilds), guild.GuildID + ".omniguild");
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory), guild.GuildID + ".omniguild");
             await serviceManager.fileHandlerService.WriteToFile(path, JsonConvert.SerializeObject(guild));
         }
 
@@ -185,7 +184,7 @@ namespace Omnipotent.Services.Omniscience
         {
 
             List<OmniDiscordGuild> guilds = new();
-            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuilds)).Where(k => Path.GetExtension(k) == ".omniguild").ToList();
+            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory)).Where(k => Path.GetExtension(k) == ".omniguild").ToList();
             foreach (var file in files)
             {
                 guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await serviceManager.fileHandlerService.ReadDataFromFile(file)));

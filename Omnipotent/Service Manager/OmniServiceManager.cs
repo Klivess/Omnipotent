@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Services.KliveAPI;
+using Omnipotent.Services.Notifications;
 using Omnipotent.Services.OmniStartupManager;
 using ProtoBuf;
 using System;
@@ -107,6 +108,11 @@ namespace Omnipotent.Service_Manager
         public KliveAPI GetKliveAPIService()
         {
             return (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+        }
+
+        public NotificationsService GetNotificationsService()
+        {
+            return (NotificationsService)(GetServiceByClassType<NotificationsService>()[0]);
         }
 
     }

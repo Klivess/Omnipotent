@@ -55,6 +55,7 @@ namespace Omnipotent.Services.KliveBot_Discord
 
         public async Task<DiscordMessage> SendMessageToKlives(DiscordMessageBuilder builder)
         {
+            while (Client == null) { }
             var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
             var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
             return await member.SendMessageAsync(builder);

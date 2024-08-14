@@ -1,9 +1,12 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
+global using static Omnipotent.Services.KliveAPI.KliveAPI;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
+using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
@@ -25,6 +28,8 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
 
                 Task.Delay(4000).Wait();
 

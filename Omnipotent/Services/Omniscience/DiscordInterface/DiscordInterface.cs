@@ -89,70 +89,16 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         }
         private async Task<string> TryAndRetrieve2FAFromKlives(OmniDiscordUser user, OmniServiceManager manager)
         {
-            var klivebotDiscord = ((KliveBotDiscord)manager.GetServiceByClassType<KliveBotDiscord>()[0]);
-            var embedBuilder = KliveBotDiscord.MakeSimpleEmbed("Require 2fa to login to OmniDiscordUser!",
-                $"Trying to login to\n\nEmail: {user.Email}\nPassword: Length {user.Password.Length}\n\nBut I require a 2fa code. Please provide the code, or reject this request.",
-                DSharpPlus.Entities.DiscordColor.DarkBlue);
-
-            embedBuilder.AddComponents(new DSharpPlus.Entities.DiscordComponent[]
-            {
-                new DSharpPlus.Entities.DiscordButtonComponent(DSharpPlus.ButtonStyle.Success, $"2fasubmit{user.Email}", "Submit", emoji: new DiscordComponentEmoji(DiscordEmoji.FromName(klivebotDiscord.Client, ":white_check_mark:"))),
-                new DSharpPlus.Entities.DiscordButtonComponent(DSharpPlus.ButtonStyle.Danger, $"2facancel{user.Email}", "Cancel", emoji: new DiscordComponentEmoji(DiscordEmoji.FromName(klivebotDiscord.Client, ":negative_squared_cross_mark:")))
-            });
-            bool cancelled = false;
-            string submitted = "";
-
-            var message = await klivebotDiscord.SendMessageToKlives(embedBuilder);
-
-            CancellationTokenSource token = new();
-
-            klivebotDiscord.Client.ComponentInteractionCreated += async (s, e) =>
-            {
-                if (e.Id == $"2facancel{user.Email}")
-                {
-                    submitted = "";
-                    cancelled = true;
-                    token.Cancel();
-                    DiscordFollowupMessageBuilder builder = new();
-                    builder.WithContent($"Cancelled {user.Email} login.");
-                    await e.Interaction.CreateFollowupMessageAsync(builder);
-                }
-                else if (e.Id == $"2fasubmit{user.Email}")
-                {
-                    submitted = "";
-                    DiscordInteractionResponseBuilder modal = new DiscordInteractionResponseBuilder();
-                    modal.CustomId = $"2faModal{user.Email}";
-                    modal.AddComponents(new TextInputComponent("2FACode", $"2faCode{user.Email}", "Enter your 2FA code here!"));
-                    modal.Title = "OmniDiscordUser 2FA";
-                    await e.Interaction.CreateResponseAsync(InteractionResponseType.Modal, modal);
-                }
-            };
-
-            klivebotDiscord.Client.ModalSubmitted += async (s, e) =>
-            {
-                if (e.Values.Keys.ToArray()[0].ToString() == $"2faCode{user.Email}")
-                {
-                    submitted = e.Values.Values.First();
-                    token.Cancel();
-                    DiscordFollowupMessageBuilder builder = new();
-                    builder.WithContent($"Submitted! {user.Email}.");
-                    await e.Interaction.DeferAsync();
-                    await e.Interaction.CreateFollowupMessageAsync(builder);
-                }
-            };
             try
             {
-                await Task.Delay(TimeSpan.FromDays(3), token.Token);
+                string twofa = await manager.GetNotificationsService().SendTextPromptToKlivesDiscord("Require 2fa to login to OmniDiscordUser!",
+    $"Trying to login to\n\nEmail: {user.Email}\nPassword: Length {user.Password.Length}\n\nBut I require a 2fa code. Please provide the code, or reject this request.",
+    TimeSpan.FromDays(3), $"Enter 2FA here for {user.GlobalName}!", "2FA here.");
+                return twofa;
             }
-            catch (TaskCanceledException e) { }
-
-            if (submitted == "" || cancelled == true)
+            catch (TimeoutException tex)
             {
                 return null;
-            }
-            else
-            {
-                return submitted;
             }
         }
         public static HttpClient DiscordHttpClient()
@@ -529,7 +475,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             public string CreateDMDirectoryPathString()
             {
-                string DMDirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMMessages), $"user{UserID}");
+                string DMDirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMMessagesDirectory), $"user{UserID}");
                 return DMDirectoryPath;
             }
             public string CreateDMPath()

@@ -13,6 +13,7 @@ using System.Net;
 using Newtonsoft.Json;
 using System.Web;
 using System.Collections.Specialized;
+using Omnipotent.Profiles;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -22,19 +23,31 @@ namespace Omnipotent.Services.KliveAPI
         public static int apiPORT = 7777;
         HttpListener listener = new HttpListener();
 
+        public struct RouteInfo
+        {
+            public Action<UserRequest> action;
+            public KMProfileManager.KMPermissions authenticationLevelRequired;
+        }
         public struct UserRequest
         {
             public HttpListenerContext context;
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
-            public async Task ReturnResponse(string response, string contentType = "text/plain")
+            public async Task ReturnResponse(string response, string contentType = "text/plain", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
                 HttpListenerResponse resp = context.Response;
-                resp.Headers.Set("Content-Type", response);
+                resp.Headers.Set("Content-Type", contentType);
+                if (headers != null)
+                {
+                    for (global::System.Int32 i = 0; i < headers.Count; i++)
+                    {
+                        resp.Headers.Add(headers.GetKey(i), headers.Get(i));
+                    }
+                }
 
                 byte[] buffer = Encoding.UTF8.GetBytes(response);
                 resp.ContentLength64 = buffer.Length;
-
+                resp.StatusCode = (int)code;
                 using Stream ros = resp.OutputStream;
                 ros.Write(buffer, 0, buffer.Length);
             }
@@ -42,8 +55,10 @@ namespace Omnipotent.Services.KliveAPI
 
         //Controller Lookup
         //Key: Route (example: /omniscience/getmessagecount)
-        //Value: EventHandler<request, params(name, value)>
-        public Dictionary<string, Action<UserRequest>> ControllerLookup;
+        //Value: EventHandler<route, routeInfo>
+        public Dictionary<string, RouteInfo> ControllerLookup;
+
+        private KMProfileManager profileManager;
         public KliveAPI()
         {
             name = "KliveAPI";
@@ -53,6 +68,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             try
             {
+                //Create API listener
                 ControllerLookup = new();
 
                 listener = new();
@@ -61,6 +77,10 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceLog($"Listening on port {apiPORT}...");
                 ServerListenLoop();
+
+                //Create profile manager
+                serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
+                profileManager = (KMProfileManager)serviceManager.GetServiceByClassType<KMProfileManager>()[0];
             }
             catch (Exception ex)
             {
@@ -71,14 +91,19 @@ namespace Omnipotent.Services.KliveAPI
         //Example of how to define a route
         //Action<KliveAPI.KliveAPI.UserRequest> lengthyBuffer = async (request) =>
         //  {
+        //      //Do work and stuff
         //      await Task.Delay(10000);
+        //      //Return a response
         //      await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10));
         //  };
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
-        public async Task CreateRoute(string route, Action<UserRequest> handler)
+        public async Task CreateRoute(string route, Action<UserRequest> handler, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
             while (!listener.IsListening) { }
-            ControllerLookup.Add(route, handler);
+            RouteInfo routeInfo = new();
+            routeInfo.action = handler;
+            routeInfo.authenticationLevelRequired = authenticationLevelRequired;
+            ControllerLookup.Add(route, routeInfo);
             ServiceLog("New route created: " + route);
         }
 
@@ -95,23 +120,69 @@ namespace Omnipotent.Services.KliveAPI
                 request.req = req;
                 request.context = context;
                 request.userParameters = nameValueCollection;
+                if (!string.IsNullOrEmpty(query))
+                {
+                    route = route.Replace(query, "");
+                }
                 if (ControllerLookup.ContainsKey(route))
                 {
-                    ControllerLookup[route].Invoke(request);
+                    RouteInfo routeData = ControllerLookup[route];
+                    if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
+                    {
+                        ServiceLog($"Unauthenticated route {route} has been requested.");
+                        ControllerLookup[route].action.Invoke(request);
+                    }
+                    else
+                    {
+                        if (req.Headers.AllKeys.Contains("Authorization"))
+                        {
+                            string password = req.Headers.Get("Authorization");
+                            var kmProfile = (KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]);
+                            if (kmProfile.CheckIfProfileExists(password))
+                            {
+                                var profile = await kmProfile.GetProfileByPassword(password);
+                                if (profile.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                                {
+                                    ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested.");
+                                    ControllerLookup[route].action.Invoke(request);
+                                }
+                                else
+                                {
+                                    ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have permission.");
+                                    DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                                }
+                            }
+                            else
+                            {
+                                ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester has an incorrect password.");
+                                DenyRequest(request, DeniedRequestReason.InvalidPassword);
+                            }
+                        }
+                        else
+                        {
+                            ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
+                            DenyRequest(request, DeniedRequestReason.NoProfile);
+                        }
+                    }
+                }
+                else
+                {
+                    await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
             }
         }
-
-        private async void RespondToMessage(HttpListenerContext context, HttpListenerRequest request, string response, string contentType = "text/plain")
+        private enum DeniedRequestReason
         {
-            HttpListenerResponse resp = context.Response;
-            resp.Headers.Set("Content-Type", response);
-
-            byte[] buffer = Encoding.UTF8.GetBytes(response);
-            resp.ContentLength64 = buffer.Length;
-
-            using Stream ros = resp.OutputStream;
-            ros.Write(buffer, 0, buffer.Length);
+            NoProfile = 0,
+            InvalidPassword = 1,
+            TooLowClearance = 2,
+        }
+        private async void DenyRequest(UserRequest request, DeniedRequestReason reason)
+        {
+            NameValueCollection headers = new();
+            headers.Add("RequestDeniedReason", reason.ToString());
+            headers.Add("RequestDeniedCode", reason.ToString());
+            await request.ReturnResponse("Access Denied: " + reason, "text/plain", headers, HttpStatusCode.Unauthorized);
         }
     }
 }

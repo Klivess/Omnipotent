@@ -18,14 +18,21 @@ namespace Omnipotent.Data_Handling
             public static string KliveBotDiscordBotDirectory = $"{SavedDataDirectory}/KliveBotDiscordBot";
             public static string KliveBotDiscordTokenText = $"{SavedDataDirectory}/KliveBotDiscordToken.txt";
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
+
+            //Omniscience
             public static string OmniscienceDirectory = $"{SavedDataDirectory}/Omniscience";
             public static string OmniDiscordUsersDirectory = $"{OmniscienceDirectory}/OmniDiscordUsers";
             public static string OmniDiscordImageAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageImageAttachments";
             public static string OmniDiscordVoiceAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVoiceAttachments";
             public static string OmniDiscordVideoAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVideoAttachments";
-            public static string OmniDiscordDMMessages = $"{OmniscienceDirectory}/DMMessages";
-            public static string OmniDiscordServerMessages = $"{OmniscienceDirectory}/DiscordServerMessages";
-            public static string OmniDiscordGuilds = $"{OmniscienceDirectory}/DiscordGuilds";
+            public static string OmniDiscordDMMessagesDirectory = $"{OmniscienceDirectory}/DMMessages";
+            public static string OmniDiscordServerMessagesDirectory = $"{OmniscienceDirectory}/DiscordServerMessages";
+            public static string OmniDiscordGuildsDirectory = $"{OmniscienceDirectory}/DiscordGuilds";
+
+            //Klives Management Profiles
+            public static string KlivesManagementInfoDirectory = $"{SavedDataDirectory}/KlivesManagement";
+            public static string KlivesManagementProfilesDirectory = $"{KlivesManagementInfoDirectory}/Profiles";
+
 
         };
 

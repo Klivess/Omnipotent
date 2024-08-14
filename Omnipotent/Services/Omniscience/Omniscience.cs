@@ -1,4 +1,5 @@
-﻿using Omnipotent.Data_Handling;
+﻿using DSharpPlus;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.Omniscience.DiscordInterface;
