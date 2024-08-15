@@ -19,7 +19,7 @@ namespace Omnipotent.Profiles
         }
         protected override async void ServiceMain()
         {
-            LoadAllProfiles();
+            await LoadAllProfiles();
             if (!Profiles.Any())
             {
                 RequestProfileFromKlives();
@@ -121,6 +121,7 @@ namespace Omnipotent.Profiles
                 }
                 catch (Exception ex) { }
             }
+            ServiceLog($"Loaded {Profiles.Count} Klives Management Profiles into memory.");
         }
 
         public async Task<KMProfile> GetProfileByPassword(string password)
