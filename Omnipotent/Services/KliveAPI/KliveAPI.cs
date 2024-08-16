@@ -45,6 +45,7 @@ namespace Omnipotent.Services.KliveAPI
                         resp.Headers.Add(headers.GetKey(i), headers.Get(i));
                     }
                 }
+                resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
                 byte[] buffer = Encoding.UTF8.GetBytes(response);
                 resp.ContentLength64 = buffer.Length;
