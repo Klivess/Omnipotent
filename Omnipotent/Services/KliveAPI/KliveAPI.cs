@@ -33,6 +33,7 @@ namespace Omnipotent.Services.KliveAPI
             public HttpListenerContext context;
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
+            public string userMessageContent;
             public async Task ReturnResponse(string response, string contentType = "text/plain", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
                 HttpListenerResponse resp = context.Response;
@@ -72,7 +73,7 @@ namespace Omnipotent.Services.KliveAPI
                 ControllerLookup = new();
 
                 listener = new();
-                listener.Prefixes.Add($"http://*:{apiPORT}/");
+                listener.Prefixes.Add($"http://+:{apiPORT}/");
                 listener.Start();
 
                 ServiceLog($"Listening on port {apiPORT}...");
@@ -119,6 +120,8 @@ namespace Omnipotent.Services.KliveAPI
                 UserRequest request = new();
                 request.req = req;
                 request.context = context;
+                StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
+                request.userMessageContent = await reader.ReadToEndAsync();
                 request.userParameters = nameValueCollection;
                 if (!string.IsNullOrEmpty(query))
                 {

@@ -50,7 +50,7 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    var password = request.userParameters.Get("password");
+                    var password = JsonConvert.DeserializeObject<string>(request.userMessageContent);
                     await request.ReturnResponse(JsonConvert.SerializeObject(CheckIfProfileExists(password)), "application/json");
                 }
                 catch (Exception ex)
