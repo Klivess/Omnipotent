@@ -56,6 +56,16 @@ namespace Omnipotent.Service_Manager
             waitingTasks = new();
         }
 
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="dueDateTime"></param>
+        /// <param name="nameIdentifier"></param>
+        /// <param name="topic"></param>
+        /// <param name="agentID"></param> ID of the Service calling this function.
+        /// <param name="reason"></param>
+        /// <param name="important"></param>
+        /// <param name="embeddedFunction"></param>
         public void CreateNewScheduledTask(DateTime dueDateTime, string nameIdentifier, string topic, string agentID, string reason = "", bool important = true, Action embeddedFunction = null)
         {
             //Create task
@@ -69,7 +79,7 @@ namespace Omnipotent.Service_Manager
             task.randomidentifier = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             //Try get agent info
             var service = serviceManager.GetServiceByID(agentID);
-            if(service != null )
+            if (service != null)
             {
                 task.agentName = service.GetName();
             }
@@ -78,7 +88,7 @@ namespace Omnipotent.Service_Manager
                 task.agentName = null;
             }
             task.dateTimeSet = DateTime.Now;
-            if(embeddedFunction != null)
+            if (embeddedFunction != null)
             {
                 task.embeddedFunction = embeddedFunction;
             }
@@ -119,7 +129,7 @@ namespace Omnipotent.Service_Manager
                     ScheduledTask task = await dataHandler.ReadAndDeserialiseDataFromFile<ScheduledTask>(item);
                     tasks.Add(task);
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                     serviceManager.logger.LogError(name, ex, "Couldn't deserialise/read task.");
                 }

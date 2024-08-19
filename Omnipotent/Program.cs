@@ -11,6 +11,7 @@ using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
 using System;
+using static SampleClassification.ConsoleApp.SampleClassification;
 
 namespace Omnipotent
 {
@@ -37,6 +38,7 @@ namespace Omnipotent
                 {
                     ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
                 }
+
                 //Main thread keep-alive very hacky probably wont cause problems hopefully probably
                 Task.Delay(-1).Wait();
             }

@@ -212,5 +212,23 @@ namespace Omnipotent.Services.Omniscience
             }
             return guilds.ToArray();
         }
+
+        public async Task SaveKnownDiscordUser(OmniDiscordUserInfo user)
+        {
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory), user.Username + ".omniuserinfo");
+            await serviceManager.fileHandlerService.WriteToFile(path, JsonConvert.SerializeObject(user));
+        }
+
+        public async Task<OmniDiscordUserInfo[]> GetAllDownloadedKnownUsers()
+        {
+
+            List<OmniDiscordUserInfo> users = new();
+            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory)).Where(k => Path.GetExtension(k) == ".omniuserinfo").ToList();
+            foreach (var file in files)
+            {
+                users.Add(JsonConvert.DeserializeObject<OmniDiscordUserInfo>(await serviceManager.fileHandlerService.ReadDataFromFile(file)));
+            }
+            return users.ToArray();
+        }
     }
 }

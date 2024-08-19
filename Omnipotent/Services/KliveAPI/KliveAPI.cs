@@ -74,7 +74,7 @@ namespace Omnipotent.Services.KliveAPI
                 ControllerLookup = new();
 
                 listener = new();
-                listener.Prefixes.Add($"http://+:{apiPORT}/");
+                listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Start();
 
                 ServiceLog($"Listening on port {apiPORT}...");
