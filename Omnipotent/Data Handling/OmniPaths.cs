@@ -34,6 +34,8 @@ namespace Omnipotent.Data_Handling
             public static string KlivesManagementInfoDirectory = $"{SavedDataDirectory}/KlivesManagement";
             public static string KlivesManagementProfilesDirectory = $"{KlivesManagementInfoDirectory}/Profiles";
 
+            //KliveAPI
+            public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
 
         };
 

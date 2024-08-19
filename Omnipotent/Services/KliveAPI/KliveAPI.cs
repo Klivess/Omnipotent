@@ -70,6 +70,8 @@ namespace Omnipotent.Services.KliveAPI
         {
             try
             {
+                //await CheckForSSLCertificate();
+
                 //Create API listener
                 ControllerLookup = new();
 
@@ -88,6 +90,13 @@ namespace Omnipotent.Services.KliveAPI
             {
                 serviceManager.logger.LogError(name, ex, "KliveAPI Failed!");
             }
+        }
+
+        private async Task CheckForSSLCertificate()
+        {
+            var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Enter a password for KliveAPI's SSL Certificate",
+                "Enter a password to sign the self-signed SSL certificate for KliveAPI.", TimeSpan.FromDays(3), "SSL Certificate Password", "SSL Password");
+            CertificateInstaller.CreateInstallCert(5, password, "KliveAPI");
         }
 
         //Example of how to define a route

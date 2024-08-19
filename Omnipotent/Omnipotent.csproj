@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="ByteSize" Version="2.1.2" />
+    <PackageReference Include="Cake.Powershell" Version="4.0.0" />
     <PackageReference Include="DSharpPlus" Version="4.4.6" />
     <PackageReference Include="DSharpPlus.Interactivity" Version="4.4.6" />
     <PackageReference Include="DSharpPlus.SlashCommands" Version="4.4.6" />
@@ -22,6 +23,7 @@
     <PackageReference Include="Microsoft.ML" Version="3.0.1" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="protobuf-net" Version="3.2.30" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="Websocket.Client" Version="5.1.2" />
   </ItemGroup>
 
