@@ -105,7 +105,7 @@ namespace Omnipotent.Profiles
 
         public async Task SaveProfileAsync(KMProfile profile)
         {
-            await serviceManager.fileHandlerService.WriteToFile(profile.CreateProfilePath(), JsonConvert.SerializeObject(profile));
+            await serviceManager.GetDataHandler().WriteToFile(profile.CreateProfilePath(), JsonConvert.SerializeObject(profile));
         }
 
         private async Task LoadAllProfiles()
@@ -116,7 +116,7 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    string data = await serviceManager.fileHandlerService.ReadDataFromFile(file);
+                    string data = await serviceManager.GetDataHandler().ReadDataFromFile(file);
                     Profiles.Add(JsonConvert.DeserializeObject<KMProfile>(data));
                 }
                 catch (Exception ex) { }

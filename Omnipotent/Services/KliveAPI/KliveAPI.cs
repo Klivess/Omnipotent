@@ -14,6 +14,7 @@ using Newtonsoft.Json;
 using System.Web;
 using System.Collections.Specialized;
 using Omnipotent.Profiles;
+using System.Management.Automation.Runspaces;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -61,6 +62,8 @@ namespace Omnipotent.Services.KliveAPI
         public Dictionary<string, RouteInfo> ControllerLookup;
 
         private KMProfileManager profileManager;
+
+        private CertificateInstaller certInstaller;
         public KliveAPI()
         {
             name = "KliveAPI";
@@ -70,18 +73,19 @@ namespace Omnipotent.Services.KliveAPI
         {
             try
             {
-                //await CheckForSSLCertificate();
+                await CheckForSSLCertificate();
 
                 //Create API listener
                 ControllerLookup = new();
 
                 listener = new();
                 listener.Prefixes.Add($"https://+:{apiPORT}/");
+
+
                 listener.Start();
 
                 ServiceLog($"Listening on port {apiPORT}...");
                 ServerListenLoop();
-
                 //Create profile manager
                 serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
                 profileManager = (KMProfileManager)serviceManager.GetServiceByClassType<KMProfileManager>()[0];
@@ -94,9 +98,13 @@ namespace Omnipotent.Services.KliveAPI
 
         private async Task CheckForSSLCertificate()
         {
-            var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Enter a password for KliveAPI's SSL Certificate",
-                "Enter a password to sign the self-signed SSL certificate for KliveAPI.", TimeSpan.FromDays(3), "SSL Certificate Password", "SSL Password");
-            CertificateInstaller.CreateInstallCert(5, password, "KliveAPI");
+            certInstaller = new(this);
+            if (!(await certInstaller.IsCertbotInstalled()))
+            {
+                await certInstaller.InstallCertBot();
+            }
+
+            //var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Enter a password for KliveAPI's SSL Certificate", "Enter a password to sign the self-signed SSL certificate for KliveAPI.", TimeSpan.FromDays(3), "SSL Certificate Password", "SSL Password");
         }
 
         //Example of how to define a route

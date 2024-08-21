@@ -145,7 +145,7 @@ namespace Omnipotent.Data_Handling
                 }
             }
             //Replace this with proper waiting
-            while (fileOperations.Any() == false) { }
+            while (fileOperations.Any() == false) { Task.Delay(10).Wait(); }
             //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
             //GC.Collect();
             ServiceMain();

@@ -2,12 +2,37 @@
 using System.Management;
 using System.Management.Automation;
 using Omnipotent.Data_Handling;
+using Microsoft.AspNetCore.Components.Web;
+using Newtonsoft.Json;
+using static System.Net.WebRequestMethods;
 
 namespace Omnipotent.Services.KliveAPI
 {
     public class CertificateInstaller
     {
-        public static void CreateInstallCert(int expDateYears, string password, string issuedBy)
+        KliveAPI parent;
+        public CertificateInstaller(KliveAPI service)
+        {
+            parent = service;
+        }
+
+        public async Task<bool> IsCertbotInstalled()
+        {
+            var powershell = PowerShell.Create();
+            powershell.AddScript("certbot --help");
+            var result = (await powershell.InvokeAsync()).ToList();
+            return result.Any();
+        }
+        public async Task InstallCertBot()
+        {
+            const string url = "https://github.com/certbot/certbot/releases/tag/v2.11.0";
+
+        }
+
+
+
+        //deprecated
+        private void CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
             // Create/install certificate
             using (var powerShell = System.Management.Automation.PowerShell.Create())

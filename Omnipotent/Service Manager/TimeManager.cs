@@ -114,7 +114,7 @@ namespace Omnipotent.Service_Manager
         private async void SaveTaskToFile(ScheduledTask task)
         {
             string path = FormFilePathWithTask(task);
-            await dataHandler.SerialiseObjectToFile(path, task);
+            await serviceManager.GetDataHandler().SerialiseObjectToFile(path, task);
         }
 
         public async Task<List<ScheduledTask>> GetAllUpcomingTasksFromDisk()
@@ -126,7 +126,7 @@ namespace Omnipotent.Service_Manager
             {
                 try
                 {
-                    ScheduledTask task = await dataHandler.ReadAndDeserialiseDataFromFile<ScheduledTask>(item);
+                    ScheduledTask task = await serviceManager.GetDataHandler().ReadAndDeserialiseDataFromFile<ScheduledTask>(item);
                     tasks.Add(task);
                 }
                 catch (Exception ex)

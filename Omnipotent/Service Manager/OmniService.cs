@@ -20,22 +20,17 @@ namespace Omnipotent.Service_Manager
         protected string name;
         public string serviceID;
         private Thread serviceThread;
-        protected DataUtil dataHandler;
-        protected OmniServiceManager serviceManager;
-        public Stopwatch serviceUptime;
+        public OmniServiceManager serviceManager;
+        protected Stopwatch serviceUptime;
 
         private bool ServiceActive;
         protected CancellationTokenSource cancellationToken;
-
-        public void ReplaceDataHandler(DataUtil util)
-        {
-            dataHandler = util;
-        }
         public void ReplaceDataManager(OmniServiceManager manager)
         {
             serviceManager = manager;
         }
         public string GetName() { return name; }
+        public TimeSpan GetServiceUptime() { return serviceUptime.Elapsed; }
         public ThreadAnteriority GetThreadAnteriority() { return threadAnteriority; }
         public bool IsServiceActive() { return ServiceActive; }
         public Thread GetThread()
@@ -84,7 +79,7 @@ namespace Omnipotent.Service_Manager
                     {
                         try
                         {
-                            ServiceMain(); Task.Delay(-1);
+                            ServiceMain(); Task.Delay(-1).Wait();
                         }
                         catch (ThreadInterruptedException interrupt) { }
                     }

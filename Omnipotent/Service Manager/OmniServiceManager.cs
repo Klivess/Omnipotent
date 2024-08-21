@@ -34,7 +34,7 @@ namespace Omnipotent.Service_Manager
     public class OmniServiceManager
     {
         public List<OmniService> activeServices;
-        public DataUtil fileHandlerService;
+        protected DataUtil fileHandlerService;
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
         public OmniLogging logger;
@@ -45,17 +45,14 @@ namespace Omnipotent.Service_Manager
             activeServices = new List<OmniService>();
             //Logger
             logger = new();
-            logger.ReplaceDataHandler(this.fileHandlerService);
             logger.ReplaceDataManager(this);
             logger.ServiceStart();
             //Instantiate file handler service
             fileHandlerService = new DataUtil();
             fileHandlerService.ReplaceDataManager(this);
-            fileHandlerService.ReplaceDataHandler(this.fileHandlerService);
             fileHandlerService.ServiceStart();
             //Instantiate service performance monitor
             monitor = new OmniServiceMonitor();
-            monitor.ReplaceDataHandler(this.fileHandlerService);
             monitor.ReplaceDataManager(this);
             monitor.ServiceStart();
             //Create prerequisite items
@@ -66,17 +63,21 @@ namespace Omnipotent.Service_Manager
             while (manager.IsServiceActive()) { Task.Delay(100); }
             //Initialising time manager
             timeManager = new();
-            timeManager.ReplaceDataHandler(this.fileHandlerService);
             timeManager.ReplaceDataManager(this);
             timeManager.ServiceStart();
         }
         public void CreateAndStartNewMonitoredOmniService(OmniService service)
         {
-            service.ReplaceDataHandler(fileHandlerService);
             service.ReplaceDataManager(this);
             service.ServiceStart();
             activeServices.Add(service);
             monitor.SetServiceToMonitor(service);
+        }
+
+        public DataUtil GetDataHandler()
+        {
+            while (fileHandlerService.IsServiceActive() == false) { Task.Delay(100); }
+            return fileHandlerService;
         }
         public OmniService GetServiceByID(string id)
         {

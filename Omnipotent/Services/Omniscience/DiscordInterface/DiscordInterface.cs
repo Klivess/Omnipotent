@@ -80,7 +80,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 var file = Directory.GetFiles(directory).Where(k => Path.GetExtension(k) == $".omnidiscuser");
                 if (file.Any())
                 {
-                    OmniDiscordUser user = await manager.fileHandlerService.ReadAndDeserialiseDataFromFile<OmniDiscordUser>(file.ToArray()[0]);
+                    OmniDiscordUser user = await manager.GetDataHandler().ReadAndDeserialiseDataFromFile<OmniDiscordUser>(file.ToArray()[0]);
                     Directory.CreateDirectory(user.CreateDMDirectoryPathString());
                     users.Add(user);
                 }
@@ -217,10 +217,10 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 string pathOfUserDataFile = Path.Combine(pathOfUserDirectory, user.FormatFileName());
                 if (!Directory.Exists(pathOfUserDirectory))
                 {
-                    await manager.fileHandlerService.CreateDirectory(pathOfUserDirectory);
+                    await manager.GetDataHandler().CreateDirectory(pathOfUserDirectory);
                 }
                 string serialisedData = JsonConvert.SerializeObject(user);
-                await manager.fileHandlerService.WriteToFile(pathOfUserDataFile, serialisedData);
+                await manager.GetDataHandler().WriteToFile(pathOfUserDataFile, serialisedData);
             }
             catch (Exception ex)
             {

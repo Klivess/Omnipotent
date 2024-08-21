@@ -174,7 +174,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveDiscordMessage(OmniDiscordUser user, OmniDiscordMessage message)
         {
             string path = Path.Combine(user.CreateDMDirectoryPathString(), message.MessageID + ".omnimessage");
-            await serviceManager.fileHandlerService.WriteToFile(path, JsonConvert.SerializeObject(message));
+            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
             if (!AllCapturedMessages.Where(k => k.MessageID == message.MessageID).Any())
             {
                 AllCapturedMessages.Add(message);
@@ -187,7 +187,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(user.CreateDMDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
             var result = Parallel.ForEach(files, (file) =>
             {
-                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(serviceManager.fileHandlerService.ReadDataFromFile(file, true).Result));
+                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(serviceManager.GetDataHandler().ReadDataFromFile(file, true).Result));
                 Console.WriteLine(messages.Count);
             });
             while (!result.IsCompleted) { }
@@ -198,7 +198,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveDiscordGuild(OmniDiscordGuild guild)
         {
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory), guild.GuildID + ".omniguild");
-            await serviceManager.fileHandlerService.WriteToFile(path, JsonConvert.SerializeObject(guild));
+            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(guild));
         }
 
         public async Task<OmniDiscordGuild[]> GetAllDownloadedGuilds()
@@ -208,7 +208,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory)).Where(k => Path.GetExtension(k) == ".omniguild").ToList();
             foreach (var file in files)
             {
-                guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await serviceManager.fileHandlerService.ReadDataFromFile(file)));
+                guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
             }
             return guilds.ToArray();
         }
@@ -216,7 +216,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveKnownDiscordUser(OmniDiscordUserInfo user)
         {
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory), user.Username + ".omniuserinfo");
-            await serviceManager.fileHandlerService.WriteToFile(path, JsonConvert.SerializeObject(user));
+            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(user));
         }
 
         public async Task<OmniDiscordUserInfo[]> GetAllDownloadedKnownUsers()
@@ -226,7 +226,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory)).Where(k => Path.GetExtension(k) == ".omniuserinfo").ToList();
             foreach (var file in files)
             {
-                users.Add(JsonConvert.DeserializeObject<OmniDiscordUserInfo>(await serviceManager.fileHandlerService.ReadDataFromFile(file)));
+                users.Add(JsonConvert.DeserializeObject<OmniDiscordUserInfo>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
             }
             return users.ToArray();
         }

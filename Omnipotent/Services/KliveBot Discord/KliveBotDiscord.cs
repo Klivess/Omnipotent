@@ -9,6 +9,8 @@ using System.Drawing;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+using DSharpPlus.SlashCommands;
+using System.Security.Policy;
 
 namespace Omnipotent.Services.KliveBot_Discord
 {
@@ -25,7 +27,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 string tokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveBotDiscordTokenText);
-                string token = await dataHandler.ReadDataFromFile(tokenPath);
+                string token = await serviceManager.GetDataHandler().ReadDataFromFile(tokenPath, true);
                 DiscordConfiguration connectionConfig = new DiscordConfiguration()
                 {
                     Token = token,
@@ -35,7 +37,16 @@ namespace Omnipotent.Services.KliveBot_Discord
                     //Intents = DiscordIntents.AllUnprivileged
                 };
                 Client = new DiscordClient(connectionConfig);
+
+                var slash = Client.UseSlashCommands(new SlashCommandsConfiguration
+                {
+                    Services = new ServiceCollection().AddSingleton(serviceManager).BuildServiceProvider()
+                });
+                slash.RegisterCommands<KliveBotDiscordCommands>();
+                ServiceLog("Slash commands registered!");
+
                 await Client.ConnectAsync(new DiscordActivity("Ran by Omnipotent!", ActivityType.ListeningTo));
+                ServiceLog("KliveBot connected to Discord!");
                 await Task.Delay(-1);
             }
             catch (Exception ex)

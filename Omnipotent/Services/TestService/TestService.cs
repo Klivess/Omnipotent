@@ -22,7 +22,7 @@ namespace Omnipotent.Services.TestService
             {
                 try
                 {
-                    dataHandler.WriteToFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "test2.txt"), RandomGeneration.GenerateRandomLengthOfNumbers(10));
+                    serviceManager.GetDataHandler().WriteToFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "test2.txt"), RandomGeneration.GenerateRandomLengthOfNumbers(10));
                 }
                 catch (Exception ex)
                 {
