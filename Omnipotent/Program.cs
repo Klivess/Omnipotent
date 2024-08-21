@@ -11,7 +11,6 @@ using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
 using System;
-using static SampleClassification.ConsoleApp.SampleClassification;
 
 namespace Omnipotent
 {
