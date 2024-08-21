@@ -5,9 +5,9 @@ using System;
 using System.Linq;
 using System.IO;
 using System.Collections.Generic;
-namespace SampleClassification.ConsoleApp
+namespace IsStatementPositiveOrNegative
 {
-    public partial class SampleClassification
+    public partial class IsStatementPositiveOrNegative
     {
         /// <summary>
         /// model input class for SampleClassification.

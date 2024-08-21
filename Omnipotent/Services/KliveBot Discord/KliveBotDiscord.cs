@@ -17,6 +17,8 @@ namespace Omnipotent.Services.KliveBot_Discord
     public class KliveBotDiscord : OmniService
     {
         public DiscordClient Client { get; set; }
+        DiscordGuild GuildContainingKlives;
+        DiscordMember KlivesMember;
         public KliveBotDiscord()
         {
             name = "KliveBot Discord Bot";
@@ -45,8 +47,13 @@ namespace Omnipotent.Services.KliveBot_Discord
                 slash.RegisterCommands<KliveBotDiscordCommands>();
                 ServiceLog("Slash commands registered!");
 
+                Client.MessageCreated += Client_MessageCreated;
+
                 await Client.ConnectAsync(new DiscordActivity("Ran by Omnipotent!", ActivityType.ListeningTo));
                 ServiceLog("KliveBot connected to Discord!");
+
+                await LoadVariables();
+
                 await Task.Delay(-1);
             }
             catch (Exception ex)
@@ -56,12 +63,35 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        private async Task LoadVariables()
+        {
+            if (KlivesMember == null)
+            {
+                GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+                KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+            }
+        }
+
+        private async Task Client_MessageCreated(DiscordClient sender, DSharpPlus.EventArgs.MessageCreateEventArgs args)
+        {
+            if (args.Channel.IsPrivate && args.Author.Id != KlivesMember.Id && args.Author.Id != Client.CurrentUser.Id)
+            {
+
+
+                await SendMessageToKlives(MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+                    $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange));
+            }
+        }
+
         public async Task<DiscordMessage> SendMessageToKlives(string message)
         {
             while (Client == null) { }
-            var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
-            var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
-            return await member.SendMessageAsync(message);
+            if (KlivesMember == null)
+            {
+                GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+                KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+            }
+            return await KlivesMember.SendMessageAsync(message);
         }
 
         public async Task<DiscordMessage> SendMessageToKlives(DiscordMessageBuilder builder)

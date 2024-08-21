@@ -1,9 +1,11 @@
-{
+﻿{
   "Scenario": "Classification",
   "DataSource": {
     "Version": 3,
     "EscapeCharacter": "\"",
     "ReadMultiLines": false,
+    "KeepDiacritics": false,
+    "KeepPunctuations": false,
     "AllowQuoting": false,
     "Type": "TabularFile",
     "FilePath": "C:\\Projects\\Software\\Omnipotent\\Omnipotent\\Services\\Sentiment Analysis\\IsStatementPositiveOrNegative\\yelp_labelled.txt",
@@ -41,7 +43,7 @@
         "Version": 1,
         "Type": "Trial",
         "TrainerName": "LbfgsMaximumEntropyMulti",
-        "Score": 0.8612579281183932,
+        "Score": 0.86125792811839319,
         "RuntimeInSeconds": 0.062,
         "Parameter": {
           "_SCHEMA_": "e0 * e1 * e2 * e7 * e10",
@@ -76,7 +78,7 @@
         "Version": 1,
         "Type": "Trial",
         "TrainerName": "LbfgsMaximumEntropyMulti",
-        "Score": 0.8612579281183932,
+        "Score": 0.86125792811839319,
         "RuntimeInSeconds": 0.077,
         "Parameter": {
           "_SCHEMA_": "e0 * e1 * e2 * e7 * e10",
@@ -111,7 +113,7 @@
         "Version": 1,
         "Type": "Trial",
         "TrainerName": "LbfgsMaximumEntropyMulti",
-        "Score": 0.8612579281183932,
+        "Score": 0.86125792811839319,
         "RuntimeInSeconds": 0.089,
         "Parameter": {
           "_SCHEMA_": "e0 * e1 * e2 * e7 * e10",
@@ -146,7 +148,7 @@
         "Version": 1,
         "Type": "Trial",
         "TrainerName": "LbfgsMaximumEntropyMulti",
-        "Score": 0.8612579281183932,
+        "Score": 0.86125792811839319,
         "RuntimeInSeconds": 0.066,
         "Parameter": {
           "_SCHEMA_": "e0 * e1 * e2 * e7 * e10",
@@ -181,7 +183,7 @@
         "Version": 1,
         "Type": "Trial",
         "TrainerName": "LbfgsMaximumEntropyMulti",
-        "Score": 0.8612579281183932,
+        "Score": 0.86125792811839319,
         "RuntimeInSeconds": 0.076,
         "Parameter": {
           "_SCHEMA_": "e0 * e1 * e2 * e7 * e10",

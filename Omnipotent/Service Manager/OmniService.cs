@@ -49,7 +49,6 @@ namespace Omnipotent.Service_Manager
             this.serviceID = RandomGeneration.GenerateRandomLengthOfNumbers(8);
             this.name = name;
             this.threadAnteriority = anteriority;
-            serviceUptime = Stopwatch.StartNew();
         }
 
         //DO NOT USE THIS (outside of this class)!!
@@ -73,6 +72,7 @@ namespace Omnipotent.Service_Manager
             else
             {
                 //serviceTask = Task.Run(ServiceMain, cancellationToken.Token);
+                serviceUptime = Stopwatch.StartNew();
                 serviceThread = new Thread(() =>
                 {
                     try

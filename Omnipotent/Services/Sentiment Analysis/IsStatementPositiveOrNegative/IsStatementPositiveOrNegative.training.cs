@@ -9,16 +9,16 @@ using Microsoft.ML;
 using Microsoft.ML.Data;
 using Microsoft.ML.Trainers;
 
-namespace SampleClassification.ConsoleApp
+namespace IsStatementPositiveOrNegative
 {
-    public partial class SampleClassification
+    public partial class IsStatementPositiveOrNegative
     {
-        public const string RetrainFilePath =  @"C:\Projects\Software\Omnipotent\Omnipotent\Services\Sentiment Analysis\IsStatementPositiveOrNegative\yelp_labelled.txt";
+        public const string RetrainFilePath = @"C:\Projects\Software\Omnipotent\Omnipotent\Services\Sentiment Analysis\IsStatementPositiveOrNegative\yelp_labelled.txt";
         public const char RetrainSeparatorChar = '	';
-        public const bool RetrainHasHeader =  false;
-        public const bool RetrainAllowQuoting =  false;
+        public const bool RetrainHasHeader = false;
+        public const bool RetrainAllowQuoting = false;
 
-         /// <summary>
+        /// <summary>
         /// Train a new model with the provided dataset.
         /// </summary>
         /// <param name="outputModelPath">File path for saving the model. Should be similar to "C:\YourPath\ModelName.mlnet"</param>
@@ -89,13 +89,13 @@ namespace SampleClassification.ConsoleApp
         public static IEstimator<ITransformer> BuildPipeline(MLContext mlContext)
         {
             // Data process configuration with pipeline data transformations
-            var pipeline = mlContext.Transforms.Text.FeaturizeText(inputColumnName:@"col0",outputColumnName:@"col0")      
-                                    .Append(mlContext.Transforms.Concatenate(@"Features", new []{@"col0"}))      
-                                    .Append(mlContext.Transforms.Conversion.MapValueToKey(outputColumnName:@"col1",inputColumnName:@"col1",addKeyValueAnnotationsAsText:false))      
-                                    .Append(mlContext.MulticlassClassification.Trainers.LbfgsMaximumEntropy(new LbfgsMaximumEntropyMulticlassTrainer.Options(){L1Regularization=0.03125F,L2Regularization=0.10961515F,LabelColumnName=@"col1",FeatureColumnName=@"Features"}))      
-                                    .Append(mlContext.Transforms.Conversion.MapKeyToValue(outputColumnName:@"PredictedLabel",inputColumnName:@"PredictedLabel"));
+            var pipeline = mlContext.Transforms.Text.FeaturizeText(inputColumnName: @"col0", outputColumnName: @"col0")
+                                    .Append(mlContext.Transforms.Concatenate(@"Features", new[] { @"col0" }))
+                                    .Append(mlContext.Transforms.Conversion.MapValueToKey(outputColumnName: @"col1", inputColumnName: @"col1", addKeyValueAnnotationsAsText: false))
+                                    .Append(mlContext.MulticlassClassification.Trainers.LbfgsMaximumEntropy(new LbfgsMaximumEntropyMulticlassTrainer.Options() { L1Regularization = 0.03125F, L2Regularization = 0.10961515F, LabelColumnName = @"col1", FeatureColumnName = @"Features" }))
+                                    .Append(mlContext.Transforms.Conversion.MapKeyToValue(outputColumnName: @"PredictedLabel", inputColumnName: @"PredictedLabel"));
 
             return pipeline;
         }
     }
- }
+}

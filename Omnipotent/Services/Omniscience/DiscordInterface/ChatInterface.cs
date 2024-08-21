@@ -66,6 +66,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
             }
         }
+
         public async Task<OmniDiscordMessage> ProcessMessageJSONObjectToOmniDiscordMessage(string messageText, bool isinDM, bool AutomaticallyDownloadAttachment = true)
         {
             WebClient wc = new();
