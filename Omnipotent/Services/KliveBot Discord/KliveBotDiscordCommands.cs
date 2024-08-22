@@ -4,6 +4,7 @@ using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System.Diagnostics;
+using System.Management.Automation.Subsystem.Prediction;
 using static IsStatementPositiveOrNegative.IsStatementPositiveOrNegative;
 
 namespace Omnipotent.Services.KliveBot_Discord
@@ -16,7 +17,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         public async Task PingAsync(InteractionContext ctx)
         {
             Stopwatch sw = new Stopwatch();
-            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Pong - response time in {sw.Elapsed.Milliseconds} milliseconds."));
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Pong - latency is {ctx.Client.Ping} milliseconds."));
             sw.Stop();
         }
 
@@ -52,6 +53,21 @@ namespace Omnipotent.Services.KliveBot_Discord
             else
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Feature not available on production build yet, sorry :("));
+            }
+        }
+
+        [SlashCommand("serviceRestart", "Restarts a service")]
+        public async Task ServiceRestartAsync(InteractionContext ctx, [Option("serviceName", "The service to restart")] string serviceName)
+        {
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+            if (serviceManager.GetServiceByName(serviceName) != null)
+            {
+                serviceManager.GetServiceByName(serviceName).RestartService();
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent($"Restarted service {serviceManager.GetServiceByName(serviceName).GetName()}"));
+            }
+            else
+            {
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent($"Couldn't find service by the name of {serviceName}"));
             }
         }
     }

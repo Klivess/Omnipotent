@@ -116,6 +116,18 @@ namespace Omnipotent.Service_Manager
             return (NotificationsService)(GetServiceByClassType<NotificationsService>()[0]);
         }
 
+        public OmniService GetServiceByName(string name)
+        {
+            var result = activeServices.Where(k => k.GetName().ToLower() == name.ToLower()).ToArray();
+            if (result.Any())
+            {
+                return result[0];
+            }
+            else
+            {
+                return null;
+            }
+        }
     }
     public class OmniServiceMonitor : OmniService
     {
