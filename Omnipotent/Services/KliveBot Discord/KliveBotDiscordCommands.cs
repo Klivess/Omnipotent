@@ -60,6 +60,11 @@ namespace Omnipotent.Services.KliveBot_Discord
         public async Task ServiceRestartAsync(InteractionContext ctx, [Option("serviceName", "The service to restart")] string serviceName)
         {
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+            if (ctx.User.Id != OmniPaths.KlivesDiscordAccountID)
+            {
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("You do not have permission to use this command."));
+                return;
+            }
             if (serviceManager.GetServiceByName(serviceName) != null)
             {
                 serviceManager.GetServiceByName(serviceName).RestartService();
