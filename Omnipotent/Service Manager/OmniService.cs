@@ -121,6 +121,7 @@ namespace Omnipotent.Service_Manager
                 Task.Delay(500).Wait();
                 serviceManager.logger.LogStatus(name, "Ending " + name + " service.");
                 ServiceActive = false;
+                GC.Collect();
                 serviceThread.Interrupt();
                 return true;
             }

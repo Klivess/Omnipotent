@@ -24,6 +24,7 @@ namespace Omnipotent.Services.KliveAPI
         public static int apiPORT = 7777;
         HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
+        private Task<HttpListenerContext> getContextTask;
 
         public struct RouteInfo
         {
@@ -87,6 +88,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener.Start();
 
                 ServiceLog($"Listening on port {apiPORT}...");
+
                 ServerListenLoop();
                 //Create profile manager
                 serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
@@ -102,6 +104,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             ContinueListenLoop = false;
+            getContextTask.Dispose();
             listener.Stop();
         }
 
@@ -139,65 +142,73 @@ namespace Omnipotent.Services.KliveAPI
         {
             while (ContinueListenLoop)
             {
-                HttpListenerContext context = listener.GetContext();
-                HttpListenerRequest req = context.Request;
-                string route = req.RawUrl;
-                string query = req.Url.Query;
-                NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
-                UserRequest request = new();
-                request.req = req;
-                request.context = context;
-                StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
-                request.userMessageContent = await reader.ReadToEndAsync();
-                request.userParameters = nameValueCollection;
-                if (!string.IsNullOrEmpty(query))
+                try
                 {
-                    route = route.Replace(query, "");
-                }
-                if (ControllerLookup.ContainsKey(route))
-                {
-                    RouteInfo routeData = ControllerLookup[route];
-                    if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
+                    getContextTask = listener.GetContextAsync();
+                    HttpListenerContext context = await getContextTask;
+                    HttpListenerRequest req = context.Request;
+                    string route = req.RawUrl;
+                    string query = req.Url.Query;
+                    NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
+                    UserRequest request = new();
+                    request.req = req;
+                    request.context = context;
+                    StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
+                    request.userMessageContent = await reader.ReadToEndAsync();
+                    request.userParameters = nameValueCollection;
+                    if (!string.IsNullOrEmpty(query))
                     {
-                        ServiceLog($"Unauthenticated route {route} has been requested.");
-                        ControllerLookup[route].action.Invoke(request);
+                        route = route.Replace(query, "");
                     }
-                    else
+                    if (ControllerLookup.ContainsKey(route))
                     {
-                        if (req.Headers.AllKeys.Contains("Authorization"))
+                        RouteInfo routeData = ControllerLookup[route];
+                        if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                         {
-                            string password = req.Headers.Get("Authorization");
-                            var kmProfile = (KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]);
-                            if (kmProfile.CheckIfProfileExists(password))
+                            ServiceLog($"Unauthenticated route {route} has been requested.");
+                            ControllerLookup[route].action.Invoke(request);
+                        }
+                        else
+                        {
+                            if (req.Headers.AllKeys.Contains("Authorization"))
                             {
-                                var profile = await kmProfile.GetProfileByPassword(password);
-                                if (profile.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                                string password = req.Headers.Get("Authorization");
+                                var kmProfile = (KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]);
+                                if (kmProfile.CheckIfProfileExists(password))
                                 {
-                                    ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested.");
-                                    ControllerLookup[route].action.Invoke(request);
+                                    var profile = await kmProfile.GetProfileByPassword(password);
+                                    if (profile.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                                    {
+                                        ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested.");
+                                        ControllerLookup[route].action.Invoke(request);
+                                    }
+                                    else
+                                    {
+                                        ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have permission.");
+                                        DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                                    }
                                 }
                                 else
                                 {
-                                    ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have permission.");
-                                    DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                                    ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester has an incorrect password.");
+                                    DenyRequest(request, DeniedRequestReason.InvalidPassword);
                                 }
                             }
                             else
                             {
-                                ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester has an incorrect password.");
-                                DenyRequest(request, DeniedRequestReason.InvalidPassword);
+                                ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
+                                DenyRequest(request, DeniedRequestReason.NoProfile);
                             }
                         }
-                        else
-                        {
-                            ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
-                            DenyRequest(request, DeniedRequestReason.NoProfile);
-                        }
+                    }
+                    else
+                    {
+                        await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                     }
                 }
-                else
+                catch (InvalidOperationException ioe)
                 {
-                    await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
+
                 }
             }
         }
