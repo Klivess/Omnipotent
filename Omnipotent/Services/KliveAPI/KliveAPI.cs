@@ -99,6 +99,7 @@ namespace Omnipotent.Services.KliveAPI
 
         private void KliveAPI_ServiceQuitRequest()
         {
+            ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             listener.Stop();
         }
 
