@@ -118,6 +118,7 @@ namespace Omnipotent.Service_Manager
             try
             {
                 ServiceQuitRequest.Invoke();
+                Task.Delay(500).Wait();
                 serviceManager.logger.LogStatus(name, "Ending " + name + " service.");
                 ServiceActive = false;
                 serviceThread.Interrupt();
