@@ -23,6 +23,7 @@ namespace Omnipotent.Services.KliveAPI
     {
         public static int apiPORT = 7777;
         HttpListener listener = new HttpListener();
+        private bool ContinueListenLoop = true;
 
         public struct RouteInfo
         {
@@ -100,6 +101,7 @@ namespace Omnipotent.Services.KliveAPI
         private void KliveAPI_ServiceQuitRequest()
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
+            ContinueListenLoop = false;
             listener.Stop();
         }
 
@@ -135,7 +137,7 @@ namespace Omnipotent.Services.KliveAPI
 
         private async void ServerListenLoop()
         {
-            while (true && listener.IsListening)
+            while (ContinueListenLoop)
             {
                 HttpListenerContext context = listener.GetContext();
                 HttpListenerRequest req = context.Request;
