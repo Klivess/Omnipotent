@@ -23,7 +23,7 @@ namespace Omnipotent.Service_Manager
         public OmniServiceManager serviceManager;
         protected Stopwatch serviceUptime;
 
-        public event Action ServiceQuitRequest;
+        protected event Action ServiceQuitRequest;
 
         private bool ServiceActive;
         protected CancellationTokenSource cancellationToken;
@@ -61,6 +61,7 @@ namespace Omnipotent.Service_Manager
         }
         public void ServiceStart()
         {
+            ServiceQuitRequest = new Action(() => { });
             if (string.IsNullOrEmpty(name))
             {
                 name = "Deduced Service " + this.GetType().Name;
