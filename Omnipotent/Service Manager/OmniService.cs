@@ -23,6 +23,8 @@ namespace Omnipotent.Service_Manager
         public OmniServiceManager serviceManager;
         protected Stopwatch serviceUptime;
 
+        public event Action ServiceQuitRequest;
+
         private bool ServiceActive;
         protected CancellationTokenSource cancellationToken;
         public void ReplaceDataManager(OmniServiceManager manager)
@@ -114,6 +116,7 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
+                ServiceQuitRequest.Invoke();
                 serviceManager.logger.LogStatus(name, "Ending " + name + " service.");
                 ServiceActive = false;
                 serviceThread.Interrupt();

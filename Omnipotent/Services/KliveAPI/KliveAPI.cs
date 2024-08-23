@@ -81,6 +81,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener = new();
                 listener.Prefixes.Add($"https://+:{apiPORT}/");
 
+                ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
                 listener.Start();
 
@@ -94,6 +95,11 @@ namespace Omnipotent.Services.KliveAPI
             {
                 serviceManager.logger.LogError(name, ex, "KliveAPI Failed!");
             }
+        }
+
+        private void KliveAPI_ServiceQuitRequest()
+        {
+            listener.Stop();
         }
 
         private async Task CheckForSSLCertificate()
@@ -128,7 +134,7 @@ namespace Omnipotent.Services.KliveAPI
 
         private async void ServerListenLoop()
         {
-            while (true)
+            while (true && listener.IsListening)
             {
                 HttpListenerContext context = listener.GetContext();
                 HttpListenerRequest req = context.Request;
