@@ -22,6 +22,7 @@ namespace Omnipotent.Services.KliveAPI
     public class KliveAPI : OmniService
     {
         public static int apiPORT = 7777;
+        public static int apiHTTPPORT = 5000;
         HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
@@ -82,12 +83,13 @@ namespace Omnipotent.Services.KliveAPI
 
                 listener = new();
                 listener.Prefixes.Add($"https://+:{apiPORT}/");
+                listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
                 listener.Start();
 
-                ServiceLog($"Listening on port {apiPORT}...");
+                ServiceLog($"Listening on HTTPS port {apiPORT} and HTTP port {apiHTTPPORT}...");
 
                 ServerListenLoop();
                 //Create profile manager
