@@ -69,7 +69,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 buttons.Add("Continue", ButtonStyle.Primary);
                 buttons.Add("Cancel", ButtonStyle.Danger);
 
-                parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", "Retrying... Failed to get messages for " + user.Username + " in channel " + channelID + ". Exception: " + aex.Message);
+                parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", "Failed to get messages for " + user.Username + " in channel " + channelID + ". Exception: " + aex.Message);
                 var kliveResult = await parentInterface.manager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Retrying... Failed to get messages for " + user.Username + " in channel " + channelID,
                     $"Failed to get messages. Exception: {OmniLogging.FormatErrorMessage(aex)}\n\nJson: {responseString}", buttons, TimeSpan.FromDays(3));
                 if (kliveResult == "Continue")
