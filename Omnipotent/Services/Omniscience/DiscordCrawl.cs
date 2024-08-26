@@ -188,7 +188,6 @@ namespace Omnipotent.Services.Omniscience
             var result = Parallel.ForEach(files, (file) =>
             {
                 messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(serviceManager.GetDataHandler().ReadDataFromFile(file, true).Result));
-                Console.WriteLine(messages.Count);
             });
             while (!result.IsCompleted) { }
             Console.WriteLine($"Took {debug.Elapsed.TotalSeconds} seconds to load {messages.Count} messages. {debug.Elapsed.TotalSeconds / messages.Count} seconds per message");
