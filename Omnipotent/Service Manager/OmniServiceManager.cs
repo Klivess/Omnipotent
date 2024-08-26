@@ -66,12 +66,20 @@ namespace Omnipotent.Service_Manager
             timeManager.ReplaceDataManager(this);
             timeManager.ServiceStart();
         }
-        public void CreateAndStartNewMonitoredOmniService(OmniService service)
+        public bool CreateAndStartNewMonitoredOmniService(OmniService service, bool overrideDuplicatedServiceCheck = false)
         {
-            service.ReplaceDataManager(this);
-            service.ServiceStart();
-            activeServices.Add(service);
-            monitor.SetServiceToMonitor(service);
+            if (GetServiceByName(service.GetName()) == null || overrideDuplicatedServiceCheck == true)
+            {
+                service.ReplaceDataManager(this);
+                service.ServiceStart();
+                activeServices.Add(service);
+                monitor.SetServiceToMonitor(service);
+                return true;
+            }
+            else
+            {
+                return false;
+            }
         }
 
         public DataUtil GetDataHandler()

@@ -104,7 +104,6 @@ namespace Omnipotent.Services.KliveAPI
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             ContinueListenLoop = false;
-            getContextTask.Dispose();
             listener.Stop();
         }
 

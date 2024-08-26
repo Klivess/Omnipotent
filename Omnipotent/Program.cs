@@ -29,7 +29,6 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
 
                 Task.Delay(4000).Wait();
 
