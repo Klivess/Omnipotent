@@ -10,6 +10,7 @@ using System.Net;
 using System.Security;
 using System.Text.RegularExpressions;
 using static Omnipotent.Profiles.KMProfileManager;
+using static Omnipotent.Services.Omniscience.DiscordInterface.ChatInterface;
 using static Omnipotent.Services.Omniscience.DiscordInterface.DiscordInterface;
 
 namespace Omnipotent.Services.Omniscience
@@ -213,6 +214,24 @@ namespace Omnipotent.Services.Omniscience
             foreach (var file in files)
             {
                 guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
+            }
+            return guilds.ToArray();
+        }
+
+        public async Task SaveKnownDiscordDMChannel(OmniDMChannelLayout dmChannel)
+        {
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMChannelsDirectory), dmChannel.ChannelID + ".omnidmchannel");
+            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(dmChannel));
+        }
+
+        public async Task<OmniDMChannelLayout[]> GetAllKnownDiscordDMChannels()
+        {
+
+            List<OmniDMChannelLayout> guilds = new();
+            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory)).Where(k => Path.GetExtension(k) == ".omnidmchannel").ToList();
+            foreach (var file in files)
+            {
+                guilds.Add(JsonConvert.DeserializeObject<OmniDMChannelLayout>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
             }
             return guilds.ToArray();
         }

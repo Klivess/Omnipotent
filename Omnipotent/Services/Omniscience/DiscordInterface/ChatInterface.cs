@@ -304,13 +304,32 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return messages;
         }
-        public async Task<OmniDMChannelLayout[]> GetAllDMChannels(OmniDiscordUser user)
+        public async Task<OmniDMChannelLayout[]> GetAllDMChannels(OmniDiscordUser user, bool useCache = true)
         {
             var allAffinities = await GetAllAffinities(user);
             List<OmniDMChannelLayout> channels = new();
+            int loadedFromCache = 0;
             foreach (var item in allAffinities)
             {
-                channels.Add(await GetDMChannel(user, item.Key));
+                if (useCache == true)
+                {
+                    var savedChannels = await ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels();
+                    if (savedChannels.Select(k => k.RecipientOrOwnerID).Contains(item.Key))
+                    {
+                        channels.Add(savedChannels.Where(k => k.RecipientOrOwnerID == item.Key).First());
+                        loadedFromCache++;
+                    }
+                    else
+                    {
+                        var channel = await GetDMChannel(user, item.Key);
+                        ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(channel);
+                        channels.Add(channel);
+                    }
+                }
+                else
+                {
+                    channels.Add(await GetDMChannel(user, item.Key));
+                }
             }
             return channels.ToArray();
         }
@@ -338,6 +357,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     layout.LastMessageID = (long)channelData.last_message_id;
                 layout.ChannelType = ConvertChannelTypeToEnum((int)channelData.type);
                 layout.ChannelID = channelData.id;
+                layout.RecipientOrOwnerID = userID;
                 List<OmniDiscordUserInfo> recipients = new();
                 foreach (var recipient in channelData.recipients)
                 {
@@ -521,6 +541,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         }
         public struct OmniDMChannelLayout
         {
+            public long RecipientOrOwnerID;
             public long LastMessageID;
             public OmniChannelType ChannelType;
             public long ChannelID;
