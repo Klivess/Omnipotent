@@ -331,6 +331,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     channels.Add(await GetDMChannel(user, item.Key));
                 }
             }
+            parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", $"Loaded {channels.Count} DM channels, {loadedFromCache} from cache.");
             return channels.ToArray();
         }
         public async Task<OmniDMChannelLayout> GetDMChannel(OmniDiscordUser user, long userID)

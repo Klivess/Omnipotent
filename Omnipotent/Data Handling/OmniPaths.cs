@@ -29,8 +29,8 @@ namespace Omnipotent.Data_Handling
             public static string OmniDiscordVideoAttachmentsDirectory = $"{OmniscienceDirectory}/OmniMessageVideoAttachments";
             public static string OmniDiscordDMMessagesDirectory = $"{OmniscienceDirectory}/DMMessages";
             public static string OmniDiscordServerMessagesDirectory = $"{OmniscienceDirectory}/DiscordServerMessages";
-            public static string OmniDiscordGuildsDirectory = $"{OmniscienceDirectory}/DiscordGuilds";
-            public static string OmniDiscordDMChannelsDirectory = $"{OmniscienceDirectory}/DiscordGuilds";
+            public static string OmniDiscordGuildsDirectory = $"{OmniscienceDirectory}/KnownDiscordGuilds";
+            public static string OmniDiscordDMChannelsDirectory = $"{OmniscienceDirectory}/KnownDMChannels";
             public static string OmniDiscordKnownUsersDirectory = $"{OmniscienceDirectory}/KnownUsers";
 
             //Klives Management Profiles
