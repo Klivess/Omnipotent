@@ -59,8 +59,8 @@ namespace Omnipotent.Profiles
                 }
             };
 
-            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/CreateProfile", createProfile, KMPermissions.Admin);
-            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, KMPermissions.Anybody);
+            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/CreateProfile", createProfile, HttpMethod.Post, KMPermissions.Admin);
+            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, HttpMethod.Post, KMPermissions.Anybody);
         }
 
         public async Task RequestProfileFromKlives()

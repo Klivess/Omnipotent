@@ -78,12 +78,12 @@ namespace Omnipotent.Services.Omniscience
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             };
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/createOmniUser", createNewOmniUser, KMPermissions.Associate);
+            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/createOmniUser", createNewOmniUser, HttpMethod.Post, KMPermissions.Associate);
             Action<KliveAPI.KliveAPI.UserRequest> getMessageCount = async (request) =>
             {
                 await request.ReturnResponse(AllCapturedMessages.Count.ToString(), "application/json");
             };
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount, Profiles.KMProfileManager.KMPermissions.Anybody);
+            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
         }
 
         private OmniDiscordUser SelectUser(string username)
@@ -181,7 +181,7 @@ namespace Omnipotent.Services.Omniscience
             else
             {
                 //hopefully never gets called
-                AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;    
+                AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;
             }
             await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
         }
