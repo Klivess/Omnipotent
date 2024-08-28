@@ -171,8 +171,12 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                                 dynamic responseJson = JsonConvert.DeserializeObject(responseData);
                                 retryAfter = responseJson.retry_after;
                             }
+                            else
+                            {
+                                retryAfter = 0.5f;
+                            }
                             TimeSpan time = TimeSpan.FromSeconds(retryAfter) + TimeSpan.FromMilliseconds(10);
-                            manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
+                            //manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
                             await Task.Delay(time);
                             HttpRequestMessage newMessage = new();
                             newMessage.Content = message.Content;

@@ -301,15 +301,21 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             long? recentMessage = afterMessage;
             while (true)
             {
-                var result = await GetMessagesAsync(user, channelID, 100, afterMessageID: recentMessage);
-                if (result.Count == 0)
+                try
                 {
-                    break;
+                    var result = await GetMessagesAsync(user, channelID, 100, afterMessageID: recentMessage);
+                    if (result.Count == 0)
+                    {
+                        break;
+                    }
+                    messages = messages.Concat(result).ToList();
+                    if (messages.Count > 0)
+                    {
+                        recentMessage = messages[messages.Count - 1].MessageID;
+                    }
                 }
-                messages = messages.Concat(result).ToList();
-                if (messages.Count > 0)
+                catch(Exception ex)
                 {
-                    recentMessage = messages[messages.Count - 1].MessageID;
                 }
             }
             return messages;
