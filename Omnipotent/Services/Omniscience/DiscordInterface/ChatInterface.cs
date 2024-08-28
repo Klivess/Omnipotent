@@ -52,7 +52,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 if (response.IsSuccessStatusCode)
                 {
                     responseString = await response.Content.ReadAsStringAsync();
-                    if (string.IsNullOrEmpty(responseString) != true)
+                    if (OmniPaths.IsValidJson(responseString))
                     {
                         dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
                         foreach (var responseJson in responseJsonn)

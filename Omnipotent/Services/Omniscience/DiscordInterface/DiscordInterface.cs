@@ -136,21 +136,9 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         var content = await response.Content.ReadAsStringAsync();
                         try
                         {
-                            try
+                            if (OmniPaths.IsValidJson(content) == false)
                             {
-                                dynamic jsonned = JsonConvert.DeserializeObject(content);
-                            }
-                            catch (JsonReaderException jex)
-                            {
-                                HttpRequestMessage newMessage = new();
-                                newMessage.Content = message.Content;
-                                foreach (var header in message.Headers)
-                                {
-                                    newMessage.Headers.Add(header.Key, header.Value);
-                                }
-                                newMessage.RequestUri = message.RequestUri;
-                                newMessage.Method = message.Method;
-                                return await SendDiscordRequest(client, newMessage);
+                                throw new InvalidOperationException("Response is not valid JSON!");
                             }
                         }
                         catch (AggregateException ex)
