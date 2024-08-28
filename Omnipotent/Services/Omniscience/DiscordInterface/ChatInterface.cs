@@ -54,12 +54,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     responseString = await response.Content.ReadAsStringAsync();
                     if (string.IsNullOrEmpty(responseString) != true)
                     {
-
-                    }
-                    dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
-                    foreach (var responseJson in responseJsonn)
-                    {
-                        messages.Add(await ProcessMessageJSONObjectToOmniDiscordMessage(responseJson.ToString(), true));
+                        dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
+                        foreach (var responseJson in responseJsonn)
+                        {
+                            messages.Add(await ProcessMessageJSONObjectToOmniDiscordMessage(responseJson.ToString(), true));
+                        }
                     }
                 }
                 else

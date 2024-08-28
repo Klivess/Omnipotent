@@ -174,11 +174,16 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveDiscordMessage(OmniDiscordUser user, OmniDiscordMessage message)
         {
             string path = Path.Combine(user.CreateDMDirectoryPathString(), message.MessageID + ".omnimessage");
-            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
-            if (!AllCapturedMessages.Where(k => k.MessageID == message.MessageID).Any())
+            if (!File.Exists(path))
             {
                 AllCapturedMessages.Add(message);
             }
+            else
+            {
+                //hopefully never gets called
+                AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;    
+            }
+            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
         }
         public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
         {
