@@ -47,7 +47,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 HttpRequestMessage httpMessage = new();
                 httpMessage.RequestUri = new Uri(messageEndpoint);
                 httpMessage.Method = HttpMethod.Get;
-                var response = await parentInterface.SendDiscordRequest(client, httpMessage);
+                var response = await parentInterface.SendDiscordRequest(client, httpMessage, false);
                 List<OmniDiscordMessage> messages = new();
                 if (response.IsSuccessStatusCode)
                 {
