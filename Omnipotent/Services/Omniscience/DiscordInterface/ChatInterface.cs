@@ -47,7 +47,16 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 HttpRequestMessage httpMessage = new();
                 httpMessage.RequestUri = new Uri(messageEndpoint);
                 httpMessage.Method = HttpMethod.Get;
-                var response = await parentInterface.SendDiscordRequest(client, httpMessage, false);
+                HttpResponseMessage response = new();
+                try
+                {
+                    response = await parentInterface.SendDiscordRequest(client, httpMessage, false);
+                }
+                catch (Exception ENDME)
+                {
+                    ErrorInformation errorInformation = new(ENDME);
+                    Console.WriteLine(errorInformation.FullFormattedMessage);
+                }
                 List<OmniDiscordMessage> messages = new();
                 if (response.IsSuccessStatusCode)
                 {
@@ -69,7 +78,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             catch (Exception aex)
             {
-                parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", "Failed to get messages for " + user.Username + " in channel " + channelID + ". Exception: " + aex.Message);
+                ErrorInformation errorinfo = new(aex);
+                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", aex, "Failed to get messages for " + user.Username + " in channel " + channelID + ".");
                 return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
 
             }
@@ -306,6 +316,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         }
         public async Task<OmniDMChannelLayout[]> GetAllDMChannels(OmniDiscordUser user, bool useCache = true)
         {
+            Directory.CreateDirectory(user.CreateKnownDMChannelsDirectoryPathString());
             var allAffinities = await GetAllAffinities(user);
             List<OmniDMChannelLayout> channels = new();
             int loadedFromCache = 0;
@@ -313,16 +324,17 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 if (useCache == true)
                 {
-                    var savedChannels = await ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels();
+                    var savedChannels = await ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels(user);
                     if (savedChannels.Select(k => k.RecipientOrOwnerID).Contains(item.Key))
                     {
-                        channels.Add(savedChannels.Where(k => k.RecipientOrOwnerID == item.Key).First());
+                        var channel = savedChannels.Where(k => k.RecipientOrOwnerID == item.Key).ToArray()[0];
+                        channels.Add(channel);
                         loadedFromCache++;
                     }
                     else
                     {
                         var channel = await GetDMChannel(user, item.Key);
-                        ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(channel);
+                        ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(user, channel);
                         channels.Add(channel);
                     }
                 }

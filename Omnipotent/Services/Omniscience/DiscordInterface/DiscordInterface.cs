@@ -18,6 +18,7 @@ using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Web.Helpers;
+using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Services.Omniscience.DiscordInterface
@@ -131,7 +132,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 var response = await client.SendAsync(message);
                 if (response.IsSuccessStatusCode)
                 {
-                    if (checkIfJsonParseable)
+                    if (true == false)
                     {
                         var content = await response.Content.ReadAsStringAsync();
                         try
@@ -161,21 +162,33 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     //If ratelimited
                     if (response.StatusCode == HttpStatusCode.TooManyRequests)
                     {
-                        string responseData = await response.Content.ReadAsStringAsync();
-                        dynamic responseJson = JsonConvert.DeserializeObject(responseData);
-                        float retryAfter = responseJson.retry_after;
-                        TimeSpan time = TimeSpan.FromSeconds(retryAfter) + TimeSpan.FromMilliseconds(10);
-                        manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
-                        await Task.Delay(time);
-                        HttpRequestMessage newMessage = new();
-                        newMessage.Content = message.Content;
-                        foreach (var header in message.Headers)
+                        try
                         {
-                            newMessage.Headers.Add(header.Key, header.Value);
+                            string responseData = await response.Content.ReadAsStringAsync();
+                            float retryAfter = 4;
+                            if (OmniPaths.IsValidJson(responseData))
+                            {
+                                dynamic responseJson = JsonConvert.DeserializeObject(responseData);
+                                retryAfter = responseJson.retry_after;
+                            }
+                            TimeSpan time = TimeSpan.FromSeconds(retryAfter) + TimeSpan.FromMilliseconds(10);
+                            manager.logger.LogStatus("Omniscience: Discord Interface", $"Client has been ratelimited, retrying in {time.TotalSeconds}");
+                            await Task.Delay(time);
+                            HttpRequestMessage newMessage = new();
+                            newMessage.Content = message.Content;
+                            foreach (var header in message.Headers)
+                            {
+                                newMessage.Headers.Add(header.Key, header.Value);
+                            }
+                            newMessage.RequestUri = message.RequestUri;
+                            newMessage.Method = message.Method;
+                            return await SendDiscordRequest(client, newMessage, checkIfJsonParseable);
                         }
-                        newMessage.RequestUri = message.RequestUri;
-                        newMessage.Method = message.Method;
-                        return await SendDiscordRequest(client, newMessage);
+                        catch (Exception ex)
+                        {
+                            ErrorInformation errorInformation = new(ex);
+                            throw new Exception($"Discord request failed! Reason: {errorInformation.FullFormattedMessage}");
+                        }
                     }
                     else
                     {
@@ -461,9 +474,19 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 return $"{Username}-{UserID}";
             }
+            public string GetDirectoryPath()
+            {
+                string pathOfUserDirectory = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordUsersDirectory), FormatDirectoryName());
+                return pathOfUserDirectory;
+            }
             public string CreateDMDirectoryPathString()
             {
                 string DMDirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMMessagesDirectory), $"user{UserID}");
+                return DMDirectoryPath;
+            }
+            public string CreateKnownDMChannelsDirectoryPathString()
+            {
+                string DMDirectoryPath = Path.Combine(GetDirectoryPath(), "KnownDMChannels");
                 return DMDirectoryPath;
             }
             public string CreateDMPath()

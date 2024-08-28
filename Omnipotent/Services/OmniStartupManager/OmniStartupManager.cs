@@ -61,6 +61,7 @@ namespace Omnipotent.Services.OmniStartupManager
                     if (Directory.Exists(OmniPaths.GetPath(dir)) == false)
                     {
                         Directory.CreateDirectory(dir);
+                        directoriesCreated++;
                     }
                 }
                 //Now, make prereq files
@@ -69,6 +70,7 @@ namespace Omnipotent.Services.OmniStartupManager
                     if (File.Exists(OmniPaths.GetPath(file)) == false)
                     {
                         File.Create(file);
+                        filesCreated++;
                     }
                 }
             }
@@ -79,7 +81,7 @@ namespace Omnipotent.Services.OmniStartupManager
 
             if (directoriesCreated > 0 || filesCreated > 0)
             {
-                serviceManager.logger.LogStatus(this.name, $"Prerequisites process complete: {directoriesCreated} directories created, {filesCreated} files created.");
+                ServiceLog($"Prerequisites process complete: {directoriesCreated} directories created, {filesCreated} files created.");
             }
 
             //When ALL startup tasks are done.

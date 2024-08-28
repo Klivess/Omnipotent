@@ -181,8 +181,12 @@ namespace Omnipotent.Services.Omniscience
             }
             else
             {
-                //hopefully never gets called
-                AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;
+                //BEWARE!!! THIS WILL RESTART THE ENTIRE FUNCTION!! MODIFY THIS FUNCTION WITH THIS IN MIND!
+                try
+                {
+                    AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;
+                }
+                catch (ArgumentOutOfRangeException) { await SaveDiscordMessage(user, message); }
             }
             await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
         }
@@ -218,17 +222,17 @@ namespace Omnipotent.Services.Omniscience
             return guilds.ToArray();
         }
 
-        public async Task SaveKnownDiscordDMChannel(OmniDMChannelLayout dmChannel)
+        public async Task SaveKnownDiscordDMChannel(OmniDiscordUser user, OmniDMChannelLayout dmChannel)
         {
-            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordDMChannelsDirectory), dmChannel.ChannelID + ".omnidmchannel");
+            string path = Path.Combine(OmniPaths.GetPath(user.CreateKnownDMChannelsDirectoryPathString()), dmChannel.ChannelID + ".omnidmchannel");
             await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(dmChannel));
         }
 
-        public async Task<OmniDMChannelLayout[]> GetAllKnownDiscordDMChannels()
+        public async Task<OmniDMChannelLayout[]> GetAllKnownDiscordDMChannels(OmniDiscordUser user)
         {
 
             List<OmniDMChannelLayout> guilds = new();
-            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory)).Where(k => Path.GetExtension(k) == ".omnidmchannel").ToList();
+            var files = Directory.GetFiles(user.CreateKnownDMChannelsDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnidmchannel").ToList();
             foreach (var file in files)
             {
                 guilds.Add(JsonConvert.DeserializeObject<OmniDMChannelLayout>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
