@@ -1,5 +1,8 @@
-﻿using Omnipotent.Service_Manager;
+﻿using Microsoft.ML.Data;
+using Omnipotent.Data_Handling;
+using Omnipotent.Service_Manager;
 using System;
+using System.CodeDom;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -7,6 +10,7 @@ using System.Net;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
+using static Omnipotent.Logging.OmniLogging;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Logging
@@ -16,18 +20,23 @@ namespace Omnipotent.Logging
         public enum LogType
         {
             Status,
-            Error
+            Error,
+            Update
         }
 
         public struct LoggedMessage
         {
+            public string logID;
             public LogType type;
             public string serviceName;
             public string message;
+            public string oldMessage;
             public ErrorInformation? errorInfo;
+            public int position;
         }
 
         Queue<LoggedMessage> loggedMessages = new();
+        List<LoggedMessage> messages = new();
 
         public OmniLogging()
         {
@@ -74,9 +83,17 @@ namespace Omnipotent.Logging
                 {
                     WriteError(message);
                 }
+                else if (message.type == LogType.Update)
+                {
+                    WriteUpdate(message);
+                }
             }
+
             //Replace this with proper waiting
-            while (loggedMessages.Any() == false) { await Task.Delay(100); }
+            while (loggedMessages.Any() == false)
+            {
+                await Task.Delay(100);
+            }
             //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
             GC.Collect();
             BeginLogLoop();
@@ -89,7 +106,6 @@ namespace Omnipotent.Logging
             var line = frame.GetFileLineNumber();
             return line;
         }
-
         public static string GetMethodOfException(Exception ex)
         {
 #pragma warning disable CS8602 // Dereference of a possibly null reference.
@@ -98,7 +114,7 @@ namespace Omnipotent.Logging
             return methodFullName;
         }
 
-        public void LogStatus(string serviceName, string message)
+        public LoggedMessage LogStatus(string serviceName, string message)
         {
             try
             {
@@ -106,45 +122,88 @@ namespace Omnipotent.Logging
                 log.serviceName = serviceName;
                 log.message = message;
                 log.type = LogType.Status;
+                log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
                 loggedMessages.Enqueue(log);
+                return log;
             }
             catch (ArgumentException ex)
             {
-                LogStatus(serviceName, message);
+                return LogStatus(serviceName, message);
             }
         }
 
-        public void LogError(string serviceName, Exception ex, string specialMessage = "")
+        public LoggedMessage LogError(string serviceName, Exception ex, string specialMessage = "")
         {
             LoggedMessage log = new();
             log.serviceName = serviceName;
             log.message = specialMessage;
             log.type = LogType.Error;
             log.errorInfo = new ErrorInformation(ex);
+            log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             loggedMessages.Enqueue(log);
+            return log;
         }
 
-        public void LogError(string serviceName, string error)
+        public void UpdateLogMessage(LoggedMessage loggedmessage, string newMessage)
+        {
+            loggedmessage.oldMessage = loggedmessage.message;
+            loggedmessage.message = newMessage;
+            loggedmessage.type = LogType.Update;
+            loggedMessages.Enqueue(loggedmessage);
+        }
+
+        public LoggedMessage LogError(string serviceName, string error)
         {
             LoggedMessage log = new();
             log.serviceName = serviceName;
             log.message = error;
             log.type = LogType.Error;
             log.errorInfo = null;
+            log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             loggedMessages.Enqueue(log);
+            return log;
         }
 
-        private async void WriteStatus(LoggedMessage message)
+        private async void WriteStatus(LoggedMessage message, int? position = null)
         {
+            if (position != null)
+            {
+                Console.SetCursorPosition(0, position.Value);
+            }
             Console.ForegroundColor = ConsoleColor.Blue;
             Console.Write($"{message.serviceName}");
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($" | {message.message}");
             Console.ForegroundColor = ConsoleColor.White;
+            message.position = messages.Count + 1;
+            messages.Add(message);
         }
 
-        private async void WriteError(LoggedMessage message)
+        private async void WriteUpdate(LoggedMessage message)
         {
+            try
+            {
+                var pos = messages.Find(k => k.logID == message.logID).position + 2;
+                //duct tape solution fix before developing omnilogging
+                if (message.errorInfo == null)
+                {
+                    WriteStatus(message, pos);
+                }
+                else
+                {
+                    WriteError(message, pos);
+                }
+                Console.SetCursorPosition(0, messages.Count + 1);
+            }
+            catch (Exception) { }
+        }
+
+        private async void WriteError(LoggedMessage message, int? position = null)
+        {
+            if (position != null)
+            {
+                Console.SetCursorPosition(0, position.Value);
+            }
             Console.ForegroundColor = ConsoleColor.Blue;
             Console.Write($"{message.serviceName}");
             Console.ForegroundColor = ConsoleColor.Red;
@@ -161,6 +220,8 @@ namespace Omnipotent.Logging
                 Console.WriteLine($" | Error: {message.errorInfo.Value.FullFormattedMessage}");
             }
             Console.ForegroundColor = ConsoleColor.White;
+            message.position = messages.Count + 1;
+            messages.Add(message);
         }
 
 

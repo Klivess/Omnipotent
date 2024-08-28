@@ -115,8 +115,8 @@ namespace Omnipotent.Services.Omniscience
                 List<OmniDiscordMessage> newMessages = new();
                 if (messageDivision.Any())
                 {
-                    oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
-                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
+                    oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
+                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
                     //Save only messages that are not already saved
                     serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
@@ -132,7 +132,7 @@ namespace Omnipotent.Services.Omniscience
                 }
                 else
                 {
-                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID).Result;
+                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID).Result;
                     //Save only messages that are not already saved
                     serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())

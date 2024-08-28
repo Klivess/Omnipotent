@@ -44,6 +44,7 @@ namespace Omnipotent
                         new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
                 });
 
+
                 //Main thread keep-alive very hacky probably wont cause problems hopefully probably
                 Task.Delay(-1).Wait();
             }
