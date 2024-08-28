@@ -140,12 +140,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             {
                                 dynamic jsonned = JsonConvert.DeserializeObject(content);
                             }
-                            catch (Exception jex)
+                            catch (JsonReaderException jex)
                             {
-                                manager.logger.LogError("Omniscience: Discord Interface", jex, "Couldn't parse JSON from Discord request!");
-                                var buttons = new Dictionary<string, ButtonStyle>();
-                                buttons.Add("Retry", ButtonStyle.Primary);
-                                await manager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Discord Request Failed!!", $"Couldn't parse JSON from Discord request! Reason: {jex.Message}\n\nJson: {content}", buttons, TimeSpan.FromDays(5));
                                 HttpRequestMessage newMessage = new();
                                 newMessage.Content = message.Content;
                                 foreach (var header in message.Headers)

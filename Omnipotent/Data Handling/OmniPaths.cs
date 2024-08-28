@@ -46,7 +46,8 @@ namespace Omnipotent.Data_Handling
 
         public static bool CheckIfOnServer()
         {
-            return Environment.GetEnvironmentVariable("server") == "server";
+            return true;
+            //return Environment.GetEnvironmentVariable("server") == "server";
         }
 
     }

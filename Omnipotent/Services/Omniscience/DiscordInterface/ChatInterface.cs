@@ -29,6 +29,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
 
         public async Task<List<OmniDiscordMessage>> GetMessagesAsync(OmniDiscordUser user, long channelID, int limit = 50, bool AutomaticallyDownloadAttachment = true, long? beforeMessageID = null, long? afterMessageID = null)
         {
+            string processID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
             string responseString = "";
             try
             {
@@ -51,6 +52,10 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 if (response.IsSuccessStatusCode)
                 {
                     responseString = await response.Content.ReadAsStringAsync();
+                    if (string.IsNullOrEmpty(responseString) != true)
+                    {
+
+                    }
                     dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
                     foreach (var responseJson in responseJsonn)
                     {
@@ -65,21 +70,9 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             catch (Exception aex)
             {
-                Dictionary<string, ButtonStyle> buttons = new();
-                buttons.Add("Continue", ButtonStyle.Primary);
-                buttons.Add("Cancel", ButtonStyle.Danger);
-
                 parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", "Failed to get messages for " + user.Username + " in channel " + channelID + ". Exception: " + aex.Message);
-                var kliveResult = await parentInterface.manager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Retrying... Failed to get messages for " + user.Username + " in channel " + channelID,
-                    $"Failed to get messages. Exception: {OmniLogging.FormatErrorMessage(aex)}\n\nJson: {responseString}", buttons, TimeSpan.FromDays(3));
-                if (kliveResult == "Continue")
-                {
-                    return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
-                }
-                else
-                {
-                    throw new Exception("Failed to get messages for " + user.Username + " in channel " + channelID + ". Exception: " + aex.Message);
-                }
+                return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
+
             }
         }
 

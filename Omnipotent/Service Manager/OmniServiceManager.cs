@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Services.KliveAPI;
+using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.OmniStartupManager;
 using ProtoBuf;
@@ -117,6 +118,10 @@ namespace Omnipotent.Service_Manager
         public KliveAPI GetKliveAPIService()
         {
             return (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+        }
+        public KliveBotDiscord GetKliveBotDiscordService()
+        {
+            return (KliveBotDiscord)(GetServiceByClassType<KliveBotDiscord>()[0]);
         }
 
         public NotificationsService GetNotificationsService()
