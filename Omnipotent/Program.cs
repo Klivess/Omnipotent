@@ -1,5 +1,6 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
+using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Profiles;
@@ -19,6 +20,7 @@ namespace Omnipotent
     {
         public static void Main(string[] args)
         {
+            OmniLogging.LogStatusStatic("Main Thread", $"Omnipotent last updated {File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe")).Humanize()}");
             OmniServiceManager omniServiceManager = new OmniServiceManager();
             try
             {
@@ -34,7 +36,6 @@ namespace Omnipotent
                 {
                     ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
                 }
-
                 //Error Handlers
                 AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
                 {
