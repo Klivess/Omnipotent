@@ -77,15 +77,15 @@ namespace Omnipotent.Logging
                 var message = loggedMessages.Dequeue();
                 if (message.type == LogType.Status)
                 {
-                    WriteStatus(message);
+                    await WriteStatus(message);
                 }
                 else if (message.type == LogType.Error)
                 {
-                    WriteError(message);
+                    await WriteError(message);
                 }
                 else if (message.type == LogType.Update)
                 {
-                    WriteUpdate(message);
+                    await WriteUpdate(message);
                 }
             }
 
@@ -164,10 +164,12 @@ namespace Omnipotent.Logging
             return log;
         }
 
-        private async void WriteStatus(LoggedMessage message, int? position = null)
+        private async Task WriteStatus(LoggedMessage message, int? position = null)
         {
             if (position != null)
             {
+                Console.SetCursorPosition(0, position.Value);
+                Console.WriteLine(new string(' ', message.message.Length + 50));
                 Console.SetCursorPosition(0, position.Value);
             }
             Console.ForegroundColor = ConsoleColor.Blue;
@@ -175,11 +177,14 @@ namespace Omnipotent.Logging
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($" | {message.message}");
             Console.ForegroundColor = ConsoleColor.White;
-            message.position = messages.Count + 1;
-            messages.Add(message);
+            if (position == null)
+            {
+                message.position = messages.Count + 1;
+                messages.Add(message);
+            }
         }
 
-        private async void WriteUpdate(LoggedMessage message)
+        private async Task WriteUpdate(LoggedMessage message)
         {
             try
             {
@@ -187,22 +192,26 @@ namespace Omnipotent.Logging
                 //duct tape solution fix before developing omnilogging
                 if (message.errorInfo == null)
                 {
-                    WriteStatus(message, pos);
+                    await WriteStatus(message, pos).WaitAsync(TimeSpan.FromSeconds(10));
                 }
                 else
                 {
-                    WriteError(message, pos);
+                    await WriteError(message, pos).WaitAsync(TimeSpan.FromSeconds(10));
                 }
                 Console.SetCursorPosition(0, messages.Count + 1);
             }
             catch (Exception) { }
         }
 
-        private async void WriteError(LoggedMessage message, int? position = null)
+        private async Task WriteError(LoggedMessage message, int? position = null)
         {
             if (position != null)
             {
                 Console.SetCursorPosition(0, position.Value);
+                for (global::System.Int32 i = 0; i < message.oldMessage.Length - 1; i++)
+                {
+                    Console.Write(" ");
+                }
             }
             Console.ForegroundColor = ConsoleColor.Blue;
             Console.Write($"{message.serviceName}");
@@ -220,8 +229,11 @@ namespace Omnipotent.Logging
                 Console.WriteLine($" | Error: {message.errorInfo.Value.FullFormattedMessage}");
             }
             Console.ForegroundColor = ConsoleColor.White;
-            message.position = messages.Count + 1;
-            messages.Add(message);
+            if (position == null)
+            {
+                message.position = messages.Count + 1;
+                messages.Add(message);
+            }
         }
 
 

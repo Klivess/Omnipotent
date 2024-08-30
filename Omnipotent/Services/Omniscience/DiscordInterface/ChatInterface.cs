@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc.Diagnostics;
 using Microsoft.AspNetCore.Mvc.Formatters.Xml;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.CSharp.RuntimeBinder;
+using Microsoft.ML.Trainers;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
@@ -314,7 +315,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         recentMessage = messages[messages.Count - 1].MessageID;
                     }
                 }
-                catch(Exception ex)
+                catch (Exception ex)
                 {
                 }
             }
@@ -324,6 +325,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             Directory.CreateDirectory(user.CreateKnownDMChannelsDirectoryPathString());
             var allAffinities = await GetAllAffinities(user);
+            var progressLog = parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", $"Loading hopefully {allAffinities.Count} DM channels - Progress: 0%");
             List<OmniDMChannelLayout> channels = new();
             int loadedFromCache = 0;
             foreach (var item in allAffinities)
@@ -348,6 +350,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                     channels.Add(await GetDMChannel(user, item.Key));
                 }
+                float countchan = channels.Count;
+                float countaff = allAffinities.Count;
+                float div = countchan / countaff;
+                float percentage = div * 100;
+                parentInterface.manager.logger.UpdateLogMessage(progressLog, $"Loading hopefully {allAffinities.Count} DM channels - Progress: {percentage}%");
             }
             parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", $"Loaded {channels.Count} DM channels, {loadedFromCache} from cache.");
             return channels.ToArray();
