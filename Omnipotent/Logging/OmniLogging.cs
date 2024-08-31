@@ -1,4 +1,5 @@
 ﻿using Microsoft.ML.Data;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System;
@@ -68,6 +69,18 @@ namespace Omnipotent.Logging
         protected override void ServiceMain()
         {
             BeginLogLoop();
+            SetupRoutes();
+        }
+
+        private async Task SetupRoutes()
+        {
+            Action<UserRequest> getLogs = async (req) =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(messages), "application/json");
+            };
+
+
+            await serviceManager.GetKliveAPIService().CreateRoute("api/logs", getLogs, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Admin);
         }
 
         private async Task BeginLogLoop()

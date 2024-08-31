@@ -101,7 +101,7 @@ namespace Omnipotent.Services.Omniscience
             //Download all new messages from channels
             serviceManager.logger.LogStatus("Omniscience", $"Updating messages from discord account: {item.Username}");
             //Scan all DM Channels
-            var allDMs = await discordInterface.ChatInterface.GetAllDMChannels(item);
+            var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item)).Reverse().ToArray();
             Stopwatch stopwatch = Stopwatch.StartNew();
             int newMessagesCount = 0;
             foreach (var dmchannel in allDMs)
@@ -115,19 +115,25 @@ namespace Omnipotent.Services.Omniscience
                 List<OmniDiscordMessage> newMessages = new();
                 if (messageDivision.Any())
                 {
-                    oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
-                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
+                    oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
+                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
                     //Save only messages that are not already saved
-                    serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                    var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
+                    var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
+                    var saveDMProgress = serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
-                        SaveDiscordMessage(item, message).Wait();
+                        await SaveDiscordMessage(item, message);
                         messagesCount++;
+                        float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
+                        this.serviceManager.logger.UpdateLogMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
                     }
                     foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
-                        SaveDiscordMessage(item, message).Wait();
+                        await SaveDiscordMessage(item, message);
                         messagesCount++;
+                        float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
+                        this.serviceManager.logger.UpdateLogMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
                     }
                 }
                 else
@@ -171,20 +177,16 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveDiscordMessage(OmniDiscordUser user, OmniDiscordMessage message)
         {
             string path = Path.Combine(user.CreateDMDirectoryPathString(), message.MessageID + ".omnimessage");
-            if (!File.Exists(path))
+            if (string.IsNullOrEmpty(message.MessageID.ToString()))
+            {
+                ServiceLogError($"Message from '{message.AuthorUsername}': Message ID is null, cannot save message.");
+                return;
+            }
+            if (!AllCapturedMessages.Select(k => k.MessageID).Contains(message.MessageID))
             {
                 AllCapturedMessages.Add(message);
+                await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
             }
-            else
-            {
-                //BEWARE!!! THIS WILL RESTART THE ENTIRE FUNCTION!! MODIFY THIS FUNCTION WITH THIS IN MIND!
-                try
-                {
-                    AllCapturedMessages[AllCapturedMessages.FindIndex(k => k.MessageID == message.MessageID)] = message;
-                }
-                catch (ArgumentOutOfRangeException) { await SaveDiscordMessage(user, message); }
-            }
-            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
         }
         public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
         {

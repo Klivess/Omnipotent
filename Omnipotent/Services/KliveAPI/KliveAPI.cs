@@ -23,7 +23,7 @@ namespace Omnipotent.Services.KliveAPI
     {
         public static int apiPORT = 7777;
         public static int apiHTTPPORT = 5000;
-        HttpListener listener = new HttpListener();
+        public HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
 
@@ -39,9 +39,16 @@ namespace Omnipotent.Services.KliveAPI
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
             public string userMessageContent;
-            public async Task ReturnResponse(string response, string contentType = "text/plain", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
+            public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
                 HttpListenerResponse resp = context.Response;
+                if (contentType == "application/json")
+                {
+                    if (OmniPaths.IsValidJson(response) != true)
+                    {
+                        response = JsonConvert.SerializeObject(response);
+                    }
+                }
                 resp.Headers.Set("Content-Type", contentType);
                 if (headers != null)
                 {
@@ -132,7 +139,12 @@ namespace Omnipotent.Services.KliveAPI
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
         public async Task CreateRoute(string route, Action<UserRequest> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
-            while (!listener.IsListening) { }
+            while (!listener.IsListening) { Task.Delay(10).Wait(); }
+            if (!route.StartsWith('/'))
+            {
+                //Add a / to the beginning of the route if it doesn't have one
+                route = "/" + route;
+            }
             RouteInfo routeInfo = new();
             routeInfo.action = handler;
             routeInfo.authenticationLevelRequired = authenticationLevelRequired;
@@ -189,12 +201,12 @@ namespace Omnipotent.Services.KliveAPI
                                         var profile = await kmProfile.GetProfileByPassword(password);
                                         if (profile.KlivesManagementRank >= routeData.authenticationLevelRequired)
                                         {
-                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested.");
+                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
                                             ControllerLookup[route].action.Invoke(request);
                                         }
                                         else
                                         {
-                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have permission.");
+                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
                                             DenyRequest(request, DeniedRequestReason.TooLowClearance);
                                         }
                                     }

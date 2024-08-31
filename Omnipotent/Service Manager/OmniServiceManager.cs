@@ -117,7 +117,10 @@ namespace Omnipotent.Service_Manager
 
         public KliveAPI GetKliveAPIService()
         {
-            return (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+
+            var service = (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+            while (service.listener.IsListening != true) { Task.Delay(100).Wait(); }
+            return service;
         }
         public KliveBotDiscord GetKliveBotDiscordService()
         {

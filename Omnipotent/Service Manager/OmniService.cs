@@ -45,6 +45,20 @@ namespace Omnipotent.Service_Manager
             return serviceManager.logger.LogStatus(name, message);
         }
 
+        public LoggedMessage ServiceLogError(string error)
+        {
+            return serviceManager.logger.LogError(name, error);
+        }
+        public LoggedMessage ServiceLogError(Exception error, string specialMessage = "")
+        {
+            return serviceManager.logger.LogError(name, error, specialMessage);
+        }
+
+        public void ServiceUpdateLoggedMessage(LoggedMessage message, string newMessage)
+        {
+            serviceManager.logger.UpdateLogMessage(message, newMessage);
+        }
+
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.
         public OmniService(string name, ThreadAnteriority anteriority)
         {
