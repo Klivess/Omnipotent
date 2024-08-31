@@ -29,7 +29,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 string tokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveBotDiscordTokenText);
-                string token = await serviceManager.GetDataHandler().ReadDataFromFile(tokenPath, true);
+                string token = await GetDataHandler().ReadDataFromFile(tokenPath, true);
                 DiscordConfiguration connectionConfig = new DiscordConfiguration()
                 {
                     Token = token,
@@ -58,7 +58,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
             catch (Exception ex)
             {
-                serviceManager.logger.LogError(name, ex, "Discord Bot Crashed!");
+                ServiceLogError(ex, "Discord Bot Crashed!");
                 TerminateService();
             }
         }

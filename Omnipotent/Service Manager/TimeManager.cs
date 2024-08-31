@@ -101,7 +101,7 @@ namespace Omnipotent.Service_Manager
             tasks.Add(task);
             SaveTaskToFile(task);
             //Log task creation
-            serviceManager.logger.LogStatus(name, $"New task made: {task.taskName} - '{task.reason}'");
+            ServiceLog($"New task made: {task.taskName} - '{task.reason}'");
         }
 
         private string FormFilePathWithTask(ScheduledTask task)
@@ -114,7 +114,7 @@ namespace Omnipotent.Service_Manager
         private async void SaveTaskToFile(ScheduledTask task)
         {
             string path = FormFilePathWithTask(task);
-            await serviceManager.GetDataHandler().SerialiseObjectToFile(path, task);
+            await GetDataHandler().SerialiseObjectToFile(path, task);
         }
 
         public async Task<List<ScheduledTask>> GetAllUpcomingTasksFromDisk()
@@ -126,12 +126,12 @@ namespace Omnipotent.Service_Manager
             {
                 try
                 {
-                    ScheduledTask task = await serviceManager.GetDataHandler().ReadAndDeserialiseDataFromFile<ScheduledTask>(item);
+                    ScheduledTask task = await GetDataHandler().ReadAndDeserialiseDataFromFile<ScheduledTask>(item);
                     tasks.Add(task);
                 }
                 catch (Exception ex)
                 {
-                    serviceManager.logger.LogError(name, ex, "Couldn't deserialise/read task.");
+                    ServiceLogError(ex, "Couldn't deserialise/read task.");
                 }
             }
             return tasks;

@@ -80,12 +80,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             catch (Exception aex)
             {
                 ErrorInformation errorinfo = new(aex);
-                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", aex, "Failed to get messages for " + user.Username + " in channel " + channelID + ".");
+                parentInterface.parent.ServiceLogError(aex, "Failed to get messages for " + user.Username + " in channel " + channelID + ".");
                 return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
 
             }
         }
-
         public async Task<OmniDiscordMessage> ProcessMessageJSONObjectToOmniDiscordMessage(string messageText, bool isinDM, bool AutomaticallyDownloadAttachment = true)
         {
             WebClient wc = new();
@@ -131,7 +130,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             }
                             catch (Exception ex)
                             {
-                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download image attachment {image.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                                parentInterface.parent.ServiceLogError(ex, $"Failed to download image attachment {image.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
                             }
                         }
                         imageAttachments.Add(image);
@@ -166,7 +165,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             }
                             catch (Exception ex)
                             {
-                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download audio attachment {voiceMessage.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                                parentInterface.parent.ServiceLogError(ex, $"Failed to download audio attachment {voiceMessage.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
                             }
                         }
                         voiceAttachments.Add(voiceMessage);
@@ -194,7 +193,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             }
                             catch (Exception ex)
                             {
-                                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to download video attachment {video.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
+                                parentInterface.parent.ServiceLogError(ex, $"Failed to download video attachment {video.Filename} from {message.AuthorUsername} in channel {message.PostedInChannelID}");
                             }
                         }
                         videoAttachments.Add(video);
@@ -325,14 +324,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             Directory.CreateDirectory(user.CreateKnownDMChannelsDirectoryPathString());
             var allAffinities = await GetAllAffinities(user);
-            var progressLog = parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", $"Loading hopefully {allAffinities.Count} DM channels - Progress: 0%");
+            var progressLog = parentInterface.parent.ServiceLog($"Loading hopefully {allAffinities.Count} DM channels - Progress: 0%");
             List<OmniDMChannelLayout> channels = new();
             int loadedFromCache = 0;
             foreach (var item in allAffinities)
             {
                 if (useCache == true)
                 {
-                    var savedChannels = await ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels(user);
+                    var savedChannels = await ((DiscordCrawl)parentInterface.parent.serviceManager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels(user);
                     if (savedChannels.Select(k => k.RecipientOrOwnerID).Contains(item.Key))
                     {
                         var channel = savedChannels.Where(k => k.RecipientOrOwnerID == item.Key).ToArray()[0];
@@ -342,7 +341,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     else
                     {
                         var channel = await GetDMChannel(user, item.Key);
-                        ((DiscordCrawl)parentInterface.manager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(user, channel);
+                        ((DiscordCrawl)parentInterface.parent.serviceManager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(user, channel);
                         channels.Add(channel);
                     }
                 }
@@ -354,9 +353,9 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 float countaff = allAffinities.Count;
                 float div = countchan / countaff;
                 float percentage = div * 100;
-                parentInterface.manager.logger.UpdateLogMessage(progressLog, $"Loading hopefully {allAffinities.Count} DM channels - Progress: {percentage}%");
+                parentInterface.parent.ServiceUpdateLoggedMessage(progressLog, $"Loading hopefully {allAffinities.Count} DM channels - Progress: {percentage}%");
             }
-            parentInterface.manager.logger.LogStatus("DiscordInterface: ChatInterface", $"Loaded {channels.Count} DM channels, {loadedFromCache} from cache.");
+            parentInterface.parent.ServiceLog($"Loaded {channels.Count} DM channels, {loadedFromCache} from cache.");
             return channels.ToArray();
         }
         public async Task<OmniDMChannelLayout> GetDMChannel(OmniDiscordUser user, long userID)
@@ -400,7 +399,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         }
         public async Task<OmniDiscordUserInfo> GetUser(OmniDiscordUser user, long userID)
         {
-
             string messageEndpoint = $"https://discord.com/api/v9/users/{userID}";
             var client = DiscordInterface.DiscordHttpClient(user);
             HttpRequestMessage httpMessage = new();
@@ -487,7 +485,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             catch (Exception ex)
             {
-                parentInterface.manager.logger.LogError("DiscordInterface: ChatInterface", ex, $"Failed to message {userIDOfUserToMessage} from {user.GlobalName}");
+                parentInterface.parent.ServiceLogError(ex, $"Failed to message {userIDOfUserToMessage} from {user.GlobalName}");
                 return false;
             }
         }
@@ -532,7 +530,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             return guilds.ToArray();
         }
-
         public enum OmniChannelType
         {
             GuildText = 0,

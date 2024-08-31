@@ -143,6 +143,11 @@ namespace Omnipotent.Data_Handling
                         fileOperations.Enqueue(task);
                     }
                 }
+                else
+                {
+                    ServiceLogError("File path is null for task: " + task.ID);
+                    task.result.SetResult("Failed");
+                }
             }
             //Replace this with proper waiting
             while (fileOperations.Any() == false) { Task.Delay(10).Wait(); }
