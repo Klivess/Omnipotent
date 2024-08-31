@@ -48,15 +48,15 @@ namespace Omnipotent.Services.OmniStartupManager
                             files.Add(path);
                         }
                     }
-                    catch(Exception ex)
+                    catch (Exception ex)
                     {
-                        serviceManager.logger.LogError(name, ex, "Couldn't translate prerequisite file: " + path);
+                        ServiceLogError(ex, "Couldn't translate prerequisite file: " + path);
                     }
                 }
                 //Loop over directories first, make directories first
                 //Make sure top-level directories are made first, sorta ducttape
                 directories = directories.OrderBy(k => k.Length).ToList();
-                foreach(string dir in directories)
+                foreach (string dir in directories)
                 {
                     if (Directory.Exists(OmniPaths.GetPath(dir)) == false)
                     {
@@ -65,7 +65,7 @@ namespace Omnipotent.Services.OmniStartupManager
                     }
                 }
                 //Now, make prereq files
-                foreach(string file in files)
+                foreach (string file in files)
                 {
                     if (File.Exists(OmniPaths.GetPath(file)) == false)
                     {
@@ -74,9 +74,9 @@ namespace Omnipotent.Services.OmniStartupManager
                     }
                 }
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
-                serviceManager.logger.LogError(name, ex, "Couldn't create prerequisites.");
+                ServiceLogError(ex, "Couldn't create prerequisites.");
             }
 
             if (directoriesCreated > 0 || filesCreated > 0)

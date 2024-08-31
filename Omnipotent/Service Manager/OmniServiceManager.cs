@@ -35,10 +35,10 @@ namespace Omnipotent.Service_Manager
     public class OmniServiceManager
     {
         public List<OmniService> activeServices;
-        protected DataUtil fileHandlerService;
+        public DataUtil fileHandlerService;
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
-        public OmniLogging logger;
+        protected OmniLogging logger;
         public OmniServiceManager()
         {
             //Initialise in order of priority
@@ -82,24 +82,23 @@ namespace Omnipotent.Service_Manager
                 return false;
             }
         }
-
-        public DataUtil GetDataHandler()
+        public ref OmniLogging GetLogger()
         {
-            while (fileHandlerService.IsServiceActive() == false) { Task.Delay(100); }
-            return fileHandlerService;
+            while (logger.IsServiceActive() == false) { Task.Delay(100).Wait(); }
+            return ref logger;
         }
         public OmniService GetServiceByID(string id)
         {
             try
             {
-                var services = activeServices.Where(k => k.serviceID == id);
-                return services.ElementAt(0);
+                var services = activeServices.Where(k => k.serviceID == id).First();
+                return services;
             }
             catch (Exception ex)
             {
                 logger.LogError("Omni Service Manager", ex, "Couldn't get OmniService by ID");
+                throw new Exception("Couldn't get OmniService by ID");
             }
-            return null;
         }
         public OmniService[] GetServiceByClassType<T>()
         {
@@ -180,7 +179,7 @@ namespace Omnipotent.Service_Manager
             }
             catch (Exception ex)
             {
-                serviceManager.logger.LogError("Omni Service Monitor", ex, "Error setting service to monitor.");
+                ServiceLogError(ex, "Error setting service to monitor.");
             }
         }
         public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored { get { return monitoredThreads; } }

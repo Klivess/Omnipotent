@@ -22,11 +22,11 @@ namespace Omnipotent.Services.TestService
             {
                 try
                 {
-                    serviceManager.GetDataHandler().WriteToFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "test2.txt"), RandomGeneration.GenerateRandomLengthOfNumbers(10));
+                    await GetDataHandler().WriteToFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "test2.txt"), RandomGeneration.GenerateRandomLengthOfNumbers(10));
                 }
                 catch (Exception ex)
                 {
-                    serviceManager.logger.LogStatus(name, "Exception: " + ex.Message);
+                    ServiceLog("Exception: " + ex.Message);
                 }
             }
         }

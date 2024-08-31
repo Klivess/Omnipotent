@@ -26,15 +26,15 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
     public class DiscordInterface
     {
         public const string discordURI = "https://discord.com/api/v9/";
-        public OmniServiceManager manager;
+        public OmniService parent;
         public List<OmniDiscordUser> LinkedDiscordAccounts;
         public ChatInterface ChatInterface;
 
         public event Action<OmniDiscordUser> NewOmniDiscordUserAdded;
 
-        public DiscordInterface(OmniServiceManager manager)
+        public DiscordInterface(OmniService parentService)
         {
-            this.manager = manager;
+            this.parent = parentService;
             LinkedDiscordAccounts = GetAllLinkedOmniDiscordUsersFromDisk().Result.ToList();
 
             ChatInterface = new ChatInterface(this);
@@ -68,7 +68,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             catch (Exception ex)
             {
-                manager.logger.LogError("Discord Interface Utility", "Couldn't load " + discordID + " on demand!");
+                parent.ServiceLogError("Couldn't load " + discordID + " on demand!");
                 return null;
             }
         }
@@ -81,18 +81,18 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 var file = Directory.GetFiles(directory).Where(k => Path.GetExtension(k) == $".omnidiscuser");
                 if (file.Any())
                 {
-                    OmniDiscordUser user = await manager.GetDataHandler().ReadAndDeserialiseDataFromFile<OmniDiscordUser>(file.ToArray()[0]);
+                    OmniDiscordUser user = await parent.GetDataHandler().ReadAndDeserialiseDataFromFile<OmniDiscordUser>(file.ToArray()[0]);
                     Directory.CreateDirectory(user.CreateDMDirectoryPathString());
                     users.Add(user);
                 }
             }
             return users.ToArray();
         }
-        private async Task<string> TryAndRetrieve2FAFromKlives(OmniDiscordUser user, OmniServiceManager manager)
+        private async Task<string> TryAndRetrieve2FAFromKlives(OmniDiscordUser user)
         {
             try
             {
-                string twofa = await manager.GetNotificationsService().SendTextPromptToKlivesDiscord("Require 2fa to login to OmniDiscordUser!",
+                string twofa = await parent.serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Require 2fa to login to OmniDiscordUser!",
     $"Trying to login to\n\nEmail: {user.Email}\nPassword: Length {user.Password.Length}\n\nBut I require a 2fa code. Please provide the code, or reject this request.",
     TimeSpan.FromDays(3), $"Enter 2FA here for {user.GlobalName}!", "2FA here.");
                 return twofa;
@@ -202,7 +202,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             }
             catch (InvalidOperationException ex)
             {
-                manager.logger.LogStatus("Omniscience: Discord Interface", "Discord request failed! Reason: " + ex.Message);
+                parent.ServiceLog("Discord request failed! Reason: " + ex.Message);
                 HttpRequestMessage newMessage = new();
                 newMessage.Content = message.Content;
                 foreach (var header in message.Headers)
@@ -222,14 +222,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 string pathOfUserDataFile = Path.Combine(pathOfUserDirectory, user.FormatFileName());
                 if (!Directory.Exists(pathOfUserDirectory))
                 {
-                    await manager.GetDataHandler().CreateDirectory(pathOfUserDirectory);
+                    await parent.GetDataHandler().CreateDirectory(pathOfUserDirectory);
                 }
                 string serialisedData = JsonConvert.SerializeObject(user);
-                await manager.GetDataHandler().WriteToFile(pathOfUserDataFile, serialisedData);
+                await parent.GetDataHandler().WriteToFile(pathOfUserDataFile, serialisedData);
             }
             catch (Exception ex)
             {
-                manager.logger.LogError("Discord Interface Utility", ex, "Error saving omnidiscorduser!");
+                parent.ServiceLogError(ex, "Error saving omnidiscorduser!");
             }
         }
         public async Task<bool> VerifyTokenWorks(OmniDiscordUser user)
@@ -318,7 +318,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         }
                         user.AvatarFilePath = avatarPath;
                     }
-                    catch (Exception ex) { manager.logger.LogError("Discord Interface Utility", $"Couldn't get avatar for {user.Username}, " + ex.Message); }
+                    catch (Exception ex) { parent.ServiceLogError($"Couldn't get avatar for {user.Username}, " + ex.Message); }
                     await SaveOmniDiscordUser(user);
                     UpdateLinkedDiscordAccounts(user);
                     return user;
@@ -352,13 +352,13 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             OmniDiscordUser user = new();
 
-            var klivebotDiscord = ((KliveBotDiscord)manager.GetServiceByClassType<KliveBotDiscord>()[0]);
+            var klivebotDiscord = ((KliveBotDiscord)parent.serviceManager.GetServiceByClassType<KliveBotDiscord>()[0]);
             var accounts = await GetAllLinkedOmniDiscordUsersFromDisk();
             if (accounts.Any())
             {
                 if (accounts.Where(k => k.Email == email).Any())
                 {
-                    manager.logger.LogStatus("Discord Interface Utility", "Trying set up account for user, but account already exists. Returning existing account.");
+                    parent.ServiceLog("Trying set up account for user, but account already exists. Returning existing account.");
                     var account = accounts.Where(k => k.Email == email).ToArray()[0];
                     user = account;
                     return await GetAccountInfo(user);
@@ -394,10 +394,10 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 if (responseDeserialised.mfa == true && responseDeserialised.mfa != null)
                 {
                     string ticket = responseDeserialised.ticket;
-                    string twoFA = await TryAndRetrieve2FAFromKlives(user, manager);
+                    string twoFA = await TryAndRetrieve2FAFromKlives(user);
                     if (twoFA != null && twoFA != string.Empty)
                     {
-                        manager.logger.LogStatus("Discord Interface Utility", "2FA Received by Klives: " + twoFA);
+                        parent.ServiceLog("2FA Received by Klives: " + twoFA);
                         var twofadata = new JObject();
                         twofadata.Add("code", twoFA);
                         twofadata.Add("gift_code_sku_id", null);
@@ -413,22 +413,22 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         {
                             dynamic response2Deserialised = JsonConvert.DeserializeObject(await response2.Content.ReadAsStringAsync());
                             user.Token = response2Deserialised.token;
-                            manager.logger.LogStatus("Discord Interface Utility", $"Logged into OmniDiscordAccount {user.Email}.");
+                            parent.ServiceLog($"Logged into OmniDiscordAccount {user.Email}.");
                             user = await GetAccountInfo(user);
-                            manager.logger.LogStatus("Discord Interface Utility", $"Acquired account info from {user.Email}: {user.GlobalName}.");
+                            parent.ServiceLog($"Acquired account info from {user.Email}: {user.GlobalName}.");
                             NewOmniDiscordUserAdded.Invoke(user);
                             return user;
                         }
                         else
                         {
-                            manager.logger.LogError("Discord Interface Utility", "Couldn't login for account as 2FA failed. Reason: " + response2.ReasonPhrase);
+                            parent.ServiceLog("Couldn't login for account as 2FA failed. Reason: " + response2.ReasonPhrase);
                             await klivebotDiscord.SendMessageToKlives($"Couldn't login into OmniDiscordAccount ({user.Email}) with 2FA! Reason: " + response2.ReasonPhrase);
                             return null;
                         }
                     }
                     else
                     {
-                        manager.logger.LogError("Discord Interface Utility", "Couldn't login for account as Klives declined the 2fa.");
+                        parent.ServiceLog("Couldn't login for account as Klives declined the 2fa.");
                         await klivebotDiscord.SendMessageToKlives($"Couldn't login into OmniDiscordAccount ({user.Email}) as you cancelled it.");
                         return null;
                     }
@@ -437,14 +437,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                     user.Token = responseDeserialised.token;
                     user.UserID = responseDeserialised.user_id;
-                    manager.logger.LogStatus("Discord Interface Utility", $"Logged into OmniDiscordAccount {user.Email}.");
+                    parent.ServiceLog($"Logged into OmniDiscordAccount {user.Email}.");
                     user = await GetAccountInfo(user);
                     return user;
                 }
             }
             else
             {
-                manager.logger.LogError("Discord Interface Utility", "Couldn't login for account with email: " + email);
+                parent.ServiceLog("Couldn't login for account with email: " + email);
                 await klivebotDiscord.SendMessageToKlives($"Couldn't login into OmniDiscordAccount ({user.Email}) at all! Reason: " + response.ReasonPhrase);
                 return null;
             }

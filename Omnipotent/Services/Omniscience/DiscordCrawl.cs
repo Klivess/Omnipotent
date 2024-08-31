@@ -29,14 +29,14 @@ namespace Omnipotent.Services.Omniscience
 
         protected override async void ServiceMain()
         {
-            discordInterface = new(serviceManager);
-            serviceManager.logger.LogStatus("Omniscience", "Starting Discord Crawl.");
+            discordInterface = new(this);
+            ServiceLog("Starting Discord Crawl.");
             LinkedUsers = (await discordInterface.GetAllLinkedOmniDiscordUsersFromDisk()).ToList();
-            serviceManager.logger.LogStatus("Omniscience", $"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
+            ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
             Stopwatch time = Stopwatch.StartNew();
             await LoadAllMessagesFromDisk(LinkedUsers.ToArray());
             time.Stop();
-            serviceManager.logger.LogStatus("Omniscience", $"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
+            ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
             if (OmniPaths.CheckIfOnServer())
             {
                 UpdateDiscordMessageDatabase();
@@ -99,7 +99,7 @@ namespace Omnipotent.Services.Omniscience
                 Directory.CreateDirectory(item.CreateDMDirectoryPathString());
             }
             //Download all new messages from channels
-            serviceManager.logger.LogStatus("Omniscience", $"Updating messages from discord account: {item.Username}");
+            ServiceLog($"Updating messages from discord account: {item.Username}");
             //Scan all DM Channels
             var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item)).Reverse().ToArray();
             Stopwatch stopwatch = Stopwatch.StartNew();
@@ -108,7 +108,7 @@ namespace Omnipotent.Services.Omniscience
             {
                 Stopwatch individualDMStopwatch = Stopwatch.StartNew();
                 int messagesCount = 0;
-                serviceManager.logger.LogStatus("Omniscience", $"Scanning DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                ServiceLog($"Scanning DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                 var messageDivision = AllCapturedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
                 //Recursively download backwards from the last message
                 List<OmniDiscordMessage> oldmessages = new();
@@ -120,27 +120,27 @@ namespace Omnipotent.Services.Omniscience
                     //Save only messages that are not already saved
                     var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
                     var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                    var saveDMProgress = serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
+                    var saveDMProgress = ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         await SaveDiscordMessage(item, message);
                         messagesCount++;
                         float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                        this.serviceManager.logger.UpdateLogMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
+                        ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
                     }
                     foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         await SaveDiscordMessage(item, message);
                         messagesCount++;
                         float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                        this.serviceManager.logger.UpdateLogMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
+                        ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
                     }
                 }
                 else
                 {
                     newMessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID).Result;
                     //Save only messages that are not already saved
-                    serviceManager.logger.LogStatus("Omniscience", $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                    ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         SaveDiscordMessage(item, message).Wait();
@@ -149,14 +149,14 @@ namespace Omnipotent.Services.Omniscience
                 }
                 newMessagesCount += messagesCount;
                 individualDMStopwatch.Stop();
-                serviceManager.logger.LogStatus("Omniscience", $"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
+                ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
             };
             stopwatch.Stop();
-            serviceManager.logger.LogStatus("Omniscience", $"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
+            ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
         }
         public async Task UpdateDiscordMessageDatabase()
         {
-            serviceManager.logger.LogStatus("Omniscience", "Updating Discord Message Database.");
+            ServiceLog("Updating Discord Message Database.");
             foreach (var item in LinkedUsers)
             {
                 await UpdateIndividualUserMessageDatabase(item);
@@ -185,7 +185,7 @@ namespace Omnipotent.Services.Omniscience
             if (!AllCapturedMessages.Select(k => k.MessageID).Contains(message.MessageID))
             {
                 AllCapturedMessages.Add(message);
-                await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
+                await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
             }
         }
         public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
@@ -193,11 +193,17 @@ namespace Omnipotent.Services.Omniscience
             Stopwatch debug = Stopwatch.StartNew();
             List<OmniDiscordMessage> messages = new();
             var files = Directory.GetFiles(user.CreateDMDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
-            var result = Parallel.ForEach(files, (file) =>
+            var cancellationTokenSource = new CancellationTokenSource();
+            var token = cancellationTokenSource.Token;
+            ParallelOptions parallelOptions = new()
             {
-                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(serviceManager.GetDataHandler().ReadDataFromFile(file, true).Result));
+                MaxDegreeOfParallelism = 10
+            };
+            var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
+            {
+                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(GetDataHandler().ReadDataFromFile(file, true).Result));
             });
-            while (!result.IsCompleted) { }
+            await result;
             Console.WriteLine($"Took {debug.Elapsed.TotalSeconds} seconds to load {messages.Count} messages. {debug.Elapsed.TotalSeconds / messages.Count} seconds per message");
             return messages;
         }
@@ -205,7 +211,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveDiscordGuild(OmniDiscordGuild guild)
         {
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory), guild.GuildID + ".omniguild");
-            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(guild));
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(guild));
         }
 
         public async Task<OmniDiscordGuild[]> GetAllDownloadedGuilds()
@@ -215,7 +221,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordGuildsDirectory)).Where(k => Path.GetExtension(k) == ".omniguild").ToList();
             foreach (var file in files)
             {
-                guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
+                guilds.Add(JsonConvert.DeserializeObject<OmniDiscordGuild>(await GetDataHandler().ReadDataFromFile(file)));
             }
             return guilds.ToArray();
         }
@@ -223,7 +229,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveKnownDiscordDMChannel(OmniDiscordUser user, OmniDMChannelLayout dmChannel)
         {
             string path = Path.Combine(OmniPaths.GetPath(user.CreateKnownDMChannelsDirectoryPathString()), dmChannel.ChannelID + ".omnidmchannel");
-            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(dmChannel));
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(dmChannel));
         }
 
         public async Task<OmniDMChannelLayout[]> GetAllKnownDiscordDMChannels(OmniDiscordUser user)
@@ -233,7 +239,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(user.CreateKnownDMChannelsDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnidmchannel").ToList();
             foreach (var file in files)
             {
-                guilds.Add(JsonConvert.DeserializeObject<OmniDMChannelLayout>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
+                guilds.Add(JsonConvert.DeserializeObject<OmniDMChannelLayout>(await GetDataHandler().ReadDataFromFile(file)));
             }
             return guilds.ToArray();
         }
@@ -241,7 +247,7 @@ namespace Omnipotent.Services.Omniscience
         public async Task SaveKnownDiscordUser(OmniDiscordUserInfo user)
         {
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory), user.Username + ".omniuserinfo");
-            await serviceManager.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(user));
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(user));
         }
 
         public async Task<OmniDiscordUserInfo[]> GetAllDownloadedKnownUsers()
@@ -251,7 +257,7 @@ namespace Omnipotent.Services.Omniscience
             var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordKnownUsersDirectory)).Where(k => Path.GetExtension(k) == ".omniuserinfo").ToList();
             foreach (var file in files)
             {
-                users.Add(JsonConvert.DeserializeObject<OmniDiscordUserInfo>(await serviceManager.GetDataHandler().ReadDataFromFile(file)));
+                users.Add(JsonConvert.DeserializeObject<OmniDiscordUserInfo>(await GetDataHandler().ReadDataFromFile(file)));
             }
             return users.ToArray();
         }
