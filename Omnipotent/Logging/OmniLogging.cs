@@ -4,6 +4,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System;
 using System.CodeDom;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -36,7 +37,7 @@ namespace Omnipotent.Logging
             public int position;
         }
 
-        Queue<LoggedMessage> loggedMessages = new();
+        SynchronizedCollection<LoggedMessage> loggedMessages = new();
         List<LoggedMessage> messages = new();
 
         public OmniLogging()
@@ -87,7 +88,8 @@ namespace Omnipotent.Logging
         {
             if (loggedMessages.Any())
             {
-                var message = loggedMessages.Dequeue();
+                var message = loggedMessages.Last();
+                loggedMessages.Remove(loggedMessages.Last());
                 if (message.type == LogType.Status)
                 {
                     await WriteStatus(message);
@@ -136,7 +138,7 @@ namespace Omnipotent.Logging
                 log.message = message;
                 log.type = LogType.Status;
                 log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-                loggedMessages.Enqueue(log);
+                loggedMessages.Add(log);
                 return log;
             }
             catch (ArgumentException ex)
@@ -153,7 +155,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = new ErrorInformation(ex);
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-            loggedMessages.Enqueue(log);
+            loggedMessages.Add(log);
             return log;
         }
 
@@ -162,7 +164,7 @@ namespace Omnipotent.Logging
             loggedmessage.oldMessage = loggedmessage.message;
             loggedmessage.message = newMessage;
             loggedmessage.type = LogType.Update;
-            loggedMessages.Enqueue(loggedmessage);
+            loggedMessages.Add(loggedmessage);
         }
 
         public LoggedMessage LogError(string serviceName, string error)
@@ -173,7 +175,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = null;
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-            loggedMessages.Enqueue(log);
+            loggedMessages.Add(log);
             return log;
         }
 

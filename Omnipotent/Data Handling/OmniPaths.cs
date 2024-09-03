@@ -21,6 +21,9 @@ namespace Omnipotent.Data_Handling
             public static string KliveBotDiscordTokenText = $"{SavedDataDirectory}/KliveBotDiscordToken.txt";
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
 
+            //Downloads
+            public static string TempDownloadsDirectory = $"TempDownloads";
+
             //Omniscience
             public static string OmniscienceDirectory = $"{SavedDataDirectory}/Omniscience";
             public static string OmniDiscordUsersDirectory = $"{OmniscienceDirectory}/OmniDiscordUsers";
@@ -38,6 +41,11 @@ namespace Omnipotent.Data_Handling
 
             //KliveAPI
             public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
+
+            //KliveLocalLLM
+            public static string KliveLocalLLMDirectory = $"{SavedDataDirectory}/KliveLocalLLM";
+            public static string KliveLocalLLMModelsDirectory = $"{KliveLocalLLMDirectory}/LLMModels";
+
 
         };
 

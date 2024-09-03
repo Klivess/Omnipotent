@@ -5,6 +5,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.OmniStartupManager;
 using ProtoBuf;
@@ -86,6 +87,16 @@ namespace Omnipotent.Service_Manager
         {
             while (logger.IsServiceActive() == false) { Task.Delay(100).Wait(); }
             return ref logger;
+        }
+        public ref TimeManager GetTimeManager()
+        {
+            while (timeManager.IsServiceActive() == false) { Task.Delay(100).Wait(); }
+            return ref timeManager;
+        }
+
+        public KliveLocalLLM GetKliveLocalLLMService()
+        {
+            return (KliveLocalLLM)(GetServiceByClassType<KliveLocalLLM>()[0]);
         }
         public OmniService GetServiceByID(string id)
         {

@@ -7,6 +7,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
@@ -29,6 +30,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
 
                 Task.Delay(4000).Wait();
 
@@ -44,7 +46,11 @@ namespace Omnipotent
                         new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
                 });
 
-
+                var session = omniServiceManager.GetKliveLocalLLMService().CreateSession();
+                Console.WriteLine("Session created. Engaging test.");
+                var response = omniServiceManager.GetKliveLocalLLMService().SendMessageToSession(session, "bruh");
+                Console.WriteLine("Test: " + response.Result);
+                Console.WriteLine("Test complete.");
                 //Main thread keep-alive very hacky probably wont cause problems hopefully probably
                 Task.Delay(-1).Wait();
             }

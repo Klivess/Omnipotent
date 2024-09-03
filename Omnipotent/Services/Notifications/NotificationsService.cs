@@ -1,5 +1,6 @@
 ﻿using DSharpPlus;
 using DSharpPlus.Entities;
+using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
@@ -27,6 +28,12 @@ namespace Omnipotent.Services.Notifications
 
         protected override async void ServiceMain()
         {
+            var datetime = DateTime.Now.AddMinutes(0.25);
+            await CreateScheduledTimeTask(datetime, "testschedule", "just to test my scheduler!!", false, async () =>
+            {
+                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"Datetime difference: {(DateTime.Now - datetime).ToString()}");
+            });
+
             //Acquire KliveBot Discord Service
             var search = (serviceManager.GetServiceByClassType<KliveBotDiscord>());
             if (!search.Any())

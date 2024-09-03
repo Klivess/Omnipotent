@@ -55,6 +55,10 @@ namespace Omnipotent.Service_Manager
         {
             serviceManager.GetLogger().UpdateLogMessage(message, newMessage);
         }
+        public async Task CreateScheduledTimeTask(DateTime duedateTime, string taskname, string reason = "", bool important = true, Action embeddedAction = null)
+        {
+            serviceManager.GetTimeManager().CreateNewScheduledTask(duedateTime, taskname, name, serviceID, reason, important, embeddedAction);
+        }
         public ref DataUtil GetDataHandler()
         {
             while (serviceManager.fileHandlerService.IsServiceActive() == false) { Task.Delay(100); }

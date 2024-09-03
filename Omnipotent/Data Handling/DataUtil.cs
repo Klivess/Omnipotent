@@ -34,7 +34,7 @@ namespace Omnipotent.Data_Handling
             public ReadWrite operation;
         }
 
-        Queue<FileOperation> fileOperations = new Queue<FileOperation>();
+        SynchronizedCollection<FileOperation> fileOperations = new SynchronizedCollection<FileOperation>();
 
         private FileOperation CreateNewOperation(string path, ReadWrite operation, string content = null)
         {
@@ -46,7 +46,7 @@ namespace Omnipotent.Data_Handling
                 fileOperation.operation = operation;
                 fileOperation.ID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
                 fileOperation.result = new TaskCompletionSource<string>();
-                fileOperations.Enqueue(fileOperation);
+                fileOperations.Add(fileOperation);
                 return fileOperation;
             }
             catch (ArgumentException ex)
@@ -110,7 +110,8 @@ namespace Omnipotent.Data_Handling
         {
             if (fileOperations.Any())
             {
-                var task = fileOperations.Dequeue();
+                var task = fileOperations.Last();
+                fileOperations.Remove(task);
                 if (task.path != null)
                 {
                     try
@@ -140,7 +141,7 @@ namespace Omnipotent.Data_Handling
                     }
                     catch (IOException exception)
                     {
-                        fileOperations.Enqueue(task);
+                        fileOperations.Add(task);
                     }
                 }
                 else
