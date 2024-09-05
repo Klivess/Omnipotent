@@ -9,5 +9,10 @@ namespace Omnipotent.Service_Manager
             Process.Start("Omnipotent.exe");
             Environment.Exit(-1);
         }
+        public static void QuitBot()
+        {
+            Process.Start("Omnipotent.exe");
+            Environment.Exit(0);
+        }
     }
 }

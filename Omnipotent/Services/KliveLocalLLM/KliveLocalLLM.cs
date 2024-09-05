@@ -1,4 +1,5 @@
-﻿using LLama;
+﻿using DSharpPlus;
+using LLama;
 using LLama.Abstractions;
 using LLama.Common;
 using LLama.Native;
@@ -79,29 +80,56 @@ namespace Omnipotent.Services.KliveLocalLLM
         {
             if (!File.Exists(modelFilePath))
             {
-                var logged = ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
-                WebClient webClient = new WebClient();
-                int progressPercentage = 0;
-                var message = await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");
-                webClient.DownloadProgressChanged += (sender, e) =>
+                try
                 {
-                    if ((e.ProgressPercentage - progressPercentage) >= 1)
+                    var logged = ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
+                    WebClient webClient = new WebClient();
+                    int progressPercentage = 0;
+                    var message = await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");
+                    webClient.DownloadProgressChanged += (sender, e) =>
                     {
-                        progressPercentage = e.ProgressPercentage;
-                        ServiceUpdateLoggedMessage(logged, $"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
-                        message.ModifyAsync($"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
-                    }
-                };
-                webClient.DownloadFileCompleted += (sender, e) =>
+                        if ((e.ProgressPercentage - progressPercentage) >= 1)
+                        {
+                            progressPercentage = e.ProgressPercentage;
+                            ServiceUpdateLoggedMessage(logged, $"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
+                            message.ModifyAsync($"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
+                        }
+                    };
+                    webClient.DownloadFileCompleted += (sender, e) =>
+                    {
+                        ServiceUpdateLoggedMessage(logged, $"Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                    };
+                    string tempFile = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.TempDownloadsDirectory), Path.GetFileName(modelFilePath));
+                    await webClient.DownloadFileTaskAsync(new Uri(modelDownloadURL), tempFile);
+                    File.Copy(tempFile, modelFilePath);
+                    File.Delete(tempFile);
+                    await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                    ServiceLog("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                }
+                catch (Exception ex)
                 {
-                    ServiceUpdateLoggedMessage(logged, $"Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
-                };
-                string tempFile = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.TempDownloadsDirectory), Path.GetFileName(modelFilePath));
-                await webClient.DownloadFileTaskAsync(new Uri(modelDownloadURL), tempFile);
-                File.Copy(tempFile, modelFilePath);
-                File.Delete(tempFile);
-                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
-                ServiceLog("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                    ServiceLogError(ex, "Failed to download prerequisite LLM LLama model for KliveLocalLLM. Sending notification to Klives on what to do.");
+                    Dictionary<string, ButtonStyle> data = new Dictionary<string, ButtonStyle>
+                    {
+                        { "Retry", ButtonStyle.Primary },
+                        { "Quit", ButtonStyle.Danger}
+                    };
+                    ErrorInformation errorInformation = new ErrorInformation(ex);
+                    var response = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Failed to download prerequisite LLM LLama model for KliveLocalLLM.",
+                        errorInformation.FullFormattedMessage + "\n\nWould you like to retry or to quit Omnipotent?", data, TimeSpan.FromDays(3));
+                    if (response == "Retry")
+                    {
+                        ServiceLog("Klives requested to retry downloading the prerequisite LLM LLama model for KliveLocalLLM.");
+                        CheckPrerequisiteModels();
+                    }
+                    else if (response == "Quit")
+                    {
+                        ServiceLog("Klives requested to quit the application.");
+                        await Task.Delay(2000);
+                        ExistentialBotUtilities.QuitBot();
+                    }
+                }
+
             }
         }
         private async Task LoadLLamaModel()
