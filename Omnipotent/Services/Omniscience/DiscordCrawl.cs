@@ -44,6 +44,7 @@ namespace Omnipotent.Services.Omniscience
             foreach (var item in LinkedUsers)
             {
                 item.websocketInterface = new(this, item);
+                await item.websocketInterface.BeginInitialisation();
                 var response = await discordInterface.ChatInterface.GetAllUserGuilds(item);
                 foreach (var guild in response)
                 {

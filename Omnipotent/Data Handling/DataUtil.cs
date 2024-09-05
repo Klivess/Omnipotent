@@ -34,7 +34,7 @@ namespace Omnipotent.Data_Handling
             public ReadWrite operation;
         }
 
-        SynchronizedCollection<FileOperation> fileOperations = new SynchronizedCollection<FileOperation>();
+        SynchronizedCollection<FileOperation> fileOperations = new();
 
         private FileOperation CreateNewOperation(string path, ReadWrite operation, string content = null)
         {
@@ -57,7 +57,7 @@ namespace Omnipotent.Data_Handling
 
         public async Task WriteToFile(string path, string content, bool requeueIfFailed = true)
         {
-            CreateNewOperation(path, ReadWrite.Write, content).result.Task.Wait();
+            await CreateNewOperation(path, ReadWrite.Write, content).result.Task;
         }
 
         public async Task CreateDirectory(string path, bool requeueIfFailed = true)

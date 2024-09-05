@@ -26,6 +26,7 @@ namespace Omnipotent.Service_Manager
             public bool isImportant;
             public string timeID;
             public string randomidentifier;
+            [JsonIgnore]
             public Action embeddedFunction;
 
             public TimeSpan GetTimespanRemaining()
@@ -107,14 +108,14 @@ namespace Omnipotent.Service_Manager
         private string FormFilePathWithTask(ScheduledTask task)
         {
             string directoryPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.TimeManagementTasksDirectory);
-            string fileName = $"{task.taskName}{task.timeID}.{TaskFileExtension}";
+            string fileName = $"{task.taskName}.{TaskFileExtension}";
             return Path.Combine(directoryPath, fileName);
         }
 
         private async void SaveTaskToFile(ScheduledTask task)
         {
             string path = FormFilePathWithTask(task);
-            await GetDataHandler().SerialiseObjectToFile(path, task);
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(task));
         }
 
         public async Task<List<ScheduledTask>> GetAllUpcomingTasksFromDisk()

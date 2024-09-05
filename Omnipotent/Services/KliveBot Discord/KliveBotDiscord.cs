@@ -76,8 +76,6 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (args.Channel.IsPrivate && args.Author.Id != KlivesMember.Id && args.Author.Id != Client.CurrentUser.Id)
             {
-
-
                 await SendMessageToKlives(MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
                     $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange));
             }

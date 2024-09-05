@@ -1,4 +1,6 @@
 ﻿using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
+using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
@@ -18,9 +20,12 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         DiscordCrawl parentService;
         OmniDiscordUser parentUser;
         private string gatewayURL;
+        private KliveLocalLLM.KliveLocalLLM.KliveLLMSession chatbotSession;
         private Websocket.Client.WebsocketClient WS;
         private CancellationTokenSource CTS;
         ManualResetEvent exitEvent = new ManualResetEvent(false);
+
+
 
         private string lastHeartbeatAck = null;
         private float heartbeatInterval = 0;
@@ -41,6 +46,10 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             var responseString = await response.Content.ReadAsStringAsync();
             dynamic responseJson = JsonConvert.DeserializeObject(responseString);
             gatewayURL = responseJson.url;
+
+            //Create chatbot session
+            chatbotSession = parentService.serviceManager.GetKliveLocalLLMService().CreateSession();
+
             //Connect to websocket
             await ConnectAsync(gatewayURL);
         }
@@ -69,8 +78,15 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     //If the message is from a DM
                     if (json.d.guild_id == null)
                     {
-                        var message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
+                        OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
                         parentService.SaveDiscordMessage(parentUser, message);
+                        if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
+                        {
+                            Console.WriteLine("Received chatbot request: Responding.");
+                            string response = await parentService.serviceManager.GetKliveLocalLLMService().SendMessageToSession(chatbotSession, message.MessageContent);
+                            await parentService.discordInterface.ChatInterface.DirectMessageUser(parentUser, message.AuthorID, response);
+                            Console.WriteLine("Responded.");
+                        }
                     }
                 }
 
@@ -94,6 +110,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             if (lastHeartbeatAck == null)
             {
                 payload = "{\r\n  \"op\": 1,\r\n  \"d\": null\r\n}";
+                WS.Send(payload);
             }
             else
             {
@@ -101,6 +118,8 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 WS.Send(payload);
                 await Task.Delay(TimeSpan.FromMilliseconds(heartbeatInterval));
             }
+            while (lastHeartbeatAck == null) { await Task.Delay(100); }
+            StartHeartbeatLoop();
         }
 
         public async Task JoinDiscordVoiceChannel(string guildID, string channelID)
