@@ -156,7 +156,6 @@ namespace Omnipotent.Services.KliveLocalLLM
             var parameters = new ModelParams(modelFilePath)
             {
                 ContextSize = 1024, // The longest length of chat as memory.
-                GpuLayerCount = 5, // How many layers to offload to GPU. Please adjust it according to your GPU memory.
             };
             loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
             var context = loadedModel.CreateContext(parameters);
