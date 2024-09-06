@@ -100,8 +100,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await args.Message.RespondAsync(response);
                 if (args.Author.Id != KlivesMember.Id)
                 {
-                    embed.Content += $"\n\nKlives Local LLM's Response: {response}";
-                    await message.ModifyAsync(embed);
+                    await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
                 }
             }
         }
