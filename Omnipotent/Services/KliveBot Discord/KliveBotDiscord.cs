@@ -76,11 +76,16 @@ namespace Omnipotent.Services.KliveBot_Discord
 
         private async Task Client_MessageCreated(DiscordClient sender, DSharpPlus.EventArgs.MessageCreateEventArgs args)
         {
-            if (args.Channel.IsPrivate && args.Author.Id != KlivesMember.Id && args.Author.Id != Client.CurrentUser.Id)
+            if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
             {
-                var embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-                    $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
-                var message = await SendMessageToKlives(embed);
+                DiscordMessageBuilder embed = new DiscordMessageBuilder();
+                DiscordMessage message = null;
+                if (args.Author.Id != KlivesMember.Id)
+                {
+                    embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+    $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
+                    message = await SendMessageToKlives(embed);
+                }
                 KliveLocalLLM.KliveLocalLLM.KliveLLMSession kliveLLMSession = null;
                 string response = "";
                 if (sessions.ContainsKey(args.Author.Id))
@@ -93,8 +98,11 @@ namespace Omnipotent.Services.KliveBot_Discord
                     response = await serviceManager.GetKliveLocalLLMService().SendMessageToSession(sessions[args.Author.Id], $"New Message from {args.Author.Username}: {args.Message.Content}");
                 }
                 await args.Message.RespondAsync(response);
-                embed.Content += $"\n\nKlives Local LLM's Response: {response}";
-                await message.ModifyAsync(embed);
+                if (args.Author.Id != KlivesMember.Id)
+                {
+                    embed.Content += $"\n\nKlives Local LLM's Response: {response}";
+                    await message.ModifyAsync(embed);
+                }
             }
         }
 
