@@ -78,29 +78,33 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
             {
-                DiscordMessageBuilder embed = new DiscordMessageBuilder();
-                DiscordMessage message = null;
-                if (args.Author.Id != KlivesMember.Id)
+
+                try
                 {
-                    embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-    $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
-                    message = await SendMessageToKlives(embed);
-                }
-                KliveLocalLLM.KliveLocalLLM.KliveLLMSession kliveLLMSession = null;
-                string response = "";
-                if (sessions.ContainsKey(args.Author.Id))
-                {
+                    DiscordMessageBuilder embed = new DiscordMessageBuilder();
+                    DiscordMessage message = null;
+                    if (args.Author.Id != KlivesMember.Id)
+                    {
+                        embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+        $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
+                        message = await SendMessageToKlives(embed);
+                    }
+                    KliveLocalLLM.KliveLocalLLM.KliveLLMSession kliveLLMSession = null;
+                    string response = "";
+                    if (!sessions.ContainsKey(args.Author.Id))
+                    {
+                        sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                    }
                     response = await serviceManager.GetKliveLocalLLMService().SendMessageToSession(sessions[args.Author.Id], $"New Message from {args.Author.Username}: {args.Message.Content}");
+                    await args.Message.RespondAsync(response);
+                    if (args.Author.Id != KlivesMember.Id)
+                    {
+                        await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
-                    response = await serviceManager.GetKliveLocalLLMService().SendMessageToSession(sessions[args.Author.Id], $"New Message from {args.Author.Username}: {args.Message.Content}");
-                }
-                await args.Message.RespondAsync(response);
-                if (args.Author.Id != KlivesMember.Id)
-                {
-                    await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
+                    ServiceLogError(ex, "Error responding to MessageCreated");
                 }
             }
         }
