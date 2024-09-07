@@ -42,11 +42,10 @@ namespace Omnipotent.Services.KliveLocalLLM
             try
             {
                 string response = "";
-
                 await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message), session.inferenceParams))
                 {
                     response += text;
-                    Console.Write(text);
+                    //Console.Write(text);
                 }
                 response = response.Replace("User:", "");
                 response = response.Replace("System:", "");
@@ -56,6 +55,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
             catch (Exception ex)
             {
+                ErrorInformation errorinfo = new ErrorInformation(ex);
+                Console.WriteLine(errorinfo.FullFormattedMessage);
                 ServiceLogError(ex, "Failed to send message to KliveLocalLLM session.");
                 throw ex;
             }
