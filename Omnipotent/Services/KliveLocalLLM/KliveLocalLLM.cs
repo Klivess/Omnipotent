@@ -39,22 +39,26 @@ namespace Omnipotent.Services.KliveLocalLLM
         }
         public async Task<string> SendMessageToSession(KliveLLMSession session, string message)
         {
-            string response = "";
-            InferenceParams inferenceParams = new InferenceParams()
+            try
             {
-                MaxTokens = 512,
-                AntiPrompts = new List<string> { "User:", } // Stop generation once antiprompts appear.
-            };
-            await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message), inferenceParams))
-            {
-                response += text;
-                Console.Write(text);
+                string response = "";
+
+                await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message), session.inferenceParams))
+                {
+                    response += text;
+                    Console.Write(text);
+                }
+                response = response.Replace("User:", "");
+                response = response.Replace("System:", "");
+                int indexofcolon = response.IndexOf(":");
+                response = string.Join("", response.ToCharArray().Skip(indexofcolon + 1)).Trim();
+                return response;
             }
-            response = response.Replace("User:", "");
-            response = response.Replace("System:", "");
-            int indexofcolon = response.IndexOf(":");
-            response = string.Join("", response.ToCharArray().Skip(indexofcolon + 1)).Trim();
-            return response;
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Failed to send message to KliveLocalLLM session.");
+                throw ex;
+            }
         }
         public async Task AddMessageToSessionHistory(KliveLLMSession session, AuthorRole role, string message)
         {
@@ -70,6 +74,13 @@ namespace Omnipotent.Services.KliveLocalLLM
             session.chatHistory = new ChatHistory();
             session.chatSession = new ChatSession(interactiveExecutor, session.chatHistory);
             session.inferenceParams = new InferenceParams();
+            session.inferenceParams = new InferenceParams()
+            {
+                MaxTokens = 2000,
+                AntiPrompts = new List<string> { "User:", }, // Stop generation once antiprompts appear.
+                Temperature = 0.5f,
+                RepeatPenalty = 1.0f,
+            };
             session.sessionId = Guid.NewGuid().ToString();
             if (AssistantPersonality)
             {
@@ -156,6 +167,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             var parameters = new ModelParams(modelFilePath)
             {
                 ContextSize = 1024, // The longest length of chat as memory.
+                Seed = 1337
+
             };
             loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
             var context = loadedModel.CreateContext(parameters);
