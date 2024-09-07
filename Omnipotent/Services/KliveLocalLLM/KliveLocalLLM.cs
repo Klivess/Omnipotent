@@ -164,6 +164,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
             //Disable logging
             //NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
+            NativeLibraryConfig.All.WithLogCallback((level, message) => ServiceLog(message));
 
             var parameters = new ModelParams(modelFilePath)
             {
