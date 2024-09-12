@@ -106,7 +106,12 @@ namespace Omnipotent.Services.Omniscience
             var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item)).Reverse().ToArray();
             Stopwatch stopwatch = Stopwatch.StartNew();
             int newMessagesCount = 0;
-            foreach (var dmchannel in allDMs)
+            CancellationTokenSource token = new();
+            ParallelOptions parallelOptions = new()
+            {
+                MaxDegreeOfParallelism = 10
+            };
+            var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
             {
                 Stopwatch individualDMStopwatch = Stopwatch.StartNew();
                 int messagesCount = 0;
@@ -152,7 +157,8 @@ namespace Omnipotent.Services.Omniscience
                 newMessagesCount += messagesCount;
                 individualDMStopwatch.Stop();
                 ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
-            };
+            });
+            await result;
             stopwatch.Stop();
             ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
         }
