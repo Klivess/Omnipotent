@@ -30,7 +30,7 @@ namespace Omnipotent.Services.Notifications
         {
             //Acquire KliveBot Discord Service
             var search = (serviceManager.GetServiceByClassType<KliveBotDiscord>());
-            if (!search.Any())
+            if (search == null)
             {
                 await Task.Delay(2000);
                 ServiceMain();

@@ -9,6 +9,7 @@ using System.Linq;
 using System.Net;
 using System.Security;
 using System.Text.RegularExpressions;
+using System.Web.Mvc.Async;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.Omniscience.DiscordInterface.ChatInterface;
 using static Omnipotent.Services.Omniscience.DiscordInterface.DiscordInterface;
@@ -20,7 +21,7 @@ namespace Omnipotent.Services.Omniscience
         public DiscordInterface.DiscordInterface discordInterface;
 
         List<OmniDiscordUser> LinkedUsers;
-        List<OmniDiscordMessage> AllCapturedMessages;
+        SynchronizedCollection<OmniDiscordMessage> AllCapturedMessages;
         public DiscordCrawl()
         {
             name = "Omniscience: DiscordCrawl";
@@ -116,8 +117,8 @@ namespace Omnipotent.Services.Omniscience
                 List<OmniDiscordMessage> newMessages = new();
                 if (messageDivision.Any())
                 {
-                    oldmessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID).Result;
-                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID).Result;
+                    oldmessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID);
+                    newMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID);
                     //Save only messages that are not already saved
                     var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
                     var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
@@ -144,7 +145,7 @@ namespace Omnipotent.Services.Omniscience
                     ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
-                        SaveDiscordMessage(item, message).Wait();
+                        await SaveDiscordMessage(item, message);
                         messagesCount++;
                     }
                 }
@@ -171,7 +172,7 @@ namespace Omnipotent.Services.Omniscience
                 var messages = await GetAllDownloadedMessages(user);
                 if (messages.Any())
                 {
-                    AllCapturedMessages = AllCapturedMessages.Concat(messages).ToList();
+                    AllCapturedMessages = new SynchronizedCollection<OmniDiscordMessage>(AllCapturedMessages.Concat(messages).ToList());
                 }
             }
         }
@@ -188,6 +189,10 @@ namespace Omnipotent.Services.Omniscience
                 AllCapturedMessages.Add(message);
                 await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
             }
+            else
+            {
+                return;
+            }
         }
         public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
         {
@@ -195,6 +200,7 @@ namespace Omnipotent.Services.Omniscience
             List<OmniDiscordMessage> messages = new();
             var files = Directory.GetFiles(user.CreateDMDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
             var cancellationTokenSource = new CancellationTokenSource();
+            var prog = ServiceLog($"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
             var token = cancellationTokenSource.Token;
             ParallelOptions parallelOptions = new()
             {
@@ -202,10 +208,20 @@ namespace Omnipotent.Services.Omniscience
             };
             var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
             {
-                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(GetDataHandler().ReadDataFromFile(file, true).Result));
+                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
             });
+            var token2 = new CancellationTokenSource();
+            Task task = Task.Run(() =>
+            {
+                while (messages.Count < files.Count)
+                {
+                    ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
+                    Task.Delay(200).Wait();
+                }
+            }, token2.Token);
             await result;
-            Console.WriteLine($"Took {debug.Elapsed.TotalSeconds} seconds to load {messages.Count} messages. {debug.Elapsed.TotalSeconds / messages.Count} seconds per message");
+            token2.Cancel();
+            ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files. {files.Count - messages.Count} files lost.");
             return messages;
         }
 

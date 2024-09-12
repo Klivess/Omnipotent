@@ -110,7 +110,7 @@ namespace Omnipotent.Logging
                 await Task.Delay(100);
             }
             //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
-            GC.Collect();
+            //GC.Collect();
             BeginLogLoop();
         }
 
@@ -186,8 +186,12 @@ namespace Omnipotent.Logging
                 Console.SetCursorPosition(0, position.Value);
                 Console.WriteLine(new string(' ', message.message.Length + 50));
                 Console.SetCursorPosition(0, position.Value);
+                Console.ForegroundColor = ConsoleColor.DarkBlue;
             }
-            Console.ForegroundColor = ConsoleColor.Blue;
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Blue;
+            }
             Console.Write($"{message.serviceName}");
             Console.ForegroundColor = ConsoleColor.Green;
             Console.WriteLine($" | {message.message}");
@@ -227,8 +231,12 @@ namespace Omnipotent.Logging
                 {
                     Console.Write(" ");
                 }
+                Console.ForegroundColor = ConsoleColor.DarkBlue;
             }
-            Console.ForegroundColor = ConsoleColor.Blue;
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Blue;
+            }
             Console.Write($"{message.serviceName}");
             Console.ForegroundColor = ConsoleColor.Red;
             if (message.errorInfo == null)

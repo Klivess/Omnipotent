@@ -25,8 +25,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         private CancellationTokenSource CTS;
         ManualResetEvent exitEvent = new ManualResetEvent(false);
 
-
-
         private string lastHeartbeatAck = null;
         private float heartbeatInterval = 0;
         public DiscordWebsocketInterface(DiscordCrawl parentServ, OmniDiscordUser user)
@@ -35,7 +33,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             parentService = parentServ;
         }
 
-        public int ReceiveBufferSize { get; set; } = 8192;
 
         public async Task BeginInitialisation()
         {
@@ -57,10 +54,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         private async Task ConnectAsync(string url)
         {
             WS = new WebsocketClient(new Uri(url));
-            WS.ReconnectTimeout = TimeSpan.FromSeconds(30);
+            WS.ReconnectTimeout = TimeSpan.FromSeconds(5);
             WS.ReconnectionHappened.Subscribe(info =>
             {
                 parentService.ServiceLog($"Reconnection for user {parentUser.GlobalName} happened, type: {info.Type}");
+                //AuthenticateWebsocketConnection();
             });
             WS.MessageReceived.Subscribe(async msg =>
             {
@@ -83,7 +81,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
                         {
                             Console.WriteLine("Received chatbot request: Responding.");
-                            string response = await parentService.serviceManager.GetKliveLocalLLMService().SendMessageToSession(chatbotSession, message.MessageContent);
+                            string response = await chatbotSession.SendMessage(message.MessageContent);
                             await parentService.discordInterface.ChatInterface.DirectMessageUser(parentUser, message.AuthorID, response);
                             Console.WriteLine("Responded.");
                         }
@@ -91,7 +89,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 }
 
             });
-            WS.Start();
+            await WS.Start();
             AuthenticateWebsocketConnection();
         }
 
@@ -107,7 +105,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         private async Task StartHeartbeatLoop()
         {
             string payload = "{\r\n  \"op\": 1,\r\n  \"d\": " + lastHeartbeatAck + "\r\n}";
-            if (lastHeartbeatAck == null)
+            if (heartbeatInterval < 1)
             {
                 payload = "{\r\n  \"op\": 1,\r\n  \"d\": null\r\n}";
                 WS.Send(payload);
@@ -118,7 +116,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 WS.Send(payload);
                 await Task.Delay(TimeSpan.FromMilliseconds(heartbeatInterval));
             }
-            while (lastHeartbeatAck == null) { await Task.Delay(100); }
+            while (heartbeatInterval < 1) { await Task.Delay(100); }
             StartHeartbeatLoop();
         }
 

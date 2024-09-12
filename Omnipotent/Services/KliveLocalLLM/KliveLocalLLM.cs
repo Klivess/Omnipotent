@@ -8,6 +8,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System.Net;
 using System.Reflection;
+using System.Security.Permissions;
 
 namespace Omnipotent.Services.KliveLocalLLM
 {
@@ -21,10 +22,51 @@ namespace Omnipotent.Services.KliveLocalLLM
         public InteractiveExecutor interactiveExecutor;
         public class KliveLLMSession
         {
+            private KliveLocalLLM parentService;
             public string sessionId;
             public ChatHistory chatHistory;
             public ChatSession chatSession;
             public InferenceParams inferenceParams;
+            private SynchronizedCollection<MessageQueueItem> messageQueue;
+
+            public struct MessageQueueItem
+            {
+                public string ID;
+                public string message;
+                public TaskCompletionSource<string> tcs;
+            }
+            public async Task<string> SendMessage(string message)
+            {
+                var messageitem = AddToMessageQueue(message);
+                return await messageitem.tcs.Task;
+            }
+            public KliveLLMSession(KliveLocalLLM parentServ)
+            {
+                this.parentService = parentServ;
+                messageQueue = new SynchronizedCollection<MessageQueueItem>();
+                AnswerLoop();
+            }
+            private MessageQueueItem AddToMessageQueue(string message)
+            {
+                MessageQueueItem item = new MessageQueueItem();
+                TaskCompletionSource<string> tcs = new TaskCompletionSource<string>();
+                item.message = message;
+                item.ID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
+                item.tcs = tcs;
+                messageQueue.Add(item);
+                return messageQueue.First(x => x.ID == item.ID);
+            }
+            private async Task AnswerLoop()
+            {
+                if (messageQueue.Any())
+                {
+                    var message = messageQueue.Last();
+                    messageQueue.Remove(message);
+                    message.tcs.SetResult(await parentService.SendMessageToSession(this, message.message));
+                }
+                await Task.Delay(1000);
+                AnswerLoop();
+            }
         }
         public KliveLocalLLM()
         {
@@ -37,7 +79,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             await CheckPrerequisiteModels();
             await LoadLLamaModel();
         }
-        public async Task<string> SendMessageToSession(KliveLLMSession session, string message)
+        internal async Task<string> SendMessageToSession(KliveLLMSession session, string message)
         {
             try
             {
@@ -71,7 +113,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 Task.Delay(1000).Wait();
             }
-            KliveLLMSession session = new KliveLLMSession();
+            KliveLLMSession session = new KliveLLMSession(this);
             session.chatHistory = new ChatHistory();
             session.chatSession = new ChatSession(interactiveExecutor, session.chatHistory);
             session.inferenceParams = new InferenceParams();
@@ -79,8 +121,6 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 MaxTokens = 2000,
                 AntiPrompts = new List<string> { "User:", }, // Stop generation once antiprompts appear.
-                Temperature = 0.5f,
-                RepeatPenalty = 1.0f,
             };
             session.sessionId = Guid.NewGuid().ToString();
             if (AssistantPersonality)
@@ -163,8 +203,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             ServiceLog("Loading LLama Model...");
 
             //Disable logging
-            //NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
-            NativeLibraryConfig.All.WithLogCallback((level, message) => ServiceLog(message));
+            NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
+            //NativeLibraryConfig.All.WithLogCallback((level, message) => ServiceLog(message));
 
             var parameters = new ModelParams(modelFilePath)
             {
