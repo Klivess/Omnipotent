@@ -207,7 +207,7 @@ namespace Omnipotent.Logging
         {
             try
             {
-                var pos = messages.Find(k => k.logID == message.logID).position + 2;
+                var pos = messages.Find(k => k.logID == message.logID).position;
                 //duct tape solution fix before developing omnilogging
                 if (message.errorInfo == null)
                 {

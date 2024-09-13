@@ -1,4 +1,5 @@
-﻿using Newtonsoft.Json;
+﻿using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
@@ -111,7 +112,8 @@ namespace Omnipotent.Services.Omniscience
             {
                 MaxDegreeOfParallelism = 2
             };
-            var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
+            //var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
+            foreach (var dmchannel in allDMs)
             {
                 Stopwatch individualDMStopwatch = Stopwatch.StartNew();
                 int messagesCount = 0;
@@ -160,8 +162,8 @@ namespace Omnipotent.Services.Omniscience
                 {
                     ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
                 }
-            });
-            await result;
+            };
+            //await result;
             stopwatch.Stop();
             ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
         }
@@ -179,9 +181,9 @@ namespace Omnipotent.Services.Omniscience
             foreach (var user in users)
             {
                 var messages = await GetAllDownloadedMessages(user);
-                if (messages.Any())
+                foreach (var item in messages)
                 {
-                    AllCapturedMessages = new SynchronizedCollection<OmniDiscordMessage>(AllCapturedMessages.Concat(messages).ToList());
+                    AllCapturedMessages.Add(item);
                 }
             }
         }
@@ -215,20 +217,17 @@ namespace Omnipotent.Services.Omniscience
             {
                 MaxDegreeOfParallelism = 50
             };
-            var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
+            //var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
+            foreach (var file in files)
             {
                 messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
-            });
-            var token2 = new CancellationTokenSource();
-            Task task = Task.Run(() =>
-            {
-                while (messages.Count < files.Count)
+                if(messages.Count % 100 == 0)
                 {
                     ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
-                    Task.Delay(200).Wait();
                 }
-            }, token2.Token);
-            await result;
+            };
+            var token2 = new CancellationTokenSource();
+            //await result;
             token2.Cancel();
             ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files. {files.Count - messages.Count} files lost.");
             return messages;
