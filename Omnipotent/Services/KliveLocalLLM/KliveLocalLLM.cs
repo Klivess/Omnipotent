@@ -202,13 +202,14 @@ namespace Omnipotent.Services.KliveLocalLLM
 
             }
         }
+        public string log = "";
         private async Task LoadLLamaModel()
         {
             ServiceLog("Loading LLama Model...");
 
             //Disable logging
-            NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
-            //NativeLibraryConfig.All.WithLogCallback((level, message) => ServiceLog(message));
+            //NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
+            NativeLibraryConfig.All.WithLogCallback((level, message) => Console.WriteLine(message));
 
             var parameters = new ModelParams(modelFilePath)
             {
