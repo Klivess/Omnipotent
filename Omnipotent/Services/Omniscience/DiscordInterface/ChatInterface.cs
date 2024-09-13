@@ -276,7 +276,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     var result = await GetMessagesAsync(user, channelID, 100, beforeMessageID: lastMessage).WaitAsync(TimeSpan.FromMinutes(5));
                     depth++;
                     messages = messages.Concat(result).ToList();
-                    Console.WriteLine($"depth: {depth}, messages: {messages.Count}");
                     await parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
