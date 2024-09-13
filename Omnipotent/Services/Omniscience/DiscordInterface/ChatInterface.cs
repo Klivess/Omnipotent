@@ -275,14 +275,15 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             List<OmniDiscordMessage> messages = new();
             long? lastMessage = beforeMessage;
             int depth = 0;
-            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName}: {depth.ToString()} layers/{messages.Count} messages.");
+            var channel = await GetGuildChannelInfo(user, channelID.ToString());
+            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
             while (true)
             {
                 try
                 {
                     var result = await GetMessagesAsync(user, channelID, 100, beforeMessageID: lastMessage).WaitAsync(TimeSpan.FromMinutes(5));
                     depth++;
-                    parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName}: {depth.ToString()} layers/{messages.Count} messages.");
+                    //parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
                         break;
@@ -297,7 +298,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                 }
             }
-            parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: Completed at {user.GlobalName}: {depth.ToString()} layers.");
+            parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: Completed at {user.GlobalName}: {depth.ToString()} layers.");
             return messages;
         }
         public async Task<List<OmniDiscordMessage>> GetALLMessagesAsyncAfter(OmniDiscordUser user, long channelID, long? afterMessage = null)
@@ -305,14 +306,16 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             List<OmniDiscordMessage> messages = new();
             long? recentMessage = afterMessage;
             int depth = 0;
-            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName}: {depth.ToString()} layers/{messages.Count} messages.");
+            var channel = await GetGuildChannelInfo(user, channelID.ToString());
+            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+
             while (true)
             {
                 try
                 {
                     var result = await GetMessagesAsync(user, channelID, 100, afterMessageID: recentMessage);
                     depth++;
-                    parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName}: {depth.ToString()} layers/{messages.Count} messages.");
+                    //parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
                         break;
@@ -327,7 +330,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                 }
             }
-            parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName}: Completed at {depth.ToString()} layers/{messages.Count} messages.");
+            parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: Completed at {depth.ToString()} layers/{messages.Count} messages.");
             return messages;
         }
         public async Task<OmniDMChannelLayout[]> GetAllDMChannels(OmniDiscordUser user, bool useCache = true)

@@ -57,7 +57,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             WS.ReconnectTimeout = TimeSpan.FromSeconds(5);
             WS.ReconnectionHappened.Subscribe(info =>
             {
-                parentService.ServiceLog($"Reconnection for user {parentUser.GlobalName} happened, type: {info.Type}");
+                //parentService.ServiceLog($"Reconnection for user {parentUser.GlobalName} happened, type: {info.Type}");
                 //AuthenticateWebsocketConnection();
             });
             WS.MessageReceived.Subscribe(async msg =>

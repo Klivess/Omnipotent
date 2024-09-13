@@ -103,13 +103,13 @@ namespace Omnipotent.Services.Omniscience
             //Download all new messages from channels
             ServiceLog($"Updating messages from discord account: {item.Username}");
             //Scan all DM Channels
-            var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item)).Reverse().ToArray();
+            var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item));
             Stopwatch stopwatch = Stopwatch.StartNew();
             int newMessagesCount = 0;
             CancellationTokenSource token = new();
             ParallelOptions parallelOptions = new()
             {
-                MaxDegreeOfParallelism = 10
+                MaxDegreeOfParallelism = 5
             };
             var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
             {
@@ -145,9 +145,9 @@ namespace Omnipotent.Services.Omniscience
                 }
                 else
                 {
-                    newMessages = discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID).Result;
+                    newMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID);
                     //Save only messages that are not already saved
-                    ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                    //ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         await SaveDiscordMessage(item, message);
@@ -156,7 +156,10 @@ namespace Omnipotent.Services.Omniscience
                 }
                 newMessagesCount += messagesCount;
                 individualDMStopwatch.Stop();
-                ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
+                if (messagesCount > 0)
+                {
+                    ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
+                }
             });
             await result;
             stopwatch.Stop();
@@ -210,7 +213,7 @@ namespace Omnipotent.Services.Omniscience
             var token = cancellationTokenSource.Token;
             ParallelOptions parallelOptions = new()
             {
-                MaxDegreeOfParallelism = 10
+                MaxDegreeOfParallelism = 50
             };
             var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
             {

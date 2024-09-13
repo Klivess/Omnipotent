@@ -84,10 +84,14 @@ namespace Omnipotent.Services.KliveLocalLLM
             try
             {
                 string response = "";
+                bool isServer = OmniPaths.CheckIfOnServer();
                 await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message), session.inferenceParams))
                 {
                     response += text;
-                    //Console.Write(text);
+                    if (!isServer)
+                    {
+                        Console.Write(text);
+                    }
                 }
                 response = response.Replace("User:", "");
                 response = response.Replace("System:", "");
@@ -209,7 +213,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             var parameters = new ModelParams(modelFilePath)
             {
                 ContextSize = 1024, // The longest length of chat as memory.
-                Seed = 1337
+                Seed = 1337,
 
             };
             loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
