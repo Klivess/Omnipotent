@@ -208,8 +208,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             ServiceLog("Loading LLama Model...");
 
             //Disable logging
-            //NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
-            NativeLibraryConfig.All.WithLogCallback((level, message) => Console.WriteLine(message));
+            NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
+            //NativeLibraryConfig.All.WithLogCallback((level, message) => Console.WriteLine(message));
 
             var parameters = new ModelParams(modelFilePath)
             {
