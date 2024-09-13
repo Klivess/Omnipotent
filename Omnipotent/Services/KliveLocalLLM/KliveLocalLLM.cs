@@ -152,7 +152,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 try
                 {
-                    var logged = ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
+                    var logged = await ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
                     WebClient webClient = new WebClient();
                     int progressPercentage = 0;
                     var message = await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");

@@ -276,7 +276,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             long? lastMessage = beforeMessage;
             int depth = 0;
             var channel = await GetGuildChannelInfo(user, channelID.ToString());
-            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+            var prog = await parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
             while (true)
             {
                 try
@@ -307,7 +307,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             long? recentMessage = afterMessage;
             int depth = 0;
             var channel = await GetGuildChannelInfo(user, channelID.ToString());
-            var prog = parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+            var prog = await parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
 
             while (true)
             {
@@ -337,7 +337,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             Directory.CreateDirectory(user.CreateKnownDMChannelsDirectoryPathString());
             var allAffinities = await GetAllAffinities(user);
-            var progressLog = parentInterface.parent.ServiceLog($"Loading hopefully {allAffinities.Count} DM channels - Progress: 0%");
+            var progressLog = await parentInterface.parent.ServiceLog($"Loading hopefully {allAffinities.Count} DM channels - Progress: 0%");
             List<OmniDMChannelLayout> channels = new();
             int loadedFromCache = 0;
             foreach (var item in allAffinities)

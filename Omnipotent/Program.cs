@@ -32,6 +32,9 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
 
+                omniServiceManager.GetLogger().TerminateService();
+
+
                 Task.Delay(4000).Wait();
 
                 if (OmniPaths.CheckIfOnServer())

@@ -109,7 +109,7 @@ namespace Omnipotent.Services.Omniscience
             CancellationTokenSource token = new();
             ParallelOptions parallelOptions = new()
             {
-                MaxDegreeOfParallelism = 5
+                MaxDegreeOfParallelism = 2
             };
             var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
             {
@@ -127,7 +127,7 @@ namespace Omnipotent.Services.Omniscience
                     //Save only messages that are not already saved
                     var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
                     var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                    var saveDMProgress = ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
+                    var saveDMProgress = await ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         await SaveDiscordMessage(item, message);
@@ -209,7 +209,7 @@ namespace Omnipotent.Services.Omniscience
             List<OmniDiscordMessage> messages = new();
             var files = Directory.GetFiles(user.CreateDMDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
             var cancellationTokenSource = new CancellationTokenSource();
-            var prog = ServiceLog($"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
+            var prog = await ServiceLog($"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
             var token = cancellationTokenSource.Token;
             ParallelOptions parallelOptions = new()
             {

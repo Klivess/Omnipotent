@@ -76,38 +76,45 @@ namespace Omnipotent.Services.KliveBot_Discord
 
         private async Task Client_MessageCreated(DiscordClient sender, DSharpPlus.EventArgs.MessageCreateEventArgs args)
         {
-            if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
+            try
             {
-                DiscordMessageBuilder embed = new DiscordMessageBuilder();
-                DiscordMessage message = null;
-                if (args.Author.Id != KlivesMember.Id)
+                if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
                 {
-                    embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-    $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
-                    message = await SendMessageToKlives(embed);
-                }
-                try
-                {
-
-                    string response = "";
-                    if (!sessions.ContainsKey(args.Author.Id))
+                    DiscordMessageBuilder embed = new DiscordMessageBuilder();
+                    DiscordMessage message = null;
+                    if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
                     {
-                        sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                        embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+        $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
+                        message = await SendMessageToKlives(embed);
                     }
-                    response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
-                    await args.Message.RespondAsync(response);
-                    if (args.Author.Id != KlivesMember.Id)
+                    try
                     {
+
+                        string response = "";
+                        if (!sessions.ContainsKey(args.Author.Id))
+                        {
+                            sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                        }
+                        response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
+                        await args.Message.RespondAsync(response);
+                        if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
+                        {
+                            await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ServiceLogError(ex, "Error responding to MessageCreated");
+                        string response = "I tried to respond to this, but an exception occurred. 😢";
+                        await args.Message.RespondAsync(response);
                         await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
                     }
                 }
-                catch (Exception ex)
-                {
-                    ServiceLogError(ex, "Error responding to MessageCreated");
-                    string response = "I tried to respond to this, but an exception occurred. 😢";
-                    await args.Message.RespondAsync(response);
-                    await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
-                }
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error in MessageCreated event!");
             }
         }
 
