@@ -28,7 +28,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             string uptimes = $"";
             foreach (var item in serviceManager.activeServices)
             {
-                uptimes += $"Service - {item.GetName()}: {item.GetServiceUptime().Humanize()}\n";
+                uptimes += $"Service - {item.GetName()}: {(item.IsServiceActive() ? item.GetServiceUptime().Humanize() : "Inactive")}\n";
             }
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(uptimes));
         }

@@ -143,6 +143,7 @@ namespace Omnipotent.Service_Manager
                 ServiceActive = false;
                 GC.Collect();
                 serviceThread.Interrupt();
+                serviceUptime = new Stopwatch();
                 return true;
             }
             catch (Exception ex)
