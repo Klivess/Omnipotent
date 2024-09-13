@@ -39,10 +39,8 @@ namespace Omnipotent.Services.Omniscience
             await LoadAllMessagesFromDisk(LinkedUsers.ToArray());
             time.Stop();
             ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
-            if (OmniPaths.CheckIfOnServer())
-            {
-                UpdateDiscordMessageDatabase();
-            }
+            UpdateDiscordMessageDatabase();
+
             foreach (var item in LinkedUsers)
             {
                 item.websocketInterface = new(this, item);
@@ -221,7 +219,7 @@ namespace Omnipotent.Services.Omniscience
             foreach (var file in files)
             {
                 messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
-                if(messages.Count % 100 == 0)
+                if (messages.Count % 100 == 0)
                 {
                     ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
                 }

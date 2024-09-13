@@ -26,6 +26,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         public ChannelFlags ChannelFlags;
         public int Position;
         public bool IsNSFW;
+        public List<OmniDiscordUserInfo> DMChannelUserInfo;
     }
 
     public enum ChannelFlags

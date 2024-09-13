@@ -123,10 +123,17 @@ namespace Omnipotent.Logging
         }
         public static string GetMethodOfException(Exception ex)
         {
+            try
+            {
 #pragma warning disable CS8602 // Dereference of a possibly null reference.
-            var methodFullName = ex.TargetSite.ReflectedType.FullName;
+                var methodFullName = ex.TargetSite.ReflectedType.FullName;
 #pragma warning restore CS8602 // Dereference of a possibly null reference.
-            return methodFullName;
+                return methodFullName;
+            }
+            catch (Exception)
+            {
+                return "NotFound";
+            }
         }
 
         public LoggedMessage LogStatus(string serviceName, string message)

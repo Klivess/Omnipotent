@@ -49,15 +49,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 httpMessage.RequestUri = new Uri(messageEndpoint);
                 httpMessage.Method = HttpMethod.Get;
                 HttpResponseMessage response = new();
-                try
-                {
-                    response = await parentInterface.SendDiscordRequest(client, httpMessage, false);
-                }
-                catch (Exception ENDME)
-                {
-                    ErrorInformation errorInformation = new(ENDME);
-                    Console.WriteLine(errorInformation.FullFormattedMessage);
-                }
+                response = await parentInterface.SendDiscordRequest(client, httpMessage, false);
                 List<OmniDiscordMessage> messages = new();
                 if (response.IsSuccessStatusCode)
                 {
@@ -275,7 +267,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             List<OmniDiscordMessage> messages = new();
             long? lastMessage = beforeMessage;
             int depth = 0;
-            var channel = await GetGuildChannelInfo(user, channelID.ToString());
+            var channel = await GetChannelInfo(user, channelID.ToString());
             var prog = await parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
             while (true)
             {
@@ -283,12 +275,13 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                     var result = await GetMessagesAsync(user, channelID, 100, beforeMessageID: lastMessage).WaitAsync(TimeSpan.FromMinutes(5));
                     depth++;
-                    parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+                    messages = messages.Concat(result).ToList();
+                    Console.WriteLine($"depth: {depth}, messages: {messages.Count}");
+                    await parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
                         break;
                     }
-                    messages = messages.Concat(result).ToList();
                     if (messages.Count > 0)
                     {
                         lastMessage = messages[messages.Count - 1].MessageID;
@@ -306,7 +299,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             List<OmniDiscordMessage> messages = new();
             long? recentMessage = afterMessage;
             int depth = 0;
-            var channel = await GetGuildChannelInfo(user, channelID.ToString());
+            var channel = await GetChannelInfo(user, channelID.ToString());
             var prog = await parentInterface.parent.ServiceLog($"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
 
             while (true)
@@ -502,23 +495,57 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 return false;
             }
         }
-        public async Task<OmniDiscordChannel> GetGuildChannelInfo(OmniDiscordUser user, string channelID)
+        public async Task<OmniDiscordChannel> GetChannelInfo(OmniDiscordUser user, string channelID)
         {
-            var response = await parentInterface.SendDiscordGetRequest(DiscordHttpClient(user), new Uri($"https://discord.com/api/v9/channels/{channelID}"));
-            string responseString = await response.Content.ReadAsStringAsync();
-            dynamic responseJson = JsonConvert.DeserializeObject(responseString);
-            OmniDiscordChannel channel = new();
-            channel.ChannelID = responseJson.id;
-            channel.ChannelName = responseJson.name;
-            channel.ChannelTopic = responseJson.topic;
-            channel.LastMessageID = responseJson.last_message_id;
-            channel.ParentChannelID = responseJson.parent_id;
-            channel.GuildID = responseJson.guild_id;
-            channel.ChannelType = ConvertChannelTypeToEnum((int)responseJson.type);
-            channel.ChannelFlags = (ChannelFlags)responseJson.flags;
-            channel.Position = responseJson.position;
-            channel.IsNSFW = responseJson.nsfw;
-            return channel;
+            try
+            {
+                var response = await parentInterface.SendDiscordGetRequest(DiscordHttpClient(user), new Uri($"https://discord.com/api/v9/channels/{channelID}"));
+                string responseString = await response.Content.ReadAsStringAsync();
+                dynamic responseJson = JsonConvert.DeserializeObject(responseString);
+                OmniDiscordChannel channel = new();
+                channel.ChannelID = responseJson.id;
+                channel.LastMessageID = responseJson.last_message_id;
+                channel.ChannelType = ConvertChannelTypeToEnum((int)responseJson.type);
+                channel.ChannelFlags = (ChannelFlags)responseJson.flags;
+                if (channel.ChannelType != OmniChannelType.DM && channel.ChannelType != OmniChannelType.GroupDM)
+                {
+                    channel.ParentChannelID = responseJson.parent_id;
+                    channel.Position = responseJson.position;
+                    channel.IsNSFW = responseJson.nsfw;
+                    channel.GuildID = responseJson.guild_id;
+                    channel.ChannelTopic = responseJson.topic;
+                    channel.ChannelName = responseJson.name;
+                }
+                try
+                {
+                    if (responseJson.recipients != null)
+                    {
+                        foreach (var item in responseJson.recipients)
+                        {
+                            OmniDiscordUserInfo userInfo = new();
+                            userInfo.UserID = item.id;
+                            userInfo.Username = item.username;
+                            userInfo.AvatarID = item.avatar;
+                            userInfo.AvatarURL = ConstructAvatarURL(userInfo.UserID.ToString(), userInfo.AvatarID);
+                            userInfo.Discriminator = item.discriminator;
+                            userInfo.Flags = (UserFlags)item.public_flags;
+                            userInfo.AccentColorHex = item.accent_color;
+                            userInfo.GlobalName = item.global_name;
+                            userInfo.BannerColorHex = item.banner_color;
+                            channel.DMChannelUserInfo = new();
+                            channel.DMChannelUserInfo.Add(userInfo);
+                            channel.ChannelName += userInfo.GlobalName + ", ";
+                        }
+                    }
+                }
+                catch (Exception) { }
+                return channel;
+            }
+            catch (Exception ex)
+            {
+                parentInterface.parent.ServiceLogError(ex);
+                return new();
+            }
         }
         public async Task<OmniDiscordGuild[]> GetAllUserGuilds(OmniDiscordUser user)
         {
