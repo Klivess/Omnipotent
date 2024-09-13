@@ -283,7 +283,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                     var result = await GetMessagesAsync(user, channelID, 100, beforeMessageID: lastMessage).WaitAsync(TimeSpan.FromMinutes(5));
                     depth++;
-                    //parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+                    parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
                         break;
@@ -315,7 +315,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 {
                     var result = await GetMessagesAsync(user, channelID, 100, afterMessageID: recentMessage);
                     depth++;
-                    //parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
+                    parentInterface.parent.ServiceUpdateLoggedMessage(prog, $"Scan depth for OmniDiscordUser: {user.GlobalName} in channel {channel.ChannelName}: {depth.ToString()} layers/{messages.Count} messages.");
                     if (result.Count == 0)
                     {
                         break;
