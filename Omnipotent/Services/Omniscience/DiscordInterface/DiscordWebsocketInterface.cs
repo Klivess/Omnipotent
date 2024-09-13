@@ -45,7 +45,10 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             gatewayURL = responseJson.url;
 
             //Create chatbot session
-            chatbotSession = parentService.serviceManager.GetKliveLocalLLMService().CreateSession();
+            if (parentService.serviceManager.GetKliveLocalLLMService().IsServiceActive())
+            {
+                chatbotSession = parentService.serviceManager.GetKliveLocalLLMService().CreateSession();
+            }
 
             //Connect to websocket
             await ConnectAsync(gatewayURL);
@@ -53,46 +56,61 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
 
         private async Task ConnectAsync(string url)
         {
-            WS = new WebsocketClient(new Uri(url));
-            WS.ReconnectTimeout = TimeSpan.FromSeconds(5);
-            WS.ReconnectionHappened.Subscribe(info =>
+            try
             {
-                //parentService.ServiceLog($"Reconnection for user {parentUser.GlobalName} happened, type: {info.Type}");
-                //AuthenticateWebsocketConnection();
-            });
-            WS.MessageReceived.Subscribe(async msg =>
-            {
-                dynamic json = JsonConvert.DeserializeObject(msg.Text);
-                if (json.op == 10)
+                WS = new WebsocketClient(new Uri(url));
+                WS.ReconnectTimeout = TimeSpan.FromSeconds(5);
+                WS.ReconnectionHappened.Subscribe(info =>
                 {
-                    heartbeatInterval = json.d.heartbeat_interval;
-                }
-                else if (json.op == 11)
+                    //parentService.ServiceLog($"Reconnection for user {parentUser.GlobalName} happened, type: {info.Type}");
+                    //AuthenticateWebsocketConnection();
+                });
+                WS.MessageReceived.Subscribe(async msg =>
                 {
-                    lastHeartbeatAck = json.d;
-                }
-                else if (json.t == "MESSAGE_CREATE")
-                {
-                    //If the message is from a DM
-                    if (json.d.guild_id == null)
+                    try
                     {
-                        OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
-                        parentService.SaveDiscordMessage(parentUser, message);
-                        if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
+                        dynamic json = JsonConvert.DeserializeObject(msg.Text);
+                        if (json.op == 10)
                         {
-                            Console.WriteLine("Received chatbot request: Responding.");
-                            string response = await chatbotSession.SendMessage(message.MessageContent);
-                            await parentService.discordInterface.ChatInterface.DirectMessageUser(parentUser, message.AuthorID, response);
-                            Console.WriteLine("Responded.");
+                            heartbeatInterval = json.d.heartbeat_interval;
+                        }
+                        else if (json.op == 11)
+                        {
+                            lastHeartbeatAck = json.d;
+                        }
+                        else if (json.t == "MESSAGE_CREATE")
+                        {
+                            //If the message is from a DM
+                            if (json.d.guild_id == null)
+                            {
+                                OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
+                                parentService.SaveDiscordMessage(parentUser, message);
+                                if (parentService.serviceManager.GetKliveLocalLLMService().IsServiceActive())
+                                {
+                                    if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
+                                    {
+                                        Console.WriteLine("Received chatbot request: Responding.");
+                                        string response = await chatbotSession.SendMessage(message.MessageContent);
+                                        await parentService.discordInterface.ChatInterface.DirectMessageUser(parentUser, message.AuthorID, response);
+                                        Console.WriteLine("Responded.");
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-
-            });
-            await WS.Start();
-            AuthenticateWebsocketConnection();
+                    catch (Exception ex)
+                    {
+                        parentService.ServiceLogError(ex);
+                    }
+                });
+                await WS.Start();
+                AuthenticateWebsocketConnection();
+            }
+            catch (Exception ex)
+            {
+                parentService.ServiceLogError(ex, "Error connecting to websocket for " + parentUser.GlobalName);
+            }
         }
-
         private async Task AuthenticateWebsocketConnection()
         {
             //Send Identify payload

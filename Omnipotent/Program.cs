@@ -30,11 +30,12 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
 
                 //Only works on my desktop, need to fix
-                if (!OmniPaths.CheckIfOnServer())
+                if (OmniPaths.CheckIfOnServer())
                 {
-                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
+                    omniServiceManager.GetKliveLocalLLMService().TerminateService();
                 }
 
                 Task.Delay(4000).Wait();
