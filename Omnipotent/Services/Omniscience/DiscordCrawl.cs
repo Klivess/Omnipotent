@@ -215,18 +215,26 @@ namespace Omnipotent.Services.Omniscience
                 MaxDegreeOfParallelism = 50
             };
             //var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
+            int errorCount = 0;
             foreach (var file in files)
             {
-                messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
-                if (messages.Count % 100 == 0)
+                try
                 {
-                    ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
+                    messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
+                    if (messages.Count % 100 == 0)
+                    {
+                        ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errorCount++;
                 }
             };
             var token2 = new CancellationTokenSource();
             //await result;
             token2.Cancel();
-            ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files. {files.Count - messages.Count} files lost.");
+            await ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files. {files.Count - messages.Count} files lost. {errorCount} messages lost due to errors.");
             return messages;
         }
 
