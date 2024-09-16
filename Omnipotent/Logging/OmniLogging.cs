@@ -125,12 +125,10 @@ namespace Omnipotent.Logging
         {
             try
             {
-#pragma warning disable CS8602 // Dereference of a possibly null reference.
                 var methodFullName = ex.TargetSite.ReflectedType.FullName;
-#pragma warning restore CS8602 // Dereference of a possibly null reference.
                 return methodFullName;
             }
-            catch (Exception)
+            catch (Exception e)
             {
                 return "NotFound";
             }

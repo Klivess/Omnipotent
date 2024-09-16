@@ -346,7 +346,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                     else
                     {
                         var channel = await GetDMChannel(user, item.Key);
-                        ((DiscordCrawl)parentInterface.parent.serviceManager.GetServiceByClassType<DiscordCrawl>()[0]).SaveKnownDiscordDMChannel(user, channel);
+                        parentInterface.parent.SaveKnownDiscordDMChannel(user, channel);
                         channels.Add(channel);
                     }
                 }

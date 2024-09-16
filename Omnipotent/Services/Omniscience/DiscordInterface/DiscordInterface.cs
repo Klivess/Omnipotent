@@ -26,13 +26,13 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
     public class DiscordInterface
     {
         public const string discordURI = "https://discord.com/api/v9/";
-        public OmniService parent;
+        public DiscordCrawl parent;
         public List<OmniDiscordUser> LinkedDiscordAccounts;
         public ChatInterface ChatInterface;
 
         public event Action<OmniDiscordUser> NewOmniDiscordUserAdded;
 
-        public DiscordInterface(OmniService parentService)
+        public DiscordInterface(DiscordCrawl parentService)
         {
             this.parent = parentService;
             LinkedDiscordAccounts = GetAllLinkedOmniDiscordUsersFromDisk().Result.ToList();

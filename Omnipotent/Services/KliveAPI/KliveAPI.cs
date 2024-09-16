@@ -110,6 +110,16 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        private async void CreateMetaKLIVEAPIRoutes()
+        {
+            await CreateRoute("/redirect", async (req) =>
+            {
+                string url = req.userParameters.Get("redirectURL");
+                string code = $"<script>window.location.replace('{url}');</script>";
+                await req.ReturnResponse(code, "text/html");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+        }
+
         private void KliveAPI_ServiceQuitRequest()
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
@@ -159,8 +169,7 @@ namespace Omnipotent.Services.KliveAPI
             {
                 try
                 {
-                    getContextTask = listener.GetContextAsync();
-                    HttpListenerContext context = await getContextTask;
+                    HttpListenerContext context = await listener.GetContextAsync();
                     HttpListenerRequest req = context.Request;
                     string route = req.RawUrl;
                     string query = req.Url.Query;

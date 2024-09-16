@@ -62,7 +62,6 @@ namespace Omnipotent.Services.Omniscience
 
             CreateRoutes();
         }
-
         private async Task CreateRoutes()
         {
             //Set up controllers
@@ -87,7 +86,6 @@ namespace Omnipotent.Services.Omniscience
             };
             await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
         }
-
         private OmniDiscordUser SelectUser(string username)
         {
             return LinkedUsers.FirstOrDefault(k => k.Username == username);
@@ -119,6 +117,9 @@ namespace Omnipotent.Services.Omniscience
                 //Recursively download backwards from the last message
                 List<OmniDiscordMessage> oldmessages = new();
                 List<OmniDiscordMessage> newMessages = new();
+
+                List<long> updatedUserIDs = new();
+
                 if (messageDivision.Any())
                 {
                     oldmessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID);
@@ -130,13 +131,24 @@ namespace Omnipotent.Services.Omniscience
                     foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
                         await SaveDiscordMessage(item, message);
+                        if (!updatedUserIDs.Contains(message.AuthorID))
+                        {
+                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                            updatedUserIDs.Add(message.AuthorID);
+                        }
                         messagesCount++;
                         float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
                         ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
                     }
                     foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
                     {
+                        if (!updatedUserIDs.Contains(message.AuthorID))
+                        {
+                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                            updatedUserIDs.Add(message.AuthorID);
+                        }
                         await SaveDiscordMessage(item, message);
+                        await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
                         messagesCount++;
                         float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
                         ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
@@ -151,6 +163,11 @@ namespace Omnipotent.Services.Omniscience
                     {
                         await SaveDiscordMessage(item, message);
                         messagesCount++;
+                        if (!updatedUserIDs.Contains(message.AuthorID))
+                        {
+                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                            updatedUserIDs.Add(message.AuthorID);
+                        }
                     }
                 }
                 newMessagesCount += messagesCount;

@@ -8,6 +8,7 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveLocalLLM;
+using Omnipotent.Services.KliveTechHub;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
@@ -31,6 +32,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
 
                 //Only works on my desktop, need to fix
                 if (OmniPaths.CheckIfOnServer())
