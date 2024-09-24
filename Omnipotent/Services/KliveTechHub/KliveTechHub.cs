@@ -129,7 +129,7 @@ namespace Omnipotent.Services.KliveTechHub
         {
             if (!CheckIfBluetoothProtocolExistsOnDevice())
             {
-                ServiceLogError(new Exception("Bluetooth protocol not supported on this device!"));
+                ServiceLog("No Bluetooth on this device, so terminating service.");
                 TerminateService();
                 return;
             }
