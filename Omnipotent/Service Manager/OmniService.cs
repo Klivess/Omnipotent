@@ -133,7 +133,7 @@ namespace Omnipotent.Service_Manager
             cancellationToken = new CancellationTokenSource();
         }
 
-        public bool TerminateService()
+        public async Task<bool> TerminateService()
         {
             try
             {
@@ -153,7 +153,7 @@ namespace Omnipotent.Service_Manager
             }
         }
 
-        public bool RestartService()
+        public async Task<bool> RestartService()
         {
             try
             {
