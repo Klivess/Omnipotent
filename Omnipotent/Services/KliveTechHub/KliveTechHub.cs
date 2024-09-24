@@ -121,8 +121,18 @@ namespace Omnipotent.Services.KliveTechHub
                 return this;
             }
         }
+        private bool CheckIfBluetoothProtocolExistsOnDevice()
+        {
+            return BluetoothRadio.IsSupported;
+        }
         protected async override void ServiceMain()
         {
+            if (!CheckIfBluetoothProtocolExistsOnDevice())
+            {
+                ServiceLogError(new Exception("Bluetooth protocol not supported on this device!"));
+                TerminateService();
+                return;
+            }
             KliveTechRoutes = new(this);
             KliveTechRoutes.RegisterRoutes();
             Task sendDataLoop = new Task(async () => { SendDataLoop(); });
