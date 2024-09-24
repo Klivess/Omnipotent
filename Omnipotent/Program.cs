@@ -32,13 +32,13 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
+                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
 
                 //Only works on my desktop, need to fix
                 if (OmniPaths.CheckIfOnServer())
                 {
                     omniServiceManager.GetKliveLocalLLMService().TerminateService();
-                    omniServiceManager.GetServiceByClassType<KliveTechHub>()[0].TerminateService();
+                    //omniServiceManager.GetServiceByClassType<KliveTechHub>()[0].TerminateService();
                 }
 
                 Task.Delay(4000).Wait();
