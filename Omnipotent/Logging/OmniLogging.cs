@@ -89,8 +89,8 @@ namespace Omnipotent.Logging
         {
             if (messagesToLog.Any())
             {
-                var message = messagesToLog.Last();
-                messagesToLog.Remove(messagesToLog.Last());
+                var message = messagesToLog.First();
+                messagesToLog.Remove(messagesToLog.First());
                 if (message.type == LogType.Status)
                 {
                     await WriteStatus(message);
