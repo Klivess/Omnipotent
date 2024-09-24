@@ -35,6 +35,7 @@ namespace Omnipotent.Logging
             public string oldMessage;
             public ErrorInformation? errorInfo;
             public int position;
+            public DateTime TimeOfLog;
         }
 
         public SynchronizedCollection<LoggedMessage> messagesToLog = new();
@@ -102,6 +103,7 @@ namespace Omnipotent.Logging
                 {
                     await WriteUpdate(message);
                 }
+                await Task.Delay(75);
             }
 
             //Replace this with proper waiting
@@ -143,6 +145,7 @@ namespace Omnipotent.Logging
                 log.message = message;
                 log.type = LogType.Status;
                 log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+                log.TimeOfLog = DateTime.Now;
                 messagesToLog.Add(log);
                 return log;
             }
@@ -160,6 +163,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = new ErrorInformation(ex);
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            log.TimeOfLog = DateTime.Now;
             messagesToLog.Add(log);
             return log;
         }
@@ -180,6 +184,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = null;
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            log.TimeOfLog = DateTime.Now;
             messagesToLog.Add(log);
             return log;
         }
