@@ -19,7 +19,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         public string ChannelName;
         public long ChannelID;
         public string ChannelTopic;
-        public long LastMessageID;
+        public string LastMessageID;
         public long ParentChannelID;
         public long GuildID;
         public OmniChannelType ChannelType;

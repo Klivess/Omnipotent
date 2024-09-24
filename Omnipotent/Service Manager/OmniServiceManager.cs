@@ -40,10 +40,11 @@ namespace Omnipotent.Service_Manager
         private OmniServiceMonitor monitor;
         public TimeManager timeManager;
         protected OmniLogging logger;
+        private Stopwatch OverallUptime;
         public OmniServiceManager()
         {
             //Initialise in order of priority
-
+            OverallUptime = Stopwatch.StartNew();
             activeServices = new List<OmniService>();
             //Logger
             logger = new();
@@ -67,6 +68,10 @@ namespace Omnipotent.Service_Manager
             timeManager = new();
             timeManager.ReplaceDataManager(this);
             timeManager.ServiceStart();
+        }
+        public TimeSpan GetOverallUptime()
+        {
+            return OverallUptime.Elapsed;
         }
         public bool CreateAndStartNewMonitoredOmniService(OmniService service, bool overrideDuplicatedServiceCheck = false)
         {

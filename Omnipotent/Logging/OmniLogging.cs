@@ -37,8 +37,8 @@ namespace Omnipotent.Logging
             public int position;
         }
 
-        SynchronizedCollection<LoggedMessage> loggedMessages = new();
-        List<LoggedMessage> messages = new();
+        public SynchronizedCollection<LoggedMessage> messagesToLog = new();
+        public List<LoggedMessage> overallMessages = new();
 
         public OmniLogging()
         {
@@ -77,7 +77,7 @@ namespace Omnipotent.Logging
         {
             Action<UserRequest> getLogs = async (req) =>
             {
-                await req.ReturnResponse(JsonConvert.SerializeObject(messages), "application/json");
+                await req.ReturnResponse(JsonConvert.SerializeObject(overallMessages), "application/json");
             };
 
 
@@ -86,10 +86,10 @@ namespace Omnipotent.Logging
 
         private async Task BeginLogLoop()
         {
-            if (loggedMessages.Any())
+            if (messagesToLog.Any())
             {
-                var message = loggedMessages.Last();
-                loggedMessages.Remove(loggedMessages.Last());
+                var message = messagesToLog.Last();
+                messagesToLog.Remove(messagesToLog.Last());
                 if (message.type == LogType.Status)
                 {
                     await WriteStatus(message);
@@ -105,7 +105,7 @@ namespace Omnipotent.Logging
             }
 
             //Replace this with proper waiting
-            while (loggedMessages.Any() == false)
+            while (messagesToLog.Any() == false)
             {
                 await Task.Delay(100);
             }
@@ -143,7 +143,7 @@ namespace Omnipotent.Logging
                 log.message = message;
                 log.type = LogType.Status;
                 log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-                loggedMessages.Add(log);
+                messagesToLog.Add(log);
                 return log;
             }
             catch (ArgumentException ex)
@@ -160,7 +160,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = new ErrorInformation(ex);
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-            loggedMessages.Add(log);
+            messagesToLog.Add(log);
             return log;
         }
 
@@ -169,7 +169,7 @@ namespace Omnipotent.Logging
             loggedmessage.oldMessage = loggedmessage.message;
             loggedmessage.message = newMessage;
             loggedmessage.type = LogType.Update;
-            loggedMessages.Add(loggedmessage);
+            messagesToLog.Add(loggedmessage);
         }
 
         public LoggedMessage LogError(string serviceName, string error)
@@ -180,7 +180,7 @@ namespace Omnipotent.Logging
             log.type = LogType.Error;
             log.errorInfo = null;
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-            loggedMessages.Add(log);
+            messagesToLog.Add(log);
             return log;
         }
 
@@ -203,8 +203,8 @@ namespace Omnipotent.Logging
             Console.ForegroundColor = ConsoleColor.White;
             if (position == null)
             {
-                message.position = messages.Count + 1;
-                messages.Add(message);
+                message.position = overallMessages.Count + 1;
+                overallMessages.Add(message);
             }
         }
 
@@ -212,7 +212,7 @@ namespace Omnipotent.Logging
         {
             try
             {
-                var pos = messages.Find(k => k.logID == message.logID).position;
+                var pos = overallMessages.Find(k => k.logID == message.logID).position;
                 //duct tape solution fix before developing omnilogging
                 if (message.errorInfo == null)
                 {
@@ -222,7 +222,7 @@ namespace Omnipotent.Logging
                 {
                     await WriteError(message, pos).WaitAsync(TimeSpan.FromSeconds(10));
                 }
-                Console.SetCursorPosition(0, messages.Count + 1);
+                Console.SetCursorPosition(0, overallMessages.Count + 1);
             }
             catch (Exception) { }
         }
@@ -259,8 +259,8 @@ namespace Omnipotent.Logging
             Console.ForegroundColor = ConsoleColor.White;
             if (position == null)
             {
-                message.position = messages.Count + 1;
-                messages.Add(message);
+                message.position = overallMessages.Count + 1;
+                overallMessages.Add(message);
             }
         }
 

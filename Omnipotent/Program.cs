@@ -38,6 +38,7 @@ namespace Omnipotent
                 if (OmniPaths.CheckIfOnServer())
                 {
                     omniServiceManager.GetKliveLocalLLMService().TerminateService();
+                    omniServiceManager.GetServiceByClassType<KliveTechHub>()[0].TerminateService();
                 }
 
                 Task.Delay(4000).Wait();
