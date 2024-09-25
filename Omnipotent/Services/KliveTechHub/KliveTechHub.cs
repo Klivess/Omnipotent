@@ -125,7 +125,8 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
-                return BluetoothRadio.IsSupported;
+                client.DiscoverDevices();
+                return true;
             }
             catch (Exception ex)
             {
