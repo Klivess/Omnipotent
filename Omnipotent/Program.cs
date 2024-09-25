@@ -2,6 +2,7 @@
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
 using Humanizer;
 using Omnipotent.Data_Handling;
+using Omnipotent.Klives_Management.General_Analytics;
 using Omnipotent.Logging;
 using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
@@ -32,6 +33,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());

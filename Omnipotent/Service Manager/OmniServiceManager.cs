@@ -160,48 +160,4 @@ namespace Omnipotent.Service_Manager
             }
         }
     }
-    public class OmniServiceMonitor : OmniService
-    {
-        public OmniServiceMonitor()
-        {
-            name = "Omnipotent Service Monitoring";
-            threadAnteriority = ThreadAnteriority.Standard;
-        }
-        public struct OmniMonitoredThread
-        {
-            public string name;
-            public int ManagedThreadID;
-            public int cpuUsage;
-            public int totalFileOperations;
-            public ByteSize memoryUsageInBytes;
-        }
-        private OmniMonitoredThread ConvertOmniServiceToOmniMonitoredThread(OmniService service)
-        {
-            OmniMonitoredThread omniMonitoredThread = new OmniMonitoredThread();
-            omniMonitoredThread.name = service.GetName();
-            omniMonitoredThread.ManagedThreadID = service.GetThread().ManagedThreadId;
-            omniMonitoredThread.cpuUsage = -1;
-            omniMonitoredThread.totalFileOperations = 0;
-            omniMonitoredThread.memoryUsageInBytes = ByteSize.FromBytes(0);
-            return omniMonitoredThread;
-        }
-        List<OmniMonitoredThread> monitoredThreads = new();
-        public void SetServiceToMonitor(OmniService omniMonitored)
-        {
-            try
-            {
-                var monitored = ConvertOmniServiceToOmniMonitoredThread(omniMonitored);
-                monitoredThreads.Add(monitored);
-            }
-            catch (Exception ex)
-            {
-                ServiceLogError(ex, "Error setting service to monitor.");
-            }
-        }
-        public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored { get { return monitoredThreads; } }
-        protected override async void ServiceMain()
-        {
-
-        }
-    }
 }
