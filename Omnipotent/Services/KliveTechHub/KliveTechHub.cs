@@ -121,12 +121,11 @@ namespace Omnipotent.Services.KliveTechHub
                 return this;
             }
         }
-        private bool CheckIfBluetoothProtocolExistsOnDevice()
+        public static bool CheckIfBluetoothProtocolExistsOnDevice()
         {
             try
             {
-                client.DiscoverDevices();
-                return true;
+                return BluetoothRadio.IsSupported;
             }
             catch (Exception ex)
             {
