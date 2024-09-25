@@ -23,6 +23,7 @@ namespace Omnipotent.Services.KliveAPI
     {
         public static int apiPORT = 7777;
         public static int apiHTTPPORT = 5000;
+        public static string domainName = "kliveapi.com"; //This is the domain name that the SSL certificate will be signed for. It should be the same as the domain name that the API will be accessed from.
         public HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
@@ -92,6 +93,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener = new();
                 listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
+                listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
