@@ -123,7 +123,14 @@ namespace Omnipotent.Services.KliveTechHub
         }
         private bool CheckIfBluetoothProtocolExistsOnDevice()
         {
-            return BluetoothRadio.IsSupported;
+            try
+            {
+                return BluetoothRadio.IsSupported;
+            }
+            catch (Exception ex)
+            {
+                return false;
+            }
         }
         protected async override void ServiceMain()
         {

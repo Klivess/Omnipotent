@@ -5,6 +5,7 @@
 
 #Klive Files
 SyncAndStartOmnipotent.bat
+serverBuild/
 
 # User-specific files
 *.rsuser
