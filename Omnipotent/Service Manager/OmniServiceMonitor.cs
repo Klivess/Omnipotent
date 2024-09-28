@@ -16,10 +16,10 @@ namespace Omnipotent.Service_Manager
         public ByteSize MemoryUsage { get; private set; }
         public ByteSize TotalSystemRAM { get; private set; }
         // CPU usage counter
-        private PerformanceCounter cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+        private PerformanceCounter cpuCounter;
 
         // RAM usage counter
-        private PerformanceCounter ramCounter = new PerformanceCounter("Memory", "Available MBytes");
+        private PerformanceCounter ramCounter;
         public struct OmniMonitoredThread
         {
             public string name;
@@ -48,6 +48,7 @@ namespace Omnipotent.Service_Manager
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error setting service to monitor.");
+                TerminateService();
             }
         }
         public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored { get { return monitoredThreads; } }
@@ -68,6 +69,8 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
+                cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+                ramCounter = new PerformanceCounter("Memory", "Available MBytes");
                 while (true)
                 {
                     // Getting CPU usage
