@@ -53,8 +53,15 @@ namespace Omnipotent.Service_Manager
         public List<OmniMonitoredThread> GetCurrentServicesBeingMonitored { get { return monitoredThreads; } }
         protected override async void ServiceMain()
         {
-            Thread ramAndCpuCounters = new(UpdateCPUandRAMCounters);
-            ramAndCpuCounters.Start();
+            try
+            {
+                Thread ramAndCpuCounters = new(UpdateCPUandRAMCounters);
+                ramAndCpuCounters.Start();
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error in ServiceMain.");
+            }
         }
 
         private async void UpdateCPUandRAMCounters()
