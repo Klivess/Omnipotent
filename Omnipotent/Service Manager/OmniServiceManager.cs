@@ -93,6 +93,11 @@ namespace Omnipotent.Service_Manager
             while (logger.IsServiceActive() == false) { Task.Delay(100).Wait(); }
             return ref logger;
         }
+        public ref OmniServiceMonitor GetMonitor()
+        {
+            while (monitor.IsServiceActive() == false) { Task.Delay(100).Wait(); }
+            return ref monitor;
+        }
         public ref TimeManager GetTimeManager()
         {
             while (timeManager.IsServiceActive() == false) { Task.Delay(100).Wait(); }
@@ -120,6 +125,14 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
+                while (true)
+                {
+                    var ser = activeServices.Where(k => k.GetType().Name == typeof(T).Name);
+                    if (ser.Any())
+                    {
+                        break;
+                    }
+                }
                 var services = activeServices.Where(k => k.GetType().Name == typeof(T).Name);
                 return services.ToArray();
             }

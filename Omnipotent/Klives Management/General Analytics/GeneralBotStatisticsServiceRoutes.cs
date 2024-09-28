@@ -13,7 +13,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
 
         public void CreateRoutes()
         {
-            this.g.serviceManager.GetKliveAPIService().CreateRoute("GeneralBotStatistics/GetGeneralBotStatistics", async (req) =>
+            this.g.serviceManager.GetKliveAPIService().CreateRoute("/GeneralBotStatistics/GetFrontpageStats", async (req) =>
             {
                 try
                 {

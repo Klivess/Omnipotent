@@ -59,37 +59,44 @@ namespace Omnipotent.Service_Manager
 
         private async void UpdateCPUandRAMCounters()
         {
-            while (true)
+            try
             {
-                // Getting CPU usage
-                float cpuUsage = cpuCounter.NextValue();
-
-                // Getting Available RAM in MB
-                float availableRAM = ramCounter.NextValue();
-
-                long totalPhysicalMemory = 0;
-
-                // Query for physical memory
-                using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"))
+                while (true)
                 {
-                    foreach (ManagementObject obj in searcher.Get())
+                    // Getting CPU usage
+                    float cpuUsage = cpuCounter.NextValue();
+
+                    // Getting Available RAM in MB
+                    float availableRAM = ramCounter.NextValue();
+
+                    long totalPhysicalMemory = 0;
+
+                    // Query for physical memory
+                    using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"))
                     {
-                        totalPhysicalMemory = Convert.ToInt64(obj["TotalPhysicalMemory"]);
+                        foreach (ManagementObject obj in searcher.Get())
+                        {
+                            totalPhysicalMemory = Convert.ToInt64(obj["TotalPhysicalMemory"]);
+                        }
                     }
+
+                    // Convert to MB
+                    double totalPhysicalMemoryInMB = totalPhysicalMemory / (1024 * 1024);
+
+                    // Calculating used RAM
+                    float usedRAM = (totalPhysicalMemory / (1024 * 1024)) - availableRAM;
+
+                    CPUUsagePercentage = (int)cpuUsage;
+                    MemoryUsage = ByteSize.FromMegaBytes(usedRAM);
+                    TotalSystemRAM = ByteSize.FromMegaBytes(totalPhysicalMemoryInMB);
+                    // Sleep for 1 second before next measurement
+                    await Task.Delay(2000);
                 }
-
-                // Convert to MB
-                double totalPhysicalMemoryInMB = totalPhysicalMemory / (1024 * 1024);
-
-                // Calculating used RAM
-                float usedRAM = (totalPhysicalMemory / (1024 * 1024)) - availableRAM;
-
-                CPUUsagePercentage = (int)cpuUsage;
-                MemoryUsage = ByteSize.FromMegaBytes(usedRAM);
-                TotalSystemRAM = ByteSize.FromMegaBytes(totalPhysicalMemoryInMB);
-
-                // Sleep for 1 second before next measurement
-                await Task.Delay(2000);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Couldn't get CPU and RAM usage, terminating service.");
+                TerminateService();
             }
         }
     }
