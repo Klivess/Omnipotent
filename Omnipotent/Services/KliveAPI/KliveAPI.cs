@@ -105,6 +105,8 @@ namespace Omnipotent.Services.KliveAPI
                 //Create profile manager
                 serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
                 profileManager = (KMProfileManager)serviceManager.GetServiceByClassType<KMProfileManager>()[0];
+
+                CreateMetaKLIVEAPIRoutes();
             }
             catch (Exception ex)
             {
