@@ -3,6 +3,7 @@ using InTheHand.Net.Sockets;
 using LLama.Batched;
 using Markdig.Parsers;
 using Markdig.Syntax;
+using Microsoft.Extensions.ObjectPool;
 using Microsoft.PowerShell.Commands;
 using Microsoft.WSMan.Management;
 using Newtonsoft.Json;
@@ -40,12 +41,14 @@ namespace Omnipotent.Services.KliveTechHub
             public string name;
             public string IPAddress;
             public string gadgetID;
-            public BluetoothDeviceInfo deviceInfo;
-            public BluetoothClient connectedClient;
             public List<KliveTechActions.KliveTechAction> actions;
             public DateTime timeConnected;
-
+            [Newtonsoft.Json.JsonIgnore]
             public Thread ReceiveLoop;
+            [Newtonsoft.Json.JsonIgnore]
+            public BluetoothDeviceInfo deviceInfo;
+            [Newtonsoft.Json.JsonIgnore]
+            public BluetoothClient connectedClient;
             public KliveTechGadget()
             {
                 actions = new();
@@ -76,50 +79,44 @@ namespace Omnipotent.Services.KliveTechHub
             [Newtonsoft.Json.JsonIgnore]
             public TaskCompletionSource<KliveTechGadgetResponse> response;
             public bool isResponseExpected;
+            public KliveTechActions.OperationNumber operation;
 
-            public string SerialiseToKliveTechReadable()
+            public KliveTechGadgetMessage CreateMessage()
             {
-                //Don't send any curly brackets
-                return $"{{ID{{{ID}}} DATA{{{dataToSend}}} RESPEXPECT{{{isResponseExpected.ToString().ToLower()}}}}}";
+                var message = new KliveTechGadgetMessage();
+                message.DATA = dataToSend;
+                message.ID = int.Parse(ID);
+                message.OP = operation;
+                message.RESPEXPECT = isResponseExpected;
+                return message;
             }
         }
         private struct KliveTechGadgetResponse
         {
             //Expected Response: {ID{string} RESP{string} RESPEXPECT{true/false} STATUS{string}}
             public string ID;
-            public string response;
+            public dynamic response;
             public bool isResponseExpected;
             public HttpStatusCode status;
 
-            public KliveTechGadgetResponse DeserialiseKliveTechResponse(string input)
+            public KliveTechGadgetResponse(string response)
             {
-                //Don't receive any curly brackets
-                // Expected Response: {ID{string} RESP{string} RESPEXPECT{true/false} STATUS{string}}
-                // Regular expressions to extract values from the input string
-                string idPattern = @"ID{([^}]*)}";
-                string respPattern = @"RESP{([^}]*)}";
-                string respExpectPattern = @"RESPEXPECT{([^}]*)}";
-                string statusPattern = @"STATUS{([^}]*)}";
-
-                // Extract ID (string)
-                string id = Regex.Match(input, idPattern).Groups[1].Value;
-
-                // Extract RESP (string)
-                string resp = Regex.Match(input, respPattern).Groups[1].Value;
-
-                // Extract RESPEXPECT (bool)
-                bool respExpect = Regex.Match(input, respExpectPattern).Groups[1].Value == "true";
-
-                // Extract STATUS (int)
-                int status = int.Parse(Regex.Match(input, statusPattern).Groups[1].Value);
-
-                //Return
-                ID = id;
-                response = resp;
-                isResponseExpected = respExpect;
-                this.status = (HttpStatusCode)status;
-                return this;
+                dynamic data = JsonConvert.DeserializeObject(response);
+                this.ID = data.ID;
+                this.response = data.DATA;
+                this.isResponseExpected = data.RESPEXPECT;
+                int status = Convert.ToInt32(data.STATUS);
+                HttpStatusCode code = (HttpStatusCode)status;
+                this.status = code;
             }
+        }
+        private struct KliveTechGadgetMessage
+        {
+            //Expected Response: {ID{string} RESP{string} RESPEXPECT{true/false} STATUS{string}}
+            public int ID;
+            public string DATA;
+            public KliveTechActions.OperationNumber OP;
+            public bool RESPEXPECT;
         }
         public static bool CheckIfBluetoothProtocolExistsOnDevice()
         {
@@ -177,7 +174,7 @@ namespace Omnipotent.Services.KliveTechHub
             KliveTechGadgetResponse res;
             try
             {
-                res = await SendData(gadget, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
+                res = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
             }
             catch (Exception ex)
             {
@@ -187,36 +184,14 @@ namespace Omnipotent.Services.KliveTechHub
             }
             if (res.status == HttpStatusCode.OK)
             {
-                try
+                foreach (var item in res.response.Actions)
                 {
-                    // Regular expression pattern to match items in the format ITEMX(name, type, paramDescription)(ENDITEM)
-                    string pattern = @"ITEM\d+\(([^,]+),\s*(\d+),\s*([^)]*)\)\(ENDITEM\)";
-
-                    // Loop through each match in the input string
-                    foreach (Match match in Regex.Matches(res.response, pattern))
-                    {
-                        // Extract name (string)
-                        string name = match.Groups[1].Value;
-
-                        // Extract type (int)
-                        var type = (KliveTechActions.ActionParameterType)int.Parse(match.Groups[2].Value);
-
-                        // Extract paramDescription (string)
-                        string paramDescription = match.Groups[3].Value;
-
-                        //Add the action to the list
-                        var action = new KliveTechActions.KliveTechAction() { name = name, parameters = (KliveTechActions.ActionParameterType)type, paramDescription = paramDescription };
-                        if (gadget.actions.Select(k => k.name).Contains(action.name) == false)
-                        {
-                            gadget.actions.Add(action);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Get Gadget Actions failed, retrying.");
-                    await GetGadgetActions(gadget);
-                    return;
+                    string test = JsonConvert.SerializeObject(item);
+                    KliveTechActions.KliveTechAction action = new();
+                    action.name = item.Name;
+                    action.paramDescription = item.ParamDescription;
+                    action.parameters = (KliveTechActions.ActionParameterType)Convert.ToInt32(item.Type);
+                    gadget.actions.Add(action);
                 }
             }
             else
@@ -225,6 +200,7 @@ namespace Omnipotent.Services.KliveTechHub
                 await GetGadgetActions(gadget);
                 return;
             }
+            ServiceLog($"{gadget.actions.Count} actions added from {gadget.name}");
         }
         private async Task DiscoverNewKliveTechGadgets()
         {
@@ -284,7 +260,21 @@ namespace Omnipotent.Services.KliveTechHub
         }
         private async Task<bool> ExecuteGadgetAction(KliveTechGadget gadget, KliveTechActions.KliveTechAction action, string data)
         {
-            var result = SendData(gadget, $"{action.name}({data})", true);
+            string serial = "";
+            if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+            {
+                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{int.Parse(data)}}}";
+            }
+            else if (action.parameters == KliveTechActions.ActionParameterType.String)
+            {
+                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":\"{data}\"}}";
+            }
+            else if (action.parameters == KliveTechActions.ActionParameterType.Bool)
+            {
+                string dat = data;
+                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{(data == "true").ToString().ToLower()}}}";
+            }
+            var result = SendData(gadget, KliveTechActions.OperationNumber.ExecuteAction, serial, true);
             return (await result).status == HttpStatusCode.OK;
         }
         private async Task ReadDataLoop(KliveTechGadget gadget)
@@ -307,10 +297,6 @@ namespace Omnipotent.Services.KliveTechHub
                         string receivedData = "";
                         while (receivedData.EndsWith(endCommand) == false)
                         {
-                            if (receivedData.StartsWith(startCommand))
-                            {
-                                receivedData = "";
-                            }
                             bytesRead = await stream.ReadAsync(receiveBuffer, 0, receiveBuffer.Length);
                             receivedData += Encoding.UTF8.GetString(receiveBuffer, 0, bytesRead);
                         }
@@ -319,7 +305,7 @@ namespace Omnipotent.Services.KliveTechHub
                         if (!string.IsNullOrEmpty(result.Trim()))
                         {
                             ServiceLog($"Received data from device {gadget.name}: " + result);
-                            KliveTechGadgetResponse Response = new KliveTechGadgetResponse().DeserialiseKliveTechResponse(result);
+                            KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result);
                             if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
                             {
                                 awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
@@ -344,11 +330,12 @@ namespace Omnipotent.Services.KliveTechHub
             thread.Start();
             return;
         }
-        private async Task<KliveTechGadgetResponse> SendData(KliveTechGadget gadget, string data, bool expectResponse = false)
+        private async Task<KliveTechGadgetResponse> SendData(KliveTechGadget gadget, KliveTechActions.OperationNumber operation, string data, bool expectResponse = false)
         {
             DataQueue dataQueue = new DataQueue();
             dataQueue.gadget = gadget;
             dataQueue.dataToSend = data;
+            dataQueue.operation = operation;
             dataQueue.type = DataQueueType.Send;
             dataQueue.ID = RandomGeneration.GenerateRandomLengthOfNumbers(5);
             dataQueue.response = new TaskCompletionSource<KliveTechGadgetResponse>();
@@ -394,7 +381,7 @@ namespace Omnipotent.Services.KliveTechHub
                             }
                             try
                             {
-                                string dataToSend = startCommand + item.SerialiseToKliveTechReadable() + endCommand;
+                                string dataToSend = startCommand + JsonConvert.SerializeObject(item.CreateMessage()) + endCommand;
                                 var firstChar = Encoding.UTF8.GetBytes(startCommand);
                                 byte[] dataBytes = Encoding.UTF8.GetBytes(dataToSend);
                                 await stream.WriteAsync(dataBytes, 0, dataBytes.Length);
@@ -427,14 +414,25 @@ namespace Omnipotent.Services.KliveTechHub
         {
             return connectedGadgets.Where(x => x.gadgetID == id).FirstOrDefault();
         }
+        public KliveTechGadget GetKliveTechGadgetByName(string name)
+        {
+            return connectedGadgets.Where(x => x.name == name).FirstOrDefault();
+        }
         public async Task<bool> ExecuteActionByName(KliveTechGadget gadget, string name, string data)
         {
-            var action = gadget.actions.Where(x => x.name == name).FirstOrDefault();
-            if (action != null)
+            try
             {
-                return await ExecuteGadgetAction(gadget, action, data);
+                var action = gadget.actions.Where(x => x.name == name).FirstOrDefault();
+                if (action != null)
+                {
+                    return await ExecuteGadgetAction(gadget, action, data);
+                }
+                return false;
             }
-            return false;
+            catch (Exception ex)
+            {
+                return false;
+            }
         }
         public async Task<bool> IsDeviceConnected(KliveTechGadget gadget)
         {

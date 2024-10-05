@@ -29,17 +29,20 @@ namespace Omnipotent.Services.KliveTechHub
             {
                 //params: gadgetid, actionid, actionparams
                 string id = req.userParameters["gadgetID"];
+                string gadgetName = req.userParameters["gadgetName"];
                 string actionName = req.userParameters["actionName"];
                 string actionParams = req.userParameters["actionParam"];
-                var g = p.GetKliveTechGadgetByID(id);
-                if (await p.ExecuteActionByName(g, actionName, actionParams))
+                KliveTechHub.KliveTechGadget g;
+                if (string.IsNullOrEmpty(gadgetName))
                 {
-                    await req.ReturnResponse("Action executed successfully!");
+                    g = p.GetKliveTechGadgetByID(id);
                 }
                 else
                 {
-                    await req.ReturnResponse("Action failed to execute!", code: System.Net.HttpStatusCode.InternalServerError);
+                    g = p.GetKliveTechGadgetByID(gadgetName);
                 }
+                p.ExecuteActionByName(g, actionName, actionParams);
+                await req.ReturnResponse("Action executed successfully!");
 
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
         }

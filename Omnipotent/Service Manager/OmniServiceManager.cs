@@ -139,6 +139,7 @@ namespace Omnipotent.Service_Manager
             catch (Exception ex)
             {
                 logger.LogError("Omni Service Manager", ex, "Couldn't get OmniService by class");
+                return GetServiceByClassType<T>();
             }
             return null;
         }

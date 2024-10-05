@@ -85,7 +85,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             try
             {
-                await CheckForSSLCertificate();
+                //await CheckForSSLCertificate();
 
                 //Create API listener
                 ControllerLookup = new();
