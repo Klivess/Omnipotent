@@ -15,6 +15,7 @@ using System.Web;
 using System.Collections.Specialized;
 using Omnipotent.Profiles;
 using System.Management.Automation.Runspaces;
+using static Omnipotent.Profiles.KMProfileManager;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -39,6 +40,7 @@ namespace Omnipotent.Services.KliveAPI
             public HttpListenerContext context;
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
+            public KMProfileManager.KMProfile? user;
             public string userMessageContent;
             public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
@@ -184,9 +186,23 @@ namespace Omnipotent.Services.KliveAPI
                     StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
                     request.userMessageContent = await reader.ReadToEndAsync();
                     request.userParameters = nameValueCollection;
+                    request.user = null;
                     if (!string.IsNullOrEmpty(query))
                     {
                         route = route.Replace(query, "");
+                    }
+                    if (req.Headers.AllKeys.Contains("Authorization"))
+                    {
+                        string password = req.Headers.Get("Authorization");
+                        var profileManager = ((KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]));
+                        if (profileManager.CheckIfProfileExists(password))
+                        {
+                            request.user = await profileManager.GetProfileByPassword(password);
+                        }
+                        else
+                        {
+                            request.user = null;
+                        }
                     }
                     if (ControllerLookup.ContainsKey(route))
                     {
@@ -205,28 +221,17 @@ namespace Omnipotent.Services.KliveAPI
                             }
                             else
                             {
-                                if (req.Headers.AllKeys.Contains("Authorization"))
+                                if (request.user != null)
                                 {
-                                    string password = req.Headers.Get("Authorization");
-                                    var kmProfile = (KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]);
-                                    if (kmProfile.CheckIfProfileExists(password))
+                                    if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
                                     {
-                                        var profile = await kmProfile.GetProfileByPassword(password);
-                                        if (profile.KlivesManagementRank >= routeData.authenticationLevelRequired)
-                                        {
-                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
-                                            ControllerLookup[route].action.Invoke(request);
-                                        }
-                                        else
-                                        {
-                                            ServiceLog($"{profile.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
-                                            DenyRequest(request, DeniedRequestReason.TooLowClearance);
-                                        }
+                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
+                                        ControllerLookup[route].action.Invoke(request);
                                     }
                                     else
                                     {
-                                        ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester has an incorrect password.");
-                                        DenyRequest(request, DeniedRequestReason.InvalidPassword);
+                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
+                                        DenyRequest(request, DeniedRequestReason.TooLowClearance);
                                     }
                                 }
                                 else
