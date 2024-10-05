@@ -32,7 +32,7 @@ namespace Omnipotent.Services.KliveTechHub
                 string gadgetName = req.userParameters["gadgetName"];
                 string actionName = req.userParameters["actionName"];
                 string actionParams = req.userParameters["actionParam"];
-                p.ServiceLog($"Request from {req.user.Name} to execute {gadgetName} gadget action {actionName}");
+                p.ServiceLog($"Request from {req.user.Name} to execute gadget '{gadgetName}' action '{actionName}' with param '{actionParams}'");
                 KliveTechHub.KliveTechGadget g;
                 if (string.IsNullOrEmpty(gadgetName))
                 {
@@ -45,7 +45,7 @@ namespace Omnipotent.Services.KliveTechHub
                 p.ExecuteActionByName(g, actionName, actionParams);
                 await req.ReturnResponse("Action executed successfully!");
 
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Guest);
         }
     }
 }
