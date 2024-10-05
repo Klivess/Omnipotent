@@ -109,11 +109,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
 $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
 
                                 await args.Message.RespondAsync(resp);
-
-                                if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
-                                {
-                                    await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\n Klives's Faked KliveBot Response: {resp}", message.Embeds[0].Color.Value));
-                                }
+                                await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\n Klives's Faked KliveBot Response: {resp}", message.Embeds[0].Color.Value));
                             }
 
                         }

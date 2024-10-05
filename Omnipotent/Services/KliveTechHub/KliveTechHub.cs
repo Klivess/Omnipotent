@@ -57,7 +57,6 @@ namespace Omnipotent.Services.KliveTechHub
             public void DisconnectDevice()
             {
                 connectedClient.Close();
-                connectedClient.Dispose();
                 if (ReceiveLoop.IsAlive)
                 {
                     ReceiveLoop.Interrupt();
