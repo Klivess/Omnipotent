@@ -36,18 +36,25 @@ namespace Omnipotent.Services.KliveBot_Discord
         [SlashCommand("GetConnectedKliveTechGadgets", "Gets all connected KliveTech gadgets and their actions.")]
         public async Task GetKliveTechGadgets(InteractionContext ctx)
         {
-            string gadgets = "";
-            var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
-            foreach (var item in kt.connectedGadgets)
+            try
             {
-                gadgets += $"**Gadget: {item.name}**";
-                foreach (var action in item.actions)
+                string gadgets = "";
+                var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+                foreach (var item in kt.connectedGadgets)
                 {
-                    gadgets += $"\nAction: {action.name} Description: {action.paramDescription}, Accepted Parameter Type: {action.parameters.ToString()}";
+                    gadgets += $"**Gadget: {item.name}**";
+                    foreach (var action in item.actions)
+                    {
+                        gadgets += $"\nAction: {action.name} Description: {action.paramDescription}, Accepted Parameter Type: {action.parameters.ToString()}";
+                    }
+                    gadgets += "\n\n";
                 }
-                gadgets += "\n\n";
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
             }
-            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
+            catch (Exception ex)
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
+            }
         }
 
         [SlashCommand("ActivateKlivetechAction", "Activates a klivetech action.")]
@@ -55,52 +62,59 @@ namespace Omnipotent.Services.KliveBot_Discord
             [Option("Gadget Action", "The action to execute")] string gadgetAction,
             [Option("Gadget Parameter", "The data to send.")] string gadgetParameter)
         {
-            var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
-            if (kt.connectedGadgets.Select(k => k.name).Contains(gadgetName))
+            try
             {
-                var gadget = kt.connectedGadgets.Where(k => k.name == gadgetName).First();
-                if (gadget.actions.Select(k => k.name).Contains(gadgetAction))
+                var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+                if (kt.connectedGadgets.Select(k => k.name).Contains(gadgetName))
                 {
-                    var action = gadget.actions.Where(k => k.name == gadgetAction).First();
-                    if (action.parameters == KliveTechActions.ActionParameterType.Bool)
+                    var gadget = kt.connectedGadgets.Where(k => k.name == gadgetName).First();
+                    if (gadget.actions.Select(k => k.name).Contains(gadgetAction))
                     {
-                        if (gadgetParameter == "true" || gadgetParameter == "false")
+                        var action = gadget.actions.Where(k => k.name == gadgetAction).First();
+                        if (action.parameters == KliveTechActions.ActionParameterType.Bool)
+                        {
+                            if (gadgetParameter == "true" || gadgetParameter == "false")
+                            {
+                                kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
+                                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                            }
+                            else
+                            {
+                                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use 'true' or 'false'"));
+                            }
+                        }
+                        else if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+                        {
+                            if (int.TryParse(gadgetParameter, out int result))
+                            {
+                                //Execute action.
+                                kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
+                                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                            }
+                            else
+                            {
+                                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use an integer."));
+                            }
+                        }
+                        else if (action.parameters == KliveTechActions.ActionParameterType.String)
                         {
                             kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
                             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
                         }
-                        else
-                        {
-                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use 'true' or 'false'"));
-                        }
                     }
-                    else if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+                    else
                     {
-                        if (int.TryParse(gadgetParameter, out int result))
-                        {
-                            //Execute action.
-                            kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
-                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
-                        }
-                        else
-                        {
-                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use an integer."));
-                        }
-                    }
-                    else if (action.parameters == KliveTechActions.ActionParameterType.String)
-                    {
-                        kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
-                        await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                        await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget {gadget.name} found, but not an action with the name '{gadgetAction}'."));
                     }
                 }
                 else
                 {
-                    await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget {gadget.name} found, but not an action with the name '{gadgetAction}'."));
+                    await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget with the name '{gadgetName}' not found or not connected."));
                 }
             }
-            else
+            catch (Exception ex)
             {
-                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget with the name '{gadgetName}' not found or not connected."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
 
