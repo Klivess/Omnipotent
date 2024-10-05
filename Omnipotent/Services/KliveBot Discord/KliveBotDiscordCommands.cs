@@ -33,7 +33,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(uptimes));
         }
-        [SlashCommand("GetConnectedKliveTechGadgets", "Gets all connected KliveTech gadgets and their actions.")]
+        [SlashCommand("getConnectedKliveTechGadgets", "Gets all connected KliveTech gadgets and their actions.")]
         public async Task GetKliveTechGadgets(InteractionContext ctx)
         {
             try
@@ -57,7 +57,21 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
-        [SlashCommand("ActivateKlivetechAction", "Activates a klivetech action.")]
+        [SlashCommand("quitKliveBot", "Quits KliveBot, only Klives can do this.")]
+        public async Task QuitKliveBot(InteractionContext ctx)
+        {
+            if (ctx.Member.Id == OmniPaths.KlivesDiscordAccountID)
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Quitting KliveBot..."));
+                ExistentialBotUtilities.QuitBot();
+            }
+            else
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+            }
+        }
+
+        [SlashCommand("activateKlivetechAction", "Activates a klivetech action.")]
         public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
             [Option("Gadget Action", "The action to execute")] string gadgetAction,
             [Option("Gadget Parameter", "The data to send.")] string gadgetParameter)
