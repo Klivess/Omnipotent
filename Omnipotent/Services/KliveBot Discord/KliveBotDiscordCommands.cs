@@ -3,6 +3,7 @@ using DSharpPlus.SlashCommands;
 using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveTechHub;
 using System.Diagnostics;
 using System.Management.Automation.Subsystem.Prediction;
 using static IsStatementPositiveOrNegative.IsStatementPositiveOrNegative;
@@ -31,6 +32,76 @@ namespace Omnipotent.Services.KliveBot_Discord
                 uptimes += $"Service - {item.GetName()}: {(item.IsServiceActive() ? item.GetServiceUptime().Humanize() : "Inactive")}\n";
             }
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(uptimes));
+        }
+        [SlashCommand("GetConnectedKliveTechGadgets", "Gets all connected KliveTech gadgets and their actions.")]
+        public async Task GetKliveTechGadgets(InteractionContext ctx)
+        {
+            string gadgets = "";
+            var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+            foreach (var item in kt.connectedGadgets)
+            {
+                gadgets += $"**Gadget: {item.name}**";
+                foreach (var action in item.actions)
+                {
+                    gadgets += $"\nAction: {action.name} Description: {action.paramDescription}, Accepted Parameter Type: {action.parameters.ToString()}";
+                }
+                gadgets += "\n\n";
+            }
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
+        }
+
+        [SlashCommand("ActivateKlivetechAction", "Activates a klivetech action.")]
+        public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
+            [Option("Gadget Action", "The action to execute")] string gadgetAction,
+            [Option("Gadget Parameter", "The data to send.")] string gadgetParameter)
+        {
+            var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+            if (kt.connectedGadgets.Select(k => k.name).Contains(gadgetName))
+            {
+                var gadget = kt.connectedGadgets.Where(k => k.name == gadgetName).First();
+                if (gadget.actions.Select(k => k.name).Contains(gadgetAction))
+                {
+                    var action = gadget.actions.Where(k => k.name == gadgetAction).First();
+                    if (action.parameters == KliveTechActions.ActionParameterType.Bool)
+                    {
+                        if (gadgetParameter == "true" || gadgetParameter == "false")
+                        {
+                            kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
+                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                        }
+                        else
+                        {
+                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use 'true' or 'false'"));
+                        }
+                    }
+                    else if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+                    {
+                        if (int.TryParse(gadgetParameter, out int result))
+                        {
+                            //Execute action.
+                            kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
+                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                        }
+                        else
+                        {
+                            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Invalid parameter value, please use an integer."));
+                        }
+                    }
+                    else if (action.parameters == KliveTechActions.ActionParameterType.String)
+                    {
+                        kt.ExecuteActionByName(gadget, gadgetAction, gadgetParameter);
+                        await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Executed action {gadgetAction} on gadget {gadgetName} with parameter {gadgetParameter}"));
+                    }
+                }
+                else
+                {
+                    await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget {gadget.name} found, but not an action with the name '{gadgetAction}'."));
+                }
+            }
+            else
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Gadget with the name '{gadgetName}' not found or not connected."));
+            }
         }
 
         [SlashCommand("analyze", "Analyzes a sentiment using Omnipotent's Sentiment Analysis model")]
