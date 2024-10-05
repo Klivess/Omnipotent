@@ -90,18 +90,28 @@ namespace Omnipotent.Services.KliveBot_Discord
                     }
                     try
                     {
+                        if (serviceManager.GetKliveLocalLLMService().IsServiceActive())
+                        {
+                            string response = "";
+                            if (!sessions.ContainsKey(args.Author.Id))
+                            {
+                                sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                            }
+                            response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
+                            await args.Message.RespondAsync(response);
+                            if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
+                            {
+                                await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
+                            }
+                        }
+                        else
+                        {
+                            string resp = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+        $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
 
-                        string response = "";
-                        if (!sessions.ContainsKey(args.Author.Id))
-                        {
-                            sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                            await args.Message.RespondAsync(resp);
                         }
-                        response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
-                        await args.Message.RespondAsync(response);
-                        if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
-                        {
-                            await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
-                        }
+
                     }
                     catch (Exception ex)
                     {
