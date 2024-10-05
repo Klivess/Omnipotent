@@ -82,14 +82,11 @@ namespace Omnipotent.Services.KliveBot_Discord
                 {
                     DiscordMessageBuilder embed = new DiscordMessageBuilder();
                     DiscordMessage message = null;
-                    if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
-                    {
-                        embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-        $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
-                        message = await SendMessageToKlives(embed);
-                    }
                     try
                     {
+                        embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+$"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
+                        message = await SendMessageToKlives(embed);
                         if (serviceManager.GetKliveLocalLLMService().IsServiceActive())
                         {
                             string response = "";
@@ -106,10 +103,14 @@ namespace Omnipotent.Services.KliveBot_Discord
                         }
                         else
                         {
-                            string resp = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-        $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
+                            if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
+                            {
+                                string resp = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+$"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
 
-                            await args.Message.RespondAsync(resp);
+                                await args.Message.RespondAsync(resp);
+                            }
+
                         }
 
                     }
