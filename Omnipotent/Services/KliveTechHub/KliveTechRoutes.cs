@@ -32,7 +32,7 @@ namespace Omnipotent.Services.KliveTechHub
                 string gadgetName = req.userParameters["gadgetName"];
                 string actionName = req.userParameters["actionName"];
                 string actionParams = req.userParameters["actionParam"];
-                p.ServiceLog($"Request from {}")
+                p.ServiceLog($"Request from {req.user.Name} to execute {gadgetName} gadget action {actionName}");
                 KliveTechHub.KliveTechGadget g;
                 if (string.IsNullOrEmpty(gadgetName))
                 {
