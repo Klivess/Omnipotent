@@ -32,17 +32,17 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
 
-                //Only works on my desktop, need to fix
-                if (OmniPaths.CheckIfOnServer())
+
+                //Services to only execute on debug
+                if (!OmniPaths.CheckIfOnServer())
                 {
-                    omniServiceManager.GetKliveLocalLLMService().TerminateService();
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 }
 
                 Task.Delay(4000).Wait();
