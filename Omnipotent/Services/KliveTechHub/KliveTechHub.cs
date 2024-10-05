@@ -416,7 +416,7 @@ namespace Omnipotent.Services.KliveTechHub
         }
         public KliveTechGadget GetKliveTechGadgetByName(string name)
         {
-            return connectedGadgets.Where(x => x.name == name).FirstOrDefault();
+            return connectedGadgets.Where(x => x.name.ToLower() == name.Trim().ToLower()).FirstOrDefault();
         }
         public async Task<bool> ExecuteActionByName(KliveTechGadget gadget, string name, string data)
         {
