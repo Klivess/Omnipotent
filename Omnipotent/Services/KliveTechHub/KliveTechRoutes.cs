@@ -39,7 +39,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
                 else
                 {
-                    g = p.GetKliveTechGadgetByID(gadgetName);
+                    g = p.GetKliveTechGadgetByName(gadgetName);
                 }
                 p.ExecuteActionByName(g, actionName, actionParams);
                 await req.ReturnResponse("Action executed successfully!");
