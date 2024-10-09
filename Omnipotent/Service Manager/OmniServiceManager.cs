@@ -134,7 +134,11 @@ namespace Omnipotent.Service_Manager
                     }
                 }
                 var services = activeServices.Where(k => k.GetType().Name == typeof(T).Name);
-                return services.ToArray();
+                if (services.Where(k => k.IsServiceActive() == true).Count() == services.Count())
+                {
+                    return services.ToArray();
+                }
+                return new List<OmniService>().ToArray();
             }
             catch (Exception ex)
             {

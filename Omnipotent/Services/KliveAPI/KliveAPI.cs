@@ -247,9 +247,10 @@ namespace Omnipotent.Services.KliveAPI
                         await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                     }
                 }
-                catch (InvalidOperationException ioe)
+                catch (Exception ioe)
                 {
-
+                    ServiceLogError(ioe, "Error in ServerListenLoop");
+                    ServerListenLoop();
                 }
             }
         }

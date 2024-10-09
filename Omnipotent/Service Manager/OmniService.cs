@@ -134,7 +134,7 @@ namespace Omnipotent.Service_Manager
         protected void CatchError(Exception ex)
         {
             //Replace with proper error handling.
-            ServiceLog($"ERROR! Task {name} has crashed due to: " + ex.Message.ToString());
+            ServiceLogError(new Exception($"ERROR! Task {name} has crashed due to: " + ex.Message.ToString()));
         }
 
         public OmniService()
