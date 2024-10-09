@@ -8,7 +8,9 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Web.Razor.Tokenizer.Symbols;
 using Omnipotent.Data_Handling;
+using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveBot_Discord;
 using static Omnipotent.Threading.WindowsInvokes;
 
 namespace Omnipotent.Service_Manager
@@ -102,6 +104,13 @@ namespace Omnipotent.Service_Manager
                     {
                         try
                         {
+                            //Thread Error Handler
+                            AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
+                            {
+                                ServiceLogError((Exception)e.ExceptionObject, "Thread Unhandled Error!");
+                                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed($"Unhandled error caught in {name} service!",
+                                    new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
+                            });
                             ServiceMain(); Task.Delay(-1).Wait();
                         }
                         catch (ThreadInterruptedException interrupt) { }

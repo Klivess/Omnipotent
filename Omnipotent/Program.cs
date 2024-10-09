@@ -16,6 +16,7 @@ using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
 using System;
 using System.Drawing;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace Omnipotent
 {
@@ -27,9 +28,19 @@ namespace Omnipotent
             OmniServiceManager omniServiceManager = new OmniServiceManager();
             try
             {
+
                 //Create services
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
+
+                //Error Handlers
+                AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
+                {
+                    OmniLogging.LogErrorStatic("Main Thread", (Exception)e.ExceptionObject, "Unhandled Error!");
+                    await omniServiceManager.GetKliveBotDiscordService().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed("Unhandled error caught in main thread!",
+                        new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
+                });
+
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
@@ -51,13 +62,6 @@ namespace Omnipotent
                 {
                     ((KliveBotDiscord)omniServiceManager.GetServiceByClassType<KliveBotDiscord>()[0]).SendMessageToKlives("Omnipotent online!");
                 }
-                //Error Handlers
-                AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
-                {
-                    OmniLogging.LogErrorStatic("Main Thread", (Exception)e.ExceptionObject, "Unhandled Error!");
-                    await omniServiceManager.GetKliveBotDiscordService().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed("Unhandled error caught in main thread!",
-                        new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
-                });
             }
             catch (Exception ex)
             {

@@ -70,11 +70,10 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
-
         [SlashCommand("activateKlivetechAction", "Activates a klivetech action.")]
         public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
-            [Option("Gadget Action", "The action to execute")] string gadgetAction,
-            [Option("Gadget Parameter", "The data to send.")] string gadgetParameter)
+    [Option("Gadget Action", "The action to execute")] string gadgetAction,
+    [Option("Gadget Parameter", "The data to send.")] string gadgetParameter)
         {
             try
             {
