@@ -1,4 +1,5 @@
-﻿using InTheHand.Net.Bluetooth;
+﻿using DSharpPlus;
+using InTheHand.Net.Bluetooth;
 using InTheHand.Net.Sockets;
 using LLama.Batched;
 using Markdig.Parsers;
@@ -203,59 +204,73 @@ namespace Omnipotent.Services.KliveTechHub
         }
         private async Task DiscoverNewKliveTechGadgets()
         {
-            BluetoothDeviceInfo[] devicesInRadius = client.DiscoverDevices();
-            foreach (BluetoothDeviceInfo device in devicesInRadius)
+            try
             {
-                try
+                BluetoothDeviceInfo[] devicesInRadius = client.DiscoverDevices();
+                foreach (BluetoothDeviceInfo device in devicesInRadius)
                 {
-                    //if name starts with klivetech and it's not already connected
-                    if (device.DeviceName.ToLower().StartsWith("klivetech") && connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).Count() == 0)
+                    try
                     {
-                        try
+                        //if name starts with klivetech and it's not already connected
+                        if (device.DeviceName.ToLower().StartsWith("klivetech") && connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).Count() == 0)
                         {
-                            KliveTechGadget gadget = new KliveTechGadget();
-                            gadget.name = device.DeviceName;
-                            gadget.IPAddress = device.DeviceAddress.ToString();
-                            gadget.deviceInfo = device;
-                            gadget.connectedClient = new BluetoothClient();
-                            gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
-                            gadget.timeConnected = DateTime.Now;
-                            ServiceLog("Found KliveTech gadget: " + gadget.name);
-                            gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
-                            gadget.ReceiveLoop.Start();
-                            connectedGadgets.Add(gadget);
-                            Thread GetGadgActions = new(async () =>
+                            try
                             {
-                                while (true)
+                                KliveTechGadget gadget = new KliveTechGadget();
+                                gadget.name = device.DeviceName;
+                                gadget.IPAddress = device.DeviceAddress.ToString();
+                                gadget.deviceInfo = device;
+                                gadget.connectedClient = new BluetoothClient();
+                                gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
+                                gadget.timeConnected = DateTime.Now;
+                                ServiceLog("Found KliveTech gadget: " + gadget.name);
+                                gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
+                                gadget.ReceiveLoop.Start();
+                                connectedGadgets.Add(gadget);
+                                Thread GetGadgActions = new(async () =>
                                 {
-                                    try
+                                    while (true)
                                     {
-                                        await GetGadgetActions(gadget);
-                                        break;
+                                        try
+                                        {
+                                            await GetGadgetActions(gadget);
+                                            break;
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            ServiceLogError(ex);
+                                        }
                                     }
-                                    catch (Exception ex)
-                                    {
-                                        ServiceLogError(ex);
-                                    }
-                                }
-                            });
-                            GetGadgActions.Start();
-                        }
-                        catch (Exception ex)
-                        {
-                            ServiceLogError(ex);
-                            DiscoverNewKliveTechGadgets();
-                            return;
+                                });
+                                GetGadgActions.Start();
+                            }
+                            catch (Exception ex)
+                            {
+                                ServiceLogError(ex);
+                                DiscoverNewKliveTechGadgets();
+                                return;
+                            }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        ServiceLogError(ex);
+                    }
                 }
-                catch (Exception ex)
+                GC.Collect();
+                //Prevent stack overflow
+                await Task.Delay(5000);
+                DiscoverNewKliveTechGadgets();
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Discover klivetech gadgets failed!");
+                var result = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
+                if (result == "Retry")
                 {
-                    ServiceLogError(ex);
+                    DiscoverNewKliveTechGadgets();
                 }
             }
-            GC.Collect();
-            DiscoverNewKliveTechGadgets();
         }
         private async Task<bool> ExecuteGadgetAction(KliveTechGadget gadget, KliveTechActions.KliveTechAction action, string data)
         {
