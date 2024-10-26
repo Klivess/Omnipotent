@@ -314,22 +314,29 @@ namespace Omnipotent.Services.KliveTechHub
         }
         private async Task<bool> ExecuteGadgetAction(KliveTechGadget gadget, KliveTechActions.KliveTechAction action, string data)
         {
-            string serial = "";
-            if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+            if (gadget.isOnline)
             {
-                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{int.Parse(data)}}}";
+                string serial = "";
+                if (action.parameters == KliveTechActions.ActionParameterType.Integer)
+                {
+                    serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{int.Parse(data)}}}";
+                }
+                else if (action.parameters == KliveTechActions.ActionParameterType.String)
+                {
+                    serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":\"{data}\"}}";
+                }
+                else if (action.parameters == KliveTechActions.ActionParameterType.Bool)
+                {
+                    string dat = data;
+                    serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{(data == "true").ToString().ToLower()}}}";
+                }
+                var result = SendData(gadget, KliveTechActions.OperationNumber.ExecuteAction, serial, true);
+                return (await result).status == HttpStatusCode.OK;
             }
-            else if (action.parameters == KliveTechActions.ActionParameterType.String)
+            else
             {
-                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":\"{data}\"}}";
+                return false;
             }
-            else if (action.parameters == KliveTechActions.ActionParameterType.Bool)
-            {
-                string dat = data;
-                serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{(data == "true").ToString().ToLower()}}}";
-            }
-            var result = SendData(gadget, KliveTechActions.OperationNumber.ExecuteAction, serial, true);
-            return (await result).status == HttpStatusCode.OK;
         }
         private async Task ReadDataLoop(KliveTechGadget gadget)
         {
@@ -416,7 +423,7 @@ namespace Omnipotent.Services.KliveTechHub
                     {
                         if (item.type == DataQueueType.Send)
                         {
-                            if (await IsDeviceConnected(item.gadget) == false)
+                            if (await IsDeviceConnected(item.gadget) == false || item.gadget.isOnline == false)
                             {
                                 AnnounceGadgetDisconnect(item.gadget);
                                 return;
