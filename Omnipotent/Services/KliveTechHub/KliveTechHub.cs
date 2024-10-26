@@ -282,6 +282,7 @@ namespace Omnipotent.Services.KliveTechHub
                 gadget.timeConnected = DateTime.Now;
                 ServiceLog("Found KliveTech gadget: " + gadget.name);
                 await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
+                RememberKliveTechDevice(gadget);
                 gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
                 gadget.ReceiveLoop.Start();
                 Thread GetGadgActions = new(async () =>
