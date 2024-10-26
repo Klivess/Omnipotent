@@ -1,4 +1,5 @@
 ﻿using DSharpPlus;
+using InTheHand.Net;
 using InTheHand.Net.Bluetooth;
 using InTheHand.Net.Sockets;
 using LLama.Batched;
@@ -42,6 +43,7 @@ namespace Omnipotent.Services.KliveTechHub
         {
             public string name;
             public string IPAddress;
+            public long IPAddressLong;
             public string gadgetID;
             public List<KliveTechActions.KliveTechAction> actions;
             public DateTime timeConnected;
@@ -164,7 +166,7 @@ namespace Omnipotent.Services.KliveTechHub
                 if (file.EndsWith(".kliveTechGadget"))
                 {
                     KliveTechGadget kliveTechGadget = JsonConvert.DeserializeObject<KliveTechGadget>(await GetDataHandler().ReadDataFromFile(file));
-                    await TryConnectToDevice(new BluetoothDeviceInfo(new InTheHand.Net.BluetoothAddress(Convert.ToByte(kliveTechGadget.IPAddress))));
+                    await TryConnectToDevice(new BluetoothDeviceInfo(new BluetoothAddress(kliveTechGadget.IPAddressLong)));
                 }
             }
             ServiceLog("Finished reconnecting to remembered KliveTech gadgets. " + connectedGadgets.Count + " gadgets in memory.");
@@ -277,6 +279,7 @@ namespace Omnipotent.Services.KliveTechHub
                 gadget.IPAddress = device.DeviceAddress.ToString();
                 gadget.deviceInfo = device;
                 gadget.connectedClient = new BluetoothClient();
+                gadget.IPAddressLong = device.DeviceAddress.ToInt64();
                 gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
                 gadget.isOnline = true;
                 gadget.timeConnected = DateTime.Now;
