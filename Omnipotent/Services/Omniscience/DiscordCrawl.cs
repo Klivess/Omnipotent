@@ -40,7 +40,14 @@ namespace Omnipotent.Services.Omniscience
             time.Stop();
             ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
             UpdateDiscordMessageDatabase();
-
+            int wordCount = 0;
+            foreach (var item in AllCapturedMessages)
+            {
+                if (item.AuthorID == 626500762540834848)
+                {
+                    wordCount += item.MessageContent.Split(" ").Length;
+                }
+            }
             foreach (var item in LinkedUsers)
             {
                 item.websocketInterface = new(this, item);
@@ -51,7 +58,23 @@ namespace Omnipotent.Services.Omniscience
                     await SaveDiscordGuild(guild);
                 }
             }
+            int kliveWordCount = 0;
+            foreach (var item in AllCapturedMessages)
+            {
+                if (item.PostedInChannelID == 1059223309260181615)
+                {
+                    kliveWordCount += item.MessageContent.Split(" ").Length;
+                }
+            }
             ServiceLog($"{(await GetAllDownloadedGuilds()).Length} guilds in database.");
+            int kliveWordCounts = 0;
+            foreach (var item in AllCapturedMessages)
+            {
+                if (item.PostedInChannelID == 1059223309260181615 && item.AuthorID.ToString() == OmniPaths.KlivesDiscordAccountID.ToString())
+                {
+                    kliveWordCounts += item.MessageContent.Split(" ").Length;
+                }
+            }
             discordInterface.NewOmniDiscordUserAdded += (async (user) =>
                 {
                     LinkedUsers.Add(user);

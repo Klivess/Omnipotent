@@ -32,7 +32,7 @@ namespace Omnipotent.Services.KliveAPI
 
 
         //deprecated
-        private void CreateInstallCert(int expDateYears, string password, string issuedBy)
+        public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
             // Create/install certificate
             using (var powerShell = System.Management.Automation.PowerShell.Create())
@@ -107,7 +107,11 @@ namespace Omnipotent.Services.KliveAPI
                     $" -Password $pwd"; // Use the previous password
                 powerShell.AddScript(exportPfxScript);
 
-                powerShell.Invoke();
+
+
+                var output = await powerShell.InvokeAsync();
+
+                parent.ServiceLog("Created and installed certificate.");
             }
         }
     }

@@ -99,9 +99,11 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
+                await CheckForSSLCertificate();
+
                 listener.Start();
 
-                ServiceLog($"Listening on HTTPS port {apiPORT} and HTTP port {apiHTTPPORT}...");
+                ServiceLog($"Listening on: {string.Join(", ", listener.Prefixes)}");
 
                 ServerListenLoop();
                 //Create profile manager
@@ -136,10 +138,7 @@ namespace Omnipotent.Services.KliveAPI
         private async Task CheckForSSLCertificate()
         {
             certInstaller = new(this);
-            if (!(await certInstaller.IsCertbotInstalled()))
-            {
-                await certInstaller.InstallCertBot();
-            }
+            certInstaller.CreateInstallCert(10, "klives", "KliveAPI");
 
             //var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Enter a password for KliveAPI's SSL Certificate", "Enter a password to sign the self-signed SSL certificate for KliveAPI.", TimeSpan.FromDays(3), "SSL Certificate Password", "SSL Password");
         }

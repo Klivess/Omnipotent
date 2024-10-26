@@ -18,6 +18,7 @@ using System.Text;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Web.Helpers;
+using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Services.KliveTechHub
@@ -44,10 +45,11 @@ namespace Omnipotent.Services.KliveTechHub
             public string gadgetID;
             public List<KliveTechActions.KliveTechAction> actions;
             public DateTime timeConnected;
+            public BluetoothDeviceInfo deviceInfo;
+            public bool isOnline;
+
             [Newtonsoft.Json.JsonIgnore]
             public Thread ReceiveLoop;
-            [Newtonsoft.Json.JsonIgnore]
-            public BluetoothDeviceInfo deviceInfo;
             [Newtonsoft.Json.JsonIgnore]
             public BluetoothClient connectedClient;
             public KliveTechGadget()
@@ -139,6 +141,7 @@ namespace Omnipotent.Services.KliveTechHub
             }
             KliveTechRoutes = new(this);
             KliveTechRoutes.RegisterRoutes();
+            await ReconnectToRememberedDevices();
             Task sendDataLoop = new Task(async () => { SendDataLoop(); });
             Task checkConnectionStatusOfGadgets = new Task(async () => { CheckConnectionStatusOfGadgets(); });
             Task discoverNewGadgets = new Task(async () => { DiscoverNewKliveTechGadgets(); });
@@ -146,6 +149,25 @@ namespace Omnipotent.Services.KliveTechHub
             checkConnectionStatusOfGadgets.Start();
             discoverNewGadgets.Start();
             //SendData(connectedGadgets.Last(), "Hello from KliveTech Hub!");
+        }
+        public async Task RememberKliveTechDevice(KliveTechGadget gadget)
+        {
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveTechHubGadgetsDirectory), $"{gadget.name}.kliveTechGadget");
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(gadget));
+        }
+        public async Task ReconnectToRememberedDevices()
+        {
+            ServiceLog("Reconnecting to remembered KliveTech gadgets.");
+            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveTechHubGadgetsDirectory));
+            foreach (var file in files)
+            {
+                if (file.EndsWith(".kliveTechGadget"))
+                {
+                    KliveTechGadget kliveTechGadget = JsonConvert.DeserializeObject<KliveTechGadget>(await GetDataHandler().ReadDataFromFile(file));
+                    await TryConnectToDevice(new BluetoothDeviceInfo(new InTheHand.Net.BluetoothAddress(Convert.ToByte(kliveTechGadget.IPAddress))));
+                }
+            }
+            ServiceLog("Finished reconnecting to remembered KliveTech gadgets. " + connectedGadgets.Count + " gadgets in memory.");
         }
         public async void CheckConnectionStatusOfGadgets()
         {
@@ -216,33 +238,7 @@ namespace Omnipotent.Services.KliveTechHub
                         {
                             try
                             {
-                                KliveTechGadget gadget = new KliveTechGadget();
-                                gadget.name = device.DeviceName;
-                                gadget.IPAddress = device.DeviceAddress.ToString();
-                                gadget.deviceInfo = device;
-                                gadget.connectedClient = new BluetoothClient();
-                                gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
-                                gadget.timeConnected = DateTime.Now;
-                                ServiceLog("Found KliveTech gadget: " + gadget.name);
-                                gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
-                                gadget.ReceiveLoop.Start();
-                                connectedGadgets.Add(gadget);
-                                Thread GetGadgActions = new(async () =>
-                                {
-                                    while (true)
-                                    {
-                                        try
-                                        {
-                                            await GetGadgetActions(gadget);
-                                            break;
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            ServiceLogError(ex);
-                                        }
-                                    }
-                                });
-                                GetGadgActions.Start();
+                                TryConnectToDevice(device);
                             }
                             catch (Exception ex)
                             {
@@ -269,6 +265,50 @@ namespace Omnipotent.Services.KliveTechHub
                 if (result == "Retry")
                 {
                     DiscoverNewKliveTechGadgets();
+                }
+            }
+        }
+        public async Task TryConnectToDevice(BluetoothDeviceInfo device)
+        {
+            KliveTechGadget gadget = new KliveTechGadget();
+            try
+            {
+                gadget.name = device.DeviceName;
+                gadget.IPAddress = device.DeviceAddress.ToString();
+                gadget.deviceInfo = device;
+                gadget.connectedClient = new BluetoothClient();
+                gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
+                gadget.isOnline = true;
+                gadget.timeConnected = DateTime.Now;
+                ServiceLog("Found KliveTech gadget: " + gadget.name);
+                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
+                gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
+                gadget.ReceiveLoop.Start();
+                Thread GetGadgActions = new(async () =>
+                {
+                    while (true)
+                    {
+                        try
+                        {
+                            await GetGadgetActions(gadget);
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            ServiceLogError(ex);
+                        }
+                    }
+                });
+                connectedGadgets.Add(gadget);
+                GetGadgActions.Start();
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError("Couldn't connect to klivetech device: " + device.DeviceName);
+                if (!string.IsNullOrEmpty(gadget.name))
+                {
+                    gadget.isOnline = false;
+                    connectedGadgets.Add(gadget);
                 }
             }
         }

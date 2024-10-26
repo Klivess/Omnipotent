@@ -48,6 +48,10 @@ namespace Omnipotent.Data_Handling
             public static string KliveLocalLLMDirectory = $"{SavedDataDirectory}/KliveLocalLLM";
             public static string KliveLocalLLMModelsDirectory = $"{KliveLocalLLMDirectory}/LLMModels";
 
+            //KliveTechHub
+            public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
+            public static string KliveTechHubGadgetsDirectory = $"{SavedDataDirectory}/KliveTechHub/KliveTechGadgets";
+
 
         };
 
