@@ -45,9 +45,9 @@ namespace Omnipotent.Services.KliveTechHub
             public string gadgetID;
             public List<KliveTechActions.KliveTechAction> actions;
             public DateTime timeConnected;
-            public BluetoothDeviceInfo deviceInfo;
             public bool isOnline;
-
+            [Newtonsoft.Json.JsonIgnore]
+            public BluetoothDeviceInfo deviceInfo;
             [Newtonsoft.Json.JsonIgnore]
             public Thread ReceiveLoop;
             [Newtonsoft.Json.JsonIgnore]
