@@ -46,6 +46,18 @@ namespace Omnipotent.Services.KliveTechHub
                 await req.ReturnResponse("Action executed successfully!");
 
             }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Guest);
+            p.serviceManager.GetKliveAPIService().CreateRoute("/klivetech/GetGadgetByID", async (req) =>
+            {
+                try
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(p.connectedGadgets.Find(k => k.gadgetID == req.userParameters["gadgetID"])));
+                }
+                catch (Exception ex)
+                {
+                    ErrorInformation er = new ErrorInformation(ex);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(er), code: System.Net.HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
         }
     }
 }

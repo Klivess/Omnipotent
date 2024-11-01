@@ -257,7 +257,7 @@ namespace Omnipotent.Services.KliveAPI
                         {
                             if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                             {
-                                ServiceLog($"Unauthenticated route {route} has been requested.");
+                                //ServiceLog($"Unauthenticated route {route} has been requested.");
                                 ControllerLookup[route].action.Invoke(request);
                             }
                             else
