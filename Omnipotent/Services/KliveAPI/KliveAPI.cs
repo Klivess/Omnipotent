@@ -130,6 +130,10 @@ namespace Omnipotent.Services.KliveAPI
                 string code = $"<script>window.location.replace('{url}');</script>";
                 await req.ReturnResponse(code, "text/html");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            await CreateRoute("/ping", async (req) =>
+            {
+                await req.ReturnResponse("Pong", "text/html");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
         }
 
         private void KliveAPI_ServiceQuitRequest()
