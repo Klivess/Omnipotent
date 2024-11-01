@@ -6,7 +6,13 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
 		<StartupObject>Omnipotent.Program</StartupObject>
+		<ApplicationIcon>favicon.ico</ApplicationIcon>
+		<ApplicationManifest>app.manifest</ApplicationManifest>
 	</PropertyGroup>
+
+	<ItemGroup>
+		<Content Include="favicon.ico" />
+	</ItemGroup>
 
 	<ItemGroup>
 		<PackageReference Include="32feet.NET" Version="3.5.0" />

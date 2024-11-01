@@ -16,6 +16,9 @@ using System.Collections.Specialized;
 using Omnipotent.Profiles;
 using System.Management.Automation.Runspaces;
 using static Omnipotent.Profiles.KMProfileManager;
+using System.Security.Cryptography.X509Certificates;
+using System.Management.Automation;
+using System.Diagnostics;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -100,6 +103,7 @@ namespace Omnipotent.Services.KliveAPI
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
                 await CheckForSSLCertificate();
+                await LinkSSLCertificate(certInstaller.rootAuthorityCrtPath);
 
                 listener.Start();
 
@@ -138,9 +142,43 @@ namespace Omnipotent.Services.KliveAPI
         private async Task CheckForSSLCertificate()
         {
             certInstaller = new(this);
-            certInstaller.CreateInstallCert(10, "klives", "KliveAPI");
+            if (!(await certInstaller.IsCertificateCreated()))
+            {
+                await certInstaller.CreateInstallCert(10, "klives", "KliveAPI");
+            }
+        }
 
-            //var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("Enter a password for KliveAPI's SSL Certificate", "Enter a password to sign the self-signed SSL certificate for KliveAPI.", TimeSpan.FromDays(3), "SSL Certificate Password", "SSL Password");
+        private async Task LinkSSLCertificate(string pathToCrt)
+        {
+            // Load the certificate from the .crt file
+            string crtFilePath = pathToCrt;
+
+            X509Certificate2 certificate = new X509Certificate2(crtFilePath);
+
+            // Get the certificate hash (thumbprint)
+            string certHash = certificate.Thumbprint;
+
+            string script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            // Set up the process start info
+            ProcessStartInfo processInfo = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = script,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            // Start the process
+            Process process = new Process();
+            process.StartInfo = processInfo;
+            process.Start();
+
+            // Read the output and errors
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
         }
 
         //Example of how to define a route

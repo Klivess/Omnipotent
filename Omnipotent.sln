@@ -5,6 +5,11 @@ VisualStudioVersion = 17.6.33801.468
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Omnipotent", "Omnipotent\Omnipotent.csproj", "{1DCE094F-D0E7-400A-9C10-3C3E34349CC8}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{4CBBE89A-D49D-470D-B761-D8FD2DF91D32}"
+	ProjectSection(SolutionItems) = preProject
+		app.manifest = app.manifest
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU

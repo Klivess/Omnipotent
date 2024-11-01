@@ -11,6 +11,11 @@ namespace Omnipotent.Services.KliveAPI
     public class CertificateInstaller
     {
         KliveAPI parent;
+        public static string saveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPICertificateDirectory);
+        public string rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
+        public string rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
+        public string myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
+        public string myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
         public CertificateInstaller(KliveAPI service)
         {
             parent = service;
@@ -28,6 +33,17 @@ namespace Omnipotent.Services.KliveAPI
             const string url = "https://github.com/certbot/certbot/releases/tag/v2.11.0";
 
         }
+        public async Task<bool> IsCertificateCreated()
+        {
+            if (!System.IO.File.Exists(rootAuthorityCrtPath) || !System.IO.File.Exists(rootAuthorityPfxPath) || !System.IO.File.Exists(myGatewayCrtPath) || !System.IO.File.Exists(myGatewayPfxPath))
+            {
+                return false;
+            }
+            else
+            {
+                return true;
+            }
+        }
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
             // Create/install certificate
@@ -36,14 +52,9 @@ namespace Omnipotent.Services.KliveAPI
                 var notAfter = DateTime.Now.AddYears(expDateYears).ToLongDateString();
                 var assemPath = Assembly.GetCallingAssembly().Location;
                 var fileInfo = new FileInfo(assemPath);
-                var saveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPICertificateDirectory);
                 // This adds certificate to Personal and Intermediate Certification Authority
                 var rootAuthorityName = "KliveAPI";
-                var rootFriendlyName = "Klive API";
-                var rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
-                var rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
-                var myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
-                var myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
+                string rootFriendlyName = "Klive API";
                 System.IO.File.Create(rootAuthorityCrtPath).Close();
                 System.IO.File.Create(rootAuthorityPfxPath).Close();
                 System.IO.File.Create(myGatewayCrtPath).Close();
