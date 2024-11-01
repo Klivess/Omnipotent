@@ -1,6 +1,7 @@
 ﻿using ByteSizeLib;
 using System.Diagnostics;
 using System.Management;
+using System.Runtime.InteropServices;
 
 namespace Omnipotent.Service_Manager
 {
@@ -70,14 +71,10 @@ namespace Omnipotent.Service_Manager
             try
             {
                 cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                ramCounter = new PerformanceCounter("Memory", "Available MBytes");
                 while (true)
                 {
                     // Getting CPU usage
                     float cpuUsage = cpuCounter.NextValue();
-
-                    // Getting Available RAM in MB
-                    float availableRAM = ramCounter.NextValue();
 
                     long totalPhysicalMemory = 0;
 
@@ -94,7 +91,7 @@ namespace Omnipotent.Service_Manager
                     double totalPhysicalMemoryInMB = totalPhysicalMemory / (1024 * 1024);
 
                     // Calculating used RAM
-                    float usedRAM = (totalPhysicalMemory / (1024 * 1024)) - availableRAM;
+                    float usedRAM = (totalPhysicalMemory / (1024 * 1024)) - PerformanceInfo.GetPhysicalAvailableMemoryInMiB();
 
                     CPUUsagePercentage = (int)cpuUsage;
                     MemoryUsage = ByteSize.FromMegaBytes(usedRAM);
@@ -107,6 +104,60 @@ namespace Omnipotent.Service_Manager
             {
                 ServiceLogError(ex, "Couldn't get CPU and RAM usage, terminating service.");
                 TerminateService();
+            }
+        }
+
+        public static class PerformanceInfo
+        {
+            [DllImport("psapi.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool GetPerformanceInfo([Out] out PerformanceInformation PerformanceInformation, [In] int Size);
+
+            [StructLayout(LayoutKind.Sequential)]
+            public struct PerformanceInformation
+            {
+                public int Size;
+                public IntPtr CommitTotal;
+                public IntPtr CommitLimit;
+                public IntPtr CommitPeak;
+                public IntPtr PhysicalTotal;
+                public IntPtr PhysicalAvailable;
+                public IntPtr SystemCache;
+                public IntPtr KernelTotal;
+                public IntPtr KernelPaged;
+                public IntPtr KernelNonPaged;
+                public IntPtr PageSize;
+                public int HandlesCount;
+                public int ProcessCount;
+                public int ThreadCount;
+            }
+
+            public static Int64 GetPhysicalAvailableMemoryInMiB()
+            {
+                PerformanceInformation pi = new PerformanceInformation();
+                if (GetPerformanceInfo(out pi, Marshal.SizeOf(pi)))
+                {
+                    return Convert.ToInt64((pi.PhysicalAvailable.ToInt64() * pi.PageSize.ToInt64() / 1048576));
+                }
+                else
+                {
+                    return -1;
+                }
+
+            }
+
+            public static Int64 GetTotalMemoryInMiB()
+            {
+                PerformanceInformation pi = new PerformanceInformation();
+                if (GetPerformanceInfo(out pi, Marshal.SizeOf(pi)))
+                {
+                    return Convert.ToInt64((pi.PhysicalTotal.ToInt64() * pi.PageSize.ToInt64() / 1048576));
+                }
+                else
+                {
+                    return -1;
+                }
+
             }
         }
     }

@@ -34,11 +34,13 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 fpstats.TotalStatusLogs = serviceManager.GetLogger().overallMessages.Where(k => k.type == OmniLogging.LogType.Status).Count();
                 fpstats.TotalErrorLogs = serviceManager.GetLogger().overallMessages.Where(k => k.type == OmniLogging.LogType.Error).Count();
                 fpstats.TotalLogs = serviceManager.GetLogger().overallMessages.Count();
-                fpstats.RamUsagePercentageGB = (serviceManager.GetMonitor().MemoryUsage.Bytes / serviceManager.GetMonitor().TotalSystemRAM.Bytes) * 100;
-                fpstats.CpuUsagePercentage = Convert.ToInt32(serviceManager.GetMonitor().CPUUsagePercentage);
-                fpstats.RamTotalGB = serviceManager.GetMonitor().TotalSystemRAM.GigaBytes;
-
-
+                try
+                {
+                    fpstats.RamUsagePercentageGB = (serviceManager.GetMonitor().MemoryUsage.Bytes / serviceManager.GetMonitor().TotalSystemRAM.Bytes) * 100;
+                    fpstats.CpuUsagePercentage = Convert.ToInt32(serviceManager.GetMonitor().CPUUsagePercentage);
+                    fpstats.RamTotalGB = serviceManager.GetMonitor().TotalSystemRAM.GigaBytes;
+                }
+                catch (Exception ex) { }
 
                 fpstats.TimeStatisticsGenerated = DateTime.Now;
                 await Task.Delay(5000);
