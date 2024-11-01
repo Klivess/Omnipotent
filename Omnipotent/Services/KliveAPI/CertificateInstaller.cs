@@ -28,10 +28,6 @@ namespace Omnipotent.Services.KliveAPI
             const string url = "https://github.com/certbot/certbot/releases/tag/v2.11.0";
 
         }
-
-
-
-        //deprecated
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
             // Create/install certificate
@@ -44,7 +40,14 @@ namespace Omnipotent.Services.KliveAPI
                 // This adds certificate to Personal and Intermediate Certification Authority
                 var rootAuthorityName = "KliveAPI";
                 var rootFriendlyName = "Klive API";
-
+                var rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
+                var rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
+                var myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
+                var myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
+                System.IO.File.Create(rootAuthorityCrtPath).Close();
+                System.IO.File.Create(rootAuthorityPfxPath).Close();
+                System.IO.File.Create(myGatewayCrtPath).Close();
+                System.IO.File.Create(myGatewayPfxPath).Close();
 
                 // Create the root certificate
                 var rootAuthorityScript =
@@ -57,7 +60,6 @@ namespace Omnipotent.Services.KliveAPI
                 powerShell.AddScript(rootAuthorityScript);
 
                 // Export CRT file
-                var rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
                 var exportAuthorityCrtScript =
                     $"$rootAuthorityPath = 'cert:\\localMachine\\my\\' + $rootAuthority.thumbprint;" +
                     $"Export-Certificate" +
@@ -66,7 +68,6 @@ namespace Omnipotent.Services.KliveAPI
                 powerShell.AddScript(exportAuthorityCrtScript);
 
                 // Export PFX file
-                var rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
                 var exportAuthorityPfxScript =
                     $"$pwd = ConvertTo-SecureString -String '{password}' -Force -AsPlainText;" +
                     $"Export-PfxCertificate" +
@@ -90,7 +91,6 @@ namespace Omnipotent.Services.KliveAPI
                 powerShell.AddScript(gatewayAuthorityScript);
 
                 // Export new certificate public key as a CRT file
-                var myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
                 var exportCrtScript =
                     $"$gatewayCertPath = 'cert:\\localMachine\\my\\' + $gatewayCert.thumbprint;" +
                     $"Export-Certificate" +
@@ -99,7 +99,6 @@ namespace Omnipotent.Services.KliveAPI
                 powerShell.AddScript(exportCrtScript);
 
                 // Export the new certificate as a PFX file
-                var myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
                 var exportPfxScript =
                     $"Export-PfxCertificate" +
                     $" -Cert $gatewayCertPath" +

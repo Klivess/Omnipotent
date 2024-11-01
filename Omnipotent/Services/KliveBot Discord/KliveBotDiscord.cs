@@ -80,13 +80,19 @@ namespace Omnipotent.Services.KliveBot_Discord
             {
                 if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
                 {
+                    //
+                    // I KNOW THIS PARTICULAR FUNCTION IS REALLY REALLY MESSY! I REALLY DO NOT CARE IN THE SLIGHTEST!!
+                    //
                     DiscordMessageBuilder embed = new DiscordMessageBuilder();
                     DiscordMessage message = null;
                     try
                     {
                         embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
 $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
-                        message = await SendMessageToKlives(embed);
+                        if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
+                        {
+                            message = await SendMessageToKlives(embed);
+                        }
                         if (serviceManager.GetKliveLocalLLMService().IsServiceActive())
                         {
                             string response = "";
