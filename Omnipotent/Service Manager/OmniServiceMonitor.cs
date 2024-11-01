@@ -102,8 +102,7 @@ namespace Omnipotent.Service_Manager
             }
             catch (Exception ex)
             {
-                ServiceLogError(ex, "Couldn't get CPU and RAM usage, terminating service.");
-                TerminateService();
+                ServiceLogError(ex, "Couldn't get CPU and RAM usage");
             }
         }
 
