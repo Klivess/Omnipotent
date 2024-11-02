@@ -227,6 +227,7 @@ namespace Omnipotent.Services.KliveAPI
 
             //Validate
             parent.ServiceLog("Validate that challenge is solved.");
+            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Validating Challenge for KliveAPI...");
             var challengeResult = await dnsChallenge.Validate();
             if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Invalid)
             {
@@ -251,6 +252,7 @@ namespace Omnipotent.Services.KliveAPI
                 //Save .pfx to file
                 await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
                 parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
+                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
             }
         }
     }
