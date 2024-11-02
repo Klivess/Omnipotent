@@ -150,6 +150,7 @@ namespace Omnipotent.Services.KliveAPI
 
             if (!System.IO.File.Exists(myPemPath))
             {
+                parent.ServiceLog("Creating ACME account and context.");
                 acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2);
                 account = await acme.NewAccount("klivesdev@gmail.com", true);
 
@@ -157,20 +158,24 @@ namespace Omnipotent.Services.KliveAPI
                 var pemKey = acme.AccountKey.ToPem();
 
                 await parent.GetDataHandler().WriteToFile(myPemPath, pemKey);
+                parent.ServiceLog("Done making ACME account and context.");
             }
             else
             {
                 try
                 {
+                    parent.ServiceLog("Loading ACME account and context from file.");
                     string pem = await parent.GetDataHandler().ReadDataFromFile(myPemPath);
 
                     // Load the saved account key
                     var accountKey = KeyFactory.FromPem(pem);
                     acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2, accountKey);
                     account = await acme.Account();
+                    parent.ServiceLog("Done loading ACME account and context.");
                 }
                 catch (Exception ex)
                 {
+                    await parent.ServiceLogError(ex, "Asking Klives on what to do next.");
                     Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
                         {
                             {"Yes", ButtonStyle.Primary },
@@ -193,10 +198,12 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             //Order
+            parent.ServiceLog("Creating ACME order.");
             var order = await acme.NewOrder(new[] { "*.klive.dev" });
             var authz = (await order.Authorizations()).First();
             var dnsChallenge = await authz.Dns();
             var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
+            parent.ServiceLog("Getting Klives to fulfill DNS record.");
 
             //Get Klives to confirm
             try
@@ -210,6 +217,7 @@ namespace Omnipotent.Services.KliveAPI
                     "Type: TXT\n" +
                     $"Name: _acme-challenge.{KliveAPI.domainName}\n" +
                     $"Value: {dnsTxt}", dict, TimeSpan.FromDays(7));
+                parent.ServiceLog("Klives has done creating the DNS record.");
             }
             catch (TimeoutException ex)
             {
@@ -218,20 +226,32 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             //Validate
-            dnsChallenge.Validate();
-
-            //Generate certificate
-            var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
-            var cert = await order.Generate(new CsrInfo
+            parent.ServiceLog("Validate that challenge is solved.");
+            var challengeResult = await dnsChallenge.Validate();
+            if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Invalid)
             {
-                Organization = "Klives Management",
-                OrganizationUnit = "KliveAPI",
-            }, privateKey);
+                await parent.ServiceLogError(new Exception("DNS challenge failed to validate."));
+                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("DNS challenge failed to validate...");
+                await InstallLocalCert(expDateYears, password, issuedBy);
+                return;
+            }
+            else if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Valid)
+            {
+                parent.ServiceLog("Challenge is solved, creating certificate.");
+                //Generate certificate
+                var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
+                var cert = await order.Generate(new CsrInfo
+                {
+                    Organization = "Klives Management",
+                    OrganizationUnit = "KliveAPI",
+                }, privateKey);
 
-            var pfxBuilder = cert.ToPfx(privateKey);
-            var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
-            //Save .pfx to file
-            await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
+                var pfxBuilder = cert.ToPfx(privateKey);
+                var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
+                //Save .pfx to file
+                await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
+                parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
+            }
         }
     }
 }
