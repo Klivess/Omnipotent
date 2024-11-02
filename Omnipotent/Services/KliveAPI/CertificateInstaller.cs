@@ -226,7 +226,7 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             //Validate
-            parent.ServiceLog("Validate that challenge is solved.");
+            parent.ServiceLog("Validating that challenge is solved.");
             await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Validating Challenge for KliveAPI...");
             var challengeResult = await dnsChallenge.Validate();
             if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Invalid)
@@ -264,6 +264,12 @@ namespace Omnipotent.Services.KliveAPI
                     await InstallLocalCert(expDateYears, password, issuedBy);
                     return;
                 }
+            }
+            else
+            {
+                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME challenge validation was neither valid or invalid??");
+                parent.ServiceLog("ACME challenge validation was neither valid or invalid??");
+                await InstallLocalCert(expDateYears, password, issuedBy);
             }
         }
     }
