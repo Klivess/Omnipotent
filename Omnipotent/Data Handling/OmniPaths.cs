@@ -44,6 +44,7 @@ namespace Omnipotent.Data_Handling
 
             //KliveAPI
             public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
+            public static string KlivesACMEAPICertificateDirectory = $"{KlivesAPICertificateDirectory}/ACMECerts";
 
             //KliveLocalLLM
             public static string KliveLocalLLMDirectory = $"{SavedDataDirectory}/KliveLocalLLM";
@@ -51,7 +52,7 @@ namespace Omnipotent.Data_Handling
 
             //KliveTechHub
             public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
-            public static string KliveTechHubGadgetsDirectory = $"{SavedDataDirectory}/KliveTechHub/KliveTechGadgets";
+            public static string KliveTechHubGadgetsDirectory = $"{KliveTechHubGadgetsDirectory}/KliveTechGadgets";
 
 
         };

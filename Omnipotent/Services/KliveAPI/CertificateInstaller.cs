@@ -5,6 +5,10 @@ using Omnipotent.Data_Handling;
 using Microsoft.AspNetCore.Components.Web;
 using Newtonsoft.Json;
 using static System.Net.WebRequestMethods;
+using System.Security.Cryptography;
+using Certes;
+using Certes.Acme;
+using DSharpPlus;
 
 namespace Omnipotent.Services.KliveAPI
 {
@@ -12,10 +16,13 @@ namespace Omnipotent.Services.KliveAPI
     {
         KliveAPI parent;
         public static string saveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPICertificateDirectory);
+        public static string pemSaveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory);
         public string rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
         public string rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
         public string myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
         public string myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
+        public string myPemPath = Path.Combine(pemSaveDir, "klivedev.gmail.com(klive.dev).txt");
+
         public CertificateInstaller(KliveAPI service)
         {
             parent = service;
@@ -45,6 +52,18 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
+        {
+            if (OmniPaths.CheckIfOnServer())
+            {
+                await InstallProductionCert(expDateYears, password, issuedBy);
+            }
+            else
+            {
+                await InstallLocalCert(expDateYears, password, issuedBy);
+            }
+        }
+
+        public async Task InstallLocalCert(int expDateYears, string password, string issuedBy)
         {
             // Create/install certificate
             using (var powerShell = System.Management.Automation.PowerShell.Create())
@@ -123,6 +142,88 @@ namespace Omnipotent.Services.KliveAPI
 
                 parent.ServiceLog("Created and installed certificate.");
             }
+        }
+        public async Task InstallProductionCert(int expDateYears, string password, string issuedBy)
+        {
+            IAccountContext account = null;
+            AcmeContext acme = null;
+
+            if (!System.IO.File.Exists(myPemPath))
+            {
+                acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2);
+                account = await acme.NewAccount("klivesdev@gmail.com", true);
+
+                // Save the account key for later use
+                var pemKey = acme.AccountKey.ToPem();
+
+                await parent.GetDataHandler().WriteToFile(myPemPath, pemKey);
+            }
+            else
+            {
+                try
+                {
+                    string pem = await parent.GetDataHandler().ReadDataFromFile(myPemPath);
+
+                    // Load the saved account key
+                    var accountKey = KeyFactory.FromPem(pem);
+                    acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2, accountKey);
+                    account = await acme.Account();
+                }
+                catch (Exception ex)
+                {
+                    Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
+                        {
+                            {"Yes", ButtonStyle.Primary },
+                            {"No", ButtonStyle.Danger },
+                        };
+                    string resp = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Error loading PEM key for Let's Encrypt.",
+                        "Should I delete the existing PEM key and create another?", dict, TimeSpan.FromDays(7));
+                    if (resp == "Yes")
+                    {
+                        System.IO.File.Delete(myPemPath);
+                        await InstallProductionCert(expDateYears, password, issuedBy);
+                        return;
+                    }
+                    else
+                    {
+                        await InstallLocalCert(expDateYears, password, issuedBy);
+                        return;
+                    }
+                }
+            }
+
+            //Order
+            var order = await acme.NewOrder(new[] { "*.klive.dev" });
+            var authz = (await order.Authorizations()).First();
+            var dnsChallenge = await authz.Dns();
+            var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
+
+            //Get Klives to confirm
+            try
+            {
+                Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
+                        {
+                            {"Done", ButtonStyle.Primary },
+                        };
+                string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Add a DNS record to {KliveAPI.domainName}.",
+                    "Please add a new DNS record so that Omnipotent can acquire the certificate needed for HTTPS.\n\n" +
+                    "Type: TXT\n" +
+                    $"Name: _acme-challenge.{KliveAPI.domainName}\n" +
+                    $"Value: {dnsTxt}", dict, TimeSpan.FromDays(7));
+            }
+            catch (TimeoutException ex)
+            {
+                await InstallLocalCert(expDateYears, password, issuedBy);
+                return;
+            }
+
+
+            //Authorize
+
+
+            //Validate
+
+            //Generate certificate
         }
     }
 }

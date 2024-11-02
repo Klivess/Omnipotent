@@ -25,7 +25,7 @@ namespace Omnipotent.Services.KliveAPI
 {
     public class KliveAPI : OmniService
     {
-        public static int apiPORT = 7777;
+        public static int apiPORT = 80;
         public static int apiHTTPPORT = 5000;
         public static string domainName = "klive.dev"; //This is the domain name that the SSL certificate will be signed for. It should be the same as the domain name that the API will be accessed from.
         public HttpListener listener = new HttpListener();
@@ -103,7 +103,7 @@ namespace Omnipotent.Services.KliveAPI
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
                 await CheckForSSLCertificate();
-                await LinkSSLCertificate(certInstaller.rootAuthorityCrtPath);
+                await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
 
                 listener.Start();
 
@@ -146,18 +146,20 @@ namespace Omnipotent.Services.KliveAPI
         private async Task CheckForSSLCertificate()
         {
             certInstaller = new(this);
+            //If not on the server (Debug/development mode)
             if (!(await certInstaller.IsCertificateCreated()))
             {
                 await certInstaller.CreateInstallCert(10, "klives", "KliveAPI");
             }
+
         }
 
-        private async Task LinkSSLCertificate(string pathToCrt)
+        private async Task LinkSSLCertificate(string pathToPfx)
         {
-            // Load the certificate from the .crt file
-            string crtFilePath = pathToCrt;
+            // Load the certificate from the .pfx file
+            string pfxFilePath = pathToPfx;
 
-            X509Certificate2 certificate = new X509Certificate2(crtFilePath);
+            X509Certificate2 certificate = new X509Certificate2(pfxFilePath, "klives");
 
             // Get the certificate hash (thumbprint)
             string certHash = certificate.Thumbprint;
