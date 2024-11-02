@@ -238,22 +238,32 @@ namespace Omnipotent.Services.KliveAPI
             }
             else if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Valid)
             {
-                parent.ServiceLog("Challenge is solved, creating certificate.");
-                //Generate certificate
-                var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
-                var cert = await order.Generate(new CsrInfo
+                try
                 {
-                    Organization = "Klives Management",
-                    OrganizationUnit = "KliveAPI",
-                }, privateKey);
+                    parent.ServiceLog("Challenge is solved, creating certificate.");
+                    await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Challenge is solved, creating certificate.");
+                    //Generate certificate
+                    var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
+                    var cert = await order.Generate(new CsrInfo
+                    {
+                        Organization = "Klives Management",
+                        OrganizationUnit = "KliveAPI",
+                    }, privateKey);
 
-                var pfxBuilder = cert.ToPfx(privateKey);
-                var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
-                //Save .pfx to file
-                System.IO.File.Create(rootAuthorityPfxPath).Close();
-                await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
-                parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
-                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
+                    var pfxBuilder = cert.ToPfx(privateKey);
+                    var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
+                    //Save .pfx to file
+                    System.IO.File.Create(rootAuthorityPfxPath).Close();
+                    await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
+                    parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
+                    await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
+                }
+                catch (Exception ex)
+                {
+                    parent.ServiceLogError(ex);
+                    await InstallLocalCert(expDateYears, password, issuedBy);
+                    return;
+                }
             }
         }
     }
