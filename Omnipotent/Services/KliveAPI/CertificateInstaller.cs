@@ -267,8 +267,8 @@ namespace Omnipotent.Services.KliveAPI
             }
             else
             {
-                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME challenge validation was neither valid or invalid??");
-                parent.ServiceLog("ACME challenge validation was neither valid or invalid??");
+                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
+                parent.ServiceLog($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
                 await InstallLocalCert(expDateYears, password, issuedBy);
             }
         }
