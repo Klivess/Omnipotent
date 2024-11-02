@@ -23,13 +23,17 @@ namespace Omnipotent.Data_Handling
             Read,
             Write,
             CreateDirectory,
-            AppendToFile
+            AppendToFile,
+            DeleteFile,
+            DeleteDirectory,
+            WriteBytes
         }
         private struct FileOperation
         {
             public string ID;
             public string path;
             public string content;
+            public byte[]? bytes;
             public TaskCompletionSource<string> result;
             public ReadWrite operation;
         }
@@ -55,9 +59,42 @@ namespace Omnipotent.Data_Handling
             }
         }
 
+        private FileOperation CreateNewByteOperation(string path, ReadWrite operation, byte[] content = null)
+        {
+            try
+            {
+                FileOperation fileOperation = new FileOperation();
+                fileOperation.path = path;
+                fileOperation.bytes = content;
+                fileOperation.operation = operation;
+                fileOperation.ID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+                fileOperation.result = new TaskCompletionSource<string>();
+                fileOperations.Add(fileOperation);
+                return fileOperation;
+            }
+            catch (ArgumentException ex)
+            {
+                return CreateNewByteOperation(path, operation, content);
+            }
+        }
+
         public async Task WriteToFile(string path, string content, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.Write, content).result.Task;
+        }
+        public async Task WriteBytesToFile(string path, byte[] content, bool requeueIfFailed = true)
+        {
+            await CreateNewByteOperation(path, ReadWrite.WriteBytes, content).result.Task;
+        }
+
+        public async Task DeleteFile(string path, bool requeueIfFailed = true)
+        {
+            await CreateNewOperation(path, ReadWrite.DeleteFile).result.Task;
+        }
+
+        public async Task DeleteDirectory(string path, bool requeueIfFailed = true)
+        {
+            await CreateNewOperation(path, ReadWrite.DeleteDirectory).result.Task;
         }
 
         public async Task CreateDirectory(string path, bool requeueIfFailed = true)
@@ -137,6 +174,18 @@ namespace Omnipotent.Data_Handling
                         {
                             await File.AppendAllTextAsync(task.path, task.content);
                             task.result.SetResult("Successful");
+                        }
+                        else if (task.operation == ReadWrite.DeleteFile)
+                        {
+                            File.Delete(task.path);
+                        }
+                        else if (task.operation == ReadWrite.DeleteDirectory)
+                        {
+                            Directory.Delete(task.path);
+                        }
+                        else if (task.operation == ReadWrite.WriteBytes)
+                        {
+                            await File.WriteAllBytesAsync(task.path, task.bytes);
                         }
                     }
                     catch (IOException exception)

@@ -217,13 +217,21 @@ namespace Omnipotent.Services.KliveAPI
                 return;
             }
 
-
-            //Authorize
-
-
             //Validate
+            dnsChallenge.Validate();
 
             //Generate certificate
+            var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
+            var cert = await order.Generate(new CsrInfo
+            {
+                Organization = "Klives Management",
+                OrganizationUnit = "KliveAPI",
+            }, privateKey);
+
+            var pfxBuilder = cert.ToPfx(privateKey);
+            var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
+            //Save .pfx to file
+            await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
         }
     }
 }
