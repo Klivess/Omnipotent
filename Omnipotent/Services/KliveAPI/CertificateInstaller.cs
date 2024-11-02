@@ -74,6 +74,9 @@ namespace Omnipotent.Services.KliveAPI
                 // This adds certificate to Personal and Intermediate Certification Authority
                 var rootAuthorityName = "KliveAPI";
                 string rootFriendlyName = "Klive API";
+                rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPILocal.crt");
+                rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPILocal.pfx");
+
                 System.IO.File.Create(rootAuthorityCrtPath).Close();
                 System.IO.File.Create(rootAuthorityPfxPath).Close();
                 System.IO.File.Create(myGatewayCrtPath).Close();
