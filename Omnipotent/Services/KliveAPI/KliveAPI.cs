@@ -163,8 +163,15 @@ namespace Omnipotent.Services.KliveAPI
 
             // Get the certificate hash (thumbprint)
             string certHash = certificate.Thumbprint;
-
-            string script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            string script;
+            if (OmniPaths.CheckIfOnServer())
+            {
+                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            }
+            else
+            {
+                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            }
             // Set up the process start info
             ProcessStartInfo processInfo = new ProcessStartInfo
             {

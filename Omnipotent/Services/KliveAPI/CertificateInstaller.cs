@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using Certes;
 using Certes.Acme;
 using DSharpPlus;
+using System.Net;
 
 namespace Omnipotent.Services.KliveAPI
 {
@@ -202,9 +203,32 @@ namespace Omnipotent.Services.KliveAPI
 
             //Order
             parent.ServiceLog("Creating ACME order.");
-            var order = await acme.NewOrder(new[] { "*.klive.dev" });
-            var authz = (await order.Authorizations()).First();
-            var dnsChallenge = await authz.Dns();
+            string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
+            IChallengeContext dnsChallenge = null;
+            IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
+            if (System.IO.File.Exists(pathOfOrder))
+            {
+                try
+                {
+                    parent.ServiceLog("Loading existing ACME challenge information.");
+                    string challengeStringData = await parent.GetDataHandler().ReadDataFromFile(pathOfOrder);
+                    var challengeData = JsonConvert.DeserializeObject<IChallengeContext>(challengeStringData);
+                    dnsChallenge = challengeData;
+                }
+                catch (Exception ex)
+                {
+                    parent.ServiceLogError(ex, "Creating new ACME challenge");
+                    var authz = (await order.Authorizations()).First();
+                    dnsChallenge = await authz.Dns();
+                }
+            }
+            else
+            {
+                parent.ServiceLog("Creating new ACME challenge.");
+                var authz = (await order.Authorizations()).First();
+                dnsChallenge = await authz.Dns();
+                await parent.GetDataHandler().WriteToFile(pathOfOrder, JsonConvert.SerializeObject(dnsChallenge));
+            }
             var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
             parent.ServiceLog("Getting Klives to fulfill DNS record.");
 
@@ -216,7 +240,7 @@ namespace Omnipotent.Services.KliveAPI
                             {"Done", ButtonStyle.Primary },
                         };
                 string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Add a DNS record to {KliveAPI.domainName}.",
-                    "Please add a new DNS record so that Omnipotent can acquire the certificate needed for HTTPS.\n\n" +
+                    "Please add a new DNS record so that Omnipotent can solve this challenge and acquire the certificate needed for HTTPS.\n\n" +
                     "Type: TXT\n" +
                     $"Name: _acme-challenge.{KliveAPI.domainName}\n" +
                     $"Value: {dnsTxt}", dict, TimeSpan.FromDays(7));
