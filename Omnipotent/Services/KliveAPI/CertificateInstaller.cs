@@ -297,8 +297,12 @@ namespace Omnipotent.Services.KliveAPI
                     var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
                     var cert = await order.Generate(new CsrInfo
                     {
-                        Organization = "Klives Management",
-                        OrganizationUnit = "KliveAPI",
+                        CountryName = "UK",
+                        State = "NoState",
+                        Locality = "London",
+                        Organization = "KlivesManagement",
+                        OrganizationUnit = "Klives",
+                        CommonName = "klive.dev",
                     }, privateKey);
 
                     var pfxBuilder = cert.ToPfx(privateKey);
