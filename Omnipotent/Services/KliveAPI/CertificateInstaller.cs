@@ -204,31 +204,14 @@ namespace Omnipotent.Services.KliveAPI
             //Order
             parent.ServiceLog("Creating ACME order.");
             string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
+
+
+
             IChallengeContext dnsChallenge = null;
             IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
-            if (System.IO.File.Exists(pathOfOrder))
-            {
-                try
-                {
-                    parent.ServiceLog("Loading existing ACME challenge information.");
-                    string challengeStringData = await parent.GetDataHandler().ReadDataFromFile(pathOfOrder);
-                    var challengeData = JsonConvert.DeserializeObject<IChallengeContext>(challengeStringData);
-                    dnsChallenge = challengeData;
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError(ex, "Creating new ACME challenge");
-                    var authz = (await order.Authorizations()).First();
-                    dnsChallenge = await authz.Dns();
-                }
-            }
-            else
-            {
-                parent.ServiceLog("Creating new ACME challenge.");
-                var authz = (await order.Authorizations()).First();
-                dnsChallenge = await authz.Dns();
-                await parent.GetDataHandler().WriteToFile(pathOfOrder, JsonConvert.SerializeObject(dnsChallenge));
-            }
+            parent.ServiceLog("Creating new ACME challenge.");
+            var authz = (await order.Authorizations()).First();
+            dnsChallenge = await authz.Dns();
             var dnsTxt = acme.AccountKey.DnsTxt(dnsChallenge.Token);
             parent.ServiceLog("Getting Klives to fulfill DNS record.");
 
@@ -251,6 +234,10 @@ namespace Omnipotent.Services.KliveAPI
                 await InstallLocalCert(expDateYears, password, issuedBy);
                 return;
             }
+
+            //Wait for DNS to propagate
+            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Waiting 1 hour for DNS to propogate");
+            await Task.Delay(TimeSpan.FromHours(1));
 
             //Validate
             parent.ServiceLog("Validating that challenge is solved.");
