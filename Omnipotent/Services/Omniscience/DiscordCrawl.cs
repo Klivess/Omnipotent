@@ -261,7 +261,7 @@ namespace Omnipotent.Services.Omniscience
                 try
                 {
                     messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
-                    if (messages.Count % 100 == 0)
+                    if (messages.Count % 1000 == 0)
                     {
                         ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
                     }
