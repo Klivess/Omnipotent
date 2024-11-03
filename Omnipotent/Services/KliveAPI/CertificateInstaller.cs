@@ -238,7 +238,28 @@ namespace Omnipotent.Services.KliveAPI
 
             //Wait for DNS to propagate
             await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Waiting 1 hour for DNS to propagate...");
-            await Task.Delay(TimeSpan.FromHours(1));
+
+            //Ask Klives if to wait for DNS to propagate
+            try
+            {
+                Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
+                        {
+                            {"Yes, wait 1 hour.", ButtonStyle.Primary },
+                            {"No, don't wait.", ButtonStyle.Primary }
+                        };
+                string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Should I wait 1 hour for DNS to propagate?",
+                    $"Click Yes if the dns TXT value {dnsTxt} is already propagated.", dict, TimeSpan.FromDays(7));
+                if (addedDNSText == "Yes, wait 1 hour.")
+                {
+                    parent.ServiceLog("Klives has chosen to wait 1 hour for the DNS to propagate.");
+                    await Task.Delay(TimeSpan.FromHours(1));
+                }
+            }
+            catch (TimeoutException ex)
+            {
+                await InstallLocalCert(expDateYears, password, issuedBy);
+                return;
+            }
 
             //Validate
             parent.ServiceLog("Validating that challenge is solved.");
