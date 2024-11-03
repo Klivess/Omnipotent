@@ -10,6 +10,7 @@ using Certes;
 using Certes.Acme;
 using DSharpPlus;
 using System.Net;
+using Certes.Acme.Resource;
 
 namespace Omnipotent.Services.KliveAPI
 {
@@ -236,21 +237,36 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             //Wait for DNS to propagate
-            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Waiting 1 hour for DNS to propogate");
+            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Waiting 1 hour for DNS to propagate...");
             await Task.Delay(TimeSpan.FromHours(1));
 
             //Validate
             parent.ServiceLog("Validating that challenge is solved.");
             await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Validating Challenge for KliveAPI...");
             var challengeResult = await dnsChallenge.Validate();
-            if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Invalid)
+
+            //challengeResult.Status.Value always returns "pending" for some reason, so we have to wait for it to change
+            await Task.Delay(TimeSpan.FromSeconds(30));
+
+            challengeResult = await dnsChallenge.Resource();
+
+            var attempts = 10;
+
+            while (attempts > 0 && challengeResult.Status == ChallengeStatus.Pending || challengeResult.Status == ChallengeStatus.Processing)
+            {
+                challengeResult = await dnsChallenge.Resource();
+                await Task.Delay(500);
+                attempts--;
+            }
+
+            if (challengeResult.Status == Certes.Acme.Resource.ChallengeStatus.Invalid)
             {
                 await parent.ServiceLogError(new Exception("DNS challenge failed to validate."));
                 await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("DNS challenge failed to validate...");
                 await InstallLocalCert(expDateYears, password, issuedBy);
                 return;
             }
-            else if (challengeResult.Status.Value == Certes.Acme.Resource.ChallengeStatus.Valid)
+            else if (challengeResult.Status == Certes.Acme.Resource.ChallengeStatus.Valid)
             {
                 try
                 {
