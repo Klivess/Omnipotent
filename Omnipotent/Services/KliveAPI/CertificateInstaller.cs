@@ -248,7 +248,7 @@ namespace Omnipotent.Services.KliveAPI
                             {"No, don't wait.", ButtonStyle.Primary }
                         };
                 string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Should I wait 1 hour for DNS to propagate?",
-                    $"Click Yes if the dns TXT value {dnsTxt} is already propagated.", dict, TimeSpan.FromDays(7));
+                    $"Click No if the dns TXT value '{dnsTxt}' is already propagated.", dict, TimeSpan.FromDays(7));
                 if (addedDNSText == "Yes, wait 1 hour.")
                 {
                     parent.ServiceLog("Klives has chosen to wait 1 hour for the DNS to propagate.");
