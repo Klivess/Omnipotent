@@ -209,7 +209,7 @@ namespace Omnipotent.Services.KliveAPI
 
 
             IChallengeContext dnsChallenge = null;
-            IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev", "klive.dev" });
+            IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
             parent.ServiceLog("Creating new ACME challenge.");
             var authz = (await order.Authorizations()).First();
             dnsChallenge = await authz.Dns();

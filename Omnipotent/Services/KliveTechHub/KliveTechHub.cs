@@ -190,7 +190,6 @@ namespace Omnipotent.Services.KliveTechHub
             catch (Exception ex)
             {
                 ServiceLogError(ex);
-                CheckConnectionStatusOfGadgets();
             }
         }
         private async Task GetGadgetActions(KliveTechGadget gadget)

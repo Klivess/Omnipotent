@@ -70,6 +70,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
+
         [SlashCommand("activateKlivetechAction", "Activates a klivetech action.")]
         public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
     [Option("Gadget Action", "The action to execute")] string gadgetAction,
@@ -130,6 +131,25 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
+        */
+
+        /*
+        [SlashCommand("messageUser", "Sends a message to a user")]
+        public async Task MessageUserDirectly(InteractionContext ctx, [Option("userID", "The user to message")] string id, [Option("messageContent", "The content of the message")] string message)
+        {
+            if (ctx.Member.Id == OmniPaths.KlivesDiscordAccountID)
+            {
+                //Get member by ID and send message to them
+                var member = await ctx.Guild.GetMemberAsync(ulong.Parse(id));
+                await member.SendMessageAsync(message);
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Done!"));
+            }
+            else
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+            }
+        }
+        */
 
         [SlashCommand("analyze", "Analyzes a sentiment using Omnipotent's Sentiment Analysis model")]
         public async Task AnalyzeSentimentAsync(InteractionContext ctx, [Option("text", "The text to analyze")] string text)
