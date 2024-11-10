@@ -131,7 +131,6 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
-        */
 
         /*
         [SlashCommand("messageUser", "Sends a message to a user")]
