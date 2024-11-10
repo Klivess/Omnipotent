@@ -6,13 +6,15 @@
         {
             Integer,
             String,
-            Bool
+            Bool,
+            None
         }
 
         public enum OperationNumber
         {
             ExecuteAction,
-            GetActions
+            GetActions,
+            Ping
         }
 
         public struct KliveTechActionRequest

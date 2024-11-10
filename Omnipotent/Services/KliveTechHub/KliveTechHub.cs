@@ -315,7 +315,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
             }
         }
-        private async Task<bool> ExecuteGadgetAction(KliveTechGadget gadget, KliveTechActions.KliveTechAction action, string data)
+        private async Task<bool> ExecuteGadgetAction(KliveTechGadget gadget, KliveTechActions.KliveTechAction action, string? data)
         {
             if (gadget.isOnline)
             {
@@ -332,6 +332,10 @@ namespace Omnipotent.Services.KliveTechHub
                 {
                     string dat = data;
                     serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":{(data == "true").ToString().ToLower()}}}";
+                }
+                else if (action.parameters == KliveTechActions.ActionParameterType.None)
+                {
+                    serial = $"{{\"ActionName\":\"{action.name}\",\"Param\":\"\"}}";
                 }
                 var result = SendData(gadget, KliveTechActions.OperationNumber.ExecuteAction, serial, true);
                 return (await result).status == HttpStatusCode.OK;
@@ -489,6 +493,10 @@ namespace Omnipotent.Services.KliveTechHub
                 var action = gadget.actions.Where(x => x.name == name).FirstOrDefault();
                 if (action != null)
                 {
+                    if (action.parameters == KliveTechActions.ActionParameterType.None)
+                    {
+                        data = null;
+                    }
                     return await ExecuteGadgetAction(gadget, action, data);
                 }
                 return false;
