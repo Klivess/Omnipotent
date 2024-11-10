@@ -52,7 +52,7 @@ namespace Omnipotent.Data_Handling
 
             //KliveTechHub
             public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
-            public static string KliveTechHubGadgetsDirectory = $"{KliveTechHubGadgetsDirectory}/KliveTechGadgets";
+            public static string KliveTechHubGadgetsDirectory = $"{KliveTechHubDirectory}/KliveTechGadgets";
 
 
         };
