@@ -517,19 +517,32 @@ namespace Omnipotent.Services.KliveTechHub
             int maxAttempts = 5;
             try
             {
-                var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
-                if (response.status == HttpStatusCode.OK)
+                try
                 {
-                    return true;
+                    var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
+                    if (response.status == HttpStatusCode.OK)
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        return false;
+                    }
                 }
-                else
+                catch (TimeoutException ex)
                 {
-                    return false;
+                    if (attempts >= maxAttempts)
+                    {
+                        return false;
+                    }
+                    else
+                    {
+                        return await IsDeviceConnected(gadget, attempts++);
+                    }
                 }
             }
-            catch (TimeoutException ex)
+            catch (Exception ex)
             {
-                return false;
                 if (attempts >= maxAttempts)
                 {
                     return false;
