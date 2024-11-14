@@ -145,7 +145,6 @@ namespace Omnipotent.Services.KliveTechHub
             KliveTechRoutes.RegisterRoutes();
             await ReconnectToRememberedDevices();
             Task sendDataLoop = new Task(async () => { SendDataLoop(); });
-            Task checkConnectionStatusOfGadgets = new Task(async () => { CheckConnectionStatusOfGadgets(); });
             Task discoverNewGadgets = new Task(async () => { DiscoverNewKliveTechGadgets(); });
             sendDataLoop.Start();
             checkConnectionStatusOfGadgets.Start();
