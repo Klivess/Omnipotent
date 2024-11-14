@@ -19,6 +19,7 @@ using static Omnipotent.Profiles.KMProfileManager;
 using System.Security.Cryptography.X509Certificates;
 using System.Management.Automation;
 using System.Diagnostics;
+using System.Collections.Concurrent;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -76,7 +77,7 @@ namespace Omnipotent.Services.KliveAPI
         //Controller Lookup
         //Key: Route (example: /omniscience/getmessagecount)
         //Value: EventHandler<route, routeInfo>
-        public Dictionary<string, RouteInfo> ControllerLookup;
+        public ConcurrentDictionary<string, RouteInfo> ControllerLookup;
 
         private KMProfileManager profileManager;
 
@@ -215,7 +216,7 @@ namespace Omnipotent.Services.KliveAPI
             routeInfo.action = handler;
             routeInfo.authenticationLevelRequired = authenticationLevelRequired;
             routeInfo.method = method;
-            ControllerLookup.Add(route, routeInfo);
+            ControllerLookup.TryAdd(route, routeInfo);
             ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
         }
 
