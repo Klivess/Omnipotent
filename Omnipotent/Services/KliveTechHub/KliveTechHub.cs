@@ -173,10 +173,15 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
+                if (gadget.isOnline == false)
+                {
+                    return;
+                }
                 if (await IsDeviceConnected(gadget) == false)
                 {
                     ServiceLog($"Device {gadget.name} disconnected!");
                     gadget.DisconnectDevice();
+                    gadget.isOnline = false;
                     return;
                 }
                 await Task.Delay(5000);
@@ -370,9 +375,22 @@ namespace Omnipotent.Services.KliveTechHub
             {
                 try
                 {
+                    if (gadget.isOnline == false)
+                    {
+                        return;
+                    }
                     // Receiving data
                     byte[] receiveBuffer = new byte[1024];
-                    NetworkStream stream = gadget.connectedClient.GetStream();
+                    NetworkStream stream = null;
+                    try
+                    {
+                        stream = gadget.connectedClient.GetStream();
+                    }
+                    catch (Exception ex)
+                    {
+                        gadget.isOnline = false;
+                        return;
+                    }
                     int bytesRead = 0;
                     string receivedData = "";
                     while (receivedData.EndsWith(endCommand) == false)
@@ -519,7 +537,7 @@ namespace Omnipotent.Services.KliveTechHub
             {
                 try
                 {
-                    var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
+                    var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(5));
                     if (response.status == HttpStatusCode.OK)
                     {
                         return true;
