@@ -368,51 +368,43 @@ namespace Omnipotent.Services.KliveTechHub
         {
             Thread thread = new Thread(async () =>
             {
-                if (!await IsDeviceConnected(gadget))
+                try
                 {
-                    AnnounceGadgetDisconnect(gadget);
-                    return;
+                    // Receiving data
+                    byte[] receiveBuffer = new byte[1024];
+                    NetworkStream stream = gadget.connectedClient.GetStream();
+                    int bytesRead = 0;
+                    string receivedData = "";
+                    while (receivedData.EndsWith(endCommand) == false)
+                    {
+                        bytesRead = await stream.ReadAsync(receiveBuffer, 0, receiveBuffer.Length);
+                        receivedData += Encoding.UTF8.GetString(receiveBuffer, 0, bytesRead);
+                    }
+                    string result = receivedData.Replace(startCommand, "").Replace(endCommand, "");
+                    receivedData = "";
+                    if (!string.IsNullOrEmpty(result.Trim()))
+                    {
+                        ServiceLog($"Received data from device {gadget.name}: " + result);
+                        KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result);
+                        if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
+                        {
+                            awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
+                        }
+                        Task.Delay(100).Wait();
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    try
+                    if (ex.Message.ToLower().Contains("aborted"))
                     {
-                        // Receiving data
-                        byte[] receiveBuffer = new byte[1024];
-                        NetworkStream stream = gadget.connectedClient.GetStream();
-                        int bytesRead = 0;
-                        string receivedData = "";
-                        while (receivedData.EndsWith(endCommand) == false)
-                        {
-                            bytesRead = await stream.ReadAsync(receiveBuffer, 0, receiveBuffer.Length);
-                            receivedData += Encoding.UTF8.GetString(receiveBuffer, 0, bytesRead);
-                        }
-                        string result = receivedData.Replace(startCommand, "").Replace(endCommand, "");
-                        receivedData = "";
-                        if (!string.IsNullOrEmpty(result.Trim()))
-                        {
-                            ServiceLog($"Received data from device {gadget.name}: " + result);
-                            KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result);
-                            if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
-                            {
-                                awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
-                            }
-                            Task.Delay(100).Wait();
-                        }
+                        AnnounceGadgetDisconnect(gadget);
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        if (ex.Message.ToLower().Contains("aborted"))
-                        {
-                            AnnounceGadgetDisconnect(gadget);
-                        }
-                        else
-                        {
-                            ServiceLogError(ex);
-                        }
+                        ServiceLogError(ex);
                     }
-                    ReadDataLoop(gadget);
                 }
+                ReadDataLoop(gadget);
             });
             thread.Start();
             return;
