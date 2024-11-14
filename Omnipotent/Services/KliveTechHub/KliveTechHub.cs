@@ -527,7 +527,7 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
-                var response = await SendData(gadget, KliveTechActions.OperationNumber.Ping, "Ping", true).WaitAsync(TimeSpan.FromSeconds(5));
+                var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(5));
                 if (response.status == HttpStatusCode.OK)
                 {
                     return true;
