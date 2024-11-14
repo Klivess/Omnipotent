@@ -403,7 +403,7 @@ namespace Omnipotent.Services.KliveTechHub
                     receivedData = "";
                     if (!string.IsNullOrEmpty(result.Trim()))
                     {
-                        ServiceLog($"Received data from device {gadget.name}: " + result);
+                        ServiceLog($"Received data from device {gadget.name}: " + result, false);
                         KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result);
                         if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
                         {
