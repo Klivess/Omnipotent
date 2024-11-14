@@ -147,7 +147,6 @@ namespace Omnipotent.Services.KliveTechHub
             Task sendDataLoop = new Task(async () => { SendDataLoop(); });
             Task discoverNewGadgets = new Task(async () => { DiscoverNewKliveTechGadgets(); });
             sendDataLoop.Start();
-            checkConnectionStatusOfGadgets.Start();
             discoverNewGadgets.Start();
             //SendData(connectedGadgets.Last(), "Hello from KliveTech Hub!");
         }
