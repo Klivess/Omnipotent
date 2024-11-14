@@ -452,11 +452,6 @@ namespace Omnipotent.Services.KliveTechHub
                     {
                         if (item.type == DataQueueType.Send)
                         {
-                            if (await IsDeviceConnected(item.gadget) == false || item.gadget.isOnline == false)
-                            {
-                                AnnounceGadgetDisconnect(item.gadget);
-                                return;
-                            }
                             NetworkStream stream = null;
                             Task task = new Task(async () =>
                             {
