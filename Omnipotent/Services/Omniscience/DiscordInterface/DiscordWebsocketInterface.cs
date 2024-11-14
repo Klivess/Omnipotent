@@ -44,12 +44,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             dynamic responseJson = JsonConvert.DeserializeObject(responseString);
             gatewayURL = responseJson.url;
 
-            //Create chatbot session
-            if (parentService.serviceManager.GetKliveLocalLLMService().IsServiceActive())
-            {
-                chatbotSession = parentService.serviceManager.GetKliveLocalLLMService().CreateSession();
-            }
-
             //Connect to websocket
             await ConnectAsync(gatewayURL);
         }
