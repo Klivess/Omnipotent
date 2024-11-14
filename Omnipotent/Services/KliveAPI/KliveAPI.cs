@@ -205,7 +205,7 @@ namespace Omnipotent.Services.KliveAPI
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
         public async Task CreateRoute(string route, Action<UserRequest> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
-            while (!listener.IsListening) { Task.Delay(10).Wait(); }
+            while (!listener.IsListening) { await Task.Delay(10); }
             if (!route.StartsWith('/'))
             {
                 //Add a / to the beginning of the route if it doesn't have one

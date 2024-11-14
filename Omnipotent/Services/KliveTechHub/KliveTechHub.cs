@@ -259,6 +259,7 @@ namespace Omnipotent.Services.KliveTechHub
                         {
                             if (connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First().isOnline == false)
                             {
+                                connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First().ReceiveLoop.Interrupt();
                                 connectedGadgets.Remove(connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First());
                                 TryConnectToDevice(device);
                             }
