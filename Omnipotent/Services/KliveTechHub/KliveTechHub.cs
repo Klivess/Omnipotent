@@ -262,10 +262,18 @@ namespace Omnipotent.Services.KliveTechHub
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Discover klivetech gadgets failed!");
-                var result = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
-                if (result == "Retry")
+                if (ex.Message.ToLower().Contains("method is not implemented by this class"))
                 {
+                    client = new BluetoothClient();
                     DiscoverNewKliveTechGadgets();
+                }
+                else
+                {
+                    var result = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
+                    if (result == "Retry")
+                    {
+                        DiscoverNewKliveTechGadgets();
+                    }
                 }
             }
         }
