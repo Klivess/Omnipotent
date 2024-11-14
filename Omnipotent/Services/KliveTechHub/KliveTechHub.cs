@@ -512,11 +512,12 @@ namespace Omnipotent.Services.KliveTechHub
                 return false;
             }
         }
-        public async Task<bool> IsDeviceConnected(KliveTechGadget gadget)
+        public async Task<bool> IsDeviceConnected(KliveTechGadget gadget, int attempts = 0)
         {
+            int maxAttempts = 5;
             try
             {
-                var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(5));
+                var response = await SendData(gadget, KliveTechActions.OperationNumber.GetActions, "GetActions", true).WaitAsync(TimeSpan.FromSeconds(10));
                 if (response.status == HttpStatusCode.OK)
                 {
                     return true;
@@ -529,6 +530,14 @@ namespace Omnipotent.Services.KliveTechHub
             catch (TimeoutException ex)
             {
                 return false;
+                if (attempts >= maxAttempts)
+                {
+                    return false;
+                }
+                else
+                {
+                    return await IsDeviceConnected(gadget, attempts++);
+                }
             }
         }
         private void AnnounceGadgetDisconnect(KliveTechGadget g)
