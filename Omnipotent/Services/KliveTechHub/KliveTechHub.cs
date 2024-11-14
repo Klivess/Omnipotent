@@ -171,20 +171,18 @@ namespace Omnipotent.Services.KliveTechHub
             }
             ServiceLog("Finished reconnecting to remembered KliveTech gadgets. " + connectedGadgets.Count + " gadgets in memory.");
         }
-        public async void CheckConnectionStatusOfGadgets()
+        public async void CheckConnectionStatusOfGadget(KliveTechGadget gadget)
         {
             try
             {
-                foreach (var item in connectedGadgets)
+                if (await IsDeviceConnected(gadget) == false)
                 {
-                    if (await IsDeviceConnected(item) == false)
-                    {
-                        ServiceLog($"Device {item.name} disconnected!");
-                        item.DisconnectDevice();
-                    }
+                    ServiceLog($"Device {gadget.name} disconnected!");
+                    gadget.DisconnectDevice();
+                    return;
                 }
                 await Task.Delay(5000);
-                CheckConnectionStatusOfGadgets();
+                CheckConnectionStatusOfGadget(gadget);
             }
             catch (Exception ex)
             {
@@ -324,6 +322,7 @@ namespace Omnipotent.Services.KliveTechHub
                         }
                     }
                 });
+                CheckConnectionStatusOfGadget(gadget);
                 connectedGadgets.Add(gadget);
                 GetGadgActions.Start();
             }
