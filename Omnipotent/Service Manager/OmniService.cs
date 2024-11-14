@@ -41,17 +41,17 @@ namespace Omnipotent.Service_Manager
         {
             return serviceThread;
         }
-        public async Task<LoggedMessage> ServiceLog(string message)
+        public async Task<LoggedMessage> ServiceLog(string message, bool appearInConsole = true)
         {
-            return serviceManager.GetLogger().LogStatus(name, message);
+            return serviceManager.GetLogger().LogStatus(name, message, appearInConsole);
         }
-        public async Task<LoggedMessage> ServiceLogError(string error)
+        public async Task<LoggedMessage> ServiceLogError(string error, bool appearInConsole = true)
         {
-            return serviceManager.GetLogger().LogError(name, error);
+            return serviceManager.GetLogger().LogError(name, error, appearInConsole);
         }
-        public async Task<LoggedMessage> ServiceLogError(Exception error, string specialMessage = "")
+        public async Task<LoggedMessage> ServiceLogError(Exception error, string specialMessage = "", bool appearInConsole = true)
         {
-            return serviceManager.GetLogger().LogError(name, error, specialMessage);
+            return serviceManager.GetLogger().LogError(name, error, specialMessage, appearInConsole);
         }
         public async Task ServiceUpdateLoggedMessage(LoggedMessage message, string newMessage)
         {

@@ -33,6 +33,7 @@ namespace Omnipotent.Logging
             public string serviceName;
             public string message;
             public string oldMessage;
+            public bool appearInConsole;
             public ErrorInformation? errorInfo;
             public int position;
             public DateTime TimeOfLog;
@@ -91,19 +92,26 @@ namespace Omnipotent.Logging
             {
                 var message = messagesToLog.First();
                 messagesToLog.Remove(messagesToLog.First());
-                if (message.type == LogType.Status)
+                if (message.appearInConsole)
                 {
-                    await WriteStatus(message);
+                    if (message.type == LogType.Status)
+                    {
+                        await WriteStatus(message);
+                    }
+                    else if (message.type == LogType.Error)
+                    {
+                        await WriteError(message);
+                    }
+                    else if (message.type == LogType.Update)
+                    {
+                        await WriteUpdate(message);
+                    }
+                    await Task.Delay(1);
                 }
-                else if (message.type == LogType.Error)
+                else
                 {
-                    await WriteError(message);
+                    overallMessages.Add(message);
                 }
-                else if (message.type == LogType.Update)
-                {
-                    await WriteUpdate(message);
-                }
-                await Task.Delay(75);
             }
 
             //Replace this with proper waiting
@@ -136,7 +144,7 @@ namespace Omnipotent.Logging
             }
         }
 
-        public LoggedMessage LogStatus(string serviceName, string message)
+        public LoggedMessage LogStatus(string serviceName, string message, bool appearInConsole = true)
         {
             try
             {
@@ -146,6 +154,7 @@ namespace Omnipotent.Logging
                 log.type = LogType.Status;
                 log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
                 log.TimeOfLog = DateTime.Now;
+                log.appearInConsole = appearInConsole;
                 messagesToLog.Add(log);
                 return log;
             }
@@ -155,7 +164,7 @@ namespace Omnipotent.Logging
             }
         }
 
-        public LoggedMessage LogError(string serviceName, Exception ex, string specialMessage = "")
+        public LoggedMessage LogError(string serviceName, Exception ex, string specialMessage = "", bool appearInConsole = true)
         {
             LoggedMessage log = new();
             log.serviceName = serviceName;
@@ -164,6 +173,7 @@ namespace Omnipotent.Logging
             log.errorInfo = new ErrorInformation(ex);
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             log.TimeOfLog = DateTime.Now;
+            log.appearInConsole = appearInConsole;
             messagesToLog.Add(log);
             return log;
         }
@@ -176,7 +186,7 @@ namespace Omnipotent.Logging
             messagesToLog.Add(loggedmessage);
         }
 
-        public LoggedMessage LogError(string serviceName, string error)
+        public LoggedMessage LogError(string serviceName, string error, bool appearInConsole = true)
         {
             LoggedMessage log = new();
             log.serviceName = serviceName;
@@ -185,6 +195,7 @@ namespace Omnipotent.Logging
             log.errorInfo = null;
             log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             log.TimeOfLog = DateTime.Now;
+            log.appearInConsole = appearInConsole;
             messagesToLog.Add(log);
             return log;
         }
