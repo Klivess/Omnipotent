@@ -34,20 +34,33 @@ namespace Omnipotent.Services.Omniscience
             discordInterface = new(this);
             ServiceLog("Starting Discord Crawl.");
             LinkedUsers = (await discordInterface.GetAllLinkedOmniDiscordUsersFromDisk()).ToList();
+
+            List<string> brokenAccountNames = new();
+            foreach (var item in LinkedUsers)
+            {
+                if (await discordInterface.VerifyTokenWorks(item) == false)
+                {
+                    brokenAccountNames.Add(item.Username);
+                }
+            }
+
+            if (brokenAccountNames.Any())
+            {
+                ServiceLog($"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
+                LinkedUsers.RemoveAll(k => brokenAccountNames.Contains(k.Username));
+                try
+                {
+                    serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
+                }
+                catch (Exception) { }
+            }
+
             ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
             Stopwatch time = Stopwatch.StartNew();
             await LoadAllMessagesFromDisk(LinkedUsers.ToArray());
             time.Stop();
             ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
             UpdateDiscordMessageDatabase();
-            int wordCount = 0;
-            foreach (var item in AllCapturedMessages)
-            {
-                if (item.AuthorID == 626500762540834848)
-                {
-                    wordCount += item.MessageContent.Split(" ").Length;
-                }
-            }
             foreach (var item in LinkedUsers)
             {
                 item.websocketInterface = new(this, item);
@@ -58,23 +71,7 @@ namespace Omnipotent.Services.Omniscience
                     await SaveDiscordGuild(guild);
                 }
             }
-            int kliveWordCount = 0;
-            foreach (var item in AllCapturedMessages)
-            {
-                if (item.PostedInChannelID == 1059223309260181615)
-                {
-                    kliveWordCount += item.MessageContent.Split(" ").Length;
-                }
-            }
             ServiceLog($"{(await GetAllDownloadedGuilds()).Length} guilds in database.");
-            int kliveWordCounts = 0;
-            foreach (var item in AllCapturedMessages)
-            {
-                if (item.PostedInChannelID == 1059223309260181615 && item.AuthorID.ToString() == OmniPaths.KlivesDiscordAccountID.ToString())
-                {
-                    kliveWordCounts += item.MessageContent.Split(" ").Length;
-                }
-            }
             discordInterface.NewOmniDiscordUserAdded += (async (user) =>
                 {
                     LinkedUsers.Add(user);
@@ -116,93 +113,105 @@ namespace Omnipotent.Services.Omniscience
 
         private async Task UpdateIndividualUserMessageDatabase(OmniDiscordUser item)
         {
-            if (!Directory.Exists(item.CreateDMDirectoryPathString()))
+            try
             {
-                Directory.CreateDirectory(item.CreateDMDirectoryPathString());
+                if (!Directory.Exists(item.CreateDMDirectoryPathString()))
+                {
+                    Directory.CreateDirectory(item.CreateDMDirectoryPathString());
+                }
+                //Download all new messages from channels
+                ServiceLog($"Updating messages from discord account: {item.Username}");
+                //Scan all DM Channels
+                var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item));
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                int newMessagesCount = 0;
+                CancellationTokenSource token = new();
+                ParallelOptions parallelOptions = new()
+                {
+                    MaxDegreeOfParallelism = 10
+                };
+                var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
+                {
+                    Stopwatch individualDMStopwatch = Stopwatch.StartNew();
+                    int messagesCount = 0;
+                    ServiceLog($"Scanning DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                    var messageDivision = AllCapturedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
+                    //Recursively download backwards from the last message
+                    List<OmniDiscordMessage> oldmessages = new();
+                    List<OmniDiscordMessage> newMessages = new();
+
+                    List<long> updatedUserIDs = new();
+
+                    if (messageDivision.Any())
+                    {
+                        oldmessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID);
+                        newMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID);
+                        //Save only messages that are not already saved
+                        var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
+                        var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
+                        var saveDMProgress = await ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
+                        foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
+                        {
+                            await SaveDiscordMessage(item, message);
+                            if (!updatedUserIDs.Contains(message.AuthorID))
+                            {
+                                await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                                updatedUserIDs.Add(message.AuthorID);
+                            }
+                            messagesCount++;
+                            float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
+                            ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
+                        }
+                        foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
+                        {
+                            if (!updatedUserIDs.Contains(message.AuthorID))
+                            {
+                                await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                                updatedUserIDs.Add(message.AuthorID);
+                            }
+                            await SaveDiscordMessage(item, message);
+                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                            messagesCount++;
+                            float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
+                            ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
+                        }
+                    }
+                    else
+                    {
+                        newMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID);
+                        //Save only messages that are not already saved
+                        //ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
+                        foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
+                        {
+                            await SaveDiscordMessage(item, message);
+                            messagesCount++;
+                            if (!updatedUserIDs.Contains(message.AuthorID))
+                            {
+                                await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
+                                updatedUserIDs.Add(message.AuthorID);
+                            }
+                        }
+                    }
+                    newMessagesCount += messagesCount;
+                    individualDMStopwatch.Stop();
+                    if (messagesCount > 0)
+                    {
+                        ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
+                    }
+                });
+                await result;
+                stopwatch.Stop();
+                ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
             }
-            //Download all new messages from channels
-            ServiceLog($"Updating messages from discord account: {item.Username}");
-            //Scan all DM Channels
-            var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item));
-            Stopwatch stopwatch = Stopwatch.StartNew();
-            int newMessagesCount = 0;
-            CancellationTokenSource token = new();
-            ParallelOptions parallelOptions = new()
+            catch (Exception ex)
             {
-                MaxDegreeOfParallelism = 10
-            };
-            var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
-            {
-                Stopwatch individualDMStopwatch = Stopwatch.StartNew();
-                int messagesCount = 0;
-                ServiceLog($"Scanning DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
-                var messageDivision = AllCapturedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
-                //Recursively download backwards from the last message
-                List<OmniDiscordMessage> oldmessages = new();
-                List<OmniDiscordMessage> newMessages = new();
-
-                List<long> updatedUserIDs = new();
-
-                if (messageDivision.Any())
+                ServiceLogError(ex);
+                try
                 {
-                    oldmessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID);
-                    newMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID);
-                    //Save only messages that are not already saved
-                    var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                    var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                    var saveDMProgress = await ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
-                    foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
-                    {
-                        await SaveDiscordMessage(item, message);
-                        if (!updatedUserIDs.Contains(message.AuthorID))
-                        {
-                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                            updatedUserIDs.Add(message.AuthorID);
-                        }
-                        messagesCount++;
-                        float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                        ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
-                    }
-                    foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
-                    {
-                        if (!updatedUserIDs.Contains(message.AuthorID))
-                        {
-                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                            updatedUserIDs.Add(message.AuthorID);
-                        }
-                        await SaveDiscordMessage(item, message);
-                        await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                        messagesCount++;
-                        float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                        ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
-                    }
+                    serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Catastrophic error updating individual user messages in DiscordCrawl: " + ex.Message);
                 }
-                else
-                {
-                    newMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID);
-                    //Save only messages that are not already saved
-                    //ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
-                    foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
-                    {
-                        await SaveDiscordMessage(item, message);
-                        messagesCount++;
-                        if (!updatedUserIDs.Contains(message.AuthorID))
-                        {
-                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                            updatedUserIDs.Add(message.AuthorID);
-                        }
-                    }
-                }
-                newMessagesCount += messagesCount;
-                individualDMStopwatch.Stop();
-                if (messagesCount > 0)
-                {
-                    ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
-                }
-            });
-            await result;
-            stopwatch.Stop();
-            ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
+                catch (Exception) { }
+            }
         }
         public async Task UpdateDiscordMessageDatabase()
         {
