@@ -234,13 +234,20 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         }
         public async Task<bool> VerifyTokenWorks(OmniDiscordUser user)
         {
-            user.client = DiscordHttpClient();
-            HttpRequestMessage message = new();
-            message.Method = HttpMethod.Get;
-            message.RequestUri = new Uri($"https://discord.com/api/v9/users/@me/affinities/users");
-            message.Headers.Add("Authorization", user.Token);
-            var response = await SendDiscordRequest(user.client, message);
-            return response.IsSuccessStatusCode;
+            try
+            {
+                user.client = DiscordHttpClient();
+                HttpRequestMessage message = new();
+                message.Method = HttpMethod.Get;
+                message.RequestUri = new Uri($"https://discord.com/api/v9/users/@me/affinities/users");
+                message.Headers.Add("Authorization", user.Token);
+                var response = await SendDiscordRequest(user.client, message);
+                return response.IsSuccessStatusCode;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         public static string ConstructIconURL(string guildID, string iconID)
