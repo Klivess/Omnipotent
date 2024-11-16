@@ -138,21 +138,37 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
 
         public async Task<DiscordMessage> SendMessageToKlives(string message)
         {
-            while (Client == null) { }
-            if (KlivesMember == null)
+            try
             {
-                GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
-                KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+                while (Client == null) { }
+                if (KlivesMember == null)
+                {
+                    GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+                    KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+                }
+                return await KlivesMember.SendMessageAsync(message);
             }
-            return await KlivesMember.SendMessageAsync(message);
+            catch(Exception ex)
+            {
+                ServiceLogError(ex, "Sending message to Klives failed!");
+                return null;
+            }
         }
 
         public async Task<DiscordMessage> SendMessageToKlives(DiscordMessageBuilder builder)
         {
-            while (Client == null) { }
-            var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
-            var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
-            return await member.SendMessageAsync(builder);
+            try
+            {
+                while (Client == null) { }
+                var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+                var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
+                return await member.SendMessageAsync(builder);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Sending message to Klives failed!");
+                return null;
+            }
         }
 
         public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, string imagefilepath = "", int imagewidth = 0, int imageheight = 0)

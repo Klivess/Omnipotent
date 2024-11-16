@@ -39,7 +39,7 @@ namespace Omnipotent.Services.KliveTechHub
         private SynchronizedCollection<DataQueue> dataSendQueue = new();
         private List<DataQueue> awaitingResponse = new();
         public List<KliveTechGadget> connectedGadgets = new();
-        public struct KliveTechGadget
+        public class KliveTechGadget
         {
             public string name;
             public string IPAddress;
@@ -169,20 +169,25 @@ namespace Omnipotent.Services.KliveTechHub
             }
             ServiceLog("Finished reconnecting to remembered KliveTech gadgets. " + connectedGadgets.Count + " gadgets in memory.");
         }
-        public async void CheckConnectionStatusOfGadget(KliveTechGadget gadget)
+        public async Task CheckConnectionStatusOfGadget(KliveTechGadget gadget, int attempts = 0)
         {
             try
             {
-                if (gadget.isOnline == false)
+                if (connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline == false)
                 {
+                    ServiceLog($"Device {gadget.name} disconnected!");
                     return;
                 }
                 if (await IsDeviceConnected(gadget) == false)
                 {
                     ServiceLog($"Device {gadget.name} disconnected!");
                     gadget.DisconnectDevice();
-                    gadget.isOnline = false;
+                    connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline = false;
                     return;
+                }
+                else
+                {
+                    Convert.ToString("hey");
                 }
                 await Task.Delay(5000);
                 CheckConnectionStatusOfGadget(gadget);
@@ -190,6 +195,11 @@ namespace Omnipotent.Services.KliveTechHub
             catch (Exception ex)
             {
                 ServiceLogError(ex);
+                if (attempts > 10)
+                {
+                    return;
+                }
+                CheckConnectionStatusOfGadget(gadget, attempts++);
             }
         }
         private async Task GetGadgetActions(KliveTechGadget gadget, int attempts = 0)
@@ -204,7 +214,7 @@ namespace Omnipotent.Services.KliveTechHub
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "Get Gadget Actions failed, retrying.");
-                await GetGadgetActions(gadget);
+                await GetGadgetActions(gadget, attempts + 1);
                 return;
             }
             if (res.status == HttpStatusCode.OK)
@@ -224,6 +234,7 @@ namespace Omnipotent.Services.KliveTechHub
                 if (attempts >= maxAttempts)
                 {
                     await ServiceLogError(new Exception("Failed to get gadget actions"), "Get Gadget Actions failed, max attempts reached.");
+                    connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline = false;
                     return;
                 }
                 await ServiceLogError(new Exception("Failed to get gadget actions"), "Get Gadget Actions failed, retrying.");
@@ -258,10 +269,14 @@ namespace Omnipotent.Services.KliveTechHub
                         }
                         else if (connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).Count() > 0)
                         {
-                            if (connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First().isOnline == false)
+                            var gadget = connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First();
+                            if (connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline == false)
                             {
-                                connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First().ReceiveLoop.Interrupt();
-                                connectedGadgets.Remove(connectedGadgets.Where(x => x.IPAddress == device.DeviceAddress.ToString()).First());
+                                if (gadget.ReceiveLoop != null)
+                                {
+                                    gadget.ReceiveLoop.Interrupt();
+                                }
+                                connectedGadgets.Remove(gadget);
                                 TryConnectToDevice(device);
                             }
                         }
@@ -294,12 +309,11 @@ namespace Omnipotent.Services.KliveTechHub
                 }
             }
         }
-        public async Task TryConnectToDevice(BluetoothDeviceInfo device)
+        public async Task TryConnectToDevice(BluetoothDeviceInfo device, int attempts = 0)
         {
             KliveTechGadget gadget = new KliveTechGadget();
             try
             {
-                gadget.name = device.DeviceName;
                 gadget.IPAddress = device.DeviceAddress.ToString();
                 gadget.deviceInfo = device;
                 gadget.connectedClient = new BluetoothClient();
@@ -307,8 +321,18 @@ namespace Omnipotent.Services.KliveTechHub
                 gadget.connectedClient.Connect(device.DeviceAddress, BluetoothService.SerialPort);
                 gadget.isOnline = true;
                 gadget.timeConnected = DateTime.Now;
+
+
+                device.Refresh();
+                //Need to wait 100ms for the device name to be received.
+                await Task.Delay(1000);
+                gadget.name = device.DeviceName;
                 ServiceLog("Found KliveTech gadget: " + gadget.name);
-                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
+                try
+                {
+                    await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
+                }
+                catch (Exception) { }
                 RememberKliveTechDevice(gadget);
                 gadget.ReceiveLoop = new Thread(async () => { ReadDataLoop(gadget); });
                 gadget.ReceiveLoop.Start();
@@ -327,17 +351,20 @@ namespace Omnipotent.Services.KliveTechHub
                         }
                     }
                 });
-                CheckConnectionStatusOfGadget(gadget);
                 connectedGadgets.Add(gadget);
+                CheckConnectionStatusOfGadget(gadget);
                 GetGadgActions.Start();
             }
             catch (Exception ex)
             {
-                ServiceLogError("Couldn't connect to klivetech device: " + device.DeviceName);
-                if (!string.IsNullOrEmpty(gadget.name))
+                ServiceLogError("Couldn't connect to klivetech device: " + device.DeviceName + " Reason: " + new ErrorInformation(ex).FullFormattedMessage);
+                if (attempts >= 5)
                 {
-                    gadget.isOnline = false;
-                    connectedGadgets.Add(gadget);
+                    return;
+                }
+                if (ex.Message.Contains("the connected party did not properly respond"))
+                {
+                    TryConnectToDevice(device, attempts + 1);
                 }
             }
         }
@@ -373,61 +400,71 @@ namespace Omnipotent.Services.KliveTechHub
         }
         private async Task ReadDataLoop(KliveTechGadget gadget)
         {
-            Thread thread = new Thread(async () =>
+            string result = "";
+            try
             {
+                if (gadget.isOnline == false)
+                {
+                    return;
+                }
+                // Receiving data
+                byte[] receiveBuffer = new byte[1024];
+                NetworkStream stream = null;
                 try
                 {
-                    if (gadget.isOnline == false)
-                    {
-                        return;
-                    }
-                    // Receiving data
-                    byte[] receiveBuffer = new byte[1024];
-                    NetworkStream stream = null;
+                    stream = gadget.connectedClient.GetStream();
+                }
+                catch (Exception ex)
+                {
+                    connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline = false;
+                    return;
+                }
+                int bytesRead = 0;
+                string receivedData = "";
+                while (receivedData.EndsWith(endCommand) == false)
+                {
                     try
-                    {
-                        stream = gadget.connectedClient.GetStream();
-                    }
-                    catch (Exception ex)
-                    {
-                        gadget.isOnline = false;
-                        return;
-                    }
-                    int bytesRead = 0;
-                    string receivedData = "";
-                    while (receivedData.EndsWith(endCommand) == false)
                     {
                         bytesRead = await stream.ReadAsync(receiveBuffer, 0, receiveBuffer.Length);
                         receivedData += Encoding.UTF8.GetString(receiveBuffer, 0, bytesRead);
                     }
-                    string result = receivedData.Replace(startCommand, "").Replace(endCommand, "");
-                    receivedData = "";
-                    if (!string.IsNullOrEmpty(result.Trim()))
+                    catch (Exception ex)
                     {
-                        ServiceLog($"Received data from device {gadget.name}: " + result, false);
-                        KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result);
-                        if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
-                        {
-                            awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
-                        }
-                        Task.Delay(100).Wait();
+                        connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline = false;
+                        return;
                     }
                 }
-                catch (Exception ex)
+                //Get index of start and end command
+                int startIndex = receivedData.IndexOf(startCommand);
+                result = receivedData;
+                int endIndex = receivedData.IndexOf(endCommand);
+                result = result.Substring(startIndex);
+                result = result.Substring(0, endIndex - startIndex);
+                result = result.Replace(startCommand, "").Replace(endCommand, "");
+                receivedData = "";
+                if (!string.IsNullOrEmpty(result.Trim()) && OmniPaths.IsValidJson(result.Trim()))
                 {
-                    if (ex.Message.ToLower().Contains("aborted"))
+                    ServiceLog($"Received data from device {gadget.name}: " + result, false);
+                    KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result.Trim());
+                    if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
                     {
-                        AnnounceGadgetDisconnect(gadget);
+                        awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
                     }
-                    else
-                    {
-                        ServiceLogError(ex);
-                    }
+                    Task.Delay(100).Wait();
                 }
-                ReadDataLoop(gadget);
-            });
-            thread.Start();
-            return;
+            }
+            catch (Exception ex)
+            {
+                if (ex.Message.ToLower().Contains("aborted"))
+                {
+                    connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).isOnline = false;
+                }
+                else
+                {
+                    ServiceLogError(ex);
+                }
+            }
+            ReadDataLoop(gadget);
         }
         private async Task<KliveTechGadgetResponse> SendData(KliveTechGadget gadget, KliveTechActions.OperationNumber operation, string data, bool expectResponse = false)
         {
@@ -459,37 +496,46 @@ namespace Omnipotent.Services.KliveTechHub
                 {
                     Task task = new Task(async () =>
                     {
-                        if (item.type == DataQueueType.Send)
+                        if (item.gadget.isOnline)
                         {
-                            NetworkStream stream = null;
-                            Task task = new Task(async () =>
+                            if (item.type == DataQueueType.Send)
                             {
-                                stream = item.gadget.connectedClient.GetStream();
-                            });
-                            task.Start();
-                            task.Wait(TimeSpan.FromSeconds(5));
-                            if (stream == null)
-                            {
-                                AnnounceGadgetDisconnect(item.gadget);
-                                return;
+                                NetworkStream stream = null;
+                                Task task = new Task(async () =>
+                                {
+                                    try
+                                    {
+                                        stream = item.gadget.connectedClient.GetStream();
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        connectedGadgets.Find(k => k.IPAddress == item.gadget.IPAddress).isOnline = false;
+                                        return;
+                                    }
+                                });
+                                task.Start();
+                                task.Wait(TimeSpan.FromSeconds(5));
+                                try
+                                {
+                                    if (stream != null & item.gadget.isOnline)
+                                    {
+                                        string dataToSend = startCommand + JsonConvert.SerializeObject(item.CreateMessage()) + endCommand;
+                                        var firstChar = Encoding.UTF8.GetBytes(startCommand);
+                                        byte[] dataBytes = Encoding.UTF8.GetBytes(dataToSend);
+                                        await stream.WriteAsync(dataBytes, 0, dataBytes.Length);
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    connectedGadgets.Find(k => k.IPAddress == item.gadget.IPAddress).isOnline = false;
+                                    ServiceLogError(ex);
+                                }
+                                if (item.isResponseExpected)
+                                {
+                                    awaitingResponse.Add(item);
+                                }
+                                //ServiceLog($"Sent data to device {item.gadget.name}: " + dataToSend);
                             }
-                            try
-                            {
-                                string dataToSend = startCommand + JsonConvert.SerializeObject(item.CreateMessage()) + endCommand;
-                                var firstChar = Encoding.UTF8.GetBytes(startCommand);
-                                byte[] dataBytes = Encoding.UTF8.GetBytes(dataToSend);
-                                await stream.WriteAsync(dataBytes, 0, dataBytes.Length);
-                            }
-                            catch (Exception ex)
-                            {
-                                ServiceLogError(ex);
-                                AnnounceGadgetDisconnect(item.gadget);
-                            }
-                            if (item.isResponseExpected)
-                            {
-                                awaitingResponse.Add(item);
-                            }
-                            //ServiceLog($"Sent data to device {item.gadget.name}: " + dataToSend);
                         }
                     });
                     task.Start();
@@ -534,7 +580,7 @@ namespace Omnipotent.Services.KliveTechHub
         }
         public async Task<bool> IsDeviceConnected(KliveTechGadget gadget, int attempts = 0)
         {
-            int maxAttempts = 5;
+            int maxAttempts = 3;
             try
             {
                 try
@@ -572,16 +618,6 @@ namespace Omnipotent.Services.KliveTechHub
                     return await IsDeviceConnected(gadget, attempts++);
                 }
             }
-        }
-        private void AnnounceGadgetDisconnect(KliveTechGadget g)
-        {
-            ServiceLog($"Device {g.name} disconnected!");
-            g.DisconnectDevice();
-            try
-            {
-                connectedGadgets.Remove(g);
-            }
-            catch (Exception ex) { }
         }
     }
 }

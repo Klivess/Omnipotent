@@ -108,8 +108,12 @@ namespace Omnipotent.Service_Manager
                             AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
                             {
                                 ServiceLogError((Exception)e.ExceptionObject, "Thread Unhandled Error!");
-                                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed($"Unhandled error caught in {name} service!",
+                                try
+                                {
+                                    await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed($"Unhandled error caught in {name} service!",
                                     new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
+                                }
+                                catch (Exception) { }
                             });
                             ServiceMain(); Task.Delay(-1).Wait();
                         }

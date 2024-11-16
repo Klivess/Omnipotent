@@ -105,9 +105,17 @@ namespace Omnipotent.Service_Manager
             return ref timeManager;
         }
 
-        public KliveLocalLLM GetKliveLocalLLMService()
+        public KliveLocalLLM? GetKliveLocalLLMService()
         {
-            return (KliveLocalLLM)(GetServiceByClassType<KliveLocalLLM>()[0]);
+            var result = GetServiceByClassType<KliveLocalLLM>();
+            if (result.Any())
+            {
+                return (KliveLocalLLM)(result[0]);
+            }
+            else
+            {
+                return null;
+            }
         }
         public OmniService GetServiceByID(string id)
         {
@@ -151,19 +159,42 @@ namespace Omnipotent.Service_Manager
 
         public KliveAPI GetKliveAPIService()
         {
-
-            var service = (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
-            while (service.listener.IsListening != true) { Task.Delay(100).Wait(); }
-            return service;
+            try
+            {
+                var service = (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+                while (service.listener.IsListening != true) { Task.Delay(100).Wait(); }
+                return service;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError("Omni Service Manager", ex, "Couldn't get KliveAPI service.");
+                return null;
+            }
         }
-        public KliveBotDiscord GetKliveBotDiscordService()
+        public KliveBotDiscord? GetKliveBotDiscordService()
         {
-            return (KliveBotDiscord)(GetServiceByClassType<KliveBotDiscord>()[0]);
+            var result = GetServiceByClassType<KliveBotDiscord>();
+            if (result.Any())
+            {
+                return (KliveBotDiscord)(result[0]);
+            }
+            else
+            {
+                return null;
+            }
         }
 
         public NotificationsService GetNotificationsService()
         {
-            return (NotificationsService)(GetServiceByClassType<NotificationsService>()[0]);
+            var result = GetServiceByClassType<NotificationsService>();
+            if (result.Any())
+            {
+                return (NotificationsService)(result[0]);
+            }
+            else
+            {
+                return null;
+            }
         }
 
         public OmniService GetServiceByName(string name)
