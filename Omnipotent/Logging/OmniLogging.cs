@@ -92,33 +92,33 @@ namespace Omnipotent.Logging
             {
                 var message = messagesToLog.First();
                 messagesToLog.Remove(messagesToLog.First());
-                if (message.appearInConsole)
+                try
                 {
-                    if (message.type == LogType.Status)
+                    if (message.appearInConsole)
                     {
-                        await WriteStatus(message);
+                        if (message.type == LogType.Status)
+                        {
+                            await WriteStatus(message);
+                        }
+                        else if (message.type == LogType.Error)
+                        {
+                            await WriteError(message);
+                        }
+                        else if (message.type == LogType.Update)
+                        {
+                            await WriteUpdate(message);
+                        }
+                        await Task.Delay(1);
                     }
-                    else if (message.type == LogType.Error)
+                    else
                     {
-                        await WriteError(message);
+                        overallMessages.Add(message);
                     }
-                    else if (message.type == LogType.Update)
-                    {
-                        await WriteUpdate(message);
-                    }
-                    await Task.Delay(1);
                 }
-                else
-                {
-                    overallMessages.Add(message);
-                }
+                catch (Exception ex) { }
             }
 
-            //Replace this with proper waiting
-            while (messagesToLog.Any() == false)
-            {
-                await Task.Delay(100);
-            }
+            await Task.Delay(10);
             //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
             //GC.Collect();
             BeginLogLoop();

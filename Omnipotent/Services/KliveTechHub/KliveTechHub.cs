@@ -252,6 +252,7 @@ namespace Omnipotent.Services.KliveTechHub
                             {
                                 ServiceLogError(ex);
                                 DiscoverNewKliveTechGadgets();
+                                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Connecting to KliveTech gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
                                 return;
                             }
                         }
@@ -268,9 +269,9 @@ namespace Omnipotent.Services.KliveTechHub
                     catch (Exception ex)
                     {
                         ServiceLogError(ex);
+                        await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Connecting to gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
                     }
                 }
-                GC.Collect();
                 //Prevent stack overflow
                 await Task.Delay(5000);
                 DiscoverNewKliveTechGadgets();
