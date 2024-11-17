@@ -312,7 +312,7 @@ namespace Omnipotent.Services.KliveAPI
                     var pfxBuilder = cert.ToPfx(privateKey);
 
                     // Add the issuer certificate to the PFX builder
-                    var issuerCertBytes = await parent.GetDataHandler().ReadBytesFromFile(pretendPearX1path);
+                    var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
                     pfxBuilder.AddIssuer(issuerCertBytes);
 
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
