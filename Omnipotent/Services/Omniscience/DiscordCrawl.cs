@@ -35,6 +35,10 @@ namespace Omnipotent.Services.Omniscience
             ServiceLog("Starting Discord Crawl.");
             LinkedUsers = (await discordInterface.GetAllLinkedOmniDiscordUsersFromDisk()).ToList();
 
+            ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
+            Stopwatch time = Stopwatch.StartNew();
+            await LoadAllMessagesFromDisk(LinkedUsers.ToArray());
+
             List<string> brokenAccountNames = new();
             foreach (var item in LinkedUsers)
             {
@@ -54,10 +58,6 @@ namespace Omnipotent.Services.Omniscience
                 }
                 catch (Exception) { }
             }
-
-            ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
-            Stopwatch time = Stopwatch.StartNew();
-            await LoadAllMessagesFromDisk(LinkedUsers.ToArray());
             time.Stop();
             ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
             UpdateDiscordMessageDatabase();

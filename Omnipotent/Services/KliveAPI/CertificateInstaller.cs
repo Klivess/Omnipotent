@@ -11,6 +11,7 @@ using Certes.Acme;
 using DSharpPlus;
 using System.Net;
 using Certes.Acme.Resource;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Omnipotent.Services.KliveAPI
 {
@@ -24,6 +25,10 @@ namespace Omnipotent.Services.KliveAPI
         public string myGatewayCrtPath = Path.Combine(saveDir, "KliveAPIGateway.crt");
         public string myGatewayPfxPath = Path.Combine(saveDir, "KliveAPIGateway.pfx");
         public string myPemPath = Path.Combine(pemSaveDir, "klivedev.gmail.com(klive.dev).txt");
+
+
+        public string pretendPearX1path = Path.Combine(pemSaveDir, "PretendPearX1.pem");
+        public string pretendPearX1URL = "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem";
 
         public CertificateInstaller(KliveAPI service)
         {
@@ -57,6 +62,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             if (OmniPaths.CheckIfOnServer())
             {
+                await CheckPretendPearExists();
                 await InstallProductionCert(expDateYears, password, issuedBy);
             }
             else
@@ -206,8 +212,6 @@ namespace Omnipotent.Services.KliveAPI
             parent.ServiceLog("Creating ACME order.");
             string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
 
-
-
             IChallengeContext dnsChallenge = null;
             IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
             parent.ServiceLog("Creating new ACME challenge.");
@@ -306,6 +310,11 @@ namespace Omnipotent.Services.KliveAPI
                     }, privateKey);
 
                     var pfxBuilder = cert.ToPfx(privateKey);
+
+                    // Add the issuer certificate to the PFX builder
+                    var issuerCertBytes = await parent.GetDataHandler().ReadBytesFromFile(pretendPearX1path);
+                    pfxBuilder.AddIssuer(issuerCertBytes);
+
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
                     //Save .pfx to file
                     System.IO.File.Create(rootAuthorityPfxPath).Close();
@@ -325,6 +334,21 @@ namespace Omnipotent.Services.KliveAPI
                 await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
                 parent.ServiceLog($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
                 await InstallLocalCert(expDateYears, password, issuedBy);
+            }
+        }
+
+        public async Task CheckPretendPearExists()
+        {
+            if (System.IO.File.Exists(pretendPearX1path))
+            {
+                return;
+            }
+            else
+            {
+                parent.ServiceLog("Downloading Pretend Pear X1 certificate.");
+                WebClient hc = new();
+                await hc.DownloadFileTaskAsync(new Uri(pretendPearX1URL), pretendPearX1path);
+                parent.ServiceLog("Downloaded Pretend Pear X1 certificate.");
             }
         }
     }

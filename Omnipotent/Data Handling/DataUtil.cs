@@ -26,7 +26,8 @@ namespace Omnipotent.Data_Handling
             AppendToFile,
             DeleteFile,
             DeleteDirectory,
-            WriteBytes
+            WriteBytes,
+            ReadBytes
         }
         private struct FileOperation
         {
@@ -35,6 +36,7 @@ namespace Omnipotent.Data_Handling
             public string content;
             public byte[]? bytes;
             public TaskCompletionSource<string> result;
+            public TaskCompletionSource<byte[]>? resultBytes;
             public ReadWrite operation;
         }
 
@@ -50,6 +52,10 @@ namespace Omnipotent.Data_Handling
                 fileOperation.operation = operation;
                 fileOperation.ID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
                 fileOperation.result = new TaskCompletionSource<string>();
+                if (operation == ReadWrite.ReadBytes)
+                {
+                    fileOperation.resultBytes = new TaskCompletionSource<byte[]>();
+                }
                 fileOperations.Add(fileOperation);
                 return fileOperation;
             }
@@ -130,6 +136,22 @@ namespace Omnipotent.Data_Handling
             }
         }
 
+        public async Task<byte[]> ReadBytesFromFile(string path, bool NonQueued = false)
+        {
+            if (File.Exists(path))
+            {
+                if (NonQueued)
+                {
+                    return await File.ReadAllBytesAsync(path);
+                }
+                return await CreateNewOperation(path, ReadWrite.ReadBytes).resultBytes.Task;
+            }
+            else
+            {
+                throw new Exception("No such file exists.");
+            }
+        }
+
         public async Task<dataType> ReadAndDeserialiseDataFromFile<dataType>(string path)
         {
             if (File.Exists(path))
@@ -186,6 +208,10 @@ namespace Omnipotent.Data_Handling
                         else if (task.operation == ReadWrite.WriteBytes)
                         {
                             await File.WriteAllBytesAsync(task.path, task.bytes);
+                        }
+                        else if (task.operation == ReadWrite.ReadBytes)
+                        {
+                            task.resultBytes.SetResult(await File.ReadAllBytesAsync(task.path));
                         }
                     }
                     catch (IOException exception)
