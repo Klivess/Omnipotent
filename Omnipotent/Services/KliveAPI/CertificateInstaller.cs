@@ -318,7 +318,7 @@ namespace Omnipotent.Services.KliveAPI
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
                     //Save .pfx to file
                     System.IO.File.Create(rootAuthorityPfxPath).Close();
-                    await parent.GetDataHandler().WriteBytesToFile(rootAuthorityPfxPath, pfx);
+                    await System.IO.File.WriteAllBytesAsync(rootAuthorityPfxPath, pfx);
                     parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
                     await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
                 }
