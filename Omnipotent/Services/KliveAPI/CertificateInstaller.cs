@@ -60,7 +60,7 @@ namespace Omnipotent.Services.KliveAPI
         }
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
-            if (OmniPaths.CheckIfOnServer())
+            if (OmniPaths.CheckIfOnServer() && OmniPaths.useACMECert)
             {
                 await CheckPretendPearExists();
                 await InstallProductionCert(expDateYears, password, issuedBy);
@@ -297,6 +297,7 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     parent.ServiceLog("Challenge is solved, creating certificate.");
                     await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Challenge is solved, creating certificate.");
+
                     //Generate certificate
                     var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
                     var cert = await order.Generate(new CsrInfo
