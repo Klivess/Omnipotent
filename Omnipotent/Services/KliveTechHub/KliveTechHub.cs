@@ -451,7 +451,11 @@ namespace Omnipotent.Services.KliveTechHub
                     KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result.Trim());
                     if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
                     {
-                        awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
+                        var wife = awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID));
+                        if (wife.response.Task.IsCompleted == false)
+                        {
+                            awaitingResponse.Find(k => k.ID == Convert.ToString(Response.ID)).response.SetResult(Response);
+                        }
                     }
                     Task.Delay(100).Wait();
                 }
