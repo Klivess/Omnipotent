@@ -48,12 +48,14 @@ namespace Omnipotent.Services.KliveTechHub
             public List<KliveTechActions.KliveTechAction> actions;
             public DateTime timeConnected;
             public bool isOnline;
+            public DateTime lastMessageReceived;
             [Newtonsoft.Json.JsonIgnore]
             public BluetoothDeviceInfo deviceInfo;
             [Newtonsoft.Json.JsonIgnore]
             public Thread ReceiveLoop;
             [Newtonsoft.Json.JsonIgnore]
             public BluetoothClient connectedClient;
+
             public KliveTechGadget()
             {
                 actions = new();
@@ -445,6 +447,7 @@ namespace Omnipotent.Services.KliveTechHub
                 if (!string.IsNullOrEmpty(result.Trim()) && OmniPaths.IsValidJson(result.Trim()))
                 {
                     ServiceLog($"Received data from device {gadget.name}: " + result, false);
+                    connectedGadgets.Find(k => k.IPAddress == gadget.IPAddress).lastMessageReceived = DateTime.Now;
                     KliveTechGadgetResponse Response = new KliveTechGadgetResponse(result.Trim());
                     if (awaitingResponse.Select(k => k.ID).ToList().Contains(Convert.ToString(Response.ID)) == true)
                     {
@@ -581,6 +584,10 @@ namespace Omnipotent.Services.KliveTechHub
         public async Task<bool> IsDeviceConnected(KliveTechGadget gadget, int attempts = 0)
         {
             int maxAttempts = 3;
+            if (gadget.lastMessageReceived.AddSeconds(10) > DateTime.Now)
+            {
+                return true;
+            }
             try
             {
                 try
