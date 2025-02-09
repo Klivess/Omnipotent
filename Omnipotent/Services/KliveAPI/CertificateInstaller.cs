@@ -27,8 +27,8 @@ namespace Omnipotent.Services.KliveAPI
         public string myPemPath = Path.Combine(pemSaveDir, "klivedev.gmail.com(klive.dev).txt");
 
 
-        public string pretendPearX1path = Path.Combine(pemSaveDir, "PretendPearX1.pem");
-        public string pretendPearX1URL = "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem";
+        public string pretendPearX1path = Path.Combine(pemSaveDir, "isrg_root_x1.pem");
+        public string pretendPearX1URL = "https://letsencrypt.org/certs/isrgrootx1.pem";
 
         public CertificateInstaller(KliveAPI service)
         {
@@ -313,8 +313,8 @@ namespace Omnipotent.Services.KliveAPI
                     var pfxBuilder = cert.ToPfx(privateKey);
 
                     // Add the issuer certificate to the PFX builder
-                    //var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
-                    //pfxBuilder.AddIssuer(issuerCertBytes);
+                    var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
+                    pfxBuilder.AddIssuer(issuerCertBytes);
 
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
                     //Save .pfx to file
