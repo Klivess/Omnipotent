@@ -97,9 +97,9 @@ namespace Omnipotent.Services.KliveAPI
                 ControllerLookup = new();
 
                 listener = new();
-                //listener.Prefixes.Add($"https://+:{apiPORT}/");
+                listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
-                //listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
+                listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 

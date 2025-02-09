@@ -180,7 +180,7 @@ namespace Omnipotent.Services.KliveAPI
 
                     // Load the saved account key
                     var accountKey = KeyFactory.FromPem(pem);
-                    acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2, accountKey);
+                    acme = new AcmeContext(WellKnownServers.LetsEncryptV2, accountKey);
                     account = await acme.Account();
                     parent.ServiceLog("Done loading ACME account and context.");
                 }
@@ -210,7 +210,7 @@ namespace Omnipotent.Services.KliveAPI
 
             //Order
             parent.ServiceLog("Creating ACME order.");
-            string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
+            //string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
 
             IChallengeContext dnsChallenge = null;
             IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
@@ -275,12 +275,12 @@ namespace Omnipotent.Services.KliveAPI
 
             challengeResult = await dnsChallenge.Resource();
 
-            var attempts = 10;
+            var attempts = 30;
 
             while (attempts > 0 && challengeResult.Status == ChallengeStatus.Pending || challengeResult.Status == ChallengeStatus.Processing)
             {
                 challengeResult = await dnsChallenge.Resource();
-                await Task.Delay(500);
+                await Task.Delay(5000);
                 attempts--;
             }
 
@@ -313,12 +313,12 @@ namespace Omnipotent.Services.KliveAPI
                     var pfxBuilder = cert.ToPfx(privateKey);
 
                     // Add the issuer certificate to the PFX builder
-                    var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
-                    pfxBuilder.AddIssuer(issuerCertBytes);
+                    //var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
+                    //pfxBuilder.AddIssuer(issuerCertBytes);
 
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
                     //Save .pfx to file
-                    System.IO.File.Create(rootAuthorityPfxPath).Close();
+                    //System.IO.File.Create(rootAuthorityPfxPath).Close();
                     await System.IO.File.WriteAllBytesAsync(rootAuthorityPfxPath, pfx);
                     parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
                     await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
