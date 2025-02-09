@@ -157,6 +157,7 @@ namespace Omnipotent.Services.KliveAPI
 
         private async Task LinkSSLCertificate(string pathToPfx)
         {
+            ServiceLog("Linking SSL Certificate...");
             // Load the certificate from the .pfx file
             string pfxFilePath = pathToPfx;
 

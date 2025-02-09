@@ -13,7 +13,7 @@ namespace Omnipotent.Data_Handling
     {
         public static ulong DiscordServerContainingKlives = 688114655910297736;
         public static ulong KlivesDiscordAccountID = 976648966944989204;
-        public static bool useACMECert = false;
+        public static bool useACMECert = true;
 
         public static DateTime LastOmnipotentUpdate = File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe"));
 
