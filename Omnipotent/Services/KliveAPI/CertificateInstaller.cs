@@ -162,7 +162,7 @@ namespace Omnipotent.Services.KliveAPI
             if (!System.IO.File.Exists(myPemPath))
             {
                 parent.ServiceLog("Creating ACME account and context.");
-                acme = new AcmeContext(WellKnownServers.LetsEncryptStagingV2);
+                acme = new AcmeContext(WellKnownServers.LetsEncryptV2);
                 account = await acme.NewAccount("klivesdev@gmail.com", true);
 
                 // Save the account key for later use
@@ -313,8 +313,8 @@ namespace Omnipotent.Services.KliveAPI
                     var pfxBuilder = cert.ToPfx(privateKey);
 
                     // Add the issuer certificate to the PFX builder
-                    var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
-                    pfxBuilder.AddIssuer(issuerCertBytes);
+                    //var issuerCertBytes = await System.IO.File.ReadAllBytesAsync(pretendPearX1path);
+                    //pfxBuilder.AddIssuer(issuerCertBytes);
 
                     var pfx = pfxBuilder.Build("klive.devKliveAPI", password);
                     //Save .pfx to file
