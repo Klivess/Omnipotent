@@ -20,6 +20,8 @@ using System.Security.Cryptography.X509Certificates;
 using System.Management.Automation;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using Microsoft.VisualBasic.FileIO;
+using DSharpPlus.Entities;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -196,6 +198,15 @@ namespace Omnipotent.Services.KliveAPI
             // Read the output and errors
             string output = process.StandardOutput.ReadToEnd();
             string error = process.StandardError.ReadToEnd();
+            string outputPath = Path.Combine(SpecialDirectories.Temp, "kliveapilinkssloutput.txt");
+            File.WriteAllText(outputPath, $"Output:\n\n{output}\n\nError:{error}");
+            DiscordMessageBuilder builder = new DiscordMessageBuilder();
+            builder.WithContent("SSL Certificate Linking Output");
+            Stream fileStream = File.Open(outputPath, FileMode.Open);
+            builder.AddFile("SSL Certificate Linking Output", fileStream);
+            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
+            fileStream.Close();
+            File.Delete(outputPath);
             process.WaitForExit();
         }
 
