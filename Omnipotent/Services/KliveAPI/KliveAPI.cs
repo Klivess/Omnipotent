@@ -99,7 +99,7 @@ namespace Omnipotent.Services.KliveAPI
                 ControllerLookup = new();
 
                 listener = new();
-                listener.Prefixes.Add($"https://+:{apiPORT}/");
+                //listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
                 listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
 
@@ -203,7 +203,7 @@ namespace Omnipotent.Services.KliveAPI
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             builder.WithContent("SSL Certificate Linking Output");
             Stream fileStream = File.Open(outputPath, FileMode.Open);
-            builder.AddFile("SSL Certificate Linking Output", fileStream);
+            builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
             await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
             fileStream.Close();
             File.Delete(outputPath);
