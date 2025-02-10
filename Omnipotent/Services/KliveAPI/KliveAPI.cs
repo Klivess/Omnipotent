@@ -165,6 +165,9 @@ namespace Omnipotent.Services.KliveAPI
 
             // Get the certificate hash (thumbprint)
             string certHash = certificate.Thumbprint;
+
+            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certHash);
+
             string script;
             if (OmniPaths.CheckIfOnServer())
             {

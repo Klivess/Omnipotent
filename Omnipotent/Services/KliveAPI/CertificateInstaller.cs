@@ -320,7 +320,7 @@ namespace Omnipotent.Services.KliveAPI
                     //Save .pfx to file
                     //System.IO.File.Create(rootAuthorityPfxPath).Close();
                     await System.IO.File.WriteAllBytesAsync(rootAuthorityPfxPath, pfx);
-                    parent.ServiceLog("ACME Certificate created for !" + KliveAPI.domainName);
+                    parent.ServiceLog("ACME Certificate created for " + KliveAPI.domainName + "!");
                     await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
                 }
                 catch (Exception ex)
