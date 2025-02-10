@@ -63,7 +63,10 @@ namespace Omnipotent.Services.KliveAPI
             if (OmniPaths.CheckIfOnServer() && OmniPaths.useACMECert)
             {
                 await CheckPretendPearExists();
-                await InstallProductionCert(expDateYears, password, issuedBy);
+                if (!System.IO.File.Exists(rootAuthorityPfxPath))
+                {
+                    await InstallProductionCert(expDateYears, password, issuedBy);
+                }
             }
             else
             {
