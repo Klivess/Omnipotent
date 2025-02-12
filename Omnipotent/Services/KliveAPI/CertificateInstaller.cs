@@ -310,7 +310,7 @@ namespace Omnipotent.Services.KliveAPI
                         Locality = "London",
                         Organization = "KlivesManagement",
                         OrganizationUnit = "Klives",
-                        CommonName = "*.klive.dev",
+                        CommonName = "klive.dev",
                     }, privateKey);
 
                     var pfxBuilder = cert.ToPfx(privateKey);
