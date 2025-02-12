@@ -22,6 +22,7 @@ using System.Diagnostics;
 using System.Collections.Concurrent;
 using Microsoft.VisualBasic.FileIO;
 using DSharpPlus.Entities;
+using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -159,6 +160,64 @@ namespace Omnipotent.Services.KliveAPI
         }
 
         private async Task LinkSSLCertificate(string pathToPfx)
+        {
+            var certificate = new X509Certificate2(
+    pathToPfx,
+    "klives",
+    X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access
+    X509KeyStorageFlags.PersistKeySet
+);
+
+            using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
+            {
+                store.Open(OpenFlags.ReadWrite);
+                store.Add(certificate); // Install to Local Machine store
+                store.Close();
+            }
+
+            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
+
+            string script;
+            if (OmniPaths.CheckIfOnServer())
+            {
+                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            }
+            else
+            {
+                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+            }
+            // Set up the process start info
+            ProcessStartInfo processInfo = new ProcessStartInfo
+            {
+                FileName = "netsh",
+                Arguments = script,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            // Start the process
+            Process process = new Process();
+            process.StartInfo = processInfo;
+            process.Start();
+
+            // Read the output and errors
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            string outputPath = Path.Combine(SpecialDirectories.Temp, "kliveapilinkssloutput.txt");
+            File.WriteAllText(outputPath, $"Output:\n\n{output}\n\nError:{error}");
+            DiscordMessageBuilder builder = new DiscordMessageBuilder();
+            builder.WithContent("SSL Certificate Linking Output");
+            Stream fileStream = File.Open(outputPath, FileMode.Open);
+            builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
+            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
+            fileStream.Close();
+            File.Delete(outputPath);
+            process.WaitForExit();
+        }
+
+        private async Task LinkSSLCertificateOLD(string pathToPfx)
         {
             ServiceLog("Linking SSL Certificate...");
             // Load the certificate from the .pfx file
