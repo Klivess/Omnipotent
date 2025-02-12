@@ -102,7 +102,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
-                listener.Prefixes.Add($"https://*:{apiPORT}/");
+                listener.Prefixes.Add($"https://+:{apiPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
@@ -185,59 +185,6 @@ namespace Omnipotent.Services.KliveAPI
             else
             {
                 script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
-            }
-            // Set up the process start info
-            ProcessStartInfo processInfo = new ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = script,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            // Start the process
-            Process process = new Process();
-            process.StartInfo = processInfo;
-            process.Start();
-
-            // Read the output and errors
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
-            string outputPath = Path.Combine(SpecialDirectories.Temp, "kliveapilinkssloutput.txt");
-            File.WriteAllText(outputPath, $"Output:\n\n{output}\n\nError:{error}");
-            DiscordMessageBuilder builder = new DiscordMessageBuilder();
-            builder.WithContent("SSL Certificate Linking Output");
-            Stream fileStream = File.Open(outputPath, FileMode.Open);
-            builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
-            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
-            fileStream.Close();
-            File.Delete(outputPath);
-            process.WaitForExit();
-        }
-
-        private async Task LinkSSLCertificateOLD(string pathToPfx)
-        {
-            ServiceLog("Linking SSL Certificate...");
-            // Load the certificate from the .pfx file
-            string pfxFilePath = pathToPfx;
-
-            X509Certificate2 certificate = new X509Certificate2(pfxFilePath, "klives");
-
-            // Get the certificate hash (thumbprint)
-            string certHash = certificate.Thumbprint;
-
-            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certHash);
-
-            string script;
-            if (OmniPaths.CheckIfOnServer())
-            {
-                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
-            }
-            else
-            {
-                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certHash} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
             }
             // Set up the process start info
             ProcessStartInfo processInfo = new ProcessStartInfo
