@@ -139,7 +139,7 @@ namespace Omnipotent.Service_Manager
                     var ser = activeServices.Where(k => k.GetType().Name == typeof(T).Name);
                     if (ser != null)
                     {
-                        if (ser != null)
+                        if (ser.Any())
                         {
                             break;
                         }
