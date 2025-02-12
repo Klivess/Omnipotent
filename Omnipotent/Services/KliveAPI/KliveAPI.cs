@@ -102,7 +102,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
-                listener.Prefixes.Add($"https://+:{apiPORT}/");
+                listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
@@ -184,7 +184,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             else
             {
-                script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
+                script = $"http add sslcert ipport={domainName}:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
             }
             // Set up the process start info
             ProcessStartInfo processInfo = new ProcessStartInfo
