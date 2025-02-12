@@ -177,6 +177,11 @@ namespace Omnipotent.Service_Manager
         public KliveBotDiscord? GetKliveBotDiscordService()
         {
             var result = GetServiceByClassType<KliveBotDiscord>();
+            while (result == null)
+            {
+                Task.Delay(100).Wait();
+                result = GetServiceByClassType<KliveBotDiscord>();
+            }
             if (result.Any())
             {
                 return (KliveBotDiscord)(result[0]);
