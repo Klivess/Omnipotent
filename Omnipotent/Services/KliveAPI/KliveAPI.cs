@@ -259,7 +259,7 @@ namespace Omnipotent.Services.KliveAPI
                     if (ControllerLookup.ContainsKey(route))
                     {
                         RouteInfo routeData = ControllerLookup[route];
-                        if (req.HttpMethod != routeData.method.ToString())
+                        if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
                         {
                             ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
                             DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
