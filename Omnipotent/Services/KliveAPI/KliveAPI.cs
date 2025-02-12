@@ -106,6 +106,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
+                ServiceLog($"Checking SSL Certificates");
                 await CheckForSSLCertificate();
                 await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
 
