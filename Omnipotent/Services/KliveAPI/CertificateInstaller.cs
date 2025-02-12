@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveAPI
             //string pathOfOrder = Path.Combine(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory, "currentActiveChallenge.txt");
 
             IChallengeContext dnsChallenge = null;
-            IOrderContext order = await acme.NewOrder(new[] { "*.klive.dev" });
+            IOrderContext order = await acme.NewOrder(new[] { "klive.dev" });
             parent.ServiceLog("Creating new ACME challenge.");
             var authz = (await order.Authorizations()).First();
             dnsChallenge = await authz.Dns();
