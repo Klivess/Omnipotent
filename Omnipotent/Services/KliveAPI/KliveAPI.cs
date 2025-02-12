@@ -163,21 +163,18 @@ namespace Omnipotent.Services.KliveAPI
         private async Task LinkSSLCertificate(string pathToPfx)
         {
             var certificate = new X509Certificate2(
-    pathToPfx,
-    "klives",
-    X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access
-    X509KeyStorageFlags.PersistKeySet
-);
-
+                pathToPfx,
+                "klives",
+                X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access
+                X509KeyStorageFlags.PersistKeySet
+            );
+            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
             using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
             {
                 store.Open(OpenFlags.ReadWrite);
                 store.Add(certificate); // Install to Local Machine store
                 store.Close();
             }
-
-            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
-
             string script;
             if (OmniPaths.CheckIfOnServer())
             {
