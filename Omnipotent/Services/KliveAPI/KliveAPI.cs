@@ -106,7 +106,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
-                ServiceLog($"Checking SSL Certificates");
+                ServiceLog($"Checking SSL Certificates ");
                 await CheckForSSLCertificate();
                 await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
 
@@ -187,27 +187,9 @@ namespace Omnipotent.Services.KliveAPI
             {
                 script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
             }
-            // Set up the process start info
-            ProcessStartInfo processInfo = new ProcessStartInfo
-            {
-                FileName = "netsh",
-                Arguments = script,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            // Start the process
-            Process process = new Process();
-            process.StartInfo = processInfo;
-            process.Start();
-
-            // Read the output and errors
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
+            string output = ExistentialBotUtilities.SendTerminalCommand("netsh", script);
             string outputPath = Path.Combine(SpecialDirectories.Temp, "kliveapilinkssloutput.txt");
-            File.WriteAllText(outputPath, $"Output:\n\n{output}\n\nError:{error}");
+            File.WriteAllText(outputPath, $"Output:\n\n{output}");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             builder.WithContent("SSL Certificate Linking Output");
             Stream fileStream = File.Open(outputPath, FileMode.Open);
@@ -215,7 +197,6 @@ namespace Omnipotent.Services.KliveAPI
             await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
             fileStream.Close();
             File.Delete(outputPath);
-            process.WaitForExit();
         }
 
         //Example of how to define a route

@@ -49,7 +49,6 @@ namespace Omnipotent
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
 
-
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
                 {
