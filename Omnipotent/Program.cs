@@ -30,8 +30,8 @@ namespace Omnipotent
             {
 
                 //Create services
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
 
                 //Error Handlers
                 AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
