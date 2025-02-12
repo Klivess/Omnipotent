@@ -122,6 +122,7 @@ namespace Omnipotent.Services.KliveAPI
             catch (Exception ex)
             {
                 ServiceLogError(ex, "KliveAPI Failed!");
+                serviceManager.GetKliveBotDiscordService().SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
             }
         }
 
