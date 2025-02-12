@@ -102,7 +102,7 @@ namespace Omnipotent.Services.KliveAPI
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
-                listener.Prefixes.Add($"https://{domainName}:{apiPORT}/");
+                listener.Prefixes.Add($"https://+:{apiPORT}/");
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
