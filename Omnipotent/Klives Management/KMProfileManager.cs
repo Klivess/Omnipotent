@@ -63,23 +63,19 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    var password = req.userParameters["password"];
-                    var profile = await GetProfileByPassword(password);
-                    if (profile == null)
+                    if (req.user == null)
                     {
-                        await req.ReturnResponse("Profile not found.", code: HttpStatusCode.Unauthorized);
+                        await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
                         return;
+                    }
+                    var canLogin = req.user.CanLogin;
+                    if (canLogin)
+                    {
+                        await req.ReturnResponse("Allowed", code: HttpStatusCode.OK);
                     }
                     else
                     {
-                        if (profile.CanLogin)
-                        {
-                            await req.ReturnResponse("Profile can login.", code: HttpStatusCode.OK);
-                        }
-                        else
-                        {
-                            await req.ReturnResponse("Profile cannot login.", code: HttpStatusCode.Unauthorized);
-                        }
+                        await req.ReturnResponse("ProfileDisbaled", code: HttpStatusCode.Unauthorized);
                     }
                 }
                 catch (Exception ex)
