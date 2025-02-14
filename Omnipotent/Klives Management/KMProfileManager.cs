@@ -75,7 +75,7 @@ namespace Omnipotent.Profiles
                     }
                     else
                     {
-                        await req.ReturnResponse("ProfileDisbaled", code: HttpStatusCode.Unauthorized);
+                        await req.ReturnResponse("ProfileDisabled", code: HttpStatusCode.Unauthorized);
                     }
                 }
                 catch (Exception ex)
