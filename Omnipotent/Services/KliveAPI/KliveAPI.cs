@@ -246,6 +246,15 @@ namespace Omnipotent.Services.KliveAPI
                     request.userMessageContent = await reader.ReadToEndAsync();
                     request.userParameters = nameValueCollection;
                     request.user = null;
+
+                    //HANDLE PREFLIGHT REQUESTS
+                    if (request.req.HttpMethod == "OPTIONS")
+                    {
+                        request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
+                        continue;
+                    }
+
+
                     if (!string.IsNullOrEmpty(query))
                     {
                         route = route.Replace(query, "");
