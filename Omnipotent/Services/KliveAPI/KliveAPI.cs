@@ -23,6 +23,7 @@ using System.Collections.Concurrent;
 using Microsoft.VisualBasic.FileIO;
 using DSharpPlus.Entities;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
+using Org.BouncyCastle.Asn1.Ocsp;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -67,9 +68,13 @@ namespace Omnipotent.Services.KliveAPI
                         resp.Headers.Add(headers.GetKey(i), headers.Get(i));
                     }
                 }
+                if (req.HttpMethod == "OPTIONS")
+                {
+                    resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With");
+                    resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST");
+                    resp.Headers.Add("Access-Control-Max-Age", "1728000");
+                }
                 resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                resp.Headers.Add("Access-Control-Allow-Headers", "*");
-                resp.Headers.Add("Access-Control-Allow-Methods", "*");
 
                 byte[] buffer = Encoding.UTF8.GetBytes(response);
                 resp.ContentLength64 = buffer.Length;
