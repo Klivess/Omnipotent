@@ -70,8 +70,8 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 if (req.HttpMethod == "OPTIONS")
                 {
-                    resp.Headers.Add("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With");
-                    resp.Headers.Add("Access-Control-Allow-Methods", "GET, POST");
+                    resp.Headers.Add("Access-Control-Allow-Headers", "*");
+                    resp.Headers.Add("Access-Control-Allow-Methods", "*");
                     resp.Headers.Add("Access-Control-Max-Age", "1728000");
                 }
                 resp.Headers.Add("Access-Control-Allow-Origin", "*");
