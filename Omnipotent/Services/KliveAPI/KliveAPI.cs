@@ -275,37 +275,47 @@ namespace Omnipotent.Services.KliveAPI
                     if (ControllerLookup.ContainsKey(route))
                     {
                         RouteInfo routeData = ControllerLookup[route];
-                        if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
+
+                        if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                         {
-                            ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
-                            DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
+                            ServiceLog($"Route {route} has been requested by a user that can't login.");
+                            DenyRequest(request, DeniedRequestReason.ProfileDisabled);
+                            continue;
                         }
                         else
                         {
-                            if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
+                            if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
                             {
-                                //ServiceLog($"Unauthenticated route {route} has been requested.");
-                                ControllerLookup[route].action.Invoke(request);
+                                ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
+                                DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
                             }
                             else
                             {
-                                if (request.user != null)
+                                if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                                 {
-                                    if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
-                                    {
-                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
-                                        ControllerLookup[route].action.Invoke(request);
-                                    }
-                                    else
-                                    {
-                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
-                                        DenyRequest(request, DeniedRequestReason.TooLowClearance);
-                                    }
+                                    //ServiceLog($"Unauthenticated route {route} has been requested.");
+                                    ControllerLookup[route].action.Invoke(request);
                                 }
                                 else
                                 {
-                                    ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
-                                    DenyRequest(request, DeniedRequestReason.NoProfile);
+                                    if (request.user != null)
+                                    {
+                                        if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                                        {
+                                            ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
+                                            ControllerLookup[route].action.Invoke(request);
+                                        }
+                                        else
+                                        {
+                                            ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
+                                            DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
+                                        DenyRequest(request, DeniedRequestReason.NoProfile);
+                                    }
                                 }
                             }
                         }
@@ -327,7 +337,8 @@ namespace Omnipotent.Services.KliveAPI
             NoProfile = 0,
             InvalidPassword = 1,
             TooLowClearance = 2,
-            IncorrectHTTPMethod = 3
+            IncorrectHTTPMethod = 3,
+            ProfileDisabled = 4
         }
         private async void DenyRequest(UserRequest request, DeniedRequestReason reason)
         {

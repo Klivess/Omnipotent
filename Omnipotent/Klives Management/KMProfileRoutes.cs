@@ -3,6 +3,7 @@ using Omnipotent.Profiles;
 using static Omnipotent.Profiles.KMProfileManager;
 using System.Net;
 using static System.Runtime.InteropServices.JavaScript.JSType;
+using System.Xml.Linq;
 
 namespace Omnipotent.Klives_Management
 {
@@ -31,6 +32,7 @@ namespace Omnipotent.Klives_Management
                     var password = request.userParameters.Get("password");
                     var profile = await p.CreateNewProfile(name, rank, password);
                     await request.ReturnResponse(JsonConvert.SerializeObject(profile), "application/json");
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("A new profile has been created with the name " + name + " and the rank " + rank + " by " + request.user.Name + ".");
                 }
                 catch (Exception ex)
                 {
@@ -100,6 +102,7 @@ namespace Omnipotent.Klives_Management
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just disabled {profile.Name}'s KMProfile.");
                 }
                 catch (Exception ex)
                 {
@@ -113,6 +116,7 @@ namespace Omnipotent.Klives_Management
                     var id = request.userParameters.Get("id");
                     var name = request.userParameters.Get("name");
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    string originalName = profile.Name;
                     if (profile == null)
                     {
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
@@ -128,6 +132,7 @@ namespace Omnipotent.Klives_Management
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {originalName}'s KMProfile username to {profile.Name}.");
                 }
                 catch (Exception ex)
                 {
@@ -156,6 +161,7 @@ namespace Omnipotent.Klives_Management
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile password.");
                 }
                 catch (Exception ex)
                 {
@@ -169,6 +175,7 @@ namespace Omnipotent.Klives_Management
                     var id = request.userParameters.Get("id");
                     var rank = (KMPermissions)Convert.ToInt32(request.userParameters.Get("rank"));
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    var originalRank = profile.KlivesManagementRank;
                     if (profile == null)
                     {
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
@@ -184,6 +191,7 @@ namespace Omnipotent.Klives_Management
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile rank from {originalRank.ToString()} to {rank.ToString()}. Ominous!!");
                 }
                 catch (Exception ex)
                 {
