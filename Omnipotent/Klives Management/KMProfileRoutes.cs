@@ -11,8 +11,8 @@ namespace Omnipotent.Klives_Management
         private KMProfileManager p;
         public KMProfileRoutes(KMProfileManager parent)
         {
-            CreateRoutes();
             p = parent;
+            CreateRoutes();
         }
 
         private async void CreateRoutes()
