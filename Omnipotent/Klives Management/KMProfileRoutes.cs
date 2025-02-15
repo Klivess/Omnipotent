@@ -80,11 +80,12 @@ namespace Omnipotent.Klives_Management
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             };
-            Action<UserRequest> disableUserLogin = async (request) =>
+            Action<UserRequest> changeUserLogin = async (request) =>
             {
                 try
                 {
                     var id = request.userParameters.Get("id");
+                    var on = request.userParameters.Get("enabled");
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
                     if (profile == null)
                     {
@@ -94,7 +95,7 @@ namespace Omnipotent.Klives_Management
                     //If profile that is trying to be edited is lower ranked than the user that is trying to edit it, then disable the login.
                     if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
                     {
-                        profile.CanLogin = false;
+                        profile.CanLogin = (on == "true");
                         p.UpdateProfileWithID(id, profile);
                         await request.ReturnResponse("ProfileDisabled", code: HttpStatusCode.OK);
                     }
@@ -231,7 +232,7 @@ namespace Omnipotent.Klives_Management
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", changeProfileRank, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetProfileByID", getProfileByUserID, HttpMethod.Get, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", getAllProfiles, HttpMethod.Get, KMPermissions.Manager);
-            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DisableLogin", disableUserLogin, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DisableLogin", changeUserLogin, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", changeProfileName, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", changeProfilePassword, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/LoginStatus", async (req) =>
