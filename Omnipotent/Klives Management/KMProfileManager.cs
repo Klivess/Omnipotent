@@ -30,7 +30,7 @@ namespace Omnipotent.Profiles
 
         public async Task RequestProfileFromKlives()
         {
-            var password = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord("No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.", TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
+            var password = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.", TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
             await CreateNewProfile("Klives", KMPermissions.Klives, password);
         }
 

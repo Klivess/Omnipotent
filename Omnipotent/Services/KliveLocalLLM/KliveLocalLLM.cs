@@ -155,7 +155,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                     var logged = await ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
                     WebClient webClient = new WebClient();
                     int progressPercentage = 0;
-                    var message = await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");
+                    var message = await ((await serviceManager.GetKliveBotDiscordService())).SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");
                     webClient.DownloadProgressChanged += (sender, e) =>
                     {
                         if ((e.ProgressPercentage - progressPercentage) >= 1)
@@ -173,7 +173,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                     await webClient.DownloadFileTaskAsync(new Uri(modelDownloadURL), tempFile);
                     File.Copy(tempFile, modelFilePath);
                     File.Delete(tempFile);
-                    await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
                     ServiceLog("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
                 }
                 catch (Exception ex)
@@ -185,7 +185,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                         { "Quit", ButtonStyle.Danger}
                     };
                     ErrorInformation errorInformation = new ErrorInformation(ex);
-                    var response = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Failed to download prerequisite LLM LLama model for KliveLocalLLM.",
+                    var response = await (await serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord("Failed to download prerequisite LLM LLama model for KliveLocalLLM.",
                         errorInformation.FullFormattedMessage + "\n\nWould you like to retry or to quit Omnipotent?", data, TimeSpan.FromDays(3));
                     if (response == "Retry")
                     {

@@ -105,9 +105,9 @@ namespace Omnipotent.Service_Manager
             return ref timeManager;
         }
 
-        public KliveLocalLLM? GetKliveLocalLLMService()
+        public async Task<KliveLocalLLM?> GetKliveLocalLLMService()
         {
-            var result = GetServiceByClassType<KliveLocalLLM>();
+            var result = await GetServiceByClassType<KliveLocalLLM>();
             if (result.Any())
             {
                 return (KliveLocalLLM)(result[0]);
@@ -130,7 +130,7 @@ namespace Omnipotent.Service_Manager
                 throw new Exception("Couldn't get OmniService by ID");
             }
         }
-        public OmniService[] GetServiceByClassType<T>()
+        public async Task<OmniService[]> GetServiceByClassType<T>()
         {
             try
             {
@@ -155,16 +155,16 @@ namespace Omnipotent.Service_Manager
             catch (Exception ex)
             {
                 logger.LogError("Omni Service Manager", ex, "Couldn't get OmniService by class");
-                return GetServiceByClassType<T>();
+                return await GetServiceByClassType<T>();
             }
             return null;
         }
 
-        public KliveAPI GetKliveAPIService()
+        public async Task<KliveAPI> GetKliveAPIService()
         {
             try
             {
-                var service = (KliveAPI)(GetServiceByClassType<KliveAPI>()[0]);
+                var service = (KliveAPI)((await GetServiceByClassType<KliveAPI>())[0]);
                 while (service.listener.IsListening != true) { Task.Delay(100).Wait(); }
                 return service;
             }
@@ -174,13 +174,13 @@ namespace Omnipotent.Service_Manager
                 return null;
             }
         }
-        public KliveBotDiscord? GetKliveBotDiscordService()
+        public async Task<KliveBotDiscord?> GetKliveBotDiscordService()
         {
-            var result = GetServiceByClassType<KliveBotDiscord>();
+            var result = await GetServiceByClassType<KliveBotDiscord>();
             while (result == null)
             {
                 Task.Delay(100).Wait();
-                result = GetServiceByClassType<KliveBotDiscord>();
+                result = await GetServiceByClassType<KliveBotDiscord>();
             }
             if (result.Any())
             {
@@ -192,9 +192,9 @@ namespace Omnipotent.Service_Manager
             }
         }
 
-        public NotificationsService GetNotificationsService()
+        public async Task<NotificationsService> GetNotificationsService()
         {
-            var result = GetServiceByClassType<NotificationsService>();
+            var result = await GetServiceByClassType<NotificationsService>();
             if (result.Any())
             {
                 return (NotificationsService)(result[0]);

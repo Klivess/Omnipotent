@@ -191,13 +191,13 @@ namespace Omnipotent.Klives_Management
                 }
             };
 
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/ChangeProfileRank", changeProfileRank, HttpMethod.Post, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/GetProfileByID", getProfileByUserID, HttpMethod.Get, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/GetAllProfiles", getAllProfiles, HttpMethod.Get, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/DisableLogin", disableUserLogin, HttpMethod.Post, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/ChangeProfileName", changeProfileName, HttpMethod.Post, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/ChangeProfilePassword", changeProfilePassword, HttpMethod.Post, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/LoginStatus", async (req) =>
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", changeProfileRank, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetProfileByID", getProfileByUserID, HttpMethod.Get, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", getAllProfiles, HttpMethod.Get, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DisableLogin", disableUserLogin, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", changeProfileName, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", changeProfilePassword, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/LoginStatus", async (req) =>
             {
                 try
                 {
@@ -222,8 +222,8 @@ namespace Omnipotent.Klives_Management
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/CreateProfile", createProfile, HttpMethod.Post, KMPermissions.Manager);
-            await p.serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, HttpMethod.Post, KMPermissions.Anybody);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/CreateProfile", createProfile, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, HttpMethod.Post, KMPermissions.Anybody);
         }
     }
 }

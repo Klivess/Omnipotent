@@ -29,7 +29,7 @@ namespace Omnipotent.Services.Notifications
         protected override async void ServiceMain()
         {
             //Acquire KliveBot Discord Service
-            var search = (serviceManager.GetServiceByClassType<KliveBotDiscord>());
+            var search = ((await serviceManager.GetServiceByClassType<KliveBotDiscord>()));
             if (search == null)
             {
                 await Task.Delay(2000);

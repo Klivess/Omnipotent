@@ -74,11 +74,11 @@ namespace Omnipotent.Services.OmniStartupManager
                     }
                 }
                 //Check if application is running on administrator
-                Task task = new(() =>
+                Task task = new(async () =>
                 {
                     if (!OmniPaths.IsUserAdministrator())
                     {
-                        serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Omnipotent is not running as administrator. Please run as administrator!!!");
+                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Omnipotent is not running as administrator. Please run as administrator!!!");
                         ServiceLog("Omnipotent is not running as administrator. Please run as administrator!!!");
                     }
                 });

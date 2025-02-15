@@ -39,7 +39,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 string gadgets = "";
-                var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+                var kt = (KliveTechHub.KliveTechHub)(await serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0];
                 foreach (var item in kt.connectedGadgets)
                 {
                     gadgets += $"**Gadget: {item.name}**";
@@ -78,7 +78,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
-                var kt = (KliveTechHub.KliveTechHub)serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>()[0];
+                var kt = (KliveTechHub.KliveTechHub)(await serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0];
                 if (kt.connectedGadgets.Select(k => k.name).Contains(gadgetName))
                 {
                     var gadget = kt.connectedGadgets.Where(k => k.name == gadgetName).First();

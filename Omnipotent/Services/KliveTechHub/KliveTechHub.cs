@@ -265,7 +265,7 @@ namespace Omnipotent.Services.KliveTechHub
                             {
                                 ServiceLogError(ex);
                                 DiscoverNewKliveTechGadgets();
-                                await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Connecting to KliveTech gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
+                                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Connecting to KliveTech gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
                                 return;
                             }
                         }
@@ -286,7 +286,7 @@ namespace Omnipotent.Services.KliveTechHub
                     catch (Exception ex)
                     {
                         ServiceLogError(ex);
-                        await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Connecting to gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
+                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Connecting to gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
                     }
                 }
                 //Prevent stack overflow
@@ -303,7 +303,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
                 else
                 {
-                    var result = await serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
+                    var result = await (await serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord("Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
                     if (result == "Retry")
                     {
                         DiscoverNewKliveTechGadgets();
@@ -332,7 +332,7 @@ namespace Omnipotent.Services.KliveTechHub
                 ServiceLog("Found KliveTech gadget: " + gadget.name);
                 try
                 {
-                    await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
+                    ((await serviceManager.GetKliveBotDiscordService())).SendMessageToKlives("Found KliveTech gadget: " + gadget.name);
                 }
                 catch (Exception) { }
                 RememberKliveTechDevice(gadget);

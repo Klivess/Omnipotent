@@ -124,14 +124,14 @@ namespace Omnipotent.Services.KliveAPI
                 ServerListenLoop();
                 //Create profile manager
                 serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
-                profileManager = (KMProfileManager)serviceManager.GetServiceByClassType<KMProfileManager>()[0];
+                profileManager = (KMProfileManager)(await serviceManager.GetServiceByClassType<KMProfileManager>())[0];
 
                 CreateMetaKLIVEAPIRoutes();
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "KliveAPI Failed!");
-                serviceManager.GetKliveBotDiscordService().SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
+                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
             }
         }
 
@@ -175,7 +175,7 @@ namespace Omnipotent.Services.KliveAPI
                 X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access
                 X509KeyStorageFlags.PersistKeySet
             );
-            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
+            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
             using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
             {
                 store.Open(OpenFlags.ReadWrite);
@@ -198,7 +198,7 @@ namespace Omnipotent.Services.KliveAPI
             builder.WithContent("SSL Certificate Linking Output");
             Stream fileStream = File.Open(outputPath, FileMode.Open);
             builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
-            await serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
+            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
             fileStream.Close();
             File.Delete(outputPath);
         }
@@ -262,7 +262,7 @@ namespace Omnipotent.Services.KliveAPI
                     if (req.Headers.AllKeys.Contains("Authorization"))
                     {
                         string password = req.Headers.Get("Authorization");
-                        var profileManager = ((KMProfileManager)(serviceManager.GetServiceByClassType<KMProfileManager>()[0]));
+                        var profileManager = ((KMProfileManager)((await serviceManager.GetServiceByClassType<KMProfileManager>())[0]));
                         if (profileManager.CheckIfProfileExists(password))
                         {
                             request.user = await profileManager.GetProfileByPassword(password);

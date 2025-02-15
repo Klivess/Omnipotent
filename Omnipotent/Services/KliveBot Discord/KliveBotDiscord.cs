@@ -93,12 +93,12 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         {
                             message = await SendMessageToKlives(embed);
                         }
-                        if (serviceManager.GetKliveLocalLLMService().IsServiceActive())
+                        if ((await serviceManager.GetKliveLocalLLMService()).IsServiceActive())
                         {
                             string response = "";
                             if (!sessions.ContainsKey(args.Author.Id))
                             {
-                                sessions.Add(args.Author.Id, serviceManager.GetKliveLocalLLMService().CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
+                                sessions.Add(args.Author.Id, (await serviceManager.GetKliveLocalLLMService()).CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
                             }
                             response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
                             await args.Message.RespondAsync(response);
@@ -111,7 +111,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         {
                             if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
                             {
-                                string resp = await serviceManager.GetNotificationsService().SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
+                                string resp = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
 $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
 
                                 await args.Message.RespondAsync(resp);
@@ -148,7 +148,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                 }
                 return await KlivesMember.SendMessageAsync(message);
             }
-            catch(Exception ex)
+            catch (Exception ex)
             {
                 ServiceLogError(ex, "Sending message to Klives failed!");
                 return null;

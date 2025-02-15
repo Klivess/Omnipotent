@@ -336,7 +336,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 if (useCache == true)
                 {
-                    var savedChannels = await ((DiscordCrawl)parentInterface.parent.serviceManager.GetServiceByClassType<DiscordCrawl>()[0]).GetAllKnownDiscordDMChannels(user);
+                    var savedChannels = await ((DiscordCrawl)(await parentInterface.parent.serviceManager.GetServiceByClassType<DiscordCrawl>())[0]).GetAllKnownDiscordDMChannels(user);
                     if (savedChannels.Select(k => k.RecipientOrOwnerID).Contains(item.Key))
                     {
                         var channel = savedChannels.Where(k => k.RecipientOrOwnerID == item.Key).ToArray()[0];

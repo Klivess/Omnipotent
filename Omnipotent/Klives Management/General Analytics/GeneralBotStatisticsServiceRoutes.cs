@@ -11,9 +11,9 @@ namespace Omnipotent.Klives_Management.General_Analytics
             CreateRoutes();
         }
 
-        public void CreateRoutes()
+        public async void CreateRoutes()
         {
-            this.g.serviceManager.GetKliveAPIService().CreateRoute("/GeneralBotStatistics/GetFrontpageStats", async (req) =>
+            (await this.g.serviceManager.GetKliveAPIService()).CreateRoute("/GeneralBotStatistics/GetFrontpageStats", async (req) =>
             {
                 try
                 {

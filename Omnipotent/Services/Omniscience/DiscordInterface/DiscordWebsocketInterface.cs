@@ -79,7 +79,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             {
                                 OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
                                 parentService.SaveDiscordMessage(parentUser, message);
-                                if (parentService.serviceManager.GetKliveLocalLLMService().IsServiceActive())
+                                if ((await parentService.serviceManager.GetKliveLocalLLMService()).IsServiceActive())
                                 {
                                     if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
                                     {

@@ -195,7 +195,7 @@ namespace Omnipotent.Services.KliveAPI
                             {"Yes", ButtonStyle.Primary },
                             {"No", ButtonStyle.Danger },
                         };
-                    string resp = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord("Error loading PEM key for Let's Encrypt.",
+                    string resp = await (await parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord("Error loading PEM key for Let's Encrypt.",
                         "Should I delete the existing PEM key and create another?", dict, TimeSpan.FromDays(7));
                     if (resp == "Yes")
                     {
@@ -230,7 +230,7 @@ namespace Omnipotent.Services.KliveAPI
                         {
                             {"Done", ButtonStyle.Primary },
                         };
-                string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Add a DNS record to {KliveAPI.domainName}.",
+                string addedDNSText = await (await parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord($"Add a DNS record to {KliveAPI.domainName}.",
                     "Please add a new DNS record so that Omnipotent can solve this challenge and acquire the certificate needed for HTTPS.\n\n" +
                     "Type: TXT\n" +
                     $"Name: _acme-challenge.{KliveAPI.domainName}\n" +
@@ -244,7 +244,7 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             //Wait for DNS to propagate
-            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Waiting 1 hour for DNS to propagate...");
+            await (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Waiting 1 hour for DNS to propagate...");
 
             //Ask Klives if to wait for DNS to propagate
             try
@@ -254,7 +254,7 @@ namespace Omnipotent.Services.KliveAPI
                             {"Yes, wait 1 hour.", ButtonStyle.Primary },
                             {"No, don't wait.", ButtonStyle.Primary }
                         };
-                string addedDNSText = await parent.serviceManager.GetNotificationsService().SendButtonsPromptToKlivesDiscord($"Should I wait 1 hour for DNS to propagate?",
+                string addedDNSText = await (await parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord($"Should I wait 1 hour for DNS to propagate?",
                     $"Click No if the dns TXT value '{dnsTxt}' is already propagated.", dict, TimeSpan.FromDays(7));
                 if (addedDNSText == "Yes, wait 1 hour.")
                 {
@@ -270,7 +270,7 @@ namespace Omnipotent.Services.KliveAPI
 
             //Validate
             parent.ServiceLog("Validating that challenge is solved.");
-            await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Validating Challenge for KliveAPI...");
+            (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Validating Challenge for KliveAPI...");
             var challengeResult = await dnsChallenge.Validate();
 
             //challengeResult.Status.Value always returns "pending" for some reason, so we have to wait for it to change
@@ -290,7 +290,7 @@ namespace Omnipotent.Services.KliveAPI
             if (challengeResult.Status == Certes.Acme.Resource.ChallengeStatus.Invalid)
             {
                 await parent.ServiceLogError(new Exception("DNS challenge failed to validate."));
-                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("DNS challenge failed to validate...");
+                (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("DNS challenge failed to validate...");
                 await InstallLocalCert(expDateYears, password, issuedBy);
                 return;
             }
@@ -299,7 +299,7 @@ namespace Omnipotent.Services.KliveAPI
                 try
                 {
                     parent.ServiceLog("Challenge is solved, creating certificate.");
-                    await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Challenge is solved, creating certificate.");
+                    (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Challenge is solved, creating certificate.");
 
                     //Generate certificate
                     var privateKey = KeyFactory.NewKey(KeyAlgorithm.ES256);
@@ -324,7 +324,7 @@ namespace Omnipotent.Services.KliveAPI
                     //System.IO.File.Create(rootAuthorityPfxPath).Close();
                     await System.IO.File.WriteAllBytesAsync(rootAuthorityPfxPath, pfx);
                     parent.ServiceLog("ACME Certificate created for " + KliveAPI.domainName + "!");
-                    await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
+                    (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("ACME Certificate created for !" + KliveAPI.domainName);
                 }
                 catch (Exception ex)
                 {
@@ -335,7 +335,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             else
             {
-                await parent.serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
+                (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
                 parent.ServiceLog($"ACME challenge validation was neither valid or invalid?? Challenge Info:\n{JsonConvert.SerializeObject(challengeResult)}");
                 await InstallLocalCert(expDateYears, password, issuedBy);
             }

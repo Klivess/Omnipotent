@@ -54,7 +54,7 @@ namespace Omnipotent.Services.Omniscience
                 LinkedUsers.RemoveAll(k => brokenAccountNames.Contains(k.Username));
                 try
                 {
-                    serviceManager.GetKliveBotDiscordService().SendMessageToKlives($"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
+                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
                 }
                 catch (Exception) { }
             }
@@ -99,12 +99,12 @@ namespace Omnipotent.Services.Omniscience
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             };
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/createOmniUser", createNewOmniUser, HttpMethod.Post, KMPermissions.Associate);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/createOmniUser", createNewOmniUser, HttpMethod.Post, KMPermissions.Associate);
             Action<KliveAPI.KliveAPI.UserRequest> getMessageCount = async (request) =>
             {
                 await request.ReturnResponse(AllCapturedMessages.Count.ToString(), "application/json");
             };
-            await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/getmessagecount", getMessageCount, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
         }
         private OmniDiscordUser SelectUser(string username)
         {
@@ -208,7 +208,7 @@ namespace Omnipotent.Services.Omniscience
                 ServiceLogError(ex);
                 try
                 {
-                    serviceManager.GetKliveBotDiscordService().SendMessageToKlives("Catastrophic error updating individual user messages in DiscordCrawl: " + ex.Message);
+                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Catastrophic error updating individual user messages in DiscordCrawl: " + ex.Message);
                 }
                 catch (Exception) { }
             }

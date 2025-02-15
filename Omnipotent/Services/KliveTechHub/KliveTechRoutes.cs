@@ -13,7 +13,7 @@ namespace Omnipotent.Services.KliveTechHub
 
         public async Task RegisterRoutes()
         {
-            p.serviceManager.GetKliveAPIService().CreateRoute("/klivetech/GetAllGadgets", async (req) =>
+            (await p.serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetAllGadgets", async (req) =>
             {
                 try
                 {
@@ -25,7 +25,7 @@ namespace Omnipotent.Services.KliveTechHub
                     await req.ReturnResponse(JsonConvert.SerializeObject(er), code: System.Net.HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
-            p.serviceManager.GetKliveAPIService().CreateRoute("/klivetech/executegadgetaction", async (req) =>
+            (await p.serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/executegadgetaction", async (req) =>
             {
                 //params: gadgetid, actionid, actionparams
                 string id = req.userParameters["gadgetID"];
@@ -46,7 +46,7 @@ namespace Omnipotent.Services.KliveTechHub
                 await req.ReturnResponse("Action executed successfully!");
 
             }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Guest);
-            p.serviceManager.GetKliveAPIService().CreateRoute("/klivetech/GetGadgetByID", async (req) =>
+            (await p.serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetGadgetByID", async (req) =>
             {
                 try
                 {
