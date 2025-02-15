@@ -1,6 +1,7 @@
 ﻿using DSharpPlus;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Klives_Management;
 using Omnipotent.Service_Manager;
 using System.Net;
 using System.Xml.Linq;
@@ -10,7 +11,7 @@ namespace Omnipotent.Profiles
     public class KMProfileManager : OmniService
     {
         private const string profileFileExtension = ".kmp";
-        List<KMProfile> Profiles;
+        public List<KMProfile> Profiles;
 
         public KMProfileManager()
         {
@@ -24,68 +25,7 @@ namespace Omnipotent.Profiles
             {
                 RequestProfileFromKlives();
             }
-            CreateRoutes();
-        }
-
-
-        private async Task CreateRoutes()
-        {
-            Action<UserRequest> createProfile = async (request) =>
-            {
-                try
-                {
-                    var name = request.userParameters.Get("name");
-                    var rank = (KMPermissions)Convert.ToInt32(request.userParameters.Get("rank"));
-                    var password = request.userParameters.Get("password");
-                    var profile = await CreateNewProfile(name, rank, password);
-                    await request.ReturnResponse(JsonConvert.SerializeObject(profile), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            };
-
-            Action<UserRequest> attemptLogin = async (request) =>
-            {
-                try
-                {
-                    var password = JsonConvert.DeserializeObject<string>(request.userMessageContent);
-                    await request.ReturnResponse(JsonConvert.SerializeObject(CheckIfProfileExists(password)), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            };
-
-            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/LoginStatus", async (req) =>
-            {
-                try
-                {
-                    if (req.user == null)
-                    {
-                        await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
-                        return;
-                    }
-                    var canLogin = req.user.CanLogin;
-                    if (canLogin)
-                    {
-                        await req.ReturnResponse("Allowed", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await req.ReturnResponse("ProfileDisabled", code: HttpStatusCode.Unauthorized);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    ServiceLogError(ex);
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Anybody);
-            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/CreateProfile", createProfile, HttpMethod.Post, KMPermissions.Admin);
-            await serviceManager.GetKliveAPIService().CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, HttpMethod.Post, KMPermissions.Anybody);
+            KMProfileRoutes routes = new(this);
         }
 
         public async Task RequestProfileFromKlives()
@@ -133,6 +73,17 @@ namespace Omnipotent.Profiles
             await GetDataHandler().WriteToFile(profile.CreateProfilePath(), JsonConvert.SerializeObject(profile));
         }
 
+        public async void UpdateProfileWithID(string userID, KMProfile profile)
+        {
+            var oldProfile = Profiles.FirstOrDefault(k => k.UserID == userID);
+            if (oldProfile != null)
+            {
+                Profiles.Remove(oldProfile);
+                Profiles.Add(profile);
+                await SaveProfileAsync(profile);
+            }
+            Profiles = Profiles.OrderBy(k => k.UserID).ToList();
+        }
         private async Task LoadAllProfiles()
         {
             Profiles = new();
