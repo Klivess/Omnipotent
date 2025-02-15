@@ -212,7 +212,7 @@ namespace Omnipotent.Klives_Management
                     if (request.user.KlivesManagementRank == KMPermissions.Klives)
                     {
                         p.Profiles.Remove(profile);
-                        await p.GetDataHandler().DeleteFile(profile.CreateProfilePath());
+                        p.GetDataHandler().DeleteFile(profile.CreateProfilePath());
                         await request.ReturnResponse("ProfileDeleted", code: HttpStatusCode.OK);
                     }
                     else
