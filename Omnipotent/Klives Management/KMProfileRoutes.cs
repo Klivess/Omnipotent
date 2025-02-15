@@ -198,7 +198,36 @@ namespace Omnipotent.Klives_Management
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             };
+            Action<UserRequest> deleteProfile = async (request) =>
+            {
+                try
+                {
+                    var id = request.userParameters.Get("id");
+                    var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    if (profile == null)
+                    {
+                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (request.user.KlivesManagementRank == KMPermissions.Klives)
+                    {
+                        p.Profiles.Remove(profile);
+                        await p.GetDataHandler().DeleteFile(profile.CreateProfilePath());
+                        await request.ReturnResponse("ProfileDeleted", code: HttpStatusCode.OK);
+                    }
+                    else
+                    {
+                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
+                    }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just deleted {profile.Name}'s KMProfile.");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            };
 
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DeleteProfile", deleteProfile, HttpMethod.Post, KMPermissions.Klives);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", changeProfileRank, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetProfileByID", getProfileByUserID, HttpMethod.Get, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", getAllProfiles, HttpMethod.Get, KMPermissions.Manager);
