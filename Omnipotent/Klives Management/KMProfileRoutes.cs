@@ -87,6 +87,11 @@ namespace Omnipotent.Klives_Management
                     var id = request.userParameters.Get("id");
                     var on = request.userParameters.Get("enabled");
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    if (on == "true" || profile.CanLogin == true)
+                    {
+                        await request.ReturnResponse("OK", code: HttpStatusCode.OK);
+                        return;
+                    }
                     if (profile == null)
                     {
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
@@ -97,7 +102,7 @@ namespace Omnipotent.Klives_Management
                     {
                         profile.CanLogin = (on == "true");
                         p.UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("ProfileDisabled", code: HttpStatusCode.OK);
+                        await request.ReturnResponse("OK", code: HttpStatusCode.OK);
                     }
                     else
                     {
@@ -118,6 +123,11 @@ namespace Omnipotent.Klives_Management
                     var name = request.userParameters.Get("name");
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
                     string originalName = profile.Name;
+                    if (profile.Name == name)
+                    {
+                        await request.ReturnResponse("ProfileNameUnchanged", code: HttpStatusCode.OK);
+                        return;
+                    }
                     if (profile == null)
                     {
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
@@ -147,6 +157,11 @@ namespace Omnipotent.Klives_Management
                     var id = request.userParameters.Get("id");
                     var password = request.userMessageContent;
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    if (profile.Password == password)
+                    {
+                        await request.ReturnResponse("ProfilePasswordUnchanged", code: HttpStatusCode.OK);
+                        return;
+                    }
                     if (profile == null)
                     {
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
@@ -176,6 +191,11 @@ namespace Omnipotent.Klives_Management
                     var id = request.userParameters.Get("id");
                     var rank = (KMPermissions)Convert.ToInt32(request.userParameters.Get("rank"));
                     var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    if (profile.KlivesManagementRank == rank)
+                    {
+                        await request.ReturnResponse("ProfileRankUnchanged", code: HttpStatusCode.OK);
+                        return;
+                    }
                     var originalRank = profile.KlivesManagementRank;
                     if (profile == null)
                     {
@@ -234,7 +254,7 @@ namespace Omnipotent.Klives_Management
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", getAllProfiles, HttpMethod.Get, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeCanLogin", changeUserLogin, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", changeProfileName, HttpMethod.Post, KMPermissions.Manager);
-            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", changeProfilePassword, HttpMethod.Post, KMPermissions.Manager);
+            await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", changeProfilePassword, HttpMethod.Post, KMPermissions.Klives);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/LoginStatus", async (req) =>
             {
                 try
