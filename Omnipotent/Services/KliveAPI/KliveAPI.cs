@@ -275,12 +275,14 @@ namespace Omnipotent.Services.KliveAPI
                     if (ControllerLookup.ContainsKey(route))
                     {
                         RouteInfo routeData = ControllerLookup[route];
-
-                        if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
+                        if (request.user != null)
                         {
-                            ServiceLog($"Route {route} has been requested by a user that can't login.");
-                            DenyRequest(request, DeniedRequestReason.ProfileDisabled);
-                            continue;
+                            if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
+                            {
+                                ServiceLog($"Route {route} has been requested by a user that can't login.");
+                                DenyRequest(request, DeniedRequestReason.ProfileDisabled);
+                                continue;
+                            }
                         }
                         else
                         {
