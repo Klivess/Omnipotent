@@ -52,35 +52,42 @@ namespace Omnipotent.Services.KliveAPI
             public string userMessageContent;
             public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
-                HttpListenerResponse resp = context.Response;
-                if (contentType == "application/json")
+                try
                 {
-                    if (OmniPaths.IsValidJson(response) != true)
+                    HttpListenerResponse resp = context.Response;
+                    if (contentType == "application/json")
                     {
-                        response = JsonConvert.SerializeObject(response);
+                        if (OmniPaths.IsValidJson(response) != true)
+                        {
+                            response = JsonConvert.SerializeObject(response);
+                        }
                     }
-                }
-                resp.Headers.Set("Content-Type", contentType);
-                if (headers != null)
-                {
-                    for (global::System.Int32 i = 0; i < headers.Count; i++)
+                    resp.Headers.Set("Content-Type", contentType);
+                    if (headers != null)
                     {
-                        resp.Headers.Add(headers.GetKey(i), headers.Get(i));
+                        for (global::System.Int32 i = 0; i < headers.Count; i++)
+                        {
+                            resp.Headers.Add(headers.GetKey(i), headers.Get(i));
+                        }
                     }
-                }
-                if (req.HttpMethod == "OPTIONS")
-                {
-                    resp.Headers.Add("Access-Control-Allow-Headers", "*");
-                    resp.Headers.Add("Access-Control-Allow-Methods", "*");
-                    resp.Headers.Add("Access-Control-Max-Age", "1728000");
-                }
-                resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    if (req.HttpMethod == "OPTIONS")
+                    {
+                        resp.Headers.Add("Access-Control-Allow-Headers", "*");
+                        resp.Headers.Add("Access-Control-Allow-Methods", "*");
+                        resp.Headers.Add("Access-Control-Max-Age", "1728000");
+                    }
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
 
-                byte[] buffer = Encoding.UTF8.GetBytes(response);
-                resp.ContentLength64 = buffer.Length;
-                resp.StatusCode = (int)code;
-                using Stream ros = resp.OutputStream;
-                ros.Write(buffer, 0, buffer.Length);
+                    byte[] buffer = Encoding.UTF8.GetBytes(response);
+                    resp.ContentLength64 = buffer.Length;
+                    resp.StatusCode = (int)code;
+                    using Stream ros = resp.OutputStream;
+                    ros.Write(buffer, 0, buffer.Length);
+                }
+                catch (Exception ex)
+                {
+                    ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, "text/plain", null, HttpStatusCode.InternalServerError);
+                }
             }
         }
 
