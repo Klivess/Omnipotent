@@ -224,8 +224,15 @@ namespace Omnipotent.Services.KliveAPI
             routeInfo.action = handler;
             routeInfo.authenticationLevelRequired = authenticationLevelRequired;
             routeInfo.method = method;
-            ControllerLookup.TryAdd(route, routeInfo);
-            ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
+            if (ControllerLookup.TryAdd(route, routeInfo))
+            {
+                ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
+            }
+            else
+            {
+                ServiceLog($"Failed to create route: " + route);
+                await CreateRoute(route, handler, method, authenticationLevelRequired);
+            }
         }
 
         private async void ServerListenLoop()
