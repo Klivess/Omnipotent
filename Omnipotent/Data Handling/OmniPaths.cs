@@ -22,7 +22,7 @@ namespace Omnipotent.Data_Handling
         {
             public static string SavedDataDirectory = $"SavedData";
             public static string KliveBotDiscordBotDirectory = $"{SavedDataDirectory}/KliveBotDiscordBot";
-            public static string KliveBotDiscordTokenText = $"{SavedDataDirectory}/KliveBotDiscordToken.txt";
+            public static string KliveBotDiscordTokenText = $"{KliveBotDiscordBotDirectory}/KliveBotDiscordToken.txt";
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
 
             //Downloads

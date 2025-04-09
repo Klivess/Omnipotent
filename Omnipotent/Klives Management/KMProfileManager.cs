@@ -45,6 +45,7 @@ namespace Omnipotent.Profiles
             public DateTime CreationDate;
             public KMPermissions KlivesManagementRank;
             public string Password;
+            public string DiscordID;
             public bool CanLogin { get; set; }
 
             public string CreateProfilePath()

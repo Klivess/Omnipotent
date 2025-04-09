@@ -247,6 +247,40 @@ namespace Omnipotent.Klives_Management
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             };
+            Action<UserRequest> changeProfileDiscordID = async (request) =>
+            {
+                try
+                {
+                    var id = request.userParameters.Get("id");
+                    var discID = request.userParameters.Get("DiscordID");
+                    var profile = p.Profiles.FirstOrDefault(k => k.UserID == id);
+                    if (profile.DiscordID == discID)
+                    {
+                        await request.ReturnResponse("ProfileDiscordIDUnchanged", code: HttpStatusCode.OK);
+                        return;
+                    }
+                    if (profile == null)
+                    {
+                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
+                    {
+                        profile.DiscordID = discID;
+                        p.UpdateProfileWithID(id, profile);
+                        await request.ReturnResponse("ProfileNameChanged", code: HttpStatusCode.OK);
+                    }
+                    else
+                    {
+                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
+                    }
+                    (await p.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile discordID to {profile.DiscordID}.");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            };
 
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DeleteProfile", deleteProfile, HttpMethod.Post, KMPermissions.Klives);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", changeProfileRank, HttpMethod.Post, KMPermissions.Manager);
