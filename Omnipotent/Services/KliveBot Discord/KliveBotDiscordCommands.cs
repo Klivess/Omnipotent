@@ -71,8 +71,6 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
-        /*
-
         [SlashCommand("activateKlivetechAction", "Activates a klivetech action.")]
         public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
     [Option("Gadget Action", "The action to execute")] string gadgetAction,
@@ -133,7 +131,6 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
-        */
         /*
         [SlashCommand("messageUser", "Sends a message to a user")]
         public async Task MessageUserDirectly(InteractionContext ctx, [Option("userID", "The user to message")] string id, [Option("messageContent", "The content of the message")] string message)
