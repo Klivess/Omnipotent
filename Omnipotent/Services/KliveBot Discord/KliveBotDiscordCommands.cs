@@ -114,12 +114,13 @@ namespace Omnipotent.Services.KliveBot_Discord
                         await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find action by the name of {gadgetAction}"));
                         return;
                     }
-                else
-                    {
-                        await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
-                        return;
-                    }
                 }
+                else
+                {
+                    await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
+                    return;
+                }
+            }
             catch (Exception ex)
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
