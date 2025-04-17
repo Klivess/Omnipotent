@@ -4,7 +4,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
 {
     public class GeneralBotStatisticsServiceRoutes
     {
-        GeneralBotStatisticsService g;
+        private GeneralBotStatisticsService g;
         public GeneralBotStatisticsServiceRoutes(GeneralBotStatisticsService generalBotStatisticsService)
         {
             this.g = generalBotStatisticsService;

@@ -10,13 +10,13 @@ namespace Omnipotent.Services.KliveTechHub
         {
             p = parentService;
         }
-
         public async Task RegisterRoutes()
         {
             (await p.serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetAllGadgets", async (req) =>
             {
                 try
                 {
+                    p.ServiceLog($"Request from {req.user.Name} to get all gadgets");
                     await req.ReturnResponse(JsonConvert.SerializeObject(p.connectedGadgets));
                 }
                 catch (Exception ex)

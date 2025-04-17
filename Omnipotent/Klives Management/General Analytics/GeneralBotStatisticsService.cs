@@ -18,8 +18,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
 
         protected override void ServiceMain()
         {
-            GetGeneralBotStatistics();
-            routes = new(this);
+            routes = new GeneralBotStatisticsServiceRoutes(this);
         }
 
         private async Task GetGeneralBotStatistics()
