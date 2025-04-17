@@ -71,6 +71,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        /*
         [SlashCommand("activateKlivetechAction", "Activates a klivetech action.")]
         public async Task ActivateKliveTechAction(InteractionContext ctx, [Option("Gadget Name", "The name of the gadget to execute.")] string gadgetName,
     [Option("Gadget Action", "The action to execute")] string gadgetAction,

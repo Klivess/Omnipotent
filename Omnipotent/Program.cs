@@ -50,7 +50,7 @@ namespace Omnipotent
                 }
 
                 //Services to only execute on debug
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
+                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (!OmniPaths.CheckIfOnServer())
                 {
                 }
