@@ -160,7 +160,7 @@ namespace Omnipotent.Services.KliveTechHub
 
         private async void setuproutestemp()
         {
-            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetAllGadgets", async (req) =>
+            Action<UserRequest> getAllGadgetsHandler = async (req) =>
             {
                 try
                 {
@@ -172,10 +172,11 @@ namespace Omnipotent.Services.KliveTechHub
                     ErrorInformation er = new ErrorInformation(ex);
                     await req.ReturnResponse(JsonConvert.SerializeObject(er), code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
-            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/executegadgetaction", async (req) =>
+            };
+
+            Action<UserRequest> executeGadgetActionHandler = async (req) =>
             {
-                //params: gadgetid, actionid, actionparams
+                //params: gadgetid, actionid, actionparams  
                 string id = req.userParameters["gadgetID"];
                 string gadgetName = req.userParameters["gadgetName"];
                 string actionName = req.userParameters["actionName"];
@@ -192,20 +193,24 @@ namespace Omnipotent.Services.KliveTechHub
                 }
                 ExecuteActionByName(g, actionName, actionParams);
                 await req.ReturnResponse("Action executed successfully!");
+            };
 
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Guest);
-            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetGadgetByID", async (req) =>
-            {
-                try
+            Action<UserRequest> getGadgetByIdHandler = async (req) =>
                 {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(connectedGadgets.Find(k => k.gadgetID == req.userParameters["gadgetID"])));
-                }
-                catch (Exception ex)
-                {
-                    ErrorInformation er = new ErrorInformation(ex);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(er), code: System.Net.HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+                    try
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(connectedGadgets.Find(k => k.gadgetID == req.userParameters["gadgetID"])));
+                    }
+                    catch (Exception ex)
+                    {
+                        ErrorInformation er = new ErrorInformation(ex);
+                        await req.ReturnResponse(JsonConvert.SerializeObject(er), code: System.Net.HttpStatusCode.InternalServerError);
+                    }
+                };
+
+            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetAllGadgets", getAllGadgetsHandler, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/executegadgetaction", executeGadgetActionHandler, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Guest);
+            (await serviceManager.GetKliveAPIService()).CreateRoute("/klivetech/GetGadgetByID", getGadgetByIdHandler, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
         }
 
         public async Task RememberKliveTechDevice(KliveTechGadget gadget)
