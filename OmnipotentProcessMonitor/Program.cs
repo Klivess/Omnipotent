@@ -54,10 +54,8 @@ namespace OmnipotentProcessMonitor
                                     Directory.CreateDirectory(logDirectory);
                                 }
                                 string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-                                using (StreamWriter writer = new StreamWriter(logFilePath, true))
-                                {
-                                    writer.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}");
-                                }
+                                File.Create(logFilePath).Dispose(); // Create the file and close it immediately to avoid locking it
+                                File.AppendAllText(logFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}\n");
                             }
                         }
                     }
