@@ -6,6 +6,7 @@ git status
 git pull origin remake
 
 REM Publish Omnipotent project
+mkdir serverBuild
 dotnet publish Omnipotent/Omnipotent.csproj --output serverBuild
 
 REM Publish OmnipotentProcessMonitor project
