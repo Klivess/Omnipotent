@@ -3,7 +3,7 @@ taskkill /F /IM Omnipotent.exe
 taskkill /F /IM OmnipotentProcessMonitor.exe
 
 git status
-git pull
+git pull origin remake
 
 REM Publish Omnipotent project
 mkdir serverBuild
