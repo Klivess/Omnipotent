@@ -54,10 +54,10 @@ namespace Omnipotent
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (!OmniPaths.CheckIfOnServer())
                 {
-                    ExistentialBotUtilities.UpdateBot();
                 }
 
                 Task.Delay(4000).Wait();
+                ExistentialBotUtilities.UpdateBot();
 
                 if (OmniPaths.CheckIfOnServer())
                 {
