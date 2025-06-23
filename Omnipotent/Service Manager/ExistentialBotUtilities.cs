@@ -21,7 +21,12 @@ namespace Omnipotent.Service_Manager
                 if (File.Exists(updateFilePath))
                 {
                     found = true;
-                    Process.Start(updateFilePath);
+                    ProcessStartInfo processInfo = new ProcessStartInfo
+                    {
+                        FileName = updateFilePath,
+                        WorkingDirectory = currentPath
+                    };
+                    Process.Start(processInfo);
                 }
                 else
                 {
