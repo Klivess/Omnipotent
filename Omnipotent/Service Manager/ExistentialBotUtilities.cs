@@ -55,7 +55,6 @@ namespace Omnipotent.Service_Manager
                 RedirectStandardError = true,
                 UseShellExecute = false,
                 CreateNoWindow = true,
-                Verb = "runas" // This ensures the process runs with admin privileges
             };
 
             try
