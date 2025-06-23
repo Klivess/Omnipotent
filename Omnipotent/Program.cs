@@ -22,7 +22,7 @@ namespace Omnipotent
 {
     public class Program
     {
-        public static void Main(string[] args)
+        public static async void Main(string[] args)
         {
             OmniLogging.LogStatusStatic("Main Thread", $"Omnipotent last updated {File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe")).Humanize()}");
             OmniServiceManager omniServiceManager = new OmniServiceManager();
@@ -48,6 +48,9 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
+
+                Task.Delay(1000).Wait();
+                ExistentialBotUtilities.UpdateBot();
 
                 //Services to only execute on debug
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
