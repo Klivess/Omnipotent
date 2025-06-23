@@ -39,25 +39,6 @@ namespace OmnipotentProcessMonitor
                         };
 
                         var process = System.Diagnostics.Process.Start(processStartInfo);
-
-                        // Read error output if the process fails to start  
-                        if (process != null)
-                        {
-                            string errorOutput = process.StandardError.ReadToEnd();
-                            if (!string.IsNullOrEmpty(errorOutput))
-                            {
-                                Console.WriteLine($"Omnipotent process error: {errorOutput}");
-                                //Go to path of Omnipotent exe, then go to the SavedData/ProcessMonitorLogs directory and write the error output to a log file
-                                string logDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SavedData", "ProcessMonitorLogs");
-                                if (!Directory.Exists(logDirectory))
-                                {
-                                    Directory.CreateDirectory(logDirectory);
-                                }
-                                string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-                                File.Create(logFilePath).Dispose(); // Create the file and close it immediately to avoid locking it
-                                File.AppendAllText(logFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}\n");
-                            }
-                        }
                     }
                 }
                 catch (Exception ex)
