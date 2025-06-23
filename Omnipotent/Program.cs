@@ -22,7 +22,7 @@ namespace Omnipotent
 {
     public class Program
     {
-        public static async void Main(string[] args)
+        public static void Main(string[] args)
         {
             OmniLogging.LogStatusStatic("Main Thread", $"Omnipotent last updated {File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe")).Humanize()}");
             OmniServiceManager omniServiceManager = new OmniServiceManager();
