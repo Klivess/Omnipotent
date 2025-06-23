@@ -12,7 +12,7 @@ dotnet publish Omnipotent/Omnipotent.csproj --output serverBuild
 REM Publish OmnipotentProcessMonitor project
 dotnet publish OmnipotentProcessMonitor/OmnipotentProcessMonitor.csproj --output serverBuild
 
-cd serverOPMonitorBuild
+cd serverBuild
 cls
 start OmnipotentProcessMonitor.exe
 PAUSE
