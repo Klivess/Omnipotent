@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -15,6 +16,8 @@ namespace OmnipotentProcessMonitor
         [STAThread]
         public static void Main()
         {
+            string processExecutablePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe");
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -30,7 +33,7 @@ namespace OmnipotentProcessMonitor
                         // If not running, start it  
                         var processStartInfo = new System.Diagnostics.ProcessStartInfo
                         {
-                            FileName = "Omnipotent.exe",
+                            FileName = processExecutablePath,
                             RedirectStandardError = true,
                             UseShellExecute = false,
                             CreateNoWindow = true

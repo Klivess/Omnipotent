@@ -10,8 +10,7 @@ mkdir serverBuild
 dotnet publish Omnipotent/Omnipotent.csproj --output serverBuild
 
 REM Publish OmnipotentProcessMonitor project
-mkdir serverOPMonitorBuild
-dotnet publish OmnipotentProcessMonitor/OmnipotentProcessMonitor.csproj --output serverOPMonitorBuild
+dotnet publish OmnipotentProcessMonitor/OmnipotentProcessMonitor.csproj --output serverBuild
 
 cd serverOPMonitorBuild
 cls
