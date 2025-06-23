@@ -8,6 +8,7 @@
 		<StartupObject>Omnipotent.Program</StartupObject>
 		<ApplicationIcon>favicon.ico</ApplicationIcon>
 		<ApplicationManifest>app.manifest</ApplicationManifest>
+		<UserSecretsId>e8c9937e-a45d-490b-b5b5-ed02c5bb4bce</UserSecretsId>
 	</PropertyGroup>
 
 	<ItemGroup>

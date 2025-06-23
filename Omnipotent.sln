@@ -10,7 +10,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution 
 		app.manifest = app.manifest
 	EndProjectSection
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OmnipotentProcessMonitor", "OmnipotentProcessMonitor\OmnipotentProcessMonitor.csproj", "{842052E7-C936-40CB-B378-84FC71915610}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OmnipotentProcessMonitor", "OmnipotentProcessMonitor\OmnipotentProcessMonitor.csproj", "{A1A43C94-8EF7-4CD6-8222-966C6FC51796}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -22,10 +22,10 @@ Global
 		{1DCE094F-D0E7-400A-9C10-3C3E34349CC8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{1DCE094F-D0E7-400A-9C10-3C3E34349CC8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{1DCE094F-D0E7-400A-9C10-3C3E34349CC8}.Release|Any CPU.Build.0 = Release|Any CPU
-		{842052E7-C936-40CB-B378-84FC71915610}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{842052E7-C936-40CB-B378-84FC71915610}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{842052E7-C936-40CB-B378-84FC71915610}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{842052E7-C936-40CB-B378-84FC71915610}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A1A43C94-8EF7-4CD6-8222-966C6FC51796}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A1A43C94-8EF7-4CD6-8222-966C6FC51796}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A1A43C94-8EF7-4CD6-8222-966C6FC51796}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A1A43C94-8EF7-4CD6-8222-966C6FC51796}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
