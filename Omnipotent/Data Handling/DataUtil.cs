@@ -152,6 +152,8 @@ namespace Omnipotent.Data_Handling
             }
         }
 
+        /// <summary>
+
         public async Task<dataType> ReadAndDeserialiseDataFromFile<dataType>(string path)
         {
             if (File.Exists(path))
@@ -231,6 +233,5 @@ namespace Omnipotent.Data_Handling
             //GC.Collect();
             ServiceMain();
         }
-
     }
 }
