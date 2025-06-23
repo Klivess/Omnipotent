@@ -49,9 +49,6 @@ namespace Omnipotent
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
 
-                Task.Delay(1000).Wait();
-                ExistentialBotUtilities.UpdateBot();
-
                 //Services to only execute on debug
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (!OmniPaths.CheckIfOnServer())
