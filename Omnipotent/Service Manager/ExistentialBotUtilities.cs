@@ -20,8 +20,8 @@ namespace Omnipotent.Service_Manager
                 string updateFilePath = Path.Combine(currentPath, "SyncAndStartOmnipotent.bat");
                 if (File.Exists(updateFilePath))
                 {
-                    found = true;
-                    SendTerminalCommand($"{updateFilePath}", null);
+                    Process.Start(updateFilePath);
+                    break;
                 }
                 else
                 {
@@ -54,19 +54,28 @@ namespace Omnipotent.Service_Manager
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true
+                CreateNoWindow = true,
+                Verb = "runas" // This ensures the process runs with admin privileges
             };
 
-            // Start the process
-            Process process = new Process();
-            process.StartInfo = processInfo;
-            process.Start();
+            try
+            {
+                // Start the process
+                Process process = new Process();
+                process.StartInfo = processInfo;
+                process.Start();
 
-            // Read the output and errors
-            string output = process.StandardOutput.ReadToEnd();
-            string error = process.StandardError.ReadToEnd();
-            process.WaitForExit(TimeSpan.FromSeconds(15));
-            return output + error;
+                // Read the output and errors
+                string output = process.StandardOutput.ReadToEnd();
+                string error = process.StandardError.ReadToEnd();
+                process.WaitForExit(TimeSpan.FromSeconds(15));
+                return output + error;
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                // Handle the case where the user cancels the UAC prompt
+                return $"Failed to execute command as admin: {ex.Message}";
+            }
         }
 
 

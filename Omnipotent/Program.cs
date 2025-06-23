@@ -1,6 +1,7 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
 using Humanizer;
+using Microsoft.PowerShell.Commands;
 using Omnipotent.Data_Handling;
 using Omnipotent.Klives_Management.General_Analytics;
 using Omnipotent.Logging;
@@ -53,6 +54,7 @@ namespace Omnipotent
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (!OmniPaths.CheckIfOnServer())
                 {
+                    ExistentialBotUtilities.UpdateBot();
                 }
 
                 Task.Delay(4000).Wait();
