@@ -12,7 +12,30 @@ namespace Omnipotent.Service_Manager
 
         public static void UpdateBot()
         {
-            Process.Start(SearchFullPathOfNearbyFile("SyncAndStartOmnipotent.bat", 3));
+            //iteratively search backwards for full path of SyncAndStartOmnipotent.bat
+            string currentPath = AppDomain.CurrentDomain.BaseDirectory;
+            bool found = false;
+            while (found == false)
+            {
+                string updateFilePath = Path.Combine(currentPath, "SyncAndStartOmnipotent.bat");
+                if (File.Exists(updateFilePath))
+                {
+                    found = true;
+                    Process.Start(updateFilePath);
+                }
+                else
+                {
+                    var parentDirectory = Directory.GetParent(currentPath);
+                    if (parentDirectory != null)
+                    {
+                        currentPath = parentDirectory.FullName;
+                    }
+                    else
+                    {
+                        throw new FileNotFoundException("SyncAndStartOmnipotent.bat not found in any parent directories.");
+                    }
+                }
+            }
         }
 
         public static void QuitBot()
@@ -61,6 +84,7 @@ namespace Omnipotent.Service_Manager
 
             try
             {
+                // Get directories and files in the current rootPath  
                 var directories = Directory.GetDirectories(rootPath);
                 var files = Directory.GetFiles(rootPath);
 
@@ -70,27 +94,29 @@ namespace Omnipotent.Service_Manager
                     files = files.Reverse().ToArray();
                 }
 
+                // Add files and directories to the paths list  
                 paths.AddRange(files);
+                paths.AddRange(directories);
 
+                // Recursively traverse parent directories  
+                if (depth > 0)
+                {
+                    string parentPath = Directory.GetParent(rootPath)?.FullName;
+                    if (!string.IsNullOrEmpty(parentPath))
+                    {
+                        paths.AddRange(GetPathsRecursively(depth - 1, reverse, parentPath));
+                    }
+                }
+
+                // Recursively traverse child directories  
                 foreach (var dir in directories)
                 {
-                    paths.Add(dir);
                     paths.AddRange(GetPathsRecursively(depth - 1, reverse, dir));
                 }
-
-                if (!reverse)
-                {
-                    directories = directories.Reverse().ToArray();
-                    files = files.Reverse().ToArray();
-                }
-
-                foreach (var dir in directories)
-                {
-                    paths.AddRange(GetPathsRecursively(depth - 1, !reverse, dir));
-                }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
+                // Handle exceptions silently  
             }
 
             return paths;
@@ -104,7 +130,7 @@ namespace Omnipotent.Service_Manager
             }
 
             var paths = GetPathsRecursively(depth, false, rootPath);
-            paths.Concat(GetPathsRecursively(depth, true, rootPath));
+            //paths.Concat(GetPathsRecursively(depth, true, rootPath));
             foreach (var path in paths)
             {
                 if (Path.GetFileName(path).Equals(filename, StringComparison.OrdinalIgnoreCase))
