@@ -36,7 +36,6 @@ namespace OmnipotentProcessMonitor
                             FileName = processExecutablePath,
                             RedirectStandardError = true,
                             UseShellExecute = false,
-                            CreateNoWindow = true
                         };
 
                         var process = System.Diagnostics.Process.Start(processStartInfo);
