@@ -67,10 +67,10 @@ namespace OmnipotentProcessMonitor
                     MessageBox.Show($"Error checking or starting Omnipotent: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     Environment.Exit(0);
                 }
-
-                // Nothing past this line will execute.  
-                Application.Run();
             }
+
+            // Nothing past this line will execute.  
+            Application.Run();
         }
     }
 }
