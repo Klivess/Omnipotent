@@ -21,12 +21,7 @@ namespace Omnipotent.Service_Manager
                 if (File.Exists(updateFilePath))
                 {
                     found = true;
-                    ProcessStartInfo processInfo = new ProcessStartInfo
-                    {
-                        FileName = updateFilePath,
-                        WorkingDirectory = currentPath
-                    };
-                    Process.Start(processInfo);
+                    SendTerminalCommand($"{updateFilePath}", null);
                 }
                 else
                 {
@@ -49,7 +44,7 @@ namespace Omnipotent.Service_Manager
             Environment.Exit(0);
         }
 
-        public static string SendTerminalCommand(string filename, string script)
+        public static string SendTerminalCommand(string script, string filename = null)
         {
             // Set up the process start info
             ProcessStartInfo processInfo = new ProcessStartInfo

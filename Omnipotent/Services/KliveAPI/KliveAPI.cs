@@ -198,7 +198,7 @@ namespace Omnipotent.Services.KliveAPI
             {
                 script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
             }
-            string output = ExistentialBotUtilities.SendTerminalCommand("netsh", script);
+            string output = ExistentialBotUtilities.SendTerminalCommand(script, "netsh");
             string outputPath = Path.Combine(SpecialDirectories.Temp, "kliveapilinkssloutput.txt");
             File.WriteAllText(outputPath, $"Output:\n\n{output}");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
