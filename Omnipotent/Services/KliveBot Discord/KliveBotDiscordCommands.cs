@@ -187,5 +187,20 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent($"Couldn't find service by the name of {serviceName}"));
             }
         }
+
+        [SlashCommand("updatebot", "Updates the bot to the latest build in the Omnipotent github repository. Only Klives can do this")]
+        public async Task UpdateBotAsync(InteractionContext ctx)
+        {
+            if (ctx.User.Id == OmniPaths.KlivesDiscordAccountID)
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("Restarting bot."));
+                ExistentialBotUtilities.UpdateBot();
+            }
+            else
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+            }
+        }
     }
 }
