@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -44,6 +45,17 @@ namespace OmnipotentProcessMonitor
                             if (!string.IsNullOrEmpty(errorOutput))
                             {
                                 Console.WriteLine($"Omnipotent process error: {errorOutput}");
+                                //Go to path of Omnipotent exe, then go to the SavedData/ProcessMonitorLogs directory and write the error output to a log file
+                                string logDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SavedData", "ProcessMonitorLogs");
+                                if (!Directory.Exists(logDirectory))
+                                {
+                                    Directory.CreateDirectory(logDirectory);
+                                }
+                                string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                                using (StreamWriter writer = new StreamWriter(logFilePath, true))
+                                {
+                                    writer.WriteLine($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}");
+                                }
                             }
                         }
                     }
@@ -59,3 +71,4 @@ namespace OmnipotentProcessMonitor
             }
         }
     }
+}

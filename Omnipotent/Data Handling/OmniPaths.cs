@@ -20,7 +20,7 @@ namespace Omnipotent.Data_Handling
         //surely theres a better way of doing this
         public struct GlobalPaths
         {
-            public static string SavedDataDirectory = $"SavedData";
+            public static string SavedDataDirectory = $"SavedData"; // (hardcoded into OP monitor, do not change value)
             public static string KliveBotDiscordBotDirectory = $"{SavedDataDirectory}/KliveBotDiscordBot";
             public static string KliveBotDiscordTokenText = $"{KliveBotDiscordBotDirectory}/KliveBotDiscordToken.txt";
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
@@ -55,7 +55,8 @@ namespace Omnipotent.Data_Handling
             public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
             public static string KliveTechHubGadgetsDirectory = $"{KliveTechHubDirectory}/KliveTechGadgets";
 
-
+            //OmnipotentProcessMonitor
+            public static string ProcessMonitorLogs = $"{SavedDataDirectory}/ProcessMonitorLogs"; // (hardcoded into OP monitor, do not change value)
         };
 
         public static string GetPath(string path)
