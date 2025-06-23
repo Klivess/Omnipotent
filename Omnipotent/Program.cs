@@ -56,6 +56,7 @@ namespace Omnipotent
                 }
 
                 Task.Delay(4000).Wait();
+                ExistentialBotUtilities.UpdateBot();
 
                 if (OmniPaths.CheckIfOnServer())
                 {
