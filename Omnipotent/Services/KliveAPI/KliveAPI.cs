@@ -166,7 +166,6 @@ namespace Omnipotent.Services.KliveAPI
         private async Task CheckForSSLCertificate()
         {
             certInstaller = new(this);
-            //If not on the server (Debug/development mode)
             if (!(await certInstaller.IsCertificateCreated()))
             {
                 await certInstaller.CreateInstallCert(10, "klives", "KliveAPI");
@@ -205,7 +204,7 @@ namespace Omnipotent.Services.KliveAPI
             builder.WithContent("SSL Certificate Linking Output");
             Stream fileStream = File.Open(outputPath, FileMode.Open);
             builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
-            //(await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
+            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
             fileStream.Close();
             File.Delete(outputPath);
         }
