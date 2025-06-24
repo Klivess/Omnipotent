@@ -2,6 +2,7 @@
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using System.Linq;
 using System.Security.Principal;
 using System.Text;
@@ -46,6 +47,7 @@ namespace Omnipotent.Data_Handling
             //KliveAPI
             public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
             public static string KlivesACMEAPICertificateDirectory = $"{KlivesAPICertificateDirectory}/ACMECerts";
+            public static string KlivesCertificateLinkingLogsDirectory = $"{KlivesAPICertificateDirectory}/CertificateLinkingLogs";
 
             //KliveLocalLLM
             public static string KliveLocalLLMDirectory = $"{SavedDataDirectory}/KliveLocalLLM";
