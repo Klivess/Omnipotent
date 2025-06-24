@@ -175,6 +175,14 @@ namespace Omnipotent.Services.KliveAPI
 
         private async Task LinkSSLCertificate(string pathToPfx)
         {
+            string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
+            string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt");
+
+            //Delete existing SSL certificate linkage
+            string deleteOutput = ExistentialBotUtilities.SendTerminalCommand("netsh", "http delete sslcert hostnameport=klive.dev:443");
+            // Log output to a file
+            File.AppendAllText(logFilePath, $"[{DateTime.Now}] Delete Output:\n{deleteOutput}\n\n");
+
             var certificate = new X509Certificate2(
                 pathToPfx,
                 "klives",
@@ -199,9 +207,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             ServiceLog("Running terminal command: " + script);
             string output = ExistentialBotUtilities.SendTerminalCommand("netsh", script);
-            // Log output to a file  
-            string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
-            string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt");
+            // Log output to a file          
             File.AppendAllText(logFilePath, $"[{DateTime.Now}] Output:\n{output}\n\n");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             builder.WithContent("SSL Certificate Linking Output. \n\n Expiration date of certificate: " + certificate.GetExpirationDateString());
