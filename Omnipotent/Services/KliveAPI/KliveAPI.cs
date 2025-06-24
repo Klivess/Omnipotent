@@ -24,6 +24,7 @@ using Microsoft.VisualBasic.FileIO;
 using DSharpPlus.Entities;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
+using Org.BouncyCastle.Crypto;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -42,6 +43,19 @@ namespace Omnipotent.Services.KliveAPI
             public Action<UserRequest> action;
             public KMProfileManager.KMPermissions authenticationLevelRequired;
             public HttpMethod method;
+
+            public List<TimeSpan> TimeTakenToProcess;
+            public async Task InvokeAction(UserRequest request)
+            {
+                Stopwatch stopwatch = Stopwatch.StartNew();
+                action.Invoke(request);
+                stopwatch.Stop();
+                if (TimeTakenToProcess == null)
+                {
+                    TimeTakenToProcess = new List<TimeSpan>();
+                }
+                TimeTakenToProcess.Add(stopwatch.Elapsed);
+            }
         }
         public struct UserRequest
         {
@@ -317,7 +331,7 @@ namespace Omnipotent.Services.KliveAPI
                                 if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                                 {
                                     //ServiceLog($"Unauthenticated route {route} has been requested.");
-                                    ControllerLookup[route].action.Invoke(request);
+                                    ControllerLookup[route].InvokeAction(request);
                                 }
                                 else
                                 {
@@ -326,7 +340,7 @@ namespace Omnipotent.Services.KliveAPI
                                         if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
                                         {
                                             ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
-                                            ControllerLookup[route].action.Invoke(request);
+                                            ControllerLookup[route].InvokeAction(request);
                                         }
                                         else
                                         {

@@ -23,7 +23,6 @@ namespace OmnipotentProcessMonitor
 
             while (true)
             {
-                Task.Delay(5000).Wait();
                 try
                 {
                     // Check if the Omnipotent process is running  
@@ -64,9 +63,9 @@ namespace OmnipotentProcessMonitor
                 {
                     // Log the error (you can replace this with your logging mechanism)  
                     Console.WriteLine($"Error checking or starting Omnipotent: {ex.Message}");
-                    MessageBox.Show($"Error checking or starting Omnipotent: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     Environment.Exit(0);
                 }
+                Task.Delay(5000).Wait();
             }
 
             // Nothing past this line will execute.  
