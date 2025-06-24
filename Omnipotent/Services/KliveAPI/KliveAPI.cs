@@ -201,7 +201,7 @@ namespace Omnipotent.Services.KliveAPI
             string output = ExistentialBotUtilities.SendTerminalCommand("netsh", script);
             // Log output to a file  
             string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
-            string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog{DateTime.Now.ToString()}.txt");
+            string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt");
             File.Create(logFilePath);
             File.AppendAllText(logFilePath, $"[{DateTime.Now}] Output:\n{output}\n\n");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
