@@ -181,7 +181,7 @@ namespace Omnipotent.Services.KliveAPI
                 X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access  
                 X509KeyStorageFlags.PersistKeySet
             );
-            //(await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
+            //(serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
             using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
             {
                 store.Open(OpenFlags.ReadWrite);
@@ -202,12 +202,13 @@ namespace Omnipotent.Services.KliveAPI
             // Log output to a file  
             string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
             string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog{DateTime.Now.ToString()}.txt");
+            File.Create(logFilePath);
             File.AppendAllText(logFilePath, $"[{DateTime.Now}] Output:\n{output}\n\n");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             builder.WithContent("SSL Certificate Linking Output. \n\n Expiration date of certificate: " + certificate.GetExpirationDateString());
             Stream fileStream = File.Open(logFilePath, FileMode.Open);
             builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
-            //(await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
+            //serviceManager.GetKliveBotDiscordService().SendMessageToKlives(builder);
             fileStream.Close();
         }
 
