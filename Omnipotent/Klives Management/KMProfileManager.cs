@@ -211,7 +211,8 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    await request.ReturnResponse(JsonConvert.SerializeObject(Profiles), "application/json");
+                    string serialized = JsonConvert.SerializeObject(Profiles);
+                    await request.ReturnResponse(serialized, "application/json");
                 }
                 catch (Exception ex)
                 {
