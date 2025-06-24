@@ -126,6 +126,33 @@ namespace Omnipotent.Profiles
 
         private async void CreateRoutes()
         {
+
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/LoginStatus", async (req) =>
+            {
+                try
+                {
+                    ServiceLog("TESTINGTESTINGTESTING");
+                    if (req.user == null)
+                    {
+                        await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
+                        return;
+                    }
+                    var canLogin = req.user.CanLogin;
+                    if (canLogin)
+                    {
+                        await req.ReturnResponse("Allowed", code: HttpStatusCode.OK);
+                    }
+                    else
+                    {
+                        await req.ReturnResponse("ProfileDisabled", code: HttpStatusCode.Unauthorized);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex);
+                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/CreateProfile", async (request) =>
             {
                 try
