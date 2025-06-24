@@ -168,6 +168,10 @@ namespace Omnipotent.Services.KliveAPI
             {
                 await req.ReturnResponse("Pong", "text/html");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            await CreateRoute("/allRoutes", async (req) =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(ControllerLookup), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
         }
 
         private void KliveAPI_ServiceQuitRequest()
