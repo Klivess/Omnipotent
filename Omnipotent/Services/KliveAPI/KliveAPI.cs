@@ -181,7 +181,7 @@ namespace Omnipotent.Services.KliveAPI
                 X509KeyStorageFlags.MachineKeySet |  // Critical for system-wide access  
                 X509KeyStorageFlags.PersistKeySet
             );
-            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
+            //(await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Linking Certificate with Thumbprint: " + certificate.Thumbprint);
             using (var store = new X509Store(StoreName.My, StoreLocation.LocalMachine))
             {
                 store.Open(OpenFlags.ReadWrite);
@@ -191,15 +191,14 @@ namespace Omnipotent.Services.KliveAPI
             string script;
             if (OmniPaths.CheckIfOnServer())
             {
-                ServiceLog($"Linking SSL Certificate with Thumbprint: {certificate.Thumbprint} to port {apiPORT} for domain {domainName}.");
                 script = $"http add sslcert hostnameport={domainName}:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}} certstorename=MY";
             }
             else
             {
                 script = $"http add sslcert ipport=0.0.0.0:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}}";
             }
+            ServiceLog("Running terminal command: " + script);
             string output = ExistentialBotUtilities.SendTerminalCommand("netsh", script);
-
             // Log output to a file  
             string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
             string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog{DateTime.Now.ToString()}.txt");
@@ -208,7 +207,7 @@ namespace Omnipotent.Services.KliveAPI
             builder.WithContent("SSL Certificate Linking Output. \n\n Expiration date of certificate: " + certificate.GetExpirationDateString());
             Stream fileStream = File.Open(logFilePath, FileMode.Open);
             builder.AddFile("SSLCertificateLinkingOutput.txt", fileStream);
-            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
+            //(await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(builder);
             fileStream.Close();
         }
 
