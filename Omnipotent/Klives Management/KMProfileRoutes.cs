@@ -316,6 +316,10 @@ namespace Omnipotent.Klives_Management
             }, HttpMethod.Get, KMPermissions.Anybody);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/CreateProfile", createProfile, HttpMethod.Post, KMPermissions.Manager);
             await (await p.serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/AttemptLogin", attemptLogin, HttpMethod.Post, KMPermissions.Anybody);
+            while (true)
+            {
+                await Task.Delay(1000);
+            }
         }
     }
 }
