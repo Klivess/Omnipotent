@@ -49,14 +49,7 @@ namespace Omnipotent.Services.KliveAPI
         }
         public async Task<bool> IsCertificateCreated()
         {
-            if (!System.IO.File.Exists(rootAuthorityCrtPath) || !System.IO.File.Exists(rootAuthorityPfxPath) || !System.IO.File.Exists(myGatewayCrtPath) || !System.IO.File.Exists(myGatewayPfxPath))
-            {
-                return false;
-            }
-            else
-            {
-                return true;
-            }
+            return System.IO.File.Exists(rootAuthorityPfxPath);
         }
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
