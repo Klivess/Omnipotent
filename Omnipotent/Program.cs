@@ -1,5 +1,6 @@
 ﻿global using static Omnipotent.Logging.OmniLogging;
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
+using DSharpPlus.Entities;
 using Humanizer;
 using Microsoft.PowerShell.Commands;
 using Omnipotent.Data_Handling;
@@ -61,6 +62,20 @@ namespace Omnipotent
                 if (OmniPaths.CheckIfOnServer())
                 {
                     ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives("Omnipotent online!");
+                }
+
+                if (args[0].StartsWith("errorOccurred"))
+                {
+                    string pathOfErrorFile = args[0].Replace("errorOccurred=", "");
+                    //Get file created time of that file
+                    DateTime fileCreatedTime = File.GetCreationTime(pathOfErrorFile);
+                    string errorMessage = $"Omnipotent process crashed at {fileCreatedTime.Humanize()}. Error log file created at: {pathOfErrorFile}";
+                    OmniLogging.LogStatusStatic("Main Thread", errorMessage);
+                    DiscordMessageBuilder embedBuilder = KliveBotDiscord.MakeSimpleEmbed("Omnipotent Process Monitor Error",
+                        errorMessage, DSharpPlus.Entities.DiscordColor.Red);
+                    FileStream fileStream = new FileStream(pathOfErrorFile, FileMode.Open, FileAccess.Read);
+                    embedBuilder.AddFile("Error Log", fileStream);
+                    ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives(embedBuilder);
                 }
             }
             catch (Exception ex)

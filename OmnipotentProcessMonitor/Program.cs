@@ -55,6 +55,17 @@ namespace OmnipotentProcessMonitor
                                 string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
                                 File.Create(logFilePath).Dispose(); // Create the file and close it immediately to avoid locking it
                                 File.AppendAllText(logFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}\n");
+
+                                // If not running, start it  
+                                var erroredProcessStartInfo = new System.Diagnostics.ProcessStartInfo
+                                {
+                                    FileName = processExecutablePath,
+                                    Arguments = "errorOccurred=" + logFilePath,
+                                    RedirectStandardError = true,
+                                    UseShellExecute = false,
+                                };
+
+                                var erroredProcess = System.Diagnostics.Process.Start(processStartInfo);
                             }
                         }
                     }
