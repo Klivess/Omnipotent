@@ -190,7 +190,6 @@ namespace Omnipotent.Services.KliveAPI
             }
 
         }
-
         private async Task LinkSSLCertificate(string pathToPfx)
         {
             string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);

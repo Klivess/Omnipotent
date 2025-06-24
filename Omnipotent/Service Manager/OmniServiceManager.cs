@@ -144,6 +144,7 @@ namespace Omnipotent.Service_Manager
                             break;
                         }
                     }
+                    await Task.Delay(100);
                 }
                 var services = activeServices.Where(k => k.GetType().Name == typeof(T).Name);
                 if (services.Where(k => k.IsServiceActive() == true).Count() == services.Count())
@@ -177,11 +178,6 @@ namespace Omnipotent.Service_Manager
         public async Task<KliveBotDiscord?> GetKliveBotDiscordService()
         {
             var result = await GetServiceByClassType<KliveBotDiscord>();
-            while (result == null)
-            {
-                Task.Delay(100).Wait();
-                result = await GetServiceByClassType<KliveBotDiscord>();
-            }
             if (result.Any())
             {
                 return (KliveBotDiscord)(result[0]);
