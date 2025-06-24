@@ -191,6 +191,7 @@ namespace Omnipotent.Services.KliveAPI
             string script;
             if (OmniPaths.CheckIfOnServer())
             {
+                ServiceLog($"Linking SSL Certificate with Thumbprint: {certificate.Thumbprint} to port {apiPORT} for domain {domainName}.");
                 script = $"http add sslcert hostnameport={domainName}:{apiPORT} certhash={certificate.Thumbprint} appid={{86476d42-f4f3-48f5-9367-ff60f2ed2cdc}} certstorename=MY";
             }
             else
