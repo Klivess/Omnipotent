@@ -202,7 +202,6 @@ namespace Omnipotent.Services.KliveAPI
             // Log output to a file  
             string logDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesCertificateLinkingLogsDirectory);
             string logFilePath = Path.Combine(logDirectory, $"CertificateLinkingLog_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.txt");
-            File.Create(logFilePath);
             File.AppendAllText(logFilePath, $"[{DateTime.Now}] Output:\n{output}\n\n");
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             builder.WithContent("SSL Certificate Linking Output. \n\n Expiration date of certificate: " + certificate.GetExpirationDateString());
