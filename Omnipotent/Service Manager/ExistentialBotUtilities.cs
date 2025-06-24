@@ -44,7 +44,7 @@ namespace Omnipotent.Service_Manager
             Environment.Exit(0);
         }
 
-        public static string SendTerminalCommand(string script, string filename = null)
+        public static string SendTerminalCommand(string filename, string script)
         {
             // Set up the process start info
             ProcessStartInfo processInfo = new ProcessStartInfo
@@ -54,27 +54,19 @@ namespace Omnipotent.Service_Manager
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
-                CreateNoWindow = true,
+                CreateNoWindow = true
             };
 
-            try
-            {
-                // Start the process
-                Process process = new Process();
-                process.StartInfo = processInfo;
-                process.Start();
+            // Start the process
+            Process process = new Process();
+            process.StartInfo = processInfo;
+            process.Start();
 
-                // Read the output and errors
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-                process.WaitForExit(TimeSpan.FromSeconds(15));
-                return output + error;
-            }
-            catch (System.ComponentModel.Win32Exception ex)
-            {
-                // Handle the case where the user cancels the UAC prompt
-                return $"Failed to execute command as admin: {ex.Message}";
-            }
+            // Read the output and errors
+            string output = process.StandardOutput.ReadToEnd();
+            string error = process.StandardError.ReadToEnd();
+            process.WaitForExit(TimeSpan.FromSeconds(15));
+            return output + error;
         }
 
 
