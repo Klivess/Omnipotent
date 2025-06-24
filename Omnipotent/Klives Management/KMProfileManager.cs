@@ -131,7 +131,6 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    ServiceLog("TESTINGTESTINGTESTING");
                     if (req.user == null)
                     {
                         await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
