@@ -46,13 +46,13 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
 
                 //Services to only execute on debug
-                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (!OmniPaths.CheckIfOnServer())
                 {
                 }
