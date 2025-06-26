@@ -46,7 +46,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
-                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLocalLLM());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
@@ -65,7 +65,8 @@ namespace Omnipotent
                 }
                 if (args.Any())
                 {
-                    if (args[0].StartsWith("errorOccurred"))
+                    OmniLogging.LogStatusStatic("Arguments Passed: ", string.Join(", ", args));
+                    if (args[0].Trim().StartsWith("errorOccurred"))
                     {
                         string pathOfErrorFile = args[0].Replace("errorOccurred=", "");
                         //Get file created time of that file
