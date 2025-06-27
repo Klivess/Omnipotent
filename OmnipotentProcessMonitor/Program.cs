@@ -52,7 +52,7 @@ namespace OmnipotentProcessMonitor
                                 {
                                     Directory.CreateDirectory(logDirectory);
                                 }
-                                string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
+                                string logFilePath = Path.Combine(logDirectory, $"OmnipotentErrorLog_{DateTime.Now:yyyy-MM-dd_HHmmss}.txt");
                                 File.Create(logFilePath).Dispose(); // Create the file and close it immediately to avoid locking it
                                 File.AppendAllText(logFilePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] Omnipotent process error: {errorOutput}\n");
 

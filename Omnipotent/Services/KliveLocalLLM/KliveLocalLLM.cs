@@ -15,7 +15,7 @@ namespace Omnipotent.Services.KliveLocalLLM
     public class KliveLocalLLM : OmniService
     {
         const string modelDownloadURL = "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf";
-        private string modelFilePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLocalLLMModelsDirectory), "qwen3-4b.gguf");
+        private string modelFilePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLocalLLMModelsDirectory), "qwen3-4b.gguf").Replace("\\", "/");
 
         public LLamaWeights loadedModel;
         public bool isModelLoaded = false;
@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 var parameters = new ModelParams(modelFilePath)
                 {
-                    ContextSize = 2048, // The longest length of chat as memory.
+                    //ContextSize = 2048, // The longest length of chat as memory.
                 };
                 loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
                 var context = loadedModel.CreateContext(parameters);
