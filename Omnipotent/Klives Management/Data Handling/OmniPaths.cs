@@ -59,6 +59,10 @@ namespace Omnipotent.Data_Handling
 
             //OmnipotentProcessMonitor
             public static string ProcessMonitorLogs = $"{SavedDataDirectory}/ProcessMonitorLogs"; // (hardcoded into OP monitor, do not change value)
+
+            //CS2ArbitrageBot
+            public static string CS2ArbitrageBotDirectory = $"{SavedDataDirectory}/CS2ArbitrageBot";
+            public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
         };
 
         public static string GetPath(string path)

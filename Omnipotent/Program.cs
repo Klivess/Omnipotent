@@ -8,6 +8,7 @@ using Omnipotent.Klives_Management.General_Analytics;
 using Omnipotent.Logging;
 using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.CS2ArbitrageBot;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveLocalLLM;
@@ -56,6 +57,7 @@ namespace Omnipotent
                 if (!OmniPaths.CheckIfOnServer())
                 {
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
                 }
 
                 if (OmniPaths.CheckIfOnServer())

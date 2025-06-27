@@ -163,7 +163,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
         {
             try
             {
-                while (Client == null) { }
+                while (Client == null) { await Task.Delay(100); }
                 var guildID = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
                 var member = await guildID.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
                 return await member.SendMessageAsync(builder);
