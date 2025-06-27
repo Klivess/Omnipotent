@@ -217,7 +217,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     ContextSize = 2048, // The longest length of chat as memory.
                 };
-                loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
+                loadedModel = LLamaWeights.LoadFromFile(parameters);
                 var context = loadedModel.CreateContext(parameters);
                 interactiveExecutor = new InteractiveExecutor(context);
                 isModelLoaded = true;
