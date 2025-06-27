@@ -207,20 +207,45 @@ namespace Omnipotent.Services.KliveLocalLLM
         {
             ServiceLog("Loading LLama Model...");
 
-            //Disable logging
-            NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
-            //NativeLibraryConfig.All.WithLogCallback((level, message) => Console.WriteLine(message));
-
-            var parameters = new ModelParams(modelFilePath)
+            try
             {
-                ContextSize = 1024, // The longest length of chat as memory.
-                Seed = 1337,
+                //Disable logging
+                NativeLibraryConfig.All.WithLogCallback((level, message) => message.ToString());
+                //NativeLibraryConfig.All.WithLogCallback((level, message) => Console.WriteLine(message));
 
-            };
-            loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
-            var context = loadedModel.CreateContext(parameters);
-            interactiveExecutor = new InteractiveExecutor(context);
-            isModelLoaded = true;
+                var parameters = new ModelParams(modelFilePath)
+                {
+                    ContextSize = 2048, // The longest length of chat as memory.
+                };
+                loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
+                var context = loadedModel.CreateContext(parameters);
+                interactiveExecutor = new InteractiveExecutor(context);
+                isModelLoaded = true;
+            }
+            catch (Exception ex)
+            {
+                //tell klives if llm model loading failed and turn off service
+                ServiceLogError(ex, "Failed to load LLama model for KliveLocalLLM. Sending notification to Klives on what to do.");
+                Dictionary<string, ButtonStyle> data = new Dictionary<string, ButtonStyle>
+                {
+                    { "Retry", ButtonStyle.Primary },
+                    { "Turn Off", ButtonStyle.Danger}
+                };
+                ErrorInformation errorInformation = new ErrorInformation(ex);
+                var response = await (await serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord("Failed to load LLama model for KliveLocalLLM.",
+                    errorInformation.FullFormattedMessage + "\n\nWould you like to retry or to turn off KliveLLM?", data, TimeSpan.FromDays(3));
+                if (response == "Retry")
+                {
+                    ServiceLog("Klives requested to retry loading the LLama model for KliveLocalLLM.");
+                    await LoadLLamaModel();
+                }
+                else if (response == "Turn Off")
+                {
+                    ServiceLog("Klives requested to quit the application.");
+                    await this.TerminateService();
+                }
+                return;
+            }
 
             ServiceLog("LLama Model Loaded!");
         }
