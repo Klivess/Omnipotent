@@ -1,4 +1,5 @@
-﻿using Omnipotent.Data_Handling;
+﻿using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
@@ -18,17 +19,14 @@ namespace Omnipotent.Services.TestService
 
         protected override async void ServiceMain()
         {
-            for (int i = 0; i < 7500; i++)
-            {
-                try
-                {
-                    await GetDataHandler().WriteToFile(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "test2.txt"), RandomGeneration.GenerateRandomLengthOfNumbers(10));
-                }
-                catch (Exception ex)
-                {
-                    ServiceLog("Exception: " + ex.Message);
-                }
-            }
+            //ServiceCreateScheduledTask(DateTime.Now.AddSeconds(10), "Test TASK", "TestTopic", "TestReason", true, 1 + 4);
+
+            serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+        }
+
+        private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
+        {
+            Console.WriteLine(JsonConvert.SerializeObject(e));
         }
     }
 }

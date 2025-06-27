@@ -55,9 +55,8 @@ namespace Omnipotent
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
                 {
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
                 }
-
-                Task.Delay(4000).Wait();
 
                 if (OmniPaths.CheckIfOnServer())
                 {

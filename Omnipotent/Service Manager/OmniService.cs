@@ -11,6 +11,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using Org.BouncyCastle.Asn1.X509.Qualified;
 using static Omnipotent.Threading.WindowsInvokes;
 
 namespace Omnipotent.Service_Manager
@@ -57,9 +58,9 @@ namespace Omnipotent.Service_Manager
         {
             serviceManager.GetLogger().UpdateLogMessage(message, newMessage);
         }
-        public async Task CreateScheduledTimeTask(DateTime duedateTime, string taskname, string reason = "", bool important = true, Action embeddedAction = null)
+        public async Task ServiceCreateScheduledTask(DateTime duedateTime, string taskname, string topic = "", string reason = "", bool important = true, object PassableData = null)
         {
-            serviceManager.GetTimeManager().CreateNewScheduledTask(duedateTime, taskname, name, serviceID, reason, important, embeddedAction);
+            serviceManager.GetTimeManager().CreateNewScheduledTask(duedateTime, taskname, topic, this.name, reason, important, PassableData);
         }
         public ref DataUtil GetDataHandler()
         {
