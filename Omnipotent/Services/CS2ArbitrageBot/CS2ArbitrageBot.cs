@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Org.BouncyCastle.Asn1.Esf;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
@@ -9,6 +10,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public float ExchangeRate;
         private SteamAPIWrapper steamAPIWrapper;
         private CSFloatWrapper csFloatWrapper;
+
+        public float MinimumPercentReturnToSnipe = 60;
 
         public CS2ArbitrageBot()
         {
@@ -39,7 +42,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
-            StartBotLogic();
+            serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+        }
+
+        private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
+        {
+            if (e.taskName == "SnipeCS2Deals")
+            {
+                SnipeDealsAndAlertKlives();
+            }
         }
 
         private async Task GetExchangeRate()
@@ -54,13 +65,25 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             //Exchange Rate: {ExchangeRate} GBP = 1 USD"
         }
 
-        public async Task StartBotLogic()
+        public async Task SnipeDealsAndAlertKlives()
         {
-            var resp = await csFloatWrapper.GetBestDealsOnCSFloat(5);
-            //json serialise and send to klives
-            string json = JsonConvert.SerializeObject(resp, Formatting.Indented);
-            await ServiceLog($"Best Deals on CSFloat: {json}");
-            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("Best Deals on CSFloat", json, DSharpPlus.Entities.DiscordColor.Green));
+            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(150))
+            {
+                SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
+                //Find price difference
+                double percentageDifference = Convert.ToDouble((correspondingListing.PriceInPounds / snipe.PriceInPounds) - 1) * 100;
+                if (percentageDifference > MinimumPercentReturnToSnipe)
+                {
+                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
+                        $"Name: {snipe.ItemMarketHashName}\n" +
+                        $"Price: {snipe.PriceText}\n" +
+                        $"Arbitrage Gain: {percentageDifference.ToString()}%\n" +
+                        $"CSFloat Listing URL: {snipe.ListingURL}\n" +
+                        $"Steam Listing URL: {correspondingListing.ListingURL}\n"
+                        , DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                }
+            }
+            await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
         }
     }
 }

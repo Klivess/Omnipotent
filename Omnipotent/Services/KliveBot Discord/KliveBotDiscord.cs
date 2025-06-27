@@ -175,7 +175,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
             }
         }
 
-        public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, string imagefilepath = "", int imagewidth = 0, int imageheight = 0)
+        public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, string imagefilepath = "")
         {
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             DiscordEmbedBuilder discordEmbed = new DiscordEmbedBuilder();
@@ -187,6 +187,18 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                 builder.AddFile(File.OpenRead(imagefilepath));
                 discordEmbed.WithThumbnail("attachment://" + Path.GetFileName(imagefilepath));
             }
+            builder.AddEmbed(discordEmbed);
+            return builder;
+        }
+
+        public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, Uri imageLink)
+        {
+            DiscordMessageBuilder builder = new DiscordMessageBuilder();
+            DiscordEmbedBuilder discordEmbed = new DiscordEmbedBuilder();
+            discordEmbed.Title = title;
+            discordEmbed.Description = description;
+            discordEmbed.Color = color;
+            discordEmbed.WithThumbnail(imageLink);
             builder.AddEmbed(discordEmbed);
             return builder;
         }
