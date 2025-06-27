@@ -153,44 +153,26 @@ namespace Omnipotent.Services.KliveLocalLLM
                 try
                 {
                     var logged = await ServiceLog("Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: 0%");
+                    WebClient webClient = new WebClient();
                     int progressPercentage = 0;
                     var message = await ((await serviceManager.GetKliveBotDiscordService())).SendMessageToKlives("Downloading prerequisite LLM LLama model for KliveLocalLLM.");
-                    string tempFile = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.TempDownloadsDirectory), Path.GetFileName(modelFilePath));
-
-                    using (HttpClient httpClient = new HttpClient())
+                    webClient.DownloadProgressChanged += (sender, e) =>
                     {
-                        httpClient.Timeout = TimeSpan.FromMinutes(30);
-                        using (var response = await httpClient.GetAsync(modelDownloadURL, HttpCompletionOption.ResponseHeadersRead))
+                        if ((e.ProgressPercentage - progressPercentage) >= 1)
                         {
-                            response.EnsureSuccessStatusCode();
-                            var totalBytes = response.Content.Headers.ContentLength ?? -1L;
-                            var canReportProgress = totalBytes != -1;
-
-                            using (var contentStream = await response.Content.ReadAsStreamAsync())
-                            using (var fileStream = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true))
-                            {
-                                var buffer = new byte[8192];
-                                long totalRead = 0;
-                                int bytesRead;
-                                while ((bytesRead = await contentStream.ReadAsync(buffer.AsMemory(0, buffer.Length))) > 0)
-                                {
-                                    await fileStream.WriteAsync(buffer.AsMemory(0, bytesRead));
-                                    totalRead += bytesRead;
-
-                                    if (canReportProgress)
-                                    {
-                                        var newProgress = (int)((totalRead * 100) / totalBytes);
-                                        if (newProgress > progressPercentage)
-                                        {
-                                            progressPercentage = newProgress;
-                                            ServiceUpdateLoggedMessage(logged, $"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {progressPercentage}%");
-                                            message.ModifyAsync($"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {progressPercentage}%");
-                                        }
-                                    }
-                                }
-                            }
+                            progressPercentage = e.ProgressPercentage;
+                            ServiceUpdateLoggedMessage(logged, $"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
+                            message.ModifyAsync($"Downloading prerequisite LLM LLama model for KliveLocalLLM. Progress: {e.ProgressPercentage}%");
                         }
-                    }
+                    };
+                    webClient.DownloadFileCompleted += (sender, e) =>
+                    {
+                        ServiceUpdateLoggedMessage(logged, $"Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
+                    };
+                    string tempFile = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.TempDownloadsDirectory), Path.GetFileName(modelFilePath));
+                    await webClient.DownloadFileTaskAsync(new Uri(modelDownloadURL), tempFile);
+                    File.Copy(tempFile, modelFilePath);
+                    File.Delete(tempFile);
                     (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
                     ServiceLog("Downloaded prerequisite LLM LLama model for KliveLocalLLM.");
                 }
@@ -231,7 +213,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
             var parameters = new ModelParams(modelFilePath)
             {
-                ContextSize = 4096, // The longest length of chat as memory.
+                ContextSize = 1024, // The longest length of chat as memory.
                 Seed = 1337,
 
             };
