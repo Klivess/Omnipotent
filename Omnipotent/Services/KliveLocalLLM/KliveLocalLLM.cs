@@ -85,7 +85,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 string response = "";
                 bool isServer = OmniPaths.CheckIfOnServer();
-                await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message), session.inferenceParams))
+                await foreach (var text in session.chatSession.ChatAsync(new ChatHistory.Message(AuthorRole.User, message + (Path.GetFileName(modelFilePath)
+                    .Contains("qwen") ? " /no_think" : "")), session.inferenceParams))
                 {
                     response += text;
                     if (!isServer)
@@ -217,7 +218,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     ContextSize = 2048, // The longest length of chat as memory.
                 };
-                loadedModel = LLamaWeights.LoadFromFile(parameters);
+                loadedModel = await LLamaWeights.LoadFromFileAsync(parameters);
                 var context = loadedModel.CreateContext(parameters);
                 interactiveExecutor = new InteractiveExecutor(context);
                 isModelLoaded = true;
