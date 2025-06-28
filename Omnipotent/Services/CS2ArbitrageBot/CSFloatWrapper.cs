@@ -175,7 +175,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
 
         public async IAsyncEnumerable<ItemListing> SnipeBestDealsOnCSFloat(int amountOfListingsToLoad, bool noRepeatedItems = true, float? minimumPriceInPence = null, float? maximumPriceInPence = null, float? minimumQuantityOnSale = null,
-    bool normalOnly = false, string csfloatSortBy = "best_deal")
+    bool normalOnly = false, string csfloatSortBy = "best_deal", bool searchRandomPages = true)
         {
             List<ItemListing> result = new List<ItemListing>();
 
@@ -221,6 +221,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 if (normalOnly)
                 {
                     url += "&category=1";
+                }
+                if (searchRandomPages)
+                {
+                    Random random = new Random();
+                    int randomPage = random.Next(0, 50); // Random page between 0 and 999
+                    url += $"&page={randomPage}";
+                }
+                else
+                {
+                    url += $"&page={page}"; // Use the current page number
                 }
                 HttpRequestMessage message = new();
                 message.Method = HttpMethod.Get;
