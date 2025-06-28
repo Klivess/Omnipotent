@@ -183,6 +183,21 @@ namespace Omnipotent.Service_Manager
             ServiceMain();
         }
 
+        public async Task<ScheduledTask?> GetTask(string taskName)
+        {
+            var tasks = await GetAllUpcomingTasksFromDisk();
+            ScheduledTask? task = tasks.Find(k => k.taskName.ToLower() == taskName.ToLower());
+            //Check that Task is not default value
+            if (task != null && task.Value.taskName != null && task.Value.taskName != string.Empty)
+            {
+                return task.Value;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
         private void BeginWaitForTask(ScheduledTask task)
         {
             Thread thread = new Thread(async () =>

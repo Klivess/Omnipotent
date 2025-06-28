@@ -69,17 +69,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 listing.PriceInPounds = Convert.ToDouble(listing.PriceInPence) / 100;
                 listing.PriceText = "£" + listing.PriceInPounds.ToString();
                 listing.SellListings = "999";
-                listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName}";
-                var assets = jsonObj["assets"]
-                    .Children<JProperty>().First().Value
-                    .Children<JProperty>().First().Value
-                    .Children<JProperty>().First().Value;
-                listing.ImageURL = ItemImageURLPrefix + assets["icon_url"];
+                listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName.Replace(" ", "+")}";
                 try
                 {
+                    var assets = jsonObj["assets"]
+    .Children<JProperty>().First().Value
+    .Children<JProperty>().First().Value
+    .Children<JProperty>().First().Value;
+                    listing.ImageURL = ItemImageURLPrefix + assets["icon_url"];
                     listing.NameColor = ColorTranslator.FromHtml("#" + assets["name_color"]);
                 }
-                catch (Exception ex) { }
+                catch (Exception ex)
+                {
+                    parent.ServiceLogError($"Failed to get image URL for item {itemHashName}. Exception: {ex.Message}");
+                }
                 if (listing.Name.Contains("Field-Tested"))
                 {
                     listing.floatType = FloatType.FieldTested;

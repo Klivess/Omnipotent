@@ -11,7 +11,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private SteamAPIWrapper steamAPIWrapper;
         private CSFloatWrapper csFloatWrapper;
 
-        public float MinimumPercentReturnToSnipe = 60;
+        public float MinimumPercentReturnToSnipe = 10;
 
         public CS2ArbitrageBot()
         {
@@ -43,6 +43,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+            if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null || OmniPaths.CheckIfOnServer() != true)
+            {
+                SnipeDealsAndAlertKlives();
+            }
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
@@ -67,20 +71,34 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task SnipeDealsAndAlertKlives()
         {
-            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(150))
+            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: 1000, normalOnly: true))
             {
-                SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
-                //Find price difference
-                double percentageDifference = Convert.ToDouble((correspondingListing.PriceInPounds / snipe.PriceInPounds) - 1) * 100;
-                if (percentageDifference > MinimumPercentReturnToSnipe)
+                try
                 {
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
-                        $"Name: {snipe.ItemMarketHashName}\n" +
-                        $"Price: {snipe.PriceText}\n" +
-                        $"Arbitrage Gain: {percentageDifference.ToString()}%\n" +
-                        $"CSFloat Listing URL: {snipe.ListingURL}\n" +
-                        $"Steam Listing URL: {correspondingListing.ListingURL}\n"
-                        , DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                    SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
+                    //Find price difference
+                    double percentageDifference = Convert.ToDouble((correspondingListing.PriceInPounds / snipe.PriceInPounds) - 1) * 100;
+                    double gainAfterSteamTax = (((correspondingListing.PriceInPounds / 1.15) / snipe.PriceInPounds) - 1) * 100;
+                    double expectedSteamToCSFloatConversionPercentage = 0.8;
+                    double predictedOverallGain = (((((correspondingListing.PriceInPounds / 1.15)) * 0.8) / snipe.PriceInPounds) - 1) * 100;
+                    if (percentageDifference > predictedOverallGain)
+                    {
+                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
+                            $"Name: {snipe.ItemMarketHashName}\n" +
+                            $"CSFloat Price: {snipe.PriceText}\n" +
+                            $"Steam Price: {correspondingListing.PriceText}\n" +
+                            $"Raw Arbitrage Gain: **{Math.Round(percentageDifference, 2).ToString()}%**\n" +
+                            $"Arbitrage Gain After Steam Tax: **{Math.Round(gainAfterSteamTax, 2).ToString()}%**\n" +
+                            $"Predicted Overall Gain After {((expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round(predictedOverallGain, 2).ToString()}%**\n" +
+                            $"CSFloat Listing URL: {snipe.ListingURL}\n" +
+                            $"Steam Listing URL: {correspondingListing.ListingURL}\n"
+                            , DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Error while processing snipe deal.");
+                    continue;
                 }
             }
             await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");

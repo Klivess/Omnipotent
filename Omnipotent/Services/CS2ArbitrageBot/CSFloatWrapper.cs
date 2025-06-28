@@ -234,8 +234,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     dynamic json = JsonConvert.DeserializeObject(strResponse);
                     cursor = json.cursor;
                     int duplicateItems = 0;
-                    foreach (dynamic jsonItem in json.data)
+                    dynamic jsonData = json.data;
+                    foreach (dynamic jsonItem in jsonData)
                     {
+                        await Task.Yield(); // Allow async execution
+
                         ItemListing item = ConvertItemListingJSONItemToStruct(jsonItem);
                         if (noRepeatedItems == true && result.Select(k => k.ItemName).Contains(item.ItemName))
                         {
@@ -244,11 +247,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         else
                         {
                             result.Add(item);
+                            Console.WriteLine(item.ItemMarketHashName);
                             yield return item;
                         }
                     }
                     page++;
                     i++;
+                    yield break;
                 }
                 else
                 {
