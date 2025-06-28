@@ -81,7 +81,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     double gainAfterSteamTax = (((correspondingListing.PriceInPounds / 1.15) / snipe.PriceInPounds) - 1) * 100;
                     double expectedSteamToCSFloatConversionPercentage = 0.8;
                     double predictedOverallGain = (((((correspondingListing.PriceInPounds / 1.15)) * 0.8) / snipe.PriceInPounds) - 1) * 100;
-                    if (percentageDifference > predictedOverallGain)
+                    if (predictedOverallGain > predictedOverallGain)
                     {
                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
                             $"Name: {snipe.ItemMarketHashName}\n" +
