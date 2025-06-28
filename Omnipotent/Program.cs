@@ -52,12 +52,12 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
 
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
                 {
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
-                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
                 }
 
                 if (OmniPaths.CheckIfOnServer())
