@@ -55,7 +55,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
 
             Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory);
-            await ServiceLog("");
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
