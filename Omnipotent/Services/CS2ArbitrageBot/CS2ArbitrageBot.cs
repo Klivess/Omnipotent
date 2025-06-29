@@ -84,7 +84,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     //Find price difference
                     Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
                     await scanalytics.SaveScannedComparison(comparison);
-                    if (comparison.PredictedOverallArbitrageGain > MinimumPercentReturnToSnipe)
+                    if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
                     {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
 #pragma warning disable CS8602 // Dereference of a possibly null reference.
