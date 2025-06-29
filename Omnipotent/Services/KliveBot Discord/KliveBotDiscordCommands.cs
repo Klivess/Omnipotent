@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 string report = $@"
 [Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
 
-Total Listings Scanned: {analytics.TotalListingsScanned}
+**Total Listings Scanned: {analytics.TotalListingsScanned}**
 
 --- Gain Buckets ---
 Listings with < 0% Gain: {analytics.NumberOfListingsBelow0PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBelow0PercentGain:F2})
@@ -228,7 +228,7 @@ Listings with > 20% Gain: {analytics.NumberOfListingsAbove20PercentGain} (Avg Pr
 --- Profitability Stats ---
 Listings with Positive Gain: {analytics.CountListingsWithPositiveGain}
 Listings with Negative Gain: {analytics.CountListingsWithNegativeGain}
-Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%
+**Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%**
 Avg Gain of Profitable Listings: {analytics.MeanGainOfProfitableListings:F2}%
 Avg Float (Profitable): {analytics.MeanFloatValueOfProfitableListings:F5}
 Avg Price (Profitable): £{analytics.MeanPriceOfProfitableListings:F2}
