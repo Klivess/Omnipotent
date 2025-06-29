@@ -4,16 +4,33 @@ using static System.Net.Mime.MediaTypeNames;
 using System.Drawing;
 using System.Net.Http.Headers;
 using System.Net;
+using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
     public class SteamAPIWrapper
     {
         private CS2ArbitrageBot parent;
+        private Dictionary<string, int> CS2NameIDTable;
         public int SentRequests = 0;
         public SteamAPIWrapper(CS2ArbitrageBot parent)
         {
             this.parent = parent;
+            if (parent.serviceManager.timeManager.GetTask("DownloadCS2ItemIDTables").GetAwaiter().GetResult() == null)
+            {
+                DownloadCS2ItemNameIDTable();
+                LoadCS2ItemNameIDTable().GetAwaiter().GetResult();
+            }
+            parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+        }
+
+        private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
+        {
+            if (e.taskName == "DownloadCS2ItemIDTables")
+            {
+                DownloadCS2ItemNameIDTable();
+                LoadCS2ItemNameIDTable().GetAwaiter().GetResult();
+            }
         }
 
         public enum FloatType
@@ -40,6 +57,31 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public const string CS2APPID = "730";
         public const string ItemImageURLPrefix = "https://community.fastly.steamstatic.com/economy/image/";
+
+        public void DownloadCS2ItemNameIDTable()
+        {
+            string url = "https://raw.githubusercontent.com/somespecialone/steam-item-name-ids/refs/heads/master/data/cs2.json";
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
+            WebClient wc = new();
+            wc.DownloadFile(new Uri(url), path);
+
+            parent.ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "DownloadCS2ItemIDTables", "SteamAPIWrapper", "To ensure that ItemNameID table is up to date.");
+        }
+
+        public async Task LoadCS2ItemNameIDTable()
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
+            if (File.Exists(path))
+            {
+                string json = await parent.GetDataHandler().ReadDataFromFile(path);
+                CS2NameIDTable = JsonConvert.DeserializeObject<Dictionary<string, int>>(json);
+            }
+            else
+            {
+                DownloadCS2ItemNameIDTable();
+                await LoadCS2ItemNameIDTable();
+            }
+        }
 
         public async Task<ItemListing> GetItemOnMarket(string itemHashName)
         {
@@ -207,6 +249,36 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }
             return listings;
+        }
+
+        public async Task<Dictionary<float, int>> GetAllBuyOrdersOfItem(string itemID)
+        {
+            Dictionary<float, int> buyOrders = new();
+            string url = $"https://steamcommunity.com/market/itemordershistogram?country=GB&language=english&currency=2&item_nameid={itemID}";
+            HttpRequestMessage message = new();
+            message.Method = HttpMethod.Get;
+            message.RequestUri = new Uri(url);
+            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            HttpClient client = new();
+            var result = await client.SendAsync(message);
+            SentRequests++;
+            if (result.IsSuccessStatusCode)
+            {
+                string response = await result.Content.ReadAsStringAsync();
+                dynamic json = JsonConvert.DeserializeObject(response);
+                foreach (var item in json.buy_order_graph)
+                {
+                    float price = Convert.ToSingle(item[0]);
+                    int amount = Convert.ToInt32(item[1]);
+                    buyOrders.Add(price, amount); //Otherwise, add a new entry
+
+                }
+            }
+            else
+            {
+                parent.ServiceLogError($"Failed to get buy orders for item {itemID}. Status Code: {result.StatusCode}");
+            }
+            return buyOrders;
         }
     }
 }

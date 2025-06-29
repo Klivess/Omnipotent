@@ -62,7 +62,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             //Ensure filename's name can actually be saved as a file's name
             //Try saying that 3 times lol
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scannedComparison));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scannedComparison, Formatting.Indented));
         }
 
         public async Task LoadScannedComparisons()
@@ -143,7 +143,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     {
                         MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.CSFloatListing.FloatValue);
                         MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.PriceInPounds);
-                        MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain)+1;
+                        MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain) + 1;
                     }
                     catch (Exception ex)
                     {

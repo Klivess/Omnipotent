@@ -1,12 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Linq;
 using System.Security.Principal;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace Omnipotent.Data_Handling
 {
@@ -63,6 +57,7 @@ namespace Omnipotent.Data_Handling
             //CS2ArbitrageBot
             public static string CS2ArbitrageBotDirectory = $"{SavedDataDirectory}/CS2ArbitrageBot";
             public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
+            public static string CS2ArbitrageBotItemNameIDTable = $"{CS2ArbitrageBotDirectory}/cs2nameIDtables.json";
             public static string CS2ArbitrageBotLabsDirectory = $"{CS2ArbitrageBotDirectory}/CS2ArbitrageBotLabs";
             public static string CS2ArbitrageBotScannedComparisonsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScannedComparisons";
         };
