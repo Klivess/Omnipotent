@@ -43,6 +43,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+
+
             if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null || OmniPaths.CheckIfOnServer() != true)
             {
                 SnipeDealsAndAlertKlives();
@@ -71,7 +73,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task SnipeDealsAndAlertKlives()
         {
-            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: 1000, normalOnly: true, csfloatSortBy: "highest_discount"))
+            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: 2500, normalOnly: true, csfloatSortBy: "highest_discount"))
             {
                 try
                 {
