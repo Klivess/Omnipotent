@@ -31,7 +31,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             public string AppraisalPriceText;
 
             public string AssetID;
-            public string FloatValue;
+            public double FloatValue;
             public string ItemID64;
         }
 

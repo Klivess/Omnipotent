@@ -58,7 +58,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
-            await parent.GetDataHandler().WriteToFile(path + scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.ItemID64 + ".json", JsonConvert.SerializeObject(scannedComparison));
+            await parent.GetDataHandler().WriteToFile(path + scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.FloatValue.ToString() + ".json", JsonConvert.SerializeObject(scannedComparison));
         }
 
         public async Task LoadScannedComparisons()
@@ -109,8 +109,52 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
             public DateTime AnalyticsGeneratedAt;
 
+            public ScannedComparisonAnalytics(List<ScannedComparison> comparisons)
+            {
+                List<ScannedComparison> comparisonsBelow0PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).ToList();
+                List<ScannedComparison> comparisonsBetween0and5PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0 && c.PredictedOverallArbitrageGain < 0.05).ToList();
+                List<ScannedComparison> comparisonsBetween5and10PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0.05 && c.PredictedOverallArbitrageGain < 0.1).ToList();
+                List<ScannedComparison> comparisonsBetween10and20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0.1 && c.PredictedOverallArbitrageGain < 0.2).ToList();
+                List<ScannedComparison> comparisonsAbove20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0.2).ToList();
+                NumberOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count;
+                MeanPriceOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count > 0 ? comparisonsBelow0PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                NumberOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count;
+                MeanPriceOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count > 0 ? comparisonsBetween0and5PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                NumberOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count;
+                MeanPriceOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count > 0 ? comparisonsBetween5and10PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                NumberOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count;
+                MeanPriceOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count > 0 ? comparisonsBetween10and20PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                NumberOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count;
+                MeanPriceOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count > 0 ? comparisonsAbove20PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                TotalListingsScanned = comparisons.Count;
 
-
+                if (comparisons.Count > 0)
+                {
+                    HighestPredictedGainFoundSoFar = comparisons.Max(c => c.PredictedOverallArbitrageGain);
+                    NameOfItemWithHighestPredictedGain = comparisons.FirstOrDefault(c => c.PredictedOverallArbitrageGain == HighestPredictedGainFoundSoFar)?.ItemMarketHashName ?? "Unknown";
+                    CountListingsWithPositiveGain = comparisons.Count(c => c.PredictedOverallArbitrageGain > 0);
+                    CountListingsWithNegativeGain = comparisons.Count(c => c.PredictedOverallArbitrageGain < 0);
+                    PercentageChanceOfFindingPositiveGainListing = (double)CountListingsWithPositiveGain / TotalListingsScanned * 100;
+                    MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.CSFloatListing.FloatValue);
+                    MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.PriceInPounds);
+                    MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.SteamListing.PriceInPounds);
+                    MeanFloatValueOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.CSFloatListing.FloatValue);
+                    MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain);
+                }
+                else
+                {
+                    HighestPredictedGainFoundSoFar = 0;
+                    NameOfItemWithHighestPredictedGain = "None";
+                    CountListingsWithPositiveGain = 0;
+                    CountListingsWithNegativeGain = 0;
+                    PercentageChanceOfFindingPositiveGainListing = 0;
+                    MeanFloatValueOfProfitableListings = 0;
+                    MeanPriceOfProfitableListings = 0;
+                    MeanPriceOfUnprofitableListings = 0;
+                    MeanFloatValueOfUnprofitableListings = 0;
+                    MeanGainOfProfitableListings = 0;
+                }
+            }
         }
     }
 }

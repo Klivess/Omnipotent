@@ -83,7 +83,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
                     //Find price difference
                     Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
-                    scanalytics.SaveScannedComparison(comparison);
+                    await scanalytics.SaveScannedComparison(comparison);
                     if (comparison.PredictedOverallArbitrageGain > MinimumPercentReturnToSnipe)
                     {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
