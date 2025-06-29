@@ -89,7 +89,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
                     await scanalytics.SaveScannedComparison(comparison);
                     //If doesnt already exist in AllScannedComparisonsInHistory, add it
-                    scanalytics.AllScannedComparisonsInHistory.Add(comparison);
+                    if (scanalytics.AllScannedComparisonsInHistory.Any(k => k.ItemMarketHashName == comparison.ItemMarketHashName))
+                    {
+                        var existingComparison = scanalytics.AllScannedComparisonsInHistory.First(k => k.ItemMarketHashName == comparison.ItemMarketHashName);
+                        if (existingComparison.PredictedOverallArbitrageGain < comparison.PredictedOverallArbitrageGain)
+                        {
+                            //If the new comparison has a better predicted overall arbitrage gain, replace the old one
+                            scanalytics.AllScannedComparisonsInHistory.Remove(existingComparison);
+                            await scanalytics.SaveScannedComparison(comparison);
+                            scanalytics.AllScannedComparisonsInHistory.Add(comparison);
+                        }
+                        else
+                        {
+                            //If the existing one is better, skip adding this one
+                            continue;
+                        }
+                    }
                     if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
                     {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
