@@ -60,6 +60,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public void DownloadCS2ItemNameIDTable()
         {
+            parent.ServiceLog("Downloading CS2 Item Name ID Table...");
+
             string url = "https://raw.githubusercontent.com/somespecialone/steam-item-name-ids/refs/heads/master/data/cs2.json";
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
             WebClient wc = new();
@@ -70,6 +72,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task LoadCS2ItemNameIDTable()
         {
+            parent.ServiceLog("Loading CS2 Item Name ID Table from disk...");
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
             if (File.Exists(path))
             {
