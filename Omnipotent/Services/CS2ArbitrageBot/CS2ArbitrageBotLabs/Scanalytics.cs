@@ -17,7 +17,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
 
         private CS2ArbitrageBot parent;
-        public double expectedSteamToCSFloatConversionPercentage = 0.8;
+        public double expectedSteamToCSFloatConversionPercentage = 0.84;
 
         public class ScannedComparison
         {
