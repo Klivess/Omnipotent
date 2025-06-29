@@ -139,11 +139,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     CountListingsWithPositiveGain = comparisons.Count(c => c.PredictedOverallArbitrageGain > 0);
                     CountListingsWithNegativeGain = comparisons.Count(c => c.PredictedOverallArbitrageGain < 0);
                     PercentageChanceOfFindingPositiveGainListing = (double)CountListingsWithPositiveGain / TotalListingsScanned * 100;
-                    MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.CSFloatListing.FloatValue);
-                    MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.PriceInPounds);
-                    MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.SteamListing.PriceInPounds);
-                    MeanFloatValueOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.CSFloatListing.FloatValue);
-                    MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain);
+                    try
+                    {
+                        MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.CSFloatListing.FloatValue);
+                        MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.PriceInPounds);
+                        MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain)+1;
+                    }
+                    catch (Exception ex)
+                    {
+                        MeanFloatValueOfProfitableListings = 0;
+                        MeanPriceOfProfitableListings = 0;
+                        MeanGainOfProfitableListings = 0;
+                    }
+
+                    try
+                    {
+                        MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.SteamListing.PriceInPounds);
+                        MeanFloatValueOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.CSFloatListing.FloatValue);
+                    }
+                    catch (Exception ex)
+                    {
+                        MeanPriceOfUnprofitableListings = 0;
+                        MeanFloatValueOfUnprofitableListings = 0;
+                    }
                 }
                 else
                 {
