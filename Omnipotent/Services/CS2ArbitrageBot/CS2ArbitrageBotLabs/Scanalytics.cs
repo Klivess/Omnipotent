@@ -40,9 +40,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 PriceTextSteamMarket = steamListing.PriceText;
 
 
-                double percentageDifference = Convert.ToDouble((steamListing.PriceInPounds / csfloatListing.PriceInPounds));
-                double gainAfterSteamTax = (((steamListing.PriceInPounds / 1.15) / csfloatListing.PriceInPounds));
-                double predictedOverallGain = (((((steamListing.PriceInPounds / 1.15)) * 0.8) / csfloatListing.PriceInPounds));
+                double percentageDifference = Convert.ToDouble((steamListing.HighestBuyOrderPriceInPounds / csfloatListing.PriceInPounds));
+                double gainAfterSteamTax = (((steamListing.HighestBuyOrderPriceInPounds / 1.15) / csfloatListing.PriceInPounds));
+                double predictedOverallGain = (((((steamListing.HighestBuyOrderPriceInPounds / 1.15)) * 0.8) / csfloatListing.PriceInPounds));
 
                 RawArbitrageGain = percentageDifference;
                 ArbitrageGainAfterSteamTax = gainAfterSteamTax; // Assuming 15% Steam tax
@@ -121,15 +121,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 List<ScannedComparison> comparisonsBetween10and20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0.1 && c.PredictedOverallArbitrageGain < 0.2).ToList();
                 List<ScannedComparison> comparisonsAbove20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 0.2).ToList();
                 NumberOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count;
-                MeanPriceOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count > 0 ? comparisonsBelow0PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                MeanPriceOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count > 0 ? comparisonsBelow0PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
                 NumberOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count;
-                MeanPriceOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count > 0 ? comparisonsBetween0and5PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                MeanPriceOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count > 0 ? comparisonsBetween0and5PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
                 NumberOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count;
-                MeanPriceOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count > 0 ? comparisonsBetween5and10PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                MeanPriceOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count > 0 ? comparisonsBetween5and10PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
                 NumberOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count;
-                MeanPriceOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count > 0 ? comparisonsBetween10and20PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                MeanPriceOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count > 0 ? comparisonsBetween10and20PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
                 NumberOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count;
-                MeanPriceOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count > 0 ? comparisonsAbove20PercentGain.Average(c => c.SteamListing.PriceInPounds) : 0;
+                MeanPriceOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count > 0 ? comparisonsAbove20PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
                 TotalListingsScanned = comparisons.Count;
 
                 if (comparisons.Count > 0)
@@ -142,7 +142,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     try
                     {
                         MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.CSFloatListing.FloatValue);
-                        MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.PriceInPounds);
+                        MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.SteamListing.HighestBuyOrderPriceInPounds);
                         MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 0).Average(c => c.PredictedOverallArbitrageGain) + 1;
                     }
                     catch (Exception ex)
@@ -154,7 +154,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                     try
                     {
-                        MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.SteamListing.PriceInPounds);
+                        MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.SteamListing.HighestBuyOrderPriceInPounds);
                         MeanFloatValueOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 0).Average(c => c.CSFloatListing.FloatValue);
                     }
                     catch (Exception ex)

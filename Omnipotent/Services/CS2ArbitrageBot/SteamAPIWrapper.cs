@@ -10,17 +10,21 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 {
     public class SteamAPIWrapper
     {
-        private CS2ArbitrageBot parent;
+        public CS2ArbitrageBot parent;
         private Dictionary<string, int> CS2NameIDTable;
         public int SentRequests = 0;
         public SteamAPIWrapper(CS2ArbitrageBot parent)
         {
             this.parent = parent;
-            if (parent.serviceManager.timeManager.GetTask("DownloadCS2ItemIDTables").GetAwaiter().GetResult() == null)
+        }
+
+        public async Task SteamAPIWrapperInitialisation()
+        {
+            if (await parent.serviceManager.timeManager.GetTask("DownloadCS2ItemIDTables") == null)
             {
-                DownloadCS2ItemNameIDTable();
-                LoadCS2ItemNameIDTable().GetAwaiter().GetResult();
+                await DownloadCS2ItemNameIDTable();
             }
+            await LoadCS2ItemNameIDTable();
             parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
         }
 
@@ -45,8 +49,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public struct ItemListing
         {
             public string Name;
-            public int PriceInPence;
-            public double PriceInPounds;
+            public int CheapestSellOrderPriceInPence;
+            public double CheapestSellOrderPriceInPounds;
+            public int HighestBuyOrderPriceInPence;
+            public double HighestBuyOrderPriceInPounds;
+            public BuyAndSellOrders BuyAndSellOrders;
             public string SellListings;
             public string PriceText;
             public string ImageURL;
@@ -58,7 +65,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public const string CS2APPID = "730";
         public const string ItemImageURLPrefix = "https://community.fastly.steamstatic.com/economy/image/";
 
-        public void DownloadCS2ItemNameIDTable()
+        public async Task DownloadCS2ItemNameIDTable()
         {
             parent.ServiceLog("Downloading CS2 Item Name ID Table...");
 
@@ -66,6 +73,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
             WebClient wc = new();
             wc.DownloadFile(new Uri(url), path);
+
+            parent.ServiceLog("CS2 Item Name ID Table downloaded successfully.");
 
             parent.ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "DownloadCS2ItemIDTables", "SteamAPIWrapper", "To ensure that ItemNameID table is up to date.");
         }
@@ -76,11 +85,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
             if (File.Exists(path))
             {
-                string json = await parent.GetDataHandler().ReadDataFromFile(path);
+                string json = await parent.GetDataHandler().ReadDataFromFile(path, true);
                 CS2NameIDTable = JsonConvert.DeserializeObject<Dictionary<string, int>>(json);
+                parent.ServiceLog("CS2 Item Name ID Table loaded successfully.");
             }
             else
             {
+                parent.ServiceLogError("CS2 Item Name ID Table file not found. Downloading it first.");
                 DownloadCS2ItemNameIDTable();
                 await LoadCS2ItemNameIDTable();
             }
@@ -110,9 +121,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 JObject listingInfo = json["listinginfo"];
                 string firstKey = listingInfo.Properties().First().Name;
                 JObject firstListing = (JObject)listingInfo[firstKey];
-                listing.PriceInPence = Convert.ToInt32(firstListing["converted_price"]) + Convert.ToInt32(firstListing["converted_fee"]);
-                listing.PriceInPounds = Convert.ToDouble(listing.PriceInPence) / 100;
-                listing.PriceText = "£" + listing.PriceInPounds.ToString();
+                listing.CheapestSellOrderPriceInPence = Convert.ToInt32(firstListing["converted_price"]) + Convert.ToInt32(firstListing["converted_fee"]);
+                listing.CheapestSellOrderPriceInPounds = Convert.ToDouble(listing.CheapestSellOrderPriceInPence) / 100;
                 listing.SellListings = "999";
                 listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName.Replace(" ", "%20")}";
                 try
@@ -148,6 +158,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     listing.floatType = FloatType.FactoryNew;
                 }
+
+                //Get Buy And Sell Orders;
+                BuyAndSellOrders buyAndSellOrders = await GetAllBuyOrdersOfItem(CS2NameIDTable[itemHashName].ToString());
+                listing.BuyAndSellOrders = buyAndSellOrders;
+                listing.HighestBuyOrderPriceInPence = Convert.ToInt32(buyAndSellOrders.BuyOrders.OrderByDescending(k => k.Key).FirstOrDefault().Key * 100);
+                listing.HighestBuyOrderPriceInPounds = Convert.ToDouble(listing.HighestBuyOrderPriceInPence) / 100;
+                listing.PriceText = "£" + listing.HighestBuyOrderPriceInPounds.ToString();
             }
             else
             {
@@ -209,10 +226,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         listing.Name = listing.Name.Replace("Field-Tested", "").Replace("Minimal Wear", "").Replace("Well-Worn", "").Replace("Battle-Scarred", "").Replace("Factory New", "").Trim();
                         //Remove parenthesis from name
                         listing.Name = listing.Name.Replace("(", "").Replace(")", "").Trim();
-                        listing.PriceInPence = Convert.ToInt32(Math.Round(Convert.ToDouble(item.sell_price) * parent.ExchangeRate));
-                        listing.PriceInPounds = Convert.ToDouble(listing.PriceInPence) / 100;
+                        listing.CheapestSellOrderPriceInPence = Convert.ToInt32(Math.Round(Convert.ToDouble(item.sell_price) * parent.ExchangeRate));
+                        listing.CheapestSellOrderPriceInPounds = Convert.ToDouble(listing.CheapestSellOrderPriceInPence) / 100;
                         listing.SellListings = item.sell_listings;
-                        listing.PriceText = "£" + listing.PriceInPounds.ToString();
+                        listing.PriceText = "£" + listing.CheapestSellOrderPriceInPounds.ToString();
                         listing.ImageURL = ItemImageURLPrefix + item.asset_description.icon_url;
                         listing.NameColor = ColorTranslator.FromHtml("#" + item.asset_description.name_color);
                         if (listing.Name.Contains("Field-Tested"))
@@ -254,9 +271,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             return listings;
         }
 
-        public async Task<Dictionary<float, int>> GetAllBuyOrdersOfItem(string itemID)
+        public struct BuyAndSellOrders
         {
-            Dictionary<float, int> buyOrders = new();
+            public Dictionary<double, int> BuyOrders;
+            public Dictionary<double, int> SellOrders;
+        }
+
+        public async Task<BuyAndSellOrders> GetAllBuyOrdersOfItem(string itemID)
+        {
+            Dictionary<double, int> buyOrders = new();
+            Dictionary<double, int> sellOrders = new();
             string url = $"https://steamcommunity.com/market/itemordershistogram?country=GB&language=english&currency=2&item_nameid={itemID}";
             HttpRequestMessage message = new();
             message.Method = HttpMethod.Get;
@@ -271,17 +295,27 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 dynamic json = JsonConvert.DeserializeObject(response);
                 foreach (var item in json.buy_order_graph)
                 {
-                    float price = Convert.ToSingle(item[0]);
+                    double price = Convert.ToDouble(item[0]);
                     int amount = Convert.ToInt32(item[1]);
                     buyOrders.Add(price, amount); //Otherwise, add a new entry
-
+                }
+                foreach (var item in json.sell_order_graph)
+                {
+                    double price = Convert.ToDouble(item[0]);
+                    int amount = Convert.ToInt32(item[1]);
+                    sellOrders.Add(price, amount); //Otherwise, add a new entry
                 }
             }
             else
             {
                 parent.ServiceLogError($"Failed to get buy orders for item {itemID}. Status Code: {result.StatusCode}");
             }
-            return buyOrders;
+            BuyAndSellOrders orders = new()
+            {
+                BuyOrders = buyOrders,
+                SellOrders = sellOrders
+            };
+            return orders;
         }
     }
 }

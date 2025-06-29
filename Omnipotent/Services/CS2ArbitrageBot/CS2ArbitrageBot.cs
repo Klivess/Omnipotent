@@ -43,6 +43,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }
             steamAPIWrapper = new SteamAPIWrapper(this);
+            await steamAPIWrapper.SteamAPIWrapperInitialisation();
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
