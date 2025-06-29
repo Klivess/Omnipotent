@@ -84,6 +84,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     //Find price difference
                     Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
                     await scanalytics.SaveScannedComparison(comparison);
+                    //If doesnt already exist in AllScannedComparisonsInHistory, add it
+                    if (scanalytics.AllScannedComparisonsInHistory.Any(k => k.CSFloatListing.ItemListingID == k.CSFloatListing.ItemListingID))
+                    {
+                        //replace that item in the list
+                        scanalytics.AllScannedComparisonsInHistory.RemoveAll(k => k.CSFloatListing.ItemListingID == k.CSFloatListing.ItemListingID);
+                    }
+                    scanalytics.AllScannedComparisonsInHistory.Add(comparison);
                     if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
                     {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
