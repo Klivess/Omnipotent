@@ -45,8 +45,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 double predictedOverallGain = (((((steamListing.PriceInPounds / 1.15)) * 0.8) / csfloatListing.PriceInPounds));
 
                 RawArbitrageGain = percentageDifference;
-                ArbitrageGainAfterSteamTax = RawArbitrageGain * 0.85; // Assuming 15% Steam tax
-                PredictedOverallArbitrageGain = ArbitrageGainAfterSteamTax; // Placeholder for future calculations
+                ArbitrageGainAfterSteamTax = gainAfterSteamTax; // Assuming 15% Steam tax
+                PredictedOverallArbitrageGain = predictedOverallGain; // Placeholder for future calculations
                 CSFloatURL = csfloatListing.ListingURL;
                 SteamListingURL = steamListing.ListingURL;
                 CSFloatListing = csfloatListing;
@@ -58,7 +58,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
-            await parent.GetDataHandler().WriteToFile(path + scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.FloatValue.ToString() + ".json", JsonConvert.SerializeObject(scannedComparison));
+            string filename = scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.FloatValue.ToString() + ".json";
+            //Ensure filename's name can actually be saved as a file's name
+            //Try saying that 3 times lol
+            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scannedComparison));
         }
 
         public async Task LoadScannedComparisons()

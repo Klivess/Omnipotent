@@ -218,6 +218,7 @@ namespace Omnipotent.Data_Handling
                     }
                     catch (IOException exception)
                     {
+                        ServiceLogError(exception);
                         fileOperations.Add(task);
                     }
                 }
