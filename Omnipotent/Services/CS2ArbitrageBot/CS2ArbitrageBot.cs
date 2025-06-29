@@ -86,16 +86,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     scanalytics.SaveScannedComparison(comparison);
                     if (comparison.PredictedOverallArbitrageGain > MinimumPercentReturnToSnipe)
                     {
+#pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
+#pragma warning disable CS8602 // Dereference of a possibly null reference.
                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
                             $"Name: {snipe.ItemMarketHashName}\n" +
                             $"CSFloat Price: {snipe.PriceText}\n" +
                             $"Steam Price: {correspondingListing.PriceText}\n" +
-                            $"Raw Arbitrage Gain: **{Math.Round(comparison.RawArbitrageGain, 2).ToString()}%**\n" +
-                            $"Arbitrage Gain After Steam Tax: **{Math.Round(comparison.ArbitrageGainAfterSteamTax, 2).ToString()}%**\n" +
-                            $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round(comparison.PredictedOverallArbitrageGain, 2).ToString()}%**\n" +
+                            $"Raw Arbitrage Gain: **{Math.Round((comparison.RawArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                            $"Arbitrage Gain After Steam Tax: **{Math.Round((comparison.ArbitrageGainAfterSteamTax - 1) * 100, 2).ToString()}%**\n" +
+                            $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
                             $"CSFloat Listing URL: {snipe.ListingURL}\n" +
                             $"Steam Listing URL: {correspondingListing.ListingURL}\n"
                             , DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+#pragma warning restore CS8602 // Dereference of a possibly null reference.
+#pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
                     }
                 }
                 catch (Exception ex)
