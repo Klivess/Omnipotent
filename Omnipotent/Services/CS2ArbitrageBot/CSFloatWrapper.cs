@@ -29,6 +29,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             public int AppraisalBasePriceInPence;
             public double AppraisalBasePriceInPounds;
             public string AppraisalPriceText;
+
+            public string AssetID;
+            public string FloatValue;
+            public string ItemID64;
         }
 
         public async Task<List<ItemListing>> GetBestDealsOnCSFloat(int amountOfListingsToLoad, bool noRepeatedItems = true, float? minimumPriceInPence = null, float? maximumPriceInPence = null, float? minimumQuantityOnSale = null,
@@ -152,6 +156,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             result.AppraisalBasePriceInPence = jsonItem.reference.base_price * parent.ExchangeRate;
             result.AppraisalBasePriceInPounds = Convert.ToDouble(result.AppraisalBasePriceInPence) / 100;
             result.AppraisalPriceText = "£" + result.AppraisalBasePriceInPounds.ToString();
+
+            result.AssetID = jsonItem.item.asset_id;
+            result.FloatValue = jsonItem.item.float_value;
+            result.ItemID64 = jsonItem.item.d_param;
             return result;
         }
 

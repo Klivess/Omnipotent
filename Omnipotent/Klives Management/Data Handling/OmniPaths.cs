@@ -63,6 +63,8 @@ namespace Omnipotent.Data_Handling
             //CS2ArbitrageBot
             public static string CS2ArbitrageBotDirectory = $"{SavedDataDirectory}/CS2ArbitrageBot";
             public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
+            public static string CS2ArbitrageBotLabsDirectory = $"{CS2ArbitrageBotDirectory}/CS2ArbitrageBotLabs";
+            public static string CS2ArbitrageBotScannedComparisonsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScannedComparisons";
         };
 
         public static string GetPath(string path)

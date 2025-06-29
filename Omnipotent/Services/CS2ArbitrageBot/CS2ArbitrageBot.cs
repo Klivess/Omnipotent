@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using Org.BouncyCastle.Asn1.Esf;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
@@ -10,6 +11,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public float ExchangeRate;
         private SteamAPIWrapper steamAPIWrapper;
         private CSFloatWrapper csFloatWrapper;
+        public Scanalytics scanalytics;
 
         public float MinimumPercentReturnToSnipe = 10;
 
@@ -42,6 +44,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
+            scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
 
@@ -79,19 +82,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
                     //Find price difference
-                    double percentageDifference = Convert.ToDouble((correspondingListing.PriceInPounds / snipe.PriceInPounds) - 1) * 100;
-                    double gainAfterSteamTax = (((correspondingListing.PriceInPounds / 1.15) / snipe.PriceInPounds) - 1) * 100;
-                    double expectedSteamToCSFloatConversionPercentage = 0.8;
-                    double predictedOverallGain = (((((correspondingListing.PriceInPounds / 1.15)) * 0.8) / snipe.PriceInPounds) - 1) * 100;
-                    if (predictedOverallGain > predictedOverallGain)
+                    Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
+                    scanalytics.SaveScannedComparison(comparison);
+                    if (comparison.PredictedOverallArbitrageGain > MinimumPercentReturnToSnipe)
                     {
                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
                             $"Name: {snipe.ItemMarketHashName}\n" +
                             $"CSFloat Price: {snipe.PriceText}\n" +
                             $"Steam Price: {correspondingListing.PriceText}\n" +
-                            $"Raw Arbitrage Gain: **{Math.Round(percentageDifference, 2).ToString()}%**\n" +
-                            $"Arbitrage Gain After Steam Tax: **{Math.Round(gainAfterSteamTax, 2).ToString()}%**\n" +
-                            $"Predicted Overall Gain After {((expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round(predictedOverallGain, 2).ToString()}%**\n" +
+                            $"Raw Arbitrage Gain: **{Math.Round(comparison.RawArbitrageGain, 2).ToString()}%**\n" +
+                            $"Arbitrage Gain After Steam Tax: **{Math.Round(comparison.ArbitrageGainAfterSteamTax, 2).ToString()}%**\n" +
+                            $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round(comparison.PredictedOverallArbitrageGain, 2).ToString()}%**\n" +
                             $"CSFloat Listing URL: {snipe.ListingURL}\n" +
                             $"Steam Listing URL: {correspondingListing.ListingURL}\n"
                             , DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
