@@ -236,7 +236,7 @@ Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
 Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
 
 --- Top Opportunity ---
-Highest Predicted Gain Found: {analytics.HighestPredictedGainFoundSoFar:F2}%
+Highest Predicted Gain Found: {Math.Round((analytics.HighestPredictedGainFoundSoFar - 1) * 100, 2)}%
 Item: {analytics.NameOfItemWithHighestPredictedGain}
 ";
 
