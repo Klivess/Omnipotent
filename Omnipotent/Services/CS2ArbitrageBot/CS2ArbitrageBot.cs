@@ -80,7 +80,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task SnipeDealsAndAlertKlives()
         {
-            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: 2500, normalOnly: true, csfloatSortBy: "highest_discount"))
+            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: 80 * 100, normalOnly: true, csfloatSortBy: "highest_discount"))
             {
                 try
                 {
