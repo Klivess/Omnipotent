@@ -69,7 +69,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 listing.PriceInPounds = Convert.ToDouble(listing.PriceInPence) / 100;
                 listing.PriceText = "£" + listing.PriceInPounds.ToString();
                 listing.SellListings = "999";
-                listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName}";
+                listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName.Replace(" ", "%20")}";
                 try
                 {
                     var assets = jsonObj["assets"]
