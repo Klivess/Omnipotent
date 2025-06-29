@@ -3,6 +3,7 @@ using DSharpPlus.SlashCommands;
 using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.CS2ArbitrageBot;
 using Omnipotent.Services.KliveTechHub;
 using System.Diagnostics;
 using System.Management.Automation.Subsystem.Prediction;
@@ -200,6 +201,54 @@ namespace Omnipotent.Services.KliveBot_Discord
             else
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+            }
+        }
+
+        [SlashCommand("GetCS2ArbitrageAnalytics", "Generates and returns the latest analytics for Klives's CS2 Arbitrage Strategy")]
+        public async Task GetCS2ArbitrageAnalytics(InteractionContext ctx)
+        {
+            try
+            {
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+                CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics analytics =
+                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(((CS2ArbitrageBot.CS2ArbitrageBot)(await serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllScannedComparisonsInHistory);
+
+                string report = $@"
+[Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
+
+Total Listings Scanned: {analytics.TotalListingsScanned}
+
+--- Gain Buckets ---
+Listings with < 0% Gain: {analytics.NumberOfListingsBelow0PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBelow0PercentGain:F2})
+Listings with 0-5% Gain: {analytics.NumberOfListingsBetween0And5PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween0And5PercentGain:F2})
+Listings with 5-10% Gain: {analytics.NumberOfListingsBetween5And10PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween5And10PercentGain:F2})
+Listings with 10-20% Gain: {analytics.NumberOfListingsBetween10And20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween10And20PercentGain:F2})
+Listings with > 20% Gain: {analytics.NumberOfListingsAbove20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsAbove20PercentGain:F2})
+
+--- Profitability Stats ---
+Listings with Positive Gain: {analytics.CountListingsWithPositiveGain}
+Listings with Negative Gain: {analytics.CountListingsWithNegativeGain}
+Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%
+Avg Gain of Profitable Listings: {analytics.MeanGainOfProfitableListings:F2}%
+Avg Float (Profitable): {analytics.MeanFloatValueOfProfitableListings:F5}
+Avg Price (Profitable): £{analytics.MeanPriceOfProfitableListings:F2}
+Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
+Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
+
+--- Top Opportunity ---
+Highest Predicted Gain Found: {analytics.HighestPredictedGainFoundSoFar:F2}%
+Item: {analytics.NameOfItemWithHighestPredictedGain}
+";
+
+                var embed = KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Analytics Report", report, DSharpPlus.Entities.DiscordColor.Green);
+                // Edit response with the Embed
+                await ctx.EditResponseAsync(new DSharpPlus.Entities.DiscordWebhookBuilder().AddEmbed(embed.Embed));
+            }
+            catch (Exception ex)
+            {
+                //Return apology message to 
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Kinda awkward but an error just occurred so I can't do this, sorry."));
+                (await serviceManager.GetKliveBotDiscordService()).ServiceLogError(ex);
             }
         }
     }
