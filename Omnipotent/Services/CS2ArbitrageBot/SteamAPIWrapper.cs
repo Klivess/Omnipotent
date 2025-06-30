@@ -371,16 +371,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 string item_nameid = string.Empty;
                 session.DevToolsEventReceived += (sender, e) =>
                 {
-                    if (e.EventData.ToJsonString().Contains("https://steamcommunity.com/market/itemordershistogram"))
+                    if (e.EventData.ToJsonString().Contains("https://steamcommunity.com/market/itemordershistogram") && found == false)
                     {
-                        parent.ServiceLog("Found itemordershistorgram request for url: " + steamListingUrl);
-                        dynamic json = JsonConvert.DeserializeObject(e.EventData.ToJsonString());
-                        string url = json.request.url;
-                        //Parse parameters from URL
-                        var parameters = System.Web.HttpUtility.ParseQueryString(new Uri(url).Query);
-                        item_nameid = parameters["item_nameid"];
-                        parent.ServiceLog("Found nameid for url: " + steamListingUrl);
-                        found = true;
+                        try
+                        {
+                            parent.ServiceLog("Found itemordershistorgram request for url: " + steamListingUrl);
+                            dynamic json = JsonConvert.DeserializeObject(e.EventData.ToJsonString());
+                            string url = json.request.url;
+                            //Parse parameters from URL
+                            var parameters = System.Web.HttpUtility.ParseQueryString(new Uri(url).Query);
+                            item_nameid = parameters["item_nameid"];
+                            parent.ServiceLog("Found nameid " + item_nameid + " for url: " + steamListingUrl);
+                            found = true;
+                        }
+                        catch (Exception ex) { }
                     }
                 };
 
@@ -390,8 +394,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     await Task.Delay(100);
                 }
-                return item_nameid;
                 chromeDriver.Quit();
+                return item_nameid;
                 //IWebElement searchBox = wait.Until(d => d.FindElement(By.Name("q")));
 
             }

@@ -59,9 +59,7 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
-                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
-
-                TestTask();
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
 
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
@@ -99,11 +97,6 @@ namespace Omnipotent
                     errorinfo.FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red)).Wait();
                 ExistentialBotUtilities.RestartBot();
             }
-        }
-
-        public static async Task TestTask()
-        {
-
         }
         private static void CurrentDomain_UnhandledException(Exception e)
         {
