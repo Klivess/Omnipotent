@@ -5,6 +5,11 @@ using System.Drawing;
 using System.Net.Http.Headers;
 using System.Net;
 using Omnipotent.Data_Handling;
+using Omnipotent.Logging;
+using OpenQA.Selenium.Chrome;
+using OpenQA.Selenium.DevTools;
+using OpenQA.Selenium.Support.UI;
+using Json.More;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
@@ -13,6 +18,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public CS2ArbitrageBot parent;
         private Dictionary<string, int> CS2NameIDTable;
         public int SentRequests = 0;
+
+        string cs2NameIDTablePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDirectory), "cs2nameIDtables.json");
+
         public SteamAPIWrapper(CS2ArbitrageBot parent)
         {
             this.parent = parent;
@@ -20,7 +28,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task SteamAPIWrapperInitialisation()
         {
-            if (await parent.serviceManager.timeManager.GetTask("DownloadCS2ItemIDTables") == null)
+            if (!File.Exists(cs2NameIDTablePath))
             {
                 await DownloadCS2ItemNameIDTable();
             }
@@ -30,11 +38,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
         {
-            if (e.taskName == "DownloadCS2ItemIDTables")
-            {
-                DownloadCS2ItemNameIDTable();
-                LoadCS2ItemNameIDTable().GetAwaiter().GetResult();
-            }
+
         }
 
         public enum FloatType
@@ -70,19 +74,36 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             parent.ServiceLog("Downloading CS2 Item Name ID Table...");
 
             string url = "https://raw.githubusercontent.com/somespecialone/steam-item-name-ids/refs/heads/master/data/cs2.json";
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
             WebClient wc = new();
-            wc.DownloadFile(new Uri(url), path);
+            wc.DownloadFile(new Uri(url), cs2NameIDTablePath);
 
             parent.ServiceLog("CS2 Item Name ID Table downloaded successfully.");
 
             parent.ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "DownloadCS2ItemIDTables", "SteamAPIWrapper", "To ensure that ItemNameID table is up to date.");
         }
 
+        public async Task AddToNameIDTable(string itemHashName, int itemID)
+        {
+            //Check if already exists first
+            if (CS2NameIDTable.ContainsKey(itemHashName))
+            {
+                //Update it
+                CS2NameIDTable[itemHashName] = itemID;
+            }
+            else
+            {
+                //Add it
+                CS2NameIDTable.Add(itemHashName, itemID);
+            }
+            //Save to disk
+            string json = JsonConvert.SerializeObject(CS2NameIDTable, Formatting.Indented);
+            await parent.GetDataHandler().WriteToFile(cs2NameIDTablePath, json);
+        }
+
         public async Task LoadCS2ItemNameIDTable()
         {
             parent.ServiceLog("Loading CS2 Item Name ID Table from disk...");
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotItemNameIDTable);
+            string path = cs2NameIDTablePath;
             if (File.Exists(path))
             {
                 string json = await parent.GetDataHandler().ReadDataFromFile(path, true);
@@ -160,6 +181,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
 
                 //Get Buy And Sell Orders;
+                //Check if itemHashName exists in CS2NameIDTable
+                if (!CS2NameIDTable.ContainsKey(itemHashName))
+                {
+                    string nameid = await GetItemNameIDViaSelenium(listing.ListingURL);
+                    await AddToNameIDTable(itemHashName, Convert.ToInt32(nameid));
+                }
                 BuyAndSellOrders buyAndSellOrders = await GetAllBuyOrdersOfItem(CS2NameIDTable[itemHashName].ToString());
                 listing.BuyAndSellOrders = buyAndSellOrders;
                 listing.HighestBuyOrderPriceInPence = Convert.ToInt32(buyAndSellOrders.BuyOrders.OrderByDescending(k => k.Key).FirstOrDefault().Key * 100);
@@ -316,6 +343,57 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 SellOrders = sellOrders
             };
             return orders;
+        }
+
+        public async Task<string> GetItemNameIDViaSelenium(string steamListingUrl)
+        {
+            try
+            {
+                var options = new ChromeOptions();
+                options.AddArgument("--headless");
+                options.AddArgument("--disable-gpu");
+                options.AddArgument("--no-sandbox");
+                options.AddArgument("--disable-dev-shm-usage");
+                options.AddArgument("--disable-web-security");
+                options.AddArgument("--disable-features=VizDisplayCompositor");
+
+
+                ChromeDriver chromeDriver = new ChromeDriver(options);
+
+                IDevTools devTools = chromeDriver;
+                DevToolsSession session = devTools.GetDevToolsSession();
+                await session.Domains.Network.EnableNetwork();
+                bool found = false;
+                string item_nameid = string.Empty;
+                session.DevToolsEventReceived += (sender, e) =>
+                {
+                    if (e.EventData.ToJsonString().Contains("https://steamcommunity.com/market/itemordershistogram"))
+                    {
+                        dynamic json = JsonConvert.DeserializeObject(e.EventData.ToJsonString());
+                        string url = json.request.url;
+                        //Parse parameters from URL
+                        var parameters = System.Web.HttpUtility.ParseQueryString(new Uri(url).Query);
+                        item_nameid = parameters["item_nameid"];
+                        found = true;
+                    }
+                };
+
+                chromeDriver.Navigate().GoToUrl(steamListingUrl);
+                WebDriverWait wait = new WebDriverWait(chromeDriver, TimeSpan.FromSeconds(10));
+                while (found == false)
+                {
+                    await Task.Delay(100);
+                }
+                return item_nameid;
+                chromeDriver.Quit();
+                //IWebElement searchBox = wait.Until(d => d.FindElement(By.Name("q")));
+
+            }
+            catch (Exception ex)
+            {
+                OmniLogging.LogErrorStatic("Main Thread", ex, "Error in TestTask!");
+                return null;
+            }
         }
     }
 }

@@ -2,7 +2,9 @@
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
 using DSharpPlus.Entities;
 using Humanizer;
+using Json.More;
 using Microsoft.PowerShell.Commands;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Klives_Management.General_Analytics;
 using Omnipotent.Logging;
@@ -17,8 +19,13 @@ using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.TestService;
+using OpenQA.Selenium;
+using OpenQA.Selenium.Chrome;
+using OpenQA.Selenium.DevTools;
+using OpenQA.Selenium.Support.UI;
 using System;
 using System.Drawing;
+using System.Text.RegularExpressions;
 using static System.Net.Mime.MediaTypeNames;
 
 namespace Omnipotent
@@ -52,7 +59,9 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
+                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
+
+                TestTask();
 
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
@@ -92,6 +101,10 @@ namespace Omnipotent
             }
         }
 
+        public static async Task TestTask()
+        {
+
+        }
         private static void CurrentDomain_UnhandledException(Exception e)
         {
             //Notify Klives
