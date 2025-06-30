@@ -84,6 +84,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public async Task AddToNameIDTable(string itemHashName, int itemID)
         {
+            parent.ServiceLog("Adding " + itemHashName + "'s item id " + itemID + " to table and saving.");
             //Check if already exists first
             if (CS2NameIDTable.ContainsKey(itemHashName))
             {
@@ -184,6 +185,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 //Check if itemHashName exists in CS2NameIDTable
                 if (!CS2NameIDTable.ContainsKey(itemHashName))
                 {
+                    parent.ServiceLog("Item not found in CS2NameIDTable. Attempting to get NameID via Selenium.");
                     string nameid = await GetItemNameIDViaSelenium(listing.ListingURL);
                     await AddToNameIDTable(itemHashName, Convert.ToInt32(nameid));
                 }
@@ -356,9 +358,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 options.AddArgument("--disable-dev-shm-usage");
                 options.AddArgument("--disable-web-security");
                 options.AddArgument("--disable-features=VizDisplayCompositor");
+                options.AddArgument("--disable-logging");
 
 
                 ChromeDriver chromeDriver = new ChromeDriver(options);
+                parent.ServiceLog("Going to webpage: " + steamListingUrl);
 
                 IDevTools devTools = chromeDriver;
                 DevToolsSession session = devTools.GetDevToolsSession();
@@ -369,11 +373,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     if (e.EventData.ToJsonString().Contains("https://steamcommunity.com/market/itemordershistogram"))
                     {
+                        parent.ServiceLog("Found itemordershistorgram request for url: " + steamListingUrl);
                         dynamic json = JsonConvert.DeserializeObject(e.EventData.ToJsonString());
                         string url = json.request.url;
                         //Parse parameters from URL
                         var parameters = System.Web.HttpUtility.ParseQueryString(new Uri(url).Query);
                         item_nameid = parameters["item_nameid"];
+                        parent.ServiceLog("Found nameid for url: " + steamListingUrl);
                         found = true;
                     }
                 };
