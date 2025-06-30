@@ -86,14 +86,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
                     //Find price difference
                     Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
+                    await scanalytics.SaveScannedComparison(comparison);
                     //If doesnt already exist in AllScannedComparisonsInHistory, add it
                     if (scanalytics.AllScannedComparisonsInHistory.Any(k => k.ItemMarketHashName == comparison.ItemMarketHashName))
                     {
-                        //remove it 
-                        scanalytics.AllScannedComparisonsInHistory.RemoveAll(k => k.ItemMarketHashName == comparison.ItemMarketHashName);
+                        var existingComparison = scanalytics.AllScannedComparisonsInHistory.First(k => k.ItemMarketHashName == comparison.ItemMarketHashName);
+                        if (existingComparison.PredictedOverallArbitrageGain < comparison.PredictedOverallArbitrageGain)
+                        {
+                            //If the new comparison has a better predicted overall arbitrage gain, replace the old one
+                            scanalytics.AllScannedComparisonsInHistory.Remove(existingComparison);
+                            await scanalytics.SaveScannedComparison(comparison);
+                            scanalytics.AllScannedComparisonsInHistory.Add(comparison);
+                        }
+                        else
+                        {
+                            //If the existing one is better, skip adding this one
+                            continue;
+                        }
                     }
-                    scanalytics.AllScannedComparisonsInHistory.Add(comparison);
-                    await scanalytics.SaveScannedComparison(comparison);
                     if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
                     {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
