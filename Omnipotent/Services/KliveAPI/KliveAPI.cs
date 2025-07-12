@@ -171,7 +171,8 @@ namespace Omnipotent.Services.KliveAPI
             await CreateRoute("/allRoutes", async (req) =>
             {
                 var copy = ControllerLookup.ToDictionary();
-                await req.ReturnResponse(JsonConvert.SerializeObject(copy), "application/json");
+                string resp = JsonConvert.SerializeObject(copy);
+                await req.ReturnResponse(resp, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
         }
 
