@@ -259,11 +259,6 @@ namespace Omnipotent.Services.KliveAPI
             {
                 ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
             }
-            else
-            {
-                ServiceLog($"Failed to create route: " + route);
-                await CreateRoute(route, handler, method, authenticationLevelRequired);
-            }
         }
 
         private async void ServerListenLoop()
