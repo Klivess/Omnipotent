@@ -313,7 +313,16 @@ namespace Omnipotent.Services.KliveAPI
                     if (ControllerLookup.ContainsKey(route))
                     {
                         RouteInfo routeData = ControllerLookup[route];
-                        if (request.user != null || routeData.authenticationLevelRequired == KMPermissions.Anybody)
+                        bool isUserNull = true;
+                        try
+                        {
+                            isUserNull = request.user == null;
+                        }
+                        catch (NullReferenceException ex)
+                        {
+                            isUserNull = true;
+                        }
+                        if (isUserNull != true || routeData.authenticationLevelRequired == KMPermissions.Anybody)
                         {
                             if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                             {
