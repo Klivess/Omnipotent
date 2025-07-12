@@ -173,7 +173,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/AttemptLogin", async (request) =>
             {
                 try
@@ -186,7 +185,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Anybody);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetProfileByID", async (request) =>
             {
                 try
@@ -205,7 +203,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", async (request) =>
             {
                 try
@@ -218,7 +215,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeCanLogin", async (request) =>
             {
                 try
@@ -253,7 +249,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", async (request) =>
             {
                 try
@@ -289,7 +284,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", async (request) =>
             {
                 try
@@ -324,7 +318,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", async (request) =>
             {
                 try
@@ -360,7 +353,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DeleteProfile", async (request) =>
             {
                 try
@@ -389,7 +381,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
-
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileDiscordID", async (request) =>
             {
                 try
@@ -424,10 +415,6 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-            while (true)
-            {
-                await Task.Delay(1000);
-            }
         }
     }
 }
