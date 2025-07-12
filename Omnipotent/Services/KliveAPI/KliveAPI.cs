@@ -170,8 +170,9 @@ namespace Omnipotent.Services.KliveAPI
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
             await CreateRoute("/allRoutes", async (req) =>
             {
-                await req.ReturnResponse(JsonConvert.SerializeObject(ControllerLookup), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+                var copy = ControllerLookup.ToDictionary();
+                await req.ReturnResponse(JsonConvert.SerializeObject(copy), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
         }
 
         private void KliveAPI_ServiceQuitRequest()
