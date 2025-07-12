@@ -4,10 +4,12 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
+using static Omnipotent.Profiles.KMProfileManager;
 
 namespace Omnipotent.Service_Manager
 {
@@ -126,11 +128,13 @@ namespace Omnipotent.Service_Manager
 
         protected override async void ServiceMain()
         {
-            //First time startup
-            if (tasks.Any() == false)
-            {
-                tasks = tasks.Concat(await GetAllUpcomingTasksFromDisk()).ToList();
-            }
+            tasks = tasks.Concat(await GetAllUpcomingTasksFromDisk()).ToList();
+            CreateRoutes();
+            WaitLoop();
+        }
+
+        public async void WaitLoop()
+        {
             //Begin task waiting loop
             //Begin waiting for each task, and checking for new tasks to appear.
             ScheduledTask[] copyOfTasks = tasks.ToArray();
@@ -214,6 +218,14 @@ namespace Omnipotent.Service_Manager
             });
             thread.Start();
             pendingTasks.Add(thread);
+        }
+
+        private async void CreateRoutes()
+        {
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/timemanager/getalltasks", async (request) =>
+            {
+                await request.ReturnResponse(JsonConvert.SerializeObject(tasks), code: HttpStatusCode.OK);
+            }, HttpMethod.Get, KMPermissions.Guest);
         }
     }
 }
