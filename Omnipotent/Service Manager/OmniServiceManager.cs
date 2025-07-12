@@ -203,12 +203,19 @@ namespace Omnipotent.Service_Manager
 
         public OmniService GetServiceByName(string name)
         {
-            var result = activeServices.Where(k => k.GetName().ToLower() == name.ToLower()).ToArray();
-            if (result.Any())
+            try
             {
-                return result[0];
+                var result = activeServices.Where(k => k.GetName().ToLower() == name.ToLower()).ToArray();
+                if (result.Any())
+                {
+                    return result[0];
+                }
+                else
+                {
+                    return null;
+                }
             }
-            else
+            catch (NullReferenceException ex)
             {
                 return null;
             }

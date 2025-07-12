@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using System.Management.Automation.Language;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs

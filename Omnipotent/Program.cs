@@ -18,6 +18,7 @@ using Omnipotent.Services.KliveTechHub;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
+using Omnipotent.Services.OmniTrader;
 using Omnipotent.Services.TestService;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
@@ -59,16 +60,19 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
+
+                testTask();
 
                 //Services to only execute on debug
                 if (!OmniPaths.CheckIfOnServer())
                 {
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                 }
 
                 if (OmniPaths.CheckIfOnServer())
                 {
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
                     ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives("Omnipotent online!");
                 }
                 if (args.Any())
@@ -95,9 +99,14 @@ namespace Omnipotent
                 OmniLogging.LogErrorStatic("Main Thread", ex, "Unhandled Error!");
                 omniServiceManager.GetKliveBotDiscordService().GetAwaiter().GetResult().SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed("Unhandled error caught in main thread!",
                     errorinfo.FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red)).Wait();
-                ExistentialBotUtilities.RestartBot();
+                //ExistentialBotUtilities.RestartBot();
             }
         }
+        public static async Task testTask()
+        {
+
+        }
+
         private static void CurrentDomain_UnhandledException(Exception e)
         {
             //Notify Klives

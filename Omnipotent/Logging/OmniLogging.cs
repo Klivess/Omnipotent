@@ -49,23 +49,95 @@ namespace Omnipotent.Logging
         }
         public struct ErrorInformation
         {
-            public Exception ErrorException;
-            public StackTrace ErrorTrace;
-            public int LineOfError;
-            public string FullFormattedMessage;
-            public string methodName;
-            public string className;
+            /// <summary>
+            /// The message describing the exception.
+            /// </summary>
+            public string Message { get; }
+
+            /// <summary>
+            /// The full stack trace at the point the exception was thrown.
+            /// </summary>
+            public string StackTrace { get; }
+
+            /// <summary>
+            /// The name of the application or object that caused the error.
+            /// </summary>
+            public string Source { get; }
+
+            /// <summary>
+            /// The method that threw the exception.
+            /// </summary>
+            public string TargetSite { get; }
+
+            /// <summary>
+            /// The full type name of the exception.
+            /// </summary>
+            public string ExceptionType { get; }
+
+            /// <summary>
+            /// The message of the inner exception, if it exists.
+            /// </summary>
+            public string InnerExceptionMessage { get; }
+
+            /// <summary>
+            /// The stack trace of the inner exception, if it exists.
+            /// </summary>
+            public string InnerStackTrace { get; }
+
+            /// <summary>
+            /// Any key-value data entries attached to the exception.
+            /// </summary>
+            public Dictionary<string, string> Data { get; }
+
+            /// <summary>
+            /// A complete formatted string combining all debugging information.
+            /// </summary>
+            public string FullFormattedMessage { get; }
+
+            /// <summary>
+            /// Original Error Exception that caused this
+            /// <summary>
+            public Exception ErrorException { get; }
+
             public ErrorInformation(Exception ex)
             {
-                var st = new StackTrace(ex, true);
-                var thisasm = Assembly.GetExecutingAssembly();
-                var method = st.GetFrames().Select(f => f.GetMethod()).First(m => m.Module.Assembly == thisasm);
                 ErrorException = ex;
-                ErrorTrace = st;
-                LineOfError = GetLineOfException(ex);
-                FullFormattedMessage = FormatErrorMessage(this);
-                methodName = GetMethodOfException(ex);
-                className = method.DeclaringType.AssemblyQualifiedName;
+                Message = ex.Message;
+                StackTrace = ex.StackTrace ?? string.Empty;
+                Source = ex.Source ?? string.Empty;
+                TargetSite = ex.TargetSite?.ToString() ?? string.Empty;
+                ExceptionType = ex.GetType().FullName ?? string.Empty;
+                InnerExceptionMessage = ex.InnerException?.Message ?? string.Empty;
+                InnerStackTrace = ex.InnerException?.StackTrace ?? string.Empty;
+
+                Data = new Dictionary<string, string>();
+                foreach (var key in ex.Data.Keys)
+                {
+                    if (key != null && ex.Data[key] != null)
+                        Data[key.ToString()] = ex.Data[key].ToString();
+                }
+
+                var formattedData = Data.Count > 0
+                    ? string.Join("\n", Data.Select(kvp => $"    {kvp.Key}: {kvp.Value}"))
+                    : "    None";
+
+                FullFormattedMessage = $@"
+Exception Type: {ExceptionType}
+Message       : {Message}
+Source        : {Source}
+Target Site   : {TargetSite}
+Stack Trace   :
+{StackTrace}
+
+Inner Exception Message:
+{InnerExceptionMessage}
+
+Inner Stack Trace:
+{InnerStackTrace}
+
+Data:
+{formattedData}
+".Trim();
             }
         }
 
@@ -299,17 +371,6 @@ namespace Omnipotent.Logging
             Console.ForegroundColor = ConsoleColor.Red;
             Console.WriteLine($" | Error: " + ex.Message + " - " + specialMessage);
             Console.ForegroundColor = ConsoleColor.White;
-        }
-
-        public static string FormatErrorMessage(ErrorInformation ex)
-        {
-            return $"{ex.ErrorException.Message} |- Line: {ex.LineOfError} Method: {ex.methodName} Class: {ex.className}";
-        }
-
-        public static string FormatErrorMessage(Exception e)
-        {
-            ErrorInformation ex = new ErrorInformation(e);
-            return $"{ex.ErrorException.Message} |- Line: {ex.LineOfError} Method: {ex.methodName} Class: {ex.className}";
         }
     }
 }

@@ -2,6 +2,7 @@
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
+using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using Org.BouncyCastle.Asn1.Esf;
 
 namespace Omnipotent.Services.CS2ArbitrageBot

@@ -14,7 +14,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 {
     public class KliveLocalLLM : OmniService
     {
-        const string modelDownloadURL = "https://huggingface.co/DavidAU/L3.2-Rogue-Creative-Instruct-Uncensored-Abliterated-7B-GGUF/resolve/main/L3.2-Rogue-Creative-Instruct-Uncensored-Abliterated-7B-D_AU-IQ4_XS.gguf";
+        const string modelDownloadURL = "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf";
         private string modelFilePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLocalLLMModelsDirectory), Path.GetFileName(new Uri(modelDownloadURL).AbsolutePath)).Replace("\\", "/");
 
         public LLamaWeights loadedModel;

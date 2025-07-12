@@ -11,7 +11,7 @@ using OpenQA.Selenium.DevTools;
 using OpenQA.Selenium.Support.UI;
 using Json.More;
 
-namespace Omnipotent.Services.CS2ArbitrageBot
+namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
     public class SteamAPIWrapper
     {
@@ -233,7 +233,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             parent.ServiceLog($"Getting {countToLoad} listings from the steam market.");
             for (int i = 0; i < 1; i++)
             {
-                string url = $"https://steamcommunity.com/market/search/render/?query=&start={queries[i] + (i * 100) + startPage}&count={queries[i]}&search_descriptions=0&appid=730&norender=1";
+                string url = $"https://steamcommunity.com/market/search/render/?query=&start={queries[i] + i * 100 + startPage}&count={queries[i]}&search_descriptions=0&appid=730&norender=1";
                 //Create HTTP Message
                 HttpRequestMessage message = new();
                 message.Method = HttpMethod.Get;
@@ -401,7 +401,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
             catch (Exception ex)
             {
-                OmniLogging.LogErrorStatic("Main Thread", ex, "Error in TestTask!");
+                LogErrorStatic("Main Thread", ex, "Error in TestTask!");
                 return null;
             }
         }

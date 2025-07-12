@@ -59,6 +59,10 @@ namespace Omnipotent.Data_Handling
             public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
             public static string CS2ArbitrageBotLabsDirectory = $"{CS2ArbitrageBotDirectory}/CS2ArbitrageBotLabs";
             public static string CS2ArbitrageBotScannedComparisonsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScannedComparisons";
+
+            //OmniTrader
+            public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
+            public static string OmniTraderAPIKey = $"{OmniTraderDirectory}/Trading212APIKey.txt";
         };
 
         public static string GetPath(string path)

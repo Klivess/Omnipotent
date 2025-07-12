@@ -42,4 +42,8 @@
 		<PackageReference Include="Websocket.Client" Version="5.2.0" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <Folder Include="Services\KlivePuppet\" />
+	</ItemGroup>
+
 </Project>

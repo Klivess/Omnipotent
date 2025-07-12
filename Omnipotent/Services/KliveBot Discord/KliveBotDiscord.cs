@@ -78,6 +78,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
+                /*
                 if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
                 {
                     //
@@ -133,6 +134,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
                     }
                 }
+                */
             }
             catch (Exception ex)
             {
