@@ -322,7 +322,7 @@ namespace Omnipotent.Services.KliveAPI
                         {
                             isUserNull = true;
                         }
-                        if (isUserNull != true || routeData.authenticationLevelRequired == KMPermissions.Anybody)
+                        if (isUserNull != true)
                         {
                             if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                             {
@@ -358,6 +358,18 @@ namespace Omnipotent.Services.KliveAPI
                                         }
                                     }
                                 }
+                            }
+                        }
+                        else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
+                        {
+                            if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
+                            {
+                                ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
+                                DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
+                            }
+                            else
+                            {
+                                ControllerLookup[route].InvokeAction(request);
                             }
                         }
                         else
