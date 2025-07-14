@@ -71,7 +71,8 @@ namespace Omnipotent.Profiles
 
         public async Task SaveProfileAsync(KMProfile profile)
         {
-            await GetDataHandler().WriteToFile(profile.CreateProfilePath(), JsonConvert.SerializeObject(profile));
+            string json = JsonConvert.SerializeObject(profile);
+            await GetDataHandler().WriteToFile(profile.CreateProfilePath(), json);
         }
 
         public async void UpdateProfileWithID(string userID, KMProfile profile)
