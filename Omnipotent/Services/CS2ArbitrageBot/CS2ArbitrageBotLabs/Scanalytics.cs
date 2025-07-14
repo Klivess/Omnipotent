@@ -59,7 +59,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
-            string filename = scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.FloatValue.ToString() + ".json";
+            string filename = scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.ItemListingID.ToString() + "id.json";
             //Ensure filename's name can actually be saved as a file's name
             //Try saying that 3 times lol
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
@@ -111,6 +111,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public double MeanFloatValueOfUnprofitableListings { get; set; }
 
             public double MeanGainOfProfitableListings;
+
+            public float TotalExpectedProfitPercent { get; set; } // This will be calculated based on the expected gain and the number of listings
+
+            public DateTime FirstListingDateRecorded { get; set; }
 
             public DateTime AnalyticsGeneratedAt;
 
@@ -178,6 +182,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     MeanGainOfProfitableListings = 0;
                 }
 
+                //Calculate total profit
+                float bal = 100;
+                foreach (var item in comparisons.Where(c => c.PredictedOverallArbitrageGain > 1))
+                {
+                    bal = bal * (float)item.PredictedOverallArbitrageGain;
+                }
+
+                FirstListingDateRecorded = comparisons.Min(c => c.LastUpdate);
                 AnalyticsGeneratedAt = DateTime.Now;
             }
         }
