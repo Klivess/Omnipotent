@@ -118,8 +118,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
             public DateTime AnalyticsGeneratedAt;
 
-            public ScannedComparisonAnalytics(List<ScannedComparison> comparisons)
+            public ScannedComparisonAnalytics(List<ScannedComparison> data)
             {
+                List<ScannedComparison> comparisons = data;
                 List<ScannedComparison> comparisonsBelow0PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).ToList();
                 List<ScannedComparison> comparisonsBetween0and5PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1 && c.PredictedOverallArbitrageGain < 1.05).ToList();
                 List<ScannedComparison> comparisonsBetween5and10PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1.05 && c.PredictedOverallArbitrageGain < 1.1).ToList();
