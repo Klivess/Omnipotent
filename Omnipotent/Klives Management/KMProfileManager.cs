@@ -114,6 +114,18 @@ namespace Omnipotent.Profiles
                 return null;
             }
         }
+        public async Task<KMProfile> GetProfileByID(string id)
+        {
+            var results = Profiles.Where(k => k.UserID == id);
+            if (results.Any())
+            {
+                return results.First();
+            }
+            else
+            {
+                return null;
+            }
+        }
 
         public enum KMPermissions
         {
@@ -221,11 +233,11 @@ namespace Omnipotent.Profiles
                 try
                 {
                     var id = request.userParameters.Get("id");
-                    var on = request.userParameters.Get("enabled");
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (on == "true" || profile.CanLogin == true)
+                    var on = request.userParameters.Get("enabled").Trim();
+                    var profile = await GetProfileByID(id);
+                    if (on == "true" && profile.CanLogin == true)
                     {
-                        await request.ReturnResponse("OK", code: HttpStatusCode.OK);
+                        await request.ReturnResponse("OK: Unchanged", code: HttpStatusCode.OK);
                         return;
                     }
                     if (profile == null)
