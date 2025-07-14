@@ -237,7 +237,7 @@ Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
 Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
 
 --- Expected Returns ---
-Expected Return of All Listings: {Math.Round((analytics.TotalExpectedProfitPercent - 1) * 100, 2)}%
+Expected Return of All Snipes: {Math.Round((analytics.TotalExpectedProfitPercent - 1) * 100, 2)}%
 
 --- Top Opportunity ---
 Highest Predicted Gain Found: {Math.Round((analytics.HighestPredictedGainFoundSoFar - 1) * 100, 2)}%

@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
+using System.Management.Automation;
 using System.Management.Automation.Language;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
@@ -185,7 +186,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 //Calculate total profit
                 float bal = 100;
-                foreach (var item in comparisons.Where(c => c.PredictedOverallArbitrageGain > 1))
+                foreach (var item in comparisons.Where(c => c.PredictedOverallArbitrageGain > 1).Where(c => (c.PredictedOverallArbitrageGain - 1) > CS2ArbitrageBot.MinimumPercentReturnToSnipe))
                 {
                     bal = bal * (float)item.PredictedOverallArbitrageGain;
                 }

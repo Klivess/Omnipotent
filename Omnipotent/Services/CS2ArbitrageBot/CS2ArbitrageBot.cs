@@ -14,7 +14,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private CSFloatWrapper csFloatWrapper;
         public Scanalytics scanalytics;
 
-        public float MinimumPercentReturnToSnipe = 10;
+        public static float MinimumPercentReturnToSnipe = 10;
 
         public CS2ArbitrageBot()
         {
