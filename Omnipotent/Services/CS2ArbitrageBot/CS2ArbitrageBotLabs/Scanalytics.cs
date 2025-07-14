@@ -189,7 +189,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 {
                     bal = bal * (float)item.PredictedOverallArbitrageGain;
                 }
-
+                TotalExpectedProfitPercent = ((bal/100)-1)*100)
                 FirstListingDateRecorded = comparisons.Min(c => c.LastUpdate);
                 AnalyticsGeneratedAt = DateTime.Now;
             }

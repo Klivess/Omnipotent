@@ -69,6 +69,7 @@ namespace Omnipotent
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                 }
+                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
 
                 if (OmniPaths.CheckIfOnServer())
                 {
