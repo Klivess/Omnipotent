@@ -191,7 +191,24 @@ namespace Omnipotent.Profiles
                 try
                 {
                     var password = JsonConvert.DeserializeObject<string>(request.userMessageContent);
-                    await request.ReturnResponse(JsonConvert.SerializeObject(CheckIfProfileExists(password)), "application/json");
+                    if (CheckIfProfileExists(password) == false)
+                    {
+                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    else
+                    {
+                        var profile = await GetProfileByPassword(password);
+                        if (profile.CanLogin == true)
+                        {
+                            await request.ReturnResponse("true", "application/json");
+                        }
+                        else
+                        {
+                            await request.ReturnResponse("LoginDisabled", code: HttpStatusCode.Unauthorized);
+                            return;
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
