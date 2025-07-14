@@ -80,6 +80,11 @@ namespace Omnipotent.Service_Manager
             task.randomidentifier = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             task.dateTimeSet = DateTime.Now;
             task.timeID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
+            //If task with identical taskName exists, replace it.
+            if (tasks.Any(k => k.taskName.ToLower() == task.taskName.ToLower()))
+            {
+                tasks.RemoveAll(k => k.taskName.ToLower() == task.taskName.ToLower());
+            }
             //Add task to tasks and save.
             tasks.Add(task);
             SaveTaskToFile(task);
