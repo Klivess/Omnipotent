@@ -4,6 +4,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.Omniscience.DiscordInterface;
+using Omnipotent.Services.Omniscience.OmniscientLabs;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Linq;
@@ -34,6 +35,7 @@ namespace Omnipotent.Services.Omniscience
             discordInterface = new(this);
             ServiceLog("Starting Discord Crawl.");
             LinkedUsers = (await discordInterface.GetAllLinkedOmniDiscordUsersFromDisk()).ToList();
+
 
             ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
             Stopwatch time = Stopwatch.StartNew();
@@ -100,11 +102,20 @@ namespace Omnipotent.Services.Omniscience
                 }
             };
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/createOmniUser", createNewOmniUser, HttpMethod.Post, KMPermissions.Associate);
-            Action<KliveAPI.KliveAPI.UserRequest> getMessageCount = async (request) =>
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/getanalytics", async (request) =>
             {
-                await request.ReturnResponse(AllCapturedMessages.Count.ToString(), "application/json");
-            };
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/getmessagecount", getMessageCount, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
+                try
+                {
+                    DiscordMessageAnalytics discordMessageAnalytics = new();
+                    var analysis = discordMessageAnalytics.Analyze(AllCapturedMessages.ToList());
+                    await request.ReturnResponse(JsonConvert.SerializeObject(analysis), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Post, KMPermissions.Manager);
         }
         private OmniDiscordUser SelectUser(string username)
         {
