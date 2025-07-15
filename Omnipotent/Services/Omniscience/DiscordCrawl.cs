@@ -115,7 +115,7 @@ namespace Omnipotent.Services.Omniscience
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                     ServiceLogError(ex);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Guest);
         }
         private OmniDiscordUser SelectUser(string username)
         {
