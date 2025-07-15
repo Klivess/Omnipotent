@@ -4,6 +4,9 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using Org.BouncyCastle.Asn1.Esf;
+using static Omnipotent.Profiles.KMProfileManager;
+using System.Net;
+using System.Threading.Tasks;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
@@ -54,7 +57,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 SnipeDealsAndAlertKlives();
             }
-
+            CreateRoutes();
             Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory);
         }
 
@@ -134,6 +137,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }
             await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+        }
+
+
+
+        public async Task CreateRoutes()
+        {
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/getscanalytics", async (request) =>
+            {
+                Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory);
+
+                await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
+            }, HttpMethod.Get, KMPermissions.Guest);
         }
     }
 }
