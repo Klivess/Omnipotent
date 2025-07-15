@@ -34,7 +34,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         public int Count;
     }
 
-    public struct OmniMessagePastDMCall
+    public class OmniMessagePastDMCall
     {
         public DateTime EndedTimestamp;
         public long[] Participants;
