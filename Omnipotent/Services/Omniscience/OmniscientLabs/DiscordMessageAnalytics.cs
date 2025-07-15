@@ -10,11 +10,59 @@ namespace Omnipotent.Services.Omniscience.OmniscientLabs
     {
         public class AnalyticsResult
         {
-            // Time analytics was produced
-            public DateTime AnalyticsGeneratedAt { get; set; }
+            // General
+            public int TotalMessages { get; set; }
+            public int TotalUsers { get; set; }
+            public int TotalGuilds { get; set; }
+            public int TotalChannels { get; set; }
+            public int TotalDMs { get; set; }
+            public int TotalEditedMessages { get; set; }
+            public int TotalTTSMessages { get; set; }
+            public int TotalMentionsEveryone { get; set; }
+            public int TotalMessagesWithImages { get; set; }
+            public int TotalMessagesWithVideos { get; set; }
+            public int TotalMessagesWithVoice { get; set; }
+            public int TotalMessagesWithReactions { get; set; }
+            public int TotalReplies { get; set; }
+            public int TotalCalls { get; set; }
+            public int TotalWords { get; set; }
+            public int TotalCharacters { get; set; }
+            public int TotalSwearWords { get; set; }
+            public int TotalQuestions { get; set; }
+            public int TotalExclamations { get; set; }
+            public int TotalLinks { get; set; }
+            public int TotalEmojis { get; set; }
+            public int TotalUniqueEmojis { get; set; }
+            public int TotalMessagesWithLinks { get; set; }
+            public int TotalMessagesWithEmojis { get; set; }
+            public int TotalEmptyMessages { get; set; }
 
-            // ... rest of your properties ...
+            // Per-user
+            public Dictionary<long, UserAnalytics> UserStats { get; set; } = new();
+            // Per-guild
+            public Dictionary<long, GuildAnalytics> GuildStats { get; set; } = new();
+            // Per-channel
+            public Dictionary<long, ChannelAnalytics> ChannelStats { get; set; } = new();
+
+            // Time-based
+            public Dictionary<DateTime, int> MessagesPerDay { get; set; } = new();
+            public Dictionary<int, int> MessagesPerHour { get; set; } = new();
+            public Dictionary<DayOfWeek, int> MessagesPerWeekday { get; set; } = new();
+
+            // Top lists
+            public List<UserAnalytics> TopMessageSenders { get; set; } = new();
+            public List<UserAnalytics> TopSwearers { get; set; } = new();
+            public List<UserAnalytics> TopQuestionAskers { get; set; } = new();
+            public List<UserAnalytics> TopReactedUsers { get; set; } = new();
+            public List<UserAnalytics> TopImageSenders { get; set; } = new();
+            public List<UserAnalytics> TopLinkSenders { get; set; } = new();
+            public List<UserAnalytics> TopEmojiUsers { get; set; } = new();
+            public List<UserAnalytics> TopCallParticipants { get; set; } = new();
+            public List<UserAnalytics> TopMentioners { get; set; } = new();
+            //Time analytics was produced
+            public DateTime AnalyticsGeneratedAt { get; set; }
         }
+
         public class UserAnalytics
         {
             public long UserID { get; set; }
@@ -44,6 +92,7 @@ namespace Omnipotent.Services.Omniscience.OmniscientLabs
             public Dictionary<int, int> MessagesPerHour { get; set; } = new();
             public Dictionary<DayOfWeek, int> MessagesPerWeekday { get; set; } = new();
         }
+
         public class GuildAnalytics
         {
             public long GuildID { get; set; }
@@ -52,6 +101,7 @@ namespace Omnipotent.Services.Omniscience.OmniscientLabs
             public HashSet<long> UserIDs { get; set; } = new();
             public Dictionary<long, int> ChannelMessageCounts { get; set; } = new();
         }
+
         public class ChannelAnalytics
         {
             public long ChannelID { get; set; }
@@ -60,8 +110,6 @@ namespace Omnipotent.Services.Omniscience.OmniscientLabs
         }
 
         // Swear words list (expand as needed)
-
-        //I DID NOT PRODUCE OR WRITE THIS LIST!!!! I HAVE A VERY CLEAN MOUTH!!!!!! - Klives
         private static readonly string[] SwearWords = new[]
         {
                 "fuck", "shit", "bitch", "asshole", "bastard", "damn", "crap", "dick", "piss", "cock", "pussy", "slut", "whore", "fag", "cunt", "motherfucker", "nigger", "retard"
@@ -81,12 +129,184 @@ namespace Omnipotent.Services.Omniscience.OmniscientLabs
 
         public AnalyticsResult Analyze(List<OmniDiscordMessage> messages)
         {
-            var result = new AnalyticsResult
-            {
-                AnalyticsGeneratedAt = DateTime.UtcNow
-            };
+            var result = new AnalyticsResult();
 
-            // ... rest of your method ...
+            var userStats = new Dictionary<long, UserAnalytics>();
+            var guildStats = new Dictionary<long, GuildAnalytics>();
+            var channelStats = new Dictionary<long, ChannelAnalytics>();
+
+            var allEmojis = new HashSet<string>();
+
+            foreach (var msg in messages)
+            {
+                // General
+                result.TotalMessages++;
+                if (msg.IsEdited) result.TotalEditedMessages++;
+                if (msg.IsTTS) result.TotalTTSMessages++;
+                if (msg.MentionedEveryone) result.TotalMentionsEveryone++;
+                if (msg.ImageAttachments != null && msg.ImageAttachments.Length > 0) result.TotalMessagesWithImages++;
+                if (msg.VideoAttachments != null && msg.VideoAttachments.Length > 0) result.TotalMessagesWithVideos++;
+                if (msg.VoiceMessageAttachments != null && msg.VoiceMessageAttachments.Length > 0) result.TotalMessagesWithVoice++;
+                if (msg.MessageReactions != null && msg.MessageReactions.Length > 0) result.TotalMessagesWithReactions++;
+                if (msg.ReferencedMessageID.HasValue) result.TotalReplies++;
+                if (msg.CallInformation != null) result.TotalCalls++;
+                if (msg.IsInDM) result.TotalDMs++;
+                if (msg.PostedInChannelID.HasValue)
+                {
+                    if (!channelStats.TryGetValue(msg.PostedInChannelID.Value, out var ch))
+                    {
+                        ch = new ChannelAnalytics { ChannelID = msg.PostedInChannelID.Value };
+                        channelStats[msg.PostedInChannelID.Value] = ch;
+                    }
+                    ch.MessageCount++;
+                    ch.UserIDs.Add(msg.AuthorID);
+                }
+                if (msg.GuildID.HasValue)
+                {
+                    if (!guildStats.TryGetValue(msg.GuildID.Value, out var g))
+                    {
+                        g = new GuildAnalytics { GuildID = msg.GuildID.Value };
+                        guildStats[msg.GuildID.Value] = g;
+                    }
+                    g.MessageCount++;
+                    g.UserIDs.Add(msg.AuthorID);
+                    if (msg.PostedInChannelID.HasValue)
+                    {
+                        if (!g.ChannelMessageCounts.ContainsKey(msg.PostedInChannelID.Value))
+                            g.ChannelMessageCounts[msg.PostedInChannelID.Value] = 0;
+                        g.ChannelMessageCounts[msg.PostedInChannelID.Value]++;
+                    }
+                }
+
+                // Per-user
+                if (!userStats.TryGetValue(msg.AuthorID, out var user))
+                {
+                    user = new UserAnalytics
+                    {
+                        UserID = msg.AuthorID,
+                        Username = msg.AuthorUsername
+                    };
+                    userStats[msg.AuthorID] = user;
+                }
+                user.MessageCount++;
+                if (msg.IsEdited) user.EditedMessages++;
+                if (msg.IsTTS) user.TTSMessages++;
+                if (msg.MentionedEveryone) user.EveryoneMentions++;
+                if (msg.ImageAttachments != null && msg.ImageAttachments.Length > 0) user.ImageMessages++;
+                if (msg.VideoAttachments != null && msg.VideoAttachments.Length > 0) user.VideoMessages++;
+                if (msg.VoiceMessageAttachments != null && msg.VoiceMessageAttachments.Length > 0) user.VoiceMessages++;
+                if (msg.MessageReactions != null && msg.MessageReactions.Length > 0) user.ReactionCount += msg.MessageReactions.Length;
+                if (msg.ReferencedMessageID.HasValue) user.Replies++;
+                if (msg.CallInformation != null) user.Calls++;
+
+                // Message content analytics
+                var content = msg.MessageContent ?? string.Empty;
+                var wordCount = content.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).Length;
+                var charCount = content.Length;
+                user.WordCount += wordCount;
+                user.CharacterCount += charCount;
+                result.TotalWords += wordCount;
+                result.TotalCharacters += charCount;
+
+                // Swear words
+                int swears = 0;
+                foreach (var swear in SwearWords)
+                {
+                    var matches = Regex.Matches(content, $@"\b{Regex.Escape(swear)}\b", RegexOptions.IgnoreCase);
+                    swears += matches.Count;
+                }
+                user.SwearWords += swears;
+                result.TotalSwearWords += swears;
+
+                // Questions
+                if (QuestionRegex.IsMatch(content))
+                {
+                    user.Questions++;
+                    result.TotalQuestions++;
+                }
+
+                // Exclamations
+                if (ExclamationRegex.IsMatch(content))
+                {
+                    user.Exclamations++;
+                    result.TotalExclamations++;
+                }
+
+                // Links
+                var linkMatches = LinkRegex.Matches(content);
+                if (linkMatches.Count > 0)
+                {
+                    user.Links += linkMatches.Count;
+                    user.MessagesWithLinks++;
+                    result.TotalLinks += linkMatches.Count;
+                    result.TotalMessagesWithLinks++;
+                }
+
+                // Emojis
+                var emojiMatches = EmojiRegex.Matches(content);
+                if (emojiMatches.Count > 0)
+                {
+                    user.Emojis += emojiMatches.Count;
+                    user.MessagesWithEmojis++;
+                    foreach (Match m in emojiMatches)
+                    {
+                        user.UniqueEmojis.Add(m.Value);
+                        allEmojis.Add(m.Value);
+                    }
+                    result.TotalEmojis += emojiMatches.Count;
+                    result.TotalMessagesWithEmojis++;
+                }
+
+                // Empty messages
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    user.EmptyMessages++;
+                    result.TotalEmptyMessages++;
+                }
+
+                // Time-based
+                var day = msg.TimeStamp.Date;
+                if (!user.MessagesPerDay.ContainsKey(day)) user.MessagesPerDay[day] = 0;
+                user.MessagesPerDay[day]++;
+                if (!result.MessagesPerDay.ContainsKey(day)) result.MessagesPerDay[day] = 0;
+                result.MessagesPerDay[day]++;
+
+                var hour = msg.TimeStamp.Hour;
+                if (!user.MessagesPerHour.ContainsKey(hour)) user.MessagesPerHour[hour] = 0;
+                user.MessagesPerHour[hour]++;
+                if (!result.MessagesPerHour.ContainsKey(hour)) result.MessagesPerHour[hour] = 0;
+                result.MessagesPerHour[hour]++;
+
+                var weekday = msg.TimeStamp.DayOfWeek;
+                if (!user.MessagesPerWeekday.ContainsKey(weekday)) user.MessagesPerWeekday[weekday] = 0;
+                user.MessagesPerWeekday[weekday]++;
+                if (!result.MessagesPerWeekday.ContainsKey(weekday)) result.MessagesPerWeekday[weekday] = 0;
+                result.MessagesPerWeekday[weekday]++;
+            }
+
+            // Finalize
+            result.UserStats = userStats;
+            result.GuildStats = guildStats;
+            result.ChannelStats = channelStats;
+            result.TotalUsers = userStats.Count;
+            result.TotalGuilds = guildStats.Count;
+            result.TotalChannels = channelStats.Count;
+            result.TotalUniqueEmojis = allEmojis.Count;
+
+            // Top lists
+            result.TopMessageSenders = userStats.Values.OrderByDescending(u => u.MessageCount).Take(10).ToList();
+            result.TopSwearers = userStats.Values.OrderByDescending(u => u.SwearWords).Take(10).ToList();
+            result.TopQuestionAskers = userStats.Values.OrderByDescending(u => u.Questions).Take(10).ToList();
+            result.TopReactedUsers = userStats.Values.OrderByDescending(u => u.ReactionCount).Take(10).ToList();
+            result.TopImageSenders = userStats.Values.OrderByDescending(u => u.ImageMessages).Take(10).ToList();
+            result.TopLinkSenders = userStats.Values.OrderByDescending(u => u.Links).Take(10).ToList();
+            result.TopEmojiUsers = userStats.Values.OrderByDescending(u => u.Emojis).Take(10).ToList();
+            result.TopCallParticipants = userStats.Values.OrderByDescending(u => u.Calls).Take(10).ToList();
+            result.TopMentioners = userStats.Values.OrderByDescending(u => u.EveryoneMentions).Take(10).ToList();
+
+            result.AnalyticsGeneratedAt = DateTime.UtcNow;
+
+            return result;
         }
     }
 }
