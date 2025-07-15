@@ -178,7 +178,8 @@ namespace Omnipotent.Profiles
                     }
                     var password = request.userParameters.Get("password");
                     var profile = await CreateNewProfile(name, rank, password);
-                    await request.ReturnResponse(JsonConvert.SerializeObject(profile), "application/json");
+                    string serialized = JsonConvert.SerializeObject(profile);
+                    await request.ReturnResponse(serialized, "application/json");
                     (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"A new profile has been created with the name {name} and the rank {rank} by {request.user.Name}.");
                 }
                 catch (Exception ex)
