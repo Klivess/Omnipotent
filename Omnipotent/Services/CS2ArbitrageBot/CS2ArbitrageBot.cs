@@ -176,6 +176,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         }
                     }
                 }
+                await Task.Delay(3000);
+                MonitorTradeList();
             }
         }
         public async Task SnipeDealsAndAlertKlives()
