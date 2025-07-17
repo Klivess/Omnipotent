@@ -17,7 +17,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             this.parent = parent;
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
             AllPurchasedListingsInHistory = new();
-            LoadScannedComparisons();
+            LoadScannedComparisons().Wait();
+            LoadPurchasedItems().Wait();
         }
 
 
@@ -26,7 +27,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         public enum StrategicStages
         {
-            AwaitingRetrieval,
+            WaitingForCSFloatSellerToAcceptSale,
+            WaitingForCSFloatTradeToBeSent,
+            WaitingForCSFloatTradeToBeAccepted,
             JustRetrieved,
             WaitingForMarketSaleOnSteam,
             WaitingForConversionItemsToPurchase,
@@ -36,7 +39,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public class PurchasedListing
         {
             public ScannedComparison comparison;
-            public DateTime TimeOfPurchase;
             public string CSFloatListingID;
             public int ExpectedAbsoluteProfitInPence;
             public float ExpectedAbsoluteProfitInPounds;
@@ -46,10 +48,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public float ActualAbsoluteProfitInPounds;
             public float ActualAbsoluteProfitInPence;
 
+            public DateTime TimeOfPurchase;
+            public DateTime TimeOfSellerToAcceptSale;
+            public DateTime TimeOfSellerToSendTradeOffer;
             public DateTime TimeOfItemRetrieval;
-            public DateTime TimeToSellOnSteam;
-            public DateTime TimeToConvertToRealFunds;
+            public DateTime PredictedTimeToBeResoldOnSteam;
+            public DateTime ActualTimeResoldOnSteam;
+            public DateTime TimeOfConvertToRealFunds;
             public DateTime TimeOfCollectedRevenue;
+
+            public string CSFloatToSteamTradeOfferLink;
 
             public float ItemFloatValue;
             public string ItemMarketHashName;
@@ -149,6 +157,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             //Try saying that 3 times lol
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(purchasedListing, Formatting.Indented));
+        }
+
+        public async Task UpdatePurchasedListing(PurchasedListing purchasedListing)
+        {
+            if (AllPurchasedListingsInHistory.Where(k => k.CSFloatListingID == purchasedListing.CSFloatListingID).Any())
+            {
+                //if it already exists
+                //replace it
+                AllPurchasedListingsInHistory.RemoveAll(k => k.CSFloatListingID == purchasedListing.CSFloatListingID);
+                AllPurchasedListingsInHistory.Add(purchasedListing);
+            }
+            else
+            {
+                AllPurchasedListingsInHistory.Add(purchasedListing);
+            }
+            await SavePurchasedListing(purchasedListing);
         }
 
         //Scanned Comparisons Analytics

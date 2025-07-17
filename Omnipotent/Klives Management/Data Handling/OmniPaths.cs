@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System.Dynamic;
 using System.Security.Principal;
 
 namespace Omnipotent.Data_Handling
@@ -105,6 +106,13 @@ namespace Omnipotent.Data_Handling
                 return false;
             }
 
+        }
+        public static bool DoesPropertyExist(dynamic settings, string name)
+        {
+            if (settings is ExpandoObject)
+                return ((IDictionary<string, object>)settings).ContainsKey(name);
+
+            return settings.GetType().GetProperty(name) != null;
         }
         public static bool IsUserAdministrator()
         {

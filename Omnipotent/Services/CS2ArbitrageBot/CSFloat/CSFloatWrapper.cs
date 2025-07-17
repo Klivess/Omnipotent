@@ -9,7 +9,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
 {
     public class CSFloatWrapper
     {
-        private HttpClient Client;
+        public HttpClient Client;
         public int SentRequests = 0;
         public int RequestsRemaining = 0;
         public CS2ArbitrageBot parent;

@@ -9,6 +9,8 @@ using System.Net;
 using System.Threading.Tasks;
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using DSharpPlus.Entities;
+using System.Numerics.Tensors;
+using Humanizer;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
@@ -84,7 +86,98 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             ExchangeRate = json.data.gbp;
             //Exchange Rate: {ExchangeRate} GBP = 1 USD"
         }
+        public async Task MonitorTradeList()
+        {
+            if (scanalytics.AllPurchasedListingsInHistory.Where(k => k.CurrentStrategicStage < Scanalytics.StrategicStages.JustRetrieved).Any() == false)
+            {
+                await Task.Delay(1000);
+                MonitorTradeList();
+            }
+            else
+            {
+                string url = "https://csfloat.com/api/v1/me/trades?limit=1000";
+                var response = await csFloatWrapper.Client.GetAsync(url);
+                string responseString = await response.Content.ReadAsStringAsync();
+                dynamic json = JsonConvert.DeserializeObject(responseString);
+                if (response.IsSuccessStatusCode)
+                {
+                    //Create copy of listings to monitor
+                    foreach (var item in json.trades)
+                    {
+                        string contractID = item.contract_id;
+                        //if listingstoMonitorFromTradeList contains a csfloat listings with a listing id equal to the contract id, find it and set its strategic stage
+                        Scanalytics.PurchasedListing? listingToMonitor = scanalytics.AllPurchasedListingsInHistory.Where(k => k.CurrentStrategicStage < Scanalytics.StrategicStages.JustRetrieved).FirstOrDefault(k => k.CSFloatListingID == contractID);
+                        if (listingToMonitor != null)
+                        {
+                            if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale)
+                            {
+                                if (OmniPaths.DoesPropertyExist(item, "accepted_at") == false)
+                                {
+                                    //If accepted_at does not exist, then the seller has not accepted the sale yet.
+                                    continue;
+                                }
+                                string acceptedAt = Convert.ToString(item.accepted_at);
+                                if (!string.IsNullOrEmpty(acceptedAt))
+                                {
+                                    listingToMonitor.TimeOfSellerToAcceptSale = DateTime.Parse(acceptedAt);
+                                    //Tell Klives that this listing has been accepted
+                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat listing {listingToMonitor.ItemMarketHashName} " +
+                                        $"with price {listingToMonitor.comparison.CSFloatListing.PriceText} has been accepted by the seller.");
+                                    listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent;
+                                    scanalytics.UpdatePurchasedListing(listingToMonitor);
+                                }
+                            }
+                            else if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent)
+                            {
+                                if (OmniPaths.DoesPropertyExist(item.steam_offer, "sent_at") == false)
+                                {
+                                    //If steam_offer or sent_at does not exist, then the trade offer has not been sent yet.
+                                    continue;
+                                }
+                                string sentAt = Convert.ToString(item.steam_offer.sent_at);
+                                if (!string.IsNullOrEmpty(sentAt))
+                                {
+                                    listingToMonitor.TimeOfSellerToSendTradeOffer = DateTime.Parse(sentAt);
+                                    //Tell Klives that this listing has been sent using an embed
+                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CSFloat Trade Sent",
+                                        $"CSFloat listing {listingToMonitor.ItemMarketHashName} with price {listingToMonitor.comparison.CSFloatListing.PriceText} trade offer has been sent by the seller. Please accept before the deadline at " + listingToMonitor.TimeOfSellerToSendTradeOffer.AddHours(18).Humanize()
+                                        + "\nTrade Offer Link: " + item.trade_url,
+                                        DSharpPlus.Entities.DiscordColor.Orange, new Uri(listingToMonitor.comparison.CSFloatListing.ImageURL)));
 
+                                    listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted;
+                                    listingToMonitor.CSFloatToSteamTradeOfferLink = item.trade_url;
+                                    scanalytics.UpdatePurchasedListing(listingToMonitor);
+                                }
+                            }
+                            else if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted)
+                            {
+                                if (OmniPaths.DoesPropertyExist(item, "verify_sale_at") == false)
+                                {
+                                    //If steam_offer or accepted_at does not exist, then the trade offer has not been accepted yet.
+                                    continue;
+                                }
+                                string verifySaleAt = Convert.ToString(item.verify_sale_at);
+                                if (!string.IsNullOrEmpty(verifySaleAt))
+                                {
+                                    listingToMonitor.PredictedTimeToBeResoldOnSteam = DateTime.Parse(Convert.ToString(item.trade_protection_ends_at));
+                                    //Tell Klives that this listing has been accepted
+                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
+                                    listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.JustRetrieved;
+                                    scanalytics.UpdatePurchasedListing(listingToMonitor);
+                                }
+                            }
+                        }
+                        else
+                        {
+                            await ServiceLogError($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
+                            //Tell Klives
+                            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         public async Task SnipeDealsAndAlertKlives()
         {
             if (OmniPaths.CheckIfOnServer() == false)
@@ -166,11 +259,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                             ItemFloatValue = (float)snipe.FloatValue,
                             ItemMarketHashName = snipe.ItemMarketHashName,
 
-                            CurrentStrategicStage = Scanalytics.StrategicStages.AwaitingRetrieval,
+                            CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale,
                         };
 
-                        scanalytics.SavePurchasedListing(purchasedListing);
-                        scanalytics.AllPurchasedListingsInHistory.Add(purchasedListing);
+                        scanalytics.UpdatePurchasedListing(purchasedListing);
 
 #pragma warning restore CS8602 // Dereference of a possibly null reference.
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
