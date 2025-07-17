@@ -35,12 +35,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             await LoadCS2ItemNameIDTable();
             parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
         }
-
         private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
         {
 
         }
-
         public enum FloatType
         {
             FactoryNew,
@@ -49,7 +47,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             WellWorn,
             BattleScarred
         }
-
         public struct ItemListing
         {
             public string Name;
@@ -81,7 +78,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             parent.ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "DownloadCS2ItemIDTables", "SteamAPIWrapper", "To ensure that ItemNameID table is up to date.");
         }
-
         public async Task AddToNameIDTable(string itemHashName, int itemID)
         {
             parent.ServiceLog("Adding " + itemHashName + "'s item id " + itemID + " to table and saving.");
@@ -100,7 +96,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             string json = JsonConvert.SerializeObject(CS2NameIDTable, Formatting.Indented);
             await parent.GetDataHandler().WriteToFile(cs2NameIDTablePath, json);
         }
-
         public async Task LoadCS2ItemNameIDTable()
         {
             parent.ServiceLog("Loading CS2 Item Name ID Table from disk...");
@@ -118,7 +113,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 await LoadCS2ItemNameIDTable();
             }
         }
-
         public async Task<ItemListing> GetItemOnMarket(string itemHashName)
         {
             ItemListing listing = new();
@@ -210,7 +204,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             return listing;
         }
-
         public async Task<List<ItemListing>> GetAllMarketListings(int countToLoad, int startPage = 0)
         {
             //Each query can only load 100 items. We need to split countToLoad into multiple queries.
@@ -299,13 +292,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             return listings;
         }
-
         public struct BuyAndSellOrders
         {
             public Dictionary<double, int> BuyOrders;
             public Dictionary<double, int> SellOrders;
         }
-
         public async Task<BuyAndSellOrders> GetAllBuyOrdersOfItem(string itemID)
         {
             Dictionary<double, int> buyOrders = new();
@@ -346,7 +337,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             };
             return orders;
         }
-
         public async Task<string> GetItemNameIDViaSelenium(string steamListingUrl)
         {
             try

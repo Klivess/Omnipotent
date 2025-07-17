@@ -1,8 +1,11 @@
-﻿using Newtonsoft.Json;
+﻿using Markdig.Helpers;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using System.Net.Http.Headers;
+using System.Text;
 using static System.Net.Mime.MediaTypeNames;
 
-namespace Omnipotent.Services.CS2ArbitrageBot
+namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
 {
     public class CSFloatWrapper
     {
@@ -16,6 +19,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             Client.DefaultRequestHeaders.Add("Authorization", CSFloatAPIKey);
             this.parent = parent;
         }
+
         public struct ItemListing
         {
             public string ItemListingID;
@@ -95,7 +99,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     dynamic json = JsonConvert.DeserializeObject(strResponse);
                     cursor = json.cursor;
                     int duplicateItems = 0;
-                    foreach (dynamic jsonItem in json.data)
+                    foreach (object jsonItem in json.data)
                     {
                         ItemListing item = ConvertItemListingJSONItemToStruct(jsonItem);
                         if (noRepeatedItems == true && result.Select(k => k.ItemName).Contains(item.ItemName))
@@ -141,7 +145,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
             return result;
         }
-
         private ItemListing ConvertItemListingJSONItemToStruct(dynamic jsonItem)
         {
             ItemListing result = new ItemListing();
@@ -162,7 +165,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             result.ItemID64 = jsonItem.item.d_param;
             return result;
         }
-
         public static DateTime ConvertEpochToDateTime(long epochTime, bool isMilliseconds = false)
         {
             // The epoch time starts from January 1, 1970, UTC
@@ -181,7 +183,91 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             var header = message.Headers.Where(k => k.Key == "x-ratelimit-remaining");
         }
+        public async Task<CSFloatAccountInformation> GetAccountInformation()
+        {
+            string url = "https://csfloat.com/api/v1/me";
+            HttpRequestMessage message = new();
+            message.Method = HttpMethod.Get;
+            message.RequestUri = new Uri(url);
+            var response = await Client.SendAsync(message);
+            if (response.IsSuccessStatusCode)
+            {
+                string responseContent = await response.Content.ReadAsStringAsync();
+                CSFloatAccountInformation account = new();
+                try
+                {
+                    dynamic json = JsonConvert.DeserializeObject(responseContent);
+                    dynamic user = json.user;
 
+                    account.SteamID = user.steam_id;
+                    account.Username = user.username;
+                    account.Flags = user.flags;
+                    account.Avatar = user.avatar;
+                    account.Email = user.email;
+                    account.PhoneNumber = user.phone_number;
+                    account.BalanceInPence = (user.balance * parent.ExchangeRate);
+                    account.BalanceInPounds = (account.BalanceInPence) / 100;
+                    account.PendingBalanceInPence = (user.pending_balance * parent.ExchangeRate);
+                    account.PendingBalanceInPounds = (account.PendingBalanceInPence) / 100;
+                    account.StallPublic = user.stall_public;
+                    account.Away = user.away;
+                    account.TradeToken = user.trade_token;
+                    account.KnowYourCustomer = user.know_your_customer;
+                    account.ExtensionSetupAt = DateTime.Parse(user.extension_setup_at.ToString());
+                    account.ObfuscatedID = user.obfuscated_id;
+                    account.Online = user.online;
+                    account.Fee = user.fee;
+                    account.WithdrawFee = user.withdraw_fee;
+                    account.Subscriptions = user.subscriptions.ToObject<List<string>>();
+                    account.Has2FA = user.has_2fa;
+                    account.HasAPIKey = user.has_api_key;
+
+                    account.PaymentAccounts = new PaymentAccounts
+                    {
+                        StripeConnect = user.payment_accounts.stripe_connect,
+                        StripeCustomer = user.payment_accounts.stripe_customer
+                    };
+
+                    account.Statistics = new Statistics
+                    {
+                        TotalSales = user.statistics.total_sales,
+                        TotalPurchases = user.statistics.total_purchases,
+                        MedianTradeTime = user.statistics.median_trade_time,
+                        TotalAvoidedTrades = user.statistics.total_avoided_trades,
+                        TotalFailedTrades = user.statistics.total_failed_trades,
+                        TotalVerifiedTrades = user.statistics.total_verified_trades,
+                        TotalTrades = user.statistics.total_trades
+                    };
+
+                    account.Preferences = new Preferences
+                    {
+                        OffersEnabled = user.preferences.offers_enabled,
+                        MaxOfferDiscount = user.preferences.max_offer_discount
+                    };
+
+                    account.FirebaseMessaging = new FirebaseMessaging
+                    {
+                        Platform = user.firebase_messaging.platform,
+                        LastUpdated = DateTime.Parse(user.firebase_messaging.last_updated.ToString())
+                    };
+
+                    account.StripeConnect = new StripeConnect
+                    {
+                        PayoutsEnabled = user.stripe_connect.payouts_enabled
+                    };
+                }
+                catch (JsonException ex)
+                {
+                    throw new Exception("Failed to deserialize CSFloat account information.", ex);
+                }
+
+                return account;
+            }
+            else
+            {
+                throw new Exception($"Failed to get CSFloat account information. Status code: {response.StatusCode}. Content: {await response.Content.ReadAsStringAsync()}");
+            }
+        }
         public async IAsyncEnumerable<ItemListing> SnipeBestDealsOnCSFloat(int amountOfListingsToLoad, bool noRepeatedItems = true, float? minimumPriceInPence = null, float? maximumPriceInPence = null, float? minimumQuantityOnSale = null,
     bool normalOnly = false, string csfloatSortBy = "best_deal", bool searchRandomPages = true)
         {
@@ -253,7 +339,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     cursor = json.cursor;
                     int duplicateItems = 0;
                     dynamic jsonData = json.data;
-                    foreach (dynamic jsonItem in jsonData)
+                    foreach (object jsonItem in jsonData)
                     {
                         //await Task.Yield(); // Allow async execution
 
@@ -301,6 +387,101 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     }
                 }
             }
+        }
+
+        public async Task<bool> BuyCSFloatListing(int priceinpence, string itemlistingID)
+        {
+            string url = $"https://csfloat.com/api/v1/listings/buy";
+            HttpRequestMessage message = new();
+            message.Method = HttpMethod.Post;
+            message.RequestUri = new Uri(url);
+
+            string poundstodollars = (priceinpence / parent.ExchangeRate).ToString();
+            string payload = "{\"total_price\":" + priceinpence + ",\"contract_ids\":[\"" + itemlistingID + "\"]}\r\n".Trim();
+            message.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+            var response = await Client.SendAsync(message);
+            if (response.IsSuccessStatusCode)
+            {
+                return true;
+            }
+            else
+            {
+                throw new Exception($"Failed to buy CSFloat listing. Status code: {response.StatusCode}. Content: {await response.Content.ReadAsStringAsync()}");
+                return false;
+            }
+
+        }
+
+        public async Task<bool> BuyCSFloatListing(ItemListing listing)
+        {
+            return await BuyCSFloatListing(listing.PriceInPence, listing.ItemListingID);
+        }
+
+
+        public class CSFloatAccountInformation
+        {
+            public string SteamID { get; set; }
+            public string Username { get; set; }
+            public int Flags { get; set; }
+            public string Avatar { get; set; }
+            public string Email { get; set; }
+            public string PhoneNumber { get; set; }
+            public int BalanceInPence { get; set; }
+            public float BalanceInPounds { get; set; }
+            public int PendingBalanceInPence { get; set; }
+            public float PendingBalanceInPounds { get; set; }
+            public bool StallPublic { get; set; }
+            public bool Away { get; set; }
+            public string TradeToken { get; set; }
+            public PaymentAccounts PaymentAccounts { get; set; }
+            public Statistics Statistics { get; set; }
+            public Preferences Preferences { get; set; }
+            public string KnowYourCustomer { get; set; }
+            public DateTime ExtensionSetupAt { get; set; }
+            public FirebaseMessaging FirebaseMessaging { get; set; }
+            public StripeConnect StripeConnect { get; set; }
+            public string ObfuscatedID { get; set; }
+            public bool Online { get; set; }
+            public double Fee { get; set; }
+            public double WithdrawFee { get; set; }
+            public List<string> Subscriptions { get; set; }
+            public bool Has2FA { get; set; }
+            public bool HasAPIKey { get; set; }
+        }
+
+        public class PaymentAccounts
+        {
+            public string StripeConnect { get; set; }
+            public string StripeCustomer { get; set; }
+        }
+
+        public class Statistics
+        {
+            public int TotalSales { get; set; }
+            public int TotalPurchases { get; set; }
+            public int MedianTradeTime { get; set; }
+            public int TotalAvoidedTrades { get; set; }
+            public int TotalFailedTrades { get; set; }
+            public int TotalVerifiedTrades { get; set; }
+            public int TotalTrades { get; set; }
+        }
+
+        public class Preferences
+        {
+            public bool OffersEnabled { get; set; }
+            public int MaxOfferDiscount { get; set; }
+        }
+
+        public class FirebaseMessaging
+        {
+            public int Platform { get; set; }
+            public DateTime LastUpdated { get; set; }
+        }
+
+        public class StripeConnect
+        {
+            public bool PayoutsEnabled { get; set; }
         }
 
     }

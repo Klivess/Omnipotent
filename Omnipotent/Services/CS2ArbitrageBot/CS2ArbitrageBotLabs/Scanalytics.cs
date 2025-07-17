@@ -1,5 +1,7 @@
-﻿using Newtonsoft.Json;
+﻿using Markdig.Renderers.Html;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using System.Management.Automation;
 using System.Management.Automation.Language;
@@ -9,17 +11,53 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
     public class Scanalytics
     {
         public List<ScannedComparison> AllScannedComparisonsInHistory;
-
+        public List<PurchasedListing> AllPurchasedListingsInHistory;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
+            AllPurchasedListingsInHistory = new();
             LoadScannedComparisons();
         }
 
 
         private CS2ArbitrageBot parent;
         public double expectedSteamToCSFloatConversionPercentage = 0.84;
+
+        public enum StrategicStages
+        {
+            AwaitingRetrieval,
+            JustRetrieved,
+            WaitingForMarketSaleOnSteam,
+            WaitingForConversionItemsToPurchase,
+            WaitingForConversionItemsToSell,
+            StrategyCompleted
+        }
+        public class PurchasedListing
+        {
+            public ScannedComparison comparison;
+            public DateTime TimeOfPurchase;
+            public string CSFloatListingID;
+            public int ExpectedAbsoluteProfitInPence;
+            public float ExpectedAbsoluteProfitInPounds;
+            public float ExpectedProfitPercentage;
+
+            public float ActualProfitPercentage;
+            public float ActualAbsoluteProfitInPounds;
+            public float ActualAbsoluteProfitInPence;
+
+            public DateTime TimeOfItemRetrieval;
+            public DateTime TimeToSellOnSteam;
+            public DateTime TimeToConvertToRealFunds;
+            public DateTime TimeOfCollectedRevenue;
+
+            public float ItemFloatValue;
+            public string ItemMarketHashName;
+
+            public float ActualSalePriceOnSteam;
+
+            public StrategicStages CurrentStrategicStage;
+        }
 
         public class ScannedComparison
         {
@@ -83,6 +121,34 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     catch (Exception e) { }
                 }
             }
+        }
+
+        public async Task LoadPurchasedItems()
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
+            if (Directory.Exists(path))
+            {
+                foreach (string file in Directory.GetFiles(path, "*.json"))
+                {
+                    try
+                    {
+                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
+                        PurchasedListing comparison = JsonConvert.DeserializeObject<PurchasedListing>(content);
+                        AllPurchasedListingsInHistory.Add(comparison);
+                    }
+                    catch (Exception e) { }
+                }
+            }
+        }
+
+        public async Task SavePurchasedListing(PurchasedListing purchasedListing)
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
+            string filename = purchasedListing.ItemMarketHashName + purchasedListing.comparison.CSFloatListing.ItemListingID.ToString() + "id.json";
+            //Ensure filename's name can actually be saved as a file's name
+            //Try saying that 3 times lol
+            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(purchasedListing, Formatting.Indented));
         }
 
         //Scanned Comparisons Analytics
