@@ -26,6 +26,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             public string ItemName;
             public string ItemMarketHashName;
             public string PriceText;
+            public int PriceInCents;
             public int PriceInPence;
             public double PriceInPounds;
             public string ListingURL;
@@ -145,13 +146,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             }
             return result;
         }
-        public ItemListing ConvertItemListingJSONItemToStruct(dynamic jsonItem)
+        public ItemListing ConvertItemListingJSONItemToStruct(dynamic jsonItem, bool hasfloatValue = true)
         {
             ItemListing result = new ItemListing();
             result.ItemListingID = jsonItem.id;
             result.ItemName = jsonItem.item.item_name;
             result.ItemMarketHashName = jsonItem.item.market_hash_name;
-            result.PriceInPence = jsonItem.price * parent.ExchangeRate;
+            int price = Convert.ToInt32(jsonItem.price);
+            result.PriceInCents = price;
+            result.PriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(price * parent.ExchangeRate)));
             result.PriceInPounds = Convert.ToDouble(result.PriceInPence) / 100;
             result.PriceText = "£" + result.PriceInPounds.ToString();
             result.ListingURL = $"https://csfloat.com/item/{result.ItemListingID}";
@@ -160,9 +163,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             result.AppraisalBasePriceInPounds = Convert.ToDouble(result.AppraisalBasePriceInPence) / 100;
             result.AppraisalPriceText = "£" + result.AppraisalBasePriceInPounds.ToString();
 
+            if (hasfloatValue == true)
+            {
+                result.FloatValue = jsonItem.item.float_value;
+                result.ItemID64 = jsonItem.item.d_param;
+            }
             result.AssetID = jsonItem.item.asset_id;
-            result.FloatValue = jsonItem.item.float_value;
-            result.ItemID64 = jsonItem.item.d_param;
             return result;
         }
         public static DateTime ConvertEpochToDateTime(long epochTime, bool isMilliseconds = false)
@@ -389,15 +395,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             }
         }
 
-        public async Task<bool> BuyCSFloatListing(int priceinpence, string itemlistingID)
+        public async Task<bool> BuyCSFloatListing(int priceincents, string itemlistingID)
         {
             string url = $"https://csfloat.com/api/v1/listings/buy";
             HttpRequestMessage message = new();
             message.Method = HttpMethod.Post;
             message.RequestUri = new Uri(url);
 
-            string poundstodollars = (priceinpence / parent.ExchangeRate).ToString();
-            string payload = "{\"total_price\":" + priceinpence + ",\"contract_ids\":[\"" + itemlistingID + "\"]}\r\n".Trim();
+            string payload = "{\"total_price\":" + priceincents + ",\"contract_ids\":[\"" + itemlistingID + "\"]}\r\n".Trim();
             message.Content = new StringContent(payload, Encoding.UTF8, "application/json");
 
             var response = await Client.SendAsync(message);
@@ -407,14 +412,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             }
             else
             {
-                throw new Exception($"Failed to buy CSFloat listing. Status code: {response.StatusCode}. Content: {await response.Content.ReadAsStringAsync()}");
+                var ex = new Exception($"Failed to buy CSFloat listing. Status code: {response.StatusCode}. Content: {await response.Content.ReadAsStringAsync()}");
+                throw ex;
                 return false;
             }
 
         }
         public async Task<bool> BuyCSFloatListing(ItemListing listing)
         {
-            return await BuyCSFloatListing(listing.PriceInPence, listing.ItemListingID);
+            return await BuyCSFloatListing(listing.PriceInCents, listing.ItemListingID);
         }
 
         public class CSFloatAccountInformation
