@@ -137,24 +137,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                                 {
                                     message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
                                         bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Purchased"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
-
-                                    Scanalytics.PurchasedListing purchasedListing = new Scanalytics.PurchasedListing
-                                    {
-                                        comparison = comparison,
-                                        TimeOfPurchase = DateTime.Now,
-                                        CSFloatListingID = snipe.ItemListingID,
-                                        ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
-                                        ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
-                                        ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
-
-                                        ItemFloatValue = (float)snipe.FloatValue,
-                                        ItemMarketHashName = snipe.ItemMarketHashName,
-
-                                        CurrentStrategicStage = Scanalytics.StrategicStages.AwaitingRetrieval,
-                                    };
-
-                                    scanalytics.SavePurchasedListing(purchasedListing);
-                                    scanalytics.AllPurchasedListingsInHistory.Add(purchasedListing);
                                 }
                             }
                             else
@@ -169,6 +151,26 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                             message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
                                 bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Purchase - Error: " + ex.Message), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                         }
+
+                        //Scanalytics
+
+                        Scanalytics.PurchasedListing purchasedListing = new Scanalytics.PurchasedListing
+                        {
+                            comparison = comparison,
+                            TimeOfPurchase = DateTime.Now,
+                            CSFloatListingID = snipe.ItemListingID,
+                            ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
+                            ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
+                            ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
+
+                            ItemFloatValue = (float)snipe.FloatValue,
+                            ItemMarketHashName = snipe.ItemMarketHashName,
+
+                            CurrentStrategicStage = Scanalytics.StrategicStages.AwaitingRetrieval,
+                        };
+
+                        scanalytics.SavePurchasedListing(purchasedListing);
+                        scanalytics.AllPurchasedListingsInHistory.Add(purchasedListing);
 
 #pragma warning restore CS8602 // Dereference of a possibly null reference.
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
