@@ -145,7 +145,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             }
             return result;
         }
-        private ItemListing ConvertItemListingJSONItemToStruct(dynamic jsonItem)
+        public ItemListing ConvertItemListingJSONItemToStruct(dynamic jsonItem)
         {
             ItemListing result = new ItemListing();
             result.ItemListingID = jsonItem.id;
@@ -412,12 +412,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             }
 
         }
-
         public async Task<bool> BuyCSFloatListing(ItemListing listing)
         {
             return await BuyCSFloatListing(listing.PriceInPence, listing.ItemListingID);
         }
-
 
         public class CSFloatAccountInformation
         {

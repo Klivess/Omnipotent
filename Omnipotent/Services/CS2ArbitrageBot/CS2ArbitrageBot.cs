@@ -59,6 +59,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
             csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
 
+            MonitorTradeList();
+
             if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null || OmniPaths.CheckIfOnServer() != true)
             {
                 SnipeDealsAndAlertKlives();
@@ -279,7 +281,52 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
         }
 
+        public async Task<Scanalytics.PurchasedListing> FindAndPurchaseParticularListing(string CSFloatListingID)
+        {
+            string url = $"https://csfloat.com/api/v1/listings/{CSFloatListingID}";
+            var response = await csFloatWrapper.Client.GetAsync(url);
+            if (!response.IsSuccessStatusCode)
+            {
+                await ServiceLogError($"Failed to get CSFloat listing with ID {CSFloatListingID}. Status Code: {response.StatusCode}");
+                throw new Exception($"Failed to get CSFloat listing with ID {CSFloatListingID}. Status Code: {response.StatusCode}");
+            }
+            string responseString = await response.Content.ReadAsStringAsync();
+            CSFloatWrapper.ItemListing csfloatlisting = csFloatWrapper.ConvertItemListingJSONItemToStruct(JsonConvert.DeserializeObject(responseString));
+            SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(csfloatlisting.ItemMarketHashName);
+            Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(csfloatlisting, correspondingListing, DateTime.Now);
 
+            if (csfloatAccountInformation.BalanceInPence > csfloatlisting.PriceInPence)
+            {
+
+                var result = await csFloatWrapper.BuyCSFloatListing(csfloatlisting);
+                Scanalytics.PurchasedListing purchasedListing = new Scanalytics.PurchasedListing
+                {
+                    comparison = comparison,
+                    TimeOfPurchase = DateTime.Now,
+                    CSFloatListingID = csfloatlisting.ItemListingID,
+                    ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
+                    ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
+                    ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
+
+                    ItemFloatValue = (float)csfloatlisting.FloatValue,
+                    ItemMarketHashName = csfloatlisting.ItemMarketHashName,
+
+                    CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale,
+                };
+
+                scanalytics.UpdatePurchasedListing(purchasedListing);
+
+                //tell klives that the bot purchased what he asked him to, this is not a snipe.
+                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Bot Purchase",
+                    $"Purchased CSFloat listing {csfloatlisting.ItemMarketHashName} with price {csfloatlisting.PriceText}.\n" +
+                    $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                    $"CSFloat Listing URL: {csfloatlisting.ListingURL}\n" +
+                    $"Steam Listing URL: {correspondingListing.ListingURL}",
+                    DSharpPlus.Entities.DiscordColor.Green, new Uri(csfloatlisting.ImageURL)));
+                return purchasedListing;
+            }
+            return null;
+        }
 
         public async Task CreateRoutes()
         {
