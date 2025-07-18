@@ -319,8 +319,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         comparison = comparison,
                         TimeOfPurchase = DateTime.Now,
                         CSFloatListingID = snipe.ItemListingID,
-                        ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
-                        ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
+                        ExpectedAbsoluteProfitInPence = ((int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) - comparison.CSFloatListing.PriceInPence,
+                        ExpectedAbsoluteProfitInPounds = (float)(((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence) / 100) - comparison.CSFloatListing.PriceInPounds),
                         ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
 
                         ItemFloatValue = (float)snipe.FloatValue,
