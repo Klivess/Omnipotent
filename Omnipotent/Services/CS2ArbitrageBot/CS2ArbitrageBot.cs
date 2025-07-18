@@ -403,9 +403,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/getscanalytics", async (request) =>
             {
-                Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
+                try
+                {
+                    Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
 
-                await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
+                    await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, "Error in /cs2arbitragebot/getscanalytics route.");
+                }
             }, HttpMethod.Get, KMPermissions.Guest);
         }
     }
