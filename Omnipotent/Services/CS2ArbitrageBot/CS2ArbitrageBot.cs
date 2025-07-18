@@ -194,6 +194,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
                                         ServiceLog($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
                                         listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.JustRetrieved;
+                                        listingToMonitor.TimeOfItemRetrieval = DateTime.Parse(Convert.ToString(item.steam_offer.updated_at));
                                         scanalytics.UpdatePurchasedListing(listingToMonitor);
                                     }
                                 }
