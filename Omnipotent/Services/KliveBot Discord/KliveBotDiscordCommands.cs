@@ -4,6 +4,7 @@ using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot;
+using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using Omnipotent.Services.KliveTechHub;
 using System.Diagnostics;
 using System.Management.Automation.Subsystem.Prediction;
@@ -211,7 +212,8 @@ namespace Omnipotent.Services.KliveBot_Discord
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics analytics =
-                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(((CS2ArbitrageBot.CS2ArbitrageBot)(await serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllScannedComparisonsInHistory);
+                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(((CS2ArbitrageBot.CS2ArbitrageBot)(await serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllScannedComparisonsInHistory,
+                    ((CS2ArbitrageBot.CS2ArbitrageBot)(await serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllPurchasedListingsInHistory);
 
                 string report = $@"
 [Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
