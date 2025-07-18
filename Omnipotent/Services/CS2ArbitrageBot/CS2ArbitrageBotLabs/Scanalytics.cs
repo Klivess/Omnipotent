@@ -292,10 +292,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 TimeTakenToPurchaseAllPurchasedItems = new();
                 foreach (var item in purchasedListings)
                 {
-                    if (item.comparison.CSFloatListing.DateTimeListingCreated != DateTime.MinValue && item.TimeOfPurchase != DateTime.MinValue)
+                    try
                     {
-                        TimeSpan timeTaken = item.TimeOfPurchase - item.comparison.CSFloatListing.DateTimeListingCreated;
-                        TimeTakenToPurchaseAllPurchasedItems.Add(timeTaken);
+                        if (item.comparison.CSFloatListing.DateTimeListingCreated != DateTime.MinValue && item.TimeOfPurchase != DateTime.MinValue)
+                        {
+                            TimeSpan timeTaken = item.TimeOfPurchase - item.comparison.CSFloatListing.DateTimeListingCreated;
+                            TimeTakenToPurchaseAllPurchasedItems.Add(timeTaken);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+
                     }
                 }
             }
