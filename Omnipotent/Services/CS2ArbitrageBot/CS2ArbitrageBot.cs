@@ -207,9 +207,25 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
                 else
                 {
-                    await ServiceLogError($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
-                    //Tell Klives
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Failed to get trade list from CSFloat. \nStatus Code: {response.StatusCode}\nResponse: {await response.Content.ReadAsStringAsync()}");
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+                        //If the response is 429 Too Many Requests, wait for 60 seconds and try again
+                        ServiceLog("CSFloat API rate limit reached. Waiting for 60 seconds before retrying.");
+                        await Task.Delay(60000);
+                    }
+                    else if (response.StatusCode == HttpStatusCode.Unauthorized)
+                    {
+                        //If the response is 401 Unauthorized, log it and exit
+                        ServiceLogError("CSFloat API key is invalid or expired. Please check your CSFloat API key.");
+                        await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("CSFloat API key is invalid or expired. Please check your CSFloat API key.");
+                        return;
+                    }
+                    else
+                    {
+                        await ServiceLogError($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
+                        //Tell Klives
+                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Failed to get trade list from CSFloat. \nStatus Code: {response.StatusCode}\nResponse: {await response.Content.ReadAsStringAsync()}");
+                    }
                 }
                 await Task.Delay(3000);
                 MonitorTradeList();
