@@ -162,17 +162,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                                     if (!string.IsNullOrEmpty(sentAt))
                                     {
                                         listingToMonitor.TimeOfSellerToSendTradeOffer = DateTime.Parse(sentAt);
+                                        listingToMonitor.CSFloatToSteamTradeOfferLink = "https://steamcommunity.com/tradeoffer/" + Convert.ToString(item.steam_offer.id) + "/";
                                         //Tell Klives that this listing has been sent using an embed
                                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CSFloat Trade Sent",
                                             $"Listing {listingToMonitor.ItemMarketHashName}\n" +
                                             $"Price: {listingToMonitor.comparison.CSFloatListing.PriceText}\n" +
                                             $"\nTrade offer has been sent by the seller. Please accept before the deadline at " + listingToMonitor.TimeOfSellerToSendTradeOffer.ToString("dd/MM/yyyy HH:mm:ss")
-                                            + "\nTrade Offer Link: " + item.trade_url,
+                                            + "\nTrade Offer Link: " + listingToMonitor.CSFloatToSteamTradeOfferLink,
                                             DSharpPlus.Entities.DiscordColor.Orange, new Uri(listingToMonitor.comparison.CSFloatListing.ImageURL)));
                                         //log it
                                         ServiceLog($"CSFloat listing {listingToMonitor.ItemMarketHashName} with price {listingToMonitor.comparison.CSFloatListing.PriceText} trade offer has been sent by the seller.");
                                         listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted;
-                                        listingToMonitor.CSFloatToSteamTradeOfferLink = item.trade_url;
                                         scanalytics.UpdatePurchasedListing(listingToMonitor);
                                     }
                                 }
