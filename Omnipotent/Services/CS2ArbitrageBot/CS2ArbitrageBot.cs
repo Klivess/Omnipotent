@@ -63,7 +63,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
             //FindAndPurchaseParticularListing("810847654237047508");
 
-            if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null && OmniPaths.CheckIfOnServer() == true)
+            if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null)
             {
                 SnipeDealsAndAlertKlives();
             }
