@@ -165,8 +165,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             result.AppraisalBasePriceInPounds = Convert.ToDouble(result.AppraisalBasePriceInPence) / 100;
             result.AppraisalPriceText = "£" + result.AppraisalBasePriceInPounds.ToString();
 
-
-
             result.DateTimeListingCreated = DateTime.Parse(Convert.ToString(jsonItem.created_at));
 
             if (hasfloatValue == true)
