@@ -57,18 +57,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
-            csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
 
+            CreateRoutes();
             MonitorTradeList();
-
+            UpdateAccountInformation();
             //FindAndPurchaseParticularListing("810847654237047508");
 
             if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null)
             {
                 SnipeDealsAndAlertKlives();
             }
-            CreateRoutes();
             Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
+        }
+
+        private async Task UpdateAccountInformation()
+        {
+            csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
