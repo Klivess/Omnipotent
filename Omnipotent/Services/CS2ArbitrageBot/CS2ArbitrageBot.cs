@@ -239,96 +239,107 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
                 return;
             }
+            //Search highest discounts
             await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "highest_discount"))
             {
-                try
+                ProcessCSFloatListing(snipe);
+            }
+            //Search new listings
+            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(150, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "most_recent"))
+            {
+                ProcessCSFloatListing(snipe);
+            }
+            await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+        }
+
+        private async Task ProcessCSFloatListing(CSFloatWrapper.ItemListing snipe)
+        {
+            try
+            {
+                SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
+                //Find price difference
+                Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
+                if (scanalytics.AllScannedComparisonsInHistory.Where(k => k.CSFloatListing.ItemListingID == snipe.ItemListingID).Any())
                 {
-                    SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
-                    //Find price difference
-                    Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
-                    if (scanalytics.AllScannedComparisonsInHistory.Where(k => k.CSFloatListing.ItemListingID == snipe.ItemListingID).Any())
-                    {
-                        ServiceLog($"Snipe for {snipe.ItemMarketHashName} already exists in history, skipping.");
-                        continue;
-                    }
-                    else
-                    {
-                        await scanalytics.SaveScannedComparison(comparison);
-                        scanalytics.AllScannedComparisonsInHistory.Add(comparison);
-                    }
-                    if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
-                    {
+                    ServiceLog($"Snipe for {snipe.ItemMarketHashName} already exists in history, skipping.");
+                    return;
+                }
+                else
+                {
+                    await scanalytics.SaveScannedComparison(comparison);
+                    scanalytics.AllScannedComparisonsInHistory.Add(comparison);
+                }
+                if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
+                {
 #pragma warning disable CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
 #pragma warning disable CS8602 // Dereference of a possibly null reference.
-                        string bodytext = $"Name: {snipe.ItemMarketHashName}\n" +
-                            $"CSFloat Price: {snipe.PriceText}\n" +
-                            $"Steam Price: {correspondingListing.PriceText}\n" +
-                            $"Raw Arbitrage Gain: **{Math.Round((comparison.RawArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
-                            $"Arbitrage Gain After Steam Tax: **{Math.Round((comparison.ArbitrageGainAfterSteamTax - 1) * 100, 2).ToString()}%**\n" +
-                            $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
-                            $"CSFloat Listing URL: {snipe.ListingURL}\n" +
-                            $"Steam Listing URL: {correspondingListing.ListingURL}\n\n" +
-                            $"Purchase Status: Purchasing...";
-                        var message = await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
-                            bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                    string bodytext = $"Name: {snipe.ItemMarketHashName}\n" +
+                        $"CSFloat Price: {snipe.PriceText}\n" +
+                        $"Steam Price: {correspondingListing.PriceText}\n" +
+                        $"Raw Arbitrage Gain: **{Math.Round((comparison.RawArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                        $"Arbitrage Gain After Steam Tax: **{Math.Round((comparison.ArbitrageGainAfterSteamTax - 1) * 100, 2).ToString()}%**\n" +
+                        $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                        $"CSFloat Listing URL: {snipe.ListingURL}\n" +
+                        $"Steam Listing URL: {correspondingListing.ListingURL}\n\n" +
+                        $"Purchase Status: Purchasing...";
+                    var message = await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
+                        bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
 
 
-                        //Purchase item
-                        try
+                    //Purchase item
+                    try
+                    {
+                        csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
+                        if (csfloatAccountInformation.BalanceInPence > snipe.PriceInPence)
                         {
-                            csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
-                            if (csfloatAccountInformation.BalanceInPence > snipe.PriceInPence)
+                            var result = await csFloatWrapper.BuyCSFloatListing(snipe);
+                            if (result == true)
                             {
-                                var result = await csFloatWrapper.BuyCSFloatListing(snipe);
-                                if (result == true)
-                                {
-                                    message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
-                                        bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Purchased"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
-                                }
-                            }
-                            else
-                            {
-                                message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found but not purchased.",
-                                    bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Afford"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                                message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
+                                    bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Purchased"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                             }
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            ServiceLogError(ex, "Error while purchasing CSFloat listing.");
-                            message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
-                                bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Purchase - Error: " + ex.Message), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                            message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found but not purchased.",
+                                bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Afford"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                         }
+                    }
+                    catch (Exception ex)
+                    {
+                        ServiceLogError(ex, "Error while purchasing CSFloat listing.");
+                        message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
+                            bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Purchase - Error: " + ex.Message), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                    }
 
-                        //Scanalytics
+                    //Scanalytics
 
-                        Scanalytics.PurchasedListing purchasedListing = new Scanalytics.PurchasedListing
-                        {
-                            comparison = comparison,
-                            TimeOfPurchase = DateTime.Now,
-                            CSFloatListingID = snipe.ItemListingID,
-                            ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
-                            ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
-                            ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
+                    Scanalytics.PurchasedListing purchasedListing = new Scanalytics.PurchasedListing
+                    {
+                        comparison = comparison,
+                        TimeOfPurchase = DateTime.Now,
+                        CSFloatListingID = snipe.ItemListingID,
+                        ExpectedAbsoluteProfitInPence = (int)(comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence),
+                        ExpectedAbsoluteProfitInPounds = (float)((comparison.PredictedOverallArbitrageGain * comparison.CSFloatListing.PriceInPence)) / 100,
+                        ExpectedProfitPercentage = (float)((comparison.PredictedOverallArbitrageGain - 1) * 100),
 
-                            ItemFloatValue = (float)snipe.FloatValue,
-                            ItemMarketHashName = snipe.ItemMarketHashName,
+                        ItemFloatValue = (float)snipe.FloatValue,
+                        ItemMarketHashName = snipe.ItemMarketHashName,
 
-                            CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale,
-                        };
+                        CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale,
+                    };
 
-                        scanalytics.UpdatePurchasedListing(purchasedListing);
+                    scanalytics.UpdatePurchasedListing(purchasedListing);
 
 #pragma warning restore CS8602 // Dereference of a possibly null reference.
 #pragma warning restore CS4014 // Because this call is not awaited, execution of the current method continues before the call is completed
-                    }
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Error while processing snipe deal.");
-                    continue;
                 }
             }
-            await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error while processing snipe deal.");
+                return;
+            }
         }
 
         public async Task<Scanalytics.PurchasedListing> FindAndPurchaseParticularListing(string CSFloatListingID)
