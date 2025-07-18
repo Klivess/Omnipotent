@@ -68,7 +68,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 SnipeDealsAndAlertKlives();
             }
             CreateRoutes();
-            Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory);
+            Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
@@ -394,7 +394,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/getscanalytics", async (request) =>
             {
-                Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory);
+                Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
 
                 await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
             }, HttpMethod.Get, KMPermissions.Guest);

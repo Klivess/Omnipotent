@@ -38,6 +38,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             public string AssetID;
             public double FloatValue;
             public string ItemID64;
+
+            public DateTime DateTimeListingCreated;
         }
 
         public async Task<List<ItemListing>> GetBestDealsOnCSFloat(int amountOfListingsToLoad, bool noRepeatedItems = true, float? minimumPriceInPence = null, float? maximumPriceInPence = null, float? minimumQuantityOnSale = null,
@@ -162,6 +164,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             result.AppraisalBasePriceInPence = jsonItem.reference.base_price * parent.ExchangeRate;
             result.AppraisalBasePriceInPounds = Convert.ToDouble(result.AppraisalBasePriceInPence) / 100;
             result.AppraisalPriceText = "£" + result.AppraisalBasePriceInPounds.ToString();
+
+            result.DateTimeListingCreated = DateTime.Parse(jsonItem.created_at);
 
             if (hasfloatValue == true)
             {

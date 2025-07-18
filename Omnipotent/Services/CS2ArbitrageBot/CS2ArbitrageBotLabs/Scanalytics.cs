@@ -209,7 +209,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
             public DateTime AnalyticsGeneratedAt;
 
-            public ScannedComparisonAnalytics(List<ScannedComparison> data)
+            public List<PurchasedListing> AllPurchasedItems;
+            public List<TimeSpan> TimeTakenToPurchaseAllPurchasedItems;
+
+            public ScannedComparisonAnalytics(List<ScannedComparison> data, List<PurchasedListing> purchasedListings)
             {
                 List<ScannedComparison> comparisons = data;
                 List<ScannedComparison> comparisonsBelow0PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).ToList();
@@ -283,6 +286,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 TotalExpectedProfitPercent = ((bal / 100) - 1) * 100;
                 FirstListingDateRecorded = comparisons.Min(c => c.LastUpdate);
                 AnalyticsGeneratedAt = DateTime.Now;
+
+                AllPurchasedItems = purchasedListings;
+
+                TimeTakenToPurchaseAllPurchasedItems = new();
+                foreach (var item in purchasedListings)
+                {
+                    if (item.comparison.CSFloatListing.DateTimeListingCreated != DateTime.MinValue && item.TimeOfPurchase != DateTime.MinValue)
+                    {
+                        TimeSpan timeTaken = item.TimeOfPurchase - item.comparison.CSFloatListing.DateTimeListingCreated;
+                        TimeTakenToPurchaseAllPurchasedItems.Add(timeTaken);
+                    }
+                }
             }
         }
     }
