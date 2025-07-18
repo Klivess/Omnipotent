@@ -234,22 +234,31 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
         public async Task SnipeDealsAndAlertKlives()
         {
-            if (OmniPaths.CheckIfOnServer() == false)
+            try
             {
+                if (OmniPaths.CheckIfOnServer() == false)
+                {
+                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+                    return;
+                }
+                //Search highest discounts
+                await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "highest_discount"))
+                {
+                    ProcessCSFloatListing(snipe);
+                }
+                //Search new listings
+                await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(150, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "most_recent"))
+                {
+                    ProcessCSFloatListing(snipe);
+                }
                 await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
-                return;
             }
-            //Search highest discounts
-            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(250, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "highest_discount"))
+            catch (Exception ex)
             {
-                ProcessCSFloatListing(snipe);
+                ServiceLogError(ex, "Error in SnipeDealsAndAlertKlives");
+                await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in SnipeDealsAndAlertKlives: {ex.Message}");
+                await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(15), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after an error.");
             }
-            //Search new listings
-            await foreach (CSFloatWrapper.ItemListing snipe in csFloatWrapper.SnipeBestDealsOnCSFloat(150, maximumPriceInPence: csfloatAccountInformation.BalanceInPence, normalOnly: true, csfloatSortBy: "most_recent"))
-            {
-                ProcessCSFloatListing(snipe);
-            }
-            await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
         }
 
         private async Task ProcessCSFloatListing(CSFloatWrapper.ItemListing snipe)
