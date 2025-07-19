@@ -81,6 +81,25 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 SnipeDealsAndAlertKlives();
             }
+            if (e.taskName == "SellCS2ArbitrageListingOnSteam")
+            {
+                try
+                {
+                    var data = JsonConvert.DeserializeObject<Scanalytics.PurchasedListing>(Convert.ToString(e.PassableData));
+                    SellSkinOnSteam(data);
+                }
+                catch (Exception ex)
+                {
+
+                }
+            }
+        }
+
+        private async Task SellSkinOnSteam(Scanalytics.PurchasedListing data)
+        {
+            ServiceLog($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
+            //Message Klives
+            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
         }
 
         private async Task GetExchangeRate()
@@ -194,6 +213,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                                     if (!string.IsNullOrEmpty(verifySaleAt))
                                     {
                                         listingToMonitor.PredictedTimeToBeResoldOnSteam = DateTime.Parse(Convert.ToString(item.trade_protection_ends_at));
+                                        ServiceCreateScheduledTask(listingToMonitor.PredictedTimeToBeResoldOnSteam, "SellCS2ArbitrageListingOnSteam", "CS2ArbitrageStrategy", $"{listingToMonitor.ItemMarketHashName} will no longer be on steam tradelock.", true, JsonConvert.SerializeObject(listingToMonitor));
                                         //Tell Klives that this listing has been accepted
                                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
                                         ServiceLog($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
