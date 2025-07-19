@@ -64,6 +64,9 @@ namespace Omnipotent.Services.KliveAPI
             public NameValueCollection userParameters;
             public KMProfileManager.KMProfile? user;
             public string userMessageContent;
+
+            [JsonIgnore]
+            public KliveAPI ParentService;
             public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
                 try
@@ -100,7 +103,15 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 catch (Exception ex)
                 {
-                    ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, "text/plain", null, HttpStatusCode.InternalServerError);
+                    ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
+                    //Return Error Response, this is a last resort to prevent the server from crashing
+                    await context.Response.OutputStream.FlushAsync();
+                    await context.Response.OutputStream.DisposeAsync();
+                    context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                    context.Response.ContentType = "text/plain";
+                    await context.Response.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("Error occurred on server."));
+                    await context.Response.OutputStream.FlushAsync();
+                    context.Response.Close();
                 }
             }
         }
@@ -277,6 +288,7 @@ namespace Omnipotent.Services.KliveAPI
                     UserRequest request = new();
                     request.req = req;
                     request.context = context;
+                    request.ParentService = this;
                     StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
                     request.userMessageContent = await reader.ReadToEndAsync();
                     request.userParameters = nameValueCollection;
