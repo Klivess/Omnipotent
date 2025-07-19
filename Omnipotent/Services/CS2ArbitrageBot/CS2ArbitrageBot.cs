@@ -90,7 +90,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
                 catch (Exception ex)
                 {
-
+                    ServiceLogError(ex);
                 }
             }
         }
