@@ -261,6 +261,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             try
             {
+                csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
+                if (csfloatAccountInformation.BalanceInPounds < 2)
+                {
+                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after insufficient balance in CSFloat Account.");
+                    return;
+                }
                 if (OmniPaths.CheckIfOnServer() == false)
                 {
                     await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
