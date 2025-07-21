@@ -12,6 +12,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
     {
         public List<ScannedComparison> AllScannedComparisonsInHistory;
         public List<PurchasedListing> AllPurchasedListingsInHistory;
+        public List<ScanResults> AllScanResultsInHistory;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
@@ -103,6 +104,63 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
         }
 
+        public enum ScanStrategy
+        {
+            SearchingThroughCSFloatHighestDiscount,
+            SearchingThroughCSFloatNewest,
+
+        }
+
+        public class ScanResults
+        {
+            public string ScanID;
+            public List<ScanStrategyResult> ScanStrategyResults;
+            public ScannedComparisonAnalytics Analytics;
+            public ScanResults()
+            {
+                ScanID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            }
+
+            public void ProduceOverallAnalytics()
+            {
+                List<ScannedComparison> totalComparisons = new();
+                List<PurchasedListing> purchasedListings = new();
+
+                foreach (var strategyResult in ScanStrategyResults)
+                {
+                    totalComparisons.AddRange(strategyResult.ScannedComparisons);
+                    purchasedListings.AddRange(strategyResult.PurchasedListings);
+                }
+                //remove all duplicates, where duplicates are defined as having the same CSFloatListing.ItemListingID
+                totalComparisons = totalComparisons.GroupBy(c => c.CSFloatListing.ItemListingID).Select(g => g.First()).ToList();
+                purchasedListings = purchasedListings.GroupBy(c => c.CSFloatListingID).Select(g => g.First()).ToList();
+                Analytics = new ScannedComparisonAnalytics(totalComparisons, purchasedListings);
+            }
+        }
+
+        public class ScanStrategyResult
+        {
+            public string ParentScanID;
+            public string ScanStrategyResultID;
+            public ScanStrategy StrategyUsed;
+            public string StrategyUsedString;
+            public List<ScannedComparison> ScannedComparisons;
+            public List<PurchasedListing> PurchasedListings;
+            public ScannedComparisonAnalytics Analytics;
+            public int DuplicateListingsFound;
+            public int ErrorsOccurred;
+
+            public ScanStrategyResult()
+            {
+                ScanStrategyResultID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            }
+
+            public void ProduceAnalytics()
+            {
+                Analytics = new ScannedComparisonAnalytics(ScannedComparisons, PurchasedListings);
+            }
+        }
+
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
@@ -173,6 +231,32 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 AllPurchasedListingsInHistory.Add(purchasedListing);
             }
             await SavePurchasedListing(purchasedListing);
+        }
+
+        public async Task SaveScanResult(ScanResults scanResult)
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
+            string filename = $"ScanResult{scanResult.ScanID}id.json";
+            //Ensure filename's name can actually be saved as a file's name
+            //Try saying that 3 times lol
+            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scanResult, Formatting.Indented));
+        }
+
+        public async Task UpdateScanResult(ScanResults scanResult)
+        {
+            if (AllScanResultsInHistory.Where(k => k.ScanID == scanResult.ScanID).Any())
+            {
+                //if it already exists
+                //replace it
+                AllScanResultsInHistory.RemoveAll(k => k.ScanID == scanResult.ScanID);
+                AllScanResultsInHistory.Add(scanResult);
+            }
+            else
+            {
+                AllScanResultsInHistory.Add(scanResult);
+            }
+            await SaveScanResult(scanResult);
         }
 
         //Scanned Comparisons Analytics
