@@ -16,7 +16,7 @@ namespace Omnipotent.Service_Manager
     public class TimeManager : OmniService
     {
         private const string TaskFileExtension = "omnitask";
-        public struct ScheduledTask
+        public class ScheduledTask
         {
             public string taskName;
             public DateTime dateTimeDue;
@@ -45,7 +45,7 @@ namespace Omnipotent.Service_Manager
         }
 
         public event EventHandler<ScheduledTask> TaskDue;
-        public List<ScheduledTask> tasks;
+        public SynchronizedCollection<ScheduledTask> tasks;
         private List<string> waitingTasks;
         private List<Thread> pendingTasks = new List<Thread>();
         public TimeManager()
@@ -67,7 +67,7 @@ namespace Omnipotent.Service_Manager
         /// <param name="reason"></param>
         /// <param name="important"></param>
         /// <param name="embeddedFunction"></param>
-        public void CreateNewScheduledTask(DateTime dueDateTime, string nameIdentifier, string topic, string agentName, string reason = "", bool important = true, object passableData = null)
+        public void CreateNewScheduledTask(DateTime dueDateTime, string nameIdentifier, string topic, string agentName, string reason = "", bool important = true, object passableData = null!)
         {
             //Create task
             ScheduledTask task = new ScheduledTask();
@@ -81,9 +81,10 @@ namespace Omnipotent.Service_Manager
             task.dateTimeSet = DateTime.Now;
             task.timeID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
             //If task with identical taskName exists, replace it.
-            if (tasks.Any(k => k.taskName.ToLower() == task.taskName.ToLower()))
+            var existingTasks = tasks.Where(k => k.taskName.ToLower() == task.taskName.ToLower()).ToList();
+            foreach (var existingTask in existingTasks)
             {
-                tasks.RemoveAll(k => k.taskName.ToLower() == task.taskName.ToLower());
+                tasks.Remove(existingTask);
             }
             //Add task to tasks and save.
             tasks.Add(task);
@@ -128,12 +129,16 @@ namespace Omnipotent.Service_Manager
 
         public List<ScheduledTask> GetAllUpcomingTasks()
         {
-            return tasks;
+            return tasks.ToList();
         }
 
         protected override async void ServiceMain()
         {
-            tasks = tasks.Concat(await GetAllUpcomingTasksFromDisk()).ToList();
+            var upcomingTasks = await GetAllUpcomingTasksFromDisk();
+            foreach (var task in upcomingTasks)
+            {
+                tasks.Add(task);
+            }
             CreateRoutes();
             WaitLoop();
         }
@@ -189,7 +194,7 @@ namespace Omnipotent.Service_Manager
             }
             await Task.Delay(2000);
             GC.Collect();
-            ServiceMain();
+            WaitLoop();
         }
 
         public async Task<ScheduledTask?> GetTask(string taskName)
@@ -197,9 +202,9 @@ namespace Omnipotent.Service_Manager
             var tasks = await GetAllUpcomingTasksFromDisk();
             ScheduledTask? task = tasks.Find(k => k.taskName.ToLower() == taskName.ToLower());
             //Check that Task is not default value
-            if (task != null && task.Value.taskName != null && task.Value.taskName != string.Empty)
+            if (task != null && task.taskName != null && task.taskName != string.Empty)
             {
-                return task.Value;
+                return task;
             }
             else
             {
