@@ -119,6 +119,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public ScanResults()
             {
                 ScanID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+                ScanStrategyResults = new List<ScanStrategyResult>();
             }
 
             public void ProduceOverallAnalytics()
@@ -153,6 +154,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public ScanStrategyResult()
             {
                 ScanStrategyResultID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+                ScannedComparisons = new List<ScannedComparison>();
+                PurchasedListings = new List<PurchasedListing>();
             }
 
             public void ProduceAnalytics()
