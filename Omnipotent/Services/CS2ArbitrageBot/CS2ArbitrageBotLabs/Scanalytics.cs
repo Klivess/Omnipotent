@@ -18,8 +18,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             this.parent = parent;
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
             AllPurchasedListingsInHistory = new();
+            AllScanResultsInHistory = new List<ScanResults>();
             LoadScannedComparisons().Wait();
             LoadPurchasedItems().Wait();
+            LoadScanResults().Wait();
         }
 
 
@@ -260,6 +262,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 AllScanResultsInHistory.Add(scanResult);
             }
             await SaveScanResult(scanResult);
+        }
+
+        public async Task LoadScanResults()
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
+            if (Directory.Exists(path))
+            {
+                foreach (string file in Directory.GetFiles(path, "*.json"))
+                {
+                    try
+                    {
+                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
+                        ScanResults comparison = JsonConvert.DeserializeObject<ScanResults>(content);
+                        AllScanResultsInHistory.Add(comparison);
+                    }
+                    catch (Exception e) { }
+                }
+            }
         }
 
         //Scanned Comparisons Analytics
