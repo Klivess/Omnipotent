@@ -87,6 +87,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             try
             {
+                ServiceLog("Starting liquidity search for CSFloat containers to Steam containers comparison.");
                 var result = await liquidityFinder.CompareCSFloatContainersToSteamContainers();
                 if (result == null)
                 {
