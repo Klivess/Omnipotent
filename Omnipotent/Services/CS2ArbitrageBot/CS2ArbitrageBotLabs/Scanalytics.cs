@@ -21,9 +21,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
             AllPurchasedListingsInHistory = new();
             AllScanResultsInHistory = new List<ScanResults>();
+            AllLiquiditySearchesInHistory = new List<LiquiditySearchResult>();
             LoadScannedComparisons().Wait();
             LoadPurchasedItems().Wait();
             LoadScanResults().Wait();
+            LoadLiquiditySearches().Wait();
         }
 
 
