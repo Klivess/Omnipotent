@@ -5,6 +5,7 @@ using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using System.Management.Automation;
 using System.Management.Automation.Language;
+using static Omnipotent.Services.CS2ArbitrageBot.CS2LiquidityFinder;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 {
@@ -13,6 +14,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<ScannedComparison> AllScannedComparisonsInHistory;
         public List<PurchasedListing> AllPurchasedListingsInHistory;
         public List<ScanResults> AllScanResultsInHistory;
+        public List<LiquiditySearchResult> AllLiquiditySearchesInHistory;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
@@ -178,6 +180,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         public async Task LoadScannedComparisons()
         {
+            AllScannedComparisonsInHistory = new List<ScannedComparison>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
             if (Directory.Exists(path))
             {
@@ -196,6 +199,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         public async Task LoadPurchasedItems()
         {
+            AllPurchasedListingsInHistory = new List<PurchasedListing>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
             if (Directory.Exists(path))
             {
@@ -266,6 +270,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         public async Task LoadScanResults()
         {
+            AllScanResultsInHistory = new List<ScanResults>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
             if (Directory.Exists(path))
             {
@@ -280,6 +285,60 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     catch (Exception e) { }
                 }
             }
+        }
+
+        public async Task LoadLiquiditySearches()
+        {
+            AllLiquiditySearchesInHistory = new();
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
+            if (Directory.Exists(path))
+            {
+                foreach (string file in Directory.GetFiles(path, "*.json"))
+                {
+                    try
+                    {
+                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
+                        var comparison = JsonConvert.DeserializeObject<LiquiditySearchResult>(content);
+                        AllLiquiditySearchesInHistory.Add(comparison);
+                    }
+                    catch (Exception e) { }
+                }
+            }
+        }
+
+        public async Task SaveLiquiditySearch(LiquiditySearchResult liquidSearchResult)
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
+            string filename = $"LiquidSearch{DateTime.Now.ToString("D")}{liquidSearchResult.LiquiditySearchID}id.json";
+            //Ensure filename's name can actually be saved as a file's name
+            //Try saying that 3 times lol
+            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(liquidSearchResult, Formatting.Indented));
+        }
+
+        public async Task UpdateLiquiditySearch(LiquiditySearchResult scanResult)
+        {
+            if (AllLiquiditySearchesInHistory.Where(k => k.LiquiditySearchID == scanResult.LiquiditySearchID).Any())
+            {
+                //if it already exists
+                //replace it
+                AllLiquiditySearchesInHistory.RemoveAll(k => k.LiquiditySearchID == scanResult.LiquiditySearchID);
+                AllLiquiditySearchesInHistory.Add(scanResult);
+            }
+            else
+            {
+                AllLiquiditySearchesInHistory.Add(scanResult);
+            }
+            await SaveLiquiditySearch(scanResult);
+        }
+
+        public LiquiditySearchResult GetLatestLiquiditySearchResult()
+        {
+            if (AllLiquiditySearchesInHistory.Count > 0)
+            {
+                return AllLiquiditySearchesInHistory.OrderByDescending(k => k.DateOfSearch).First();
+            }
+            return null;
         }
 
         //Scanned Comparisons Analytics

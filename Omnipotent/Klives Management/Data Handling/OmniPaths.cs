@@ -58,11 +58,13 @@ namespace Omnipotent.Data_Handling
             //CS2ArbitrageBot
             public static string CS2ArbitrageBotDirectory = $"{SavedDataDirectory}/CS2ArbitrageBot";
             public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
+            public static string CS2ArbitrageBotCSFloatLoginCookie = $"{CS2ArbitrageBotDirectory}/CSFloatLoginCookie.txt";
+            //           Labs
             public static string CS2ArbitrageBotLabsDirectory = $"{CS2ArbitrageBotDirectory}/CS2ArbitrageBotLabs";
             public static string CS2ArbitrageBotScannedComparisonsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScannedComparisons";
             public static string CS2ArbitrageBotPurchasedItemsDirectory = $"{CS2ArbitrageBotLabsDirectory}/PurchasedItems";
             public static string CS2ArbitrageBotScanResultsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScanResults";
-            public static string CS2ArbitrageBotCSFloatLoginCookie = $"{CS2ArbitrageBotDirectory}/CSFloatLoginCookie.txt";
+            public static string CS2ArbitrageBotLiquiditySearchesDirectory = $"{CS2ArbitrageBotLabsDirectory}/LiquiditySearches";
 
             //OmniTrader
             public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
@@ -133,6 +135,13 @@ namespace Omnipotent.Data_Handling
                 isAdmin = false;
             }
             return isAdmin;
+
+        }
+
+        public static DateTime EpochMsToDateTime(string epochMs)
+        {
+            return DateTimeOffset.FromUnixTimeMilliseconds(long.Parse(epochMs)).UtcDateTime;
         }
     }
+
 }

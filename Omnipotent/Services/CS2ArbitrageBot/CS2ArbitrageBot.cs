@@ -18,9 +18,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
     public class CS2ArbitrageBot : OmniService
     {
         public float ExchangeRate;
-        private SteamAPIWrapper steamAPIWrapper;
-        private CSFloatWrapper csFloatWrapper;
+        public SteamAPIWrapper steamAPIWrapper;
+        public CSFloatWrapper csFloatWrapper;
         public Scanalytics scanalytics;
+        private CS2LiquidityFinder liquidityFinder;
         public CSFloatWrapper.CSFloatAccountInformation csfloatAccountInformation;
 
         public static float MinimumPercentReturnToSnipe = 10;
@@ -55,20 +56,54 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             steamAPIWrapper = new SteamAPIWrapper(this);
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
+            liquidityFinder = new CS2LiquidityFinder(this);
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
+            var containers = await liquidityFinder.CompareCSFloatContainersToSteamContainers();
+
+            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+            //string filePath = Path.Combine(desktopPath, "CS2ArbitrageBot_ComparisonResults.json");
+            //await GetDataHandler().WriteToFile(filePath, valSerialized);
+
+            await UpdateAccountInformation();
 
             CreateRoutes();
             MonitorTradeList();
-            UpdateAccountInformation();
             //FindAndPurchaseParticularListing("810847654237047508");
 
             if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null)
             {
                 SnipeDealsAndAlertKlives();
             }
+            if (await serviceManager.timeManager.GetTask("CompareLiquidItemOptions") == null)
+            {
+                CompareLiquidItemOptions();
+            }
             Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
+        }
+
+        private async Task CompareLiquidItemOptions()
+        {
+            try
+            {
+                var result = await liquidityFinder.CompareCSFloatContainersToSteamContainers();
+                if (result == null)
+                {
+                    ServiceLog("Liquidity search returned null?");
+                }
+                else
+                {
+                    await scanalytics.UpdateLiquiditySearch(result);
+                    ServiceLog($"Liquidity search completed with {result.HighestReturnCoefficientFound} highest return coefficient found");
+                }
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "CompareLiquidItemOptions", "CS2ArbitrageAnalytics", "Compare price gaps in liquid items to convert Steam Credit to CSFloat Credit", false);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error in CompareLiquidItemOptions");
+                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in CompareLiquidItemOptions: {ex.Message}");
+            }
         }
 
         private async Task UpdateAccountInformation()
@@ -93,6 +128,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     ServiceLogError(ex);
                 }
+            }
+            if (e.taskName == "CompareLiquidItemOptions")
+            {
+                CompareLiquidItemOptions();
             }
         }
 
@@ -266,12 +305,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
                 if (csfloatAccountInformation.BalanceInPounds < 2)
                 {
-                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after insufficient balance in CSFloat Account.");
+                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after insufficient balance in CSFloat Account.", false);
                     return;
                 }
                 if (OmniPaths.CheckIfOnServer() == false)
                 {
-                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market", false);
                     return;
                 }
 
@@ -341,13 +380,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
                 scanResults.ProduceOverallAnalytics();
                 scanalytics.UpdateScanResult(scanResults);
-                await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market");
+                await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market", false);
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error in SnipeDealsAndAlertKlives");
                 await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in SnipeDealsAndAlertKlives: {ex.Message}");
-                await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(15), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after an error.");
+                await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(15), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after an error.", false);
             }
         }
 
@@ -522,6 +561,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 try
                 {
                     await request.ReturnResponse(JsonConvert.SerializeObject(scanalytics.AllScanResultsInHistory), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, "Error in /cs2arbitragebot/scanresults route.");
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/liquidityscanresults", async (request) =>
+            {
+                try
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(scanalytics.AllLiquiditySearchesInHistory), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
