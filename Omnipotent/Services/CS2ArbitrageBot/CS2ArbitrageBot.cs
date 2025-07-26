@@ -97,13 +97,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     await scanalytics.UpdateLiquiditySearch(result);
                     ServiceLog($"Liquidity search completed with {result.HighestReturnCoefficientFound} highest return coefficient found");
                 }
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "CompareLiquidItemOptions", "CS2ArbitrageAnalytics", "Compare price gaps in liquid items to convert Steam Credit to CSFloat Credit", false);
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error in CompareLiquidItemOptions");
                 (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in CompareLiquidItemOptions: {ex.Message}");
             }
+            ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "CompareLiquidItemOptions", "CS2ArbitrageAnalytics", "Compare price gaps in liquid items to convert Steam Credit to CSFloat Credit", false);
         }
 
         private async Task UpdateAccountInformation()
@@ -141,7 +141,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             //Message Klives
             (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
         }
-
         private async Task GetExchangeRate()
         {
             HttpClient client = new();
@@ -389,7 +388,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(15), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after an error.", false);
             }
         }
-
         private async Task<KeyValuePair<ScannedComparison, PurchasedListing>?> ProcessCSFloatListing(CSFloatWrapper.ItemListing snipe)
         {
             try
@@ -491,7 +489,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 throw;
             }
         }
-
         public async Task<Scanalytics.PurchasedListing> FindAndPurchaseParticularListing(string CSFloatListingID)
         {
             string url = $"https://csfloat.com/api/v1/listings/{CSFloatListingID}";
@@ -539,7 +536,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }
             return null;
         }
-
         public async Task CreateRoutes()
         {
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/getscanalytics", async (request) =>
