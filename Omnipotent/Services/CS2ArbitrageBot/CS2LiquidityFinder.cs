@@ -44,7 +44,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             public double IdealCSFloatSellPriceInPounds;
             public int IdealCSFloatSellPriceInPence;
 
-            public float IdealPriceToPurchaseOnSteamInPounds;
+            public double IdealPriceToPurchaseOnSteamInPounds;
             public double IdealReturnCoefficientFromSteamtoCSFloat;
             public double IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
         }
@@ -139,10 +139,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     gap.IdealCSFloatSellPriceInPounds = Convert.ToDouble(gap.IdealCSFloatSellPriceInPence) / 100;
 
                     gap.priceHistory = await GetPriceHistoryOfSteamItem(item.MarketHashName);
-                    gap.IdealPriceToPurchaseOnSteamInPounds = FindIdealPriceToPlaceBuyOrder(gap.priceHistory);
+                    try
+                    {
+                        gap.IdealPriceToPurchaseOnSteamInPounds = FindIdealPriceToPlaceBuyOrder(gap.priceHistory);
+
+                    }
+                    catch (Exception x)
+                    {
+                        gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds;
+                    }
                     gap.IdealReturnCoefficientFromSteamtoCSFloat = Convert.ToDouble(gap.csfloatContainer.PriceInPounds / gap.IdealPriceToPurchaseOnSteamInPounds);
                     gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded = gap.IdealReturnCoefficientFromSteamtoCSFloat / 1.02;
-
                     gaps.Add(gap);
                 }
 
