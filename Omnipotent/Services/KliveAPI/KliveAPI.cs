@@ -167,6 +167,14 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        /// <summary>
+        /// Handles file upload requests with multipart form data.
+        /// Security features:
+        /// - File type validation (whitelist of allowed extensions)
+        /// - File size limit (10MB per file)
+        /// - Automatic filename sanitization with timestamps
+        /// - Directory creation if not exists
+        /// </summary>
         private async Task HandleFileUpload(UserRequest req)
         {
             try
@@ -270,6 +278,14 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        /// <summary>
+        /// Handles file download requests by filename.
+        /// Security features:
+        /// - Path sanitization to prevent directory traversal
+        /// - File existence validation
+        /// - Proper content type detection
+        /// - Support for both JSON (base64) and raw binary responses
+        /// </summary>
         private async Task HandleFileDownload(UserRequest req)
         {
             try
@@ -506,13 +522,17 @@ namespace Omnipotent.Services.KliveAPI
                 await req.ReturnResponse(resp, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
 
-            // File upload route
+            // File upload route - handles multipart form data uploads
+            // Supports multiple files, file type validation, size limits
+            // Authentication required: Associate level or higher
             await CreateRoute("/files/upload", async (req) =>
             {
                 await HandleFileUpload(req);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Associate);
 
-            // File download route
+            // File download route - serves uploaded files by filename
+            // Supports both JSON (base64) and raw binary responses
+            // Authentication required: Associate level or higher
             await CreateRoute("/files/download", async (req) =>
             {
                 await HandleFileDownload(req);
