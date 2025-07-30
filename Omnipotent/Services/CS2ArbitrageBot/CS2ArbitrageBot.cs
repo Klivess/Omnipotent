@@ -127,7 +127,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
                 catch (Exception ex)
                 {
-                    ServiceLogError(ex);
+                    ServiceLogError(ex, "Couldn't start selling the skin on steam.");
                 }
             }
             if (e.taskName == "CompareLiquidItemOptions")

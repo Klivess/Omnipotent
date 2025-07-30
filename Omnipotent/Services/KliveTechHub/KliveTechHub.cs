@@ -310,6 +310,9 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
+                ServiceLog("Discovering new KliveTech gadgets...");
+                //Message klives
+                await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Discovering new KliveTech gadgets...");
                 BluetoothDeviceInfo[] devicesInRadius = client.DiscoverDevices();
                 foreach (BluetoothDeviceInfo device in devicesInRadius)
                 {
@@ -349,6 +352,15 @@ namespace Omnipotent.Services.KliveTechHub
                         ServiceLogError(ex);
                         (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Connecting to gadget failed!: " + new ErrorInformation(ex).FullFormattedMessage);
                     }
+                }
+                //Tell klives how it went
+                if (connectedGadgets.Count > 0)
+                {
+                    await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Discovered {connectedGadgets.Count} KliveTech gadgets!");
+                }
+                else
+                {
+                    await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("No new KliveTech gadgets discovered.");
                 }
                 //Prevent stack overflow
                 await Task.Delay(5000);
