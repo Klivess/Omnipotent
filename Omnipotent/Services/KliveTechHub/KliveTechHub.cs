@@ -310,7 +310,6 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
-                ServiceLog("Discovering new KliveTech gadgets...");
                 BluetoothDeviceInfo[] devicesInRadius = client.DiscoverDevices();
                 foreach (BluetoothDeviceInfo device in devicesInRadius)
                 {
