@@ -69,6 +69,11 @@ namespace Omnipotent.Data_Handling
             //OmniTrader
             public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
             public static string OmniTraderAPIKey = $"{OmniTraderDirectory}/Trading212APIKey.txt";
+
+            //KliveCloud
+            public static string KliveCloudDirectory = $"{SavedDataDirectory}/KliveCloud";
+            public static string KliveCloudFilesDirectory = $"{KliveCloudDirectory}/Files";
+            public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
         };
 
         public static string GetPath(string path)
