@@ -74,6 +74,7 @@ namespace Omnipotent.Data_Handling
             public static string KliveCloudDirectory = $"{SavedDataDirectory}/KliveCloud";
             public static string KliveCloudFilesDirectory = $"{KliveCloudDirectory}/Files";
             public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
+            public static string KliveCloudFolderPermissionsDirectory = $"{KliveCloudDirectory}/FolderPermissions";
         };
 
         public static string GetPath(string path)
