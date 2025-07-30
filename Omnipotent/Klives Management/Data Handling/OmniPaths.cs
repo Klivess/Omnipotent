@@ -43,6 +43,7 @@ namespace Omnipotent.Data_Handling
             public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
             public static string KlivesACMEAPICertificateDirectory = $"{KlivesAPICertificateDirectory}/ACMECerts";
             public static string KlivesCertificateLinkingLogsDirectory = $"{KlivesAPICertificateDirectory}/CertificateLinkingLogs";
+            public static string KlivesAPIUploadedFilesDirectory = $"{SavedDataDirectory}/KliveAPI/UploadedFiles";
 
             //KliveLocalLLM
             public static string KliveLocalLLMDirectory = $"{SavedDataDirectory}/KliveLocalLLM";

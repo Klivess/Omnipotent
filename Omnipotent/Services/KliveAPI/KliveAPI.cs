@@ -167,6 +167,326 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        private async Task HandleFileUpload(UserRequest req)
+        {
+            try
+            {
+                // Ensure upload directory exists
+                var uploadDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPIUploadedFilesDirectory);
+                var dataHandler = GetDataHandler();
+                await dataHandler.CreateDirectory(uploadDir);
+
+                // Get content type
+                string contentType = req.req.ContentType ?? "";
+                
+                if (!contentType.StartsWith("multipart/form-data"))
+                {
+                    await req.ReturnResponse("Content-Type must be multipart/form-data", "application/json", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                // Parse multipart form data
+                var boundary = ExtractBoundary(contentType);
+                if (string.IsNullOrEmpty(boundary))
+                {
+                    await req.ReturnResponse("Missing boundary in Content-Type", "application/json", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                // Read the request body as bytes to handle binary data correctly
+                using var memoryStream = new MemoryStream();
+                await req.req.InputStream.CopyToAsync(memoryStream);
+                var bodyBytes = memoryStream.ToArray();
+                
+                // Parse multipart data
+                var files = ParseMultipartFormData(bodyBytes, boundary);
+                
+                if (files.Count == 0)
+                {
+                    await req.ReturnResponse("No files found in request", "application/json", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var uploadedFiles = new List<object>();
+                
+                foreach (var file in files)
+                {
+                    // Validate file
+                    if (string.IsNullOrEmpty(file.FileName))
+                    {
+                        continue;
+                    }
+                    
+                    // Security: validate file extension
+                    var allowedExtensions = new[] { ".txt", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".doc", ".docx", ".zip" };
+                    var fileExtension = Path.GetExtension(file.FileName).ToLowerInvariant();
+                    
+                    if (!allowedExtensions.Contains(fileExtension))
+                    {
+                        ServiceLog($"File upload rejected: {file.FileName} - unsupported extension {fileExtension}");
+                        continue;
+                    }
+                    
+                    // Security: validate file size (10MB limit)
+                    if (file.Content.Length > 10 * 1024 * 1024)
+                    {
+                        ServiceLog($"File upload rejected: {file.FileName} - file too large ({file.Content.Length} bytes)");
+                        continue;
+                    }
+                    
+                    // Generate safe filename
+                    var safeFileName = $"{DateTime.UtcNow:yyyy-MM-dd_HH-mm-ss}_{Path.GetFileName(file.FileName)}";
+                    var filePath = Path.Combine(uploadDir, safeFileName);
+                    
+                    // Save file
+                    await dataHandler.WriteBytesToFile(filePath, file.Content);
+                    
+                    uploadedFiles.Add(new
+                    {
+                        originalName = file.FileName,
+                        savedName = safeFileName,
+                        size = file.Content.Length,
+                        contentType = file.ContentType,
+                        uploadTime = DateTime.UtcNow
+                    });
+                    
+                    ServiceLog($"File uploaded: {file.FileName} -> {safeFileName} ({file.Content.Length} bytes)");
+                }
+                
+                var response = new
+                {
+                    success = true,
+                    uploadedFiles = uploadedFiles,
+                    message = $"Successfully uploaded {uploadedFiles.Count} file(s)"
+                };
+                
+                await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error during file upload");
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = "Upload failed" }), 
+                    "application/json", null, HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private async Task HandleFileDownload(UserRequest req)
+        {
+            try
+            {
+                var fileName = req.userParameters.Get("filename");
+                
+                if (string.IsNullOrEmpty(fileName))
+                {
+                    await req.ReturnResponse("Missing filename parameter", "application/json", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+                
+                // Security: prevent directory traversal
+                fileName = Path.GetFileName(fileName);
+                
+                var uploadDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPIUploadedFilesDirectory);
+                var filePath = Path.Combine(uploadDir, fileName);
+                
+                if (!File.Exists(filePath))
+                {
+                    await req.ReturnResponse("File not found", "application/json", null, HttpStatusCode.NotFound);
+                    return;
+                }
+                
+                var dataHandler = GetDataHandler();
+                var fileBytes = await dataHandler.ReadBytesFromFile(filePath);
+                
+                // Determine content type based on file extension
+                var contentType = GetContentType(fileName);
+                
+                // Set headers for file download
+                var headers = new NameValueCollection();
+                headers.Add("Content-Disposition", $"attachment; filename=\"{fileName}\"");
+                
+                // Convert bytes to base64 for JSON response or return raw bytes
+                if (req.userParameters.Get("raw") == "true")
+                {
+                    // Return raw bytes
+                    req.context.Response.ContentType = contentType;
+                    req.context.Response.ContentLength64 = fileBytes.Length;
+                    req.context.Response.StatusCode = 200;
+                    
+                    foreach (string key in headers.AllKeys)
+                    {
+                        req.context.Response.Headers.Add(key, headers[key]);
+                    }
+                    
+                    await req.context.Response.OutputStream.WriteAsync(fileBytes, 0, fileBytes.Length);
+                    req.context.Response.Close();
+                }
+                else
+                {
+                    // Return JSON with base64 encoded content
+                    var response = new
+                    {
+                        success = true,
+                        fileName = fileName,
+                        contentType = contentType,
+                        size = fileBytes.Length,
+                        content = Convert.ToBase64String(fileBytes)
+                    };
+                    
+                    await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+                }
+                
+                ServiceLog($"File downloaded: {fileName} ({fileBytes.Length} bytes)");
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error during file download");
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = "Download failed" }), 
+                    "application/json", null, HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private string ExtractBoundary(string contentType)
+        {
+            var boundaryPrefix = "boundary=";
+            var boundaryIndex = contentType.IndexOf(boundaryPrefix);
+            if (boundaryIndex == -1) return null;
+            
+            var boundary = contentType.Substring(boundaryIndex + boundaryPrefix.Length);
+            boundary = boundary.Split(';')[0].Trim();
+            
+            // Remove quotes if present
+            if (boundary.StartsWith("\"") && boundary.EndsWith("\""))
+            {
+                boundary = boundary.Substring(1, boundary.Length - 2);
+            }
+            
+            return boundary;
+        }
+
+        private List<MultipartFile> ParseMultipartFormData(byte[] bodyBytes, string boundary)
+        {
+            var files = new List<MultipartFile>();
+            var boundaryMarker = "--" + boundary;
+            var boundaryBytes = Encoding.UTF8.GetBytes(boundaryMarker);
+            var body = Encoding.UTF8.GetString(bodyBytes);
+            
+            var parts = body.Split(new[] { boundaryMarker }, StringSplitOptions.RemoveEmptyEntries);
+            
+            foreach (var part in parts)
+            {
+                if (string.IsNullOrWhiteSpace(part) || part.Trim() == "--") continue;
+                
+                var headerEndIndex = part.IndexOf("\r\n\r\n");
+                if (headerEndIndex == -1) continue;
+                
+                var headers = part.Substring(0, headerEndIndex);
+                var contentStart = headerEndIndex + 4;
+                
+                // Get content as bytes for binary files
+                var partBytes = Encoding.UTF8.GetBytes(part);
+                var headerBytes = Encoding.UTF8.GetBytes(headers);
+                var contentBytes = new byte[partBytes.Length - (headerBytes.Length + 4)];
+                
+                if (contentBytes.Length > 0)
+                {
+                    Array.Copy(partBytes, headerBytes.Length + 4, contentBytes, 0, contentBytes.Length);
+                    
+                    // Remove trailing CRLF if present
+                    if (contentBytes.Length >= 2 && 
+                        contentBytes[contentBytes.Length - 2] == 13 && 
+                        contentBytes[contentBytes.Length - 1] == 10)
+                    {
+                        var trimmedBytes = new byte[contentBytes.Length - 2];
+                        Array.Copy(contentBytes, 0, trimmedBytes, 0, trimmedBytes.Length);
+                        contentBytes = trimmedBytes;
+                    }
+                }
+                
+                // Parse Content-Disposition header
+                var contentDisposition = ExtractHeader(headers, "Content-Disposition");
+                var fileName = ExtractAttributeFromHeader(contentDisposition, "filename");
+                var name = ExtractAttributeFromHeader(contentDisposition, "name");
+                
+                if (!string.IsNullOrEmpty(fileName))
+                {
+                    var contentType = ExtractHeader(headers, "Content-Type") ?? "application/octet-stream";
+                    
+                    files.Add(new MultipartFile
+                    {
+                        Name = name,
+                        FileName = fileName,
+                        ContentType = contentType,
+                        Content = contentBytes
+                    });
+                }
+            }
+            
+            return files;
+        }
+
+        private string ExtractHeader(string headers, string headerName)
+        {
+            var lines = headers.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var line in lines)
+            {
+                if (line.StartsWith(headerName + ":", StringComparison.OrdinalIgnoreCase))
+                {
+                    return line.Substring(headerName.Length + 1).Trim();
+                }
+            }
+            return null;
+        }
+
+        private string ExtractAttributeFromHeader(string header, string attributeName)
+        {
+            if (string.IsNullOrEmpty(header)) return null;
+            
+            var pattern = attributeName + "=";
+            var index = header.IndexOf(pattern, StringComparison.OrdinalIgnoreCase);
+            if (index == -1) return null;
+            
+            var value = header.Substring(index + pattern.Length);
+            var endIndex = value.IndexOf(';');
+            if (endIndex != -1)
+            {
+                value = value.Substring(0, endIndex);
+            }
+            
+            // Remove quotes
+            value = value.Trim().Trim('"');
+            return value;
+        }
+
+        private string GetContentType(string fileName)
+        {
+            var extension = Path.GetExtension(fileName).ToLowerInvariant();
+            return extension switch
+            {
+                ".txt" => "text/plain",
+                ".pdf" => "application/pdf",
+                ".png" => "image/png",
+                ".jpg" or ".jpeg" => "image/jpeg",
+                ".gif" => "image/gif",
+                ".doc" => "application/msword",
+                ".docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ".zip" => "application/zip",
+                _ => "application/octet-stream"
+            };
+        }
+
+        private DataUtil GetDataHandler()
+        {
+            return (DataUtil)serviceManager.GetServiceByClassType<DataUtil>().Result[0];
+        }
+
+        private class MultipartFile
+        {
+            public string Name { get; set; }
+            public string FileName { get; set; }
+            public string ContentType { get; set; }
+            public byte[] Content { get; set; }
+        }
+
         private async void CreateMetaKLIVEAPIRoutes()
         {
             await CreateRoute("/redirect", async (req) =>
@@ -184,6 +504,18 @@ namespace Omnipotent.Services.KliveAPI
                 var copy = ControllerLookup.ToDictionary();
                 string resp = JsonConvert.SerializeObject(copy);
                 await req.ReturnResponse(resp, "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
+
+            // File upload route
+            await CreateRoute("/files/upload", async (req) =>
+            {
+                await HandleFileUpload(req);
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Associate);
+
+            // File download route
+            await CreateRoute("/files/download", async (req) =>
+            {
+                await HandleFileDownload(req);
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
         }
 
