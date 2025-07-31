@@ -59,16 +59,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             liquidityFinder = new CS2LiquidityFinder(this);
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
-
-            var containers = await liquidityFinder.CompareCSFloatContainersToSteamContainers();
-
-            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            //string filePath = Path.Combine(desktopPath, "CS2ArbitrageBot_ComparisonResults.json");
-            //await GetDataHandler().WriteToFile(filePath, valSerialized);
+            CreateRoutes();
 
             await UpdateAccountInformation();
 
-            CreateRoutes();
             MonitorTradeList();
             //FindAndPurchaseParticularListing("810847654237047508");
 
