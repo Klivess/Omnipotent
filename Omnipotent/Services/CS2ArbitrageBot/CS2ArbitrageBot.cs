@@ -53,16 +53,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     await ServiceLog($"CSFloat API Key set to: {csfloatAPIKey}");
                 }
             }
+            CreateRoutes();
             steamAPIWrapper = new SteamAPIWrapper(this);
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             liquidityFinder = new CS2LiquidityFinder(this);
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
-            CreateRoutes();
-
-            //Testing REMOVE BEFORE PUSHING TO MASTER
-            await steamAPIWrapper.profileWrapper.LoginToSteam();
 
 
             await UpdateAccountInformation();
