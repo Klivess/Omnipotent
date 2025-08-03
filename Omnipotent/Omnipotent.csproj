@@ -32,13 +32,13 @@
 		<PackageReference Include="Microsoft.AspNet.WebApi" Version="5.3.0" />
 		<PackageReference Include="Microsoft.AspNet.WebApi.Core" Version="5.3.0" />
 		<PackageReference Include="Microsoft.AspNetCore.Http" Version="2.3.0" />
-		<PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.6" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.7" />
 		<PackageReference Include="Microsoft.ML" Version="4.0.2" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
-		<PackageReference Include="protobuf-net" Version="3.2.52" />
+		<PackageReference Include="protobuf-net" Version="3.2.56" />
 		<PackageReference Include="Selenium.WebDriver" Version="4.34.0" />
-		<PackageReference Include="Selenium.WebDriver.ChromeDriver" Version="138.0.7204.4900" />
-		<PackageReference Include="System.Management" Version="9.0.6" />
+		<PackageReference Include="Selenium.WebDriver.ChromeDriver" Version="138.0.7204.18300" />
+		<PackageReference Include="System.Management" Version="9.0.7" />
 		<PackageReference Include="Websocket.Client" Version="5.2.0" />
 	</ItemGroup>
 

@@ -61,11 +61,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
             CreateRoutes();
 
+            //Testing REMOVE BEFORE PUSHING TO MASTER
+            await steamAPIWrapper.profileWrapper.LoginToSteam();
+
+
             await UpdateAccountInformation();
-
             MonitorTradeList();
-            //FindAndPurchaseParticularListing("810847654237047508");
-
             if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null)
             {
                 SnipeDealsAndAlertKlives();
@@ -559,11 +560,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/scanresults route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/liquidityscanresults", async (request) =>
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/latestliquidityplan", async (request) =>
             {
                 try
                 {
-                    await request.ReturnResponse(JsonConvert.SerializeObject(scanalytics.AllLiquiditySearchesInHistory), code: HttpStatusCode.OK);
+                    var plan = scanalytics.ProduceLiquidityPlan(scanalytics.GetLatestLiquiditySearchResult());
+                    await request.ReturnResponse(JsonConvert.SerializeObject(plan), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {

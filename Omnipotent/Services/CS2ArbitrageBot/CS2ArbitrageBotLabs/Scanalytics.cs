@@ -3,8 +3,10 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
+using OpenQA.Selenium.DevTools.V136.CSS;
 using System.Management.Automation;
 using System.Management.Automation.Language;
+using System.Text;
 using static Omnipotent.Services.CS2ArbitrageBot.CS2LiquidityFinder;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
@@ -15,6 +17,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<PurchasedListing> AllPurchasedListingsInHistory;
         public List<ScanResults> AllScanResultsInHistory;
         public List<LiquiditySearchResult> AllLiquiditySearchesInHistory;
+        private CS2ArbitrageBot parent;
+        public double expectedSteamToCSFloatConversionPercentage = 0.84;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
@@ -28,10 +32,137 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             LoadLiquiditySearches().Wait();
         }
 
+        public class LiquidityPlan
+        {
+            public DateTime ProductionDateOfLiquiditySearchResultUsed;
+            public List<ContainerGap> Top10Gaps;
+            public Dictionary<string, List<LiquidityPlanBuyTactics>> BuyOrderTacticsAndCorrespondingReturns;
+            public Dictionary<string, SteamPriceHistoryDataPoint> OptimalPurchasePointsForEachContainerGap;
+            public string LiquidityPlanDescription;
 
-        private CS2ArbitrageBot parent;
-        public double expectedSteamToCSFloatConversionPercentage = 0.84;
+            public struct LiquidityPlanBuyTactics
+            {
+                public string ItemMarketHashName;
+                public double ReturnCoefficient;
+                public double PriceNeededToBuyOnSteam;
+                public double PriceNeededToSellOnCSFloat;
+                public SteamPriceHistoryDataPoint LastTimeSoldAtThisPrice;
+            }
+        }
+        public LiquidityPlan ProduceLiquidityPlan(LiquiditySearchResult liquiditySearchResult)
+        {
+            LiquidityPlan plan = new();
+            try
+            {
+                plan.ProductionDateOfLiquiditySearchResultUsed = liquiditySearchResult.DateOfSearch;
 
+                // Remove all ContainerGaps in AllGapsFound which have a return coefficient of Infinity  
+                List<ContainerGap> filteredGaps = liquiditySearchResult.AllGapsFound
+                    .Where(g => g.ReturnCoefficientFromSteamtoCSFloat != double.PositiveInfinity)
+                    .ToList();
+
+                // Remove all ContainerGaps with a steam price greater than £10  
+                filteredGaps = filteredGaps
+                    .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < 10)
+                    .ToList();
+
+                // Sort the gaps by Ideal return coefficient  
+                filteredGaps = filteredGaps
+                    .OrderByDescending(g => g.ReturnCoefficientFromSteamtoCSFloat)
+                    .ToList();
+
+                // Take the top 10 and set it to plan.Top10Gaps  
+                plan.Top10Gaps = filteredGaps.Take(10).ToList();
+
+                // Create a dictionary of the price needed to buy for 90% profit  
+                plan.BuyOrderTacticsAndCorrespondingReturns = new();
+                foreach (var gap in plan.Top10Gaps)
+                {
+                    List<LiquidityPlan.LiquidityPlanBuyTactics> tacticsList = new();
+                    for (int i = 84; i < 100; i++)
+                    {
+                        LiquidityPlan.LiquidityPlanBuyTactics tactic = new();
+                        double returnCoeff = i / 100.0;
+                        double priceNeededToBuyOnSteam = Convert.ToDouble((gap.csfloatContainer.PriceInPounds / 1.02) / returnCoeff);
+                        tactic.ReturnCoefficient = returnCoeff;
+                        tactic.ItemMarketHashName = gap.csfloatContainer.MarketHashName;
+                        tactic.PriceNeededToBuyOnSteam = priceNeededToBuyOnSteam;
+                        tactic.PriceNeededToSellOnCSFloat = gap.csfloatContainer.PriceInPounds;
+
+                        // Look for the latest (datetime wise) time that gap.priceHistory has a price equal to priceNeededToBuyOnSteam  
+                        var matchingPricePoint = gap.priceHistory
+                            .Where(p => Math.Abs(p.PriceInPence - (priceNeededToBuyOnSteam * 100)) < 0.01)
+                            .OrderByDescending(p => p.DateTimeRecorded)
+                            .FirstOrDefault();
+
+                        tactic.LastTimeSoldAtThisPrice = matchingPricePoint;
+                        tacticsList.Add(tactic);
+                    }
+                    plan.BuyOrderTacticsAndCorrespondingReturns.Add(gap.csfloatContainer.MarketHashName, tacticsList);
+                }
+
+                plan.OptimalPurchasePointsForEachContainerGap = GetOptimalPurchasePoints(plan);
+
+                // Build description string  
+                var sb = new StringBuilder();
+                foreach (var gap in plan.Top10Gaps)
+                {
+                    var name = gap.csfloatContainer.MarketHashName;
+                    // Find the SteamPriceHistoryDataPoint chosen  
+                    var dp = plan.OptimalPurchasePointsForEachContainerGap[name];
+                    // Locate the matching tactic to read its return coefficient and buy price  
+                    var tactic = plan.BuyOrderTacticsAndCorrespondingReturns[name]
+                        .First(t => t.LastTimeSoldAtThisPrice.DateTimeRecorded == dp.DateTimeRecorded
+                                  && Math.Abs(t.LastTimeSoldAtThisPrice.PriceInPence - dp.PriceInPence) < 0.01);
+
+                    sb.AppendLine(
+                        $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +
+                        $"(last seen {dp.DateTimeRecorded:yyyy-MM-dd}).");
+                }
+                plan.LiquidityPlanDescription = sb.ToString().TrimEnd();
+            }
+            catch (Exception ex)
+            {
+                // Log the error and rethrow it for higher-level handling  
+                parent.ServiceLogError($"Error in ProduceLiquidityPlan: {ex.Message}").Wait();
+                throw;
+            }
+
+            return plan;
+        }
+        public static Dictionary<string, SteamPriceHistoryDataPoint> GetOptimalPurchasePoints(LiquidityPlan plan)
+        {
+            var optimalPoints = new Dictionary<string, SteamPriceHistoryDataPoint>();
+            var now = DateTime.UtcNow;
+
+            foreach (var kvp in plan.BuyOrderTacticsAndCorrespondingReturns)
+            {
+                var scored = kvp.Value
+                    .Where(t => t.LastTimeSoldAtThisPrice.DateTimeRecorded != default)
+                    .Select(t =>
+                    {
+                        var last = t.LastTimeSoldAtThisPrice.DateTimeRecorded;
+                        var daysSince = (now - last).TotalDays;
+                        // score = (return × quantity) penalized by age
+                        double score = (t.ReturnCoefficient * t.LastTimeSoldAtThisPrice.QuantitySold)
+                                       / (1.0 + daysSince);
+                        return new { DataPoint = t.LastTimeSoldAtThisPrice, Score = score, Age = daysSince };
+                    })
+                    .ToList();
+
+                // Prefer those seen within the last 7 days
+                var recent = scored.Where(x => x.Age <= 7).ToList();
+                var candidates = recent.Any() ? recent : scored;
+
+                if (candidates.Any())
+                {
+                    var best = candidates.OrderByDescending(x => x.Score).First().DataPoint;
+                    optimalPoints[kvp.Key] = best;
+                }
+            }
+
+            return optimalPoints;
+        }
         public enum StrategicStages
         {
             WaitingForCSFloatSellerToAcceptSale,
@@ -73,7 +204,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
             public StrategicStages CurrentStrategicStage;
         }
-
         public class ScannedComparison
         {
             public string ItemMarketHashName;
@@ -109,14 +239,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 LastUpdate = lastUpdate;
             }
         }
-
         public enum ScanStrategy
         {
             SearchingThroughCSFloatHighestDiscount,
             SearchingThroughCSFloatNewest,
 
         }
-
         public class ScanResults
         {
             public string ScanID;
@@ -144,7 +272,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 Analytics = new ScannedComparisonAnalytics(totalComparisons, purchasedListings);
             }
         }
-
         public class ScanStrategyResult
         {
             public string ParentScanID;
@@ -169,7 +296,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 Analytics = new ScannedComparisonAnalytics(ScannedComparisons, PurchasedListings);
             }
         }
-
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
@@ -179,7 +305,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scannedComparison, Formatting.Indented));
         }
-
         public async Task LoadScannedComparisons()
         {
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
@@ -198,7 +323,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
-
         public async Task LoadPurchasedItems()
         {
             AllPurchasedListingsInHistory = new List<PurchasedListing>();
@@ -217,7 +341,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
-
         public async Task SavePurchasedListing(PurchasedListing purchasedListing)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
@@ -227,7 +350,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(purchasedListing, Formatting.Indented));
         }
-
         public async Task UpdatePurchasedListing(PurchasedListing purchasedListing)
         {
             if (AllPurchasedListingsInHistory.Where(k => k.CSFloatListingID == purchasedListing.CSFloatListingID).Any())
@@ -243,7 +365,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
             await SavePurchasedListing(purchasedListing);
         }
-
         public async Task SaveScanResult(ScanResults scanResult)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
@@ -253,7 +374,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scanResult, Formatting.Indented));
         }
-
         public async Task UpdateScanResult(ScanResults scanResult)
         {
             if (AllScanResultsInHistory.Where(k => k.ScanID == scanResult.ScanID).Any())
@@ -269,7 +389,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
             await SaveScanResult(scanResult);
         }
-
         public async Task LoadScanResults()
         {
             AllScanResultsInHistory = new List<ScanResults>();
@@ -288,7 +407,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
-
         public async Task LoadLiquiditySearches()
         {
             AllLiquiditySearchesInHistory = new();
@@ -307,7 +425,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
-
         public async Task SaveLiquiditySearch(LiquiditySearchResult liquidSearchResult)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
@@ -317,7 +434,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(liquidSearchResult, Formatting.Indented));
         }
-
         public async Task UpdateLiquiditySearch(LiquiditySearchResult scanResult)
         {
             if (AllLiquiditySearchesInHistory.Where(k => k.LiquiditySearchID == scanResult.LiquiditySearchID).Any())
@@ -333,7 +449,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
             await SaveLiquiditySearch(scanResult);
         }
-
         public LiquiditySearchResult GetLatestLiquiditySearchResult()
         {
             if (AllLiquiditySearchesInHistory.Count > 0)
@@ -342,9 +457,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
             return null;
         }
-
         //Scanned Comparisons Analytics
-
         public class ScannedComparisonAnalytics
         {
             public int NumberOfListingsBelow0PercentGain { get; set; }

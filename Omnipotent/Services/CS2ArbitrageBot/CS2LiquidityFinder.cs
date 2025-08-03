@@ -48,7 +48,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             public double IdealReturnCoefficientFromSteamtoCSFloat;
             public double IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
         }
-
         public async Task<List<Container>> GetAllWeaponCasePricesInPoundsOnCSFloat()
         {
             try
@@ -113,7 +112,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 return null;
             }
         }
-
         public async Task<LiquiditySearchResult> CompareCSFloatContainersToSteamContainers()
         {
             var startTime = DateTime.UtcNow;
@@ -130,8 +128,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     double returnCoefficient = 0;
                     returnCoefficient = Convert.ToDouble(item.PriceInPounds / listing.CheapestSellOrderPriceInPounds);
                     gap.ReturnCoefficientFromSteamtoCSFloat = returnCoefficient;
-                    gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
 
+                    //If the return coefficient is Infinity, break this iteration and continue
+                    if (double.IsInfinity(returnCoefficient) || double.IsNaN(returnCoefficient))
+                    {
+                        parent.ServiceLogError($"Return coefficient for {item.MarketHashName} is Infinity or NaN, skipping this item.");
+                        continue;
+                    }
+                    gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
                     //Linear regression has shown this to be the best fit for the CSFloat price prediction
                     //                              y=1.09215x+0.000318599
                     gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(((1.09215) * item.PriceInCents) + 0.000318599);
