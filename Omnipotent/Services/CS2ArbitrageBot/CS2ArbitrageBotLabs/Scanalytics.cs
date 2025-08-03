@@ -105,15 +105,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 // Build description string  
                 var sb = new StringBuilder();
-                foreach (var gap in plan.Top10Gaps)
+                foreach (var kvp in plan.OptimalPurchasePointsForEachContainerGap)
                 {
-                    var name = gap.csfloatContainer.MarketHashName;
-                    // Find the SteamPriceHistoryDataPoint chosen  
-                    var dp = plan.OptimalPurchasePointsForEachContainerGap[name];
-                    // Locate the matching tactic to read its return coefficient and buy price  
+                    string name = kvp.Key;
+                    var dp = kvp.Value;
                     var tactic = plan.BuyOrderTacticsAndCorrespondingReturns[name]
                         .First(t => t.LastTimeSoldAtThisPrice.DateTimeRecorded == dp.DateTimeRecorded
-                                  && Math.Abs(t.LastTimeSoldAtThisPrice.PriceInPence - dp.PriceInPence) < 0.01);
+                                 && Math.Abs(t.LastTimeSoldAtThisPrice.PriceInPence - dp.PriceInPence) < 0.01);
 
                     sb.AppendLine(
                         $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +

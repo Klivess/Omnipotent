@@ -567,7 +567,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 catch (Exception e)
                 {
                     await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
-                    ServiceLogError(e, "Error in /cs2arbitragebot/scanresults route.");
+                    ServiceLogError(e, "Error in /cs2arbitragebot/latestliquidityplan route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
         }
