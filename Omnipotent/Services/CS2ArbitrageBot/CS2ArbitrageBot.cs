@@ -110,7 +110,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 SnipeDealsAndAlertKlives();
             }
-            if (e.taskName.StartsWith("SellCS2ArbitrageListingOnSteam"))
+            if (e.taskName.Contains("SellCS2ArbitrageListingOnSteam"))
             {
                 try
                 {
@@ -131,8 +131,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private async Task SellSkinOnSteam(Scanalytics.PurchasedListing data)
         {
             ServiceLog($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
-            //Message Klives
             (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
+            data.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
+            await scanalytics.UpdatePurchasedListing(data);
+            //Message Klives
         }
         private async Task GetExchangeRate()
         {
@@ -244,7 +246,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                                     }
                                     if (!string.IsNullOrEmpty(verifySaleAt))
                                     {
-                                        listingToMonitor.PredictedTimeToBeResoldOnSteam = DateTime.Parse(Convert.ToString(item.trade_protection_ends_at));
+                                        DateTime reselltime;
+                                        try
+                                        {
+                                            reselltime = DateTime.Parse(Convert.ToString(item.trade_protection_ends_at));
+                                            reselltime = reselltime.AddHours(1.1);
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            reselltime = DateTime.Now.AddDays(8);
+                                        }
+                                        listingToMonitor.PredictedTimeToBeResoldOnSteam = reselltime;
                                         string filename = "SellCS2ArbitrageListingOnSteam" + listingToMonitor.ItemMarketHashName;
                                         filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
                                         ServiceCreateScheduledTask(listingToMonitor.PredictedTimeToBeResoldOnSteam, filename, "CS2ArbitrageStrategy", $"{listingToMonitor.ItemMarketHashName} will no longer be on steam tradelock.", true, JsonConvert.SerializeObject(listingToMonitor));
