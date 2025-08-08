@@ -66,10 +66,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < 10)
                     .ToList();
 
+                //Remove all ContainerGaps which are not weapon cases.
+                filteredGaps = filteredGaps
+                    .Where(g => g.csfloatContainer.containerType == ContainerType.WeaponCase).ToList();
+
                 // Sort the gaps by Ideal return coefficient  
                 filteredGaps = filteredGaps
                     .OrderByDescending(g => g.ReturnCoefficientFromSteamtoCSFloat)
                     .ToList();
+
 
                 // Take the top 10 and set it to plan.Top10Gaps  
                 plan.Top10Gaps = filteredGaps.Take(10).ToList();
