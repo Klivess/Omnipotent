@@ -9,6 +9,7 @@ using Newtonsoft.Json;
 using System.Management.Automation;
 using OpenQA.Selenium.Support.UI;
 using OpenQA.Selenium.DevTools;
+using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -21,6 +22,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         {
             LoginCookies = new List<string>();
             this.parent = parent;
+        }
+
+        public async Task SellItem(Scanalytics.PurchasedListing purchasedListing)
+        {
+            string url = "https://steamcommunity.com/market/sellitem/";
+            HttpClient client = new();
+            string cookieString = await ProduceCookieString();
+            client.DefaultRequestHeaders.Add("Cookie", cookieString);
         }
 
         public async Task InitialiseLogin()

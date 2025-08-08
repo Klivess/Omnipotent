@@ -46,7 +46,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 public double ReturnCoefficient;
                 public double PriceNeededToBuyOnSteam;
                 public double PriceNeededToSellOnCSFloat;
-                public SteamPriceHistoryDataPoint LastTimeSoldAtThisPrice;
+                public SteamPriceHistoryDataPoint LastTimeSoldAtThisPriceOrBelow;
             }
         }
         public LiquidityPlan ProduceLiquidityPlan(LiquiditySearchResult liquiditySearchResult)
@@ -89,13 +89,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                         tactic.PriceNeededToBuyOnSteam = priceNeededToBuyOnSteam;
                         tactic.PriceNeededToSellOnCSFloat = gap.csfloatContainer.PriceInPounds;
 
-                        // Look for the latest (datetime wise) time that gap.priceHistory has a price equal to priceNeededToBuyOnSteam  
+                        // Look for the latest (datetime wise) time that gap.priceHistory has a price below to priceNeededToBuyOnSteam  
                         var matchingPricePoint = gap.priceHistory
-                            .Where(p => Math.Abs(p.PriceInPence - (priceNeededToBuyOnSteam * 100)) < 0.01)
+                            .Where(p => p.PriceInPounds <= priceNeededToBuyOnSteam)
                             .OrderByDescending(p => p.DateTimeRecorded)
                             .FirstOrDefault();
 
-                        tactic.LastTimeSoldAtThisPrice = matchingPricePoint;
+                        tactic.LastTimeSoldAtThisPriceOrBelow = matchingPricePoint;
                         tacticsList.Add(tactic);
                     }
                     plan.BuyOrderTacticsAndCorrespondingReturns.Add(gap.csfloatContainer.MarketHashName, tacticsList);
@@ -110,8 +110,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     string name = kvp.Key;
                     var dp = kvp.Value;
                     var tactic = plan.BuyOrderTacticsAndCorrespondingReturns[name]
-                        .First(t => t.LastTimeSoldAtThisPrice.DateTimeRecorded == dp.DateTimeRecorded
-                                 && Math.Abs(t.LastTimeSoldAtThisPrice.PriceInPence - dp.PriceInPence) < 0.01);
+                        .First(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded == dp.DateTimeRecorded
+                                 && Math.Abs(t.LastTimeSoldAtThisPriceOrBelow.PriceInPence - dp.PriceInPence) < 0.01);
 
                     sb.AppendLine(
                         $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +
@@ -136,15 +136,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             foreach (var kvp in plan.BuyOrderTacticsAndCorrespondingReturns)
             {
                 var scored = kvp.Value
-                    .Where(t => t.LastTimeSoldAtThisPrice.DateTimeRecorded != default)
+                    .Where(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded != default)
                     .Select(t =>
                     {
-                        var last = t.LastTimeSoldAtThisPrice.DateTimeRecorded;
+                        var last = t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded;
                         var daysSince = (now - last).TotalDays;
                         // score = (return × quantity) penalized by age
-                        double score = (t.ReturnCoefficient * t.LastTimeSoldAtThisPrice.QuantitySold)
+                        double score = (t.ReturnCoefficient * t.LastTimeSoldAtThisPriceOrBelow.QuantitySold)
                                        / (1.0 + daysSince);
-                        return new { DataPoint = t.LastTimeSoldAtThisPrice, Score = score, Age = daysSince };
+                        return new { DataPoint = t.LastTimeSoldAtThisPriceOrBelow, Score = score, Age = daysSince };
                     })
                     .ToList();
 

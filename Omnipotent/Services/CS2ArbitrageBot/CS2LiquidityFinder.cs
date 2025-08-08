@@ -217,7 +217,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 return default;
             }
         }
-
         public struct SteamPriceHistoryDataPoint
         {
             public DateTime DateTimeRecorded;
@@ -225,7 +224,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             public double PriceInPence => Convert.ToDouble(Math.Ceiling(PriceInPounds * 100));
             public int QuantitySold;
         }
-
         public async Task<List<SteamPriceHistoryDataPoint>?> GetPriceHistoryOfSteamItem(string marketHashName)
         {
             try
@@ -328,7 +326,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 yield return points[i];
             }
         }
-
         public static float FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
         {
             var minimas = CS2LiquidityFinder.GetPriceBottoms(dataPoints, 9, 0).ToList();
@@ -346,9 +343,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
             return minimumPriceInLastWeek * 1.01f;
         }
-
-
-
         public class LiquiditySearchResult
         {
             public List<ContainerGap> AllGapsFound;
