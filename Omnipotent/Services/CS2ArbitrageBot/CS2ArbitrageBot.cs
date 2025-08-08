@@ -24,7 +24,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private CS2LiquidityFinder liquidityFinder;
         public CSFloatWrapper.CSFloatAccountInformation csfloatAccountInformation;
 
-        public static float MinimumPercentReturnToSnipe = 10;
+        public static float MinimumPercentReturnToSnipe = 25;
 
         public CS2ArbitrageBot()
         {
