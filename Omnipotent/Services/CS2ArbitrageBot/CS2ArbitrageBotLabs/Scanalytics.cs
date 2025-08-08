@@ -35,7 +35,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public class LiquidityPlan
         {
             public DateTime ProductionDateOfLiquiditySearchResultUsed;
-            public List<ContainerGap> Top10Gaps;
+            public List<ContainerGap> Top10Gaps = new();
             public Dictionary<string, List<LiquidityPlanBuyTactics>> BuyOrderTacticsAndCorrespondingReturns;
             public Dictionary<string, SteamPriceHistoryDataPoint> OptimalPurchasePointsForEachContainerGap;
             public string LiquidityPlanDescription;
@@ -125,6 +125,21 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 parent.ServiceLogError($"Error in ProduceLiquidityPlan: {ex.Message}").Wait();
                 throw;
             }
+
+
+            //Omit everything but the last 2 weeks of pricehistory for each containergap in Top10Gaps
+            var twoWeeksAgo = DateTime.UtcNow.AddDays(-14);
+            var updatedGaps = new List<ContainerGap>();
+            foreach (var gap in plan.Top10Gaps)
+            {
+                var updatedGap = gap; // Create a copy of the gap object  
+                updatedGap.priceHistory = updatedGap.priceHistory
+                    .Where(p => p.DateTimeRecorded >= twoWeeksAgo)
+                    .ToList();
+                updatedGaps.Add(updatedGap);
+            }
+            plan.Top10Gaps = updatedGaps; // Replace the original list with the updated list  
+
 
             return plan;
         }
