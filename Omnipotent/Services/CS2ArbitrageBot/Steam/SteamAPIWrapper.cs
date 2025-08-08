@@ -30,10 +30,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task SteamAPIWrapperInitialisation()
         {
             profileWrapper = new SteamAPIProfileWrapper(this);
-            if (OmniPaths.CheckIfOnServer() == false)
-            {
-                await profileWrapper.InitialiseLogin();
-            }
+            await profileWrapper.InitialiseLogin();
             if (!File.Exists(cs2NameIDTablePath))
             {
                 await DownloadCS2ItemNameIDTable();
