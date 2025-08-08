@@ -8,6 +8,7 @@ using Omnipotent.Data_Handling;
 using Newtonsoft.Json;
 using System.Management.Automation;
 using OpenQA.Selenium.Support.UI;
+using OpenQA.Selenium.DevTools;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -25,23 +26,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task InitialiseLogin()
         {
             await LoadSteamPassword();
-            await LoginToSteam();
+            if (await CheckIfCookieStringWorks())
+            {
+                parent.parent.ServiceLog("Login to Steam via saved cookie is successful.");
+            }
+            else
+            {
+                await LoginToSteam();
+            }
         }
-
         public async Task LoginToSteam()
         {
             string loginUrl = "https://steamcommunity.com/login/home/";
 
             // Initialize Selenium WebDriver  
             var options = new ChromeOptions();
-            // options.AddArgument("--headless"); // Run in headless mode  
+            options.AddArgument("--headless"); // Run in headless mode  
             using (IWebDriver driver = new ChromeDriver(options))
             {
                 try
                 {
                     // Navigate to the login page  
-                    driver.Navigate().GoToUrl(loginUrl);
-
+                    await driver.Navigate().GoToUrlAsync(loginUrl);
+                    await Task.Delay(6500);
                     // Wait for the page to load and locate the username field  
                     WebDriverWait wait = new WebDriverWait(driver, TimeSpan.FromSeconds(10));
                     IWebElement usernameField = wait.Until(d => d.FindElement(By.CssSelector("input[type='text']._2GBWeup5cttgbTw8FM3tfx")));
@@ -56,12 +63,58 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     // Locate and click the login button  
                     IWebElement loginButton = driver.FindElement(By.CssSelector("button.DjSvCZoKKfoNSmarsEcTS[type='submit']"));
                     loginButton.Click();
+                    await Task.Delay(2000);
 
-                    // Wait for the login process to complete  
-                    await Task.Delay(10000);
+                    bool confirmed = false;
+                    try
+                    {
+                        string response = await (await parent.parent.serviceManager.GetNotificationsService())
+                            .SendButtonsPromptToKlivesDiscord(
+                                "CS2 Arbitrage Bot",
+                                $"The bot requires you to accept a steam mobile login confirmation, which was sent to you at {DateTime.Now.ToString()}.",
+                                new Dictionary<string, DSharpPlus.ButtonStyle>
+                                {
+                           { "Confirmed", DSharpPlus.ButtonStyle.Success },
+                                    { "Retry", DSharpPlus.ButtonStyle.Secondary},
+                           { "Deny", DSharpPlus.ButtonStyle.Danger }
+                                },
+                                TimeSpan.FromDays(3)
+                            );
 
-                    // Save cookies after successful login  
-                    await SaveSteamCookiesAsync(driver);
+                        if (response == "Confirmed")
+                        {
+                            confirmed = true;
+                        }
+                        else if (response == "Retry")
+                        {
+                            driver.Close(); // Close the current driver instance
+                            driver.Quit(); // Ensure the driver is properly disposed
+                            await LoginToSteam(); // Retry login
+                            return; // Exit the current method to avoid further processing
+                        }
+                        else if (response == "Deny")
+                        {
+                            throw new Exception("User denied the login confirmation request from Klives.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new Exception("Failed to send confirmation request to Klives.", ex);
+                    }
+
+                    if (confirmed)
+                    {
+                        await Task.Delay(5000);
+
+                        // Save cookies after successful login  
+                        await SaveSteamCookiesAsync(driver);
+                        driver.Close();
+                        driver.Quit();
+                    }
+                    else
+                    {
+                        throw new Exception("User denied the login confirmation request from Klives.");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -103,7 +156,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task SaveSteamCookiesAsync(IWebDriver driver)
         {
             var cookies = driver.Manage().Cookies.AllCookies;
-            string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatLoginCookie);
+            string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
             var cookieList = new List<object>();
 
             foreach (var cookie in cookies)
@@ -126,7 +179,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task LoadSteamCookiesAsync(IWebDriver driver, string gotourl)
         {
             driver.Navigate().GoToUrl(gotourl); // must visit domain first  
-            string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatLoginCookie);
+            string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
 
             if (File.Exists(filePath))
             {
@@ -147,6 +200,56 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
 
             driver.Navigate().Refresh();
+        }
+        public async Task<string> ProduceCookieString()
+        {
+            string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
+            string data = await parent.parent.GetDataHandler().ReadDataFromFile(filePath);
+            if (string.IsNullOrEmpty(data))
+            {
+                return "";
+            }
+            string cookieString = "";
+            var cookieList = JsonConvert.DeserializeObject<List<Dictionary<string, object>>>(data);
+            foreach (var cookie in cookieList)
+            {
+                cookieString += $"{cookie["Name"].ToString()}={cookie["Value"].ToString()}; ";
+            }
+            return cookieString.Trim();
+        }
+        public async Task<bool> CheckIfCookieStringWorks()
+        {
+            string url = "https://steamcommunity.com/market/mylistings?start=0&count=1";
+            HttpClient client = new();
+            string cookieString = await ProduceCookieString();
+            if (string.IsNullOrEmpty(cookieString))
+            {
+                return false; // No cookies available
+            }
+            client.DefaultRequestHeaders.Add("Cookie", cookieString);
+            try
+            {
+                HttpResponseMessage response = await client.GetAsync(url);
+                if (response.IsSuccessStatusCode)
+                {
+                    return true;
+                }
+                else if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                {
+                    parent.parent.ServiceLogError("CheckIfCookieWorks got ratelimited, retrying in 30 seconds...");
+                    await Task.Delay(30000);
+                    return await CheckIfCookieStringWorks(); // Retry after delay
+                }
+                else
+                {
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error checking cookie string: {ex.Message}");
+                return false;
+            }
         }
     }
 }
