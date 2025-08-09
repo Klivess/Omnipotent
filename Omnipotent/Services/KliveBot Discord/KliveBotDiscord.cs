@@ -77,7 +77,6 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
-                /*
                 if (args.Channel.IsPrivate && args.Author.Id != Client.CurrentUser.Id)
                 {
                     //
@@ -93,37 +92,11 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         {
                             message = await SendMessageToKlives(embed);
                         }
-                        var llmService = (await serviceManager.GetKliveLocalLLMService());
+                        var llmService = (await serviceManager.GetKliveLLMService());
                         if (llmService.IsServiceActive())
                         {
-                            if (llmService.isModelLoaded)
-                            {
-                                string response = "";
-                                if (!sessions.ContainsKey(args.Author.Id))
-                                {
-                                    sessions.Add(args.Author.Id, (await serviceManager.GetKliveLocalLLMService()).CreateSession(new List<string> { KliveBotPersonalityString.personality }, false));
-                                }
-                                response = await sessions[args.Author.Id].SendMessage($"New Message from {args.Author.Username}: {args.Message.Content}");
-                                await args.Message.RespondAsync(response);
-                                if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
-                                {
-                                    await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
-                                }
-                            }
+                            args.Message.RespondAsync(await llmService.QueryLLM(args.Message.Content));
                         }
-                        else
-                        {
-                            if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
-                            {
-                                string resp = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-$"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), TimeSpan.FromDays(3), "KliveBot's Response", "Response");
-
-                                await args.Message.RespondAsync(resp);
-                                await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\n Klives's Faked KliveBot Response: {resp}", message.Embeds[0].Color.Value));
-                            }
-
-                        }
-
                     }
                     catch (Exception ex)
                     {
@@ -133,7 +106,6 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
                     }
                 }
-                */
             }
             catch (Exception ex)
             {

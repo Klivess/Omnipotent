@@ -39,11 +39,12 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
+
         }
 
         public async Task<string> QueryLLM(string content)
         {
-            string payload = ProducePayloadString("user", "Develop a step by step cunning strategy to grow a youtube channel, which produces compilations of video memes. Include tactics like how to title videos and what to include in subscriptions etc.", "openai/gpt-oss-120b:cerebras");
+            string payload = ProducePayloadString("user", content, "openai/gpt-oss-120b:cerebras");
             HttpContent httpcontent = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
             var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", httpcontent);
             string llmResp = await response.Content.ReadAsStringAsync();
