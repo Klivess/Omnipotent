@@ -20,7 +20,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         DiscordCrawl parentService;
         OmniDiscordUser parentUser;
         private string gatewayURL;
-        private KliveLocalLLM.KliveLocalLLM.KliveLLMSession chatbotSession;
         private Websocket.Client.WebsocketClient WS;
         private CancellationTokenSource CTS;
         ManualResetEvent exitEvent = new ManualResetEvent(false);
@@ -79,16 +78,6 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                             {
                                 OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
                                 parentService.SaveDiscordMessage(parentUser, message);
-                                if ((await parentService.serviceManager.GetKliveLocalLLMService()).IsServiceActive())
-                                {
-                                    if ((message.AuthorID.ToString() != parentUser.UserID) && (message.AuthorID.ToString() == "976648966944989204"))
-                                    {
-                                        Console.WriteLine("Received chatbot request: Responding.");
-                                        string response = await chatbotSession.SendMessage(message.MessageContent);
-                                        await parentService.discordInterface.ChatInterface.DirectMessageUser(parentUser, message.AuthorID, response);
-                                        Console.WriteLine("Responded.");
-                                    }
-                                }
                             }
                         }
                     }

@@ -20,7 +20,6 @@ namespace Omnipotent.Services.KliveBot_Discord
         public DiscordClient Client { get; set; }
         DiscordGuild GuildContainingKlives;
         DiscordMember KlivesMember;
-        Dictionary<ulong, KliveLocalLLM.KliveLocalLLM.KliveLLMSession> sessions = new();
         public KliveBotDiscord()
         {
             name = "KliveBot Discord Bot";

@@ -105,12 +105,12 @@ namespace Omnipotent.Service_Manager
             return ref timeManager;
         }
 
-        public async Task<KliveLocalLLM?> GetKliveLocalLLMService()
+        public async Task<KliveLLM?> GetKliveLLMService()
         {
-            var result = await GetServiceByClassType<KliveLocalLLM>();
+            var result = await GetServiceByClassType<KliveLLM>();
             if (result.Any())
             {
-                return (KliveLocalLLM)(result[0]);
+                return (KliveLLM)(result[0]);
             }
             else
             {

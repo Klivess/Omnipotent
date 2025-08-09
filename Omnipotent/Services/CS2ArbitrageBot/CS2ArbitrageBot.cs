@@ -77,6 +77,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private async Task CompareLiquidItemOptions()
         {
+            if (OmniPaths.CheckIfOnServer() == false)
+            {
+                ServiceLog("Not on server, skipping liquidity search.");
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "CompareLiquidItemOptions", "CS2ArbitrageAnalytics", "Compare price gaps in liquid items to convert Steam Credit to CSFloat Credit", false);
+                return;
+            }
             try
             {
                 ServiceLog("Starting liquidity search for CSFloat containers to Steam containers comparison.");
