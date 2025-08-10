@@ -327,22 +327,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 yield return points[i];
             }
         }
-        public static float FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
+        public static double FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
         {
-            var minimas = CS2LiquidityFinder.GetPriceBottoms(dataPoints, 9, 0).ToList();
-
-            // Filter minimas to only include points from the last week  
-            DateTime oneWeekAgo = DateTime.Now.AddDays(-7);
-            var recentMinimas = minimas.Where(m => m.DateTimeRecorded >= oneWeekAgo).ToList();
-
-            // Get the minimum price from the filtered minimas  
-            if (recentMinimas.Count == 0)
-            {
-                throw new InvalidOperationException("No minimas found in the last week.");
-            }
-            float minimumPriceInLastWeek = (float)recentMinimas.Min(m => m.PriceInPounds);
-
-            return minimumPriceInLastWeek * 1.01f;
+            var list = dataPoints.Where(k => k.DateTimeRecorded > DateTime.UtcNow.AddDays(-3)); // Filter to last 3 days
+            double lowestprice = list.Select(k => k.PriceInPounds).Min();
+            return lowestprice;
         }
         public class LiquiditySearchResult
         {
