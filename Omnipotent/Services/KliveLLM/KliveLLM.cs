@@ -39,7 +39,6 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
-
         }
 
         public async Task<string> QueryLLM(string content)

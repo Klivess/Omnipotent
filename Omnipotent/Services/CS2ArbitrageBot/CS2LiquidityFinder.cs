@@ -138,7 +138,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
                     //Linear regression has shown this to be the best fit for the CSFloat price prediction
                     //                              y=1.09215x+0.000318599
-                    gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(((1.09215) * item.PriceInCents) + 0.000318599);
+                    //nvm dont use linear regression line       
+                    gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(item.PriceInCents * 1.05);
                     gap.IdealCSFloatSellPriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(gap.IdealCSFloatSellPriceInCents * parent.ExchangeRate)));
                     gap.IdealCSFloatSellPriceInPounds = Convert.ToDouble(gap.IdealCSFloatSellPriceInPence) / 100;
 
