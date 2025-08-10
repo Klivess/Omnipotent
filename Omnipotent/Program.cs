@@ -75,8 +75,9 @@ namespace Omnipotent
 
                 if (OmniPaths.CheckIfOnServer())
                 {
+                    var lastUpdate = OmniPaths.LastOmnipotentUpdate;
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
-                    ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives("Omnipotent online!");
+                    ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives("Omnipotent online! Last updated: " + lastUpdate.ToString() + "(" + lastUpdate.Humanize() + ")");
                 }
                 if (args.Any())
                 {
