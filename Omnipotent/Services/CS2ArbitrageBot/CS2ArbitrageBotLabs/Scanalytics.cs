@@ -66,9 +66,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < 10)
                     .ToList();
 
-                //Remove all ContainerGaps which are not weapon cases.
+                // Remove all ContainerGaps that do not meet the liquidity requirement of at least 500 items sold in the last 5 days  
+                var fiveDaysAgo = DateTime.UtcNow.AddDays(-5);
                 filteredGaps = filteredGaps
-                    .Where(g => g.csfloatContainer.containerType == ContainerType.WeaponCase).ToList();
+                   .Where(g => g.priceHistory
+                       .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
+                       .Sum(p => p.QuantitySold) >= 500)
+                   .ToList();
+
 
                 // Sort the gaps by Ideal return coefficient  
                 filteredGaps = filteredGaps
