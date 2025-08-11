@@ -329,9 +329,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
         public static double FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
         {
-            var list = dataPoints.Where(k => k.DateTimeRecorded > DateTime.UtcNow.AddDays(-3)); // Filter to last 3 days
-            double lowestprice = list.Select(k => k.PriceInPounds).Min();
-            return lowestprice;
+            double lowestPrice = 0;
+            foreach (var item in dataPoints.OrderBy(k => k.PriceInPounds))
+            {
+                if (item.QuantitySold > 50)
+                {
+                    lowestPrice = item.PriceInPounds;
+                }
+            }
+            return lowestPrice;
         }
         public class LiquiditySearchResult
         {
