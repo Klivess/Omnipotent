@@ -49,7 +49,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 public SteamPriceHistoryDataPoint LastTimeSoldAtThisPriceOrBelow;
             }
         }
-        public async Task<LiquidityPlan> ProduceLiquidityPlanAsync(LiquiditySearchResult liquiditySearchResult)
+        public LiquidityPlan ProduceLiquidityPlanAsync(LiquiditySearchResult liquiditySearchResult)
         {
             LiquidityPlan plan = new();
             try
