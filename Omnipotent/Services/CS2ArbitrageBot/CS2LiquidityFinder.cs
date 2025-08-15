@@ -332,7 +332,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             double lowestPrice = 0;
             foreach (var item in dataPoints.OrderBy(k => k.PriceInPounds))
             {
-                if (item.QuantitySold > 50)
+                if (item.QuantitySold > 50 && item.PriceInPounds < lowestPrice)
                 {
                     lowestPrice = item.PriceInPounds;
                 }

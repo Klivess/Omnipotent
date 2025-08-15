@@ -61,6 +61,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
+            //steamAPIWrapper.profileWrapper.GetSteamBalance();
+
 
             await UpdateAccountInformation();
             MonitorTradeList();

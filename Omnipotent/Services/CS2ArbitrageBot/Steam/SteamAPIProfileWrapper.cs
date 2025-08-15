@@ -10,6 +10,7 @@ using System.Management.Automation;
 using OpenQA.Selenium.Support.UI;
 using OpenQA.Selenium.DevTools;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
+using Microsoft.AspNetCore.Components;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -24,12 +25,85 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             this.parent = parent;
         }
 
-        public async Task SellItem(Scanalytics.PurchasedListing purchasedListing)
+        public struct SteamBalance
         {
-            string url = "https://steamcommunity.com/market/sellitem/";
-            HttpClient client = new();
-            string cookieString = await ProduceCookieString();
-            client.DefaultRequestHeaders.Add("Cookie", cookieString);
+            public float UsableBalanceInPounds;
+            public float PendingBalanceInPounds;
+            public float TotalBalanceInPounds;
+        }
+
+        public async Task<bool> SellItem(Scanalytics.PurchasedListing purchasedListing)
+        {
+            if (await CheckIfCookieStringWorks())
+            {
+                string url = "https://steamcommunity.com/market/sellitem/";
+                HttpClient client = new();
+                string cookieString = await ProduceCookieString();
+                client.DefaultRequestHeaders.Add("Cookie", cookieString);
+                return false;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        public async Task<SteamBalance?> GetSteamBalance()
+        {
+            SteamBalance bal;
+
+            // Initialize Selenium WebDriver  
+            var options = new ChromeOptions();
+            //options.AddArgument("--headless"); // Run in headless mode  
+            IWebDriver driver = new ChromeDriver(options);
+            await LoadSteamCookiesAsync(driver, "https://store.steampowered.com/account/history/");
+            await Task.Delay(10000);
+
+
+
+
+
+            if (await CheckIfCookieStringWorks())
+            {
+                string cookieString = await ProduceCookieString();
+                string url = "https://store.steampowered.com/account/history/";
+                HttpClient client = new();
+                client.DefaultRequestHeaders.Add("Cookie", cookieString);
+                HttpResponseMessage response = await client.GetAsync(url);
+                if (response.IsSuccessStatusCode)
+                {
+                    string content = await response.Content.ReadAsStringAsync();
+                    try
+                    {
+
+
+                        string pendingBalanceString = content.Substring(content.IndexOf(">Pending:"), content.IndexOf(">Pending:") + 15).Replace(">Pending: £", "").Trim();
+                        string usableBalanceString = content.Substring(content.IndexOf("Wallet <b>("), content.IndexOf("Wallet <b>(") + 17).Replace("Wallet <b>(", "").Trim();
+
+                        bal.UsableBalanceInPounds = 0; // Replace with actual parsing logic
+                        bal.PendingBalanceInPounds = 0; // Replace with actual parsing logic
+                        bal.TotalBalanceInPounds = bal.UsableBalanceInPounds + bal.PendingBalanceInPounds;
+                        return bal;
+                    }
+                    catch (Exception ex)
+                    {
+                        parent.parent.ServiceLogError($"Failed to parse Steam balance: {ex.Message}");
+                        (await parent.parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Failed to parse Steam balance HTML. Parser could have finally broken?");
+                        return null;
+                    }
+                }
+                else
+                {
+                    string content = await response.Content.ReadAsStringAsync();
+                    parent.parent.ServiceLogError($"Failed to retrieve Steam balance, status code was not 200. Code: {response.StatusCode} Response: {content}");
+                    return null;
+                }
+            }
+            else
+            {
+                parent.parent.ServiceLogError("Not logged in, so can't get steam balance.");
+                return null;
+            }
         }
 
         public async Task InitialiseLogin()
@@ -50,7 +124,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             // Initialize Selenium WebDriver  
             var options = new ChromeOptions();
-            options.AddArgument("--headless"); // Run in headless mode  
+            //options.AddArgument("--headless"); // Run in headless mode  
             using (IWebDriver driver = new ChromeDriver(options))
             {
                 try
