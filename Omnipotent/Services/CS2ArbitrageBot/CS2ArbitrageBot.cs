@@ -24,6 +24,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private CS2LiquidityFinder liquidityFinder;
         public CSFloatWrapper.CSFloatAccountInformation csfloatAccountInformation;
 
+        public SteamAPIProfileWrapper.SteamBalance? steamBalance;
+
         public static float MinimumPercentReturnToSnipe = 25;
 
         public CS2ArbitrageBot()
@@ -61,8 +63,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
-            //steamAPIWrapper.profileWrapper.GetSteamBalance();
-
+            steamBalance = await steamAPIWrapper.profileWrapper.GetSteamBalance();
 
             await UpdateAccountInformation();
             MonitorTradeList();
@@ -315,6 +316,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             try
             {
                 csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
+                steamBalance = await steamAPIWrapper.profileWrapper.GetSteamBalance();
                 if (csfloatAccountInformation.BalanceInPounds < 2)
                 {
                     await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after insufficient balance in CSFloat Account.", false);
@@ -327,7 +329,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
 
                 ScanResults scanResults = new ScanResults();
-
 
                 //Search highest discounts
                 ScanStrategyResult highestDiscountScanStrategy = new ScanStrategyResult();
@@ -581,7 +582,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    var plan = scanalytics.ProduceLiquidityPlan(scanalytics.GetLatestLiquiditySearchResult());
+                    var plan = scanalytics.ProduceLiquidityPlanAsync(scanalytics.GetLatestLiquiditySearchResult());
                     await request.ReturnResponse(JsonConvert.SerializeObject(plan), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)

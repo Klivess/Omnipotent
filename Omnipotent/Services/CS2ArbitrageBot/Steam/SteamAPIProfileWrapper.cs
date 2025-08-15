@@ -34,11 +34,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
         public async Task<bool> SellItem(Scanalytics.PurchasedListing purchasedListing)
         {
-            if (await CheckIfCookieStringWorks())
+            if (await CheckIfCommunityCookieStringWorks())
             {
                 string url = "https://steamcommunity.com/market/sellitem/";
                 HttpClient client = new();
-                string cookieString = await ProduceCookieString();
+                string cookieString = await ProduceCommunityCookieString();
                 client.DefaultRequestHeaders.Add("Cookie", cookieString);
                 return false;
             }
@@ -51,22 +51,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task<SteamBalance?> GetSteamBalance()
         {
             SteamBalance bal;
-
-            // Initialize Selenium WebDriver  
-            var options = new ChromeOptions();
-            //options.AddArgument("--headless"); // Run in headless mode  
-            IWebDriver driver = new ChromeDriver(options);
-            await LoadSteamCookiesAsync(driver, "https://store.steampowered.com/account/history/");
-            await Task.Delay(10000);
-
-
-
-
-
-            if (await CheckIfCookieStringWorks())
+            if (await CheckIfCommunityCookieStringWorks())
             {
-                string cookieString = await ProduceCookieString();
-                string url = "https://store.steampowered.com/account/history/";
+                string cookieString = await ProduceCommunityCookieString();
+                string url = "https://steamcommunity.com/market/";
                 HttpClient client = new();
                 client.DefaultRequestHeaders.Add("Cookie", cookieString);
                 HttpResponseMessage response = await client.GetAsync(url);
@@ -77,10 +65,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     {
 
 
-                        string pendingBalanceString = content.Substring(content.IndexOf(">Pending:"), content.IndexOf(">Pending:") + 15).Replace(">Pending: £", "").Trim();
-                        string usableBalanceString = content.Substring(content.IndexOf("Wallet <b>("), content.IndexOf("Wallet <b>(") + 17).Replace("Wallet <b>(", "").Trim();
+                        //string pendingBalanceString = content.Substring(content.IndexOf(">Pending:"), content.IndexOf(">Pending:") + 15).Replace(">Pending: £", "").Trim();
+                        string usableBalanceIdentifier = "Wallet balance <span id=\"marketWalletBalanceAmount\">£";
+                        string usableBalanceString = content.Substring(content.IndexOf(usableBalanceIdentifier), 58).Replace(usableBalanceIdentifier, "").Trim();
 
-                        bal.UsableBalanceInPounds = 0; // Replace with actual parsing logic
+                        bal.UsableBalanceInPounds = (float)Convert.ToDouble(usableBalanceString); // Replace with actual parsing logic
                         bal.PendingBalanceInPounds = 0; // Replace with actual parsing logic
                         bal.TotalBalanceInPounds = bal.UsableBalanceInPounds + bal.PendingBalanceInPounds;
                         return bal;
@@ -109,7 +98,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public async Task InitialiseLogin()
         {
             await LoadSteamPassword();
-            if (await CheckIfCookieStringWorks())
+            if (await CheckIfCommunityCookieStringWorks())
             {
                 parent.parent.ServiceLog("Login to Steam via saved cookie is successful.");
             }
@@ -190,7 +179,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         await Task.Delay(5000);
 
                         // Save cookies after successful login  
-                        await SaveSteamCookiesAsync(driver);
+                        await SaveSteamCommunityCookiesAsync(driver);
                         driver.Close();
                         driver.Quit();
                     }
@@ -236,7 +225,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 SteamPassword = password;
             }
         }
-        public async Task SaveSteamCookiesAsync(IWebDriver driver)
+        public async Task SaveSteamCommunityCookiesAsync(IWebDriver driver)
         {
             var cookies = driver.Manage().Cookies.AllCookies;
             string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
@@ -259,7 +248,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             var json = JsonConvert.SerializeObject(cookieList);
             await parent.parent.GetDataHandler().WriteToFile(filePath, json);
         }
-        public async Task LoadSteamCookiesAsync(IWebDriver driver, string gotourl)
+        public async Task LoadSteamCommunityCookiesAsync(IWebDriver driver, string gotourl)
         {
             driver.Navigate().GoToUrl(gotourl); // must visit domain first  
             string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
@@ -284,7 +273,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             driver.Navigate().Refresh();
         }
-        public async Task<string> ProduceCookieString()
+        public async Task<string> ProduceCommunityCookieString()
         {
             string filePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginCookies);
             string data = await parent.parent.GetDataHandler().ReadDataFromFile(filePath);
@@ -300,11 +289,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             return cookieString.Trim();
         }
-        public async Task<bool> CheckIfCookieStringWorks()
+        public async Task<bool> CheckIfCommunityCookieStringWorks()
         {
             string url = "https://steamcommunity.com/market/mylistings?start=0&count=1";
             HttpClient client = new();
-            string cookieString = await ProduceCookieString();
+            string cookieString = await ProduceCommunityCookieString();
             if (string.IsNullOrEmpty(cookieString))
             {
                 return false; // No cookies available
@@ -321,7 +310,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 {
                     parent.parent.ServiceLogError("CheckIfCookieWorks got ratelimited, retrying in 30 seconds...");
                     await Task.Delay(30000);
-                    return await CheckIfCookieStringWorks(); // Retry after delay
+                    return await CheckIfCommunityCookieStringWorks(); // Retry after delay
                 }
                 else
                 {
