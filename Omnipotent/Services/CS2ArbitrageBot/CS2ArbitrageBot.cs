@@ -591,6 +591,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/latestliquidityplan route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/balanceHistory", async (request) =>
+            {
+                try
+                {
+                    var logs = await scanalytics.GetAllLogsOfCSFloatAndSteamBalance();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(logs), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, $"Error in {request.route} route.");
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
         }
     }
 }

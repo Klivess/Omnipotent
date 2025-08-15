@@ -42,6 +42,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
         }
 
+        public async Task<List<CSFloatAndSteamBalance>> GetAllLogsOfCSFloatAndSteamBalance()
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
+            List<CSFloatAndSteamBalance> balances = new();
+            if (Directory.Exists(path))
+            {
+                foreach (string file in Directory.GetFiles(path, "*.json"))
+                {
+                    try
+                    {
+                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
+                        CSFloatAndSteamBalance balance = JsonConvert.DeserializeObject<CSFloatAndSteamBalance>(content);
+                        balances.Add(balance);
+                    }
+                    catch (Exception e)
+                    {
+                        parent.ServiceLogError(e, "Error loading CSFloat and Steam balance log.");
+                    }
+                }
+            }
+            return balances;
+        }
+
         private async Task RecordAccountInfoAsync()
         {
             try

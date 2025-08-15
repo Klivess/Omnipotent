@@ -25,6 +25,7 @@ using DSharpPlus.Entities;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Crypto;
+using Microsoft.PowerShell.Commands;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -59,6 +60,7 @@ namespace Omnipotent.Services.KliveAPI
         }
         public struct UserRequest
         {
+            public string route;
             public HttpListenerContext context;
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
@@ -287,6 +289,7 @@ namespace Omnipotent.Services.KliveAPI
                     NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
                     UserRequest request = new();
                     request.req = req;
+                    request.route = route;
                     request.context = context;
                     request.ParentService = this;
                     StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
