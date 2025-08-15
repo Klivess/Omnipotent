@@ -26,11 +26,79 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             AllPurchasedListingsInHistory = new();
             AllScanResultsInHistory = new List<ScanResults>();
             AllLiquiditySearchesInHistory = new List<LiquiditySearchResult>();
+            SetUpScanalytics();
             LoadScannedComparisons().Wait();
             LoadPurchasedItems().Wait();
             LoadScanResults().Wait();
             LoadLiquiditySearches().Wait();
         }
+
+        private async void SetUpScanalytics()
+        {
+            parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+            if ((await parent.serviceManager.timeManager.GetTask("RecordCSFloatAndSteamBalance")) == null)
+            {
+                RecordAccountInfoAsync();
+            }
+        }
+
+        private async Task RecordAccountInfoAsync()
+        {
+            try
+            {
+                CSFloatAndSteamBalance info = new();
+                parent.csfloatAccountInformation = await parent.csFloatWrapper.GetAccountInformation();
+                info.CSFloatUsableBalanceInPounds = parent.csfloatAccountInformation.BalanceInPounds;
+                info.CSFloatPendingBalanceInPounds = parent.csfloatAccountInformation.PendingBalanceInPounds;
+                info.CSFloatTotalBalanceInPounds = info.CSFloatUsableBalanceInPounds + info.CSFloatPendingBalanceInPounds;
+                SteamAPIProfileWrapper.SteamBalance steamBal = (await parent.steamAPIWrapper.profileWrapper.GetSteamBalance()).Value;
+                info.SteamUsableBalanceInPounds = steamBal.UsableBalanceInPounds;
+                info.SteamPendingBalanceInPounds = steamBal.PendingBalanceInPounds;
+                info.SteamTotalBalanceInPounds = info.SteamUsableBalanceInPounds + info.SteamPendingBalanceInPounds;
+                info.DateTimeOfBalanceRecord = DateTime.Now;
+                info.CSFloatProfileStatistics = parent.csfloatAccountInformation.Statistics;
+                info.CSFloatFee = parent.csfloatAccountInformation.Fee;
+                info.CSFloatWithdrawFee = parent.csfloatAccountInformation.WithdrawFee;
+
+                string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
+                string filename = $"AccountInfo{DateTime.Now.ToString("yyyy-MM-dd")}.json";
+                //Ensure filename's name can actually be saved as a file's name
+                filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+                await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(info, Formatting.Indented));
+                parent.ServiceLog($"Recorded account info: {info.CSFloatUsableBalanceInPounds} CSFloat, {info.SteamUsableBalanceInPounds} Steam.");
+
+                await parent.ServiceCreateScheduledTask(DateTime.Today.AddDays(1).AddHours(12), "RecordCSFloatAndSteamBalance", "CS2ArbitrageLabs", "Record daily balances of CSFloat account and Steam account.", false);
+            }
+            catch (Exception ex)
+            {
+                parent.ServiceLogError(ex, "Error recording account info.");
+                await parent.ServiceCreateScheduledTask(DateTime.Today.AddDays(1).AddHours(12), "RecordCSFloatAndSteamBalance", "CS2ArbitrageLabs", "Record daily balances of CSFloat account and Steam account after an error.", false);
+            }
+        }
+
+        private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
+        {
+            if (e.taskName == "RecordCSFloatAndSteamBalance")
+            {
+                RecordAccountInfoAsync();
+            }
+        }
+
+        public class CSFloatAndSteamBalance
+        {
+            public float CSFloatUsableBalanceInPounds { get; set; }
+            public float CSFloatTotalBalanceInPounds { get; set; }
+            public float CSFloatPendingBalanceInPounds { get; set; }
+            public float SteamUsableBalanceInPounds { get; set; }
+            public float SteamPendingBalanceInPounds { get; set; }
+            public float SteamTotalBalanceInPounds { get; set; }
+
+            public DateTime DateTimeOfBalanceRecord { get; set; }
+            public CSFloatWrapper.Statistics CSFloatProfileStatistics { get; set; }
+            public double CSFloatFee;
+            public double CSFloatWithdrawFee;
+        }
+
 
         public class LiquidityPlan
         {

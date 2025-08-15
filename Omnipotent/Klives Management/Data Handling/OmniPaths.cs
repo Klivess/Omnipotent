@@ -67,6 +67,7 @@ namespace Omnipotent.Data_Handling
             public static string CS2ArbitrageBotPurchasedItemsDirectory = $"{CS2ArbitrageBotLabsDirectory}/PurchasedItems";
             public static string CS2ArbitrageBotScanResultsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScanResults";
             public static string CS2ArbitrageBotLiquiditySearchesDirectory = $"{CS2ArbitrageBotLabsDirectory}/LiquiditySearches";
+            public static string CS2ArbitrageBotDailyAccountInfoDirectory = $"{CS2ArbitrageBotLabsDirectory}/DailyAccountInformation";
 
             //OmniTrader
             public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
