@@ -19,6 +19,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             WeaponCase,
             StickerCapsule,
             AutographCapsule,
+            SouvenirPackage
         }
 
         public struct Container
@@ -73,6 +74,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         else if (weaponCaseList.type == "autograph_capsule")
                         {
                             type = ContainerType.AutographCapsule;
+                        }
+                        else if (weaponCaseList.type == "weapon_case_souvenirpkg")
+                        {
+                            type = ContainerType.SouvenirPackage;
                         }
                         else
                         {
@@ -330,12 +335,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public static double FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
         {
             double lowestPrice = 0;
+            float quantitySoldOverLast5Days = dataPoints
+                .Where(k => k.DateTimeRecorded > DateTime.UtcNow.AddDays(-5))
+                .Sum(k => k.QuantitySold);
             foreach (var item in dataPoints.OrderBy(k => k.PriceInPounds))
             {
-                if (item.QuantitySold > 50 && item.PriceInPounds < lowestPrice)
+                if (item.QuantitySold > (0.05 * quantitySoldOverLast5Days) && item.PriceInPounds < lowestPrice)
                 {
                     lowestPrice = item.PriceInPounds;
                 }
+            }
+            if (dataPoints.OrderByDescending(k => k.DateTimeRecorded).ToList()[0].PriceInPounds < lowestPrice)
+            {
+                lowestPrice = dataPoints.OrderByDescending(k => k.DateTimeRecorded).ToList()[0].PriceInPounds;
             }
             return lowestPrice;
         }

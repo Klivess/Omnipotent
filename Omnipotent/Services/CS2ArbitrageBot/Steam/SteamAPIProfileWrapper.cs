@@ -289,7 +289,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             return cookieString.Trim();
         }
-        public async Task<bool> CheckIfCommunityCookieStringWorks()
+        public async Task<bool> CheckIfCommunityCookieStringWorks(bool reLogin = true)
         {
             string url = "https://steamcommunity.com/market/mylistings?start=0&count=1";
             HttpClient client = new();
@@ -314,13 +314,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 }
                 else
                 {
-                    return false;
+                    if (reLogin)
+                    {
+                        await LoginToSteam();
+                        return await CheckIfCommunityCookieStringWorks();
+                    }
+                    else
+                    {
+                        return false;
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error checking cookie string: {ex.Message}");
-                return false;
+                if (reLogin)
+                {
+                    await LoginToSteam();
+                    return await CheckIfCommunityCookieStringWorks();
+                }
+                else
+                {
+                    return false;
+                }
             }
         }
     }
