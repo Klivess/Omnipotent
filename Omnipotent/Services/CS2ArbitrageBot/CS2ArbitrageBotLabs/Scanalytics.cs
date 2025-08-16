@@ -154,7 +154,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 // Remove all ContainerGaps with a steam price greater than half of the current steamwallet balance.  
                 filteredGaps = filteredGaps
-                    .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < (parent.steamBalance.Value.UsableBalanceInPounds / 2))
+                    .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < (40))
                     .ToList();
 
                 // Remove all ContainerGaps that do not meet the liquidity requirement of at least 500 items sold in the last 5 days  
