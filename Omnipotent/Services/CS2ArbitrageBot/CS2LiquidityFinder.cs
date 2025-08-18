@@ -151,7 +151,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     gap.priceHistory = await GetPriceHistoryOfSteamItem(item.MarketHashName);
                     try
                     {
-                        gap.IdealPriceToPurchaseOnSteamInPounds = FindIdealPriceToPlaceBuyOrder(gap.priceHistory);
+                        gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds / 1.05;
 
                     }
                     catch (Exception x)
