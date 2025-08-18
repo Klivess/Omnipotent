@@ -67,7 +67,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
                         //string pendingBalanceString = content.Substring(content.IndexOf(">Pending:"), content.IndexOf(">Pending:") + 15).Replace(">Pending: £", "").Trim();
                         string usableBalanceIdentifier = "Wallet balance <span id=\"marketWalletBalanceAmount\">£";
-                        string usableBalanceString = content.Substring(content.IndexOf(usableBalanceIdentifier), 58).Replace(usableBalanceIdentifier, "").Trim();
+                        string usableBalanceString = content.Substring(content.IndexOf(usableBalanceIdentifier));
+                        usableBalanceString = usableBalanceString.Substring(0, usableBalanceString.IndexOf("</span>")).Replace(usableBalanceIdentifier, "").Trim();
 
                         bal.UsableBalanceInPounds = (float)Convert.ToDouble(usableBalanceString); // Replace with actual parsing logic
                         bal.PendingBalanceInPounds = 0; // Replace with actual parsing logic
