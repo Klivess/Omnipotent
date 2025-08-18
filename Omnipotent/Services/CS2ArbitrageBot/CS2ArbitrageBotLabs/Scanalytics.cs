@@ -174,7 +174,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 // Sort the gaps by Ideal return coefficient  
                 filteredGaps = filteredGaps
-                    .OrderByDescending(g => g.ReturnCoefficientFromSteamtoCSFloat)
+                    .OrderByDescending(g => g.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded)
                     .ToList();
 
 
