@@ -7,6 +7,7 @@ namespace Omnipotent.Services.MemeScraper
 {
     public class MemeScraper : OmniService
     {
+        MemeScraperSources SourceManager;
         public MemeScraper()
         {
             name = "MemeScraper";
@@ -14,6 +15,10 @@ namespace Omnipotent.Services.MemeScraper
         }
         protected override async void ServiceMain()
         {
+            SourceManager = new MemeScraperSources(this);
+
+
+
 
         }
     }

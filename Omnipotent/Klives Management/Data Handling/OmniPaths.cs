@@ -72,6 +72,15 @@ namespace Omnipotent.Data_Handling
             //OmniTrader
             public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
             public static string OmniTraderAPIKey = $"{OmniTraderDirectory}/Trading212APIKey.txt";
+
+            //Meme Scraper 
+            public static string MemeScraperDirectory = $"{SavedDataDirectory}/MemeScraper";
+            public static string MemeScraperInstagramDirectory = $"{MemeScraperDirectory}/Instagram";
+            public static string MemeScraperInstagramSourcesDirectory = $"{MemeScraperInstagramDirectory}/InstagramSources";
+            public static string MemeScraperReelsVideoDirectory = $"{MemeScraperInstagramDirectory}/Media";
+            public static string MemeScraperReelsDataDirectory = $"{MemeScraperInstagramDirectory}/Reels";
+            public static string MemeScraperPostsDataDirectory = $"{MemeScraperInstagramDirectory}/Posts";
+
         };
 
         public static string GetPath(string path)
