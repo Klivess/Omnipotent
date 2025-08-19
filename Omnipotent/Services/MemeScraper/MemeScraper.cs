@@ -108,7 +108,7 @@ namespace Omnipotent.Services.MemeScraper
                     string username = jsonData.username;
                     bool DownloadReels = jsonData.downloadReels ?? false;
                     bool DownloadPosts = jsonData.downloadPosts ?? false;
-                    List<string> niches = new(); -
+                    List<string> niches = new();
                     foreach (var item in jsonData.niches)
                     {
                         niches.Add(item.ToString());
