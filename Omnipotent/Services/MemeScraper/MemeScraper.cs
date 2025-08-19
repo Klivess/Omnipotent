@@ -155,6 +155,21 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/deleteSource", async (request) =>
+            {
+                try
+                {
+                    string id = request.userParameters["accountID"];
+                    bool deleteAssociatedMemes = request.userParameters["deleteAssociatedMemes"] == "true";
+                    await request.ReturnResponse("OK");
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, $"Error in {request.route} route.");
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
         }
     }
 }
