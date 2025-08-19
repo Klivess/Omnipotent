@@ -80,6 +80,7 @@ namespace Omnipotent.Service_Manager
             task.randomidentifier = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             task.dateTimeSet = DateTime.Now;
             task.timeID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
+            task.PassableData = passableData;
             //If task with identical taskName exists, replace it.
             var existingTasks = tasks.Where(k => k.taskName.ToLower() == task.taskName.ToLower()).ToList();
             foreach (var existingTask in existingTasks)
