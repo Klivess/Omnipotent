@@ -126,41 +126,49 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 var getallWeaponCases = await GetAllWeaponCasePricesInPoundsOnCSFloat();
                 foreach (var item in getallWeaponCases)
                 {
-                    ContainerGap gap;
-                    SteamAPIWrapper.ItemListing listing = await parent.steamAPIWrapper.GetItemOnMarket(item.MarketHashName);
-                    gap.csfloatContainer = item;
-                    gap.steamListing = listing;
-                    double returnCoefficient = 0;
-                    returnCoefficient = Convert.ToDouble(item.PriceInPounds / listing.CheapestSellOrderPriceInPounds);
-                    gap.ReturnCoefficientFromSteamtoCSFloat = returnCoefficient;
-
-                    //If the return coefficient is Infinity, break this iteration and continue
-                    if (double.IsInfinity(returnCoefficient) || double.IsNaN(returnCoefficient))
-                    {
-                        parent.ServiceLogError($"Return coefficient for {item.MarketHashName} is Infinity or NaN, skipping this item.");
-                        continue;
-                    }
-                    gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
-                    //Linear regression has shown this to be the best fit for the CSFloat price prediction
-                    //                              y=1.09215x+0.000318599
-                    //nvm dont use linear regression line       
-                    gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(item.PriceInCents * 1.05);
-                    gap.IdealCSFloatSellPriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(gap.IdealCSFloatSellPriceInCents * parent.ExchangeRate)));
-                    gap.IdealCSFloatSellPriceInPounds = Convert.ToDouble(gap.IdealCSFloatSellPriceInPence) / 100;
-
-                    gap.priceHistory = await GetPriceHistoryOfSteamItem(item.MarketHashName);
                     try
                     {
-                        gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds / 1.05;
+                        ContainerGap gap;
+                        SteamAPIWrapper.ItemListing listing = await parent.steamAPIWrapper.GetItemOnMarket(item.MarketHashName);
+                        gap.csfloatContainer = item;
+                        gap.steamListing = listing;
+                        double returnCoefficient = 0;
+                        returnCoefficient = Convert.ToDouble(item.PriceInPounds / listing.CheapestSellOrderPriceInPounds);
+                        gap.ReturnCoefficientFromSteamtoCSFloat = returnCoefficient;
 
+                        //If the return coefficient is Infinity, break this iteration and continue
+                        if (double.IsInfinity(returnCoefficient) || double.IsNaN(returnCoefficient))
+                        {
+                            parent.ServiceLogError($"Return coefficient for {item.MarketHashName} is Infinity or NaN, skipping this item.");
+                            continue;
+                        }
+                        gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
+                        //Linear regression has shown this to be the best fit for the CSFloat price prediction
+                        //                              y=1.09215x+0.000318599
+                        //nvm dont use linear regression line       
+                        gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(item.PriceInCents * 1.05);
+                        gap.IdealCSFloatSellPriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(gap.IdealCSFloatSellPriceInCents * parent.ExchangeRate)));
+                        gap.IdealCSFloatSellPriceInPounds = Convert.ToDouble(gap.IdealCSFloatSellPriceInPence) / 100;
+
+                        gap.priceHistory = await GetPriceHistoryOfSteamItem(item.MarketHashName);
+                        try
+                        {
+                            gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds / 1.05;
+
+                        }
+                        catch (Exception x)
+                        {
+                            gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds;
+                        }
+                        gap.IdealReturnCoefficientFromSteamtoCSFloat = Convert.ToDouble(gap.csfloatContainer.PriceInPounds / gap.IdealPriceToPurchaseOnSteamInPounds);
+                        gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded = gap.IdealReturnCoefficientFromSteamtoCSFloat / 1.02;
+                        gaps.Add(gap);
                     }
-                    catch (Exception x)
+                    catch (Exception ex)
                     {
-                        gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds;
+                        parent.ServiceLogError(ex, $"Error processing item: {item.MarketHashName}");
+                        continue; // Skip this item if there's an error
                     }
-                    gap.IdealReturnCoefficientFromSteamtoCSFloat = Convert.ToDouble(gap.csfloatContainer.PriceInPounds / gap.IdealPriceToPurchaseOnSteamInPounds);
-                    gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded = gap.IdealReturnCoefficientFromSteamtoCSFloat / 1.02;
-                    gaps.Add(gap);
                 }
 
                 // Analytics

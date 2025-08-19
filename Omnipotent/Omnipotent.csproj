@@ -49,6 +49,7 @@
 
 	<ItemGroup>
 	  <Folder Include="Services\KlivePuppet\" />
+	  <Folder Include="Services\OmniTube\" />
 	  <Folder Include="Services\OmniTrader\Strategies\" />
 	</ItemGroup>
 
