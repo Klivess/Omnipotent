@@ -65,7 +65,7 @@ namespace Omnipotent.Services.MemeScraper
         public async Task SaveNiche(Niche niche)
         {
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory), "Niche" + niche.NicheTagName + ".json");
-            await parent.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(niche, Formatting.Indented))
+            await parent.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(niche, Formatting.Indented));
         }
 
         public async Task LoadNiches()
