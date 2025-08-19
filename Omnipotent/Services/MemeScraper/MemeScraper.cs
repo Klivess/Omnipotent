@@ -135,6 +135,18 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/getAllSources", async (request) =>
+            {
+                try
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(SourceManager.InstagramSources), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, $"Error in {request.route} route.");
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
         }
     }
 }
