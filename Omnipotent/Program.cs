@@ -16,6 +16,7 @@ using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveCloud;
 using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.KliveTechHub;
+using Omnipotent.Services.MemeScraper;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
 using Omnipotent.Services.OmniStartupManager;
@@ -58,6 +59,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveCloud());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLLM());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new MemeScraper());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
