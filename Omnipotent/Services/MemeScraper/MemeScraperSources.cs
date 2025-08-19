@@ -24,6 +24,7 @@ namespace Omnipotent.Services.MemeScraper
         }
         public class Source
         {
+            public string SourceID;
             public int MemesCollectedTotal;
             public int VideoMemesCollectedTotal;
             public int ImageMemesCollectedTotal;
@@ -155,6 +156,7 @@ namespace Omnipotent.Services.MemeScraper
 
                         string content = body.Body;
                         dynamic jsonData = JsonConvert.DeserializeObject(content);
+                        source.SourceID = Guid.NewGuid().ToString();
                         source.Username = jsonData.data.profile.username;
                         source.AccountID = jsonData.data.profile.id;
                         source.Followers = jsonData.data.profile.edge_followed_by.count;
@@ -215,6 +217,29 @@ namespace Omnipotent.Services.MemeScraper
             catch (Exception ex)
             {
                 return null; // Return null if an error occurs
+            }
+        }
+
+        public async Task DeleteInstagramSource(InstagramSource source, bool DeleteAssociatedMemes)
+        {
+            string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory), source.AccountID + ".json");
+            InstagramSources.RemoveAt(InstagramSources.Select(k => k.AccountID).ToList().IndexOf(source.AccountID));
+            parent.GetDataHandler().DeleteFile(filePath);
+            if (DeleteAssociatedMemes)
+            {
+                // Delete all associated memes
+                foreach (var memePath in source.PathsOfAllMemes)
+                {
+                    parent.mediaManager.allScrapedReels.RemoveAll(k => k.InstagramReelFilePath == memePath);
+                    string pth = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, memePath);
+                    string reelData = await parent.GetDataHandler().ReadDataFromFile(pth);
+                    InstagramScrapeUtilities.InstagramReel reel = JsonConvert.DeserializeObject<InstagramScrapeUtilities.InstagramReel>(reelData);
+                    if (File.Exists(pth))
+                    {
+                        parent.GetDataHandler().DeleteDirectory(reel.InstagramReelFilePath);
+                        parent.GetDataHandler().DeleteFile(pth);
+                    }
+                }
             }
         }
     }

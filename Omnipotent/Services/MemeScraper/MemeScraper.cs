@@ -13,9 +13,9 @@ namespace Omnipotent.Services.MemeScraper
 {
     public class MemeScraper : OmniService
     {
-        MemeScraperSources SourceManager;
-        InstagramScrapeUtilities instagramScrapeUtilities;
-        MemeScraperMedia mediaManager;
+        public MemeScraperSources SourceManager;
+        public InstagramScrapeUtilities instagramScrapeUtilities;
+        public MemeScraperMedia mediaManager;
         public MemeScraper()
         {
             name = "MemeScraper";
@@ -66,7 +66,6 @@ namespace Omnipotent.Services.MemeScraper
                         string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory), $"ReelMedia{reel.PostID}{fileExtension}");
                         await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
                         reel.DateTimeReelDownloaded = DateTime.Now;
-                        reel.InstagramReelFilePath = $"ReelMedia{reel.PostID}{fileExtension}";
 
                         //Update Source
                         source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
@@ -75,6 +74,8 @@ namespace Omnipotent.Services.MemeScraper
                         source.LastScraped = DateTime.Now;
 
                         //Save Reel Data
+                        string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
+                        reel.InstagramReelFilePath = dataPath;
                         mediaManager.allScrapedReels.Add(reel);
                         await mediaManager.SaveInstagramReel(reel);
 
@@ -143,7 +144,7 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/getAllSources", async (request) =>
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/getAllInstagramSources", async (request) =>
             {
                 try
                 {
@@ -155,12 +156,16 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/deleteSource", async (request) =>
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/deleteInstagramSource", async (request) =>
             {
                 try
                 {
-                    string id = request.userParameters["accountID"];
+                    string id = request.userParameters["sourceAccountID"];
                     bool deleteAssociatedMemes = request.userParameters["deleteAssociatedMemes"] == "true";
+
+                    var source = SourceManager.GetInstagramSourceByID(id);
+                    SourceManager.DeleteInstagramSource(source, deleteAssociatedMemes);
+
                     await request.ReturnResponse("OK");
                 }
                 catch (Exception e)
