@@ -38,7 +38,7 @@ namespace Omnipotent.Services.MemeScraper
         {
             public string Username;
             public int Followers;
-            public int AccountID;
+            public string AccountID;
             public string FullName;
             public string ProfilePictureUrl;
             public string Bio;
@@ -206,7 +206,7 @@ namespace Omnipotent.Services.MemeScraper
             return source;
         }
 
-        public InstagramSource GetInstagramSourceByID(int id)
+        public InstagramSource GetInstagramSourceByID(string id)
         {
             try
             {
