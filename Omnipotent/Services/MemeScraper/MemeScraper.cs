@@ -85,6 +85,7 @@ namespace Omnipotent.Services.MemeScraper
                         SourceManager.UpdateInstagramSource(source);
                     }
                 }
+                ServiceLog($"Finished scraping Instagram account {source.Username} for reels.", true);
                 ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.AccountID,
                     "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
             }
