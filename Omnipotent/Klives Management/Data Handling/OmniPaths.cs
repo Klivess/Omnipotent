@@ -75,6 +75,7 @@ namespace Omnipotent.Data_Handling
 
             //Meme Scraper 
             public static string MemeScraperDirectory = $"{SavedDataDirectory}/MemeScraper";
+            public static string MemeScraperNichesDirectory = $"{MemeScraperDirectory}/Niches";
             public static string MemeScraperInstagramDirectory = $"{MemeScraperDirectory}/Instagram";
             public static string MemeScraperInstagramSourcesDirectory = $"{MemeScraperInstagramDirectory}/InstagramSources";
             public static string MemeScraperReelsVideoDirectory = $"{MemeScraperInstagramDirectory}/Media";

@@ -33,8 +33,10 @@ namespace Omnipotent.Services.MemeScraper
             public string VideoDownloadURL;
             public int CommentCount;
             public string Description;
-            public string? InstagramReelFilePath;
             public string ShortCode;
+
+            public string? InstagramReelFilePath;
+            public DateTime DateTimeReelDownloaded;
         }
 
         public async Task<List<InstagramReel>> AllInstagramProfileReelDownloadsLinksAsync(string username)

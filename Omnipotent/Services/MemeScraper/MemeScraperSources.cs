@@ -14,6 +14,7 @@ namespace Omnipotent.Services.MemeScraper
     {
         MemeScraper parent;
         public List<InstagramSource> InstagramSources;
+        public List<Niche> AllNiches;
         public MemeScraperSources(MemeScraper parent)
         {
             this.parent = parent;
@@ -60,6 +61,32 @@ namespace Omnipotent.Services.MemeScraper
             public DateTime CreatedAt;
             public DateTime LastUpdated;
         }
+
+        public async Task SaveNiche(Niche niche)
+        {
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory), "Niche" + niche.NicheTagName + ".json");
+            await parent.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(niche, Formatting.Indented))
+        }
+
+        public async Task LoadNiches()
+        {
+            AllNiches = new List<Niche>();
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory);
+            string[] files = Directory.GetFiles(path, "*.json");
+            foreach (var file in files)
+            {
+                try
+                {
+                    string content = await parent.GetDataHandler().ReadDataFromFile(file);
+                    Niche niche = JsonConvert.DeserializeObject<Niche>(content);
+                    AllNiches.Add(niche);
+                }
+                catch (Exception ex)
+                {
+                    parent.ServiceLogError($"Error loading niche from file {file}: {ex.Message}");
+                }
+            }
+        }
         public async Task LoadAllInstagramSources()
         {
             var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory));
@@ -84,6 +111,19 @@ namespace Omnipotent.Services.MemeScraper
         {
             string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory), source.AccountID + ".json");
             await parent.GetDataHandler().WriteToFile(filePath, JsonConvert.SerializeObject(source, Formatting.Indented));
+        }
+
+        public async Task UpdateInstagramSource(InstagramSource source)
+        {
+            //Replace the existing source in the list if it exists
+            var existingSource = InstagramSources.FirstOrDefault(s => s.AccountID == source.AccountID);
+            if (existingSource != null)
+            {
+                InstagramSources.Remove(existingSource);
+            }
+            InstagramSources.Add(source);
+            //Save the updated source to file
+            await SaveInstagramSource(source);
         }
         public async Task<InstagramSource> ProduceNewInstagramSource(string username, bool DownloadReels, bool DownloadPosts, List<Niche> Niches)
         {
@@ -158,8 +198,23 @@ namespace Omnipotent.Services.MemeScraper
             }
             await SaveInstagramSource(source);
             InstagramSources.Add(source);
+
+            await parent.ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
+
             driver.Quit();
             return source;
+        }
+
+        public InstagramSource GetInstagramSourceByID(int id)
+        {
+            try
+            {
+                return InstagramSources.Where(k => k.AccountID == id).ToArray()[0];
+            }
+            catch (Exception ex)
+            {
+                return null; // Return null if an error occurs
+            }
         }
     }
 }
