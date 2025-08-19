@@ -19,6 +19,7 @@ namespace Omnipotent.Services.MemeScraper
         {
             this.parent = parent;
             InstagramSources = new List<InstagramSource>();
+            AllNiches = new List<Niche>();
             LoadAllInstagramSources().Wait();
         }
         public class Source
