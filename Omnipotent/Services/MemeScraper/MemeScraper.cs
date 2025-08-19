@@ -54,8 +54,10 @@ namespace Omnipotent.Services.MemeScraper
             {
                 if (source.DownloadReels)
                 {
+                    ServiceLog($"Starting to scrape Instagram account {source.Username} for reels.");
                     List<InstagramScrapeUtilities.InstagramReel> reels = await instagramScrapeUtilities.AllInstagramProfileReelDownloadsLinksAsync(source.Username);
                     reels = reels.Where(k => mediaManager.allScrapedReels.Select(x => x.PostID).Contains(k.PostID)).ToList();
+                    ServiceLog($"Found {reels.Count} reels to download from {source.Username}.", true);
                     foreach (var reel in reels)
                     {
                         WebClient wc = new();
@@ -83,12 +85,14 @@ namespace Omnipotent.Services.MemeScraper
                         SourceManager.UpdateInstagramSource(source);
                     }
                 }
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.AccountID,
+                    "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "Error scraping Instagram account", true);
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping", $"Go through all of {source.Username} posts and download them after an error.", false, source.AccountID);
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping",
+                    $"Go through all of {source.Username} posts and download them after an error.", false, source.AccountID);
             }
         }
 
