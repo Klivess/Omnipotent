@@ -111,7 +111,7 @@ namespace Omnipotent.Services.MemeScraper
                     List<string> niches = new();
                     foreach (var item in jsonData.niches)
                     {
-                        niches.Add(item);
+                        niches.Add(item.ToString());
                     }
                     List<MemeScraperSources.Niche> nichesList = new();
                     foreach (var niche in niches)
