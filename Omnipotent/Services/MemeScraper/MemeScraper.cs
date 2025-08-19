@@ -118,16 +118,20 @@ namespace Omnipotent.Services.MemeScraper
                         }
                         else
                         {
-                            nichesList.Add(new MemeScraperSources.Niche
+                            var nichey = new MemeScraperSources.Niche
                             {
                                 NicheTagName = niche,
                                 CreatedAt = DateTime.Now,
                                 LastUpdated = DateTime.Now
-                            });
+                            };
+                            await SourceManager.SaveNiche(nichey);
+                            SourceManager.AllNiches.Add(nichey);
+                            nichesList.Add(nichey);
                         }
-                        SourceManager.ProduceNewInstagramSource(username, DownloadReels, DownloadPosts, nichesList);
-                        await request.ReturnResponse("Instagram source being added.", code: HttpStatusCode.OK);
                     }
+                    SourceManager.ProduceNewInstagramSource(username, DownloadReels, DownloadPosts, nichesList);
+                    await request.ReturnResponse("Instagram source being added.", code: HttpStatusCode.OK);
+
                 }
                 catch (Exception e)
                 {
