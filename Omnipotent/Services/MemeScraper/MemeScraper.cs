@@ -173,7 +173,7 @@ namespace Omnipotent.Services.MemeScraper
                     await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Get, KMPermissions.Manager);
 
         }
     }
