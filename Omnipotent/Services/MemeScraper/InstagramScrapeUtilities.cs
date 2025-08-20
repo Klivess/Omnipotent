@@ -1,4 +1,5 @@
-﻿using Newtonsoft.Json;
+﻿using LangChain.Extensions;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using OpenQA.Selenium;
@@ -7,6 +8,7 @@ using OpenQA.Selenium.DevTools;
 using OpenQA.Selenium.DevTools.V138.Network;
 using OpenQA.Selenium.Support.UI;
 using System.Diagnostics;
+using System.Management.Automation;
 using System.Text.Json;
 using System.Xml.Linq;
 
@@ -45,7 +47,7 @@ namespace Omnipotent.Services.MemeScraper
             try
             {
                 ChromeOptions options = new ChromeOptions();
-                options.AddArgument("--headless"); // Run in headless mode
+                options.AddArgument("--headless"); // Run in headless mode  
                 var driver = new ChromeDriver(options);
                 driver.Navigate().GoToUrl($"https://inflact.com/instagram-downloader?profile={username}/");
 
@@ -55,11 +57,12 @@ namespace Omnipotent.Services.MemeScraper
                 await network.Enable(new EnableCommandSettings());
 
                 Stopwatch st = Stopwatch.StartNew();
-
+                int counter = 0;
                 network.ResponseReceived += async (sender, e) =>
                 {
-                    if (e.Response.Url.Contains("https://inflact.com/downloader/api/downloader/reels/"))
+                    if (e.Response.Url.Contains("reels"))
                     {
+                        counter++;
                         try
                         {
                             InstagramReel reel = new();
@@ -68,66 +71,95 @@ namespace Omnipotent.Services.MemeScraper
                             {
                                 RequestId = e.RequestId
                             });
-                            try
+                            string content = body.Body;
+                            dynamic jsonData = JsonConvert.DeserializeObject(content);
+                            foreach (var item in jsonData.data.reels)
                             {
-                                string content = body.Body;
-                                dynamic jsonData = JsonConvert.DeserializeObject(content);
-                                foreach (var item in jsonData.data.reels)
+                                try
                                 {
                                     string se = JsonConvert.SerializeObject(item);
                                     reel.PostID = item.post_id;
                                     reel.OwnerUsername = item.owner.username;
                                     reel.OwnerID = item.owner.id;
                                     reel.ViewCount = item.videoViewCount;
-                                    reel.CreatedAt = OmniPaths.EpochMsToDateTime(item.created_at);
+                                    reel.CreatedAt = OmniPaths.EpochSToDateTime(Convert.ToString(item.created_at));
                                     reel.ShortCode = item.shortCode;
                                     reel.ShortURL = $"https://www.instagram.com/reels/{reel.ShortCode}/";
                                     reel.VideoDownloadURL = item.url;
                                     reel.CommentCount = item.comment_count;
                                     reel.Description = item.description;
                                     string url = item.url;
-                                    if (reels.Select(k => k.PostID).Contains(reel.PostID))
-                                    {
-                                        continue; // Skip if the link already exists
-                                    }
-                                    reels.Add(reel);
                                     st.Restart();
+                                    if (!reels.Any(r => r.ShortCode == reel.ShortCode))
+                                    {
+                                        reels.Add(reel);
+                                    }
                                 }
-                            }
-                            catch (Exception ex)
-                            {
+                                catch (Exception ex)
+                                {
+                                    parent.ServiceLogError(ex, "Error deserialising reel info", false);
+                                }
                             }
                         }
                         catch (Exception ex)
                         {
-                            //parent.ServiceLogError($"Error processing GetReelLinks response: {ex.Message}");
+                            parent.ServiceLogError($"Error processing GetReelLinks response: {ex.Message}");
+
                         }
                     }
                 };
-
-                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(10));
-                wait.Until(d => d.FindElement(By.ClassName("input-main")));
                 await Task.Delay(5000);
-
-
-                var viewAllButton = driver.FindElement(By.CssSelector("div.StyledBtn-sc-1ygbkhl.kYFPxn.Btn-sc-1knupfx.gOCeBO[data-test-id='profile-reels-view-all']"));
-                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", viewAllButton);
-                await Task.Delay(2000);
+                var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(120));
+                while (true)
+                {
+                    await Task.Delay(1000); // Wait and retry
+                    var viewAllButton = wait.Until(d =>
+                    {
+                        try
+                        {
+                            return d.FindElement(By.CssSelector("div.StyledBtn-sc-1ygbkhl.kYFPxn.Btn-sc-1knupfx.gOCeBO[data-test-id='profile-reels-view-all']"));
+                        }
+                        catch (NoSuchElementException)
+                        {
+                            return null; // Retry until the element is found
+                        }
+                    });
+                    if (viewAllButton != null)
+                    {
+                        ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", viewAllButton);
+                        break;
+                    }
+                }
                 st.Restart();
                 while (true)
                 {
                     try
                     {
-                        var viewMoreButton = driver.FindElement(By.CssSelector("div.StyledBtn-sc-1ygbkhl.hzXvLs.Btn-sc-1knupfx.gOCeBO"));
-                        ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", viewMoreButton);
-                        await Task.Delay(5000);
+                        var viewMoreButton = wait.Until(d =>
+                        {
+                            var button = d.FindElements(By.CssSelector("div.StyledBtn-sc-1ygbkhl.hzXvLs.Btn-sc-1knupfx.gOCeBO")).FirstOrDefault();
+                            var loadingSvg = button?.FindElements(By.CssSelector("svg.is-spin")).FirstOrDefault();
+
+                            // Return the button only if it's not in a loading state  
+                            return loadingSvg == null ? button : null;
+                        });
+
+                        if (viewMoreButton == null)
+                        {
+                            // Break out if the button no longer exists or is not found  
+                            break;
+                        }
+
+                            // Click the button once it's ready  
+                            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", viewMoreButton);
+                        await Task.Delay(1000);
                     }
-                    catch (NoSuchElementException e)
+                    catch (WebDriverTimeoutException)
                     {
+                        // Break out if the button no longer exists  
                         break;
                     }
                 }
-
                 while (st.Elapsed.TotalSeconds < 20)
                 {
                     await Task.Delay(1000);
@@ -140,7 +172,10 @@ namespace Omnipotent.Services.MemeScraper
                 parent.ServiceLogError($"Error in AllInstagramProfileReelDownloadsLinksAsync: {ex.Message}");
             }
 
+
+
             return reels;
+
         }
     }
 }

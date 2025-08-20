@@ -155,6 +155,11 @@ namespace Omnipotent.Data_Handling
         {
             return DateTimeOffset.FromUnixTimeMilliseconds(long.Parse(epochMs)).UtcDateTime;
         }
+
+        public static DateTime EpochSToDateTime(string epochS)
+        {
+            return DateTimeOffset.FromUnixTimeSeconds(long.Parse(epochS)).UtcDateTime;
+        }
     }
 
 }

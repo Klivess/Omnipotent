@@ -58,7 +58,7 @@ namespace Omnipotent.Services.MemeScraper
                     List<InstagramScrapeUtilities.InstagramReel> reels = await instagramScrapeUtilities.AllInstagramProfileReelDownloadsLinksAsync(source.Username);
                     reels = reels.Where(k => mediaManager.allScrapedReels.Select(x => x.PostID).Contains(k.PostID)).ToList();
                     ServiceLog($"Found {reels.Count} reels to download from {source.Username}.", true);
-                    foreach (var reel in reels)
+                    await Parallel.ForEachAsync(reels, async (reel, token) =>
                     {
                         WebClient wc = new();
                         // Parse filetype from reel.VideoDownloadURL url  
@@ -83,7 +83,7 @@ namespace Omnipotent.Services.MemeScraper
 
                         //Save Source Data
                         SourceManager.UpdateInstagramSource(source);
-                    }
+                    });
                 }
                 ServiceLog($"Finished scraping Instagram account {source.Username} for reels.", true);
                 ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.AccountID,
