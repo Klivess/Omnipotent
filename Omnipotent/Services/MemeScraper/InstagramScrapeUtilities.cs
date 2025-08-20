@@ -7,6 +7,7 @@ using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.DevTools;
 using OpenQA.Selenium.DevTools.V138.Network;
 using OpenQA.Selenium.Support.UI;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Management.Automation;
 using System.Text.Json;
@@ -43,7 +44,8 @@ namespace Omnipotent.Services.MemeScraper
 
         public async Task<List<InstagramReel>> AllInstagramProfileReelDownloadsLinksAsync(string username)
         {
-            List<InstagramReel> reels = new();
+            ConcurrentBag<string> reqIDs = new();
+            ConcurrentBag<InstagramReel> reels = new();
             try
             {
                 ChromeOptions options = new ChromeOptions();
@@ -66,6 +68,12 @@ namespace Omnipotent.Services.MemeScraper
                         try
                         {
                             InstagramReel reel = new();
+                            //Check if we have already processed this request
+                            if (reqIDs.Contains(e.RequestId))
+                            {
+                                return; // Skip if we've already processed this request
+                            }
+                            reqIDs.Add(e.RequestId); // Add the request ID to the set to avoid duplicates
                             await Task.Delay(2500);
                             var body = await network.GetResponseBody(new GetResponseBodyCommandSettings
                             {
@@ -77,7 +85,6 @@ namespace Omnipotent.Services.MemeScraper
                             {
                                 try
                                 {
-                                    string se = JsonConvert.SerializeObject(item);
                                     reel.PostID = item.post_id;
                                     reel.OwnerUsername = item.owner.username;
                                     reel.OwnerID = item.owner.id;
@@ -90,20 +97,17 @@ namespace Omnipotent.Services.MemeScraper
                                     reel.Description = item.description;
                                     string url = item.url;
                                     st.Restart();
-                                    if (!reels.Any(r => r.ShortCode == reel.ShortCode))
-                                    {
-                                        reels.Add(reel);
-                                    }
+                                    reels.Add(reel);
                                 }
-                                catch (Exception ex)
+                                catch (Exception g)
                                 {
-                                    parent.ServiceLogError(ex, "Error deserialising reel info", false);
+                                    parent.ServiceLogError(g, "Error deserialising reel info", false);
                                 }
                             }
                         }
-                        catch (Exception ex)
+                        catch (Exception t)
                         {
-                            parent.ServiceLogError($"Error processing GetReelLinks response: {ex.Message}");
+                            parent.ServiceLogError(t, "Error processing AllInstagramProfileReelDownloadsLinksAsync response.");
 
                         }
                     }
@@ -173,8 +177,10 @@ namespace Omnipotent.Services.MemeScraper
             }
 
 
+            //remove duplicates
+            var uniqueReels = reels.GroupBy(r => r.PostID).Select(g => g.First());
 
-            return reels;
+            return uniqueReels.ToList();
 
         }
     }
