@@ -114,7 +114,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             // Initialize Selenium WebDriver  
             var options = new ChromeOptions();
-            //options.AddArgument("--headless"); // Run in headless mode  
+            options.AddArgument("--headless"); // Run in headless mode  
             using (IWebDriver driver = new ChromeDriver(options))
             {
                 try

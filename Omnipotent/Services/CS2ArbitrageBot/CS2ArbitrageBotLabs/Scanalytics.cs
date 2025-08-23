@@ -18,7 +18,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<ScanResults> AllScanResultsInHistory;
         public List<LiquiditySearchResult> AllLiquiditySearchesInHistory;
         private CS2ArbitrageBot parent;
-        public double expectedSteamToCSFloatConversionPercentage = 0.84;
+        public double expectedSteamToCSFloatConversionPercentage = 0.7;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;

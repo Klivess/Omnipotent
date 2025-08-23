@@ -26,7 +26,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         public SteamAPIProfileWrapper.SteamBalance? steamBalance;
 
-        public static float MinimumPercentReturnToSnipe = 25;
+        public static float MinimumPercentReturnToSnipe = 10;
 
         public CS2ArbitrageBot()
         {

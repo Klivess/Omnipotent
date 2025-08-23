@@ -49,7 +49,7 @@ namespace Omnipotent.Services.MemeScraper
             try
             {
                 ChromeOptions options = new ChromeOptions();
-                options.AddArgument("--headless"); // Run in headless mode  
+                //options.AddArgument("--headless"); // Run in headless mode  
                 var driver = new ChromeDriver(options);
                 driver.Navigate().GoToUrl($"https://inflact.com/instagram-downloader?profile={username}/");
 
@@ -64,16 +64,9 @@ namespace Omnipotent.Services.MemeScraper
                 {
                     if (e.Response.Url.Contains("reels"))
                     {
-                        counter++;
                         try
                         {
                             InstagramReel reel = new();
-                            //Check if we have already processed this request
-                            if (reqIDs.Contains(e.RequestId))
-                            {
-                                return; // Skip if we've already processed this request
-                            }
-                            reqIDs.Add(e.RequestId); // Add the request ID to the set to avoid duplicates
                             await Task.Delay(2500);
                             var body = await network.GetResponseBody(new GetResponseBodyCommandSettings
                             {
@@ -83,6 +76,7 @@ namespace Omnipotent.Services.MemeScraper
                             dynamic jsonData = JsonConvert.DeserializeObject(content);
                             foreach (var item in jsonData.data.reels)
                             {
+                                counter++;
                                 try
                                 {
                                     reel.PostID = item.post_id;
