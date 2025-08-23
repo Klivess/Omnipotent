@@ -28,6 +28,7 @@ namespace Omnipotent.Service_Manager
             public string timeID;
             public string randomidentifier;
             public object PassableData { get; set; }
+            public bool prefired;
 
             public TimeSpan GetTimespanRemaining()
             {
@@ -77,6 +78,7 @@ namespace Omnipotent.Service_Manager
             task.agentName = agentName;
             task.reason = reason;
             task.isImportant = important;
+            task.prefired = false;
             task.randomidentifier = RandomGeneration.GenerateRandomLengthOfNumbers(20);
             task.dateTimeSet = DateTime.Now;
             task.timeID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
@@ -219,16 +221,38 @@ namespace Omnipotent.Service_Manager
             {
                 TimeSpan timespan = task.GetTimespanRemaining();
                 await Task.Delay(timespan);
-                if (TaskDue != null)
+                if (task.prefired == false)
                 {
-                    TaskDue.Invoke(this, task);
+                    if (TaskDue != null)
+                    {
+                        TaskDue.Invoke(this, task);
+                    }
+                    //Remove task from list, and delete file.
+                    tasks.Remove(task);
+                    string filePath = FormFilePathWithTask(task);
+                    if (File.Exists(filePath))
+                    {
+                        try
+                        {
+                            File.Delete(filePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            ServiceLogError(ex, "Couldn't delete task file.");
+                        }
+                    }
                 }
-                //Remove task from list, and delete file.
-                tasks.Remove(task);
-                string filePath = FormFilePathWithTask(task);
             });
             thread.Start();
             pendingTasks.Add(thread);
+        }
+
+        public async Task PrefireTask(string taskname)
+        {
+            var task = await GetTask(taskname);
+            TaskDue.Invoke(this, task);
+            tasks.Remove(task);
+            task.prefired = true;
         }
 
         private async void CreateRoutes()
@@ -236,6 +260,19 @@ namespace Omnipotent.Service_Manager
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/timemanager/getalltasks", async (request) =>
             {
                 await request.ReturnResponse(JsonConvert.SerializeObject(tasks), code: HttpStatusCode.OK);
+            }, HttpMethod.Get, KMPermissions.Guest);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/timemanager/prefiretask", async (request) =>
+            {
+                try
+                {
+                    await PrefireTask(request.userParameters["name"]);
+                    await request.ReturnResponse("Task prefired successfully.", code: HttpStatusCode.OK);
+                }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex, $"Error in {request.route} while prefiring task.");
+                    await request.ReturnResponse($"Error: {ex.Message}", code: HttpStatusCode.InternalServerError);
+                }
             }, HttpMethod.Get, KMPermissions.Guest);
         }
     }
