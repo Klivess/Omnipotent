@@ -27,13 +27,21 @@ namespace Omnipotent.Services.MemeScraper
             instagramScrapeUtilities = new InstagramScrapeUtilities(this);
             mediaManager = new MemeScraperMedia(this);
 
+            if (!OmniPaths.CheckIfOnServer())
+            {
+                var list = await instagramScrapeUtilities.AllInstagramProfileReelDownloadsLinksAsync("tgpu");
+                ServiceLog($"Found {list.Count} reels for tgpu.", true);
+
+                await DownloadVideosInParallel(list.Select(k => k.VideoDownloadURL).ToList(), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeScraper2"));
+            }
+
             CreateRoutes();
 
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
             foreach (var item in SourceManager.InstagramSources)
             {
-                if (await serviceManager.timeManager.GetTask("ScrapeAllInstagramPostsFromSource" + item.AccountID) == null)
+                if (await serviceManager.timeManager.GetTask("ScrapeAllInstagramPostsFromSource-" + item.Username) == null)
                 {
                     ScrapeInstagramAccount(item);
                 }
@@ -64,35 +72,38 @@ namespace Omnipotent.Services.MemeScraper
                         // Parse filetype from reel.VideoDownloadURL url  
                         string fileExtension = Path.GetExtension(new Uri(reel.VideoDownloadURL).AbsolutePath);
 
-                        //Save Reel Video
-                        string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory), $"ReelMedia{reel.PostID}{fileExtension}");
-                        await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
-                        reel.DateTimeReelDownloaded = DateTime.Now;
+                        if (!mediaManager.allScrapedReels.Any(k => k.PostID == reel.PostID))
+                        {
+                            //Save Reel Video
+                            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory), $"ReelMedia{reel.PostID}{fileExtension}");
+                            await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
+                            reel.DateTimeReelDownloaded = DateTime.Now;
 
-                        //Update Source
-                        source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
-                        source.MemesCollectedTotal++;
-                        source.VideoMemesCollectedTotal++;
-                        source.LastScraped = DateTime.Now;
+                            //Update Source
+                            source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
+                            source.MemesCollectedTotal++;
+                            source.VideoMemesCollectedTotal++;
+                            source.LastScraped = DateTime.Now;
 
-                        //Save Reel Data
-                        string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
-                        reel.InstagramReelFilePath = dataPath;
-                        mediaManager.allScrapedReels.Add(reel);
-                        await mediaManager.SaveInstagramReel(reel);
+                            //Save Reel Data
+                            string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
+                            reel.InstagramReelFilePath = dataPath;
+                            mediaManager.allScrapedReels.Add(reel);
+                            await mediaManager.SaveInstagramReel(reel);
 
-                        //Save Source Data
-                        SourceManager.UpdateInstagramSource(source);
+                            //Save Source Data
+                            SourceManager.UpdateInstagramSource(source);
+                        }
                     });
                 }
                 ServiceLog($"Finished scraping Instagram account {source.Username} for reels.", true);
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.AccountID,
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.Username,
                     "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "Error scraping Instagram account", true);
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping",
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.Username, "Meme Scraping",
                     $"Go through all of {source.Username} posts and download them after an error.", false, source.AccountID);
             }
         }
@@ -180,6 +191,28 @@ namespace Omnipotent.Services.MemeScraper
                 }
             }, HttpMethod.Get, KMPermissions.Manager);
 
+        }
+
+        public async Task DownloadVideosInParallel(List<string> videoDownloadLinks, string targetDirectory)
+        {
+            try
+            {
+                Directory.CreateDirectory(targetDirectory); // Ensure the target directory exists  
+
+                await Parallel.ForEachAsync(videoDownloadLinks, async (videoUrl, token) =>
+                {
+                    WebClient wc = new();
+                    string fileExtension = Path.GetExtension(new Uri(videoUrl).AbsolutePath);
+                    string fileName = $"Video_{Guid.NewGuid()}{fileExtension}";
+                    string filePath = Path.Combine(targetDirectory, fileName);
+
+                    await wc.DownloadFileTaskAsync(new Uri(videoUrl), filePath);
+                });
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error downloading videos in parallel.", true);
+            }
         }
     }
 }

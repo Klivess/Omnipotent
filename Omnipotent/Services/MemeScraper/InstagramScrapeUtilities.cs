@@ -172,10 +172,16 @@ namespace Omnipotent.Services.MemeScraper
 
 
             //remove duplicates
-            var uniqueReels = reels.GroupBy(r => r.PostID).Select(g => g.First());
+            List<InstagramReel> uniqueReels = new();
+            foreach (var reel in reels)
+            {
+                if (!uniqueReels.Any(r => r.ShortCode == reel.ShortCode))
+                {
+                    uniqueReels.Add(reel);
+                }
+            }
 
-            return uniqueReels.ToList();
-
+            return uniqueReels;
         }
     }
 }

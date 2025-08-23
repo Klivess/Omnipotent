@@ -33,6 +33,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             name = "CS2ArbitrageBot";
             threadAnteriority = ThreadAnteriority.High;
         }
+
         protected override async void ServiceMain()
         {
             GetExchangeRate().Wait();
