@@ -109,12 +109,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         public class CSFloatAndSteamBalance
         {
-            public float CSFloatUsableBalanceInPounds { get; set; }
-            public float CSFloatTotalBalanceInPounds { get; set; }
-            public float CSFloatPendingBalanceInPounds { get; set; }
-            public float SteamUsableBalanceInPounds { get; set; }
-            public float SteamPendingBalanceInPounds { get; set; }
-            public float SteamTotalBalanceInPounds { get; set; }
+            public double CSFloatUsableBalanceInPounds { get; set; }
+            public double CSFloatTotalBalanceInPounds { get; set; }
+            public double CSFloatPendingBalanceInPounds { get; set; }
+            public double SteamUsableBalanceInPounds { get; set; }
+            public double SteamPendingBalanceInPounds { get; set; }
+            public double SteamTotalBalanceInPounds { get; set; }
 
             public DateTime DateTimeOfBalanceRecord { get; set; }
             public CSFloatWrapper.Statistics CSFloatProfileStatistics { get; set; }
