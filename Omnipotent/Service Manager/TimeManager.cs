@@ -249,10 +249,17 @@ namespace Omnipotent.Service_Manager
 
         public async Task PrefireTask(string taskname)
         {
-            var task = await GetTask(taskname);
-            TaskDue.Invoke(this, task);
-            tasks.Remove(task);
-            task.prefired = true;
+            try
+            {
+                var task = await GetTask(taskname);
+                TaskDue.Invoke(this, task);
+                tasks.Remove(task);
+                task.prefired = true;
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error while prefiring task: " + taskname);
+            }
         }
 
         private async void CreateRoutes()
