@@ -123,7 +123,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                     GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
                     KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
                 }
-                return await KlivesMember.SendMessageAsync(message);
+                return await KlivesMember.SendMessageAsync(OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "" + message);
             }
             catch (Exception ex)
             {
@@ -152,7 +152,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
         {
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             DiscordEmbedBuilder discordEmbed = new DiscordEmbedBuilder();
-            discordEmbed.Title = title;
+            discordEmbed.Title = OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "" + title;
             discordEmbed.Description = description;
             discordEmbed.Color = color;
             if (imagefilepath != "")
