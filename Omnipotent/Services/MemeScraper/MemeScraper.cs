@@ -7,6 +7,7 @@ using Newtonsoft.Json;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using static Omnipotent.Profiles.KMProfileManager;
 using OpenQA.Selenium.DevTools.V136.Network;
+using Org.BouncyCastle.Asn1.X500;
 
 
 namespace Omnipotent.Services.MemeScraper
@@ -43,7 +44,9 @@ namespace Omnipotent.Services.MemeScraper
             {
                 if (await serviceManager.timeManager.GetTask("ScrapeAllInstagramPostsFromSource-" + item.Username) == null)
                 {
-                    ScrapeInstagramAccount(item);
+                    Random rnd = new();
+                    ServiceCreateScheduledTask(DateTime.Now.AddMinutes(rnd.Next(0, 1000)), "ScrapeAllInstagramPostsFromSource" + item.Username,
+    "Meme Scraping", $"Go through all of {item.Username} posts and download them.", false, item.AccountID);
                 }
             }
         }
@@ -58,6 +61,7 @@ namespace Omnipotent.Services.MemeScraper
 
         public async Task ScrapeInstagramAccount(MemeScraperSources.InstagramSource source)
         {
+            Random rnd = new();
             try
             {
                 if (source.DownloadReels)
@@ -97,13 +101,13 @@ namespace Omnipotent.Services.MemeScraper
                     });
                 }
                 ServiceLog($"Finished scraping Instagram account {source.Username} for reels.", true);
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "ScrapeAllInstagramPostsFromSource" + source.Username,
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(3).AddMinutes(rnd.Next(0, 500)), "ScrapeAllInstagramPostsFromSource" + source.Username,
                     "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "Error scraping Instagram account", true);
-                ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "ScrapeAllInstagramPostsFromSource" + source.Username, "Meme Scraping",
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(1).AddMinutes(rnd.Next(0, 500)), "ScrapeAllInstagramPostsFromSource" + source.Username, "Meme Scraping",
                     $"Go through all of {source.Username} posts and download them after an error.", false, source.AccountID);
             }
         }
