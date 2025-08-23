@@ -42,7 +42,7 @@ namespace Omnipotent.Services.MemeScraper
             public DateTime DateTimeReelDownloaded;
         }
 
-        public async Task<List<InstagramReel>> AllInstagramProfileReelDownloadsLinksAsync(string username)
+        public async Task<List<InstagramReel>> ScrapeAllInstagramProfileReelDownloadsLinksAsync(string username)
         {
             ConcurrentBag<string> reqIDs = new();
             ConcurrentBag<InstagramReel> reels = new();

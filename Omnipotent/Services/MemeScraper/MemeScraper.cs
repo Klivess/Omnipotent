@@ -30,7 +30,7 @@ namespace Omnipotent.Services.MemeScraper
 
             if (!OmniPaths.CheckIfOnServer())
             {
-                var list = await instagramScrapeUtilities.AllInstagramProfileReelDownloadsLinksAsync("tgpu");
+                var list = await instagramScrapeUtilities.ScrapeAllInstagramProfileReelDownloadsLinksAsync("tgpu");
                 ServiceLog($"Found {list.Count} reels for tgpu.", true);
 
                 await DownloadVideosInParallel(list.Select(k => k.VideoDownloadURL).ToList(), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeScraper2"));
@@ -67,7 +67,7 @@ namespace Omnipotent.Services.MemeScraper
                 if (source.DownloadReels)
                 {
                     ServiceLog($"Starting to scrape Instagram account {source.Username} for reels.");
-                    List<InstagramScrapeUtilities.InstagramReel> reels = await instagramScrapeUtilities.AllInstagramProfileReelDownloadsLinksAsync(source.Username);
+                    List<InstagramScrapeUtilities.InstagramReel> reels = await instagramScrapeUtilities.ScrapeAllInstagramProfileReelDownloadsLinksAsync(source.Username);
                     reels = reels.Where(k => mediaManager.allScrapedReels.Select(x => x.PostID).Contains(k.PostID)).ToList();
                     ServiceLog($"Found {reels.Count} reels to download from {source.Username}.", true);
                     await Parallel.ForEachAsync(reels, async (reel, token) =>

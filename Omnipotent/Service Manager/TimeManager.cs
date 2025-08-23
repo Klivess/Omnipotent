@@ -225,7 +225,7 @@ namespace Omnipotent.Service_Manager
                 {
                     if (TaskDue != null)
                     {
-                        TaskDue.Invoke(this, task);
+                        Task.Run(() => TaskDue.Invoke(this, task));
                     }
                     //Remove task from list, and delete file.
                     tasks.Remove(task);
@@ -252,7 +252,10 @@ namespace Omnipotent.Service_Manager
             try
             {
                 var task = await GetTask(taskname);
-                TaskDue.Invoke(this, task);
+                if (TaskDue != null)
+                {
+                    Task.Run(() => TaskDue.Invoke(this, task));
+                }
                 tasks.Remove(task);
                 task.prefired = true;
             }
@@ -280,7 +283,7 @@ namespace Omnipotent.Service_Manager
                     ServiceLogError(ex, $"Error in {request.route} while prefiring task.");
                     await request.ReturnResponse($"Error: {ex.Message}", code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, KMPermissions.Associate);
         }
     }
 }
