@@ -29,7 +29,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public Dictionary<DateTime, int> MemesDownloadedPerDay;
 
             // New analytics
-            public Dictionary<InstagramSource, int> ReelsDownloadedPerSource;
+            public Dictionary<string, int> ReelsDownloadedPerSource;
             public DateTime? MostActiveDownloadDay;
             public List<InstagramSource> InactiveSources;
             public double GrowthRateOfDownloads;
@@ -84,13 +84,13 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
                 }
 
                 // 1. ReelsDownloadedPerSource
-                ReelsDownloadedPerSource = new Dictionary<InstagramSource, int>();
+                ReelsDownloadedPerSource = new Dictionary<string, int>();
                 if (sources != null && reels != null)
                 {
                     foreach (var src in sources)
                     {
                         int count = reels.Count(r => r.OwnerUsername == src.Username);
-                        ReelsDownloadedPerSource[src] = count;
+                        ReelsDownloadedPerSource[src.Username] = count;
                     }
                 }
 
