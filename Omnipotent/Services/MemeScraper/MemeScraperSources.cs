@@ -4,6 +4,7 @@ using Omnipotent.Data_Handling;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.DevTools;
 using OpenQA.Selenium.DevTools.V136.Network;
+using System.IO;
 using System.Linq.Expressions;
 using System.Net;
 using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
@@ -25,13 +26,9 @@ namespace Omnipotent.Services.MemeScraper
         public class Source
         {
             public string SourceID;
-            public int MemesCollectedTotal;
-            public int VideoMemesCollectedTotal;
-            public int ImageMemesCollectedTotal;
             public DateTime DateTimeAdded;
             public DateTime LastScraped;
             public DateTime LastUpdated;
-            public List<string> PathsOfAllMemes = new List<string>();
             public List<Niche> Niches;
         }
 
@@ -177,12 +174,8 @@ namespace Omnipotent.Services.MemeScraper
                             source.AccountTopHashtags.Add(tag);
                         }
 
-                        source.ImageMemesCollectedTotal = 0;
-                        source.VideoMemesCollectedTotal = 0;
-                        source.MemesCollectedTotal = 0;
                         source.DateTimeAdded = DateTime.Now;
                         source.LastUpdated = DateTime.Now;
-                        source.PathsOfAllMemes = new List<string>();
                         source.Niches = Niches;
                         dataAcquired = true;
                     }
@@ -228,16 +221,17 @@ namespace Omnipotent.Services.MemeScraper
             if (DeleteAssociatedMemes)
             {
                 // Delete all associated memes
-                foreach (var memePath in source.PathsOfAllMemes)
+                foreach (var memePath in parent.mediaManager.allScrapedReels.Where(k => k.OwnerUsername == source.Username))
                 {
-                    parent.mediaManager.allScrapedReels.RemoveAll(k => k.InstagramReelFilePath == memePath);
-                    string pth = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, memePath);
-                    string reelData = await parent.GetDataHandler().ReadDataFromFile(pth);
-                    InstagramScrapeUtilities.InstagramReel reel = JsonConvert.DeserializeObject<InstagramScrapeUtilities.InstagramReel>(reelData);
-                    if (File.Exists(pth))
+                    try
                     {
-                        parent.GetDataHandler().DeleteDirectory(reel.InstagramReelFilePath);
-                        parent.GetDataHandler().DeleteFile(pth);
+                        parent.GetDataHandler().DeleteFile(memePath.InstagramReelVideoFilePath);
+                        parent.GetDataHandler().DeleteFile(memePath.InstagramReelInfoFilePath);
+                        parent.mediaManager.allScrapedReels.Remove(memePath);
+                    }
+                    catch (Exception e)
+                    {
+
                     }
                 }
             }

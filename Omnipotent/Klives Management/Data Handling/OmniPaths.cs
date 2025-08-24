@@ -82,6 +82,12 @@ namespace Omnipotent.Data_Handling
             public static string MemeScraperReelsDataDirectory = $"{MemeScraperInstagramDirectory}/Reels";
             public static string MemeScraperPostsDataDirectory = $"{MemeScraperInstagramDirectory}/Posts";
 
+            //OmniTube
+            public static string FFMpegDirectory = $"FFmpeg";
+            public static string FFMpegWorkingDirectory = $"{FFMpegDirectory}/FFmpegWorkingDirectory";
+            public static string OmniTubeDirectory = $"{SavedDataDirectory}/OmniTube";
+
+
         };
 
         public static string GetPath(string path)

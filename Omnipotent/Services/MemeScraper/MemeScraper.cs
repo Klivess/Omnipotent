@@ -84,18 +84,15 @@ namespace Omnipotent.Services.MemeScraper
                                 await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
                                 reel.DateTimeReelDownloaded = DateTime.Now;
 
-
+                                string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
                                 try
                                 {
                                     //Update Source
-                                    source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
-                                    source.MemesCollectedTotal++;
-                                    source.VideoMemesCollectedTotal++;
                                     source.LastScraped = DateTime.Now;
 
                                     //Save Reel Data
-                                    string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
-                                    reel.InstagramReelFilePath = dataPath;
+                                    reel.InstagramReelInfoFilePath = dataPath;
+                                    reel.InstagramReelVideoFilePath = path;
                                     mediaManager.allScrapedReels.Add(reel);
                                     await mediaManager.SaveInstagramReel(reel);
 
@@ -105,9 +102,9 @@ namespace Omnipotent.Services.MemeScraper
                                 catch (Exception e)
                                 {
                                     ServiceLogError(e, $"Error saving reel {reel.PostID} for {source.Username}.", true);
-                                    reel.InstagramReelFilePath = null; // Set to null if saving fails
                                     reel.DateTimeReelDownloaded = DateTime.MinValue; // Reset the download time
                                     File.Delete(path); // Delete the file if saving fails
+                                    File.Delete(dataPath);
                                 }
                             }
                         }

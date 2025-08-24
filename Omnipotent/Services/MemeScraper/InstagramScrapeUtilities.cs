@@ -38,7 +38,8 @@ namespace Omnipotent.Services.MemeScraper
             public string Description;
             public string ShortCode;
 
-            public string? InstagramReelFilePath;
+            public string? InstagramReelInfoFilePath;
+            public string? InstagramReelVideoFilePath;
             public DateTime DateTimeReelDownloaded;
         }
 
