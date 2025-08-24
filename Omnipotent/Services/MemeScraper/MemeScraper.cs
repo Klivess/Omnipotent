@@ -8,6 +8,7 @@ using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using static Omnipotent.Profiles.KMProfileManager;
 using OpenQA.Selenium.DevTools.V136.Network;
 using Org.BouncyCastle.Asn1.X500;
+using Omnipotent.Services.MemeScraper.MemeScraper_Labs;
 
 
 namespace Omnipotent.Services.MemeScraper
@@ -17,6 +18,7 @@ namespace Omnipotent.Services.MemeScraper
         public MemeScraperSources SourceManager;
         public InstagramScrapeUtilities instagramScrapeUtilities;
         public MemeScraperMedia mediaManager;
+        public MemeScraperLabs memeScraperLabs;
         public MemeScraper()
         {
             name = "MemeScraper";
@@ -27,6 +29,7 @@ namespace Omnipotent.Services.MemeScraper
             SourceManager = new MemeScraperSources(this);
             instagramScrapeUtilities = new InstagramScrapeUtilities(this);
             mediaManager = new MemeScraperMedia(this);
+            memeScraperLabs = new(this);
 
             if (!OmniPaths.CheckIfOnServer())
             {
@@ -183,6 +186,19 @@ namespace Omnipotent.Services.MemeScraper
                 try
                 {
                     await request.ReturnResponse(JsonConvert.SerializeObject(SourceManager.InstagramSources), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, $"Error in {request.route} route.");
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/memeScraperAnalytics", async (request) =>
+            {
+                try
+                {
+                    var analytics = new MemeScraperLabs.MemeScraperAnalytics(SourceManager.InstagramSources, mediaManager.allScrapedReels);
+                    await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
