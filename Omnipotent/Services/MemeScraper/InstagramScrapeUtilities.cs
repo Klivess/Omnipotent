@@ -49,7 +49,7 @@ namespace Omnipotent.Services.MemeScraper
             try
             {
                 ChromeOptions options = new ChromeOptions();
-                //options.AddArgument("--headless"); // Run in headless mode  
+                options.AddArgument("--headless"); // Run in headless mode  
                 var driver = new ChromeDriver(options);
                 driver.Navigate().GoToUrl($"https://inflact.com/instagram-downloader?profile={username}/");
 
