@@ -68,7 +68,6 @@ namespace Omnipotent.Services.MemeScraper
                 {
                     ServiceLog($"Starting to scrape Instagram account {source.Username} for reels.");
                     List<InstagramScrapeUtilities.InstagramReel> reels = await instagramScrapeUtilities.ScrapeAllInstagramProfileReelDownloadsLinksAsync(source.Username);
-                    reels = reels.Where(k => mediaManager.allScrapedReels.Select(x => x.PostID).Contains(k.PostID)).ToList();
                     ServiceLog($"Found {reels.Count} reels to download from {source.Username}.", true);
                     await Parallel.ForEachAsync(reels, async (reel, token) =>
                     {

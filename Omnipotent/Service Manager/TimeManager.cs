@@ -275,7 +275,7 @@ namespace Omnipotent.Service_Manager
             {
                 try
                 {
-                    await PrefireTask(request.userParameters["name"]);
+                    PrefireTask(request.userParameters["name"]);
                     await request.ReturnResponse("Task prefired successfully.", code: HttpStatusCode.OK);
                 }
                 catch (Exception ex)
