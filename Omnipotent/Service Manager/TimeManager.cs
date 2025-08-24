@@ -252,12 +252,12 @@ namespace Omnipotent.Service_Manager
             try
             {
                 var task = await GetTask(taskname);
+                tasks.Remove(task);
+                task.prefired = true;
                 if (TaskDue != null)
                 {
                     Task.Run(() => TaskDue.Invoke(this, task));
                 }
-                tasks.Remove(task);
-                task.prefired = true;
             }
             catch (Exception ex)
             {
