@@ -71,31 +71,49 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLog($"Found {reels.Count} reels to download from {source.Username}.", true);
                     await Parallel.ForEachAsync(reels, async (reel, token) =>
                     {
-                        WebClient wc = new();
-                        // Parse filetype from reel.VideoDownloadURL url  
-                        string fileExtension = Path.GetExtension(new Uri(reel.VideoDownloadURL).AbsolutePath);
-
-                        if (!mediaManager.allScrapedReels.Any(k => k.PostID == reel.PostID))
+                        try
                         {
-                            //Save Reel Video
-                            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory), $"ReelMedia{reel.PostID}{fileExtension}");
-                            await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
-                            reel.DateTimeReelDownloaded = DateTime.Now;
+                            WebClient wc = new();
+                            // Parse filetype from reel.VideoDownloadURL url  
+                            string fileExtension = Path.GetExtension(new Uri(reel.VideoDownloadURL).AbsolutePath);
 
-                            //Update Source
-                            source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
-                            source.MemesCollectedTotal++;
-                            source.VideoMemesCollectedTotal++;
-                            source.LastScraped = DateTime.Now;
+                            if (!mediaManager.allScrapedReels.Any(k => k.PostID == reel.PostID))
+                            {
+                                //Save Reel Video
+                                string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory), $"ReelMedia{reel.PostID}{fileExtension}");
+                                await wc.DownloadFileTaskAsync(new Uri(reel.VideoDownloadURL), path);
+                                reel.DateTimeReelDownloaded = DateTime.Now;
 
-                            //Save Reel Data
-                            string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
-                            reel.InstagramReelFilePath = dataPath;
-                            mediaManager.allScrapedReels.Add(reel);
-                            await mediaManager.SaveInstagramReel(reel);
 
-                            //Save Source Data
-                            SourceManager.UpdateInstagramSource(source);
+                                try
+                                {
+                                    //Update Source
+                                    source.PathsOfAllMemes.Add(reel.InstagramReelFilePath);
+                                    source.MemesCollectedTotal++;
+                                    source.VideoMemesCollectedTotal++;
+                                    source.LastScraped = DateTime.Now;
+
+                                    //Save Reel Data
+                                    string dataPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory, $"Reel{reel.PostID}.json");
+                                    reel.InstagramReelFilePath = dataPath;
+                                    mediaManager.allScrapedReels.Add(reel);
+                                    await mediaManager.SaveInstagramReel(reel);
+
+                                    //Save Source Data
+                                    SourceManager.UpdateInstagramSource(source);
+                                }
+                                catch (Exception e)
+                                {
+                                    ServiceLogError(e, $"Error saving reel {reel.PostID} for {source.Username}.", true);
+                                    reel.InstagramReelFilePath = null; // Set to null if saving fails
+                                    reel.DateTimeReelDownloaded = DateTime.MinValue; // Reset the download time
+                                    File.Delete(path); // Delete the file if saving fails
+                                }
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            await ServiceLogError(e, $"Error processing reel {reel.PostID} for {source.Username}.", true);
                         }
                     });
                 }
