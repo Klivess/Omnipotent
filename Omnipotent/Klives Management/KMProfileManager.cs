@@ -255,7 +255,8 @@ namespace Omnipotent.Profiles
                     List<KMProfile> kMProfiles = new(Profiles);
                     foreach (var item in kMProfiles)
                     {
-                        item.Password = "***";
+                        if (request.user.KlivesManagementRank != KMPermissions.Klives)
+                            item.Password = "***";
                     }
                     string serialized = JsonConvert.SerializeObject(kMProfiles);
                     await request.ReturnResponse(serialized, "application/json");
