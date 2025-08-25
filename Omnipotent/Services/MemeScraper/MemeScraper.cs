@@ -97,7 +97,8 @@ namespace Omnipotent.Services.MemeScraper
 
                                     //Save Reel Data
                                     reel.SetInstagramReelInfoFilePath(dataPath);
-                                    reel.SetInstagramReelVideoFilePath(path);
+                                    string videoPath = Path.Combine(OmniPaths.GlobalPaths.MemeScraperReelsVideoDirectory, $"ReelMedia{reel.PostID}{fileExtension}");
+                                    reel.SetInstagramReelVideoFilePath(videoPath);
                                     mediaManager.allScrapedReels.Add(reel);
                                     await mediaManager.SaveInstagramReel(reel);
 
