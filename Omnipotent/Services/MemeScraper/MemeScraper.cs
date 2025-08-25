@@ -33,11 +33,13 @@ namespace Omnipotent.Services.MemeScraper
 
             if (!OmniPaths.CheckIfOnServer())
             {
-                var list = await instagramScrapeUtilities.ScrapeAllInstagramProfileReelDownloadsLinksAsync("tgpu");
-                ServiceLog($"Found {list.Count} reels for tgpu.", true);
+                //var list = await instagramScrapeUtilities.ScrapeAllInstagramProfileReelDownloadsLinksAsync("tgpu");
+                //ServiceLog($"Found {list.Count} reels for tgpu.", true);
 
-                await DownloadVideosInParallel(list.Select(k => k.VideoDownloadURL).ToList(), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeScraper2"));
+                //await DownloadVideosInParallel(list.Select(k => k.VideoDownloadURL).ToList(), Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeScraper2"));
             }
+
+            //CheckForBrokenFilePaths();
 
             CreateRoutes();
 
@@ -94,8 +96,8 @@ namespace Omnipotent.Services.MemeScraper
                                     source.LastScraped = DateTime.Now;
 
                                     //Save Reel Data
-                                    reel.InstagramReelInfoFilePath = dataPath;
-                                    reel.InstagramReelVideoFilePath = path;
+                                    reel.SetInstagramReelInfoFilePath(dataPath);
+                                    reel.SetInstagramReelVideoFilePath(path);
                                     mediaManager.allScrapedReels.Add(reel);
                                     await mediaManager.SaveInstagramReel(reel);
 

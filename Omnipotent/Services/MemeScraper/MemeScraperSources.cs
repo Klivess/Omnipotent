@@ -225,8 +225,8 @@ namespace Omnipotent.Services.MemeScraper
                 {
                     try
                     {
-                        parent.GetDataHandler().DeleteFile(memePath.InstagramReelVideoFilePath);
-                        parent.GetDataHandler().DeleteFile(memePath.InstagramReelInfoFilePath);
+                        parent.GetDataHandler().DeleteFile(memePath.GetInstagramReelVideoFilePath());
+                        parent.GetDataHandler().DeleteFile(memePath.GetInstagramReelInfoFilePath());
                         parent.mediaManager.allScrapedReels.Remove(memePath);
                     }
                     catch (Exception e)

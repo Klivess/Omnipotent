@@ -49,7 +49,7 @@ namespace Omnipotent.Services.OmniTube.Video_Factory
 
         public async Task ProduceMemeCompilation(List<InstagramScrapeUtilities.InstagramReel> reels, string videoOutputPath = "")
         {
-            FFMpeg.Join(videoOutputPath, reels.Select(k => k.InstagramReelVideoFilePath).ToArray());
+            FFMpeg.Join(videoOutputPath, reels.Select(k => k.GetInstagramReelVideoFilePath()).ToArray());
         }
     }
 }
