@@ -38,8 +38,8 @@ namespace Omnipotent.Services.MemeScraper
             public string Description;
             public string ShortCode;
 
-            private string? InstagramReelInfoFilePath;
-            private string? InstagramReelVideoFilePath;
+            public string? InstagramReelInfoFilePath;
+            public string? InstagramReelVideoFilePath;
 
             public DateTime DateTimeReelDownloaded;
 
@@ -50,7 +50,7 @@ namespace Omnipotent.Services.MemeScraper
 
             public string GetInstagramReelVideoFilePath()
             {
-                return InstagramReelVideoFilePath;
+                return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, InstagramReelVideoFilePath);
             }
 
             public void SetInstagramReelInfoFilePath(string path)

@@ -21,7 +21,8 @@ namespace Omnipotent.Services.MemeScraper
         {
             allScrapedReels = new List<InstagramScrapeUtilities.InstagramReel>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
-            foreach (var item in Directory.GetFiles(path, "*.json"))
+            var files = Directory.GetFiles(path, "*.json");
+            foreach (var item in files)
             {
                 try
                 {

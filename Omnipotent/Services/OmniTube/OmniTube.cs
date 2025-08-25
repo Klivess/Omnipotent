@@ -21,7 +21,10 @@ namespace Omnipotent.Services.OmniTube
             {
                 List<InstagramScrapeUtilities.InstagramReel> reels = new();
                 var memeScraper = (MemeScraper.MemeScraper)(await serviceManager.GetServiceByClassType<MemeScraper.MemeScraper>())[0];
-                await Task.Delay(2000);
+                while (memeScraper.mediaManager == null)
+                {
+                    await Task.Delay(100);
+                }
                 //Copy the reels from memeScraper to avoid threading issues
                 reels.AddRange(memeScraper.mediaManager.allScrapedReels);
                 //Pick 50 random reels

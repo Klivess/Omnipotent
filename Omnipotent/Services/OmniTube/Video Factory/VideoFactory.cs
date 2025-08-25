@@ -11,6 +11,7 @@ namespace Omnipotent.Services.OmniTube.Video_Factory
     {
         OmniTube parent;
         public string ffmpegPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory), "ffmpeg.exe");
+        public string ffmpegProbePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory), "ffprobe.exe");
         public VideoFactory(OmniTube parent)
         {
             this.parent = parent;
@@ -40,6 +41,28 @@ namespace Omnipotent.Services.OmniTube.Video_Factory
             {
                 parent.ServiceLog("FFmpeg is already installed.");
             }
+
+            if (File.Exists(ffmpegProbePath) == false)
+            {
+                parent.ServiceLog("FFmpeg not found, installing...");
+                string zipDownloadURL = "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffprobe-6.1-win-64.zip";
+                WebClient wc = new();
+                string zipFilePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory), "ffprobe.zip");
+                wc.DownloadFile(zipDownloadURL, zipFilePath);
+                // Unzip the file
+                System.IO.Compression.ZipFile.ExtractToDirectory(zipFilePath, OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory));
+                // Delete the zip file
+                if (File.Exists(zipFilePath))
+                {
+                    File.Delete(zipFilePath);
+                }
+                parent.ServiceLog("FFmpeg Probe has been installed successfully.");
+            }
+            else
+            {
+                parent.ServiceLog("FFmpeg Probe is already installed.");
+            }
+
             GlobalFFOptions.Configure(new FFOptions
             {
                 BinaryFolder = OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory),
