@@ -1,5 +1,6 @@
 ﻿using DSharpPlus;
 using LangChain.Providers;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Klives_Management;
@@ -188,7 +189,7 @@ namespace Omnipotent.Profiles
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Associate);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/AttemptLogin", async (request) =>
             {
                 try
@@ -234,25 +235,36 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
                         return;
                     }
+                    string password = profile.Password;
+                    if (request.user.KlivesManagementRank != KMPermissions.Klives)
+                    {
+                        profile.Password = "***";
+                    }
                     await request.ReturnResponse(JsonConvert.SerializeObject(profile), "application/json");
+                    profile.Password = password;
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Associate);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", async (request) =>
             {
                 try
                 {
-                    string serialized = JsonConvert.SerializeObject(Profiles);
+                    List<KMProfile> kMProfiles = new(Profiles);
+                    foreach (var item in kMProfiles)
+                    {
+                        item.Password = "***";
+                    }
+                    string serialized = JsonConvert.SerializeObject(kMProfiles);
                     await request.ReturnResponse(serialized, "application/json");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Associate);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeCanLogin", async (request) =>
             {
                 try
@@ -286,7 +298,7 @@ namespace Omnipotent.Profiles
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Admin);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", async (request) =>
             {
                 try
@@ -321,7 +333,7 @@ namespace Omnipotent.Profiles
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Admin);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", async (request) =>
             {
                 try
@@ -390,7 +402,7 @@ namespace Omnipotent.Profiles
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Admin);
             await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DeleteProfile", async (request) =>
             {
                 try
@@ -452,7 +464,7 @@ namespace Omnipotent.Profiles
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Admin);
         }
     }
 }
