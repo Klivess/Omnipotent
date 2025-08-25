@@ -1,10 +1,12 @@
 ﻿using DSharpPlus;
+using LangChain.Providers;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Klives_Management;
 using Omnipotent.Service_Manager;
 using System.Net;
 using System.Xml.Linq;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Profiles
 {
@@ -203,6 +205,11 @@ namespace Omnipotent.Profiles
                         if (profile.CanLogin == true)
                         {
                             await request.ReturnResponse("true", "application/json");
+                            if (profile.KlivesManagementRank != KMPermissions.Klives)
+                            {
+                                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{profile.Name} has logged into Klives Management.");
+                            }
+
                         }
                         else
                         {
