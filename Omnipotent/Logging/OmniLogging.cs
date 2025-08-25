@@ -40,7 +40,7 @@ namespace Omnipotent.Logging
         }
 
         public SynchronizedCollection<LoggedMessage> messagesToLog = new();
-        public List<LoggedMessage> overallMessages = new();
+        public SynchronizedCollection<LoggedMessage> overallMessages = new();
 
         public OmniLogging()
         {
@@ -151,7 +151,7 @@ Data:
         {
             Action<UserRequest> getLogs = async (req) =>
             {
-                var copy = new List<LoggedMessage>(overallMessages);
+                var copy = new SynchronizedCollection<LoggedMessage>(overallMessages);
                 await req.ReturnResponse(JsonConvert.SerializeObject(copy), "application/json");
             };
 
@@ -301,7 +301,7 @@ Data:
         {
             try
             {
-                var pos = overallMessages.Find(k => k.logID == message.logID).position;
+                var pos = overallMessages.ToList().Find(k => k.logID == message.logID).position;
                 //duct tape solution fix before developing omnilogging
                 if (message.errorInfo == null)
                 {
