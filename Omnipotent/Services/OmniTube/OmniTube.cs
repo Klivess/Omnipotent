@@ -30,7 +30,7 @@ namespace Omnipotent.Services.OmniTube
                 //Pick 50 random reels
                 reels = reels.OrderBy(x => Guid.NewGuid()).Take(50).ToList();
                 string outputPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeCompilation.mp4");
-                await videoFactory.ProduceMemeCompilation(reels, outputPath);
+                var success = await videoFactory.ProduceMemeCompilation(reels, outputPath);
                 ServiceLog("Meme compilation video created at: " + outputPath);
             }
         }

@@ -1,14 +1,16 @@
-﻿using Omnipotent.Service_Manager;
-using System.Net;
-using System.Collections.Concurrent;
-using System.Management.Automation;
-using Omnipotent.Data_Handling;
+﻿using LangChain.Providers;
 using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
+using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
-using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.MemeScraper.MemeScraper_Labs;
 using OpenQA.Selenium.DevTools.V136.Network;
 using Org.BouncyCastle.Asn1.X500;
-using Omnipotent.Services.MemeScraper.MemeScraper_Labs;
+using System.Collections.Concurrent;
+using System.Management.Automation;
+using System.Net;
+using static Omnipotent.Profiles.KMProfileManager;
 
 
 namespace Omnipotent.Services.MemeScraper
@@ -175,6 +177,12 @@ namespace Omnipotent.Services.MemeScraper
                         }
                     }
                     SourceManager.ProduceNewInstagramSource(username, DownloadReels, DownloadPosts, nichesList);
+                    try
+                    {
+                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} uploaded a new instagram source: '{username}'.");
+                    }
+                    catch (Exception e) { }
+                    ServiceLog($"{request.user.Name} uploaded a new instagram source: '{username}'.");
                     await request.ReturnResponse("Instagram source being added.", code: HttpStatusCode.OK);
 
                 }

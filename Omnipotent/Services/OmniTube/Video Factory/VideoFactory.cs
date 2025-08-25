@@ -70,9 +70,60 @@ namespace Omnipotent.Services.OmniTube.Video_Factory
             });
         }
 
-        public async Task ProduceMemeCompilation(List<InstagramScrapeUtilities.InstagramReel> reels, string videoOutputPath = "")
+        public async Task<bool> ProduceMemeCompilation(List<InstagramScrapeUtilities.InstagramReel> reels, string videoOutputPath = "")
         {
-            FFMpeg.Join(videoOutputPath, reels.Select(k => k.GetInstagramReelVideoFilePath()).ToArray());
+            parent.ServiceLog("Starting meme compilation video production...");
+            string tempDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegWorkingDirectory), "OmniTubeMemeCompilation_" + Guid.NewGuid());
+            Directory.CreateDirectory(tempDir);
+
+            var standardWidth = 1080;
+            var standardHeight = 1920;
+            var standardFramerate = 30;
+            var standardFormat = "mp4";
+            var standardCodec = "libx264";
+            var standardAudioCodec = "aac";
+            var convertedFiles = new List<string>();
+
+            try
+            {
+                foreach (var reel in reels)
+                {
+                    string inputPath = reel.GetInstagramReelVideoFilePath();
+                    string outputPath = Path.Combine(tempDir, $"{Path.GetFileNameWithoutExtension(inputPath)}_converted.{standardFormat}");
+
+                    var conversion = await FFMpegArguments
+                        .FromFileInput(inputPath)
+                        .OutputToFile(outputPath, true, options => options
+                            .WithVideoCodec(standardCodec)
+                            .WithAudioCodec(standardAudioCodec)
+                            .WithCustomArgument($"-vf scale={standardWidth}:{standardHeight}")
+                            .WithCustomArgument($"-r {standardFramerate}")
+                            .WithCustomArgument("-preset veryfast")
+                            .ForceFormat(standardFormat))
+                        .ProcessAsynchronously();
+
+                    convertedFiles.Add(outputPath);
+                }
+
+                parent.ServiceLog("Meme compilation video joined.");
+                return FFMpeg.Join(videoOutputPath, convertedFiles.ToArray());
+            }
+            finally
+            {
+                // Clean up temp files
+                foreach (var file in convertedFiles)
+                {
+                    if (File.Exists(file))
+                    {
+                        File.Delete(file);
+                    }
+                }
+                if (Directory.Exists(tempDir))
+                {
+
+                    Directory.Delete(tempDir, true);
+                }
+            }
         }
     }
 }
