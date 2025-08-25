@@ -205,12 +205,15 @@ namespace Omnipotent.Profiles
                         var profile = await GetProfileByPassword(password);
                         if (profile.CanLogin == true)
                         {
-                            await request.ReturnResponse("true", "application/json");
-                            if (profile.KlivesManagementRank != KMPermissions.Klives)
+                            try
                             {
-                                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{profile.Name} has logged into Klives Management.");
+                                if (profile.KlivesManagementRank != KMPermissions.Klives)
+                                {
+                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{profile.Name} has logged into Klives Management.");
+                                }
                             }
-
+                            catch (Exception e) { }
+                            await request.ReturnResponse("true", "application/json");
                         }
                         else
                         {
