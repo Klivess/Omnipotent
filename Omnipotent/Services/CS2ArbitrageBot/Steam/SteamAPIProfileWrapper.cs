@@ -27,9 +27,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
         public struct SteamBalance
         {
-            public float UsableBalanceInPounds;
-            public float PendingBalanceInPounds;
-            public float TotalBalanceInPounds;
+            public double UsableBalanceInPounds;
+            public double PendingBalanceInPounds;
+            public double TotalBalanceInPounds;
         }
 
         public async Task<bool> SellItem(Scanalytics.PurchasedListing purchasedListing)

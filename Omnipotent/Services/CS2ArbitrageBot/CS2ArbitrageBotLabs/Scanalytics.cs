@@ -153,7 +153,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     .ToList();
 
                 // Remove all ContainerGaps with a steam price greater than half of the current steamwallet balance.  
-                float maxPrice = 10;
+                double maxPrice = 10;
                 try
                 {
                     maxPrice = parent.steamBalance.Value.UsableBalanceInPounds;

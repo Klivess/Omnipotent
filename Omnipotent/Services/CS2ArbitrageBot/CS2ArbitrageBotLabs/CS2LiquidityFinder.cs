@@ -60,7 +60,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 {
                     string content = await response.Content.ReadAsStringAsync();
                     dynamic json = Newtonsoft.Json.JsonConvert.DeserializeObject(content);
-                    foreach (object weaponCaseList in json.data)
+                    foreach (dynamic weaponCaseList in json.data)
                     {
                         ContainerType type;
                         if (weaponCaseList.type == "weapon_case")
@@ -83,7 +83,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                         {
                             continue;
                         }
-                        foreach (object item in weaponCaseList.items)
+                        foreach (dynamic item in weaponCaseList.items)
                         {
                             Container container = new();
                             container.MarketHashName = item.market_hash_name;
