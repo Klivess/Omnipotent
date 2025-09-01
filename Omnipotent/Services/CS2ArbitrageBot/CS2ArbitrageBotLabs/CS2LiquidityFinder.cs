@@ -4,7 +4,7 @@ using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using System.ComponentModel;
 using System.Reflection.Metadata.Ecma335;
 
-namespace Omnipotent.Services.CS2ArbitrageBot
+namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 {
     public class CS2LiquidityFinder
     {
@@ -60,7 +60,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     string content = await response.Content.ReadAsStringAsync();
                     dynamic json = Newtonsoft.Json.JsonConvert.DeserializeObject(content);
-                    foreach (dynamic weaponCaseList in json.data)
+                    foreach (object weaponCaseList in json.data)
                     {
                         ContainerType type;
                         if (weaponCaseList.type == "weapon_case")
@@ -83,7 +83,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         {
                             continue;
                         }
-                        foreach (dynamic item in weaponCaseList.items)
+                        foreach (object item in weaponCaseList.items)
                         {
                             Container container = new();
                             container.MarketHashName = item.market_hash_name;
@@ -348,7 +348,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 .Sum(k => k.QuantitySold);
             foreach (var item in dataPoints.OrderBy(k => k.PriceInPounds))
             {
-                if (item.QuantitySold > (0.05 * quantitySoldOverLast5Days) && item.PriceInPounds < lowestPrice)
+                if (item.QuantitySold > 0.05 * quantitySoldOverLast5Days && item.PriceInPounds < lowestPrice)
                 {
                     lowestPrice = item.PriceInPounds;
                 }

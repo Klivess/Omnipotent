@@ -7,7 +7,7 @@ using OpenQA.Selenium.DevTools.V136.CSS;
 using System.Management.Automation;
 using System.Management.Automation.Language;
 using System.Text;
-using static Omnipotent.Services.CS2ArbitrageBot.CS2LiquidityFinder;
+using static Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs.CS2LiquidityFinder;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 {
