@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using DSharpPlus.SlashCommands;
 using System.Security.Policy;
 using Omnipotent.Services.KliveLocalLLM;
+using System.Diagnostics;
 
 namespace Omnipotent.Services.KliveBot_Discord
 {
@@ -40,10 +41,10 @@ namespace Omnipotent.Services.KliveBot_Discord
                     //Intents = DiscordIntents.AllUnprivileged
                 };
                 Client = new DiscordClient(connectionConfig);
-
+                var parent = this;
                 var slash = Client.UseSlashCommands(new SlashCommandsConfiguration
                 {
-                    Services = new ServiceCollection().AddSingleton(serviceManager).BuildServiceProvider()
+                    Services = new ServiceCollection().AddSingleton(parent).BuildServiceProvider()
                 });
                 slash.RegisterCommands<KliveBotDiscordCommands>();
                 ServiceLog("Slash commands registered!");

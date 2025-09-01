@@ -51,7 +51,7 @@ namespace Omnipotent.Services.OmniTube
                 }));
                 var selection = reelsUnder10Seconds.OrderBy(x => Guid.NewGuid()).Take(50).ToList();
                 string outputPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "MemeCompilation.mp4");
-                var success = await videoFactory.ProduceMemeCompilation(selection, outputPath);
+                //var success = await videoFactory.ProduceMemeCompilation(selection, outputPath);
                 ServiceLog("Meme compilation video created at: " + outputPath);
             }
         }
