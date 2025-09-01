@@ -338,7 +338,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public SteamAPIWrapper.ItemListing SteamListing;
             public DateTime LastUpdate;
 
-            public ScannedComparison(CSFloatWrapper.ItemListing csfloatListing, SteamAPIWrapper.ItemListing steamListing, DateTime lastUpdate)
+            public ScannedComparison(CSFloatWrapper.ItemListing csfloatListing, SteamAPIWrapper.ItemListing steamListing, DateTime lastUpdate, double expectedConversionCoeff)
             {
                 ItemMarketHashName = csfloatListing.ItemMarketHashName;
                 PriceTextCSFloat = csfloatListing.PriceText;
@@ -347,7 +347,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 double percentageDifference = Convert.ToDouble((steamListing.HighestBuyOrderPriceInPounds / csfloatListing.PriceInPounds));
                 double gainAfterSteamTax = (((steamListing.HighestBuyOrderPriceInPounds / 1.15) / csfloatListing.PriceInPounds));
-                double predictedOverallGain = (((((steamListing.HighestBuyOrderPriceInPounds / 1.15)) * 0.8) / csfloatListing.PriceInPounds));
+                double predictedOverallGain = (((((steamListing.HighestBuyOrderPriceInPounds / 1.15)) * expectedConversionCoeff) / csfloatListing.PriceInPounds));
 
                 RawArbitrageGain = percentageDifference;
                 ArbitrageGainAfterSteamTax = gainAfterSteamTax; // Assuming 15% Steam tax

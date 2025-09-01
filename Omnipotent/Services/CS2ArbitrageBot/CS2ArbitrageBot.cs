@@ -409,7 +409,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
                 //Find price difference
-                Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now);
+                Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now, scanalytics.expectedSteamToCSFloatConversionPercentage);
                 if (scanalytics.AllScannedComparisonsInHistory.Where(k => k.CSFloatListing.ItemListingID == snipe.ItemListingID).Any())
                 {
                     ServiceLog($"Snipe for {snipe.ItemMarketHashName} already exists in history, skipping.");
@@ -517,7 +517,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             dynamic json = JsonConvert.DeserializeObject(responseString);
             CSFloatWrapper.ItemListing csfloatlisting = csFloatWrapper.ConvertItemListingJSONItemToStruct(json, false);
             SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(csfloatlisting.ItemMarketHashName);
-            Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(csfloatlisting, correspondingListing, DateTime.Now);
+            Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(csfloatlisting, correspondingListing, DateTime.Now, scanalytics.expectedSteamToCSFloatConversionPercentage);
 
             if (csfloatAccountInformation.BalanceInPence > csfloatlisting.PriceInPence)
             {

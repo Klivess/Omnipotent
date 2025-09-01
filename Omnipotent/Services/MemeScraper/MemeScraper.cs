@@ -62,7 +62,10 @@ namespace Omnipotent.Services.MemeScraper
         {
             if (e.taskName.StartsWith("ScrapeAllInstagramPostsFromSource"))
             {
-                ScrapeInstagramAccount(SourceManager.GetInstagramSourceByID((string)e.PassableData));
+                if (OmniPaths.CheckIfOnServer())
+                {
+                    ScrapeInstagramAccount(SourceManager.GetInstagramSourceByID((string)e.PassableData));
+                }
             }
         }
 
