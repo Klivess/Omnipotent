@@ -57,10 +57,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }
             steamAPIWrapper = new SteamAPIWrapper(this);
-            await steamAPIWrapper.SteamAPIWrapperInitialisation();
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             liquidityFinder = new CS2LiquidityFinder(this);
             scanalytics = new Scanalytics(this);
+            await steamAPIWrapper.SteamAPIWrapperInitialisation();
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
             CreateRoutes();
