@@ -9,7 +9,6 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
         public MemeScraperLabs(MemeScraper parent)
         {
             this.parent = parent;
-            // Constructor logic if needed
         }
         public class MemeScraperAnalytics
         {
@@ -17,7 +16,6 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public List<InstagramScrapeUtilities.InstagramReel> InstagramReelsDownloaded;
             public DateTime DateTimeOfAnalyticsProduced;
 
-            // Analytics fields
             public int TotalInstagramSources;
             public int TotalReelsDownloaded;
             public double AverageReelsPerSource;
@@ -28,14 +26,12 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public double AverageViewCountPerReel;
             public Dictionary<DateTime, int> MemesDownloadedPerDay;
 
-            // New analytics
             public Dictionary<string, int> ReelsDownloadedPerSource;
             public DateTime? MostActiveDownloadDay;
             public List<InstagramSource> InactiveSources;
             public double GrowthRateOfDownloads;
             public double SourceDiversityIndex;
 
-            // Additional analytics
             public Dictionary<string, int> TopNichesByDownload;
             public List<InstagramScrapeUtilities.InstagramReel> ReelsWithHighEngagement;
             public int DownloadGaps;
@@ -51,13 +47,20 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
                 InstagramReelsDownloaded = reels;
                 DateTimeOfAnalyticsProduced = DateTime.Now;
 
-                // Calculate analytics
                 TotalInstagramSources = sources?.Count ?? 0;
                 TotalReelsDownloaded = reels?.Count ?? 0;
                 AverageReelsPerSource = (TotalInstagramSources > 0) ? (double)TotalReelsDownloaded / TotalInstagramSources : 0;
                 EarliestReelDownload = reels != null && reels.Count > 0 ? reels.Min(r => r.DateTimeReelDownloaded) : null;
                 LatestReelDownload = reels != null && reels.Count > 0 ? reels.Max(r => r.DateTimeReelDownloaded) : null;
-                TotalViewCount = reels?.Sum(r => r.ViewCount) ?? 0;
+                // With this code to prevent overflow and correctly sum into Int128:
+                TotalViewCount = 0;
+                if (reels != null)
+                {
+                    foreach (var r in reels)
+                    {
+                        TotalViewCount += (Int128)r.ViewCount;
+                    }
+                }
                 AverageViewCountPerReel = (TotalReelsDownloaded > 0) ? (double)TotalViewCount / TotalReelsDownloaded : 0;
 
                 // Find most active source (by number of reels downloaded)
