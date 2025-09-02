@@ -24,7 +24,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public DateTime? EarliestReelDownload;
             public DateTime? LatestReelDownload;
             public InstagramSource? MostActiveSource;
-            public int TotalViewCount;
+            public Int128 TotalViewCount;
             public double AverageViewCountPerReel;
             public Dictionary<DateTime, int> MemesDownloadedPerDay;
 
