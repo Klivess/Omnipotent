@@ -56,7 +56,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     await ServiceLog($"CSFloat API Key set to: {csfloatAPIKey}");
                 }
             }
-            CreateRoutes();
             steamAPIWrapper = new SteamAPIWrapper(this);
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
@@ -64,7 +63,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             scanalytics = new Scanalytics(this);
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
 
-            steamBalance = await steamAPIWrapper.profileWrapper.GetSteamBalance();
+            CreateRoutes();
 
             await UpdateAccountInformation();
             MonitorTradeList();
@@ -76,7 +75,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 CompareLiquidItemOptions();
             }
-            Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
         }
 
         private async Task CompareLiquidItemOptions()
