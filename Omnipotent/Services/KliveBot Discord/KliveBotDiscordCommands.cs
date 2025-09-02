@@ -217,7 +217,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 try
                 {
                     var copy = new List<OmniLogging.LoggedMessage>(parent.serviceManager.GetLogger().overallMessages.ToList());
-                    string serial = JsonConvert.SerializeObject(copy);
+                    string serial = JsonConvert.SerializeObject(copy, Formatting.Indented);
                     await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("Logs produced, sending to Klives."));
                     DiscordMessageBuilder dmb = new DiscordMessageBuilder();
                     string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveBotDiscordBotDirectory), "logs.json");

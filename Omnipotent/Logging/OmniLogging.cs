@@ -151,8 +151,8 @@ Data:
         {
             Action<UserRequest> getLogs = async (req) =>
             {
-                var copy = new SynchronizedCollection<LoggedMessage>(overallMessages);
-                await req.ReturnResponse(JsonConvert.SerializeObject(copy), "application/json");
+                var copy = new List<LoggedMessage>(overallMessages.ToList());
+                await req.ReturnResponse(JsonConvert.SerializeObject(copy, Formatting.Indented), "application/json");
             };
 
 
