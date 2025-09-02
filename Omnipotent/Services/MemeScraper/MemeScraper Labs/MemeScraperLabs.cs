@@ -25,6 +25,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public Int128 TotalViewCount;
             public double AverageViewCountPerReel;
             public Dictionary<DateTime, int> MemesDownloadedPerDay;
+            public Dictionary<DateTime, int> CumulativeDownloadedMemesPerDay;
 
             public Dictionary<string, int> ReelsDownloadedPerSource;
             public DateTime? MostActiveDownloadDay;
@@ -84,6 +85,15 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
                         int count = reels.Count(r => r.DateTimeReelDownloaded.Date == date);
                         MemesDownloadedPerDay[date] = count;
                     }
+                }
+
+                //Calculate CumulativeDownloadedMemesPerDay
+                CumulativeDownloadedMemesPerDay = new Dictionary<DateTime, int>();
+                int cumulativeCount = 0;
+                foreach (var kv in MemesDownloadedPerDay.OrderBy(kv => kv.Key))
+                {
+                    cumulativeCount += kv.Value;
+                    CumulativeDownloadedMemesPerDay[kv.Key] = cumulativeCount;
                 }
 
                 // 1. ReelsDownloadedPerSource
