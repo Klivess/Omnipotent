@@ -152,11 +152,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
                 // Remove all ContainerGaps with a steam price greater than half of the current steamwallet balance.  
                 double maxPrice = 10;
-                try
+                if (parent.steamBalance != null)
                 {
                     maxPrice = parent.steamBalance.Value.UsableBalanceInPounds;
                 }
-                catch (Exception e) { }
                 filteredGaps = filteredGaps
                     .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < (maxPrice))
                     .ToList();
@@ -164,17 +163,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 // Remove all ContainerGaps that do not meet the liquidity requirement of at least 500 items sold in the last 5 days  
                 var fiveDaysAgo = DateTime.UtcNow.AddDays(-5);
                 filteredGaps = filteredGaps
-                   .Where(g => g.priceHistory
-                       .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
-                       .Sum(p => p.QuantitySold) >= 500)
+                   .Where(g => g.priceHistory != null &&
+                               g.priceHistory
+                                   .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
+                                   .Sum(p => p.QuantitySold) >= 500)
                    .ToList();
-
 
                 // Sort the gaps by Ideal return coefficient  
                 filteredGaps = filteredGaps
                     .OrderByDescending(g => g.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded)
                     .ToList();
-
 
                 // Take the top 10 and set it to plan.Top10Gaps  
                 plan.Top10Gaps = filteredGaps.Take(10).ToList();
@@ -195,10 +193,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                         tactic.PriceNeededToSellOnCSFloat = gap.csfloatContainer.PriceInPounds;
 
                         // Look for the latest (datetime wise) time that gap.priceHistory has a price below to priceNeededToBuyOnSteam  
-                        var matchingPricePoint = gap.priceHistory
-                            .Where(p => p.PriceInPounds <= priceNeededToBuyOnSteam)
-                            .OrderByDescending(p => p.DateTimeRecorded)
-                            .FirstOrDefault();
+                        var matchingPricePoint = gap.priceHistory != null
+                            ? gap.priceHistory
+                                .Where(p => p.PriceInPounds <= priceNeededToBuyOnSteam)
+                                .OrderByDescending(p => p.DateTimeRecorded)
+                                .FirstOrDefault()
+                            : default;
 
                         tactic.LastTimeSoldAtThisPriceOrBelow = matchingPricePoint;
                         tacticsList.Add(tactic);
@@ -215,12 +215,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     string name = kvp.Key;
                     var dp = kvp.Value;
                     var tactic = plan.BuyOrderTacticsAndCorrespondingReturns[name]
-                        .First(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded == dp.DateTimeRecorded
-                                 && Math.Abs(t.LastTimeSoldAtThisPriceOrBelow.PriceInPence - dp.PriceInPence) < 0.01);
+                        .FirstOrDefault(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded == dp.DateTimeRecorded
+                                          && Math.Abs(t.LastTimeSoldAtThisPriceOrBelow.PriceInPence - dp.PriceInPence) < 0.01);
 
-                    sb.AppendLine(
-                        $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +
-                        $"(last seen {dp.DateTimeRecorded:yyyy-MM-dd}).");
+                    if (tactic.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded != default)
+                    {
+                        sb.AppendLine(
+                            $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +
+                            $"(last seen {dp.DateTimeRecorded:yyyy-MM-dd}).");
+                    }
                 }
                 plan.LiquidityPlanDescription = sb.ToString().TrimEnd();
             }
@@ -231,20 +234,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 throw;
             }
 
-
             //Omit everything but the last 2 weeks of pricehistory for each containergap in Top10Gaps
             var twoWeeksAgo = DateTime.UtcNow.AddDays(-14);
             var updatedGaps = new List<ContainerGap>();
             foreach (var gap in plan.Top10Gaps)
             {
                 var updatedGap = gap; // Create a copy of the gap object  
-                updatedGap.priceHistory = updatedGap.priceHistory
-                    .Where(p => p.DateTimeRecorded >= twoWeeksAgo)
-                    .ToList();
+                updatedGap.priceHistory = updatedGap.priceHistory != null
+                    ? updatedGap.priceHistory
+                        .Where(p => p.DateTimeRecorded >= twoWeeksAgo)
+                        .ToList()
+                    : new List<SteamPriceHistoryDataPoint>();
                 updatedGaps.Add(updatedGap);
             }
             plan.Top10Gaps = updatedGaps; // Replace the original list with the updated list  
-
 
             return plan;
         }
