@@ -1,4 +1,5 @@
 ﻿using Markdig.Renderers.Html;
+using Microsoft.AspNetCore.Authorization.Infrastructure;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
@@ -16,7 +17,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<ScannedComparison> AllScannedComparisonsInHistory;
         public List<PurchasedListing> AllPurchasedListingsInHistory;
         public List<ScanResults> AllScanResultsInHistory;
-        public List<LiquiditySearchResult> AllLiquiditySearchesInHistory;
         private CS2ArbitrageBot parent;
         public double expectedSteamToCSFloatConversionPercentage = 0.7;
         public Scanalytics(CS2ArbitrageBot parent)
@@ -25,12 +25,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             AllScannedComparisonsInHistory = new List<ScannedComparison>();
             AllPurchasedListingsInHistory = new();
             AllScanResultsInHistory = new List<ScanResults>();
-            AllLiquiditySearchesInHistory = new List<LiquiditySearchResult>();
             SetUpScanalytics();
             LoadScannedComparisons().Wait();
             LoadPurchasedItems().Wait();
             LoadScanResults().Wait();
-            LoadLiquiditySearches().Wait();
         }
 
         private async void SetUpScanalytics()
@@ -527,6 +525,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
+        /*
         public async Task LoadLiquiditySearches()
         {
             AllLiquiditySearchesInHistory = new();
@@ -545,6 +544,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 }
             }
         }
+        */
         public async Task SaveLiquiditySearch(LiquiditySearchResult liquidSearchResult)
         {
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
@@ -554,6 +554,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(liquidSearchResult, Formatting.Indented));
         }
+        /*
         public async Task UpdateLiquiditySearch(LiquiditySearchResult scanResult)
         {
             if (AllLiquiditySearchesInHistory.Where(k => k.LiquiditySearchID == scanResult.LiquiditySearchID).Any())
@@ -569,11 +570,31 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
             await SaveLiquiditySearch(scanResult);
         }
-        public LiquiditySearchResult GetLatestLiquiditySearchResult()
+        */
+        public async Task<LiquiditySearchResult> GetLatestLiquiditySearchResult()
         {
-            if (AllLiquiditySearchesInHistory.Count > 0)
+            DateTime dateTime = DateTime.MinValue;
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
+            string[] files = Directory.GetFiles(path);
+            string filePath = "";
+            foreach (var item in files)
             {
-                return AllLiquiditySearchesInHistory.OrderByDescending(k => k.DateOfSearch).First();
+                DateTime fileDate = File.GetCreationTime(item);
+                if (fileDate > dateTime)
+                {
+                    dateTime = fileDate;
+                    filePath = item;
+                }
+            }
+            if (filePath != "")
+            {
+                try
+                {
+                    string content = await parent.GetDataHandler().ReadDataFromFile(filePath, true);
+                    var comparison = JsonConvert.DeserializeObject<LiquiditySearchResult>(content);
+                    return comparison;
+                }
+                catch (Exception e) { }
             }
             return null;
         }

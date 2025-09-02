@@ -95,7 +95,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
                 else
                 {
-                    await scanalytics.UpdateLiquiditySearch(result);
+                    await scanalytics.SaveLiquiditySearch(result);
                     ServiceLog($"Liquidity search completed with {result.HighestReturnCoefficientFound} highest return coefficient found");
                 }
             }
@@ -581,7 +581,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    var plan = scanalytics.ProduceLiquidityPlanAsync(scanalytics.GetLatestLiquiditySearchResult());
+                    var plan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
                     await request.ReturnResponse(JsonConvert.SerializeObject(plan), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
