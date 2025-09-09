@@ -69,9 +69,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             {
                 CSFloatAndSteamBalance info = new();
                 parent.csfloatAccountInformation = await parent.csFloatWrapper.GetAccountInformation();
-                info.CSFloatUsableBalanceInPounds = parent.csfloatAccountInformation.BalanceInPounds;
-                info.CSFloatPendingBalanceInPounds = parent.csfloatAccountInformation.PendingBalanceInPounds;
-                info.CSFloatTotalBalanceInPounds = info.CSFloatUsableBalanceInPounds + info.CSFloatPendingBalanceInPounds;
+                info.CSFloatUsableBalanceInPounds = Convert.ToDouble(parent.csfloatAccountInformation.BalanceInPounds);
+                info.CSFloatPendingBalanceInPounds = Convert.ToDouble(parent.csfloatAccountInformation.PendingBalanceInPounds);
+                info.CSFloatTotalBalanceInPounds = Convert.ToDouble(info.CSFloatUsableBalanceInPounds) + Convert.ToDouble(info.CSFloatPendingBalanceInPounds);
                 SteamAPIProfileWrapper.SteamBalance steamBal = (await parent.steamAPIWrapper.profileWrapper.GetSteamBalance()).Value;
                 info.SteamUsableBalanceInPounds = steamBal.UsableBalanceInPounds;
                 info.SteamPendingBalanceInPounds = steamBal.PendingBalanceInPounds;
