@@ -18,6 +18,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public CS2ArbitrageBot parent;
         public SteamAPIProfileWrapper profileWrapper;
         private Dictionary<string, int> CS2NameIDTable;
+        public string SteamIDOfSteamClient = "76561198048900350";
         public int SentRequests = 0;
 
         string cs2NameIDTablePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDirectory), "cs2nameIDtables.json");

@@ -138,7 +138,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private async Task SellSkinOnSteam(Scanalytics.PurchasedListing data)
         {
             ServiceLog($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
-            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
+            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market. Bot will sell now.");
             data.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
             await scanalytics.UpdatePurchasedListing(data);
             //Message Klives
