@@ -356,6 +356,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 highestDiscountScanStrategy.StrategyUsed = ScanStrategy.SearchingThroughCSFloatHighestDiscount;
                 highestDiscountScanStrategy.StrategyUsedString = Enum.GetName(typeof(ScanStrategy), highestDiscountScanStrategy.StrategyUsed);
                 highestDiscountScanStrategy.ParentScanID = scanResults.ScanID;
+                highestDiscountScanStrategy.ProduceAnalytics();
                 scanResults.ScanStrategyResults.Add(highestDiscountScanStrategy);
 
 
@@ -387,6 +388,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 searchNewListings.StrategyUsed = ScanStrategy.SearchingThroughCSFloatNewest;
                 searchNewListings.StrategyUsedString = Enum.GetName(typeof(ScanStrategy), searchNewListings.StrategyUsed);
                 searchNewListings.ParentScanID = scanResults.ScanID;
+                searchNewListings.ProduceAnalytics();
                 scanResults.ScanStrategyResults.Add(searchNewListings);
 
                 scanResults.ProduceOverallAnalytics();
