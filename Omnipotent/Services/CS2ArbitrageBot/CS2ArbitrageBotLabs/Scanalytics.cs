@@ -7,6 +7,7 @@ using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using OpenQA.Selenium.DevTools.V136.CSS;
 using System.Management.Automation;
 using System.Management.Automation.Language;
+using System.Runtime.Intrinsics.X86;
 using System.Text;
 using static Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs.CS2LiquidityFinder;
 
@@ -18,7 +19,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<PurchasedListing> AllPurchasedListingsInHistory;
         public List<ScanResults> AllScanResultsInHistory;
         private CS2ArbitrageBot parent;
-        public double expectedSteamToCSFloatConversionPercentage = 0.7;
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
@@ -138,7 +138,35 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 public SteamPriceHistoryDataPoint LastTimeSoldAtThisPriceOrBelow;
             }
         }
-        public LiquidityPlan ProduceLiquidityPlanAsync(LiquiditySearchResult liquiditySearchResult)
+        public async Task<double> ExpectedSteamToCSFloatConversionPercentage()
+        {
+            try
+            {
+                LiquidityPlan liquidityPlan = ProduceLiquidityPlanAsync(await GetLatestLiquiditySearchResult(), 10);
+                if (liquidityPlan.Top10Gaps.Count > 0)
+                {
+                    //Get the gap of the Top 10 Gaps which has the highest quantity sold in the last 5 days
+                    var fiveDaysAgo = DateTime.UtcNow.AddDays(-5);
+                    var gapWithHighestQuantitySold = liquidityPlan.Top10Gaps
+                        .Where(g => g.priceHistory != null)
+                        .OrderByDescending(g => g.priceHistory
+                            .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
+                            .Sum(p => p.QuantitySold))
+                        .FirstOrDefault();
+                    return gapWithHighestQuantitySold.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
+                }
+                else
+                {
+                    return 0.75;
+                }
+            }
+            catch (Exception e)
+            {
+                return 0.75;
+            }
+        }
+
+        public LiquidityPlan ProduceLiquidityPlanAsync(LiquiditySearchResult liquiditySearchResult, double? maxPrice = null)
         {
             LiquidityPlan plan = new();
             try
@@ -151,10 +179,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     .ToList();
 
                 // Remove all ContainerGaps with a steam price greater than half of the current steamwallet balance.  
-                double maxPrice = 10;
-                if (parent.steamBalance != null)
+                if (maxPrice == null)
                 {
-                    maxPrice = parent.steamBalance.Value.UsableBalanceInPounds;
+                    if (parent.steamBalance != null)
+                    {
+                        maxPrice = parent.steamBalance.Value.UsableBalanceInPounds;
+                    }
                 }
                 filteredGaps = filteredGaps
                     .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < (maxPrice))
@@ -377,7 +407,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 ScanStrategyResults = new List<ScanStrategyResult>();
             }
 
-            public void ProduceOverallAnalytics()
+            public void ProduceOverallAnalytics(double ExpectedSteamToCSFloatConversionPercentage)
             {
                 List<ScannedComparison> totalComparisons = new();
                 List<PurchasedListing> purchasedListings = new();
@@ -390,7 +420,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 //remove all duplicates, where duplicates are defined as having the same CSFloatListing.ItemListingID
                 totalComparisons = totalComparisons.GroupBy(c => c.CSFloatListing.ItemListingID).Select(g => g.First()).ToList();
                 purchasedListings = purchasedListings.GroupBy(c => c.CSFloatListingID).Select(g => g.First()).ToList();
-                Analytics = new ScannedComparisonAnalytics(totalComparisons, purchasedListings);
+                Analytics = new ScannedComparisonAnalytics(totalComparisons, purchasedListings, ExpectedSteamToCSFloatConversionPercentage);
             }
         }
         public class ScanStrategyResult
@@ -412,9 +442,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 PurchasedListings = new List<PurchasedListing>();
             }
 
-            public void ProduceAnalytics()
+            public void ProduceAnalytics(double ExpectedSteamToCSFloatConversionPercentage)
             {
-                Analytics = new ScannedComparisonAnalytics(ScannedComparisons, PurchasedListings);
+                Analytics = new ScannedComparisonAnalytics(ScannedComparisons, PurchasedListings, ExpectedSteamToCSFloatConversionPercentage);
             }
         }
         public async Task SaveScannedComparison(ScannedComparison scannedComparison)
@@ -637,7 +667,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public List<PurchasedListing> AllPurchasedItems;
             public List<TimeSpan> TimeTakenToPurchaseAllPurchasedItems;
 
-            public ScannedComparisonAnalytics(List<ScannedComparison> data, List<PurchasedListing> purchasedListings)
+            public double CurrentExpectedReturnCoefficientOfSteamToCSFloat;
+
+            public ScannedComparisonAnalytics(List<ScannedComparison> data, List<PurchasedListing> purchasedListings, double currentExpectedReturnCoefficientOfSteamToCSFloat)
             {
                 List<ScannedComparison> comparisons = data;
                 List<ScannedComparison> comparisonsBelow0PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).ToList();
@@ -713,6 +745,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 AnalyticsGeneratedAt = DateTime.Now;
 
                 AllPurchasedItems = purchasedListings;
+
+                try
+                {
+                    CurrentExpectedReturnCoefficientOfSteamToCSFloat = currentExpectedReturnCoefficientOfSteamToCSFloat;
+                }
+                catch (Exception e) { }
 
                 TimeTakenToPurchaseAllPurchasedItems = new();
                 foreach (var item in purchasedListings)

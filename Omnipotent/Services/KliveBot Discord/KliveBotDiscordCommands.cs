@@ -248,40 +248,46 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+                var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
+                var scanalytics = cs2Service.scanalytics;
+                // Fix: Pass the required third argument (currentExpectedReturnCoefficientOfSteamToCSFloat)
+                double currentExpectedReturnCoefficient = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
                 CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics analytics =
-                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(((CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllScannedComparisonsInHistory,
-                    ((CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0]).scanalytics.AllPurchasedListingsInHistory);
+                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(
+                        scanalytics.AllScannedComparisonsInHistory,
+                        scanalytics.AllPurchasedListingsInHistory,
+                        currentExpectedReturnCoefficient);
 
                 string report = $@"
-[Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
-Earliest Listing Recorded: {analytics.FirstListingDateRecorded}
+        [Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
+        Earliest Listing Recorded: {analytics.FirstListingDateRecorded}
 
-**Total Listings Scanned: {analytics.TotalListingsScanned}**
+        **Total Listings Scanned: {analytics.TotalListingsScanned}**
 
---- Gain Buckets ---
-Listings with < 0% Gain: {analytics.NumberOfListingsBelow0PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBelow0PercentGain:F2})
-Listings with 0-5% Gain: {analytics.NumberOfListingsBetween0And5PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween0And5PercentGain:F2})
-Listings with 5-10% Gain: {analytics.NumberOfListingsBetween5And10PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween5And10PercentGain:F2})
-Listings with 10-20% Gain: {analytics.NumberOfListingsBetween10And20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween10And20PercentGain:F2})
-Listings with > 20% Gain: {analytics.NumberOfListingsAbove20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsAbove20PercentGain:F2})
+        --- Gain Buckets ---
+        Listings with < 0% Gain: {analytics.NumberOfListingsBelow0PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBelow0PercentGain:F2})
+        Listings with 0-5% Gain: {analytics.NumberOfListingsBetween0And5PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween0And5PercentGain:F2})
+        Listings with 5-10% Gain: {analytics.NumberOfListingsBetween5And10PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween5And10PercentGain:F2})
+        Listings with 10-20% Gain: {analytics.NumberOfListingsBetween10And20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsBetween10And20PercentGain:F2})
+        Listings with > 20% Gain: {analytics.NumberOfListingsAbove20PercentGain} (Avg Price: £{analytics.MeanPriceOfListingsAbove20PercentGain:F2})
 
---- Profitability Stats ---
-Listings with Positive Gain: {analytics.CountListingsWithPositiveGain}
-Listings with Negative Gain: {analytics.CountListingsWithNegativeGain}
-**Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%**
-Avg Gain of Profitable Listings: {analytics.MeanGainOfProfitableListings:F2}%
-Avg Float (Profitable): {analytics.MeanFloatValueOfProfitableListings:F5}
-Avg Price (Profitable): £{analytics.MeanPriceOfProfitableListings:F2}
-Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
-Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
+        --- Profitability Stats ---
+        Listings with Positive Gain: {analytics.CountListingsWithPositiveGain}
+        Listings with Negative Gain: {analytics.CountListingsWithNegativeGain}
+        **Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%**
+        Avg Gain of Profitable Listings: {analytics.MeanGainOfProfitableListings:F2}%
+        Avg Float (Profitable): {analytics.MeanFloatValueOfProfitableListings:F5}
+        Avg Price (Profitable): £{analytics.MeanPriceOfProfitableListings:F2}
+        Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
+        Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
 
---- Expected Returns ---
-Expected Return of All Snipes: {Math.Round((analytics.TotalExpectedProfitPercent - 1) * 100, 2)}%
+        --- Expected Returns ---
+        Expected Return of All Snipes: {Math.Round((analytics.TotalExpectedProfitPercent - 1) * 100, 2)}%
 
---- Top Opportunity ---
-Highest Predicted Gain Found: {Math.Round((analytics.HighestPredictedGainFoundSoFar - 1) * 100, 2)}%
-Item: {analytics.NameOfItemWithHighestPredictedGain}
-";
+        --- Top Opportunity ---
+        Highest Predicted Gain Found: {Math.Round((analytics.HighestPredictedGainFoundSoFar - 1) * 100, 2)}%
+        Item: {analytics.NameOfItemWithHighestPredictedGain}
+        ";
 
                 var embed = KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Analytics Report", report, DSharpPlus.Entities.DiscordColor.Green);
                 // Edit response with the Embed

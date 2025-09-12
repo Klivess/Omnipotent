@@ -10,6 +10,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
         {
             this.parent = parent;
         }
+
         public class MemeScraperAnalytics
         {
             public List<InstagramSource> InstagramSources;

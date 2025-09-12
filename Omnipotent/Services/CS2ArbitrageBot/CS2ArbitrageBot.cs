@@ -315,6 +315,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
                 steamBalance = await steamAPIWrapper.profileWrapper.GetSteamBalance();
+
+                double expectedReturnSteamToCSfloat = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
                 if (csfloatAccountInformation.BalanceInPounds < 2)
                 {
                     await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after insufficient balance in CSFloat Account.", false);
@@ -356,7 +358,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 highestDiscountScanStrategy.StrategyUsed = ScanStrategy.SearchingThroughCSFloatHighestDiscount;
                 highestDiscountScanStrategy.StrategyUsedString = Enum.GetName(typeof(ScanStrategy), highestDiscountScanStrategy.StrategyUsed);
                 highestDiscountScanStrategy.ParentScanID = scanResults.ScanID;
-                highestDiscountScanStrategy.ProduceAnalytics();
+                highestDiscountScanStrategy.ProduceAnalytics(expectedReturnSteamToCSfloat);
                 scanResults.ScanStrategyResults.Add(highestDiscountScanStrategy);
 
 
@@ -388,10 +390,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 searchNewListings.StrategyUsed = ScanStrategy.SearchingThroughCSFloatNewest;
                 searchNewListings.StrategyUsedString = Enum.GetName(typeof(ScanStrategy), searchNewListings.StrategyUsed);
                 searchNewListings.ParentScanID = scanResults.ScanID;
-                searchNewListings.ProduceAnalytics();
+                searchNewListings.ProduceAnalytics(expectedReturnSteamToCSfloat);
                 scanResults.ScanStrategyResults.Add(searchNewListings);
 
-                scanResults.ProduceOverallAnalytics();
+                scanResults.ProduceOverallAnalytics(expectedReturnSteamToCSfloat);
                 scanalytics.UpdateScanResult(scanResults);
                 await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market", false);
             }
@@ -408,7 +410,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(snipe.ItemMarketHashName);
                 //Find price difference
-                Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now, scanalytics.expectedSteamToCSFloatConversionPercentage);
+                Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now, await scanalytics.ExpectedSteamToCSFloatConversionPercentage());
+
                 if (scanalytics.AllScannedComparisonsInHistory.Where(k => k.CSFloatListing.ItemListingID == snipe.ItemListingID).Any())
                 {
                     ServiceLog($"Snipe for {snipe.ItemMarketHashName} already exists in history, skipping.");
@@ -428,7 +431,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         $"Steam Price: {correspondingListing.PriceText}\n" +
                         $"Raw Arbitrage Gain: **{Math.Round((comparison.RawArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
                         $"Arbitrage Gain After Steam Tax: **{Math.Round((comparison.ArbitrageGainAfterSteamTax - 1) * 100, 2).ToString()}%**\n" +
-                        $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                        $"Predicted Overall Gain After {((await scanalytics.ExpectedSteamToCSFloatConversionPercentage() * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
                         $"CSFloat Listing URL: {snipe.ListingURL}\n" +
                         $"Steam Listing URL: {correspondingListing.ListingURL}\n\n" +
                         $"Purchase Status: Purchasing...";
@@ -507,6 +510,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             string url = $"https://csfloat.com/api/v1/listings/{CSFloatListingID}";
             var response = await csFloatWrapper.Client.GetAsync(url);
+            double expectedReturnSteamToCSfloat = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
             if (!response.IsSuccessStatusCode)
             {
                 await ServiceLogError($"Failed to get CSFloat listing with ID {CSFloatListingID}. Status Code: {response.StatusCode}");
@@ -516,7 +520,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             dynamic json = JsonConvert.DeserializeObject(responseString);
             CSFloatWrapper.ItemListing csfloatlisting = csFloatWrapper.ConvertItemListingJSONItemToStruct(json, false);
             SteamAPIWrapper.ItemListing correspondingListing = await steamAPIWrapper.GetItemOnMarket(csfloatlisting.ItemMarketHashName);
-            Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(csfloatlisting, correspondingListing, DateTime.Now, scanalytics.expectedSteamToCSFloatConversionPercentage);
+            Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(csfloatlisting, correspondingListing, DateTime.Now, expectedReturnSteamToCSfloat);
 
             if (csfloatAccountInformation.BalanceInPence > csfloatlisting.PriceInPence)
             {
@@ -542,7 +546,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 //tell klives that the bot purchased what he asked him to, this is not a snipe.
                 (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Bot Purchase",
                     $"Purchased CSFloat listing {csfloatlisting.ItemMarketHashName} with price {csfloatlisting.PriceText}.\n" +
-                    $"Predicted Overall Gain After {((scanalytics.expectedSteamToCSFloatConversionPercentage * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
+                    $"Predicted Overall Gain After {((expectedReturnSteamToCSfloat * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
                     $"CSFloat Listing URL: {csfloatlisting.ListingURL}\n" +
                     $"Steam Listing URL: {correspondingListing.ListingURL}",
                     DSharpPlus.Entities.DiscordColor.Green, new Uri(csfloatlisting.ImageURL)));
@@ -556,7 +560,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory);
+                    Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory, await scanalytics.ExpectedSteamToCSFloatConversionPercentage());
 
                     await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
                 }
