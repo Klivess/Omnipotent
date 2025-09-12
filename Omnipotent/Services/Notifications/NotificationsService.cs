@@ -71,7 +71,7 @@ namespace Omnipotent.Services.Notifications
                     {
                         token.Cancel();
                         DiscordInteractionResponseBuilder builder = new();
-                        builder.WithContent($"Submitted!");
+                        builder.WithContent($"Submitted! ||option: {e.Id}||");
                         await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
                         submitted = buttonsInfo.ElementAt(i).Key;
                         break;
@@ -117,9 +117,9 @@ namespace Omnipotent.Services.Notifications
                 if (e.Values.Keys.ToArray()[0].ToString() == modalID)
                 {
                     DiscordInteractionResponseBuilder builder = new();
+                    submitted = e.Values.Values.First();
                     builder.WithContent($"Submitted!");
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
-                    submitted = e.Values.Values.First();
                 }
             };
 
