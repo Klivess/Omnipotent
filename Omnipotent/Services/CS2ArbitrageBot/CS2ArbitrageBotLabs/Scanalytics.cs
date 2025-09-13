@@ -153,6 +153,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                             .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
                             .Sum(p => p.QuantitySold))
                         .FirstOrDefault();
+
+                    if (gapWithHighestQuantitySold.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded > 0.85)
+                    {
+                        return 0.85;
+                    }
                     return gapWithHighestQuantitySold.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
                 }
                 else
