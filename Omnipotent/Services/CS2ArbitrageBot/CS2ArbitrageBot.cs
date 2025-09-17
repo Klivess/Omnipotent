@@ -95,7 +95,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 else
                 {
                     await scanalytics.SaveLiquiditySearch(result);
-                    ServiceLog($"Liquidity search completed with {result.HighestReturnCoefficientFound} highest return coefficient found");
+                    ServiceLog($"Liquidity search completed with {result.HighestReturnCoefficientFound.ReturnCoefficientFromSteamToCSFloatTaxIncluded} highest return coefficient found");
                 }
             }
             catch (Exception ex)
