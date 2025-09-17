@@ -265,7 +265,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             catch (Exception ex)
             {
                 // Log the error and rethrow it for higher-level handling  
-                parent.ServiceLogError($"Error in ProduceLiquidityPlan: {ex.Message}").Wait();
+                parent.ServiceLogError(ex, $"Error in ProduceLiquidityPlan");
                 throw;
             }
 
@@ -632,7 +632,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     var comparison = JsonConvert.DeserializeObject<LiquiditySearchResult>(content);
                     return comparison;
                 }
-                catch (Exception e) { }
+                catch (Exception e)
+                {
+                    parent.ServiceLogError(e, "Error loading latest liquidity search result.");
+                    throw e;
+                }
             }
             return null;
         }
