@@ -242,6 +242,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        /*
         [SlashCommand("produceliquidityplan", "Produces a liquidity strategy for the CS2 Arbitrage Bot.")]
         public async Task ProduceAndDisplayLiquidityPlan(InteractionContext ctx)
         {
@@ -331,7 +332,7 @@ namespace Omnipotent.Services.KliveBot_Discord
 
         }
 
-
+        */
         [SlashCommand("GetCS2ArbitrageAnalytics", "Generates and returns the latest analytics for Klives's CS2 Arbitrage Strategy")]
         public async Task GetCS2ArbitrageAnalytics(InteractionContext ctx)
         {
