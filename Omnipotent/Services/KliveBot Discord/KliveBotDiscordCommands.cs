@@ -242,6 +242,19 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        [SlashCommand("produceliquidityplan", "Produces a liquidity strategy for the CS2 Arbitrage Bot.")]
+        public async Task ProduceAndDisplayLiquidityPlan(InteractionContext ctx)
+        {
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
+            var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
+            var scanalytics = cs2Service.scanalytics;
+
+            var liquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult(), cs2Service.steamBalance.Value.TotalBalanceInPounds);
+
+            
+        }
+
+
         [SlashCommand("GetCS2ArbitrageAnalytics", "Generates and returns the latest analytics for Klives's CS2 Arbitrage Strategy")]
         public async Task GetCS2ArbitrageAnalytics(InteractionContext ctx)
         {
