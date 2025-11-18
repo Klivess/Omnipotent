@@ -17,7 +17,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 {
     public class CS2ArbitrageBot : OmniService
     {
-        public float ExchangeRate;
+        public float? ExchangeRate;
         public SteamAPIWrapper steamAPIWrapper;
         public CSFloatWrapper csFloatWrapper;
         public Scanalytics scanalytics;
@@ -36,7 +36,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         protected override async void ServiceMain()
         {
-            GetExchangeRate().Wait();
+
+            try
+            {
+                await GetExchangeRate();
+            }
+            catch (Exception e)
+            {
+                ServiceLogError(e, "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
+                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
+                ExchangeRate = null;
+            }
             string csfloatAPIKey = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatAPIKey));
             if (string.IsNullOrEmpty(csfloatAPIKey))
             {
@@ -56,6 +66,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     await ServiceLog($"CSFloat API Key set to: {csfloatAPIKey}");
                 }
             }
+
+
+
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             liquidityFinder = new CS2LiquidityFinder(this);
@@ -313,6 +326,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             try
             {
+                if (ExchangeRate == null)
+                {
+                    //try get exchange rate, if fails, log it and reschedule for 1 hour from now to try 
+                    try
+                    {
+                        await GetExchangeRate();
+                    }
+                    catch (Exception e)
+                    {
+                        ServiceLogError(e, "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
+                        ExchangeRate = null;
+                        await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after error getting exchange rate.", false);
+                        return;
+                    }
+                }
+
                 csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
                 steamBalance = await steamAPIWrapper.profileWrapper.GetSteamBalance();
 
