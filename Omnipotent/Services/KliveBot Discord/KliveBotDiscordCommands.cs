@@ -251,7 +251,84 @@ namespace Omnipotent.Services.KliveBot_Discord
 
             var liquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult(), cs2Service.steamBalance.Value.TotalBalanceInPounds);
 
-            
+
+            try
+            {
+                if (liquidityPlan == null || liquidityPlan.Top10Gaps == null || liquidityPlan.Top10Gaps.Count == 0)
+                {
+                    await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("No gaps found in the latest liquidity plan."));
+                    return;
+                }
+
+                // Build pages: each page will contain up to 3 gaps to make the output readable
+                const int gapsPerPage = 3;
+                var gaps = liquidityPlan.Top10Gaps;
+                var pages = new List<DiscordEmbedBuilder>();
+
+                for (int i = 0; i < gaps.Count; i += gapsPerPage)
+                {
+                    var pageBuilder = new DiscordEmbedBuilder()
+                        .WithTitle($"Liquidity Plan - Gaps {i + 1} to {Math.Min(i + gapsPerPage, gaps.Count)}")
+                        .WithColor(DiscordColor.Azure)
+                        .WithFooter($"Produced: {liquidityPlan.ProductionDateOfLiquiditySearchResultUsed:yyyy-MM-dd HH:mm} | Page {pages.Count + 1}");
+
+                    var sb = new System.Text.StringBuilder();
+                    for (int j = i; j < i + gapsPerPage && j < gaps.Count; j++)
+                    {
+                        var gap = gaps[j];
+                        sb.AppendLine($"**{j + 1}. {gap.csfloatContainer.MarketHashName}**");
+                        sb.AppendLine($"• CSFloat Price: £{gap.csfloatContainer.PriceInPounds:F2} (¢{gap.csfloatContainer.PriceInCents})");
+                        sb.AppendLine($"• Steam Cheapest Sell Order: £{(gap.steamListing.CheapestSellOrderPriceInPence):F2}");
+                        sb.AppendLine($"• Return Coefficient (Steam → CSFloat): {gap.ReturnCoefficientFromSteamtoCSFloat:F3} ({gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded:F3} tax-included)");
+                        sb.AppendLine($"• Ideal CSFloat Sell Price: £{gap.IdealCSFloatSellPriceInPounds:F2}");
+                        sb.AppendLine($"• Ideal Steam Purchase Price: £{gap.IdealPriceToPurchaseOnSteamInPounds:F2}");
+                        sb.AppendLine($"• Ideal Return Coefficient: {gap.IdealReturnCoefficientFromSteamtoCSFloat:F3} ({gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded:F3} tax-included)");
+
+                        if (gap.priceHistory != null && gap.priceHistory.Count > 0)
+                        {
+                            var latest = gap.priceHistory.OrderByDescending(p => p.DateTimeRecorded).First();
+                            sb.AppendLine($"• Latest price history point: £{latest.PriceInPounds:F2} @ {latest.DateTimeRecorded:yyyy-MM-dd} (Qty: {latest.QuantitySold})");
+
+                            // show 3 most recent bottoms if exist
+                            var bottoms = CS2LiquidityFinder.GetPriceBottoms(gap.priceHistory).OrderByDescending(p => p.DateTimeRecorded).Take(3).ToList();
+                            if (bottoms.Any())
+                            {
+                                sb.AppendLine("• Recent bottoms:");
+                                foreach (var b in bottoms)
+                                {
+                                    sb.AppendLine($"  - £{b.PriceInPounds:F2} @ {b.DateTimeRecorded:yyyy-MM-dd} (Qty: {b.QuantitySold})");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            sb.AppendLine("• No price history available.");
+                        }
+
+                        sb.AppendLine($"• Image: {gap.csfloatContainer.ImageURL}");
+                        sb.AppendLine($"\n");
+                    }
+
+                    pageBuilder.WithDescription(sb.ToString());
+                    pages.Add(pageBuilder);
+                }
+
+                // Send first page as edit of deferred response
+                var firstWebhook = new DiscordWebhookBuilder().AddEmbed(pages[0].Build());
+                await ctx.EditResponseAsync(firstWebhook);
+
+                // Send remaining pages as follow-ups so they're easy to read (acts like pagination)
+                for (int p = 1; p < pages.Count; p++)
+                {
+                    await ctx.FollowUpAsync(new DiscordFollowupMessageBuilder().AddEmbed(pages[p].Build()));
+                }
+            }
+            catch (Exception ex)
+            {
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("An error occurred producing the liquidity plan embed."));
+                (await parent.serviceManager.GetKliveBotDiscordService()).ServiceLogError(ex);
+            }
+
         }
 
 
@@ -315,3 +392,4 @@ namespace Omnipotent.Services.KliveBot_Discord
         }
     }
 }
+   
