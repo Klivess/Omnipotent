@@ -162,7 +162,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             HttpRequestMessage message = new();
             message.RequestUri = new Uri("https://csfloat.com/api/v1/meta/exchange-rates");
             message.Method = HttpMethod.Get;
-            var response = client.SendAsync(message).Result;
+            var response = await client.SendAsync(message);
             dynamic json = JsonConvert.DeserializeObject(await response.Content.ReadAsStringAsync());
             ExchangeRate = json.data.gbp;
             ServiceLog($"Exchange Rate: {ExchangeRate} GBP = 1 USD");
