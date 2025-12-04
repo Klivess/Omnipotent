@@ -1,5 +1,4 @@
 ﻿using DSharpPlus.Entities;
-using FluffySpoon.Ngrok;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -36,7 +35,6 @@ namespace Omnipotent.Services.KliveAPI
         public static int apiPORT = 443;
         public static int apiHTTPPORT = 5000;
         public static string domainName = "klive.dev"; //This is the domain name that the SSL certificate will be signed for. It should be the same as the domain name that the API will be accessed from.
-        public INgrokService? ngrokService = null;
         public HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
@@ -180,29 +178,7 @@ namespace Omnipotent.Services.KliveAPI
 
         private async Task InitialiseNgrok()
         {
-            var services = new ServiceCollection();
-
             string authToken = await GetNgrokAuthorizationToken();
-            services.AddNgrok(async options =>
-            {
-                options.AuthToken = authToken;
-            });
-
-            var serviceProvider = services.BuildServiceProvider();
-            ngrokService = serviceProvider.GetService<INgrokService>();
-
-            //this downloads the Ngrok executable and starts it in the background.
-            await ngrokService.InitializeAsync();
-
-            //this opens a tunnel for the given URL
-            var tunnel = await ngrokService.StartAsync(new Uri($"localhost:{apiPORT}/"));
-            string url = tunnel.PublicUrl;
-            ServiceLog($"Ngrok tunnel URL for https://+:{apiPORT}/ is: " + tunnel.PublicUrl);
-
-            //the active tunnel can also be accessed using ngrokService.ActiveTunnel.
-
-            //we may stop the tunnel as well.
-            //await ngrokService.StopAsync();
         }
 
         private async Task<string> GetNgrokAuthorizationToken()
