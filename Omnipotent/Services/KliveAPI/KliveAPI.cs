@@ -9,6 +9,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Ngrok;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Crypto;
@@ -36,6 +37,7 @@ namespace Omnipotent.Services.KliveAPI
         public static int apiHTTPPORT = 5000;
         public static string domainName = "klive.dev"; //This is the domain name that the SSL certificate will be signed for. It should be the same as the domain name that the API will be accessed from.
         public HttpListener listener = new HttpListener();
+        private NgrokManager ngrokManager = new();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
 
