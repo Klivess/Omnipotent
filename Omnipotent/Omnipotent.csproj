@@ -25,6 +25,7 @@
 		<PackageReference Include="DSharpPlus.SlashCommands" Version="4.5.1" />
 		<PackageReference Include="DSharpPlus.VoiceNext" Version="4.5.1" />
 		<PackageReference Include="FFMpegCore" Version="5.2.0" />
+		<PackageReference Include="FluffySpoon.Ngrok" Version="1.164.0" />
 		<PackageReference Include="Humanizer.Core" Version="2.14.1" />
 		<PackageReference Include="LangChain" Version="0.17.0" />
 		<PackageReference Include="LangChain.Providers.HuggingFace" Version="0.17.0" />

@@ -10,6 +10,7 @@ namespace Omnipotent.Data_Handling
         public static ulong DiscordServerContainingKlives = 688114655910297736;
         public static ulong KlivesDiscordAccountID = 976648966944989204;
         public static bool useACMECert = true;
+        public static bool KliveAPIUseNgrok = true;
 
         public static DateTime LastOmnipotentUpdate = File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe"));
 
@@ -40,9 +41,10 @@ namespace Omnipotent.Data_Handling
             public static string KlivesManagementProfilesDirectory = $"{KlivesManagementInfoDirectory}/Profiles";
 
             //KliveAPI
-            public static string KlivesAPICertificateDirectory = $"{SavedDataDirectory}/KliveAPI";
-            public static string KlivesACMEAPICertificateDirectory = $"{KlivesAPICertificateDirectory}/ACMECerts";
-            public static string KlivesCertificateLinkingLogsDirectory = $"{KlivesAPICertificateDirectory}/CertificateLinkingLogs";
+            public static string KlivesAPIDirectory = $"{SavedDataDirectory}/KliveAPI";
+            public static string KlivesACMEAPICertificateDirectory = $"{KlivesAPIDirectory}/ACMECerts";
+            public static string KlivesCertificateLinkingLogsDirectory = $"{KlivesAPIDirectory}/CertificateLinkingLogs";
+            public static string KlivesAPINgrokToken = $"{KlivesAPIDirectory}/ngroktoken.txt";
 
             //KliveLocalLLM
             public static string KliveLLMDirectory = $"{SavedDataDirectory}/KliveLLM";

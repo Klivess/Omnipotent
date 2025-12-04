@@ -1,31 +1,32 @@
-﻿using Microsoft.AspNetCore.Builder;
+﻿using DSharpPlus.Entities;
+using FluffySpoon.Ngrok;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Omnipotent.Data_Handling;
-using Omnipotent.Service_Manager;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using System.Net;
-using Newtonsoft.Json;
-using System.Web;
-using System.Collections.Specialized;
-using Omnipotent.Profiles;
-using System.Management.Automation.Runspaces;
-using static Omnipotent.Profiles.KMProfileManager;
-using System.Security.Cryptography.X509Certificates;
-using System.Management.Automation;
-using System.Diagnostics;
-using System.Collections.Concurrent;
+using Microsoft.PowerShell.Commands;
 using Microsoft.VisualBasic.FileIO;
-using DSharpPlus.Entities;
+using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
+using Omnipotent.Profiles;
+using Omnipotent.Service_Manager;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Crypto;
-using Microsoft.PowerShell.Commands;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Diagnostics;
+using System.Linq;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Threading.Tasks;
+using System.Web;
+using static Omnipotent.Profiles.KMProfileManager;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -35,6 +36,7 @@ namespace Omnipotent.Services.KliveAPI
         public static int apiPORT = 443;
         public static int apiHTTPPORT = 5000;
         public static string domainName = "klive.dev"; //This is the domain name that the SSL certificate will be signed for. It should be the same as the domain name that the API will be accessed from.
+        public INgrokService? ngrokService = null;
         public HttpListener listener = new HttpListener();
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
@@ -147,9 +149,16 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
-                ServiceLog($"Checking SSL Certificates ");
-                await CheckForSSLCertificate();
-                await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
+                if (OmniPaths.KliveAPIUseNgrok)
+                {
+                    await InitialiseNgrok();
+                }
+                else
+                {
+                    ServiceLog($"Checking SSL Certificates ");
+                    await CheckForSSLCertificate();
+                    await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
+                }
 
                 listener.Start();
 
@@ -167,6 +176,63 @@ namespace Omnipotent.Services.KliveAPI
                 ServiceLogError(ex, "KliveAPI Failed!");
                 (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
             }
+        }
+
+        private async Task InitialiseNgrok()
+        {
+            var services = new ServiceCollection();
+
+            string authToken = await GetNgrokAuthorizationToken();
+            services.AddNgrok(async options =>
+            {
+                options.AuthToken = authToken;
+            });
+
+            var serviceProvider = services.BuildServiceProvider();
+            ngrokService = serviceProvider.GetService<INgrokService>();
+
+            //this downloads the Ngrok executable and starts it in the background.
+            await ngrokService.InitializeAsync();
+
+            //this opens a tunnel for the given URL
+            var tunnel = await ngrokService.StartAsync(new Uri($"localhost:{apiPORT}/"));
+            string url = tunnel.PublicUrl;
+            ServiceLog($"Ngrok tunnel URL for https://+:{apiPORT}/ is: " + tunnel.PublicUrl);
+
+            //the active tunnel can also be accessed using ngrokService.ActiveTunnel.
+
+            //we may stop the tunnel as well.
+            //await ngrokService.StopAsync();
+        }
+
+        private async Task<string> GetNgrokAuthorizationToken()
+        {
+            string authToken = "";
+            string pathToAuthTokenFile = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPINgrokToken);
+            bool found = false;
+            authToken = (await GetDataHandler().ReadDataFromFile(pathToAuthTokenFile, true)).Trim();
+            if (string.IsNullOrEmpty(authToken))
+            {
+                ServiceLog("Ngrok auth token file is empty. Please add your ngrok auth token to the file at: " + pathToAuthTokenFile);
+                string result = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("Ngrok auth token file is empty.", "Please add your ngrok auth token.", TimeSpan.FromDays(30), "Ngrok Token", "Auth Token");
+                authToken = result;
+                if (!string.IsNullOrEmpty(authToken))
+                {
+                    await GetDataHandler().WriteToFile(pathToAuthTokenFile, authToken);
+                    found = true;
+                }
+                else
+                {
+                    ServiceLog("No ngrok auth token provided. Please add your ngrok auth token to the file at: " + pathToAuthTokenFile);
+                    return await GetNgrokAuthorizationToken();
+                }
+            }
+            else
+            {
+                ServiceLog("Ngrok auth token found in file.");
+                found = true;
+            }
+            return authToken;
         }
 
         private async void CreateMetaKLIVEAPIRoutes()

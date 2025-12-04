@@ -18,7 +18,7 @@ namespace Omnipotent.Services.KliveAPI
     public class CertificateInstaller
     {
         KliveAPI parent;
-        public static string saveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPICertificateDirectory);
+        public static string saveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesAPIDirectory);
         public static string pemSaveDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesACMEAPICertificateDirectory);
         public string rootAuthorityCrtPath = Path.Combine(saveDir, "KliveAPI.crt");
         public string rootAuthorityPfxPath = Path.Combine(saveDir, "KliveAPI.pfx");
