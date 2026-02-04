@@ -62,7 +62,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveCloud());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLLM());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new MemeScraper());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());
+                //omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTube());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {

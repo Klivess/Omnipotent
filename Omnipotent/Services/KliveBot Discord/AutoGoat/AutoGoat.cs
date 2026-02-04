@@ -9,7 +9,6 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
 {
     public class AutoGoat : OmniService
     {
-
         public static string josueID = "1438288341886832875";
         public static string oliverID = "489871029100085248";
         public static string nourdinID = "976648966944989204";
