@@ -15,6 +15,7 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
         public static string nourdinID = "976648966944989204";
         public static string bartuID = "720531645152755804";
         public static string alexID = "316456930316910593";
+        public static string victorID = "437602988291391490";
 
         public AutoGoat()
         {
@@ -46,10 +47,17 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
                     if (args.Author.Id.ToString() == nourdinID)
                     {
                         await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":black_heart:"));
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":clap:"));
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":brain:"));
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":bulb:"));
                     }
                     if (args.Author.Id.ToString() == alexID)
                     {
                         await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":EyeofQuok:"));
+                    }
+                    if(args.Author.Id.ToString() == victorID)
+                    {
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":nerd:"));
                     }
                 });
                 task.Start();
