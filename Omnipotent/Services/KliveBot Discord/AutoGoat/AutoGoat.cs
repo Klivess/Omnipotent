@@ -1,6 +1,7 @@
 ﻿using DSharpPlus;
 using DSharpPlus.Entities;
 using DSharpPlus.EventArgs;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using SteamKit2.Internal;
 using System.Web.WebPages.Scope;
@@ -31,32 +32,33 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
 
         private async Task AutoGoat_MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
         {
+            Random rnd = new Random();
+
             //if in hypixel
             if (args.Guild.Id.ToString() == "802103827100467240")
             {
                 var task = Task.Run(async () =>
                 {
                     //if its josue
-                    if (args.Author.Id.ToString() == josueID)
+                    if (args.Author.Id.ToString() == josueID&&rnd.Next(0, 100) < 5)
                     {
-                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":goat:"));
-                        await TypeWithRegionalIndicators(sender, args, "WACKY");
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":wacky:"));
                         ServiceLog(GetName() + " reacted to Josue's message in Hypixel with a goat emoji.");
                     }
-                    if (args.Author.Id.ToString() == nourdinID)
+                    if (args.Author.Id.ToString() == nourdinID && rnd.Next(0, 100) < 10)
                     {
-                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":black_heart:"));
-                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":clap:"));
-                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":brain:"));
-                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":bulb:"));
+                        await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":goat:"));
+                        ServiceLog(GetName() + " reacted to Nourdin's message in Hypixel with a goat emoji.");
                     }
-                    if (args.Author.Id.ToString() == alexID)
+                    if (args.Author.Id.ToString() == alexID&&rnd.Next(0,100)<5)
                     {
                         await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":EyeofQuok:"));
+                        ServiceLog(GetName() + " reacted to Alex's message in Hypixel with an eye of quok emoji.");
                     }
-                    if(args.Author.Id.ToString() == victorID)
+                    if(args.Author.Id.ToString() == victorID && rnd.Next(0, 100) < 5)
                     {
                         await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":nerd:"));
+                        ServiceLog(GetName() + " reacted to Victor's message in Hypixel with a nerd emoji.");
                     }
                 });
                 task.Start();
