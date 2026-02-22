@@ -53,7 +53,7 @@ namespace Omnipotent.Services.KliveAPI
         }
         public async Task CreateInstallCert(int expDateYears, string password, string issuedBy)
         {
-            if (OmniPaths.CheckIfOnServer() && OmniPaths.useACMECert)
+            if (OmniPaths.CheckIfOnServer()&&OmniPaths.useACMECert)
             {
                 await CheckPretendPearExists();
                 if (!System.IO.File.Exists(rootAuthorityPfxPath))
