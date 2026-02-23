@@ -306,6 +306,27 @@ namespace Omnipotent.Services.KliveCloud
             ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp"
         };
 
+        private static readonly Dictionary<string, string> VideoMimeTypes = new(StringComparer.OrdinalIgnoreCase)
+        {
+            { ".mp4", "video/mp4" },
+            { ".mkv", "video/x-matroska" },
+            { ".avi", "video/x-msvideo" },
+            { ".mov", "video/quicktime" },
+            { ".wmv", "video/x-ms-wmv" },
+            { ".flv", "video/x-flv" },
+            { ".webm", "video/webm" },
+            { ".m4v", "video/x-m4v" },
+            { ".mpg", "video/mpeg" },
+            { ".mpeg", "video/mpeg" },
+            { ".3gp", "video/3gpp" }
+        };
+
+        public string GetVideoMimeType(CloudItem item)
+        {
+            string ext = Path.GetExtension(item.Name);
+            return VideoMimeTypes.TryGetValue(ext, out string mime) ? mime : "application/octet-stream";
+        }
+
         public bool IsImage(CloudItem item)
         {
             return item.ItemType == CloudItemType.File && ImageExtensions.Contains(Path.GetExtension(item.Name));

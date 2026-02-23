@@ -605,6 +605,103 @@ namespace Omnipotent.Services.KliveCloud
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
+
+            // Stream a video file with HTTP Range support
+            await api.CreateRoute("/KliveCloud/StreamVideo", async (req) =>
+            {
+                try
+                {
+                    string itemID = req.userParameters.Get("itemID");
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("ItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (!parent.IsVideo(item))
+                    {
+                        await req.ReturnResponse("ItemIsNotAVideo", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (item.MinimumPermissionLevel > req.user.KlivesManagementRank)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    string filePath = parent.GetFullItemPath(item);
+                    if (!File.Exists(filePath))
+                    {
+                        await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var fileInfo = new FileInfo(filePath);
+                    long fileLength = fileInfo.Length;
+                    string mimeType = parent.GetVideoMimeType(item);
+
+                    var resp = req.context.Response;
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Add("Accept-Ranges", "bytes");
+
+                    string rangeHeader = req.req.Headers["Range"];
+
+                    if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
+                    {
+                        string rangeValue = rangeHeader.Substring("bytes=".Length);
+                        string[] parts = rangeValue.Split('-');
+                        long start = long.Parse(parts[0]);
+                        long end = !string.IsNullOrEmpty(parts[1]) ? long.Parse(parts[1]) : fileLength - 1;
+
+                        if (start >= fileLength || end >= fileLength || start > end)
+                        {
+                            resp.StatusCode = 416;
+                            resp.Headers.Add("Content-Range", $"bytes */{fileLength}");
+                            resp.Close();
+                            return;
+                        }
+
+                        long contentLength = end - start + 1;
+                        resp.StatusCode = 206;
+                        resp.ContentType = mimeType;
+                        resp.ContentLength64 = contentLength;
+                        resp.Headers.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
+
+                        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        fs.Seek(start, SeekOrigin.Begin);
+                        byte[] buffer = new byte[65536];
+                        long remaining = contentLength;
+                        using Stream output = resp.OutputStream;
+                        while (remaining > 0)
+                        {
+                            int toRead = (int)Math.Min(buffer.Length, remaining);
+                            int bytesRead = await fs.ReadAsync(buffer, 0, toRead);
+                            if (bytesRead == 0) break;
+                            await output.WriteAsync(buffer, 0, bytesRead);
+                            remaining -= bytesRead;
+                        }
+                    }
+                    else
+                    {
+                        resp.StatusCode = 200;
+                        resp.ContentType = mimeType;
+                        resp.ContentLength64 = fileLength;
+
+                        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        byte[] buffer = new byte[65536];
+                        using Stream output = resp.OutputStream;
+                        int bytesRead;
+                        while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                        {
+                            await output.WriteAsync(buffer, 0, bytesRead);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
         }
 
         private List<CloudItem> GetDescendants(string folderID, KMPermissions userPerm)
