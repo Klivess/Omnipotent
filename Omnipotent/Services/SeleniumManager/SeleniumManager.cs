@@ -15,10 +15,12 @@ namespace Omnipotent.Services.SeleniumManager
             public string name;
             private ChromeOptions options;
             private ChromeDriver? driver;
+            public DateTime createdAt;
 
             public SeleniumObject()
             {
                 options = new ChromeOptions();
+                createdAt = DateTime.Now;
                 options.SetLoggingPreference(OpenQA.Selenium.LogType.Browser, OpenQA.Selenium.LogLevel.Off);
                 options.AddArguments("--disable-logging");
                 options.AddArguments("--silent");
