@@ -1,17 +1,18 @@
-﻿using System.Reflection;
-using System.Management;
-using System.Management.Automation;
-using Omnipotent.Data_Handling;
+﻿using Certes;
+using Certes.Acme;
+using Certes.Acme.Resource;
+using DSharpPlus;
 using Microsoft.AspNetCore.Components.Web;
 using Newtonsoft.Json;
-using static System.Net.WebRequestMethods;
-using System.Security.Cryptography;
-using Certes;
-using Certes.Acme;
-using DSharpPlus;
+using Newtonsoft.Json.Linq;
+using Omnipotent.Data_Handling;
+using System.Management;
+using System.Management.Automation;
 using System.Net;
-using Certes.Acme.Resource;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using static System.Net.WebRequestMethods;
 
 namespace Omnipotent.Services.KliveAPI
 {
@@ -224,7 +225,9 @@ namespace Omnipotent.Services.KliveAPI
                             {"Done", ButtonStyle.Primary },
                         };
                 string addedDNSText = await (await parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord($"Add a DNS record to {KliveAPI.domainName}.",
-                    "Please add a new DNS record so that Omnipotent can solve this challenge and acquire the certificate needed for HTTPS.\n\n" +
+                    "Please add a new DNS record so that Omnipotent can solve this challenge and acquire the certificate needed for HTTPS.\n" +
+                    $"Ensure that there is an A record with IP {await GetPublicIpAddress()} (public IP address)."+
+                    ""+
                     "Type: TXT\n" +
                     $"Name: _acme-challenge.{KliveAPI.domainName}\n" +
                     $"Value: {dnsTxt}", dict, TimeSpan.FromDays(7));
@@ -346,6 +349,31 @@ namespace Omnipotent.Services.KliveAPI
                 WebClient hc = new();
                 await hc.DownloadFileTaskAsync(new Uri(pretendPearX1URL), pretendPearX1path);
                 parent.ServiceLog("Downloaded Pretend Pear X1 certificate.");
+            }
+        }
+
+        public static async Task<string> GetPublicIpAddress()
+        {
+            using (HttpClient client = new HttpClient())
+            {
+                try
+                {
+                    // Request API to get public IP
+                    HttpResponseMessage response = await client.GetAsync("https://api.ipify.org?format=json");
+                    response.EnsureSuccessStatusCode();
+
+                    // Parse the returned JSON response
+                    string jsonResponse = await response.Content.ReadAsStringAsync();
+                    JObject jsonObject = JObject.Parse(jsonResponse);
+
+                    // Extract IP address
+                    return jsonObject["ip"].ToString();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("Error: " + ex.Message);
+                    return null;
+                }
             }
         }
     }
