@@ -86,6 +86,7 @@ namespace Omnipotent.Data_Handling
             public static string KliveCloudDirectory = $"{SavedDataDirectory}/KliveCloud";
             public static string KliveCloudStorageDirectory = $"{KliveCloudDirectory}/Cloud";
             public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
+            public static string KliveCloudThumbnailsDirectory = $"{KliveCloudDirectory}/Thumbnails";
 
             //OmniTube
             public static string FFMpegDirectory = $"FFmpeg";

@@ -324,6 +324,287 @@ namespace Omnipotent.Services.KliveCloud
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Guest);
+
+            // Get drive capacity info for the drive the application is running on
+            await api.CreateRoute("/KliveCloud/GetDriveInfo", async (req) =>
+            {
+                try
+                {
+                    string appDriveLetter = Path.GetPathRoot(AppDomain.CurrentDomain.BaseDirectory);
+                    DriveInfo drive = new DriveInfo(appDriveLetter);
+
+                    var driveInfo = new
+                    {
+                        DriveName = drive.Name,
+                        TotalCapacityBytes = drive.TotalSize,
+                        UsedCapacityBytes = drive.TotalSize - drive.AvailableFreeSpace,
+                        FreeCapacityBytes = drive.AvailableFreeSpace,
+                        TotalCapacityGB = Math.Round(drive.TotalSize / 1073741824.0, 2),
+                        UsedCapacityGB = Math.Round((drive.TotalSize - drive.AvailableFreeSpace) / 1073741824.0, 2),
+                        FreeCapacityGB = Math.Round(drive.AvailableFreeSpace / 1073741824.0, 2),
+                        UsagePercentage = Math.Round((drive.TotalSize - drive.AvailableFreeSpace) / (double)drive.TotalSize * 100, 2),
+                        DriveFormat = drive.DriveFormat
+                    };
+
+                    string json = JsonConvert.SerializeObject(driveInfo);
+                    await req.ReturnResponse(json, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Get a preview/thumbnail image for an image or video file
+            await api.CreateRoute("/KliveCloud/GetPreview", async (req) =>
+            {
+                try
+                {
+                    string itemID = req.userParameters.Get("itemID");
+                    string widthStr = req.userParameters.Get("maxWidth");
+                    string heightStr = req.userParameters.Get("maxHeight");
+
+                    int maxWidth = 300;
+                    int maxHeight = 300;
+                    if (!string.IsNullOrEmpty(widthStr)) maxWidth = Math.Clamp(Convert.ToInt32(widthStr), 16, 1920);
+                    if (!string.IsNullOrEmpty(heightStr)) maxHeight = Math.Clamp(Convert.ToInt32(heightStr), 16, 1920);
+
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("ItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (item.MinimumPermissionLevel > req.user.KlivesManagementRank)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+                    if (!parent.IsPreviewable(item))
+                    {
+                        await req.ReturnResponse("ItemNotPreviewable", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    byte[] thumbnailData = await parent.GeneratePreview(item, maxWidth, maxHeight);
+                    if (thumbnailData == null)
+                    {
+                        await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
+                        return;
+                    }
+
+                    var resp = req.context.Response;
+                    resp.ContentType = "image/jpeg";
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Add("Cache-Control", "public, max-age=3600");
+                    resp.ContentLength64 = thumbnailData.Length;
+                    resp.StatusCode = (int)HttpStatusCode.OK;
+                    using Stream ros = resp.OutputStream;
+                    ros.Write(thumbnailData, 0, thumbnailData.Length);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Check if an item is previewable (image or video)
+            await api.CreateRoute("/KliveCloud/IsPreviewable", async (req) =>
+            {
+                try
+                {
+                    string itemID = req.userParameters.Get("itemID");
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("ItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (item.MinimumPermissionLevel > req.user.KlivesManagementRank)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    var result = new
+                    {
+                        ItemID = item.ItemID,
+                        IsPreviewable = parent.IsPreviewable(item),
+                        IsImage = parent.IsImage(item),
+                        IsVideo = parent.IsVideo(item),
+                        MediaType = parent.IsImage(item) ? "Image" : parent.IsVideo(item) ? "Video" : "None"
+                    };
+
+                    string json = JsonConvert.SerializeObject(result);
+                    await req.ReturnResponse(json, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Create a share link for a file
+            await api.CreateRoute("/KliveCloud/CreateShareLink", async (req) =>
+            {
+                try
+                {
+                    string itemID = req.userParameters.Get("itemID");
+                    string expirationHoursStr = req.userParameters.Get("expirationHours");
+
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("ItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    if (item.ItemType != CloudItemType.File)
+                    {
+                        await req.ReturnResponse("ItemIsNotAFile", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (item.MinimumPermissionLevel > req.user.KlivesManagementRank)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    DateTime? expirationDate = null;
+                    if (!string.IsNullOrEmpty(expirationHoursStr))
+                    {
+                        double hours = Convert.ToDouble(expirationHoursStr);
+                        expirationDate = DateTime.Now.AddHours(hours);
+                    }
+
+                    var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate);
+
+                    string downloadUrl = $"https://{KliveAPI.KliveAPI.domainName}:{KliveAPI.KliveAPI.apiPORT}/KliveCloud/DownloadShared?code={shareLink.ShareCode}";
+
+                    var result = new
+                    {
+                        ShareCode = shareLink.ShareCode,
+                        ItemID = shareLink.ItemID,
+                        FileName = item.Name,
+                        DownloadURL = downloadUrl,
+                        CreatedDate = shareLink.CreatedDate,
+                        ExpirationDate = shareLink.ExpirationDate
+                    };
+
+                    string json = JsonConvert.SerializeObject(result);
+                    await req.ReturnResponse(json, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
+            // Delete a share link
+            await api.CreateRoute("/KliveCloud/DeleteShareLink", async (req) =>
+            {
+                try
+                {
+                    string shareCode = req.userParameters.Get("code");
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.CreatedByUserID != req.user.UserID && req.user.KlivesManagementRank < KMPermissions.Admin)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    await parent.DeleteShareLink(shareCode);
+                    await req.ReturnResponse("ShareLinkDeleted", code: HttpStatusCode.OK);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
+            // List all share links created by the current user (Admins and Klives see all)
+            await api.CreateRoute("/KliveCloud/ListShareLinks", async (req) =>
+            {
+                try
+                {
+                    List<KliveCloud.ShareLink> links;
+                    if (req.user.KlivesManagementRank >= KMPermissions.Admin)
+                    {
+                        links = parent.ShareLinks.ToList();
+                    }
+                    else
+                    {
+                        links = parent.ShareLinks.Where(k => k.CreatedByUserID == req.user.UserID).ToList();
+                    }
+
+                    string json = JsonConvert.SerializeObject(links);
+                    await req.ReturnResponse(json, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Download a file via share link (no authentication required)
+            await api.CreateRoute("/KliveCloud/DownloadShared", async (req) =>
+            {
+                try
+                {
+                    string shareCode = req.userParameters.Get("code");
+                    if (string.IsNullOrEmpty(shareCode))
+                    {
+                        await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
+                    {
+                        await parent.DeleteShareLink(shareCode);
+                        await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(link.ItemID);
+                    if (item == null || item.ItemType != CloudItemType.File)
+                    {
+                        await req.ReturnResponse("FileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    byte[] fileData = await parent.DownloadFile(link.ItemID);
+                    if (fileData == null)
+                    {
+                        await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var resp = req.context.Response;
+                    resp.ContentType = "application/octet-stream";
+                    resp.Headers.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.ContentLength64 = fileData.Length;
+                    resp.StatusCode = (int)HttpStatusCode.OK;
+                    using Stream ros = resp.OutputStream;
+                    ros.Write(fileData, 0, fileData.Length);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
         }
 
         private List<CloudItem> GetDescendants(string folderID, KMPermissions userPerm)

@@ -1,3 +1,4 @@
+using FFMpegCore;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
@@ -9,8 +10,10 @@ namespace Omnipotent.Services.KliveCloud
     public class KliveCloud : OmniService
     {
         public List<CloudItem> CloudItems;
+        public List<ShareLink> ShareLinks;
         private KliveCloudRoutes routes;
         private string metadataFilePath;
+        private string shareLinksFilePath;
 
         public KliveCloud()
         {
@@ -22,11 +25,21 @@ namespace Omnipotent.Services.KliveCloud
         {
             string storagePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudStorageDirectory);
             string metadataPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudMetadataDirectory);
+            string thumbnailsPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudThumbnailsDirectory);
             Directory.CreateDirectory(storagePath);
             Directory.CreateDirectory(metadataPath);
+            Directory.CreateDirectory(thumbnailsPath);
             metadataFilePath = Path.Combine(metadataPath, "cloud_metadata.json");
+            shareLinksFilePath = Path.Combine(metadataPath, "share_links.json");
+
+            GlobalFFOptions.Configure(new FFOptions
+            {
+                BinaryFolder = OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory),
+                WorkingDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegWorkingDirectory),
+            });
 
             await LoadMetadata();
+            await LoadShareLinks();
 
             routes = new KliveCloudRoutes(this);
             routes.CreateRoutes();
@@ -56,6 +69,69 @@ namespace Omnipotent.Services.KliveCloud
         {
             string json = JsonConvert.SerializeObject(CloudItems, Formatting.Indented);
             await GetDataHandler().WriteToFile(metadataFilePath, json);
+        }
+
+        public class ShareLink
+        {
+            public string ShareCode;
+            public string ItemID;
+            public string CreatedByUserID;
+            public DateTime CreatedDate;
+            public DateTime? ExpirationDate;
+        }
+
+        private async Task LoadShareLinks()
+        {
+            ShareLinks = new List<ShareLink>();
+            if (File.Exists(shareLinksFilePath))
+            {
+                try
+                {
+                    string data = await GetDataHandler().ReadDataFromFile(shareLinksFilePath);
+                    ShareLinks = JsonConvert.DeserializeObject<List<ShareLink>>(data) ?? new List<ShareLink>();
+                }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex, "Failed to load KliveCloud share links.");
+                    ShareLinks = new List<ShareLink>();
+                }
+            }
+        }
+
+        public async Task SaveShareLinks()
+        {
+            string json = JsonConvert.SerializeObject(ShareLinks, Formatting.Indented);
+            await GetDataHandler().WriteToFile(shareLinksFilePath, json);
+        }
+
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate)
+        {
+            var link = new ShareLink
+            {
+                ShareCode = Guid.NewGuid().ToString("N"),
+                ItemID = itemID,
+                CreatedByUserID = createdByUserID,
+                CreatedDate = DateTime.Now,
+                ExpirationDate = expirationDate
+            };
+            ShareLinks.Add(link);
+            await SaveShareLinks();
+            ServiceLog($"Share link created for item {itemID} by user {createdByUserID}.");
+            return link;
+        }
+
+        public ShareLink GetShareLinkByCode(string shareCode)
+        {
+            return ShareLinks.FirstOrDefault(k => k.ShareCode == shareCode);
+        }
+
+        public async Task<bool> DeleteShareLink(string shareCode)
+        {
+            var link = GetShareLinkByCode(shareCode);
+            if (link == null) return false;
+            ShareLinks.Remove(link);
+            await SaveShareLinks();
+            return true;
         }
 
         public string GetFullItemPath(CloudItem item)
@@ -218,6 +294,120 @@ namespace Omnipotent.Services.KliveCloud
             if (folder == null || folder.ItemType != CloudItemType.Folder) return null;
             if (folder.MinimumPermissionLevel > userPermission) return null;
             return folder;
+        }
+
+        private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".tif", ".ico", ".svg"
+        };
+
+        private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp"
+        };
+
+        public bool IsImage(CloudItem item)
+        {
+            return item.ItemType == CloudItemType.File && ImageExtensions.Contains(Path.GetExtension(item.Name));
+        }
+
+        public bool IsVideo(CloudItem item)
+        {
+            return item.ItemType == CloudItemType.File && VideoExtensions.Contains(Path.GetExtension(item.Name));
+        }
+
+        public bool IsPreviewable(CloudItem item)
+        {
+            return IsImage(item) || IsVideo(item);
+        }
+
+        private string GetThumbnailCachePath(string itemID, int width, int height)
+        {
+            string thumbnailsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudThumbnailsDirectory);
+            return Path.Combine(thumbnailsDir, $"{itemID}_{width}x{height}.jpg");
+        }
+
+        public async Task<byte[]> GeneratePreview(CloudItem item, int maxWidth, int maxHeight)
+        {
+            string sourcePath = GetFullItemPath(item);
+            if (!File.Exists(sourcePath)) return null;
+
+            string cachePath = GetThumbnailCachePath(item.ItemID, maxWidth, maxHeight);
+
+            if (File.Exists(cachePath))
+            {
+                var cacheWriteTime = File.GetLastWriteTimeUtc(cachePath);
+                var sourceWriteTime = File.GetLastWriteTimeUtc(sourcePath);
+                if (cacheWriteTime >= sourceWriteTime)
+                {
+                    return await File.ReadAllBytesAsync(cachePath);
+                }
+            }
+
+            if (IsImage(item))
+            {
+                return await GenerateImageThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
+            }
+            else if (IsVideo(item))
+            {
+                return await GenerateVideoThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
+            }
+
+            return null;
+        }
+
+        private async Task<byte[]> GenerateImageThumbnail(string sourcePath, string cachePath, int maxWidth, int maxHeight)
+        {
+            try
+            {
+                await FFMpegArguments
+                    .FromFileInput(sourcePath)
+                    .OutputToFile(cachePath, true, options => options
+                        .WithCustomArgument($"-vf \"scale='min({maxWidth},iw)':min'({maxHeight},ih)':force_original_aspect_ratio=decrease\"")
+                        .WithFrameOutputCount(1)
+                        .ForceFormat("image2"))
+                    .ProcessAsynchronously();
+
+                if (File.Exists(cachePath))
+                {
+                    return await File.ReadAllBytesAsync(cachePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Failed to generate image thumbnail for {sourcePath}");
+            }
+            return null;
+        }
+
+        private async Task<byte[]> GenerateVideoThumbnail(string sourcePath, string cachePath, int maxWidth, int maxHeight)
+        {
+            try
+            {
+                var mediaInfo = await FFProbe.AnalyseAsync(sourcePath);
+                TimeSpan captureTime = mediaInfo.Duration.TotalSeconds > 1
+                    ? TimeSpan.FromSeconds(1)
+                    : TimeSpan.Zero;
+
+                await FFMpegArguments
+                    .FromFileInput(sourcePath, false, options => options
+                        .Seek(captureTime))
+                    .OutputToFile(cachePath, true, options => options
+                        .WithCustomArgument($"-vf \"scale='min({maxWidth},iw)':min'({maxHeight},ih)':force_original_aspect_ratio=decrease\"")
+                        .WithFrameOutputCount(1)
+                        .ForceFormat("image2"))
+                    .ProcessAsynchronously();
+
+                if (File.Exists(cachePath))
+                {
+                    return await File.ReadAllBytesAsync(cachePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Failed to generate video thumbnail for {sourcePath}");
+            }
+            return null;
         }
     }
 }
