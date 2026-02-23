@@ -185,7 +185,7 @@ namespace Omnipotent.Services.MemeScraper
                     await Task.Delay(1000);
                 }
 
-                driver.Quit();
+                (await parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
             }
             catch (Exception ex)
             {

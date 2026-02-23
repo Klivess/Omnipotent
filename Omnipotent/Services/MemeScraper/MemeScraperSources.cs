@@ -199,7 +199,7 @@ namespace Omnipotent.Services.MemeScraper
 
             await parent.ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
 
-            driver.Quit();
+            (await parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
             return source;
         }
 

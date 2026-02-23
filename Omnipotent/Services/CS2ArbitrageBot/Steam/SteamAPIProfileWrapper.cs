@@ -198,7 +198,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 finally
                 {
                     // Quit the WebDriver  
-                    driver.Quit();
+                    (await parent.parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
                 }
             }
         }

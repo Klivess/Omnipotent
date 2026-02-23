@@ -389,7 +389,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 {
                     await Task.Delay(100);
                 }
-                chromeDriver.Quit();
+                (await parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
                 return item_nameid;
                 //IWebElement searchBox = wait.Until(d => d.FindElement(By.Name("q")));
 
