@@ -1,5 +1,7 @@
-﻿using Omnipotent.Service_Manager;
+﻿using Newtonsoft.Json;
+using Omnipotent.Service_Manager;
 using OpenQA.Selenium.Chrome;
+using SteamKit2;
 using SteamKit2.GC.CSGO.Internal;
 using System.Collections.Concurrent;
 
@@ -7,15 +9,19 @@ namespace Omnipotent.Services.SeleniumManager
 {
     public class SeleniumManager : OmniService
     {
+        private SeleniumManagerRoutes routes;
         private ConcurrentBag<SeleniumObject> currentActiveSeleniumInstances;
 
         public class SeleniumObject
         {
             public ulong objectID;
             public string name;
-            private ChromeOptions options;
-            private ChromeDriver? driver;
             public DateTime createdAt;
+
+            [JsonIgnore]            
+            private ChromeOptions options;
+            [JsonIgnore]
+            private ChromeDriver? driver;
 
             public SeleniumObject()
             {
@@ -54,13 +60,15 @@ namespace Omnipotent.Services.SeleniumManager
 
         public SeleniumManager()
         {
-            name = "AutoGoat";
+            name = "SeleniumManager";
             threadAnteriority = ThreadAnteriority.High;
         }
 
         protected override async void ServiceMain()
         {
+            routes = new SeleniumManagerRoutes(this);
             currentActiveSeleniumInstances = new ConcurrentBag<SeleniumObject>();
+            routes.CreateRoutes();
         }
 
         public SeleniumObject CreateSeleniumObject(string name)
