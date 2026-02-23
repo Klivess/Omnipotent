@@ -400,3 +400,4 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+/Omnipotent/Services/KliveCloud/KliveCloud_API_Documentation.md
