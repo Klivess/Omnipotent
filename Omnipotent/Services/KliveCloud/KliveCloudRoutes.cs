@@ -606,6 +606,62 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
 
+            // Get file info via share link (no authentication required)
+            await api.CreateRoute("/KliveCloud/GetSharedItemInfo", async (req) =>
+            {
+                try
+                {
+                    string shareCode = req.userParameters.Get("code");
+                    if (string.IsNullOrEmpty(shareCode))
+                    {
+                        await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
+                    {
+                        await parent.DeleteShareLink(shareCode);
+                        await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(link.ItemID);
+                    if (item == null || item.ItemType != CloudItemType.File)
+                    {
+                        await req.ReturnResponse("FileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var result = new
+                    {
+                        item.ItemID,
+                        item.Name,
+                        item.ItemType,
+                        item.FileSizeBytes,
+                        item.CreatedDate,
+                        item.ModifiedDate,
+                        IsImage = parent.IsImage(item),
+                        IsVideo = parent.IsVideo(item),
+                        ShareCode = link.ShareCode,
+                        ExpirationDate = link.ExpirationDate
+                    };
+
+                    string json = JsonConvert.SerializeObject(result);
+                    await req.ReturnResponse(json, "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
+
             // Stream a video file with HTTP Range support
             await api.CreateRoute("/KliveCloud/StreamVideo", async (req) =>
             {
