@@ -20,7 +20,7 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
         public AutoGoat()
         {
             name = "AutoGoat";
-            threadAnteriority = ThreadAnteriority.Standard;
+            threadAnteriority = ThreadAnteriority.Low;
         }
 
         protected override async void ServiceMain()

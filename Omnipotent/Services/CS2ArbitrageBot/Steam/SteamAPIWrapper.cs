@@ -345,17 +345,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         {
             try
             {
-                var options = new ChromeOptions();
-                options.AddArgument("--headless");
-                options.AddArgument("--disable-gpu");
-                options.AddArgument("--no-sandbox");
-                options.AddArgument("--disable-dev-shm-usage");
-                options.AddArgument("--disable-web-security");
-                options.AddArgument("--disable-features=VizDisplayCompositor");
-                options.AddArgument("--disable-logging");
+
+                var seleniumObject = (await parent.GetSeleniumManager()).CreateSeleniumObject("GetSteamItemID");
+                seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
+                seleniumObject.AddArgumentToOptions("--disable-gpu");
+                seleniumObject.AddArgumentToOptions("--no-sandbox");
+                seleniumObject.AddArgumentToOptions("--disable-dev-shm-usage");
+                seleniumObject.AddArgumentToOptions("--disable-web-security");
+                seleniumObject.AddArgumentToOptions("--disable-features=VizDisplayCompositor");
+                seleniumObject.AddArgumentToOptions("--disable-logging");
 
 
-                ChromeDriver chromeDriver = new ChromeDriver(options);
+                ChromeDriver chromeDriver = seleniumObject.UseChromeDriver();
                 parent.ServiceLog("Going to webpage: " + steamListingUrl);
 
                 IDevTools devTools = chromeDriver;

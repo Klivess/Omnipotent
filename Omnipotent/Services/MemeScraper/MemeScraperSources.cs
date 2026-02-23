@@ -127,9 +127,11 @@ namespace Omnipotent.Services.MemeScraper
         public async Task<InstagramSource> ProduceNewInstagramSource(string username, bool DownloadReels, bool DownloadPosts, List<Niche> Niches)
         {
             InstagramSource source = new();
-            ChromeOptions options = new ChromeOptions();
-            options.AddArgument("--headless"); // Run in headless mode
-            var driver = new ChromeDriver(options);
+
+
+            var seleniumObject = (await parent.GetSeleniumManager()).CreateSeleniumObject("ProduceNewInstagramSource");
+            seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
+            var driver = seleniumObject.UseChromeDriver();
 
 
             var devTools = driver as IDevTools;

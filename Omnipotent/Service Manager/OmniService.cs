@@ -11,6 +11,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.SeleniumManager;
 using Org.BouncyCastle.Asn1.X509.Qualified;
 using static Omnipotent.Threading.WindowsInvokes;
 
@@ -18,7 +19,7 @@ namespace Omnipotent.Service_Manager
 {
 
     public class OmniService
-    {
+    { 
         protected ThreadAnteriority threadAnteriority;
         protected string name;
         public string serviceID;
@@ -66,6 +67,12 @@ namespace Omnipotent.Service_Manager
         {
             while (serviceManager.fileHandlerService.IsServiceActive() == false) { Task.Delay(100); }
             return ref serviceManager.fileHandlerService;
+        }
+
+        public async Task<SeleniumManager> GetSeleniumManager()
+        {
+            while ((await serviceManager.GetServiceByClassType<SeleniumManager>()) == null) { Task.Delay(100); }
+            return (SeleniumManager)(await serviceManager.GetServiceByClassType<SeleniumManager>())[0];
         }
 
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.

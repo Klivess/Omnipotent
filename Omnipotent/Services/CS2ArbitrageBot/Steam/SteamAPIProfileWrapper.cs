@@ -113,9 +113,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             string loginUrl = "https://steamcommunity.com/login/home/";
 
             // Initialize Selenium WebDriver  
-            var options = new ChromeOptions();
-            options.AddArgument("--headless"); // Run in headless mode  
-            using (IWebDriver driver = new ChromeDriver(options))
+
+            var seleniumObject = (await parent.parent.GetSeleniumManager()).CreateSeleniumObject("SteamLogin");
+            seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
+            using (var driver = seleniumObject.UseChromeDriver())
             {
                 try
                 {

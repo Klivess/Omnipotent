@@ -70,9 +70,9 @@ namespace Omnipotent.Services.MemeScraper
             ConcurrentBag<InstagramReel> reels = new();
             try
             {
-                ChromeOptions options = new ChromeOptions();
-                options.AddArgument("--headless"); // Run in headless mode  
-                var driver = new ChromeDriver(options);
+                var seleniumObject = (await parent.GetSeleniumManager()).CreateSeleniumObject("ScrapeAllInstagramProfileReelDownloadsLinks");
+                seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
+                var driver = seleniumObject.UseChromeDriver();
                 driver.Navigate().GoToUrl($"https://inflact.com/instagram-downloader?profile={username}/");
 
                 var devTools = driver as IDevTools;
