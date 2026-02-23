@@ -26,8 +26,16 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
         protected override async void ServiceMain()
         {
             await Task.Delay(5000);
-            ServiceLog(GetName() + " is now watching.");
-            (await serviceManager.GetKliveBotDiscordService()).Client.MessageCreated += AutoGoat_MessageCreated;
+            try
+            {
+                (await serviceManager.GetKliveBotDiscordService()).Client.MessageCreated += AutoGoat_MessageCreated;
+                ServiceLog(GetName() + " is now watching.");
+            }
+            catch (Exception e)
+            {
+                ServiceLogError(e, "Failed to subscribe to message created event in AutoGoat.");
+                TerminateService();
+            }
         }
 
         private async Task AutoGoat_MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
