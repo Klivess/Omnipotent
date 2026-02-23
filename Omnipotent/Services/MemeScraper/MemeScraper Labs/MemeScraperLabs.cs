@@ -191,7 +191,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
                 }
 
                 // 9. ReelsWithMissingMetadata
-                ReelsWithMissingMetadata = reels?.Where(r => string.IsNullOrWhiteSpace(r.Description) || string.IsNullOrWhiteSpace(r.VideoDownloadURL)).ToList() ?? new List<InstagramScrapeUtilities.InstagramReel>();
+                //ReelsWithMissingMetadata = reels?.Where(r => string.IsNullOrWhiteSpace(r.Description) || string.IsNullOrWhiteSpace(r.VideoDownloadURL)).ToList() ?? new List<InstagramScrapeUtilities.InstagramReel>();
 
                 // 13. MostCommonDownloadDayOfWeek
                 MostCommonDownloadDayOfWeek = null;
