@@ -37,7 +37,6 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public int DownloadGaps;
             public double ReelsPerSourceStdDev;
             public double PercentageOfSourcesWithRecentActivity;
-            public List<InstagramScrapeUtilities.InstagramReel> ReelsWithMissingMetadata;
             public DayOfWeek? MostCommonDownloadDayOfWeek;
             public List<InstagramScrapeUtilities.InstagramReel> ReelsWithNoViews;
 
@@ -151,7 +150,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
                 // 5. ReelsWithHighEngagement (above average views or comments)
                 double avgViews = AverageViewCountPerReel;
                 double avgComments = reels != null && reels.Count > 0 ? reels.Average(r => r.CommentCount) : 0;
-                ReelsWithHighEngagement = reels?.Where(r => r.ViewCount > avgViews || r.CommentCount > avgComments).ToList() ?? new List<InstagramScrapeUtilities.InstagramReel>();
+                ReelsWithHighEngagement = (reels?.Where(r => r.ViewCount > avgViews || r.CommentCount > avgComments).ToList() ?? new List<InstagramScrapeUtilities.InstagramReel>()).Take(100).ToList();
 
                 // 6. DownloadGaps (longest period with zero downloads)
                 DownloadGaps = 0;
