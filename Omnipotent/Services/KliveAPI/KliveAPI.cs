@@ -41,7 +41,7 @@ namespace Omnipotent.Services.KliveAPI
 
         public struct RouteInfo
         {
-            public Action<UserRequest> action;
+            public Func<UserRequest, Task> action;
             public KMProfileManager.KMPermissions authenticationLevelRequired;
             public HttpMethod method;
 
@@ -49,7 +49,7 @@ namespace Omnipotent.Services.KliveAPI
             public async Task InvokeAction(UserRequest request)
             {
                 Stopwatch stopwatch = Stopwatch.StartNew();
-                action.Invoke(request);
+                await action(request);
                 stopwatch.Stop();
                 if (TimeTakenToProcess == null)
                 {
@@ -109,14 +109,19 @@ namespace Omnipotent.Services.KliveAPI
                 catch (Exception ex)
                 {
                     ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
-                    //Return Error Response, this is a last resort to prevent the server from crashing
-                    await context.Response.OutputStream.FlushAsync();
-                    await context.Response.OutputStream.DisposeAsync();
-                    context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
-                    context.Response.ContentType = "text/plain";
-                    await context.Response.OutputStream.WriteAsync(Encoding.UTF8.GetBytes("Error occurred on server."));
-                    await context.Response.OutputStream.FlushAsync();
-                    context.Response.Close();
+                    try
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        context.Response.ContentType = "text/plain";
+                        byte[] errorBytes = Encoding.UTF8.GetBytes("Error occurred on server.");
+                        context.Response.ContentLength64 = errorBytes.Length;
+                        await context.Response.OutputStream.WriteAsync(errorBytes);
+                        context.Response.Close();
+                    }
+                    catch
+                    {
+                        // Response stream already closed, nothing more we can do
+                    }
                 }
             }
 
@@ -305,7 +310,7 @@ namespace Omnipotent.Services.KliveAPI
         //      await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10));
         //  };
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
-        public async Task CreateRoute(string route, Action<UserRequest> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
+        public async Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
             //while (!listener.IsListening) { await Task.Delay(10); }
             if (!route.StartsWith('/'))
@@ -330,100 +335,87 @@ namespace Omnipotent.Services.KliveAPI
                 try
                 {
                     HttpListenerContext context = await listener.GetContextAsync();
-                    HttpListenerRequest req = context.Request;
-                    string route = req.RawUrl;
-                    string query = req.Url.Query;
-                    NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
-                    UserRequest request = new();
-                    request.req = req;
-                    request.route = route;
-                    request.context = context;
-                    request.ParentService = this;
+                    _ = Task.Run(() => ProcessRequestAsync(context));
+                }
+                catch (Exception ioe)
+                {
+                    if (ContinueListenLoop)
+                    {
+                        ServiceLogError(ioe, "Error in ServerListenLoop");
+                    }
+                }
+            }
+        }
+
+        private async Task ProcessRequestAsync(HttpListenerContext context)
+        {
+            try
+            {
+                HttpListenerRequest req = context.Request;
+                string route = req.RawUrl;
+                string query = req.Url.Query;
+                NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
+                UserRequest request = new();
+                request.req = req;
+                request.route = route;
+                request.context = context;
+                request.ParentService = this;
+
+                // Only read body for methods that carry a payload
+                if (req.HttpMethod == "POST" || req.HttpMethod == "PUT" || req.HttpMethod == "PATCH")
+                {
                     using (MemoryStream bodyStream = new MemoryStream())
                     {
-                        await request.req.InputStream.CopyToAsync(bodyStream);
+                        await req.InputStream.CopyToAsync(bodyStream);
                         request.userMessageBytes = bodyStream.ToArray();
                     }
                     request.userMessageContent = Encoding.UTF8.GetString(request.userMessageBytes);
-                    request.userParameters = nameValueCollection;
-                    request.user = null;
+                }
+                else
+                {
+                    request.userMessageBytes = Array.Empty<byte>();
+                    request.userMessageContent = string.Empty;
+                }
 
-                    //HANDLE PREFLIGHT REQUESTS
-                    if (request.req.HttpMethod == "OPTIONS")
+                request.userParameters = nameValueCollection;
+                request.user = null;
+
+                //HANDLE PREFLIGHT REQUESTS
+                if (request.req.HttpMethod == "OPTIONS")
+                {
+                    await request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
+                    return;
+                }
+
+
+                if (!string.IsNullOrEmpty(query))
+                {
+                    route = route.Replace(query, "");
+                }
+                if (req.Headers.AllKeys.Contains("Authorization"))
+                {
+                    string password = req.Headers.Get("Authorization");
+                    if (profileManager != null && profileManager.CheckIfProfileExists(password))
                     {
-                        request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
-                        continue;
+                        request.user = await profileManager.GetProfileByPassword(password);
                     }
-
-
-                    if (!string.IsNullOrEmpty(query))
+                    else
                     {
-                        route = route.Replace(query, "");
+                        request.user = null;
                     }
-                    if (req.Headers.AllKeys.Contains("Authorization"))
+                }
+                if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
+                {
+                    bool isUserNull = request.user == null;
+                    if (isUserNull != true)
                     {
-                        string password = req.Headers.Get("Authorization");
-                        var profileManager = ((KMProfileManager)((await serviceManager.GetServiceByClassType<KMProfileManager>())[0]));
-                        if (profileManager.CheckIfProfileExists(password))
+                        if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                         {
-                            request.user = await profileManager.GetProfileByPassword(password);
+                            ServiceLog($"Route {route} has been requested by a user that can't login.");
+                            DenyRequest(request, DeniedRequestReason.ProfileDisabled);
+                            return;
                         }
                         else
-                        {
-                            request.user = null;
-                        }
-                    }
-                    if (ControllerLookup.ContainsKey(route))
-                    {
-                        RouteInfo routeData = ControllerLookup[route];
-                        bool isUserNull = true;
-                        try
-                        {
-                            isUserNull = request.user == null;
-                        }
-                        catch (NullReferenceException ex)
-                        {
-                            isUserNull = true;
-                        }
-                        if (isUserNull != true)
-                        {
-                            if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
-                            {
-                                ServiceLog($"Route {route} has been requested by a user that can't login.");
-                                DenyRequest(request, DeniedRequestReason.ProfileDisabled);
-                                continue;
-                            }
-                            else
-                            {
-                                if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
-                                {
-                                    ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
-                                    DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
-                                }
-                                else
-                                {
-                                    if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
-                                    {
-                                        //ServiceLog($"Unauthenticated route {route} has been requested.");
-                                        ControllerLookup[route].InvokeAction(request);
-                                    }
-                                    else
-                                    {
-                                        if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
-                                        {
-                                            ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
-                                            ControllerLookup[route].InvokeAction(request);
-                                        }
-                                        else
-                                        {
-                                            ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
-                                            DenyRequest(request, DeniedRequestReason.TooLowClearance);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
                         {
                             if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
                             {
@@ -432,25 +424,53 @@ namespace Omnipotent.Services.KliveAPI
                             }
                             else
                             {
-                                ControllerLookup[route].InvokeAction(request);
+                                if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
+                                {
+                                    //ServiceLog($"Unauthenticated route {route} has been requested.");
+                                    await routeData.InvokeAction(request);
+                                }
+                                else
+                                {
+                                    if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                                    {
+                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
+                                        await routeData.InvokeAction(request);
+                                    }
+                                    else
+                                    {
+                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
+                                        DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                                    }
+                                }
                             }
+                        }
+                    }
+                    else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
+                    {
+                        if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
+                        {
+                            ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
+                            DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
                         }
                         else
                         {
-                            ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
-                            DenyRequest(request, DeniedRequestReason.NoProfile);
+                            await routeData.InvokeAction(request);
                         }
                     }
                     else
                     {
-                        await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
+                        ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
+                        DenyRequest(request, DeniedRequestReason.NoProfile);
                     }
                 }
-                catch (Exception ioe)
+                else
                 {
-                    ServiceLogError(ioe, "Error in ServerListenLoop");
-                    ServerListenLoop();
+                    await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
             }
         }
         private enum DeniedRequestReason

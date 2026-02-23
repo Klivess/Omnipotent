@@ -160,7 +160,7 @@ namespace Omnipotent.Services.KliveTechHub
 
         private async void setuproutestemp()
         {
-            Action<UserRequest> getAllGadgetsHandler = async (req) =>
+            Func<UserRequest, Task> getAllGadgetsHandler = async (req) =>
             {
                 try
                 {
@@ -174,7 +174,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
             };
 
-            Action<UserRequest> executeGadgetActionHandler = async (req) =>
+            Func<UserRequest, Task> executeGadgetActionHandler = async (req) =>
             {
                 //params: gadgetid, actionid, actionparams  
                 string id = req.userParameters["gadgetID"];
@@ -195,7 +195,7 @@ namespace Omnipotent.Services.KliveTechHub
                 await req.ReturnResponse("Action executed successfully!");
             };
 
-            Action<UserRequest> getGadgetByIdHandler = async (req) =>
+            Func<UserRequest, Task> getGadgetByIdHandler = async (req) =>
                 {
                     try
                     {

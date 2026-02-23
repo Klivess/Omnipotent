@@ -149,7 +149,7 @@ Data:
 
         private async Task SetupRoutes()
         {
-            Action<UserRequest> getLogs = async (req) =>
+            Func<UserRequest, Task> getLogs = async (req) =>
             {
                 var copy = new List<LoggedMessage>(overallMessages.ToList());
                 await req.ReturnResponse(JsonConvert.SerializeObject(copy, Formatting.Indented), "application/json");

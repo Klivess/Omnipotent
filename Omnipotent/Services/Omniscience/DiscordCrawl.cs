@@ -87,7 +87,7 @@ namespace Omnipotent.Services.Omniscience
         private async Task CreateRoutes()
         {
             //Set up controllers
-            Action<UserRequest> createNewOmniUser = async (request) =>
+            Func<UserRequest, Task> createNewOmniUser = async (request) =>
             {
                 try
                 {
