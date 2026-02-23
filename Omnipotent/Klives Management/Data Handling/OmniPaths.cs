@@ -82,6 +82,11 @@ namespace Omnipotent.Data_Handling
             public static string MemeScraperReelsDataDirectory = $"{MemeScraperInstagramDirectory}/Reels";
             public static string MemeScraperPostsDataDirectory = $"{MemeScraperInstagramDirectory}/Posts";
 
+            //KliveCloud
+            public static string KliveCloudDirectory = $"{SavedDataDirectory}/KliveCloud";
+            public static string KliveCloudStorageDirectory = $"{KliveCloudDirectory}/Cloud";
+            public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
+
             //OmniTube
             public static string FFMpegDirectory = $"FFmpeg";
             public static string FFMpegWorkingDirectory = $"{FFMpegDirectory}/FFmpegWorkingDirectory";
