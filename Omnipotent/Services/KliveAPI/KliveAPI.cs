@@ -66,6 +66,7 @@ namespace Omnipotent.Services.KliveAPI
             public NameValueCollection userParameters;
             public KMProfileManager.KMProfile? user;
             public string userMessageContent;
+            public byte[] userMessageBytes;
 
             [JsonIgnore]
             public KliveAPI ParentService;
@@ -292,8 +293,12 @@ namespace Omnipotent.Services.KliveAPI
                     request.route = route;
                     request.context = context;
                     request.ParentService = this;
-                    StreamReader reader = new StreamReader(request.req.InputStream, Encoding.UTF8);
-                    request.userMessageContent = await reader.ReadToEndAsync();
+                    using (MemoryStream bodyStream = new MemoryStream())
+                    {
+                        await request.req.InputStream.CopyToAsync(bodyStream);
+                        request.userMessageBytes = bodyStream.ToArray();
+                    }
+                    request.userMessageContent = Encoding.UTF8.GetString(request.userMessageBytes);
                     request.userParameters = nameValueCollection;
                     request.user = null;
 

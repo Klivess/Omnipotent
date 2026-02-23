@@ -188,10 +188,8 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    // Read file bytes from request body
-                    using MemoryStream ms = new MemoryStream();
-                    await req.req.InputStream.CopyToAsync(ms);
-                    byte[] fileData = ms.ToArray();
+                    // Use the raw bytes already read by the server listen loop
+                    byte[] fileData = req.userMessageBytes;
 
                     if (fileData.Length == 0)
                     {
