@@ -95,8 +95,10 @@ namespace Omnipotent.Services.KliveAPI
                         resp.Headers.Add("Access-Control-Allow-Headers", "*");
                         resp.Headers.Add("Access-Control-Allow-Methods", "*");
                         resp.Headers.Add("Access-Control-Max-Age", "1728000");
+                        resp.Headers.Add("Access-Control-Expose-Headers", "*");
                     }
                     resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Add("Access-Control-Expose-Headers", "*");
 
                     byte[] buffer = Encoding.UTF8.GetBytes(response);
                     resp.ContentLength64 = buffer.Length;
@@ -116,6 +118,50 @@ namespace Omnipotent.Services.KliveAPI
                     await context.Response.OutputStream.FlushAsync();
                     context.Response.Close();
                 }
+            }
+
+            public async Task ReturnBinaryResponse(byte[] data, string contentType, HttpStatusCode code = HttpStatusCode.OK, NameValueCollection headers = null)
+            {
+                try
+                {
+                    HttpListenerResponse resp = context.Response;
+                    resp.ContentType = contentType;
+                    resp.StatusCode = (int)code;
+                    resp.ContentLength64 = data.Length;
+                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Add("Access-Control-Expose-Headers", "*");
+                    if (headers != null)
+                    {
+                        for (int i = 0; i < headers.Count; i++)
+                        {
+                            resp.Headers.Add(headers.GetKey(i), headers.Get(i));
+                        }
+                    }
+                    using Stream ros = resp.OutputStream;
+                    await ros.WriteAsync(data, 0, data.Length);
+                }
+                catch (Exception ex)
+                {
+                    ParentService.ServiceLogError(ex, "Error while returning binary response for route: " + context.Request.RawUrl);
+                }
+            }
+
+            public Stream PrepareStreamResponse(string contentType, long contentLength, HttpStatusCode code = HttpStatusCode.OK, NameValueCollection headers = null)
+            {
+                HttpListenerResponse resp = context.Response;
+                resp.ContentType = contentType;
+                resp.StatusCode = (int)code;
+                resp.ContentLength64 = contentLength;
+                resp.Headers.Add("Access-Control-Allow-Origin", "*");
+                resp.Headers.Add("Access-Control-Expose-Headers", "*");
+                if (headers != null)
+                {
+                    for (int i = 0; i < headers.Count; i++)
+                    {
+                        resp.Headers.Add(headers.GetKey(i), headers.Get(i));
+                    }
+                }
+                return resp.OutputStream;
             }
         }
 

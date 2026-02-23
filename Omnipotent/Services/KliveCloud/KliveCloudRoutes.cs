@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Profiles;
+using System.Collections.Specialized;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.KliveCloud.CloudItem;
@@ -237,14 +238,9 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    var resp = req.context.Response;
-                    resp.ContentType = "application/octet-stream";
-                    resp.Headers.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.ContentLength64 = fileData.Length;
-                    resp.StatusCode = (int)HttpStatusCode.OK;
-                    using Stream ros = resp.OutputStream;
-                    ros.Write(fileData, 0, fileData.Length);
+                    NameValueCollection dlHeaders = new();
+                    dlHeaders.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
+                    await req.ReturnBinaryResponse(fileData, "application/octet-stream", HttpStatusCode.OK, dlHeaders);
                 }
                 catch (Exception ex)
                 {
@@ -393,14 +389,9 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    var resp = req.context.Response;
-                    resp.ContentType = "image/jpeg";
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.Headers.Add("Cache-Control", "public, max-age=3600");
-                    resp.ContentLength64 = thumbnailData.Length;
-                    resp.StatusCode = (int)HttpStatusCode.OK;
-                    using Stream ros = resp.OutputStream;
-                    ros.Write(thumbnailData, 0, thumbnailData.Length);
+                    NameValueCollection previewHeaders = new();
+                    previewHeaders.Add("Cache-Control", "public, max-age=3600");
+                    await req.ReturnBinaryResponse(thumbnailData, "image/jpeg", HttpStatusCode.OK, previewHeaders);
                 }
                 catch (Exception ex)
                 {
@@ -591,14 +582,9 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    var resp = req.context.Response;
-                    resp.ContentType = "application/octet-stream";
-                    resp.Headers.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.ContentLength64 = fileData.Length;
-                    resp.StatusCode = (int)HttpStatusCode.OK;
-                    using Stream ros = resp.OutputStream;
-                    ros.Write(fileData, 0, fileData.Length);
+                    NameValueCollection sharedHeaders = new();
+                    sharedHeaders.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
+                    await req.ReturnBinaryResponse(fileData, "application/octet-stream", HttpStatusCode.OK, sharedHeaders);
                 }
                 catch (Exception ex)
                 {
@@ -696,10 +682,6 @@ namespace Omnipotent.Services.KliveCloud
                     long fileLength = fileInfo.Length;
                     string mimeType = parent.GetVideoMimeType(item);
 
-                    var resp = req.context.Response;
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.Headers.Add("Accept-Ranges", "bytes");
-
                     string rangeHeader = req.req.Headers["Range"];
 
                     if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
@@ -711,23 +693,23 @@ namespace Omnipotent.Services.KliveCloud
 
                         if (start >= fileLength || end >= fileLength || start > end)
                         {
-                            resp.StatusCode = 416;
-                            resp.Headers.Add("Content-Range", $"bytes */{fileLength}");
-                            resp.Close();
+                            NameValueCollection rangeErrHeaders = new();
+                            rangeErrHeaders.Add("Accept-Ranges", "bytes");
+                            rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
+                            await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
                             return;
                         }
 
                         long contentLength = end - start + 1;
-                        resp.StatusCode = 206;
-                        resp.ContentType = mimeType;
-                        resp.ContentLength64 = contentLength;
-                        resp.Headers.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
+                        NameValueCollection rangeHeaders = new();
+                        rangeHeaders.Add("Accept-Ranges", "bytes");
+                        rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
 
+                        using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
                         using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
                         fs.Seek(start, SeekOrigin.Begin);
                         byte[] buffer = new byte[65536];
                         long remaining = contentLength;
-                        using Stream output = resp.OutputStream;
                         while (remaining > 0)
                         {
                             int toRead = (int)Math.Min(buffer.Length, remaining);
@@ -739,13 +721,12 @@ namespace Omnipotent.Services.KliveCloud
                     }
                     else
                     {
-                        resp.StatusCode = 200;
-                        resp.ContentType = mimeType;
-                        resp.ContentLength64 = fileLength;
+                        NameValueCollection fullHeaders = new();
+                        fullHeaders.Add("Accept-Ranges", "bytes");
 
+                        using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
                         using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
                         byte[] buffer = new byte[65536];
-                        using Stream output = resp.OutputStream;
                         int bytesRead;
                         while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
                         {

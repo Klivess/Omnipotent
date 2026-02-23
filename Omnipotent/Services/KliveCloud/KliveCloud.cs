@@ -134,10 +134,30 @@ namespace Omnipotent.Services.KliveCloud
             return true;
         }
 
+        private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
+
+        public static void ValidateItemName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("Name cannot be empty.");
+            if (name.IndexOfAny(InvalidNameChars) >= 0)
+                throw new ArgumentException("Name contains invalid characters.");
+            if (name.Contains("..") || name == "." || name == "..")
+                throw new ArgumentException("Name contains path traversal sequences.");
+        }
+
+        private string GetStorageBasePath()
+        {
+            return Path.GetFullPath(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudStorageDirectory));
+        }
+
         public string GetFullItemPath(CloudItem item)
         {
-            string basePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudStorageDirectory);
-            return Path.Combine(basePath, item.RelativePath);
+            string basePath = GetStorageBasePath();
+            string fullPath = Path.GetFullPath(Path.Combine(basePath, item.RelativePath));
+            if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && fullPath != basePath)
+                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+            return fullPath;
         }
 
         public CloudItem GetItemByID(string itemID)
@@ -161,6 +181,8 @@ namespace Omnipotent.Services.KliveCloud
 
         public async Task<CloudItem> CreateFolder(string name, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
         {
+            ValidateItemName(name);
+
             string relativePath;
             if (string.IsNullOrEmpty(parentFolderID))
             {
@@ -174,7 +196,10 @@ namespace Omnipotent.Services.KliveCloud
                 relativePath = Path.Combine(parentFolder.RelativePath, name);
             }
 
-            string fullPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudStorageDirectory), relativePath);
+            string basePath = GetStorageBasePath();
+            string fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
+            if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
+                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
             Directory.CreateDirectory(fullPath);
 
             CloudItem folder = new CloudItem
@@ -199,6 +224,8 @@ namespace Omnipotent.Services.KliveCloud
 
         public async Task<CloudItem> UploadFile(string fileName, byte[] fileData, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
         {
+            ValidateItemName(fileName);
+
             string relativePath;
             if (string.IsNullOrEmpty(parentFolderID))
             {
@@ -212,7 +239,10 @@ namespace Omnipotent.Services.KliveCloud
                 relativePath = Path.Combine(parentFolder.RelativePath, fileName);
             }
 
-            string fullPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudStorageDirectory), relativePath);
+            string basePath = GetStorageBasePath();
+            string fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
+            if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
+                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
             string directory = Path.GetDirectoryName(fullPath);
             if (!Directory.Exists(directory))
                 Directory.CreateDirectory(directory);
