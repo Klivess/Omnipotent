@@ -15,6 +15,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
         {
             public DateTime DateTimeOfAnalyticsProduced;
 
+            public List<InstagramSource> InstagramSources;
             public int TotalInstagramSources;
             public int TotalReelsDownloaded;
             public double AverageReelsPerSource;
@@ -43,7 +44,7 @@ namespace Omnipotent.Services.MemeScraper.MemeScraper_Labs
             public MemeScraperAnalytics(List<InstagramSource> sources, List<InstagramScrapeUtilities.InstagramReel> reels)
             {
                 DateTimeOfAnalyticsProduced = DateTime.Now;
-
+                InstagramSources = sources ?? new List<InstagramSource>();
                 TotalInstagramSources = sources?.Count ?? 0;
                 TotalReelsDownloaded = reels?.Count ?? 0;
                 AverageReelsPerSource = (TotalInstagramSources > 0) ? (double)TotalReelsDownloaded / TotalInstagramSources : 0;
