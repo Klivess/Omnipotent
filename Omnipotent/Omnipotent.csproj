@@ -12,6 +12,13 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+	  <Compile Remove="Services\OmniTrader\Strategies\**" />
+	  <Content Remove="Services\OmniTrader\Strategies\**" />
+	  <EmbeddedResource Remove="Services\OmniTrader\Strategies\**" />
+	  <None Remove="Services\OmniTrader\Strategies\**" />
+	</ItemGroup>
+
+	<ItemGroup>
 		<Content Include="favicon.ico" />
 	</ItemGroup>
 
@@ -42,6 +49,7 @@
 		<PackageReference Include="Microsoft.ML" Version="4.0.2" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
 		<PackageReference Include="protobuf-net" Version="3.2.56" />
+		<PackageReference Include="ScottPlot" Version="5.0.55" />
 		<PackageReference Include="Selenium.WebDriver" Version="4.34.0" />
 		<PackageReference Include="Selenium.WebDriver.ChromeDriver" Version="138.0.7204.18300" />
 		<PackageReference Include="SteamKit2" Version="3.3.1" />
@@ -51,7 +59,6 @@
 
 	<ItemGroup>
 		<Folder Include="Services\KlivePuppet\" />
-		<Folder Include="Services\OmniTrader\Strategies\" />
 	</ItemGroup>
 
 </Project>

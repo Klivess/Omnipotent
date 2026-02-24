@@ -315,7 +315,7 @@ namespace Omnipotent.Services.KliveCloud
             if (item == null || item.ItemType != CloudItemType.File) return null;
             string fullPath = GetFullItemPath(item);
             if (!File.Exists(fullPath)) return null;
-            return await GetDataHandler().ReadBytesFromFile(fullPath);
+            return await GetDataHandler().ReadBytesFromFile(fullPath, true);
         }
 
         public CloudItem GetFolderTree(string folderID, KMPermissions userPermission)
