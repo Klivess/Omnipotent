@@ -31,6 +31,8 @@ namespace Omnipotent.Services.SeleniumManager
                 options.AddArguments("--disable-logging");
                 options.AddArguments("--silent");
                 options.AddArguments("--log-level=3");
+                //hopefully reduce CPU load
+                options.AddArguments("--no-sandbox");
             }
 
             public void AddArgumentToOptions(string argument)
