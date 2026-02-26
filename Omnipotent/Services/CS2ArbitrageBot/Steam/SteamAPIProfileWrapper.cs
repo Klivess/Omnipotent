@@ -193,8 +193,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
                         // Save cookies after successful login  
                         await SaveSteamCommunityCookiesAsync(driver);
-                        driver.Close();
-                        driver.Quit();
                     }
                     else
                     {
@@ -206,11 +204,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     // Handle exceptions (e.g., log errors)  
                     Console.WriteLine($"Error during Steam login: {ex.Message}");
                 }
-                finally
-                {
-                    // Quit the WebDriver  
-                    (await parent.parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
-                }
+                // Quit the WebDriver  
+                (await parent.parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
             }
         }
         public async Task LoadSteamPassword()
