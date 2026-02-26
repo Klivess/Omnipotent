@@ -112,8 +112,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         {
             string loginUrl = "https://steamcommunity.com/login/home/";
 
-            // Initialize Selenium WebDriver  
 
+            string canStartLogin = await (await parent.parent.serviceManager.GetNotificationsService())
+    .SendButtonsPromptToKlivesDiscord(
+        "CS2 Arbitrage Bot",
+        $"The bot requires you to accept a steam mobile login confirmation, Are you ready to receive it?.",
+        new Dictionary<string, DSharpPlus.ButtonStyle>
+        {
+                           { "Yes", DSharpPlus.ButtonStyle.Success },
+        },
+        TimeSpan.FromDays(31)
+    );
+
+            // Initialize Selenium WebDriver  
             var seleniumObject = (await parent.parent.GetSeleniumManager()).CreateSeleniumObject("SteamLogin");
             seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
             using (var driver = seleniumObject.UseChromeDriver())
