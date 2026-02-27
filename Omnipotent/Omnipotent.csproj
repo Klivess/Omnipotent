@@ -12,13 +12,6 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-	  <Compile Remove="Services\OmniTrader\Strategies\**" />
-	  <Content Remove="Services\OmniTrader\Strategies\**" />
-	  <EmbeddedResource Remove="Services\OmniTrader\Strategies\**" />
-	  <None Remove="Services\OmniTrader\Strategies\**" />
-	</ItemGroup>
-
-	<ItemGroup>
 		<Content Include="favicon.ico" />
 	</ItemGroup>
 
@@ -56,6 +49,8 @@
 		<PackageReference Include="SteamKit2" Version="3.3.1" />
 		<PackageReference Include="System.Management" Version="9.0.7" />
 		<PackageReference Include="Websocket.Client" Version="5.2.0" />
+		<PackageReference Include="XGBoostSharp" Version="0.5.2" />
+		<PackageReference Include="XGBoostSharp-cpu" Version="0.5.2" />
 	</ItemGroup>
 
 	<ItemGroup>

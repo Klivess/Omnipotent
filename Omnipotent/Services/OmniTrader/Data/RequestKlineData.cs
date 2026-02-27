@@ -52,28 +52,36 @@ namespace Omnipotent.Services.OmniTrader.Data
             OHLCCandlesData oHLCCandlesData = new OHLCCandlesData();
 
             HttpClient httpClient = new HttpClient();
-            string url = $"{krakenAPI}0/public/OHLC?pair={coin}{currency}&interval={(int)interval}&since={(since.HasValue ? new DateTimeOffset(since.Value).ToUnixTimeSeconds() : 0)}";
+            string url = $"{krakenAPI}0/public/OHLC?pair={coin}/{currency}&interval={(int)interval}&since={(since.HasValue ? new DateTimeOffset(since.Value).ToUnixTimeSeconds() : 0)}";
             var response = await httpClient.GetAsync(url);
-            string responseContent = await response.Content.ReadAsStringAsync();
-            dynamic jsonResponse = JsonConvert.DeserializeObject(responseContent);
-            var result = jsonResponse.result;
-            var candles = result[$"X{coin}Z{currency}"];
-            oHLCCandlesData.candles = new List<OHLCCandle>();
-            foreach (var candle in candles)
-            {
-                OHLCCandle oHLCCandle;
-                oHLCCandle.Timestamp = DateTimeOffset.FromUnixTimeSeconds((long)candle[0]).DateTime;
-                oHLCCandle.Open = (decimal)candle[1];
-                oHLCCandle.High = (decimal)candle[2];
-                oHLCCandle.Low = (decimal)candle[3];
-                oHLCCandle.Close = (decimal)candle[4];
-                oHLCCandle.VWAP = (decimal)candle[5];
-                oHLCCandle.Volume = (decimal)candle[6];
-                oHLCCandle.TradeCount = (decimal)candle[7];
-                oHLCCandlesData.candles.Add(oHLCCandle);
-            }
 
-            return oHLCCandlesData;
+            if (response.IsSuccessStatusCode)
+            {
+                string responseContent = await response.Content.ReadAsStringAsync();
+                dynamic jsonResponse = JsonConvert.DeserializeObject(responseContent);
+                var result = jsonResponse.result;
+                var candles = result[$"{coin}/{currency}"];
+                oHLCCandlesData.candles = new List<OHLCCandle>();
+                foreach (var candle in candles)
+                {
+                    OHLCCandle oHLCCandle;
+                    oHLCCandle.Timestamp = DateTimeOffset.FromUnixTimeSeconds((long)candle[0]).DateTime;
+                    oHLCCandle.Open = (decimal)candle[1];
+                    oHLCCandle.High = (decimal)candle[2];
+                    oHLCCandle.Low = (decimal)candle[3];
+                    oHLCCandle.Close = (decimal)candle[4];
+                    oHLCCandle.VWAP = (decimal)candle[5];
+                    oHLCCandle.Volume = (decimal)candle[6];
+                    oHLCCandle.TradeCount = (decimal)candle[7];
+                    oHLCCandlesData.candles.Add(oHLCCandle);
+                }
+
+                return oHLCCandlesData;
+            }
+            else
+            {
+                throw new Exception($"Failed to retrieve OHLC data: {response.StatusCode} Reason: {await response.Content.ReadAsStringAsync()}");
+            }
         }
     }
 }
