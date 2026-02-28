@@ -1,6 +1,4 @@
 ﻿using ByteSizeLib;
-using System.Diagnostics;
-using System.Management;
 using System.Runtime.InteropServices;
 
 namespace Omnipotent.Service_Manager
@@ -16,11 +14,7 @@ namespace Omnipotent.Service_Manager
         List<OmniMonitoredThread> monitoredThreads = new();
         public ByteSize MemoryUsage { get; private set; }
         public ByteSize TotalSystemRAM { get; private set; }
-        // CPU usage counter
-        private PerformanceCounter cpuCounter;
 
-        // RAM usage counter
-        private PerformanceCounter ramCounter;
         public struct OmniMonitoredThread
         {
             public string name;
@@ -68,42 +62,63 @@ namespace Omnipotent.Service_Manager
 
         private async void UpdateCPUandRAMCounters()
         {
-            try
+            // Cache total RAM once – it never changes at runtime
+            long totalRamMiB = PerformanceInfo.GetTotalMemoryInMiB();
+            if (totalRamMiB > 0)
             {
-                cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                while (true)
+                TotalSystemRAM = ByteSize.FromMegaBytes(totalRamMiB);
+            }
+
+            // Take an initial CPU snapshot so the first delta is valid
+            GetSystemTimes(out var prevIdle, out var prevKernel, out var prevUser);
+            await Task.Delay(1000);
+
+            while (true)
+            {
+                try
                 {
-                    // Getting CPU usage
-                    float cpuUsage = cpuCounter.NextValue();
-
-                    long totalPhysicalMemory = 0;
-
-                    // Query for physical memory
-                    using (ManagementObjectSearcher searcher = new ManagementObjectSearcher("SELECT TotalPhysicalMemory FROM Win32_ComputerSystem"))
+                    // CPU usage via GetSystemTimes delta
+                    if (GetSystemTimes(out var idleTime, out var kernelTime, out var userTime))
                     {
-                        foreach (ManagementObject obj in searcher.Get())
-                        {
-                            totalPhysicalMemory = Convert.ToInt64(obj["TotalPhysicalMemory"]);
-                        }
+                        long idleDelta = FileTimeToLong(idleTime) - FileTimeToLong(prevIdle);
+                        long kernelDelta = FileTimeToLong(kernelTime) - FileTimeToLong(prevKernel);
+                        long userDelta = FileTimeToLong(userTime) - FileTimeToLong(prevUser);
+                        long totalDelta = kernelDelta + userDelta; // kernel includes idle
+                        CPUUsagePercentage = totalDelta > 0
+                            ? (int)(((totalDelta - idleDelta) * 100) / totalDelta)
+                            : 0;
+                        prevIdle = idleTime;
+                        prevKernel = kernelTime;
+                        prevUser = userTime;
                     }
 
-                    // Convert to MB
-                    double totalPhysicalMemoryInMB = totalPhysicalMemory / (1024 * 1024);
-
-                    // Calculating used RAM
-                    float usedRAM = (totalPhysicalMemory / (1024 * 1024)) - PerformanceInfo.GetPhysicalAvailableMemoryInMiB();
-
-                    CPUUsagePercentage = (int)cpuUsage;
-                    MemoryUsage = ByteSize.FromMegaBytes(usedRAM);
-                    TotalSystemRAM = ByteSize.FromMegaBytes(totalPhysicalMemoryInMB);
-                    // Sleep for 1 second before next measurement
-                    await Task.Delay(2000);
+                    // RAM usage via P/Invoke (fast, no WMI)
+                    long availableMiB = PerformanceInfo.GetPhysicalAvailableMemoryInMiB();
+                    if (availableMiB >= 0 && totalRamMiB > 0)
+                    {
+                        long usedMiB = totalRamMiB - availableMiB;
+                        MemoryUsage = ByteSize.FromMegaBytes(usedMiB);
+                    }
                 }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex, "Error reading CPU/RAM counters, retrying...");
+                }
+
+                await Task.Delay(2000);
             }
-            catch (Exception ex)
-            {
-                ServiceLogError(ex, "Couldn't get CPU and RAM usage");
-            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetSystemTimes(
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpIdleTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpKernelTime,
+            out System.Runtime.InteropServices.ComTypes.FILETIME lpUserTime);
+
+        private static long FileTimeToLong(System.Runtime.InteropServices.ComTypes.FILETIME ft)
+        {
+            return ((long)ft.dwHighDateTime << 32) | (uint)ft.dwLowDateTime;
         }
 
         public static class PerformanceInfo
@@ -131,32 +146,24 @@ namespace Omnipotent.Service_Manager
                 public int ThreadCount;
             }
 
-            public static Int64 GetPhysicalAvailableMemoryInMiB()
+            public static long GetPhysicalAvailableMemoryInMiB()
             {
                 PerformanceInformation pi = new PerformanceInformation();
                 if (GetPerformanceInfo(out pi, Marshal.SizeOf(pi)))
                 {
-                    return Convert.ToInt64((pi.PhysicalAvailable.ToInt64() * pi.PageSize.ToInt64() / 1048576));
+                    return pi.PhysicalAvailable.ToInt64() * pi.PageSize.ToInt64() / 1048576;
                 }
-                else
-                {
-                    return -1;
-                }
-
+                return -1;
             }
 
-            public static Int64 GetTotalMemoryInMiB()
+            public static long GetTotalMemoryInMiB()
             {
                 PerformanceInformation pi = new PerformanceInformation();
                 if (GetPerformanceInfo(out pi, Marshal.SizeOf(pi)))
                 {
-                    return Convert.ToInt64((pi.PhysicalTotal.ToInt64() * pi.PageSize.ToInt64() / 1048576));
+                    return pi.PhysicalTotal.ToInt64() * pi.PageSize.ToInt64() / 1048576;
                 }
-                else
-                {
-                    return -1;
-                }
-
+                return -1;
             }
         }
     }
