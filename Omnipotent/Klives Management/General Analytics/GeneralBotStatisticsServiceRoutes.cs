@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using System.Diagnostics;
 
 namespace Omnipotent.Klives_Management.General_Analytics
 {
@@ -97,6 +98,37 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+
+            // Trigger bot update – launches SyncAndStartOmnipotent.bat which kills the process, pulls, rebuilds and restarts
+            api.CreateRoute("/GeneralBotStatistics/UpdateBot", async (req) =>
+            {
+                try
+                {
+                    string scriptPath = Path.Combine(Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)!.FullName, "SyncAndStartOmnipotent.bat");
+                    if (!File.Exists(scriptPath))
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = $"Update script not found at {scriptPath}" }), code: System.Net.HttpStatusCode.InternalServerError);
+                        return;
+                    }
+
+                    g.ServiceLog($"Bot update requested by {req.user.Name}. Launching update script...");
+
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"/c \"{scriptPath}\"",
+                        WorkingDirectory = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)!.FullName,
+                        UseShellExecute = true,
+                        CreateNoWindow = false
+                    });
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = true, Message = "Update script launched. The bot will restart shortly." }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
         }
     }
 }
