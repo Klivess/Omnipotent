@@ -113,8 +113,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             string loginUrl = "https://steamcommunity.com/login/home/";
 
 
-            string canStartLogin = await (await parent.parent.serviceManager.GetNotificationsService())
-    .SendButtonsPromptToKlivesDiscord(
+            string canStartLogin = await (await parent.parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord(
         "CS2 Arbitrage Bot",
         $"The bot requires you to accept a steam mobile login confirmation, Are you ready to receive it?.",
         new Dictionary<string, DSharpPlus.ButtonStyle>
@@ -202,7 +201,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 catch (Exception ex)
                 {
                     // Handle exceptions (e.g., log errors)  
-                    Console.WriteLine($"Error during Steam login: {ex.Message}");
+                    parent.parent.ServiceLogError(ex, $"Error during Steam login: {ex.Message}");
                 }
                 // Quit the WebDriver  
                 (await parent.parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
@@ -335,7 +334,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error checking cookie string: {ex.Message}");
+                parent.parent.ServiceLogError(ex, $"Error checking cookie string: {ex.Message}");
                 if (reLogin)
                 {
                     await LoginToSteam();
