@@ -104,7 +104,8 @@ namespace Omnipotent.Klives_Management.General_Analytics
             {
                 try
                 {
-                    string scriptPath = Path.Combine(Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)!.FullName, "SyncAndStartOmnipotent.bat");
+                    string repoRoot = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+                    string scriptPath = Path.Combine(repoRoot, "SyncAndStartOmnipotent.bat");
                     if (!File.Exists(scriptPath))
                     {
                         await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = $"Update script not found at {scriptPath}" }), code: System.Net.HttpStatusCode.InternalServerError);
@@ -117,7 +118,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     {
                         FileName = "cmd.exe",
                         Arguments = $"/c \"{scriptPath}\"",
-                        WorkingDirectory = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)!.FullName,
+                        WorkingDirectory = repoRoot,
                         UseShellExecute = true,
                         CreateNoWindow = false
                     });
