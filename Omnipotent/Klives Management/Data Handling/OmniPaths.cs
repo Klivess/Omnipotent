@@ -92,6 +92,7 @@ namespace Omnipotent.Data_Handling
             public static string FFMpegDirectory = $"FFmpeg";
             public static string FFMpegWorkingDirectory = $"{FFMpegDirectory}/FFmpegWorkingDirectory";
             public static string OmniTubeDirectory = $"{SavedDataDirectory}/OmniTube";
+            public static string OmniTubeBrandsDirectory = $"{OmniTubeDirectory}/OmniBrands";
 
 
         };
