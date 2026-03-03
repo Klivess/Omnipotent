@@ -125,7 +125,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             // Initialize Selenium WebDriver  
             var seleniumObject = (await parent.parent.GetSeleniumManager()).CreateSeleniumObject("SteamLogin");
-            seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
             using (var driver = seleniumObject.UseChromeDriver())
             {
                 try

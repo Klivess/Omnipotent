@@ -25,8 +25,8 @@ namespace Omnipotent.Services.OmniTrader
 
 
             var backtestSet = await requestKlineData.GetCryptoCandlesDataAsync("BTC", "USD", RequestKlineData.TimeInterval.OneHour, 500);
-            var results = await simpleXGBoostRegressionOmniStrategy.BacktestStrategy(backtestSet);
-            ServiceLog(JsonConvert.SerializeObject(results));
+            //var results = await simpleXGBoostRegressionOmniStrategy.BacktestStrategy(backtestSet);
+            //ServiceLog(JsonConvert.SerializeObject(results));
         }
     }
 }

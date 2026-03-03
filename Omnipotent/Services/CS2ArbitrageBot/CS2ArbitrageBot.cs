@@ -76,6 +76,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             await CreateRoutes();
 
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
+
+            if (OmniPaths.CheckIfOnServer() == false)
+            {
+                //await steamAPIWrapper.profileWrapper.LoginToSteam();
+            }
+
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
             await UpdateAccountInformation();
             MonitorTradeList();

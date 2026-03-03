@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using OpenQA.Selenium.Chrome;
 using SteamKit2;
@@ -22,17 +23,32 @@ namespace Omnipotent.Services.SeleniumManager
             private ChromeOptions options;
             [JsonIgnore]
             private ChromeDriver? driver;
+            [JsonIgnore]
+            private DateTime lastActivity;
+            [JsonIgnore]
+            private TimeSpan worstCaseSessionDuration;
+            [JsonIgnore]
+            private CancellationTokenSource? inactivityCts;
 
-            public SeleniumObject()
+            public SeleniumObject(TimeSpan? worstCaseSessionDuration = null)
             {
+                this.worstCaseSessionDuration = worstCaseSessionDuration ?? TimeSpan.FromHours(3);
                 options = new ChromeOptions();
                 createdAt = DateTime.Now;
+                lastActivity = DateTime.Now;
                 options.SetLoggingPreference(OpenQA.Selenium.LogType.Browser, OpenQA.Selenium.LogLevel.Off);
                 options.AddArguments("--disable-logging");
                 options.AddArguments("--silent");
                 options.AddArguments("--log-level=3");
                 //hopefully reduce CPU load
                 options.AddArguments("--no-sandbox");
+
+                if (OmniPaths.CheckIfOnServer())
+                {
+                    options.AddArguments("--headless");
+                }
+
+                StartInactivityMonitor();
             }
 
             public void AddArgumentToOptions(string argument)
@@ -42,6 +58,7 @@ namespace Omnipotent.Services.SeleniumManager
 
             public ChromeDriver UseChromeDriver()
             {
+                lastActivity = DateTime.Now;
                 if(driver is null)
                 {
                     driver = new ChromeDriver(options);
@@ -51,12 +68,33 @@ namespace Omnipotent.Services.SeleniumManager
 
             internal async void CloseDriver()
             {
+                inactivityCts?.Cancel();
+                inactivityCts?.Dispose();
+                inactivityCts = null;
                 if (driver is not null)
                 {
                     driver.Quit();
                     driver.Dispose();
                     driver = null;
                 }
+            }
+
+            private void StartInactivityMonitor()
+            {
+                inactivityCts = new CancellationTokenSource();
+                var token = inactivityCts.Token;
+                Task.Run(async () =>
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromMinutes(1), token).ConfigureAwait(false);
+                        if (DateTime.Now - lastActivity >= worstCaseSessionDuration)
+                        {
+                            CloseDriver();
+                            break;
+                        }
+                    }
+                }, token);
             }
         }
 
@@ -73,9 +111,9 @@ namespace Omnipotent.Services.SeleniumManager
             routes.CreateRoutes();
         }
 
-        public SeleniumObject CreateSeleniumObject(string name)
+        public SeleniumObject CreateSeleniumObject(string name, TimeSpan? worstCaseSessionDuration = null)
         {
-            var newSeleniumObject = new SeleniumObject();
+            var newSeleniumObject = new SeleniumObject(worstCaseSessionDuration);
             newSeleniumObject.objectID = (ulong)DateTime.Now.Ticks;
             newSeleniumObject.name = name;
             currentActiveSeleniumInstances.Add(newSeleniumObject);
