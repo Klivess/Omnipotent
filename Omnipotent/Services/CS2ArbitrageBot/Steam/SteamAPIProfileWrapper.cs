@@ -143,9 +143,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     IWebElement passwordField = driver.FindElement(By.CssSelector("input[type='password']._2GBWeup5cttgbTw8FM3tfx"));
                     passwordField.SendKeys(SteamPassword);
 
+                    // Dismiss cookie consent popup if present
+                    try
+                    {
+                        var cookiePopup = driver.FindElements(By.CssSelector("div.cookiepreferences_popup_content"));
+                        if (cookiePopup.Count > 0)
+                        {
+                            var acceptButton = cookiePopup[0].FindElement(By.CssSelector("div.btn_green_white_innerfade, button"));
+                            acceptButton.Click();
+                            await Task.Delay(1000);
+                        }
+                    }
+                    catch { }
+
                     // Locate and click the login button  
                     IWebElement loginButton = driver.FindElement(By.CssSelector("button.DjSvCZoKKfoNSmarsEcTS[type='submit']"));
-                    loginButton.Click();
+                    try
+                    {
+                        loginButton.Click();
+                    }
+                    catch (ElementClickInterceptedException)
+                    {
+                        ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", loginButton);
+                    }
                     await Task.Delay(2000);
 
                     bool confirmed = false;

@@ -79,7 +79,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
             if (OmniPaths.CheckIfOnServer() == false)
             {
-                //await steamAPIWrapper.profileWrapper.LoginToSteam();
+                await steamAPIWrapper.profileWrapper.LoginToSteam();
             }
 
             serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
