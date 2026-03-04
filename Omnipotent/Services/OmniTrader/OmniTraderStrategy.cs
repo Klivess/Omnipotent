@@ -1,6 +1,5 @@
-﻿using JetBrains.Annotations;
+﻿using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
-using SimpleBacktestLib;
 
 namespace Omnipotent.Services.OmniTrader
 {
@@ -49,44 +48,10 @@ namespace Omnipotent.Services.OmniTrader
             await parent.ServiceLog($"[{Name}] {message}");
         }
 
-        private List<BacktestCandle> ConvertOmniCandleToBacktestableCandle(List<RequestKlineData.OHLCCandle> candles)
+        public async Task<OmniBacktestResult> BacktestStrategy(RequestKlineData.OHLCCandlesData testSet, BacktestSettings? settings = null)
         {
-            return candles.Select(c => new BacktestCandle
-            {
-                Time = c.Timestamp,
-                Open = c.Open,
-                High = c.High,
-                Low = c.Low,
-                Close = c.Close,
-                Volume = c.Volume
-            }).ToList();
-        }
-
-        public async Task<BacktestResult> BacktestStrategy(RequestKlineData.OHLCCandlesData testSet)
-        {
-            //convert the candles to backtestable candles
-            List<BacktestCandle> backtestCandles = ConvertOmniCandleToBacktestableCandle(testSet.candles);
-
-            BacktestBuilder builder = BacktestBuilder.CreateBuilder(backtestCandles)
-            .OnTick(state =>
-            {
-                var currentCandle = testSet.candles.FirstOrDefault(c => c.Timestamp == state.GetCurrentCandle().Time);
-
-                OnBuy += (sender, args) =>
-                {
-                    state.Trade.Spot.Buy(args.amountType, args.inputAmount);
-                };
-
-                OnSell += (sender, args) =>
-                {
-                    state.Trade.Spot.Sell(args.amountType, args.inputAmount);
-                };
-
-
-                OnTick(new RequestKlineData.OHLCCandlesData { candles = new List<RequestKlineData.OHLCCandle> { currentCandle } });
-            });
-
-            return await builder.RunAsync();
+            var backtester = new OmniBacktester(this, testSet.candles, settings);
+            return await backtester.RunAsync();
         }
     }
 }

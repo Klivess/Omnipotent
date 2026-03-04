@@ -2,9 +2,9 @@
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
 using Omnipotent.Services.OmniTrader.Strategies;
-using SimpleBacktestLib;
 
 namespace Omnipotent.Services.OmniTrader
 {
@@ -23,11 +23,22 @@ namespace Omnipotent.Services.OmniTrader
             SimpleXGBoostRegressionOmniStrategy simpleXGBoostRegressionOmniStrategy = new();
             await simpleXGBoostRegressionOmniStrategy.Initialise(this);
 
+            IBSMeanReversionStrategy ibsMeanReversionStrategy = new();
+            await ibsMeanReversionStrategy.Initialise(this);
 
-            var backtestSet = await requestKlineData.GetCryptoCandlesDataAsync("BTC", "USD", RequestKlineData.TimeInterval.OneHour, 500);
-            var results = await simpleXGBoostRegressionOmniStrategy.BacktestStrategy(backtestSet);
-            string resultStringed = JsonConvert.SerializeObject(results);
-            ServiceLog(resultStringed);
+            var backtestSet = await requestKlineData.GetCryptoCandlesDataAsync("BTC", "USD", RequestKlineData.TimeInterval.OneDay, 1000);
+            CandlestickChartGenerator candlestickChartGenerator = new();
+
+
+            var settings = new BacktestSettings
+            {
+                InitialQuoteBalance = 1000,
+                FeeFraction = 0.001m,
+                SlippageFraction = 0.0005m
+            };
+
+            var ibsResults = await ibsMeanReversionStrategy.BacktestStrategy(backtestSet, settings);
+            await ServiceLog(ibsResults.ToString());
         }
     }
 }

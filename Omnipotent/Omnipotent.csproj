@@ -55,7 +55,6 @@
 
 	<ItemGroup>
 		<Folder Include="Services\KlivePuppet\" />
-		<Folder Include="Services\OmniTrader\Backtesting\" />
 	</ItemGroup>
 
 </Project>

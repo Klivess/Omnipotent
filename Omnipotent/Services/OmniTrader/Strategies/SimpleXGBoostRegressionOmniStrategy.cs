@@ -1,4 +1,5 @@
-﻿using Omnipotent.Services.OmniTrader.Data;
+﻿using Omnipotent.Services.OmniTrader.Backtesting;
+using Omnipotent.Services.OmniTrader.Data;
 using XGBoostSharp;
 
 namespace Omnipotent.Services.OmniTrader.Strategies
@@ -98,9 +99,9 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             string reason = $"Predicted: {predictedClose:F2} | Current: {currentClose:F2} | Delta: {delta:F2}";
 
             if (delta > 0)
-                RaiseBuy(SimpleBacktestLib.AmountType.Percentage, 5);
+                RaiseBuy(AmountType.Percentage, 5);
             else
-                RaiseSell(SimpleBacktestLib.AmountType.Percentage, 5);
+                RaiseSell(AmountType.Percentage, 5);
         }
     }
 }

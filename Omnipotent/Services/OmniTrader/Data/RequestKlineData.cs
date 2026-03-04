@@ -46,22 +46,41 @@ namespace Omnipotent.Services.OmniTrader.Data
         }
 
         // This method retrieves OHLC candle data for a specified cryptocurrency pair and time interval.
-        // Maximum candle count is 720
+        // Automatically paginates if more than 720 candles are requested and trims to exactly candleCount.
         public async Task<OHLCCandlesData> GetCryptoCandlesDataAsync(string coin, string currency, TimeInterval interval, int candleCount, DateTime? since = null)
         {
-            OHLCCandlesData oHLCCandlesData = new OHLCCandlesData();
-
+            string pair = $"{coin}/{currency}";
             HttpClient httpClient = new HttpClient();
-            string url = $"{krakenAPI}0/public/OHLC?pair={coin}/{currency}&interval={(int)interval}&since={(since.HasValue ? new DateTimeOffset(since.Value).ToUnixTimeSeconds() : 0)}";
-            var response = await httpClient.GetAsync(url);
+            List<OHLCCandle> allCandles = [];
 
-            if (response.IsSuccessStatusCode)
+            // Calculate the starting timestamp so we fetch far enough back to cover candleCount candles
+            long sinceUnix;
+            if (since.HasValue)
             {
+                sinceUnix = new DateTimeOffset(since.Value).ToUnixTimeSeconds();
+            }
+            else
+            {
+                long intervalSeconds = (int)interval * 60;
+                sinceUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (candleCount * intervalSeconds);
+            }
+
+            while (allCandles.Count < candleCount)
+            {
+                string url = $"{krakenAPI}0/public/OHLC?pair={pair}&interval={(int)interval}&since={sinceUnix}";
+                var response = await httpClient.GetAsync(url);
+
+                if (!response.IsSuccessStatusCode)
+                    throw new Exception($"Failed to retrieve OHLC data: {response.StatusCode} Reason: {await response.Content.ReadAsStringAsync()}");
+
                 string responseContent = await response.Content.ReadAsStringAsync();
                 dynamic jsonResponse = JsonConvert.DeserializeObject(responseContent);
                 var result = jsonResponse.result;
-                var candles = result[$"{coin}/{currency}"];
-                oHLCCandlesData.candles = new List<OHLCCandle>();
+                var candles = result[pair];
+
+                int batchCount = 0;
+                long lastTimestamp = sinceUnix;
+
                 foreach (var candle in candles)
                 {
                     OHLCCandle oHLCCandle;
@@ -73,15 +92,29 @@ namespace Omnipotent.Services.OmniTrader.Data
                     oHLCCandle.VWAP = (decimal)candle[5];
                     oHLCCandle.Volume = (decimal)candle[6];
                     oHLCCandle.TradeCount = (decimal)candle[7];
-                    oHLCCandlesData.candles.Add(oHLCCandle);
+                    allCandles.Add(oHLCCandle);
+
+                    lastTimestamp = (long)candle[0];
+                    batchCount++;
                 }
 
-                return oHLCCandlesData;
+                // No new candles returned — nothing left to fetch
+                if (batchCount == 0)
+                    break;
+
+                // Advance past the last candle we received for the next page
+                sinceUnix = lastTimestamp + 1;
             }
-            else
-            {
-                throw new Exception($"Failed to retrieve OHLC data: {response.StatusCode} Reason: {await response.Content.ReadAsStringAsync()}");
-            }
+
+            // Deduplicate by timestamp (in case of overlap between pages) and take the most recent candleCount
+            allCandles = allCandles
+                .GroupBy(c => c.Timestamp)
+                .Select(g => g.First())
+                .OrderBy(c => c.Timestamp)
+                .TakeLast(candleCount)
+                .ToList();
+
+            return new OHLCCandlesData { candles = allCandles };
         }
     }
 }
