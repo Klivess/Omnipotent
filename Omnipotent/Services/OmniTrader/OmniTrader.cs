@@ -21,12 +21,13 @@ namespace Omnipotent.Services.OmniTrader
             requestKlineData = new RequestKlineData(this);
 
             SimpleXGBoostRegressionOmniStrategy simpleXGBoostRegressionOmniStrategy = new();
-            simpleXGBoostRegressionOmniStrategy.Initialise(this);
+            await simpleXGBoostRegressionOmniStrategy.Initialise(this);
 
 
             var backtestSet = await requestKlineData.GetCryptoCandlesDataAsync("BTC", "USD", RequestKlineData.TimeInterval.OneHour, 500);
-            //var results = await simpleXGBoostRegressionOmniStrategy.BacktestStrategy(backtestSet);
-            //ServiceLog(JsonConvert.SerializeObject(results));
+            var results = await simpleXGBoostRegressionOmniStrategy.BacktestStrategy(backtestSet);
+            string resultStringed = JsonConvert.SerializeObject(results);
+            ServiceLog(resultStringed);
         }
     }
 }

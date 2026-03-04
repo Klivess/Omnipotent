@@ -21,17 +21,17 @@ namespace Omnipotent.Services.OmniTrader
         public event EventHandler<TradeSignalEventArgs> OnBuy;
         public event EventHandler<TradeSignalEventArgs> OnSell;
 
-        public void Initialise(OmniTrader parent)
+        public async Task Initialise(OmniTrader parent)
         {
             this.parent = parent;
 
             if (IsLoaded)
                 return;
 
-            OnLoad();
+            await OnLoad();
             IsLoaded = true;
         }
-        protected virtual async void OnLoad() { }
+        protected virtual async Task OnLoad() { }
         public virtual void OnTick(RequestKlineData.OHLCCandlesData last200Candles) { }
 
         protected void RaiseBuy(AmountType amountType, decimal inputAmount)

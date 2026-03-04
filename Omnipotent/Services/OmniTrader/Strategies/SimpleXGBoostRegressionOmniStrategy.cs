@@ -37,7 +37,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             return (features, labels);
         }
 
-        protected override async void OnLoad()
+        protected override async Task OnLoad()
         {
             //Train model (ideally we'd have the model already loaded but this is lowkey just a test strategy lol)
 
@@ -98,9 +98,9 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             string reason = $"Predicted: {predictedClose:F2} | Current: {currentClose:F2} | Delta: {delta:F2}";
 
             if (delta > 0)
-                RaiseBuy(SimpleBacktestLib.AmountType.Percentage, 2);
+                RaiseBuy(SimpleBacktestLib.AmountType.Percentage, 5);
             else
-                RaiseBuy(SimpleBacktestLib.AmountType.Percentage, 2);
+                RaiseSell(SimpleBacktestLib.AmountType.Percentage, 5);
         }
     }
 }
