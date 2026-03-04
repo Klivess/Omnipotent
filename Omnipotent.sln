@@ -14,6 +14,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OmnipotentProcessMonitor", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Omnipotent.Tests", "Omnipotent.Tests\Omnipotent.Tests.csproj", "{0FFFA012-B0F4-4D4F-B27B-207F101348B2}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KliveLink", "KliveLink\KliveLink.csproj", "{4AB769B0-B713-4C5B-820D-2B625E150768}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -60,6 +62,18 @@ Global
 		{0FFFA012-B0F4-4D4F-B27B-207F101348B2}.Release|x64.Build.0 = Release|Any CPU
 		{0FFFA012-B0F4-4D4F-B27B-207F101348B2}.Release|x86.ActiveCfg = Release|Any CPU
 		{0FFFA012-B0F4-4D4F-B27B-207F101348B2}.Release|x86.Build.0 = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|x64.Build.0 = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Debug|x86.Build.0 = Debug|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|x64.ActiveCfg = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|x64.Build.0 = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|x86.ActiveCfg = Release|Any CPU
+		{4AB769B0-B713-4C5B-820D-2B625E150768}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

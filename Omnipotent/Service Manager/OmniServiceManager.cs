@@ -6,6 +6,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.KliveLink;
 using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.OmniStartupManager;
@@ -194,6 +195,19 @@ namespace Omnipotent.Service_Manager
             if (result.Any())
             {
                 return (NotificationsService)(result[0]);
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        public async Task<KliveLinkService?> GetKliveLinkService()
+        {
+            var result = await GetServiceByClassType<KliveLinkService>();
+            if (result.Any())
+            {
+                return (KliveLinkService)(result[0]);
             }
             else
             {

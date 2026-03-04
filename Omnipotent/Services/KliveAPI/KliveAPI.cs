@@ -212,6 +212,9 @@ namespace Omnipotent.Services.KliveAPI
                 serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
                 profileManager = (KMProfileManager)(await serviceManager.GetServiceByClassType<KMProfileManager>())[0];
 
+                //Create KliveLink remote administration service
+                serviceManager.CreateAndStartNewMonitoredOmniService(new KliveLink.KliveLinkService());
+
                 CreateMetaKLIVEAPIRoutes();
             }
             catch (Exception ex)
