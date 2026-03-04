@@ -31,6 +31,12 @@ namespace Omnipotent.Services.KliveLink
             public CancellationTokenSource Cts { get; set; } = new();
 
             /// <summary>
+            /// Ensures only one WebSocket send at a time.
+            /// WebSocket does not support concurrent writes.
+            /// </summary>
+            public SemaphoreSlim SendLock { get; } = new(1, 1);
+
+            /// <summary>
             /// Pending response handlers keyed by message ID.
             /// When we send a command, we register a TaskCompletionSource here;
             /// the receive loop completes it when the response arrives.
@@ -84,6 +90,14 @@ namespace Omnipotent.Services.KliveLink
             finally
             {
                 ConnectedAgents.TryRemove(agentId, out _);
+                if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
+                {
+                    try
+                    {
+                        await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Server closing connection", CancellationToken.None);
+                    }
+                    catch { }
+                }
                 ServiceLog($"Agent disconnected: {agentId}");
                 agent.Cts.Cancel();
             }
@@ -100,7 +114,10 @@ namespace Omnipotent.Services.KliveLink
                 {
                     var result = await agent.Socket.ReceiveAsync(new ArraySegment<byte>(buffer), agent.Cts.Token);
                     if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        ServiceLog($"Agent {agent.AgentId}: received Close frame.");
                         break;
+                    }
 
                     messageBuffer.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
 
@@ -114,26 +131,36 @@ namespace Omnipotent.Services.KliveLink
                             var msg = KliveLinkMessage.Deserialize(json);
                             if (msg != null)
                             {
-                                HandleAgentMessage(agent, msg);
+                                await HandleAgentMessage(agent, msg);
                             }
                         }
                         catch (Exception ex)
                         {
-                            ServiceLogError(ex, $"Error parsing message from agent {agent.AgentId}");
+                            ServiceLogError(ex, $"Error handling message from agent {agent.AgentId}");
                         }
                     }
                 }
-                catch (OperationCanceledException) { break; }
-                catch (WebSocketException) { break; }
+                catch (OperationCanceledException)
+                {
+                    ServiceLog($"Agent {agent.AgentId}: receive cancelled.");
+                    break;
+                }
+                catch (WebSocketException ex)
+                {
+                    ServiceLogError(ex, $"Agent {agent.AgentId}: WebSocket error in receive loop");
+                    break;
+                }
             }
+
+            ServiceLog($"Agent {agent.AgentId}: receive loop exited (State={agent.Socket.State}).");
         }
 
-        private void HandleAgentMessage(ConnectedAgent agent, KliveLinkMessage msg)
+        private async Task HandleAgentMessage(ConnectedAgent agent, KliveLinkMessage msg)
         {
             switch (msg.Command)
             {
                 case KliveLinkCommandType.Heartbeat:
-                    _ = SendToAgent(agent, new KliveLinkMessage { Command = KliveLinkCommandType.HeartbeatAck });
+                    await SendToAgent(agent, new KliveLinkMessage { Command = KliveLinkCommandType.HeartbeatAck });
                     break;
 
                 case KliveLinkCommandType.Pong:
@@ -195,8 +222,21 @@ namespace Omnipotent.Services.KliveLink
         private async Task SendToAgent(ConnectedAgent agent, KliveLinkMessage msg)
         {
             if (agent.Socket.State != WebSocketState.Open) return;
-            byte[] data = Encoding.UTF8.GetBytes(msg.Serialize());
-            await agent.Socket.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, agent.Cts.Token);
+            await agent.SendLock.WaitAsync(agent.Cts.Token);
+            try
+            {
+                if (agent.Socket.State != WebSocketState.Open) return;
+                byte[] data = Encoding.UTF8.GetBytes(msg.Serialize());
+                await agent.Socket.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, agent.Cts.Token);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Error sending to agent {agent.AgentId}");
+            }
+            finally
+            {
+                agent.SendLock.Release();
+            }
         }
 
         // --- Screen capture viewer management ---

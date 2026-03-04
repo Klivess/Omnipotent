@@ -78,7 +78,7 @@ namespace Omnipotent.Services.KliveLink
                     return;
                 }
 
-                var wsContext = await context.AcceptWebSocketAsync(subProtocol: null);
+                var wsContext = await context.AcceptWebSocketAsync(subProtocol: null, keepAliveInterval: TimeSpan.FromSeconds(30));
                 _service.ServiceLog($"KliveLink WebSocket accepted for agent: {agentId}");
 
                 await _service.HandleAgentConnection(wsContext.WebSocket, agentId);

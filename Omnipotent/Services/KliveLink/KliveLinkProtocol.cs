@@ -174,7 +174,6 @@ namespace Omnipotent.Services.KliveLink
     {
         public string AgentId { get; set; } = "";
         public string MachineName { get; set; } = "";
-        public bool ConsentGranted { get; set; }
         public DateTime ConnectedSince { get; set; }
         public bool IsScreenCaptureActive { get; set; }
     }
