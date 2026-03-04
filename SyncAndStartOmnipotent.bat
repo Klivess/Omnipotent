@@ -12,8 +12,8 @@ dotnet publish Omnipotent/Omnipotent.csproj --output serverBuild
 REM Publish OmnipotentProcessMonitor project
 dotnet publish OmnipotentProcessMonitor/OmnipotentProcessMonitor.csproj --output serverBuild
 
-REM Publish OmnipotentProcessMonitor project
-dotnet publish KliveLink/KliveLink.csproj --output serverBuild
+REM Publish KliveLink project
+dotnet publish KliveLink/KliveLink.csproj --output serverBuild -r win-x64 -c Release /p:PublishSingleFile=true /p:PublishTrimmed=true /p:CopyOutputSymbolsToPublishDirectory=false --self-contained true
 
 cd serverBuild
 cls
