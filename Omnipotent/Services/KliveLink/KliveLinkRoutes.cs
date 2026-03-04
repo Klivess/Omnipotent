@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using System.Net;
 using System.Net.WebSockets;
 using static Omnipotent.Profiles.KMProfileManager;
@@ -387,7 +388,7 @@ namespace Omnipotent.Services.KliveLink
             {
                 try
                 {
-                    string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KL.exe");
+                    string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KliveLink.exe");
                     if (!File.Exists(exePath))
                     {
                         await req.ReturnResponse("\"KL executable not found on server\"", code: HttpStatusCode.NotFound);
@@ -397,7 +398,7 @@ namespace Omnipotent.Services.KliveLink
                     byte[] fileBytes = await File.ReadAllBytesAsync(exePath);
                     var headers = new System.Collections.Specialized.NameValueCollection
                     {
-                        { "Content-Disposition", "attachment; filename=\"KL.exe\"" }
+                        { "Content-Disposition", $"attachment; filename=\"{"0rehjgrsetoiughrto8u"}.exe\"" }
                     };
                     await req.ReturnBinaryResponse(fileBytes, "application/octet-stream", headers: headers);
                 }
