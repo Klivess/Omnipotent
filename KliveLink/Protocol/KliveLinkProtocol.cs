@@ -57,6 +57,7 @@ namespace KliveLink.Protocol
     public class KliveLinkMessage
     {
         public string MessageId { get; set; } = Guid.NewGuid().ToString("N");
+        public string? ReplyToMessageId { get; set; }
         public KliveLinkCommandType Command { get; set; }
         public string? Payload { get; set; }
         public DateTime Timestamp { get; set; } = DateTime.UtcNow;

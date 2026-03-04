@@ -15,7 +15,7 @@ namespace KliveLink
     /// </summary>
     internal static class Program
     {
-        private const string DefaultServerUri = "wss://klive.dev:443/klivelink/ws";
+        private const string DefaultServerUri = "ws://klive.dev:5100/klivelink";
         private static NotifyIcon? _trayIcon;
         private static KliveLinkClient? _client;
 

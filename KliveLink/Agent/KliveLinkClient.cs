@@ -149,7 +149,7 @@ namespace KliveLink.Agent
                 switch (msg.Command)
                 {
                     case KliveLinkCommandType.Ping:
-                        await SendMessage(new KliveLinkMessage { Command = KliveLinkCommandType.Pong });
+                        await SendMessage(new KliveLinkMessage { Command = KliveLinkCommandType.Pong, ReplyToMessageId = msg.MessageId });
                         break;
 
                     case KliveLinkCommandType.HeartbeatAck:
@@ -157,30 +157,30 @@ namespace KliveLink.Agent
 
                     case KliveLinkCommandType.GetSystemInfo:
                         var sysInfo = _executor.GetSystemInfo();
-                        await SendResponse(KliveLinkCommandType.SystemInfoResponse, sysInfo);
+                        await SendResponse(KliveLinkCommandType.SystemInfoResponse, sysInfo, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.RunProcess:
                         var runReq = JsonConvert.DeserializeObject<RunProcessPayload>(msg.Payload ?? "{}");
                         var runResult = _executor.RunProcess(runReq!);
-                        await SendResponse(KliveLinkCommandType.RunProcessResult, runResult);
+                        await SendResponse(KliveLinkCommandType.RunProcessResult, runResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.RunTerminalCommand:
                         var termReq = JsonConvert.DeserializeObject<TerminalCommandPayload>(msg.Payload ?? "{}");
                         var termResult = _executor.RunTerminalCommand(termReq!);
-                        await SendResponse(KliveLinkCommandType.TerminalCommandResult, termResult);
+                        await SendResponse(KliveLinkCommandType.TerminalCommandResult, termResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.ListProcesses:
                         var procs = _executor.ListProcesses();
-                        await SendResponse(KliveLinkCommandType.ListProcessesResult, procs);
+                        await SendResponse(KliveLinkCommandType.ListProcessesResult, procs, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.KillProcess:
                         var killReq = JsonConvert.DeserializeObject<KillProcessPayload>(msg.Payload ?? "{}");
                         var killResult = _executor.KillProcess(killReq!);
-                        await SendResponse(KliveLinkCommandType.KillProcessResult, killResult);
+                        await SendResponse(KliveLinkCommandType.KillProcessResult, killResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.RequestScreenCapture:
@@ -195,19 +195,19 @@ namespace KliveLink.Agent
                     case KliveLinkCommandType.ListDirectory:
                         var lsReq = JsonConvert.DeserializeObject<ListDirectoryPayload>(msg.Payload ?? "{}");
                         var lsResult = _executor.ListDirectory(lsReq!);
-                        await SendResponse(KliveLinkCommandType.ListDirectoryResult, lsResult);
+                        await SendResponse(KliveLinkCommandType.ListDirectoryResult, lsResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.DownloadFile:
                         var dlReq = JsonConvert.DeserializeObject<DownloadFilePayload>(msg.Payload ?? "{}");
                         var dlResult = _executor.ReadFile(dlReq!);
-                        await SendResponse(KliveLinkCommandType.DownloadFileResult, dlResult);
+                        await SendResponse(KliveLinkCommandType.DownloadFileResult, dlResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.UploadFile:
                         var ulReq = JsonConvert.DeserializeObject<UploadFilePayload>(msg.Payload ?? "{}");
                         var ulResult = _executor.WriteFile(ulReq!);
-                        await SendResponse(KliveLinkCommandType.UploadFileAck, ulResult);
+                        await SendResponse(KliveLinkCommandType.UploadFileAck, ulResult, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.GetAgentStatus:
@@ -218,7 +218,7 @@ namespace KliveLink.Agent
                             ConnectedSince = DateTime.UtcNow,
                             IsScreenCaptureActive = _screenCapture.IsCapturing
                         };
-                        await SendResponse(KliveLinkCommandType.AgentStatusResponse, status);
+                        await SendResponse(KliveLinkCommandType.AgentStatusResponse, status, msg.MessageId);
                         break;
 
                     case KliveLinkCommandType.DisconnectAgent:
@@ -237,11 +237,12 @@ namespace KliveLink.Agent
             }
         }
 
-        private async Task SendResponse(KliveLinkCommandType command, object payload)
+        private async Task SendResponse(KliveLinkCommandType command, object payload, string? replyToMessageId = null)
         {
             await SendMessage(new KliveLinkMessage
             {
                 Command = command,
+                ReplyToMessageId = replyToMessageId,
                 Payload = JsonConvert.SerializeObject(payload)
             });
         }

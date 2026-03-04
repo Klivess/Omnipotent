@@ -21,15 +21,6 @@ namespace Omnipotent.Services.KliveLink
         {
             var api = await _parent.serviceManager.GetKliveAPIService();
 
-            // --- WebSocket endpoint for agent connections ---
-            await api.CreateRoute("/klivelink/ws", async (req) =>
-            {
-                // WebSocket upgrade is handled in KliveAPI's listen loop.
-                // This route exists as a placeholder for documentation; actual WebSocket
-                // handling is done via the dedicated WebSocket accept path.
-                await req.ReturnResponse("WebSocket endpoint. Connect via ws:// or wss://.", code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Anybody);
-
             // --- List all connected agents ---
             await api.CreateRoute("/klivelink/agents", async (req) =>
             {

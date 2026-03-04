@@ -14,6 +14,7 @@ namespace Omnipotent.Services.KliveLink
     public class KliveLinkService : OmniService
     {
         public ConcurrentDictionary<string, ConnectedAgent> ConnectedAgents { get; } = new();
+        private KliveLinkServer? _server;
 
         public class ConnectedAgent
         {
@@ -39,9 +40,15 @@ namespace Omnipotent.Services.KliveLink
 
         protected override async void ServiceMain()
         {
+            // Start the dedicated WebSocket server for agent connections
+            _server = new KliveLinkServer(this);
+            _server.Start();
+            ServiceQuitRequest += () => _server.Stop();
+
+            // Register HTTP API routes on KliveAPI for controlling agents
             var routes = new KliveLinkRoutes(this);
             routes.CreateRoutes();
-            ServiceLog($"KliveLinkService started. Waiting for agent connections.");
+            ServiceLog($"KliveLinkService started. WebSocket server on port {KliveLinkServer.Port}. Waiting for agent connections.");
         }
 
         /// <summary>
@@ -127,12 +134,11 @@ namespace Omnipotent.Services.KliveLink
                     break;
 
                 default:
-                    // Route response to any pending request
-                    foreach (var pending in agent.PendingResponses)
+                    // Route response to the matching pending request via ReplyToMessageId
+                    if (!string.IsNullOrEmpty(msg.ReplyToMessageId)
+                        && agent.PendingResponses.TryRemove(msg.ReplyToMessageId, out var tcs))
                     {
-                        pending.Value.TrySetResult(msg);
-                        agent.PendingResponses.TryRemove(pending.Key, out _);
-                        break; // Complete the oldest pending request
+                        tcs.TrySetResult(msg);
                     }
                     break;
             }
