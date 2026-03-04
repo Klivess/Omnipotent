@@ -31,7 +31,16 @@ namespace Omnipotent.Services.OmniTrader
             IsLoaded = true;
         }
         protected virtual async Task OnLoad() { }
-        public virtual void OnTick(RequestKlineData.OHLCCandlesData last200Candles) { }
+
+        public async Task Tick(RequestKlineData.OHLCCandlesData candlesData)
+        {
+            if (!IsLoaded)
+                throw new InvalidOperationException($"Strategy '{Name}' was not initialised. Call Initialise() before Tick().");
+
+            await OnTick(candlesData);
+        }
+
+        protected virtual Task OnTick(RequestKlineData.OHLCCandlesData candlesData) => Task.CompletedTask;
 
         protected void RaiseBuy(AmountType amountType, decimal inputAmount)
         {

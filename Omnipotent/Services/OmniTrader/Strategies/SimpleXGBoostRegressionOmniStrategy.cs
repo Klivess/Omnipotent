@@ -66,19 +66,13 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             StrategyLog("Model trained. Test MAE: {mae:F2} USD over {predictions.Length} samples.");
         }
 
-        public override async void OnTick(RequestKlineData.OHLCCandlesData last200Candles)
+        protected override async Task OnTick(RequestKlineData.OHLCCandlesData candlesData)
         {
-            if (IsLoaded == false)
-            {
-                throw new Exception("Strategy wasn't initialised!");
-            }
-
-
             if (regressor == null)
                 return;
 
             // Fetch the most recent candles (need at least 1 to predict the next close)
-            var latest = last200Candles.candles.Last();
+            var latest = candlesData.candles.Last();
 
             float[] features =
             [

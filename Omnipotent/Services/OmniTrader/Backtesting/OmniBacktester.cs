@@ -30,7 +30,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _settings = settings ?? new BacktestSettings();
         }
 
-        public Task<OmniBacktestResult> RunAsync()
+        public async Task<OmniBacktestResult> RunAsync()
         {
             _quoteBalance = _settings.InitialQuoteBalance;
             _baseBalance = _settings.InitialBaseBalance;
@@ -60,7 +60,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                     {
                         candles = [currentCandle]
                     };
-                    _strategy.OnTick(tickData);
+                    await _strategy.Tick(tickData);
                 }
             }
             finally
@@ -77,7 +77,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
 
             decimal finalEquity = _quoteBalance + _baseBalance * (_candles.Count > 0 ? _candles[^1].Close : 0);
 
-            return Task.FromResult(BuildResult(initialEquity, finalEquity));
+            return BuildResult(initialEquity, finalEquity);
         }
 
         private void HandleBuy(object? sender, TradeSignalEventArgs args)

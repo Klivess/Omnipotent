@@ -75,6 +75,12 @@ namespace Omnipotent.Services.OmniTrader.Data
 
                 string responseContent = await response.Content.ReadAsStringAsync();
                 dynamic jsonResponse = JsonConvert.DeserializeObject(responseContent);
+
+                // Check for API-level errors before accessing result
+                var errors = jsonResponse.error;
+                if (errors != null && errors.Count > 0)
+                    throw new Exception($"Kraken API error: {string.Join(", ", errors)}");
+
                 var result = jsonResponse.result;
                 var candles = result[pair];
 
@@ -104,6 +110,9 @@ namespace Omnipotent.Services.OmniTrader.Data
 
                 // Advance past the last candle we received for the next page
                 sinceUnix = lastTimestamp + 1;
+
+                // Rate-limit: wait before the next paginated request
+                await Task.Delay(1500);
             }
 
             // Deduplicate by timestamp (in case of overlap between pages) and take the most recent candleCount

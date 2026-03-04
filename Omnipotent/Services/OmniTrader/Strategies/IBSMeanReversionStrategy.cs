@@ -31,17 +31,14 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             return Task.CompletedTask;
         }
 
-        public override void OnTick(RequestKlineData.OHLCCandlesData last200Candles)
+        protected override Task OnTick(RequestKlineData.OHLCCandlesData candlesData)
         {
-            if (!IsLoaded)
-                throw new Exception("Strategy wasn't initialised!");
-
-            var current = last200Candles.candles.Last();
+            var current = candlesData.candles.Last();
             _history.Add(current);
 
             // Need at least AvgRangeLookback bars of history to evaluate signals
             if (_history.Count < AvgRangeLookback)
-                return;
+                return Task.CompletedTask;
 
             if (_inPosition)
             {
@@ -71,6 +68,8 @@ namespace Omnipotent.Services.OmniTrader.Strategies
                     StrategyLog($"ENTRY | Close {current.Close:F2} < Threshold {entryThreshold:F2} | IBS {ibs:F4}");
                 }
             }
+
+            return Task.CompletedTask;
         }
 
         private static decimal CalculateIBS(RequestKlineData.OHLCCandle candle)
