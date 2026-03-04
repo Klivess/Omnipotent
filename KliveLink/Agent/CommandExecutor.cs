@@ -258,5 +258,42 @@ namespace KliveLink.Agent
                 return new UploadFileAckPayload { Success = false, Message = ex.Message };
             }
         }
+
+        public SelfDestructResultPayload SelfDestruct()
+        {
+            try
+            {
+                string exePath = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "";
+                string? installDir = Path.GetDirectoryName(exePath);
+
+                // Build a cmd script that waits for the process to exit, then deletes the install
+                // directory and finally removes itself.
+                string tempScript = Path.Combine(Path.GetTempPath(), $"kl_cleanup_{Guid.NewGuid():N}.cmd");
+                string script =
+                    "@echo off\r\n" +
+                    $"timeout /t 3 /nobreak >nul\r\n" +
+                    $"taskkill /F /PID {Environment.ProcessId} >nul 2>&1\r\n" +
+                    $"timeout /t 2 /nobreak >nul\r\n" +
+                    (installDir != null ? $"rmdir /s /q \"{installDir}\"\r\n" : "") +
+                    $"del /f /q \"{tempScript}\"\r\n";
+
+                File.WriteAllText(tempScript, script);
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"{tempScript}\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+
+                return new SelfDestructResultPayload { Acknowledged = true, Message = "Self-destruct initiated." };
+            }
+            catch (Exception ex)
+            {
+                return new SelfDestructResultPayload { Acknowledged = false, Message = ex.Message };
+            }
+        }
     }
 }

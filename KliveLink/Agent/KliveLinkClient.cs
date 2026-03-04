@@ -226,6 +226,13 @@ namespace KliveLink.Agent
                         _cts?.Cancel();
                         break;
 
+                    case KliveLinkCommandType.SelfDestruct:
+                        Log("Server requested self-destruct.");
+                        var sdResult = _executor.SelfDestruct();
+                        await SendResponse(KliveLinkCommandType.SelfDestructAck, sdResult, msg.MessageId);
+                        _cts?.Cancel();
+                        break;
+
                     default:
                         await SendError(msg.MessageId, $"Unknown command: {msg.Command}");
                         break;

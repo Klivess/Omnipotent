@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using System.Net;
+using System.Net.WebSockets;
 using static Omnipotent.Profiles.KMProfileManager;
 
 namespace Omnipotent.Services.KliveLink
@@ -355,6 +356,72 @@ namespace Omnipotent.Services.KliveLink
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            // --- Self-destruct an agent (removes all traces from the client machine) ---
+            await api.CreateRoute("/klivelink/agent/selfdestruct", async (req) =>
+            {
+                try
+                {
+                    string? agentId = req.userParameters.Get("agentId");
+                    if (string.IsNullOrEmpty(agentId))
+                    {
+                        await req.ReturnResponse("\"agentId parameter required\"", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var response = await _parent.SendCommandAndWaitAsync(agentId, new KliveLinkMessage
+                    {
+                        Command = KliveLinkCommandType.SelfDestruct
+                    });
+
+                    await req.ReturnResponse(response?.Payload ?? "\"No response from agent\"", "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // --- WebSocket: live screen capture stream for frontend viewers ---
+            await api.CreateWebSocketRoute("/klivelink/agent/screencapture/stream", async (context, socket, queryParams, user) =>
+            {
+                string? agentId = queryParams.Get("agentId");
+                if (string.IsNullOrEmpty(agentId) || socket.State != WebSocketState.Open)
+                {
+                    if (socket.State == WebSocketState.Open)
+                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "agentId parameter required", CancellationToken.None);
+                    return;
+                }
+
+                if (!_parent.ConnectedAgents.ContainsKey(agentId))
+                {
+                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Agent not connected", CancellationToken.None);
+                    return;
+                }
+
+                string viewerId = _parent.AddScreenViewer(agentId, socket);
+                try
+                {
+                    // Hold the connection open until the viewer disconnects
+                    var buffer = new byte[1024];
+                    while (socket.State == WebSocketState.Open)
+                    {
+                        var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                        if (result.MessageType == WebSocketMessageType.Close)
+                            break;
+                    }
+                }
+                catch (WebSocketException) { }
+                finally
+                {
+                    _parent.RemoveScreenViewer(agentId, viewerId);
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Stream ended", CancellationToken.None); }
+                        catch { }
+                    }
+                }
+            }, KMPermissions.Klives);
 
             _parent.ServiceLog("KliveLink routes created (all Klives-rank restricted).");
         }

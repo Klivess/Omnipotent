@@ -16,6 +16,12 @@ namespace Omnipotent.Services.KliveLink
         public ConcurrentDictionary<string, ConnectedAgent> ConnectedAgents { get; } = new();
         private KliveLinkServer? _server;
 
+        /// <summary>
+        /// Active screen capture viewers per agent ID.
+        /// Frontend WebSocket connections that receive forwarded ScreenCaptureFrame data.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _screenViewers = new();
+
         public class ConnectedAgent
         {
             public string AgentId { get; set; } = "";
@@ -133,6 +139,10 @@ namespace Omnipotent.Services.KliveLink
                 case KliveLinkCommandType.Pong:
                     break;
 
+                case KliveLinkCommandType.ScreenCaptureFrame:
+                    _ = ForwardFrameToViewers(agent.AgentId, msg.Payload ?? "");
+                    break;
+
                 default:
                     // Route response to the matching pending request via ReplyToMessageId
                     if (!string.IsNullOrEmpty(msg.ReplyToMessageId)
@@ -187,6 +197,54 @@ namespace Omnipotent.Services.KliveLink
             if (agent.Socket.State != WebSocketState.Open) return;
             byte[] data = Encoding.UTF8.GetBytes(msg.Serialize());
             await agent.Socket.SendAsync(new ArraySegment<byte>(data), WebSocketMessageType.Text, true, agent.Cts.Token);
+        }
+
+        // --- Screen capture viewer management ---
+
+        public string AddScreenViewer(string agentId, WebSocket viewerSocket)
+        {
+            string viewerId = Guid.NewGuid().ToString("N");
+            var viewers = _screenViewers.GetOrAdd(agentId, _ => new ConcurrentDictionary<string, WebSocket>());
+            viewers[viewerId] = viewerSocket;
+            ServiceLog($"Screen viewer {viewerId} added for agent {agentId} (total: {viewers.Count})");
+            return viewerId;
+        }
+
+        public void RemoveScreenViewer(string agentId, string viewerId)
+        {
+            if (_screenViewers.TryGetValue(agentId, out var viewers))
+            {
+                viewers.TryRemove(viewerId, out _);
+                ServiceLog($"Screen viewer {viewerId} removed for agent {agentId} (remaining: {viewers.Count})");
+            }
+        }
+
+        internal async Task ForwardFrameToViewers(string agentId, string frameJson)
+        {
+            if (!_screenViewers.TryGetValue(agentId, out var viewers) || viewers.IsEmpty)
+                return;
+
+            byte[] data = Encoding.UTF8.GetBytes(frameJson);
+            var segment = new ArraySegment<byte>(data);
+
+            foreach (var (viewerId, socket) in viewers)
+            {
+                try
+                {
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        await socket.SendAsync(segment, WebSocketMessageType.Text, true, CancellationToken.None);
+                    }
+                    else
+                    {
+                        viewers.TryRemove(viewerId, out _);
+                    }
+                }
+                catch
+                {
+                    viewers.TryRemove(viewerId, out _);
+                }
+            }
         }
     }
 }

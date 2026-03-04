@@ -49,6 +49,8 @@ namespace KliveLink.Protocol
         GetAgentStatus,
         AgentStatusResponse,
         DisconnectAgent,
+        SelfDestruct,
+        SelfDestructAck,
 
         // Error
         Error,
@@ -202,5 +204,11 @@ namespace KliveLink.Protocol
     {
         public string Message { get; set; } = "";
         public string? Details { get; set; }
+    }
+
+    public class SelfDestructResultPayload
+    {
+        public bool Acknowledged { get; set; }
+        public string Message { get; set; } = "";
     }
 }

@@ -32,6 +32,8 @@ namespace Omnipotent.Services.KliveLink
         GetAgentStatus,
         AgentStatusResponse,
         DisconnectAgent,
+        SelfDestruct,
+        SelfDestructAck,
         Error,
     }
 
@@ -181,5 +183,11 @@ namespace Omnipotent.Services.KliveLink
     {
         public string Message { get; set; } = "";
         public string? Details { get; set; }
+    }
+
+    public class SelfDestructResultPayload
+    {
+        public bool Acknowledged { get; set; }
+        public string Message { get; set; } = "";
     }
 }
