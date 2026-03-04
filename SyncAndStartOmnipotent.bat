@@ -12,6 +12,9 @@ dotnet publish Omnipotent/Omnipotent.csproj --output serverBuild
 REM Publish OmnipotentProcessMonitor project
 dotnet publish OmnipotentProcessMonitor/OmnipotentProcessMonitor.csproj --output serverBuild
 
+REM Publish OmnipotentProcessMonitor project
+dotnet publish KliveLink/KliveLink.csproj --output serverBuild
+
 cd serverBuild
 cls
 start OmnipotentProcessMonitor.exe

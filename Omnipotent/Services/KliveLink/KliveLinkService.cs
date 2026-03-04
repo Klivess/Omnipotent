@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveBot_Discord;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
@@ -14,6 +15,7 @@ namespace Omnipotent.Services.KliveLink
     public class KliveLinkService : OmniService
     {
         public ConcurrentDictionary<string, ConnectedAgent> ConnectedAgents { get; } = new();
+        private readonly ConcurrentDictionary<string, byte> _knownAgentIds = new();
         private KliveLinkServer? _server;
 
         /// <summary>
@@ -78,6 +80,24 @@ namespace Omnipotent.Services.KliveLink
 
             ConnectedAgents[agentId] = agent;
             ServiceLog($"Agent connected: {agentId}");
+
+            // Notify Klives via Discord on first-ever connection
+            if (_knownAgentIds.TryAdd(agentId, 0))
+            {
+                try
+                {
+                    var discordServices = await serviceManager.GetServiceByClassType<KliveBotDiscord>();
+                    if (discordServices?.Length > 0)
+                    {
+                        var discord = (KliveBotDiscord)discordServices[0];
+                        await discord.SendMessageToKlives($"🔗 New KliveLink agent connected: **{agentId}** at {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex, "Failed to send KliveLink connection notification");
+                }
+            }
 
             try
             {

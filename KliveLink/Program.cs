@@ -5,6 +5,8 @@ using System.Reflection;
 using System.Diagnostics;
 using Microsoft.Win32;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace KliveLink
 {
@@ -12,12 +14,20 @@ namespace KliveLink
     internal static class Program
     {
         private const string DefaultServerUri = "ws://klive.dev:5100/klivelink";
+        private const string MutexName = "Global\\SysMonWatchdog";
         private static NotifyIcon? _trayIcon;
         private static KliveLinkClient? _client;
 
         [STAThread]
         static void Main(string[] args)
         {
+            // If launched with --watchdog, run as a watchdog that restarts the main process
+            if (args.Contains("--watchdog"))
+            {
+                RunWatchdog(args.Where(a => a != "--watchdog").ToArray());
+                return;
+            }
+
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -53,6 +63,9 @@ namespace KliveLink
                 });
                 return;
             }
+
+            // Launch watchdog process to restart us if killed
+            StartWatchdog(args);
 
             // Parse arguments
             string serverUri = DefaultServerUri;
@@ -91,6 +104,78 @@ namespace KliveLink
             cts.Cancel();
             _client.Dispose();
             _trayIcon?.Dispose();
+        }
+
+        /// <summary>
+        /// Launches a separate copy of this exe as a watchdog process.
+        /// The watchdog monitors the main process and restarts it if terminated.
+        /// </summary>
+        private static void StartWatchdog(string[] args)
+        {
+            try
+            {
+                string exePath = Environment.ProcessPath!;
+                string watchdogArgs = "--watchdog " + string.Join(" ", args.Select(a => $"\"{a}\""));
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = exePath,
+                    Arguments = watchdogArgs,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Watchdog mode: monitors the main process and restarts it if killed.
+        /// Uses a mutex to ensure only one watchdog runs at a time.
+        /// </summary>
+        private static void RunWatchdog(string[] args)
+        {
+            using var mutex = new Mutex(true, MutexName, out bool createdNew);
+            if (!createdNew)
+                return; // Another watchdog is already running
+
+            string exePath = Environment.ProcessPath!;
+            string mainArgs = string.Join(" ", args.Select(a => $"\"{a}\""));
+
+            while (true)
+            {
+                // Find the main process (same exe, without --watchdog)
+                var current = Process.GetCurrentProcess();
+                var mainProcess = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(exePath))
+                    .FirstOrDefault(p => p.Id != current.Id);
+
+                if (mainProcess == null)
+                {
+                    // Main process is gone — restart it
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo
+                        {
+                            FileName = exePath,
+                            Arguments = mainArgs,
+                            UseShellExecute = false,
+                            CreateNoWindow = true,
+                            WindowStyle = ProcessWindowStyle.Hidden
+                        });
+                    }
+                    catch { }
+
+                    // Wait for it to start
+                    Thread.Sleep(3000);
+                }
+                else
+                {
+                    try
+                    {
+                        mainProcess.WaitForExit(5000);
+                    }
+                    catch { }
+                }
+            }
         }
     }
 }
