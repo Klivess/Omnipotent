@@ -389,9 +389,11 @@ namespace Omnipotent.Services.KliveLink
                 try
                 {
                     string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KliveLink.exe");
+                    await req.ReturnResponse(exePath);
+                    return;
                     if (!File.Exists(exePath))
                     {
-                        await req.ReturnResponse("\"KL executable not found on server\"", code: HttpStatusCode.NotFound);
+                        await req.ReturnResponse("KL executable not found on server", code: HttpStatusCode.NotFound);
                         return;
                     }
 
