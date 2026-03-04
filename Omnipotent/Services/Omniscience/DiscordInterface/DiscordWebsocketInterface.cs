@@ -73,12 +73,14 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         }
                         else if (json.t == "MESSAGE_CREATE")
                         {
-                            //If the message is from a DM
-                            if (json.d.guild_id == null)
+                            bool isDM = json.d.guild_id == null;
+                            OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), isDM);
+                            if (!isDM)
                             {
-                                OmniDiscordMessage message = await parentService.discordInterface.ChatInterface.ProcessMessageJSONObjectToOmniDiscordMessage(json.d.ToString(), true);
-                                parentService.SaveDiscordMessage(parentUser, message);
+                                message.GuildID = (long)json.d.guild_id;
+                                message.IsInDM = false;
                             }
+                            parentService.SaveDiscordMessage(parentUser, message);
                         }
                     }
                     catch (Exception ex)

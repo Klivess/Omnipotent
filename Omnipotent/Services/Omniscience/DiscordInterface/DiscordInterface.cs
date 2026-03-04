@@ -505,6 +505,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 string DMDirectoryPath = Path.Combine(CreateDMDirectoryPathString(), $"{UserID}messages.omnimessages");
                 return DMDirectoryPath;
             }
+            public string CreateGuildMessagesDirectoryPathString()
+            {
+                string guildMsgDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordServerMessagesDirectory), $"user{UserID}");
+                return guildMsgDir;
+            }
 
             public string FormatFileName()
             {

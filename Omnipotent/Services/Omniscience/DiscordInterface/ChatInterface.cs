@@ -28,7 +28,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             this.parentInterface = parentInterface;
         }
 
-        public async Task<List<OmniDiscordMessage>> GetMessagesAsync(OmniDiscordUser user, long channelID, int limit = 50, bool AutomaticallyDownloadAttachment = true, long? beforeMessageID = null, long? afterMessageID = null)
+        public async Task<List<OmniDiscordMessage>> GetMessagesAsync(OmniDiscordUser user, long channelID, int limit = 50, bool AutomaticallyDownloadAttachment = true, long? beforeMessageID = null, long? afterMessageID = null, bool isDM = true, long? guildID = null, int retryCount = 0)
         {
             string processID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
             string responseString = "";
@@ -59,7 +59,12 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                         dynamic responseJsonn = JsonConvert.DeserializeObject(responseString);
                         foreach (var responseJson in responseJsonn)
                         {
-                            messages.Add(await ProcessMessageJSONObjectToOmniDiscordMessage(responseJson.ToString(), true));
+                            var msg = await ProcessMessageJSONObjectToOmniDiscordMessage(responseJson.ToString(), isDM);
+                            if (guildID.HasValue)
+                            {
+                                msg.GuildID = guildID.Value;
+                            }
+                            messages.Add(msg);
                         }
                     }
                 }
@@ -73,8 +78,12 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 ErrorInformation errorinfo = new(aex);
                 parentInterface.parent.ServiceLogError(aex, "Failed to get messages for " + user.Username + " in channel " + channelID + ".");
-                return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID);
-
+                if (retryCount < 3)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2 * (retryCount + 1)));
+                    return await GetMessagesAsync(user, channelID, limit, AutomaticallyDownloadAttachment, beforeMessageID, afterMessageID, isDM, guildID, retryCount + 1);
+                }
+                return new List<OmniDiscordMessage>();
             }
         }
         public async Task<OmniDiscordMessage> ProcessMessageJSONObjectToOmniDiscordMessage(string messageText, bool isinDM, bool AutomaticallyDownloadAttachment = true)
@@ -568,6 +577,39 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
                 }
             }
             return guilds.ToArray();
+        }
+        public async Task<List<OmniDiscordChannel>> GetAllGuildChannels(OmniDiscordUser user, string guildID)
+        {
+            List<OmniDiscordChannel> channels = new();
+            try
+            {
+                var response = await parentInterface.SendDiscordGetRequest(DiscordHttpClient(user), new Uri($"https://discord.com/api/v9/guilds/{guildID}/channels"));
+                if (response.IsSuccessStatusCode)
+                {
+                    string responseString = await response.Content.ReadAsStringAsync();
+                    dynamic responseJson = JsonConvert.DeserializeObject(responseString);
+                    foreach (var item in responseJson)
+                    {
+                        OmniDiscordChannel channel = new();
+                        channel.ChannelID = item.id;
+                        channel.ChannelName = item.name;
+                        channel.ChannelType = ConvertChannelTypeToEnum((int)item.type);
+                        channel.ChannelFlags = item.flags != null ? (ChannelFlags)(int)item.flags : 0;
+                        channel.GuildID = long.Parse(guildID);
+                        try { channel.ChannelTopic = item.topic; } catch { }
+                        try { channel.ParentChannelID = item.parent_id; } catch { }
+                        try { channel.Position = item.position; } catch { }
+                        try { channel.IsNSFW = item.nsfw ?? false; } catch { }
+                        try { channel.LastMessageID = item.last_message_id; } catch { }
+                        channels.Add(channel);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                parentInterface.parent.ServiceLogError(ex, $"Failed to get channels for guild {guildID}");
+            }
+            return channels;
         }
         public enum OmniChannelType
         {

@@ -24,6 +24,9 @@ namespace Omnipotent.Services.Omniscience
 
         List<OmniDiscordUser> LinkedUsers;
         SynchronizedCollection<OmniDiscordMessage> AllCapturedMessages;
+        private HashSet<long> CapturedMessageIDs;
+        private readonly object _messageIdLock = new();
+
         public DiscordCrawl()
         {
             name = "Omniscience: DiscordCrawl";
@@ -35,7 +38,6 @@ namespace Omnipotent.Services.Omniscience
             discordInterface = new(this);
             ServiceLog("Starting Discord Crawl.");
             LinkedUsers = (await discordInterface.GetAllLinkedOmniDiscordUsersFromDisk()).ToList();
-
 
             ServiceLog($"{LinkedUsers.Count} OmniDiscordUsers linked. Loading all saved messages from disk into memory..");
             Stopwatch time = Stopwatch.StartNew();
@@ -62,7 +64,7 @@ namespace Omnipotent.Services.Omniscience
             }
             time.Stop();
             ServiceLog($"Loaded {AllCapturedMessages.Count} messages from disk in {time.Elapsed.TotalSeconds} seconds.");
-            UpdateDiscordMessageDatabase();
+
             foreach (var item in LinkedUsers)
             {
                 item.websocketInterface = new(this, item);
@@ -74,35 +76,43 @@ namespace Omnipotent.Services.Omniscience
                 }
             }
             ServiceLog($"{(await GetAllDownloadedGuilds()).Length} guilds in database.");
-            discordInterface.NewOmniDiscordUserAdded += (async (user) =>
-                {
-                    LinkedUsers.Add(user);
-                    user.websocketInterface = new(this, user);
-                    await user.websocketInterface.BeginInitialisation();
-                });
 
+            discordInterface.NewOmniDiscordUserAdded += (async (user) =>
+            {
+                LinkedUsers.Add(user);
+                user.websocketInterface = new(this, user);
+                await user.websocketInterface.BeginInitialisation();
+                var guilds = await discordInterface.ChatInterface.GetAllUserGuilds(user);
+                foreach (var guild in guilds)
+                {
+                    await SaveDiscordGuild(guild);
+                }
+            });
 
             CreateRoutes();
+            UpdateAllMessages();
         }
+
         private async Task CreateRoutes()
         {
-            //Set up controllers
-            Func<UserRequest, Task> createNewOmniUser = async (request) =>
+            var api = await serviceManager.GetKliveAPIService();
+
+            await api.CreateRoute("/omniscience/createOmniUser", async (request) =>
             {
                 try
                 {
                     var token = request.userParameters.Get("token");
                     var account = await discordInterface.CreateNewOmniDiscordUserLink(token);
-                    UpdateIndividualUserMessageDatabase(account);
+                    _ = Task.Run(() => UpdateAllMessagesForUser(account));
                     await request.ReturnResponse(JsonConvert.SerializeObject(account), "application/json");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            };
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/createOmniUser", createNewOmniUser, HttpMethod.Post, KMPermissions.Associate);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/omniscience/getanalytics", async (request) =>
+            }, HttpMethod.Post, KMPermissions.Associate);
+
+            await api.CreateRoute("/omniscience/getanalytics", async (request) =>
             {
                 try
                 {
@@ -116,165 +126,412 @@ namespace Omnipotent.Services.Omniscience
                     ServiceLogError(ex);
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/messages", async (request) =>
+            {
+                try
+                {
+                    var channelIdParam = request.userParameters.Get("channelId");
+                    var userIdParam = request.userParameters.Get("userId");
+                    var guildIdParam = request.userParameters.Get("guildId");
+                    var limitParam = request.userParameters.Get("limit");
+                    var offsetParam = request.userParameters.Get("offset");
+                    var dmOnlyParam = request.userParameters.Get("dmOnly");
+
+                    int limit = 100;
+                    int offset = 0;
+                    if (!string.IsNullOrEmpty(limitParam)) int.TryParse(limitParam, out limit);
+                    if (!string.IsNullOrEmpty(offsetParam)) int.TryParse(offsetParam, out offset);
+                    limit = Math.Clamp(limit, 1, 1000);
+
+                    IEnumerable<OmniDiscordMessage> query = AllCapturedMessages;
+                    if (!string.IsNullOrEmpty(channelIdParam) && long.TryParse(channelIdParam, out long channelId))
+                        query = query.Where(m => m.PostedInChannelID == channelId);
+                    if (!string.IsNullOrEmpty(userIdParam) && long.TryParse(userIdParam, out long userId))
+                        query = query.Where(m => m.AuthorID == userId);
+                    if (!string.IsNullOrEmpty(guildIdParam) && long.TryParse(guildIdParam, out long guildId))
+                        query = query.Where(m => m.GuildID == guildId);
+                    if (!string.IsNullOrEmpty(dmOnlyParam) && bool.TryParse(dmOnlyParam, out bool dmOnly))
+                        query = query.Where(m => m.IsInDM == dmOnly);
+
+                    var results = query.OrderByDescending(m => m.TimeStamp).Skip(offset).Take(limit).ToList();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(results), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/search", async (request) =>
+            {
+                try
+                {
+                    var queryParam = request.userParameters.Get("q");
+                    var limitParam = request.userParameters.Get("limit");
+                    int limit = 100;
+                    if (!string.IsNullOrEmpty(limitParam)) int.TryParse(limitParam, out limit);
+                    limit = Math.Clamp(limit, 1, 500);
+
+                    if (string.IsNullOrWhiteSpace(queryParam))
+                    {
+                        await request.ReturnResponse("Missing 'q' parameter.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var results = AllCapturedMessages
+                        .Where(m => !string.IsNullOrEmpty(m.MessageContent) && m.MessageContent.Contains(queryParam, StringComparison.OrdinalIgnoreCase))
+                        .OrderByDescending(m => m.TimeStamp)
+                        .Take(limit)
+                        .ToList();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(results), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/guilds", async (request) =>
+            {
+                try
+                {
+                    var guilds = await GetAllDownloadedGuilds();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(guilds), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/channels", async (request) =>
+            {
+                try
+                {
+                    var guildIdParam = request.userParameters.Get("guildId");
+                    if (string.IsNullOrEmpty(guildIdParam))
+                    {
+                        await request.ReturnResponse("Missing 'guildId' parameter.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (!LinkedUsers.Any())
+                    {
+                        await request.ReturnResponse("No linked users available.", code: HttpStatusCode.ServiceUnavailable);
+                        return;
+                    }
+                    var channels = await discordInterface.ChatInterface.GetAllGuildChannels(LinkedUsers.First(), guildIdParam);
+                    await request.ReturnResponse(JsonConvert.SerializeObject(channels), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/users", async (request) =>
+            {
+                try
+                {
+                    var users = await GetAllDownloadedKnownUsers();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(users), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/stats", async (request) =>
+            {
+                try
+                {
+                    var messages = AllCapturedMessages.ToList();
+                    var stats = new
+                    {
+                        TotalMessages = messages.Count,
+                        DMMessages = messages.Count(m => m.IsInDM),
+                        GuildMessages = messages.Count(m => !m.IsInDM),
+                        UniqueAuthors = messages.Select(m => m.AuthorID).Distinct().Count(),
+                        UniqueChannels = messages.Select(m => m.PostedInChannelID).Distinct().Count(),
+                        UniqueGuilds = messages.Where(m => m.GuildID.HasValue).Select(m => m.GuildID.Value).Distinct().Count(),
+                        TotalGuildsInDB = (await GetAllDownloadedGuilds()).Length,
+                        TotalKnownUsers = (await GetAllDownloadedKnownUsers()).Length,
+                        LinkedAccounts = LinkedUsers.Count,
+                        OldestMessage = messages.Any() ? messages.Min(m => m.TimeStamp) : (DateTime?)null,
+                        NewestMessage = messages.Any() ? messages.Max(m => m.TimeStamp) : (DateTime?)null,
+                        MessagesToday = messages.Count(m => m.TimeStamp.Date == DateTime.Today),
+                    };
+                    await request.ReturnResponse(JsonConvert.SerializeObject(stats), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await api.CreateRoute("/omniscience/linkedAccounts", async (request) =>
+            {
+                try
+                {
+                    var accounts = LinkedUsers.Select(u => new { u.UserID, u.Username, u.GlobalName }).ToList();
+                    await request.ReturnResponse(JsonConvert.SerializeObject(accounts), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Get, KMPermissions.Associate);
+
+            await api.CreateRoute("/omniscience/resync", async (request) =>
+            {
+                try
+                {
+                    _ = Task.Run(() => UpdateAllMessages());
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { status = "Resync started." }), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(ex);
+                }
+            }, HttpMethod.Post, KMPermissions.Associate);
         }
+
         private OmniDiscordUser SelectUser(string username)
         {
             return LinkedUsers.FirstOrDefault(k => k.Username == username);
         }
 
-        private async Task UpdateIndividualUserMessageDatabase(OmniDiscordUser item)
+        private bool IsMessageAlreadyCaptured(long messageID)
+        {
+            lock (_messageIdLock)
+            {
+                return CapturedMessageIDs.Contains(messageID);
+            }
+        }
+
+        private async Task UpdateAllMessages()
+        {
+            ServiceLog("Updating all messages (DMs + Guilds) for all linked users.");
+            foreach (var item in LinkedUsers)
+            {
+                await UpdateAllMessagesForUser(item);
+            }
+            ServiceLog($"Full message sync complete. Total messages in memory: {AllCapturedMessages.Count}");
+        }
+
+        private async Task UpdateAllMessagesForUser(OmniDiscordUser user)
+        {
+            await UpdateDMMessagesForUser(user);
+            await UpdateGuildMessagesForUser(user);
+        }
+
+        private async Task UpdateDMMessagesForUser(OmniDiscordUser item)
         {
             try
             {
-                if (!Directory.Exists(item.CreateDMDirectoryPathString()))
-                {
-                    Directory.CreateDirectory(item.CreateDMDirectoryPathString());
-                }
-                //Download all new messages from channels
-                ServiceLog($"Updating messages from discord account: {item.Username}");
-                //Scan all DM Channels
-                var allDMs = (await discordInterface.ChatInterface.GetAllDMChannels(item));
+                Directory.CreateDirectory(item.CreateDMDirectoryPathString());
+                ServiceLog($"Updating DM messages from discord account: {item.Username}");
+                var allDMs = await discordInterface.ChatInterface.GetAllDMChannels(item);
                 Stopwatch stopwatch = Stopwatch.StartNew();
                 int newMessagesCount = 0;
-                CancellationTokenSource token = new();
                 ParallelOptions parallelOptions = new()
                 {
                     MaxDegreeOfParallelism = 10
                 };
                 var result = Parallel.ForEachAsync(allDMs, parallelOptions, async (dmchannel, token) =>
                 {
-                    Stopwatch individualDMStopwatch = Stopwatch.StartNew();
                     int messagesCount = 0;
-                    ServiceLog($"Scanning DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
-                    var messageDivision = AllCapturedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
-                    //Recursively download backwards from the last message
-                    List<OmniDiscordMessage> oldmessages = new();
-                    List<OmniDiscordMessage> newMessages = new();
-
                     List<long> updatedUserIDs = new();
+                    var existingInChannel = AllCapturedMessages.Where(k => k.PostedInChannelID == dmchannel.ChannelID).OrderBy(k => k.TimeStamp);
 
-                    if (messageDivision.Any())
+                    List<OmniDiscordMessage> downloadedMessages = new();
+                    if (existingInChannel.Any())
                     {
-                        oldmessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, messageDivision.First().MessageID);
-                        newMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, messageDivision.Last().MessageID);
-                        //Save only messages that are not already saved
-                        var newMessagesFiltered = newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                        var oldMessagesFiltered = oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList();
-                        var saveDMProgress = await ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: 0%");
-                        foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
-                        {
-                            await SaveDiscordMessage(item, message);
-                            if (!updatedUserIDs.Contains(message.AuthorID))
-                            {
-                                await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                                updatedUserIDs.Add(message.AuthorID);
-                            }
-                            messagesCount++;
-                            float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                            ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
-                        }
-                        foreach (var message in oldmessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
-                        {
-                            if (!updatedUserIDs.Contains(message.AuthorID))
-                            {
-                                await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                                updatedUserIDs.Add(message.AuthorID);
-                            }
-                            await SaveDiscordMessage(item, message);
-                            await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                            messagesCount++;
-                            float percentage = (float)messagesCount / (newMessagesFiltered.Count + oldMessagesFiltered.Count);
-                            ServiceUpdateLoggedMessage(saveDMProgress, $"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} Progress: {percentage}%");
-                        }
+                        var oldMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID, existingInChannel.First().MessageID);
+                        var newMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(item, dmchannel.ChannelID, existingInChannel.Last().MessageID);
+                        downloadedMessages.AddRange(oldMessages);
+                        downloadedMessages.AddRange(newMessages);
                     }
                     else
                     {
-                        newMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID);
-                        //Save only messages that are not already saved
-                        //ServiceLog($"Saving DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
-                        foreach (var message in newMessages.Where(k => (!(messageDivision.Select(n => n.MessageID).Contains(k.MessageID)))).ToList())
+                        downloadedMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(item, dmchannel.ChannelID);
+                    }
+
+                    foreach (var message in downloadedMessages)
+                    {
+                        if (IsMessageAlreadyCaptured(message.MessageID)) continue;
+                        await SaveDiscordMessage(item, message);
+                        messagesCount++;
+                        if (!updatedUserIDs.Contains(message.AuthorID))
                         {
-                            await SaveDiscordMessage(item, message);
-                            messagesCount++;
-                            if (!updatedUserIDs.Contains(message.AuthorID))
+                            try
                             {
                                 await SaveKnownDiscordUser(await discordInterface.ChatInterface.GetUser(item, message.AuthorID));
-                                updatedUserIDs.Add(message.AuthorID);
                             }
+                            catch (Exception) { }
+                            updatedUserIDs.Add(message.AuthorID);
                         }
                     }
-                    newMessagesCount += messagesCount;
-                    individualDMStopwatch.Stop();
+
+                    Interlocked.Add(ref newMessagesCount, messagesCount);
                     if (messagesCount > 0)
                     {
-                        ServiceLog($"Downloaded {messagesCount} DMs from DM containing users: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))} in {individualDMStopwatch.Elapsed.TotalSeconds} seconds");
+                        ServiceLog($"Downloaded {messagesCount} new DMs from channel containing: {string.Join(", ", dmchannel.Recipients.Select(k => k.Username))}");
                     }
                 });
                 await result;
                 stopwatch.Stop();
-                ServiceLog($"Downloaded {newMessagesCount} new messages from discord user: {item.Username}, taking {stopwatch.Elapsed.TotalSeconds} seconds.");
+                ServiceLog($"DM sync for {item.Username}: {newMessagesCount} new messages in {stopwatch.Elapsed.TotalSeconds:F1}s.");
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex);
-                try
-                {
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Catastrophic error updating individual user messages in DiscordCrawl: " + ex.Message);
-                }
+                try { (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error updating DM messages in DiscordCrawl: " + ex.Message); }
                 catch (Exception) { }
             }
         }
-        public async Task UpdateDiscordMessageDatabase()
+
+        private async Task UpdateGuildMessagesForUser(OmniDiscordUser user)
         {
-            ServiceLog("Updating Discord Message Database.");
-            foreach (var item in LinkedUsers)
+            try
             {
-                await UpdateIndividualUserMessageDatabase(item);
+                Directory.CreateDirectory(user.CreateGuildMessagesDirectoryPathString());
+                var guilds = await discordInterface.ChatInterface.GetAllUserGuilds(user);
+                ServiceLog($"Updating guild messages for {user.Username} across {guilds.Length} guilds.");
+                Stopwatch totalStopwatch = Stopwatch.StartNew();
+                int totalNewMessages = 0;
+
+                foreach (var guild in guilds)
+                {
+                    await SaveDiscordGuild(guild);
+                    try
+                    {
+                        var channels = await discordInterface.ChatInterface.GetAllGuildChannels(user, guild.GuildID);
+                        var textChannels = channels.Where(c =>
+                            c.ChannelType == OmniChannelType.GuildText ||
+                            c.ChannelType == OmniChannelType.GuildAnnouncement ||
+                            c.ChannelType == OmniChannelType.GuildForum ||
+                            c.ChannelType == OmniChannelType.GuildMedia ||
+                            c.ChannelType == OmniChannelType.PublicThread ||
+                            c.ChannelType == OmniChannelType.PrivateThread ||
+                            c.ChannelType == OmniChannelType.AnnouncementThread
+                        ).ToList();
+
+                        int guildNewMessages = 0;
+                        ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = 5 };
+                        var result = Parallel.ForEachAsync(textChannels, parallelOptions, async (channel, token) =>
+                        {
+                            try
+                            {
+                                long guildIDLong = long.Parse(guild.GuildID);
+                                var existingInChannel = AllCapturedMessages
+                                    .Where(k => k.PostedInChannelID == channel.ChannelID)
+                                    .OrderBy(k => k.TimeStamp);
+
+                                List<OmniDiscordMessage> downloadedMessages = new();
+                                if (existingInChannel.Any())
+                                {
+                                    var olderMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(user, channel.ChannelID, existingInChannel.First().MessageID);
+                                    var newerMessages = await discordInterface.ChatInterface.GetALLMessagesAsyncAfter(user, channel.ChannelID, existingInChannel.Last().MessageID);
+                                    downloadedMessages.AddRange(olderMessages);
+                                    downloadedMessages.AddRange(newerMessages);
+                                }
+                                else
+                                {
+                                    downloadedMessages = await discordInterface.ChatInterface.GetALLMessagesAsync(user, channel.ChannelID);
+                                }
+
+                                int channelNewCount = 0;
+                                foreach (var message in downloadedMessages)
+                                {
+                                    if (IsMessageAlreadyCaptured(message.MessageID)) continue;
+                                    var msg = message;
+                                    msg.GuildID = guildIDLong;
+                                    msg.IsInDM = false;
+                                    await SaveDiscordMessage(user, msg);
+                                    channelNewCount++;
+                                }
+                                Interlocked.Add(ref guildNewMessages, channelNewCount);
+                                if (channelNewCount > 0)
+                                {
+                                    ServiceLog($"Downloaded {channelNewCount} messages from #{channel.ChannelName} in {guild.GuildName}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                ServiceLogError(ex, $"Error downloading messages from #{channel.ChannelName} in {guild.GuildName}");
+                            }
+                        });
+                        await result;
+                        Interlocked.Add(ref totalNewMessages, guildNewMessages);
+                        if (guildNewMessages > 0)
+                        {
+                            ServiceLog($"Guild '{guild.GuildName}': {guildNewMessages} new messages downloaded.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        ServiceLogError(ex, $"Error processing guild {guild.GuildName}");
+                    }
+                }
+                totalStopwatch.Stop();
+                ServiceLog($"Guild sync for {user.Username}: {totalNewMessages} new messages across {guilds.Length} guilds in {totalStopwatch.Elapsed.TotalSeconds:F1}s.");
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex);
+                try { (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error updating guild messages in DiscordCrawl: " + ex.Message); }
+                catch (Exception) { }
             }
         }
+
         private async Task LoadAllMessagesFromDisk(OmniDiscordUser[] users)
         {
             AllCapturedMessages = new();
+            CapturedMessageIDs = new();
             foreach (var user in users)
             {
-                var messages = await GetAllDownloadedMessages(user);
-                foreach (var item in messages)
+                var dmMessages = await LoadMessagesFromDirectory(user.CreateDMDirectoryPathString());
+                foreach (var item in dmMessages)
                 {
                     AllCapturedMessages.Add(item);
+                    lock (_messageIdLock) { CapturedMessageIDs.Add(item.MessageID); }
+                }
+                string guildDir = user.CreateGuildMessagesDirectoryPathString();
+                if (Directory.Exists(guildDir))
+                {
+                    var guildMessages = await LoadMessagesFromDirectory(guildDir);
+                    foreach (var item in guildMessages)
+                    {
+                        if (!CapturedMessageIDs.Contains(item.MessageID))
+                        {
+                            AllCapturedMessages.Add(item);
+                            lock (_messageIdLock) { CapturedMessageIDs.Add(item.MessageID); }
+                        }
+                    }
                 }
             }
         }
-        public async Task SaveDiscordMessage(OmniDiscordUser user, OmniDiscordMessage message)
+
+        private async Task<List<OmniDiscordMessage>> LoadMessagesFromDirectory(string directoryPath)
         {
-            string path = Path.Combine(user.CreateDMDirectoryPathString(), message.MessageID + ".omnimessage");
-            if (string.IsNullOrEmpty(message.MessageID.ToString()))
-            {
-                ServiceLogError($"Message from '{message.AuthorUsername}': Message ID is null, cannot save message.");
-                return;
-            }
-            if (!AllCapturedMessages.Select(k => k.MessageID).Contains(message.MessageID))
-            {
-                AllCapturedMessages.Add(message);
-                await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
-            }
-            else
-            {
-                return;
-            }
-        }
-        public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
-        {
-            Stopwatch debug = Stopwatch.StartNew();
             List<OmniDiscordMessage> messages = new();
-            var files = Directory.GetFiles(user.CreateDMDirectoryPathString()).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
-            var cancellationTokenSource = new CancellationTokenSource();
-            var prog = await ServiceLog($"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
-            var token = cancellationTokenSource.Token;
-            ParallelOptions parallelOptions = new()
+            if (!Directory.Exists(directoryPath))
             {
-                MaxDegreeOfParallelism = 50
-            };
-            //var result = Parallel.ForEachAsync(files, parallelOptions, async (file, token) =>
+                Directory.CreateDirectory(directoryPath);
+                return messages;
+            }
+            var files = Directory.GetFiles(directoryPath).Where(k => Path.GetExtension(k) == ".omnimessage").ToList();
+            var prog = await ServiceLog($"Loading messages from {directoryPath}: 0/{files.Count}");
             int errorCount = 0;
             foreach (var file in files)
             {
@@ -283,19 +540,50 @@ namespace Omnipotent.Services.Omniscience
                     messages.Add(JsonConvert.DeserializeObject<OmniDiscordMessage>(await GetDataHandler().ReadDataFromFile(file, true)));
                     if (messages.Count % 1000 == 0)
                     {
-                        ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files.");
+                        ServiceUpdateLoggedMessage(prog, $"Loading messages from {Path.GetFileName(directoryPath)}: {messages.Count}/{files.Count}");
                     }
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     errorCount++;
                 }
-            };
-            var token2 = new CancellationTokenSource();
-            //await result;
-            token2.Cancel();
-            await ServiceUpdateLoggedMessage(prog, $"Starting disk load of discord messages: {messages.Count} out of {files.Count} message files. {files.Count - messages.Count} files lost. {errorCount} messages lost due to errors.");
+            }
+            await ServiceUpdateLoggedMessage(prog, $"Loaded {messages.Count}/{files.Count} messages from {Path.GetFileName(directoryPath)}. {errorCount} errors.");
             return messages;
+        }
+
+        public async Task SaveDiscordMessage(OmniDiscordUser user, OmniDiscordMessage message)
+        {
+            if (message.MessageID == 0)
+            {
+                ServiceLogError($"Message from '{message.AuthorUsername}': Message ID is null/zero, cannot save message.");
+                return;
+            }
+
+            bool alreadyExists;
+            lock (_messageIdLock)
+            {
+                alreadyExists = !CapturedMessageIDs.Add(message.MessageID);
+            }
+            if (alreadyExists) return;
+
+            AllCapturedMessages.Add(message);
+
+            string directory = message.IsInDM ? user.CreateDMDirectoryPathString() : user.CreateGuildMessagesDirectoryPathString();
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, message.MessageID + ".omnimessage");
+            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(message));
+        }
+
+        public async Task<List<OmniDiscordMessage>> GetAllDownloadedMessages(OmniDiscordUser user)
+        {
+            var dmMessages = await LoadMessagesFromDirectory(user.CreateDMDirectoryPathString());
+            string guildDir = user.CreateGuildMessagesDirectoryPathString();
+            if (Directory.Exists(guildDir))
+            {
+                dmMessages.AddRange(await LoadMessagesFromDirectory(guildDir));
+            }
+            return dmMessages;
         }
 
         public async Task SaveDiscordGuild(OmniDiscordGuild guild)
