@@ -22,7 +22,7 @@ namespace Omnipotent.Services.OmniTube
             if (OmniPaths.CheckIfOnServer() == false)
             {
                 List<InstagramScrapeUtilities.InstagramReel> reels = new();
-                var memeScraper = (MemeScraper.MemeScraper)(await serviceManager.GetServiceByClassType<MemeScraper.MemeScraper>())[0];
+                var memeScraper = (MemeScraper.MemeScraper)(await GetServicesByType<MemeScraper.MemeScraper>())[0];
                 while (memeScraper.mediaManager == null)
                 {
                     await Task.Delay(100);

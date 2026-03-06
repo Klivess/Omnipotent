@@ -93,7 +93,7 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         {
                             message = await SendMessageToKlives(embed);
                         }
-                        var llmService = (await serviceManager.GetKliveLLMService());
+                        var llmService = (KliveLocalLLM.KliveLLM)(await GetServicesByType<KliveLocalLLM.KliveLLM>())[0];
                         if (llmService.IsServiceActive())
                         {
                             args.Message.RespondAsync(await llmService.QueryLLM(args.Message.Content));

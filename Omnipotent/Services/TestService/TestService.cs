@@ -21,7 +21,7 @@ namespace Omnipotent.Services.TestService
         {
             //ServiceCreateScheduledTask(DateTime.Now.AddSeconds(10), "Test TASK", "TestTopic", "TestReason", true, 1 + 4);
 
-            serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+            GetTimeManagerService().TaskDue += TimeManager_TaskDue;
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)

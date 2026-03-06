@@ -21,10 +21,8 @@ namespace Omnipotent.Services.KliveLink
 
         public async void CreateRoutes()
         {
-            var api = await _parent.serviceManager.GetKliveAPIService();
-
             // --- List all connected agents ---
-            await api.CreateRoute("/klivelink/agents", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agents", async (req) =>
             {
                 try
                 {
@@ -45,7 +43,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Get system info from an agent ---
-            await api.CreateRoute("/klivelink/agent/systeminfo", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/systeminfo", async (req) =>
             {
                 try
                 {
@@ -70,7 +68,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Run a process on an agent ---
-            await api.CreateRoute("/klivelink/agent/runprocess", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/runprocess", async (req) =>
             {
                 try
                 {
@@ -97,7 +95,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Run a terminal command on an agent ---
-            await api.CreateRoute("/klivelink/agent/terminal", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/terminal", async (req) =>
             {
                 try
                 {
@@ -124,7 +122,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- List processes on an agent ---
-            await api.CreateRoute("/klivelink/agent/processes", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/processes", async (req) =>
             {
                 try
                 {
@@ -149,7 +147,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Kill a process on an agent ---
-            await api.CreateRoute("/klivelink/agent/killprocess", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/killprocess", async (req) =>
             {
                 try
                 {
@@ -176,7 +174,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Start screen capture on an agent ---
-            await api.CreateRoute("/klivelink/agent/screencapture/start", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/screencapture/start", async (req) =>
             {
                 try
                 {
@@ -203,7 +201,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Stop screen capture on an agent ---
-            await api.CreateRoute("/klivelink/agent/screencapture/stop", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/screencapture/stop", async (req) =>
             {
                 try
                 {
@@ -228,7 +226,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- List directory on an agent ---
-            await api.CreateRoute("/klivelink/agent/listdir", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/listdir", async (req) =>
             {
                 try
                 {
@@ -255,7 +253,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Download a file from an agent ---
-            await api.CreateRoute("/klivelink/agent/downloadfile", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/downloadfile", async (req) =>
             {
                 try
                 {
@@ -282,7 +280,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Upload a file to an agent ---
-            await api.CreateRoute("/klivelink/agent/uploadfile", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/uploadfile", async (req) =>
             {
                 try
                 {
@@ -309,7 +307,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Get agent status ---
-            await api.CreateRoute("/klivelink/agent/status", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/status", async (req) =>
             {
                 try
                 {
@@ -334,7 +332,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // --- Disconnect an agent ---
-            await api.CreateRoute("/klivelink/agent/disconnect", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/disconnect", async (req) =>
             {
                 try
                 {
@@ -359,7 +357,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Self-destruct an agent (removes all traces from the client machine) ---
-            await api.CreateRoute("/klivelink/agent/selfdestruct", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/agent/selfdestruct", async (req) =>
             {
                 try
                 {
@@ -384,7 +382,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // --- Download the KliveLink agent executable ---
-            await api.CreateRoute("/klivelink/download", async (req) =>
+            await _parent.CreateAPIRoute("/klivelink/download", async (req) =>
             {
                 try
                 {
@@ -409,7 +407,7 @@ namespace Omnipotent.Services.KliveLink
             }, HttpMethod.Get, KMPermissions.Anybody);
 
             // --- WebSocket: live screen capture stream for frontend viewers ---
-            await api.CreateWebSocketRoute("/klivelink/agent/screencapture/stream", async (context, socket, queryParams, user) =>
+            await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivelink/agent/screencapture/stream", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, Omnipotent.Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
             {
                 string? agentId = queryParams.Get("agentId");
                 if (string.IsNullOrEmpty(agentId) || socket.State != WebSocketState.Open)
@@ -447,7 +445,7 @@ namespace Omnipotent.Services.KliveLink
                         catch { }
                     }
                 }
-            }, KMPermissions.Klives);
+            }), KMPermissions.Klives);
 
             _parent.ServiceLog("KliveLink routes created (all Klives-rank restricted).");
         }

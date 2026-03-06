@@ -470,8 +470,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         $"CSFloat Listing URL: {snipe.ListingURL}\n" +
                         $"Steam Listing URL: {correspondingListing.ListingURL}\n\n" +
                         $"Purchase Status: Purchasing...";
-                    var message = await (await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
-                        bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                    var message = (DiscordMessage)(await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
+                        bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL))));
 
                     bool itemPurchased = false;
                     //Purchase item

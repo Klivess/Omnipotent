@@ -18,10 +18,8 @@ namespace Omnipotent.Services.KliveCloud
 
         public async void CreateRoutes()
         {
-            var api = await parent.serviceManager.GetKliveAPIService();
-
             // List items at root or in a specific folder
-            await api.CreateRoute("/KliveCloud/ListItems", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/ListItems", async (req) =>
             {
                 try
                 {
@@ -59,7 +57,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Get full folder tree structure recursively
-            await api.CreateRoute("/KliveCloud/GetFolderTree", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/GetFolderTree", async (req) =>
             {
                 try
                 {
@@ -100,7 +98,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Get info about a specific item
-            await api.CreateRoute("/KliveCloud/GetItemInfo", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/GetItemInfo", async (req) =>
             {
                 try
                 {
@@ -126,7 +124,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Create a folder
-            await api.CreateRoute("/KliveCloud/CreateFolder", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/CreateFolder", async (req) =>
             {
                 try
                 {
@@ -163,7 +161,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // Upload a file (file bytes sent as request body)
-            await api.CreateRoute("/KliveCloud/UploadFile", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/UploadFile", async (req) =>
             {
                 try
                 {
@@ -209,7 +207,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // Download a file
-            await api.CreateRoute("/KliveCloud/DownloadFile", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/DownloadFile", async (req) =>
             {
                 try
                 {
@@ -249,7 +247,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Delete a file or folder
-            await api.CreateRoute("/KliveCloud/DeleteItem", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/DeleteItem", async (req) =>
             {
                 try
                 {
@@ -283,7 +281,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // Change permission level of a file or folder
-            await api.CreateRoute("/KliveCloud/ChangeItemPermission", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/ChangeItemPermission", async (req) =>
             {
                 try
                 {
@@ -322,7 +320,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // Get drive capacity info for the drive the application is running on
-            await api.CreateRoute("/KliveCloud/GetDriveInfo", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/GetDriveInfo", async (req) =>
             {
                 try
                 {
@@ -352,7 +350,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Get a preview/thumbnail image for an image or video file
-            await api.CreateRoute("/KliveCloud/GetPreview", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/GetPreview", async (req) =>
             {
                 try
                 {
@@ -400,7 +398,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Check if an item is previewable (image or video)
-            await api.CreateRoute("/KliveCloud/IsPreviewable", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/IsPreviewable", async (req) =>
             {
                 try
                 {
@@ -436,7 +434,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Create a share link for a file
-            await api.CreateRoute("/KliveCloud/CreateShareLink", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/CreateShareLink", async (req) =>
             {
                 try
                 {
@@ -491,7 +489,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // Delete a share link
-            await api.CreateRoute("/KliveCloud/DeleteShareLink", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/DeleteShareLink", async (req) =>
             {
                 try
                 {
@@ -519,7 +517,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // List all share links created by the current user (Admins and Klives see all)
-            await api.CreateRoute("/KliveCloud/ListShareLinks", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/ListShareLinks", async (req) =>
             {
                 try
                 {
@@ -543,7 +541,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Guest);
 
             // Download a file via share link (no authentication required)
-            await api.CreateRoute("/KliveCloud/DownloadShared", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/DownloadShared", async (req) =>
             {
                 try
                 {
@@ -593,7 +591,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Anybody);
 
             // Get file info via share link (no authentication required)
-            await api.CreateRoute("/KliveCloud/GetSharedItemInfo", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/GetSharedItemInfo", async (req) =>
             {
                 try
                 {
@@ -649,7 +647,7 @@ namespace Omnipotent.Services.KliveCloud
             }, HttpMethod.Get, KMPermissions.Anybody);
 
             // Stream a video file with HTTP Range support
-            await api.CreateRoute("/KliveCloud/StreamVideo", async (req) =>
+            await parent.CreateAPIRoute("/KliveCloud/StreamVideo", async (req) =>
             {
                 try
                 {

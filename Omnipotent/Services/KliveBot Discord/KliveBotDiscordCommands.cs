@@ -32,7 +32,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         public async Task UptimesAsync(InteractionContext ctx)
         {
             string uptimes = $"";
-            foreach (var item in parent.serviceManager.activeServices)
+            foreach (var item in parent.GetActiveServices())
             {
                 uptimes += $"Service - {item.GetName()}: {(item.IsServiceActive() ? item.GetServiceUptime().Humanize() : "Inactive")}\n";
             }
@@ -44,7 +44,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 string gadgets = "";
-                var kt = (KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0];
+                var kt = (KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0];
                 foreach (var item in kt.connectedGadgets)
                 {
                     gadgets += $"**Gadget: {item.name}**";
@@ -84,29 +84,29 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
-                if (((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName) != null)
+                if (((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName) != null)
                 {
-                    if (((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName).actions.Select(k => k.name).Contains(gadgetAction))
+                    if (((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName).actions.Select(k => k.name).Contains(gadgetAction))
                     {
-                        var gadget = ((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName);
+                        var gadget = ((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).GetKliveTechGadgetByName(gadgetName);
                         var action = gadget.actions.Where(k => k.name == gadgetAction).FirstOrDefault();
                         if (action != null)
                         {
                             if (action.parameters == KliveTechHub.KliveTechActions.ActionParameterType.String)
                             {
-                                await ((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, gadgetParameter);
+                                await ((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, gadgetParameter);
                             }
                             else if (action.parameters == KliveTechHub.KliveTechActions.ActionParameterType.Bool)
                             {
-                                await ((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, gadgetParameter);
+                                await ((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, gadgetParameter);
                             }
                             else if (action.parameters == KliveTechHub.KliveTechActions.ActionParameterType.Integer)
                             {
-                                await ((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, int.Parse(gadgetParameter).ToString());
+                                await ((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, int.Parse(gadgetParameter).ToString());
                             }
                             else if (action.parameters == KliveTechHub.KliveTechActions.ActionParameterType.None)
                             {
-                                await ((KliveTechHub.KliveTechHub)(await parent.serviceManager.GetServiceByClassType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, "");
+                                await ((KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0]).ExecuteActionByName(gadget, action.name, "");
                             }
                             else
                             {
@@ -182,10 +182,10 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("You do not have permission to use this command."));
                 return;
             }
-            if (parent.serviceManager.GetServiceByName(serviceName) != null)
+            if (parent.GetServiceByName(serviceName) != null)
             {
-                parent.serviceManager.GetServiceByName(serviceName).RestartService();
-                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent($"Restarted service {parent.serviceManager.GetServiceByName(serviceName).GetName()}"));
+                parent.GetServiceByName(serviceName).RestartService();
+                await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent($"Restarted service {parent.GetServiceByName(serviceName).GetName()}"));
             }
             else
             {
@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 try
                 {
-                    var copy = new List<OmniLogging.LoggedMessage>(parent.serviceManager.GetLogger().overallMessages.ToList());
+                    var copy = new List<OmniLogging.LoggedMessage>(parent.GetLoggerService().overallMessages.ToList());
                     string serial = JsonConvert.SerializeObject(copy, Formatting.Indented);
                     await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("Logs produced, sending to Klives."));
                     DiscordMessageBuilder dmb = new DiscordMessageBuilder();
@@ -224,7 +224,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                     await parent.GetDataHandler().GetDataHandler().WriteToFile(path, serial);
                     var str = File.OpenRead(path);
                     dmb.AddFile("logs.json", str);
-                    await (await parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(dmb);
+                    await parent.ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", dmb);
                     dmb.Clear();
                     await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("Logs sent to Klives."));
                     str.Close();
@@ -247,7 +247,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         public async Task ProduceAndDisplayLiquidityPlan(InteractionContext ctx)
         {
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
-            var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
+            var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
             var scanalytics = cs2Service.scanalytics;
 
             var liquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult(), cs2Service.steamBalance.Value.TotalBalanceInPounds);
@@ -327,7 +327,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             catch (Exception ex)
             {
                 await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("An error occurred producing the liquidity plan embed."));
-                (await parent.serviceManager.GetKliveBotDiscordService()).ServiceLogError(ex);
+                parent.ServiceLogError(ex);
             }
 
         }
@@ -339,7 +339,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             try
             {
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
-                var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.serviceManager.GetServiceByClassType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
+                var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
                 var scanalytics = cs2Service.scanalytics;
                 // Fix: Pass the required third argument (currentExpectedReturnCoefficientOfSteamToCSFloat)
                 double currentExpectedReturnCoefficient = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
@@ -388,7 +388,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             {
                 //Return apology message to 
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Kinda awkward but an error just occurred so I can't do this, sorry."));
-                (await parent.serviceManager.GetKliveBotDiscordService()).ServiceLogError(ex);
+                parent.ServiceLogError(ex);
             }
         }
     }

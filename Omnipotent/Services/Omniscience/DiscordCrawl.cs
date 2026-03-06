@@ -1,4 +1,4 @@
-﻿using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
@@ -58,7 +58,7 @@ namespace Omnipotent.Services.Omniscience
                 LinkedUsers.RemoveAll(k => brokenAccountNames.Contains(k.Username));
                 try
                 {
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
+                    await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"The following accounts have invalid tokens and will not be monitored for this session: {string.Join(", ", brokenAccountNames)}");
                 }
                 catch (Exception) { }
             }
@@ -95,9 +95,7 @@ namespace Omnipotent.Services.Omniscience
 
         private async Task CreateRoutes()
         {
-            var api = await serviceManager.GetKliveAPIService();
-
-            await api.CreateRoute("/omniscience/createOmniUser", async (request) =>
+            await CreateAPIRoute("/omniscience/createOmniUser", async (request) =>
             {
                 try
                 {
@@ -112,7 +110,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Post, KMPermissions.Associate);
 
-            await api.CreateRoute("/omniscience/getanalytics", async (request) =>
+            await CreateAPIRoute("/omniscience/getanalytics", async (request) =>
             {
                 try
                 {
@@ -127,7 +125,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/messages", async (request) =>
+            await CreateAPIRoute("/omniscience/messages", async (request) =>
             {
                 try
                 {
@@ -164,7 +162,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/search", async (request) =>
+            await CreateAPIRoute("/omniscience/search", async (request) =>
             {
                 try
                 {
@@ -194,7 +192,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/guilds", async (request) =>
+            await CreateAPIRoute("/omniscience/guilds", async (request) =>
             {
                 try
                 {
@@ -208,7 +206,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/channels", async (request) =>
+            await CreateAPIRoute("/omniscience/channels", async (request) =>
             {
                 try
                 {
@@ -233,7 +231,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/users", async (request) =>
+            await CreateAPIRoute("/omniscience/users", async (request) =>
             {
                 try
                 {
@@ -247,7 +245,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/stats", async (request) =>
+            await CreateAPIRoute("/omniscience/stats", async (request) =>
             {
                 try
                 {
@@ -276,7 +274,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await api.CreateRoute("/omniscience/linkedAccounts", async (request) =>
+            await CreateAPIRoute("/omniscience/linkedAccounts", async (request) =>
             {
                 try
                 {
@@ -290,7 +288,7 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Get, KMPermissions.Associate);
 
-            await api.CreateRoute("/omniscience/resync", async (request) =>
+            await CreateAPIRoute("/omniscience/resync", async (request) =>
             {
                 try
                 {
@@ -395,7 +393,7 @@ namespace Omnipotent.Services.Omniscience
             catch (Exception ex)
             {
                 ServiceLogError(ex);
-                try { (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error updating DM messages in DiscordCrawl: " + ex.Message); }
+                try { await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Error updating DM messages in DiscordCrawl: " + ex.Message); }
                 catch (Exception) { }
             }
         }
@@ -489,7 +487,7 @@ namespace Omnipotent.Services.Omniscience
             catch (Exception ex)
             {
                 ServiceLogError(ex);
-                try { (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error updating guild messages in DiscordCrawl: " + ex.Message); }
+                try { await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Error updating guild messages in DiscordCrawl: " + ex.Message); }
                 catch (Exception) { }
             }
         }

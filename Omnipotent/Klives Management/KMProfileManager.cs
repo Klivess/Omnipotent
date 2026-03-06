@@ -5,6 +5,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Klives_Management;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveBot_Discord;
 using System.Net;
 using System.Xml.Linq;
 using static System.Runtime.InteropServices.JavaScript.JSType;

@@ -34,7 +34,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             huggingFaceToken = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLMTokenText));
             if (string.IsNullOrEmpty(huggingFaceToken))
             {
-                string apparentToken = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("KliveLLM requires a hugging face token to function.", "Produce one and set it.", TimeSpan.FromDays(7), "Token", "right here please");
+                string apparentToken = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "KliveLLM requires a hugging face token to function.", "Produce one and set it.", TimeSpan.FromDays(7), "Token", "right here please");
                 huggingFaceToken = apparentToken.Trim();
             }
             client = new HttpClient();

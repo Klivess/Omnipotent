@@ -28,7 +28,7 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
             await Task.Delay(5000);
             try
             {
-                (await serviceManager.GetKliveBotDiscordService()).Client.MessageCreated += AutoGoat_MessageCreated;
+                ((KliveBotDiscord)(await GetServicesByType<KliveBotDiscord>())[0]).Client.MessageCreated += AutoGoat_MessageCreated;
                 ServiceLog(GetName() + " is now watching.");
             }
             catch (Exception e)

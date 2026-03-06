@@ -78,7 +78,7 @@ namespace Omnipotent.Services.OmniStartupManager
                 {
                     if (!OmniPaths.IsUserAdministrator())
                     {
-                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Omnipotent is not running as administrator. Please run as administrator!!!");
+                        await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Omnipotent is not running as administrator. Please run as administrator!!!");
                         ServiceLog("Omnipotent is not running as administrator. Please run as administrator!!!");
                     }
                 });

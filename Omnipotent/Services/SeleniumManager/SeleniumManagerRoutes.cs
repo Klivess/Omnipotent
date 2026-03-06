@@ -14,7 +14,7 @@ namespace Omnipotent.Services.SeleniumManager
 
         public async void CreateRoutes()
         {
-            await (await parent.serviceManager.GetKliveAPIService()).CreateRoute("seleniumManager/getAllSeleniumInstances", async (req) =>
+            await parent.CreateAPIRoute("seleniumManager/getAllSeleniumInstances", async (req) =>
             {
                 string json = JsonConvert.SerializeObject(parent.GetCurrentActiveSeleniumInstances());
 

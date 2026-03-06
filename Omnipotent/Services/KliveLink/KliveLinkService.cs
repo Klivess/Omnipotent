@@ -86,7 +86,7 @@ namespace Omnipotent.Services.KliveLink
             {
                 try
                 {
-                    var discordServices = await serviceManager.GetServiceByClassType<KliveBotDiscord>();
+                    var discordServices = await GetServicesByType<KliveBotDiscord>();
                     if (discordServices?.Length > 0)
                     {
                         var discord = (KliveBotDiscord)discordServices[0];
