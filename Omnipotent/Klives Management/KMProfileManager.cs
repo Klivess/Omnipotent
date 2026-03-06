@@ -33,7 +33,7 @@ namespace Omnipotent.Profiles
 
         public async Task RequestProfileFromKlives()
         {
-            var password = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.", TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
+            var password = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.", TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
             await CreateNewProfile("Klives", KMPermissions.Klives, password);
         }
 
@@ -143,7 +143,7 @@ namespace Omnipotent.Profiles
         private async void CreateRoutes()
         {
 
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/LoginStatus", async (req) =>
+            await CreateAPIRoute("/KMProfiles/LoginStatus", async (req) =>
             {
                 try
                 {
@@ -168,7 +168,7 @@ namespace Omnipotent.Profiles
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/CreateProfile", async (request) =>
+            await CreateAPIRoute("/KMProfiles/CreateProfile", async (request) =>
             {
                 try
                 {
@@ -183,14 +183,14 @@ namespace Omnipotent.Profiles
                     var profile = await CreateNewProfile(name, rank, password);
                     string serialized = JsonConvert.SerializeObject(profile);
                     await request.ReturnResponse(serialized, "application/json");
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"A new profile has been created with the name {name} and the rank {rank} by {request.user.Name}.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"A new profile has been created with the name {name} and the rank {rank} by {request.user.Name}.");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Associate);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/AttemptLogin", async (request) =>
+            await CreateAPIRoute("/KMProfiles/AttemptLogin", async (request) =>
             {
                 try
                 {
@@ -209,7 +209,7 @@ namespace Omnipotent.Profiles
                             {
                                 if (profile.KlivesManagementRank != KMPermissions.Klives)
                                 {
-                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{profile.Name} has logged into Klives Management.");
+                                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{profile.Name} has logged into Klives Management.");
                                 }
                             }
                             catch (Exception e) { }
@@ -227,7 +227,7 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Anybody);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetProfileByID", async (request) =>
+            await CreateAPIRoute("/KMProfiles/GetProfileByID", async (request) =>
             {
                 try
                 {
@@ -251,7 +251,7 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Associate);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/GetAllProfiles", async (request) =>
+            await CreateAPIRoute("/KMProfiles/GetAllProfiles", async (request) =>
             {
                 try
                 {
@@ -269,7 +269,7 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Associate);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeCanLogin", async (request) =>
+            await CreateAPIRoute("/KMProfiles/ChangeCanLogin", async (request) =>
             {
                 try
                 {
@@ -296,14 +296,14 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just disabled {profile.Name}'s KMProfile.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just disabled {profile.Name}'s KMProfile.");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileName", async (request) =>
+            await CreateAPIRoute("/KMProfiles/ChangeProfileName", async (request) =>
             {
                 try
                 {
@@ -331,14 +331,14 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {originalName}'s KMProfile username to {profile.Name}.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {originalName}'s KMProfile username to {profile.Name}.");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfilePassword", async (request) =>
+            await CreateAPIRoute("/KMProfiles/ChangeProfilePassword", async (request) =>
             {
                 try
                 {
@@ -365,14 +365,14 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile password.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile password.");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileRank", async (request) =>
+            await CreateAPIRoute("/KMProfiles/ChangeProfileRank", async (request) =>
             {
                 try
                 {
@@ -400,14 +400,14 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile rank from {originalRank.ToString()} to {rank.ToString()}. Ominous!!");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile rank from {originalRank.ToString()} to {rank.ToString()}. Ominous!!");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/DeleteProfile", async (request) =>
+            await CreateAPIRoute("/KMProfiles/DeleteProfile", async (request) =>
             {
                 try
                 {
@@ -428,14 +428,14 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just deleted {profile.Name}'s KMProfile.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just deleted {profile.Name}'s KMProfile.");
                 }
                 catch (Exception ex)
                 {
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/KMProfiles/ChangeProfileDiscordID", async (request) =>
+            await CreateAPIRoute("/KMProfiles/ChangeProfileDiscordID", async (request) =>
             {
                 try
                 {
@@ -462,7 +462,7 @@ namespace Omnipotent.Profiles
                     {
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
-                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} just changed {profile.Name}'s KMProfile discordID to {profile.DiscordID}.");
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile discordID to {profile.DiscordID}.");
                 }
                 catch (Exception ex)
                 {

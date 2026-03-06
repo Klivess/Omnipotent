@@ -65,21 +65,62 @@ namespace Omnipotent.Services.OmniTrader.Data
                 sinceUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - (candleCount * intervalSeconds);
             }
 
+            const int maxRetries = 10;
+            const int baseDelayMs = 1500;
+
             while (allCandles.Count < candleCount)
             {
                 string url = $"{krakenAPI}0/public/OHLC?pair={pair}&interval={(int)interval}&since={sinceUnix}";
-                var response = await httpClient.GetAsync(url);
 
-                if (!response.IsSuccessStatusCode)
-                    throw new Exception($"Failed to retrieve OHLC data: {response.StatusCode} Reason: {await response.Content.ReadAsStringAsync()}");
+                dynamic jsonResponse = null;
 
-                string responseContent = await response.Content.ReadAsStringAsync();
-                dynamic jsonResponse = JsonConvert.DeserializeObject(responseContent);
+                for (int attempt = 0; ; attempt++)
+                {
+                    var response = await httpClient.GetAsync(url);
 
-                // Check for API-level errors before accessing result
-                var errors = jsonResponse.error;
-                if (errors != null && errors.Count > 0)
-                    throw new Exception($"Kraken API error: {string.Join(", ", errors)}");
+                    // Handle HTTP-level rate limiting (429)
+                    if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                    {
+                        if (attempt >= maxRetries)
+                            throw new Exception($"Failed to retrieve OHLC data after {maxRetries + 1} attempts: rate limited by Kraken API.");
+                        await Task.Delay(baseDelayMs * (int)Math.Pow(2, attempt));
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                        throw new Exception($"Failed to retrieve OHLC data: {response.StatusCode} Reason: {await response.Content.ReadAsStringAsync()}");
+
+                    string responseContent = await response.Content.ReadAsStringAsync();
+                    jsonResponse = JsonConvert.DeserializeObject(responseContent);
+
+                    // Check for API-level errors before accessing result
+                    var errors = jsonResponse.error;
+                    if (errors != null && errors.Count > 0)
+                    {
+                        bool isRateLimited = false;
+                        foreach (var error in errors)
+                        {
+                            string msg = (string)error;
+                            if (msg.Contains("EAPI:Rate limit") || msg.Contains("EGeneral:Too many requests"))
+                            {
+                                isRateLimited = true;
+                                break;
+                            }
+                        }
+
+                        if (isRateLimited)
+                        {
+                            if (attempt >= maxRetries)
+                                throw new Exception($"Failed to retrieve OHLC data after {maxRetries + 1} attempts: rate limited by Kraken API.");
+                            await Task.Delay(baseDelayMs * (int)Math.Pow(2, attempt));
+                            continue;
+                        }
+
+                        throw new Exception($"Kraken API error: {string.Join(", ", errors)}");
+                    }
+
+                    break;
+                }
 
                 var result = jsonResponse.result;
                 var candles = result[pair];
@@ -111,8 +152,8 @@ namespace Omnipotent.Services.OmniTrader.Data
                 // Advance past the last candle we received for the next page
                 sinceUnix = lastTimestamp + 1;
 
-                // Rate-limit: wait before the next paginated request
-                await Task.Delay(1500);
+                // Rate-limit: respect 1 call/second cadence between paginated requests
+                await Task.Delay(baseDelayMs);
             }
 
             // Deduplicate by timestamp (in case of overlap between pages) and take the most recent candleCount

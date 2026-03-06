@@ -37,7 +37,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 await DownloadCS2ItemNameIDTable();
             }
             await LoadCS2ItemNameIDTable();
-            parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+            parent.GetTimeManagerService().TaskDue += TimeManager_TaskDue;
         }
         private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
         {

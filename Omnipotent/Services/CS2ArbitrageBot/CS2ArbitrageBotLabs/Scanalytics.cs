@@ -33,8 +33,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         private async void SetUpScanalytics()
         {
-            parent.serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
-            if ((await parent.serviceManager.timeManager.GetTask("RecordCSFloatAndSteamBalance")) == null)
+            parent.GetTimeManagerService().TaskDue += TimeManager_TaskDue;
+            if ((await parent.GetTimeManagerService().GetTask("RecordCSFloatAndSteamBalance")) == null)
             {
                 RecordAccountInfoAsync();
             }

@@ -14,10 +14,8 @@ namespace Omnipotent.Klives_Management.General_Analytics
 
         public async void CreateRoutes()
         {
-            var api = await g.serviceManager.GetKliveAPIService();
-
             // Full statistics snapshot (all data in one call – ideal for the 5-second dashboard refresh)
-            api.CreateRoute("/GeneralBotStatistics/GetFrontpageStats", async (req) =>
+            await g.CreateAPIRoute("/GeneralBotStatistics/GetFrontpageStats", async (req) =>
             {
                 try
                 {
@@ -30,7 +28,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
 
             // Lightweight hardware-only summary (CPU, RAM, disks, network)
-            api.CreateRoute("/GeneralBotStatistics/GetHardwareStats", async (req) =>
+            await g.CreateAPIRoute("/GeneralBotStatistics/GetHardwareStats", async (req) =>
             {
                 try
                 {
@@ -57,7 +55,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
 
             // Services overview
-            api.CreateRoute("/GeneralBotStatistics/GetServicesStats", async (req) =>
+            await g.CreateAPIRoute("/GeneralBotStatistics/GetServicesStats", async (req) =>
             {
                 try
                 {
@@ -77,7 +75,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
 
             // Process / GC diagnostics
-            api.CreateRoute("/GeneralBotStatistics/GetProcessStats", async (req) =>
+            await g.CreateAPIRoute("/GeneralBotStatistics/GetProcessStats", async (req) =>
             {
                 try
                 {
@@ -100,7 +98,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
 
             // Trigger bot update – launches SyncAndStartOmnipotent.bat which kills the process, pulls, rebuilds and restarts
-            api.CreateRoute("/GeneralBotStatistics/UpdateBot", async (req) =>
+            await g.CreateAPIRoute("/GeneralBotStatistics/UpdateBot", async (req) =>
             {
                 try
                 {

@@ -20,6 +20,10 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private decimal _positionEntryFee;
         private DateTime _positionEntryTime;
 
+        // Pending stop-loss / take-profit levels (null = not set)
+        private decimal? _stopLossPrice;
+        private decimal? _takeProfitPrice;
+
         private readonly List<TradeRecord> _trades = [];
         private readonly List<decimal> _equityCurve = [];
 
@@ -36,6 +40,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _baseBalance = _settings.InitialBaseBalance;
             _totalFees = 0;
             _inPosition = false;
+            _stopLossPrice = null;
+            _takeProfitPrice = null;
             _trades.Clear();
             _equityCurve.Clear();
 
@@ -44,12 +50,18 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             // Wire up strategy signals
             _strategy.OnBuy += HandleBuy;
             _strategy.OnSell += HandleSell;
+            _strategy.OnStopLossUpdated += HandleStopLossUpdated;
+            _strategy.OnTakeProfitUpdated += HandleTakeProfitUpdated;
 
             try
             {
                 for (int i = 0; i < _candles.Count; i++)
                 {
                     var currentCandle = _candles[i];
+
+                    // Enforce pending SL/TP orders before the strategy sees this candle
+                    if (_inPosition)
+                        CheckStopLossTakeProfit(currentCandle);
 
                     // Record equity at this candle's close
                     decimal equity = _quoteBalance + _baseBalance * currentCandle.Close;
@@ -67,6 +79,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             {
                 _strategy.OnBuy -= HandleBuy;
                 _strategy.OnSell -= HandleSell;
+                _strategy.OnStopLossUpdated -= HandleStopLossUpdated;
+                _strategy.OnTakeProfitUpdated -= HandleTakeProfitUpdated;
             }
 
             // If still in a position at the end, force-close at last close
@@ -78,6 +92,69 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             decimal finalEquity = _quoteBalance + _baseBalance * (_candles.Count > 0 ? _candles[^1].Close : 0);
 
             return BuildResult(initialEquity, finalEquity);
+        }
+
+        private void HandleStopLossUpdated(decimal price)
+        {
+            _stopLossPrice = price > 0 ? price : null;
+        }
+
+        private void HandleTakeProfitUpdated(decimal price)
+        {
+            _takeProfitPrice = price > 0 ? price : null;
+        }
+
+        private void CheckStopLossTakeProfit(RequestKlineData.OHLCCandle candle)
+        {
+            bool slHit = _stopLossPrice.HasValue && candle.Low <= _stopLossPrice.Value;
+            bool tpHit = _takeProfitPrice.HasValue && candle.High >= _takeProfitPrice.Value;
+
+            if (!slHit && !tpHit)
+                return;
+
+            // If both could trigger on the same bar, stop-loss takes priority (capital protection)
+            if (slHit)
+            {
+                // Gap-through: if the candle opens below SL, fill at the (worse) open price
+                decimal fillPrice = Math.Min(_stopLossPrice!.Value, candle.Open);
+                ExecuteSLTPExit(candle, fillPrice);
+                _strategy.NotifyStopLossTriggered(fillPrice);
+            }
+            else
+            {
+                // Gap-through: if the candle opens above TP, fill at the (better) open price
+                decimal fillPrice = Math.Max(_takeProfitPrice!.Value, candle.Open);
+                ExecuteSLTPExit(candle, fillPrice);
+                _strategy.NotifyTakeProfitTriggered(fillPrice);
+            }
+        }
+
+        private void ExecuteSLTPExit(RequestKlineData.OHLCCandle candle, decimal fillPrice)
+        {
+            decimal executionPrice = fillPrice * (1 - _settings.SlippageFraction);
+            decimal grossProceeds = _baseBalance * executionPrice;
+            decimal fee = grossProceeds * _settings.FeeFraction;
+            decimal netProceeds = grossProceeds - fee;
+
+            _trades.Add(new TradeRecord
+            {
+                EntryTime = _positionEntryTime,
+                EntryPrice = _positionEntryPrice,
+                EntryQuantity = _positionQuantity,
+                EntryCost = _positionCost,
+                EntryFee = _positionEntryFee,
+                ExitTime = candle.Timestamp,
+                ExitPrice = executionPrice,
+                ExitProceeds = netProceeds,
+                ExitFee = fee
+            });
+
+            _quoteBalance += netProceeds;
+            _totalFees += fee;
+            _baseBalance = 0;
+            _inPosition = false;
+            _stopLossPrice = null;
+            _takeProfitPrice = null;
         }
 
         private void HandleBuy(object? sender, TradeSignalEventArgs args)
@@ -107,6 +184,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _positionCost = quoteToSpend;
             _positionEntryFee = fee;
             _positionEntryTime = candle.Timestamp;
+            _stopLossPrice = args.StopLossPrice;
+            _takeProfitPrice = args.TakeProfitPrice;
         }
 
         private void HandleSell(object? sender, TradeSignalEventArgs args)
@@ -144,6 +223,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             });
 
             _inPosition = false;
+            _stopLossPrice = null;
+            _takeProfitPrice = null;
         }
 
         private void ForceClosePosition(RequestKlineData.OHLCCandle candle)
@@ -170,6 +251,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _totalFees += fee;
             _baseBalance = 0;
             _inPosition = false;
+            _stopLossPrice = null;
+            _takeProfitPrice = null;
         }
 
         private OmniBacktestResult BuildResult(decimal initialEquity, decimal finalEquity)

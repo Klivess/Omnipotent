@@ -61,11 +61,11 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     // --- Bot / Application ---
                     stats.lastOmnipotentUpdate = File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe"));
                     stats.lastOmnipotentUpdateHumanized = stats.lastOmnipotentUpdate.Humanize();
-                    stats.BotUptime = serviceManager.GetOverallUptime();
+                    stats.BotUptime = GetManagerUptime();
                     stats.BotUptimeHumanized = stats.BotUptime.Humanize();
 
                     // --- Logging ---
-                    var logger = serviceManager.GetLogger();
+                    var logger = GetLoggerService();
                     var messages = logger.overallMessages;
                     stats.TotalLogs = messages.Count;
                     int statusCount = 0, errorCount = 0;
@@ -81,7 +81,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     // --- System Hardware (from OmniServiceMonitor) ---
                     try
                     {
-                        var monitor = serviceManager.GetMonitor();
+                        var monitor = GetServiceMonitor();
                         double totalBytes = monitor.TotalSystemRAM.Bytes;
                         stats.RamTotalGB = monitor.TotalSystemRAM.GigaBytes;
                         stats.RamUsedGB = monitor.MemoryUsage.GigaBytes;
@@ -157,7 +157,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     // --- Active services ---
                     try
                     {
-                        var services = serviceManager.activeServices;
+                        var services = GetActiveServices();
                         stats.TotalServicesRegistered = services.Count;
                         int active = 0;
                         var summaries = new List<ServiceSummary>(services.Count);
@@ -183,7 +183,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     // --- Scheduled tasks ---
                     try
                     {
-                        var tasks = serviceManager.GetTimeManager().tasks;
+                        var tasks = GetTimeManagerService().tasks;
                         stats.TotalScheduledTasks = tasks.Count;
                         var nextTask = tasks.Where(t => !t.HasTaskTimePassed()).OrderBy(t => t.dateTimeDue).FirstOrDefault();
                         if (nextTask != null)

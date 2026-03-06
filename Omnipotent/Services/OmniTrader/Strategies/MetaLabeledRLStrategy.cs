@@ -209,7 +209,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             _trailingStopPrice = close - _stopDistance;
             _takeProfitPrice = close + atr * action.TakeProfitAtrMultiplier;
 
-            RaiseBuy(Backtesting.AmountType.Percentage, action.SizePercent);
+            RaiseBuy(Backtesting.AmountType.Percentage, action.SizePercent, _trailingStopPrice, _takeProfitPrice);
             _inPosition = true;
 
             StrategyLog(
@@ -229,43 +229,50 @@ namespace Omnipotent.Services.OmniTrader.Strategies
                 _highestSinceEntry = current.High;
                 decimal newStop = _highestSinceEntry - _stopDistance;
                 if (newStop > _trailingStopPrice)
+                {
                     _trailingStopPrice = newStop;
+                    UpdateStopLoss(_trailingStopPrice);
+                }
             }
 
-            // Determine exit condition and the actual fill price for each case
-            decimal exitPrice;
-            string exitReason;
+            // IBS exit: close > previous bar's high (signal-based, not a pending order)
+            if (idx >= 1 && current.Close > _history[idx - 1].High)
+            {
+                decimal exitPrice = current.Close;
+                string exitReason = $"IBS EXIT | Close {current.Close:F2} > Prev High {_history[idx - 1].High:F2}";
 
-            if (current.Low <= _trailingStopPrice)
-            {
-                exitPrice = _trailingStopPrice;
-                exitReason = $"TRAILING STOP | Low {current.Low:F2} <= Stop {_trailingStopPrice:F2}";
-            }
-            else if (current.High >= _takeProfitPrice)
-            {
-                exitPrice = _takeProfitPrice;
-                exitReason = $"TAKE PROFIT | High {current.High:F2} >= TP {_takeProfitPrice:F2}";
-            }
-            else if (idx >= 1 && current.Close > _history[idx - 1].High)
-            {
-                exitPrice = current.Close;
-                exitReason = $"IBS EXIT | Close {current.Close:F2} > Prev High {_history[idx - 1].High:F2}";
-            }
-            else
-            {
-                return; // Still holding
-            }
+                RaiseSell(Backtesting.AmountType.Percentage, 100);
+                _inPosition = false;
 
-            // Close position
-            RaiseSell(Backtesting.AmountType.Percentage, 100);
+                decimal returnPct = _entryPrice == 0 ? 0 : (exitPrice - _entryPrice) / _entryPrice * 100;
+                int nextState = ComputeRLState(_history, idx);
+                _rl.OnPositionClosed(returnPct, nextState);
+
+                StrategyLog($"{exitReason} | Return {returnPct:F2}%");
+            }
+        }
+
+        // ── Backtester SL/TP notification callbacks ───────────────────────
+        protected override void OnStopLossHit(decimal fillPrice)
+        {
             _inPosition = false;
 
-            // Use the actual fill price so the RL agent receives an accurate reward signal
-            decimal returnPct = _entryPrice == 0 ? 0 : (exitPrice - _entryPrice) / _entryPrice * 100;
-            int nextState = ComputeRLState(_history, idx);
+            decimal returnPct = _entryPrice == 0 ? 0 : (fillPrice - _entryPrice) / _entryPrice * 100;
+            int nextState = _history.Count > 0 ? ComputeRLState(_history, _history.Count - 1) : 0;
             _rl.OnPositionClosed(returnPct, nextState);
 
-            StrategyLog($"{exitReason} | Return {returnPct:F2}%");
+            StrategyLog($"TRAILING STOP | Fill {fillPrice:F2} | Return {returnPct:F2}%");
+        }
+
+        protected override void OnTakeProfitHit(decimal fillPrice)
+        {
+            _inPosition = false;
+
+            decimal returnPct = _entryPrice == 0 ? 0 : (fillPrice - _entryPrice) / _entryPrice * 100;
+            int nextState = _history.Count > 0 ? ComputeRLState(_history, _history.Count - 1) : 0;
+            _rl.OnPositionClosed(returnPct, nextState);
+
+            StrategyLog($"TAKE PROFIT | Fill {fillPrice:F2} | Return {returnPct:F2}%");
         }
 
         // ── IBS entry signal check ────────────────────────────────────────

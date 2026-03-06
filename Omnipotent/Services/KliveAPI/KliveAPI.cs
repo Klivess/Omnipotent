@@ -218,18 +218,18 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServerListenLoop();
                 //Create profile manager
-                serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
-                profileManager = (KMProfileManager)(await serviceManager.GetServiceByClassType<KMProfileManager>())[0];
+                CreateAndStartService(new KMProfileManager());
+                profileManager = (KMProfileManager)(await GetServicesByType<KMProfileManager>())[0];
 
                 //Create KliveLink remote administration service
-                serviceManager.CreateAndStartNewMonitoredOmniService(new KliveLink.KliveLinkService());
+                CreateAndStartService(new KliveLink.KliveLinkService());
 
                 CreateMetaKLIVEAPIRoutes();
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "KliveAPI Failed!");
-                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
             }
         }
 

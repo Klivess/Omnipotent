@@ -78,7 +78,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     catch (Exception ex)
                     {
                         parent.parent.ServiceLogError($"Failed to parse Steam balance: {ex.Message}");
-                        (await parent.parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Failed to parse Steam balance HTML. Parser could have finally broken?");
+                        await parent.parent.ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Failed to parse Steam balance HTML. Parser could have finally broken?");
                         return null;
                     }
                 }
@@ -113,7 +113,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             string loginUrl = "https://steamcommunity.com/login/home/";
 
 
-            string canStartLogin = await (await parent.parent.serviceManager.GetNotificationsService()).SendButtonsPromptToKlivesDiscord(
+            string canStartLogin = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord",
         "CS2 Arbitrage Bot",
         $"The bot requires you to accept a steam mobile login confirmation, Are you ready to receive it?.",
         new Dictionary<string, DSharpPlus.ButtonStyle>
@@ -171,8 +171,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     bool confirmed = false;
                     try
                     {
-                        string response = await (await parent.parent.serviceManager.GetNotificationsService())
-                            .SendButtonsPromptToKlivesDiscord(
+                        string response = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
+                            "SendButtonsPromptToKlivesDiscord",
                                 "CS2 Arbitrage Bot",
                                 $"The bot requires you to accept a steam mobile login confirmation, which was sent to you at {DateTime.Now.ToString()}.",
                                 new Dictionary<string, DSharpPlus.ButtonStyle>
@@ -232,12 +232,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             if (string.IsNullOrEmpty(password))
             {
                 //Ask klives for a password using the Notification system
-                string result = await (await parent.parent.serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("CS2 Arbitrage Bot Steam Login Password",
+                string result = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "CS2 Arbitrage Bot Steam Login Password",
                     "Please enter your Steam login password for the CS2 Arbitrage Bot.", TimeSpan.FromDays(3), "Steam", "password");
                 if (string.IsNullOrEmpty(result))
                 {
                     //If the user did not enter a password, we will try to load it again
-                    await (await parent.parent.serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Steam login password for the CS2 Arbitrage Bot was null or empty, try again.");
+                    await parent.parent.ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Steam login password for the CS2 Arbitrage Bot was null or empty, try again.");
                     await LoadSteamPassword();
                 }
                 else
