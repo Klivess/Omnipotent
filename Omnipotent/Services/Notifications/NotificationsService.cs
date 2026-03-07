@@ -107,7 +107,7 @@ namespace Omnipotent.Services.Notifications
                 {
                     DiscordInteractionResponseBuilder modal = new DiscordInteractionResponseBuilder();
                     modal.CustomId = modalID;
-                    modal.AddComponents(new TextInputComponent("", modalID, modalPlaceholder));
+                    modal.AddComponents(new TextInputComponent("Your input", modalID, modalPlaceholder));
                     modal.Title = modalTitle;
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.Modal, modal);
                 }
