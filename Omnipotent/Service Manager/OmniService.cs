@@ -78,7 +78,17 @@ namespace Omnipotent.Service_Manager
             {
                 throw new InvalidOperationException($"Service of type {typeof(T).Name} not found.");
             }
-            var method = service[0].GetType().GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var bindingFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            System.Reflection.MethodInfo? method;
+            try
+            {
+                method = service[0].GetType().GetMethod(methodName, bindingFlags);
+            }
+            catch (System.Reflection.AmbiguousMatchException)
+            {
+                var argTypes = args.Select(a => a.GetType()).ToArray();
+                method = service[0].GetType().GetMethod(methodName, bindingFlags, null, argTypes, null);
+            }
             if (method == null)
             {
                 throw new Exception($"Method {methodName} not found in service of type {typeof(T).Name}.");
