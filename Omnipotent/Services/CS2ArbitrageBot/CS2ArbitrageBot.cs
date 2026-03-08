@@ -77,30 +77,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
 
-            // --- TEST: Sell Glock-18 | Clear Polymer (Field-Tested) from inventory ---
-            try
-            {
-                string testItemName = "SSG 08 | Blue Spruce (Field-Tested)";
-                var steamListing = await steamAPIWrapper.GetItemOnMarket(testItemName);
-                int salePriceInPence = steamListing.HighestBuyOrderPriceInPence;
-                await ServiceLog($"[TEST] Selling {testItemName} at highest buy order: £{salePriceInPence / 100.0:F2}");
-
-                var testListing = new Scanalytics.PurchasedListing
-                {
-                    ItemMarketHashName = testItemName,
-                    ActualSalePriceOnSteam = salePriceInPence / 100f,
-                    CurrentStrategicStage = StrategicStages.JustRetrieved,
-                };
-
-                bool success = await steamAPIWrapper.profileWrapper.SellItem(testListing, 6);
-                await ServiceLog($"[TEST] Sell result for {testItemName}: {(success ? "SUCCESS" : "FAILED")}");
-            }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "[TEST] Error selling SSG 08 | Blue Spruce (Field-Tested)");
-            }
-            // --- END TEST ---
-
             if (OmniPaths.CheckIfOnServer() == false)
             {
                 //await steamAPIWrapper.profileWrapper.LoginToSteam();
