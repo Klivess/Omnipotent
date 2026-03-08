@@ -55,6 +55,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<Folder Include="Diagrams\" />
 		<Folder Include="Services\KlivePuppet\" />
 	</ItemGroup>
 

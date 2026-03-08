@@ -669,9 +669,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory, await scanalytics.ExpectedSteamToCSFloatConversionPercentage());
+                    if (cachedAnalytics == null || lastAnalyticsUpdate == null || DateTime.Now - lastAnalyticsUpdate > analyticsCacheDuration)
+                    {
+                        cachedAnalytics = new ScannedComparisonAnalytics(
+                            scanalytics.AllScannedComparisonsInHistory,
+                            scanalytics.AllPurchasedListingsInHistory,
+                            await scanalytics.ExpectedSteamToCSFloatConversionPercentage()
+                        );
+                        lastAnalyticsUpdate = DateTime.Now;
+                    }
 
-                    await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
+                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedAnalytics), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -679,6 +687,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/getscanalytics route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+
             await CreateAPIRoute("/cs2arbitragebot/scanresults", async (request) =>
             {
                 try
@@ -691,12 +700,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/scanresults route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+
             await CreateAPIRoute("/cs2arbitragebot/latestliquidityplan", async (request) =>
             {
                 try
                 {
-                    var plan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
-                    await request.ReturnResponse(JsonConvert.SerializeObject(plan), code: HttpStatusCode.OK);
+                    if (cachedLiquidityPlan == null || lastLiquidityPlanUpdate == null || DateTime.Now - lastLiquidityPlanUpdate > liquidityPlanCacheDuration)
+                    {
+                        cachedLiquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
+                        lastLiquidityPlanUpdate = DateTime.Now;
+                    }
+
+                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedLiquidityPlan), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -704,6 +719,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/latestliquidityplan route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+
             await CreateAPIRoute("/cs2arbitragebot/balanceHistory", async (request) =>
             {
                 try
@@ -718,5 +734,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
         }
+
+        private ScannedComparisonAnalytics cachedAnalytics;
+        private DateTime? lastAnalyticsUpdate;
+        private readonly TimeSpan analyticsCacheDuration = TimeSpan.FromMinutes(5);
+
+        private object cachedLiquidityPlan;
+        private DateTime? lastLiquidityPlanUpdate;
+        private readonly TimeSpan liquidityPlanCacheDuration = TimeSpan.FromMinutes(5);
     }
 }
