@@ -190,6 +190,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             name = "KliveAPI";
             threadAnteriority = ThreadAnteriority.Critical;
+            ControllerLookup = new ConcurrentDictionary<string, RouteInfo>();
         }
         protected override async void ServiceMain()
         {
