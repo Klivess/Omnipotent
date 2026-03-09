@@ -24,10 +24,12 @@ namespace Omnipotent.Services.OmniTrader
         internal event Action<decimal>? OnStopLossUpdated;
         internal event Action<decimal>? OnTakeProfitUpdated;
 
+        public List<RequestKlineData.OHLCCandle> candleHistory;
+
         public async Task Initialise(OmniTrader parent)
         {
             this.parent = parent;
-
+            candleHistory = new();
             if (IsLoaded)
                 return;
 
@@ -36,15 +38,19 @@ namespace Omnipotent.Services.OmniTrader
         }
         protected virtual async Task OnLoad() { }
 
-        public async Task Tick(RequestKlineData.OHLCCandlesData candlesData)
+        public async Task Tick(RequestKlineData.OHLCCandle candleData)
         {
             if (!IsLoaded)
                 throw new InvalidOperationException($"Strategy '{Name}' was not initialised. Call Initialise() before Tick().");
 
-            await OnTick(candlesData);
+            if (candleHistory.Count > 0 && candleData.Timestamp == candleHistory[^1].Timestamp)
+                return;
+
+            candleHistory.Add(candleData);
+            await OnTick(candleData);
         }
 
-        protected virtual Task OnTick(RequestKlineData.OHLCCandlesData candlesData) => Task.CompletedTask;
+        protected virtual Task OnTick(RequestKlineData.OHLCCandle candleData) => Task.CompletedTask;
 
         protected void RaiseBuy(AmountType amountType, decimal inputAmount, decimal? stopLossPrice = null, decimal? takeProfitPrice = null)
         {
@@ -88,8 +94,27 @@ namespace Omnipotent.Services.OmniTrader
 
         public async Task<OmniBacktestResult> BacktestStrategy(RequestKlineData.OHLCCandlesData testSet, BacktestSettings? settings = null)
         {
-            var backtester = new OmniBacktester(this, testSet.candles, settings);
+            var backtester = new OmniBacktester(this, testSet, settings);
             return await backtester.RunAsync();
+        }
+
+        public async Task<OmniBacktestResult> FindBestTimeframeForStrategy(string coin, string currency, int amountOfCandles = 500, BacktestSettings? settings = null)
+        {
+            OmniBacktestResult bestResult = new();
+            foreach(var frame in Enum.GetValues(typeof(RequestKlineData.TimeInterval)))
+            {
+                RequestKlineData.TimeInterval interval = (RequestKlineData.TimeInterval)frame;
+                if (interval >= RequestKlineData.TimeInterval.OneWeek)
+                    break;
+                var testSet = await parent.requestKlineData.GetCryptoCandlesDataAsync(coin, currency, interval, amountOfCandles);
+                var backtester = new OmniBacktester(this, testSet, settings);
+                var result = await backtester.RunAsync();
+                if (result.FinalEquity > bestResult.FinalEquity)
+                {
+                    bestResult = result;
+                }
+            }
+            return bestResult;
         }
     }
 }

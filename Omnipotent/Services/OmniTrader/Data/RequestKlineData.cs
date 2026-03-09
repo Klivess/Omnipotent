@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Service_Manager;
+using ScottPlot.TickGenerators;
 using SteamKit2.GC.Deadlock.Internal;
 using SteamKit2.Internal;
 
@@ -30,7 +31,18 @@ namespace Omnipotent.Services.OmniTrader.Data
 
         public class OHLCCandlesData
         {
+            public RequestKlineData.TimeInterval timeInterval;
+            public DateTime startDate;
+            public DateTime endDate;
             public List<OHLCCandle> candles;
+
+            public OHLCCandlesData(List<OHLCCandle> candles, RequestKlineData.TimeInterval interval)
+            {
+                this.candles = candles;
+                timeInterval= interval;
+                startDate= candles.Select(k=>k.Timestamp).OrderBy(k=>k.Ticks).ToList()[0];
+                endDate= candles.Select(k => k.Timestamp).OrderByDescending(k => k.Ticks).ToList()[0];
+            }
         }
 
         public struct OHLCCandle
@@ -83,7 +95,8 @@ namespace Omnipotent.Services.OmniTrader.Data
                     {
                         if (attempt >= maxRetries)
                             throw new Exception($"Failed to retrieve OHLC data after {maxRetries + 1} attempts: rate limited by Kraken API.");
-                        await Task.Delay(baseDelayMs * (int)Math.Pow(2, attempt));
+                        int delay = baseDelayMs * (int)Math.Pow(2, attempt);
+                        await Task.Delay(delay);
                         continue;
                     }
 
@@ -112,7 +125,8 @@ namespace Omnipotent.Services.OmniTrader.Data
                         {
                             if (attempt >= maxRetries)
                                 throw new Exception($"Failed to retrieve OHLC data after {maxRetries + 1} attempts: rate limited by Kraken API.");
-                            await Task.Delay(baseDelayMs * (int)Math.Pow(2, attempt));
+                            int delay = baseDelayMs * (int)Math.Pow(2, attempt);
+                            await Task.Delay(delay);
                             continue;
                         }
 
@@ -164,7 +178,7 @@ namespace Omnipotent.Services.OmniTrader.Data
                 .TakeLast(candleCount)
                 .ToList();
 
-            return new OHLCCandlesData { candles = allCandles };
+            return new OHLCCandlesData(allCandles, interval);
         }
     }
 }

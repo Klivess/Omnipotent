@@ -25,7 +25,6 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         private readonly RLPositionManager _rl;
 
         // ── Internal state ────────────────────────────────────────────────
-        private readonly List<RequestKlineData.OHLCCandle> _history = [];
         private bool _inPosition;
         private decimal _entryPrice;
         private decimal _stopDistance;      // ATR × multiplier, fixed at entry
@@ -49,7 +48,6 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         // ── Lifecycle ─────────────────────────────────────────────────────
         protected override async Task OnLoad()
         {
-            _history.Clear();
             _inPosition = false;
 
             // Fetch training data (separate pair/interval to avoid look-ahead bias)
@@ -152,20 +150,12 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         }
 
         // ── Tick handler ──────────────────────────────────────────────────
-        protected override Task OnTick(RequestKlineData.OHLCCandlesData candlesData)
+        protected override Task OnTick(RequestKlineData.OHLCCandle candlesData)
         {
-            var current = candlesData.candles.Last();
-
-            // Guard against duplicate ticks (e.g. live feed reconnects)
-            if (_history.Count > 0 && current.Timestamp == _history[^1].Timestamp)
+            if (candleHistory.Count < MinBars)
                 return Task.CompletedTask;
 
-            _history.Add(current);
-
-            if (_history.Count < MinBars)
-                return Task.CompletedTask;
-
-            int idx = _history.Count - 1;
+            int idx = candleHistory.Count - 1;
 
             if (_inPosition)
             {
@@ -183,26 +173,26 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         private void HandleNoPosition(int idx)
         {
             // 1. Check IBS entry signal
-            if (!IsIBSEntrySignal(_history, idx))
+            if (!IsIBSEntrySignal(candleHistory, idx))
                 return;
 
             // 2. Meta-label gate: should we take this trade?
             if (_gate.IsTrained)
             {
-                var features = MetaLabelGate.ExtractFeatures(_history, idx);
+                var features = MetaLabelGate.ExtractFeatures(candleHistory, idx);
                 if (!_gate.ShouldTakeTrade(features))
                 {
-                    StrategyLog($"GATE BLOCKED signal at {_history[idx].Close:F2}");
+                    StrategyLog($"GATE BLOCKED signal at {candleHistory[idx].Close:F2}");
                     return;
                 }
             }
 
             // 3. RL agent decides sizing and stop/TP levels
-            int state = ComputeRLState(_history, idx);
+            int state = ComputeRLState(candleHistory, idx);
             var action = _rl.SelectAction(state);
 
-            decimal atr = TechnicalIndicators.ATR(_history, 14, idx);
-            decimal close = _history[idx].Close;
+            decimal atr = TechnicalIndicators.ATR(candleHistory, 14, idx);
+            decimal close = candleHistory[idx].Close;
             _entryPrice = close;
             _highestSinceEntry = close;
             _stopDistance = atr * action.StopAtrMultiplier;
@@ -221,7 +211,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         // ── Position management logic ─────────────────────────────────────
         private void HandleOpenPosition(int idx)
         {
-            var current = _history[idx];
+            var current = candleHistory[idx];
 
             // Ratchet trailing stop up as price rises; distance stays fixed at _stopDistance
             if (current.High > _highestSinceEntry)
@@ -236,16 +226,16 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             }
 
             // IBS exit: close > previous bar's high (signal-based, not a pending order)
-            if (idx >= 1 && current.Close > _history[idx - 1].High)
+            if (idx >= 1 && current.Close > candleHistory[idx - 1].High)
             {
                 decimal exitPrice = current.Close;
-                string exitReason = $"IBS EXIT | Close {current.Close:F2} > Prev High {_history[idx - 1].High:F2}";
+                string exitReason = $"IBS EXIT | Close {current.Close:F2} > Prev High {candleHistory[idx - 1].High:F2}";
 
                 RaiseSell(Backtesting.AmountType.Percentage, 100);
                 _inPosition = false;
 
                 decimal returnPct = _entryPrice == 0 ? 0 : (exitPrice - _entryPrice) / _entryPrice * 100;
-                int nextState = ComputeRLState(_history, idx);
+                int nextState = ComputeRLState(candleHistory, idx);
                 _rl.OnPositionClosed(returnPct, nextState);
 
                 StrategyLog($"{exitReason} | Return {returnPct:F2}%");
@@ -258,7 +248,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             _inPosition = false;
 
             decimal returnPct = _entryPrice == 0 ? 0 : (fillPrice - _entryPrice) / _entryPrice * 100;
-            int nextState = _history.Count > 0 ? ComputeRLState(_history, _history.Count - 1) : 0;
+            int nextState = candleHistory.Count > 0 ? ComputeRLState(candleHistory, candleHistory.Count - 1) : 0;
             _rl.OnPositionClosed(returnPct, nextState);
 
             StrategyLog($"TRAILING STOP | Fill {fillPrice:F2} | Return {returnPct:F2}%");
@@ -269,7 +259,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             _inPosition = false;
 
             decimal returnPct = _entryPrice == 0 ? 0 : (fillPrice - _entryPrice) / _entryPrice * 100;
-            int nextState = _history.Count > 0 ? ComputeRLState(_history, _history.Count - 1) : 0;
+            int nextState = candleHistory.Count > 0 ? ComputeRLState(candleHistory, candleHistory.Count - 1) : 0;
             _rl.OnPositionClosed(returnPct, nextState);
 
             StrategyLog($"TAKE PROFIT | Fill {fillPrice:F2} | Return {returnPct:F2}%");

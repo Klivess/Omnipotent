@@ -15,7 +15,6 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         private const decimal RangeMultiplier = 2.5m;
         private const decimal IBSThreshold = 0.3m;
 
-        private readonly List<RequestKlineData.OHLCCandle> _history = [];
         private bool _inPosition;
 
         public IBSMeanReversionStrategy()
@@ -26,29 +25,25 @@ namespace Omnipotent.Services.OmniTrader.Strategies
 
         protected override Task OnLoad()
         {
-            _history.Clear();
             _inPosition = false;
             return Task.CompletedTask;
         }
 
-        protected override Task OnTick(RequestKlineData.OHLCCandlesData candlesData)
+        protected override Task OnTick(RequestKlineData.OHLCCandle current)
         {
-            var current = candlesData.candles.Last();
-            _history.Add(current);
 
             // Need at least AvgRangeLookback bars of history to evaluate signals
-            if (_history.Count < AvgRangeLookback)
+            if (candleHistory.Count < AvgRangeLookback)
                 return Task.CompletedTask;
 
             if (_inPosition)
             {
                 // Exit: close > yesterday's high
-                var previousBar = _history[^2];
+                var previousBar = candleHistory[^2];
                 if (current.Close > previousBar.High)
                 {
                     RaiseSell(AmountType.Percentage, 100);
                     _inPosition = false;
-                    StrategyLog($"EXIT  | Close {current.Close:F2} > Prev High {previousBar.High:F2}");
                 }
             }
             else
@@ -65,7 +60,6 @@ namespace Omnipotent.Services.OmniTrader.Strategies
                 {
                     RaiseBuy(AmountType.Percentage, 100);
                     _inPosition = true;
-                    StrategyLog($"ENTRY | Close {current.Close:F2} < Threshold {entryThreshold:F2} | IBS {ibs:F4}");
                 }
             }
 
@@ -83,11 +77,11 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         private decimal GetHighestHigh(int lookback)
         {
             decimal highest = decimal.MinValue;
-            int start = _history.Count - lookback;
-            for (int i = start; i < _history.Count; i++)
+            int start = candleHistory.Count - lookback;
+            for (int i = start; i < candleHistory.Count; i++)
             {
-                if (_history[i].High > highest)
-                    highest = _history[i].High;
+                if (candleHistory[i].High > highest)
+                    highest = candleHistory[i].High;
             }
             return highest;
         }
@@ -95,19 +89,21 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         private decimal GetAverageHigh(int lookback)
         {
             decimal sum = 0;
-            int start = _history.Count - lookback;
-            for (int i = start; i < _history.Count; i++)
-                sum += _history[i].High;
+            int start = candleHistory.Count - lookback;
+            for (int i = start; i < candleHistory.Count; i++)
+                sum += candleHistory[i].High;
             return sum / lookback;
         }
 
         private decimal GetAverageLow(int lookback)
         {
             decimal sum = 0;
-            int start = _history.Count - lookback;
-            for (int i = start; i < _history.Count; i++)
-                sum += _history[i].Low;
+            int start = candleHistory.Count - lookback;
+            for (int i = start; i < candleHistory.Count; i++)
+                sum += candleHistory[i].Low;
             return sum / lookback;
         }
+
+
     }
 }

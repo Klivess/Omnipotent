@@ -56,6 +56,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         // Durations
         public int TotalCandles { get; set; }
         public TimeSpan BacktestDuration { get; set; }
+        public DateTime StartTime { get; set; }
+        public DateTime EndTime { get; set; }
 
         // Individual trades
         public List<TradeRecord> Trades { get; set; } = [];
@@ -83,6 +85,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 ---
                 Buy & Hold P&L:     {BuyAndHoldPnLPercent:F2}%
                 Beats Buy & Hold:   {BeatsBuyAndHold}
+                Start Date:         {StartTime:yyyy-MM-dd-HH:mm:ss}
+                End Date:            {EndTime:yyyy-MM-dd-HH:mm:ss}
                 """;
         }
     }

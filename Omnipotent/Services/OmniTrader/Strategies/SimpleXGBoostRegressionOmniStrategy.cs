@@ -66,13 +66,10 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             StrategyLog("Model trained. Test MAE: {mae:F2} USD over {predictions.Length} samples.");
         }
 
-        protected override async Task OnTick(RequestKlineData.OHLCCandlesData candlesData)
+        protected override async Task OnTick(RequestKlineData.OHLCCandle latest)
         {
             if (regressor == null)
                 return;
-
-            // Fetch the most recent candles (need at least 1 to predict the next close)
-            var latest = candlesData.candles.Last();
 
             float[] features =
             [
@@ -92,9 +89,9 @@ namespace Omnipotent.Services.OmniTrader.Strategies
 
             string reason = $"Predicted: {predictedClose:F2} | Current: {currentClose:F2} | Delta: {delta:F2}";
 
-            if (delta > 0)
+            if (delta > predictedClose*1.02)
                 RaiseBuy(AmountType.Percentage, 5);
-            else
+            else if(delta < predictedClose*0.98)
                 RaiseSell(AmountType.Percentage, 5);
         }
     }

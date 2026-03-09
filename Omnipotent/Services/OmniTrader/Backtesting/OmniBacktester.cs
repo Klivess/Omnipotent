@@ -1,4 +1,5 @@
 using Omnipotent.Services.OmniTrader.Data;
+using System.Reactive;
 
 namespace Omnipotent.Services.OmniTrader.Backtesting
 {
@@ -6,7 +7,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
     {
         private readonly BacktestSettings _settings;
         private readonly OmniTraderStrategy _strategy;
-        private readonly List<RequestKlineData.OHLCCandle> _candles;
+        private readonly RequestKlineData.OHLCCandlesData _candles;
 
         private decimal _quoteBalance;
         private decimal _baseBalance;
@@ -27,10 +28,17 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private readonly List<TradeRecord> _trades = [];
         private readonly List<decimal> _equityCurve = [];
 
-        public OmniBacktester(OmniTraderStrategy strategy, List<RequestKlineData.OHLCCandle> candles, BacktestSettings? settings = null)
+        public OmniBacktester(OmniTraderStrategy strategy, RequestKlineData.OHLCCandlesData candles, BacktestSettings? settings = null)
         {
             _strategy = strategy;
             _candles = candles;
+            _settings = settings ?? new BacktestSettings();
+        }
+        public OmniBacktester(OmniTraderStrategy strategy, List<RequestKlineData.OHLCCandle> candles, RequestKlineData.TimeInterval interval, BacktestSettings? settings = null)
+        {
+            _strategy = strategy;
+            RequestKlineData.OHLCCandlesData candlesData = new(candles, interval);
+            _candles = candlesData;
             _settings = settings ?? new BacktestSettings();
         }
 
@@ -45,7 +53,9 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _trades.Clear();
             _equityCurve.Clear();
 
-            decimal initialEquity = _quoteBalance + _baseBalance * (_candles.Count > 0 ? _candles[0].Close : 0);
+
+
+            decimal initialEquity = _quoteBalance + _baseBalance * (_candles.candles.Count > 0 ? _candles.candles[0].Close : 0);
 
             // Wire up strategy signals
             _strategy.OnBuy += HandleBuy;
@@ -55,9 +65,9 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
 
             try
             {
-                for (int i = 0; i < _candles.Count; i++)
+                for (int i = 0; i < _candles.candles.Count; i++)
                 {
-                    var currentCandle = _candles[i];
+                    var currentCandle = _candles.candles[i];
 
                     // Enforce pending SL/TP orders before the strategy sees this candle
                     if (_inPosition)
@@ -67,12 +77,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                     decimal equity = _quoteBalance + _baseBalance * currentCandle.Close;
                     _equityCurve.Add(equity);
 
-                    // Feed the strategy a single-candle tick
-                    var tickData = new RequestKlineData.OHLCCandlesData
-                    {
-                        candles = [currentCandle]
-                    };
-                    await _strategy.Tick(tickData);
+                    await _strategy.Tick(currentCandle);
                 }
             }
             finally
@@ -84,14 +89,17 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             }
 
             // If still in a position at the end, force-close at last close
-            if (_inPosition && _candles.Count > 0)
+            if (_inPosition && _candles.candles.Count > 0)
             {
-                ForceClosePosition(_candles[^1]);
+                ForceClosePosition(_candles.candles[^1]);
             }
 
-            decimal finalEquity = _quoteBalance + _baseBalance * (_candles.Count > 0 ? _candles[^1].Close : 0);
+            decimal finalEquity = _quoteBalance + _baseBalance * (_candles.candles.Count > 0 ? _candles.candles[^1].Close : 0);
 
-            return BuildResult(initialEquity, finalEquity);
+            var result = BuildResult(initialEquity, finalEquity);
+            result.StartTime = _candles.startDate;
+            result.EndTime = _candles.endDate;
+            return result;
         }
 
         private void HandleStopLossUpdated(decimal price)
@@ -161,7 +169,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         {
             if (_inPosition) return; // Already in a position
 
-            var candle = _candles[_equityCurve.Count - 1]; // Current candle being processed
+            var candle = _candles.candles[_equityCurve.Count - 1]; // Current candle being processed
             decimal executionPrice = candle.Close * (1 + _settings.SlippageFraction); // Slippage: buy higher
 
             decimal quoteToSpend = args.amountType == AmountType.Percentage
@@ -192,7 +200,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         {
             if (!_inPosition) return; // Nothing to sell
 
-            var candle = _candles[_equityCurve.Count - 1];
+            var candle = _candles.candles[_equityCurve.Count - 1];
             decimal executionPrice = candle.Close * (1 - _settings.SlippageFraction); // Slippage: sell lower
 
             decimal quantityToSell = args.amountType == AmountType.Percentage
@@ -302,13 +310,13 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
 
             // Buy & hold: what if all initial equity bought at first close and sold at last close
             decimal buyAndHoldPnLPercent = 0;
-            if (_candles.Count >= 2 && _candles[0].Close != 0)
+            if (_candles.candles.Count >= 2 && _candles.candles[0].Close != 0)
             {
-                buyAndHoldPnLPercent = (_candles[^1].Close - _candles[0].Close) / _candles[0].Close * 100;
+                buyAndHoldPnLPercent = (_candles.candles[^1].Close - _candles.candles[0].Close) / _candles.candles[0].Close * 100;
             }
 
-            TimeSpan duration = _candles.Count >= 2
-                ? _candles[^1].Timestamp - _candles[0].Timestamp
+            TimeSpan duration = _candles.candles.Count >= 2
+                ? _candles.candles[^1].Timestamp - _candles.candles[0].Timestamp
                 : TimeSpan.Zero;
 
             return new OmniBacktestResult
@@ -330,7 +338,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 MaxDrawdownPercent = maxDrawdownPercent,
                 SharpeRatio = sharpe,
                 BuyAndHoldPnLPercent = buyAndHoldPnLPercent,
-                TotalCandles = _candles.Count,
+                TotalCandles = _candles.candles.Count,
                 BacktestDuration = duration,
                 Trades = _trades
             };
