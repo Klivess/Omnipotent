@@ -29,7 +29,7 @@ namespace Omnipotent.Services.Notifications
         protected override async void ServiceMain()
         {
             //Acquire KliveBot Discord Service
-            var search = ((await serviceManager.GetServiceByClassType<KliveBotDiscord>()));
+            var search = ((await GetServicesByType<KliveBotDiscord>()));
             if (search == null)
             {
                 await Task.Delay(2000);
@@ -107,7 +107,7 @@ namespace Omnipotent.Services.Notifications
                 {
                     DiscordInteractionResponseBuilder modal = new DiscordInteractionResponseBuilder();
                     modal.CustomId = modalID;
-                    modal.AddComponents(new TextInputComponent("", modalID, modalPlaceholder));
+                    modal.AddComponents(new TextInputComponent("Your input", modalID, modalPlaceholder));
                     modal.Title = modalTitle;
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.Modal, modal);
                 }

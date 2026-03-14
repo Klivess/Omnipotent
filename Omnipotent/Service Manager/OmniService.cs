@@ -9,8 +9,10 @@ using System.Threading.Tasks;
 using System.Web.Razor.Tokenizer.Symbols;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
+using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.SeleniumManager;
 using Org.BouncyCastle.Asn1.X509.Qualified;
 using static Omnipotent.Threading.WindowsInvokes;
@@ -24,7 +26,7 @@ namespace Omnipotent.Service_Manager
         protected string name;
         public string serviceID;
         private Thread serviceThread;
-        public OmniServiceManager serviceManager;
+        private OmniServiceManager serviceManager;
         protected Stopwatch serviceUptime;
 
         protected event Action ServiceQuitRequest;
@@ -69,10 +71,82 @@ namespace Omnipotent.Service_Manager
             return ref serviceManager.fileHandlerService;
         }
 
+        public async Task<object?> ExecuteServiceMethod<T>(string methodName, params object[] args)
+        {
+            var service = await serviceManager.GetServiceByClassType<T>();
+            if (service == null || service.Count() == 0)
+            {
+                throw new InvalidOperationException($"Service of type {typeof(T).Name} not found.");
+            }
+            var bindingFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            System.Reflection.MethodInfo? method;
+            try
+            {
+                method = service[0].GetType().GetMethod(methodName, bindingFlags);
+            }
+            catch (System.Reflection.AmbiguousMatchException)
+            {
+                var argTypes = args.Select(a => a.GetType()).ToArray();
+                method = service[0].GetType().GetMethod(methodName, bindingFlags, null, argTypes, null);
+            }
+            if (method == null)
+            {
+                throw new Exception($"Method {methodName} not found in service of type {typeof(T).Name}.");
+            }
+            var result = method.Invoke(service[0], args.Length > 0 ? args : null);
+            if (result is Task task)
+            {
+                await task;
+                var taskType = task.GetType();
+                if (taskType.IsGenericType)
+                {
+                    return taskType.GetProperty("Result")?.GetValue(task);
+                }
+                return null;
+            }
+            return result;
+        }
+
+        public async Task<object?> GetServiceObject<T>(string objectName)
+        {
+            var service = await serviceManager.GetServiceByClassType<T>();
+            if (service == null || service.Count() == 0)
+            {
+                throw new InvalidOperationException($"Service of type {typeof(T).Name} not found.");
+            }
+            var field = service[0].GetType().GetField(objectName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (field != null)
+            {
+                return field.GetValue(service[0]);
+            }
+            var property = service[0].GetType().GetProperty(objectName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (property != null)
+            {
+                return property.GetValue(service[0]);
+            }
+            throw new MissingMemberException($"Field or property '{objectName}' not found in service of type {typeof(T).Name}.");
+        }
+
         public async Task<SeleniumManager> GetSeleniumManager()
         {
             while ((await serviceManager.GetServiceByClassType<SeleniumManager>()) == null) { Task.Delay(100); }
             return (SeleniumManager)(await serviceManager.GetServiceByClassType<SeleniumManager>())[0];
+        }
+
+        // Service manager internal access helpers
+        public TimeSpan GetManagerUptime() => serviceManager.GetOverallUptime();
+        public ref OmniLogging GetLoggerService() => ref serviceManager.GetLogger();
+        public ref OmniServiceMonitor GetServiceMonitor() => ref serviceManager.GetMonitor();
+        public List<OmniService> GetActiveServices() => serviceManager.activeServices;
+        public ref TimeManager GetTimeManagerService() => ref serviceManager.GetTimeManager();
+        public OmniService GetServiceByName(string serviceName) => serviceManager.GetServiceByName(serviceName);
+        public bool CreateAndStartService(OmniService service, bool overrideDuplicate = false) => serviceManager.CreateAndStartNewMonitoredOmniService(service, overrideDuplicate);
+        public async Task<OmniService[]> GetServicesByType<T>() => await serviceManager.GetServiceByClassType<T>();
+
+        // Common cross-service helper for API route creation (wraps ExecuteServiceMethod)
+        public async Task CreateAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission)
+        {
+            await ExecuteServiceMethod<KliveAPI>("CreateRoute", path, handler, method, permission);
         }
 
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.

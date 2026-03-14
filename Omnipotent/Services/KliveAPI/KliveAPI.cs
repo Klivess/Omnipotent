@@ -20,6 +20,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Management.Automation;
 using System.Diagnostics;
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
 using Microsoft.VisualBasic.FileIO;
 using DSharpPlus.Entities;
 using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
@@ -58,6 +59,12 @@ namespace Omnipotent.Services.KliveAPI
                 TimeTakenToProcess.Add(stopwatch.Elapsed);
             }
         }
+        public struct WebSocketRouteInfo
+        {
+            public Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler;
+            public KMProfileManager.KMPermissions authenticationLevelRequired;
+        }
+
         public struct UserRequest
         {
             public string route;
@@ -174,6 +181,7 @@ namespace Omnipotent.Services.KliveAPI
         //Key: Route (example: /omniscience/getmessagecount)
         //Value: EventHandler<route, routeInfo>
         public ConcurrentDictionary<string, RouteInfo> ControllerLookup;
+        public ConcurrentDictionary<string, WebSocketRouteInfo> WebSocketRouteLookup;
 
         private KMProfileManager profileManager;
 
@@ -182,6 +190,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             name = "KliveAPI";
             threadAnteriority = ThreadAnteriority.Critical;
+            ControllerLookup = new ConcurrentDictionary<string, RouteInfo>();
         }
         protected override async void ServiceMain()
         {
@@ -191,6 +200,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 //Create API listener
                 ControllerLookup = new();
+                WebSocketRouteLookup = new();
 
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
@@ -209,15 +219,18 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServerListenLoop();
                 //Create profile manager
-                serviceManager.CreateAndStartNewMonitoredOmniService(new KMProfileManager());
-                profileManager = (KMProfileManager)(await serviceManager.GetServiceByClassType<KMProfileManager>())[0];
+                CreateAndStartService(new KMProfileManager());
+                profileManager = (KMProfileManager)(await GetServicesByType<KMProfileManager>())[0];
+
+                //Create KliveLink remote administration service
+                CreateAndStartService(new KliveLink.KliveLinkService());
 
                 CreateMetaKLIVEAPIRoutes();
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "KliveAPI Failed!");
-                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
             }
         }
 
@@ -328,6 +341,23 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, KMProfileManager.KMPermissions authenticationLevelRequired)
+        {
+            if (!route.StartsWith('/'))
+            {
+                route = "/" + route;
+            }
+            var info = new WebSocketRouteInfo
+            {
+                handler = handler,
+                authenticationLevelRequired = authenticationLevelRequired
+            };
+            if (WebSocketRouteLookup.TryAdd(route, info))
+            {
+                ServiceLog($"New WebSocket route created: {route}");
+            }
+        }
+
         private async void ServerListenLoop()
         {
             while (ContinueListenLoop)
@@ -404,6 +434,25 @@ namespace Omnipotent.Services.KliveAPI
                         request.user = null;
                     }
                 }
+
+                // --- WebSocket upgrade handling ---
+                if (req.IsWebSocketRequest && WebSocketRouteLookup.TryGetValue(route, out WebSocketRouteInfo wsRouteData))
+                {
+                    if (wsRouteData.authenticationLevelRequired == KMPermissions.Anybody
+                        || (request.user != null && request.user.KlivesManagementRank >= wsRouteData.authenticationLevelRequired))
+                    {
+                        var wsContext = await context.AcceptWebSocketAsync(subProtocol: null);
+                        ServiceLog($"WebSocket accepted for route {route}");
+                        await wsRouteData.handler(context, wsContext.WebSocket, nameValueCollection, request.user);
+                    }
+                    else
+                    {
+                        context.Response.StatusCode = 401;
+                        context.Response.Close();
+                    }
+                    return;
+                }
+
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
                     bool isUserNull = request.user == null;

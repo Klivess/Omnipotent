@@ -92,7 +92,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             try
             {
-                string twofa = await (await parent.serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("Require 2fa to login to OmniDiscordUser!",
+                string twofa = (string)await parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "Require 2fa to login to OmniDiscordUser!",
     $"Trying to login to\n\nEmail: {user.Email}\nPassword: Length {user.Password.Length}\n\nBut I require a 2fa code. Please provide the code, or reject this request.",
     TimeSpan.FromDays(3), $"Enter 2FA here for {user.GlobalName}!", "2FA here.");
                 return twofa;
@@ -359,7 +359,7 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
         {
             OmniDiscordUser user = new();
 
-            var klivebotDiscord = ((KliveBotDiscord)(await parent.serviceManager.GetServiceByClassType<KliveBotDiscord>())[0]);
+            var klivebotDiscord = ((KliveBotDiscord)(await parent.GetServicesByType<KliveBotDiscord>())[0]);
             var accounts = await GetAllLinkedOmniDiscordUsersFromDisk();
             if (accounts.Any())
             {
@@ -504,6 +504,11 @@ namespace Omnipotent.Services.Omniscience.DiscordInterface
             {
                 string DMDirectoryPath = Path.Combine(CreateDMDirectoryPathString(), $"{UserID}messages.omnimessages");
                 return DMDirectoryPath;
+            }
+            public string CreateGuildMessagesDirectoryPathString()
+            {
+                string guildMsgDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDiscordServerMessagesDirectory), $"user{UserID}");
+                return guildMsgDir;
             }
 
             public string FormatFileName()

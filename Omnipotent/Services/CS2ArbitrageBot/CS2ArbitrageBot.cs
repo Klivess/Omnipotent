@@ -44,20 +44,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             catch (Exception e)
             {
                 ServiceLogError(e, "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
-                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
                 ExchangeRate = null;
             }
             string csfloatAPIKey = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatAPIKey));
             if (string.IsNullOrEmpty(csfloatAPIKey))
             {
                 await ServiceLogError("CSFloat API Key is not set. Contacting Klives");
-                string response = await (await serviceManager.GetNotificationsService()).SendTextPromptToKlivesDiscord("CSFloat API Key is not set for CS2ArbitrageBot. Set it."
+                string response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "CSFloat API Key is not set for CS2ArbitrageBot. Set it."
                     , "Get the CSFloat API key by going to CSFloat Profile Developer tab", TimeSpan.FromDays(7), "Enter your API key", "API key");
                 csfloatAPIKey = response;
                 if (string.IsNullOrEmpty(csfloatAPIKey))
                 {
                     await ServiceLogError("CSFloat API Key is still not set. Exiting CS2ArbitrageBot service.");
-                    await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("CSFloat API Key is empty.... Exiting CS2ArbitrageBot service.");
+                    await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "CSFloat API Key is empty.... Exiting CS2ArbitrageBot service.");
                     await TerminateService();
                 }
                 else
@@ -76,14 +76,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             await CreateRoutes();
 
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
-            serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+
+            if (OmniPaths.CheckIfOnServer() == false)
+            {
+                //await steamAPIWrapper.profileWrapper.LoginToSteam();
+            }
+
+            GetTimeManagerService().TaskDue += TimeManager_TaskDue;
             await UpdateAccountInformation();
             MonitorTradeList();
-            if (await serviceManager.timeManager.GetTask("SnipeCS2Deals") == null)
+            if (await GetTimeManagerService().GetTask("SnipeCS2Deals") == null)
             {
                 SnipeDealsAndAlertKlives();
             }
-            if (await serviceManager.timeManager.GetTask("CompareLiquidItemOptions") == null)
+            if (await GetTimeManagerService().GetTask("CompareLiquidItemOptions") == null)
             {
                 CompareLiquidItemOptions();
             }
@@ -114,7 +120,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error in CompareLiquidItemOptions");
-                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in CompareLiquidItemOptions: {ex.Message}");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"Error in CompareLiquidItemOptions: {ex.Message}");
             }
             ServiceCreateScheduledTask(DateTime.Now.AddDays(1), "CompareLiquidItemOptions", "CS2ArbitrageAnalytics", "Compare price gaps in liquid items to convert Steam Credit to CSFloat Credit", false);
         }
@@ -150,11 +156,68 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private async Task SellSkinOnSteam(Scanalytics.PurchasedListing data)
         {
-            ServiceLog($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market");
-            (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold **for {data.ActualSalePriceOnSteam}** on the Steam Market. Bot will sell now.");
-            data.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
-            await scanalytics.UpdatePurchasedListing(data);
-            //Message Klives
+            try
+            {
+                // Calculate sale price: use the highest buy order from the original comparison
+                int salePriceInPence = data.comparison.SteamListing.HighestBuyOrderPriceInPence;
+
+                // Refresh Steam price to get the current highest buy order
+                try
+                {
+                    var currentSteamListing = await steamAPIWrapper.GetItemOnMarket(data.ItemMarketHashName);
+                    if (currentSteamListing.HighestBuyOrderPriceInPence > 0)
+                    {
+                        salePriceInPence = currentSteamListing.HighestBuyOrderPriceInPence;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"Could not refresh Steam price for {data.ItemMarketHashName}, using original comparison price.");
+                }
+
+                data.ActualSalePriceOnSteam = salePriceInPence / 100f;
+                await ServiceLog($"Item {data.ItemMarketHashName} with float {data.ItemFloatValue} is ready to be sold on the Steam Market for £{data.ActualSalePriceOnSteam:F2}");
+
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage — Listing on Steam",
+                        $"Item: {data.ItemMarketHashName}\n" +
+                        $"Float: {data.ItemFloatValue}\n" +
+                        $"Sale Price: **£{data.ActualSalePriceOnSteam:F2}**\n" +
+                        $"Original CSFloat Purchase: {data.comparison.CSFloatListing.PriceText}\n" +
+                        $"Expected Profit: {data.ExpectedProfitPercentage:F1}%\n\n" +
+                        $"Attempting to list on Steam Market...",
+                        DSharpPlus.Entities.DiscordColor.Teal));
+
+                bool sold = await steamAPIWrapper.profileWrapper.SellItem(data, salePriceInPence);
+
+                if (sold)
+                {
+                    data.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
+                    await scanalytics.UpdatePurchasedListing(data);
+
+                    await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                        KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage — Listed on Steam ✓",
+                            $"Item: {data.ItemMarketHashName}\n" +
+                            $"Listed for: **£{data.ActualSalePriceOnSteam:F2}**\n" +
+                            $"Waiting for a buyer.",
+                            DSharpPlus.Entities.DiscordColor.Green));
+                }
+                else
+                {
+                    await ServiceLogError($"Failed to list {data.ItemMarketHashName} on Steam Market.");
+                    await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                        KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage — Failed to List",
+                            $"Item: {data.ItemMarketHashName}\n" +
+                            $"Could not list on Steam Market. May need manual intervention.",
+                            DSharpPlus.Entities.DiscordColor.Red));
+                }
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"Error in SellSkinOnSteam for {data.ItemMarketHashName}");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    $"Error selling {data.ItemMarketHashName} on Steam: {ex.Message}");
+            }
         }
         private async Task GetExchangeRate()
         {
@@ -170,156 +233,173 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
         public async Task MonitorTradeList()
         {
-            if (scanalytics.AllPurchasedListingsInHistory.Where(k => k.CurrentStrategicStage < Scanalytics.StrategicStages.JustRetrieved).Any() == false)
+            CancellationTokenSource cts = new();
+            ServiceQuitRequest += () => cts.Cancel();
+
+            while (!cts.Token.IsCancellationRequested)
             {
-                await Task.Delay(1000);
-                MonitorTradeList();
+                try
+                {
+                    var pendingListings = scanalytics.AllPurchasedListingsInHistory
+                        .Where(k => k.CurrentStrategicStage < Scanalytics.StrategicStages.JustRetrieved)
+                        .ToList();
+
+                    if (pendingListings.Count == 0)
+                    {
+                        await Task.Delay(1000, cts.Token);
+                        continue;
+                    }
+
+                    string url = "https://csfloat.com/api/v1/me/trades?limit=1000";
+                    var response = await csFloatWrapper.Client.GetAsync(url, cts.Token);
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        await HandleTradeListError(response);
+                        continue;
+                    }
+
+                    string responseString = await response.Content.ReadAsStringAsync(cts.Token);
+                    dynamic json = JsonConvert.DeserializeObject(responseString);
+
+                    foreach (var item in json.trades)
+                    {
+                        string contractID = (string)item.contract_id;
+                        var listing = pendingListings.FirstOrDefault(k => k.CSFloatListingID == contractID);
+                        if (listing == null) continue;
+
+                        try
+                        {
+                            await ProcessTradeStateTransition(listing, item);
+                        }
+                        catch (Exception ex)
+                        {
+                            await ServiceLogError(ex, $"Error processing trade for {listing.ItemMarketHashName}");
+                        }
+                    }
+
+                    await Task.Delay(3000, cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Unhandled error in MonitorTradeList loop");
+                    await Task.Delay(10000, cts.Token);
+                }
+            }
+
+            ServiceLog("MonitorTradeList loop exited.");
+        }
+
+        private async Task ProcessTradeStateTransition(Scanalytics.PurchasedListing listing, dynamic tradeItem)
+        {
+            switch (listing.CurrentStrategicStage)
+            {
+                case Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale:
+                    await TryTransitionSellerAccepted(listing, tradeItem);
+                    break;
+                case Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent:
+                    await TryTransitionTradeSent(listing, tradeItem);
+                    break;
+                case Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted:
+                    await TryTransitionTradeCompleted(listing, tradeItem);
+                    break;
+            }
+        }
+
+        private async Task TryTransitionSellerAccepted(Scanalytics.PurchasedListing listing, dynamic tradeItem)
+        {
+            string? acceptedAt = Convert.ToString(tradeItem.accepted_at);
+            if (string.IsNullOrEmpty(acceptedAt)) return;
+
+            listing.TimeOfSellerToAcceptSale = DateTime.Parse(acceptedAt);
+            listing.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent;
+            await scanalytics.UpdatePurchasedListing(listing);
+
+            string message = $"CSFloat listing {listing.ItemMarketHashName} with price {listing.comparison.CSFloatListing.PriceText} has been accepted by the seller.";
+            await ServiceLog(message);
+            await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", message);
+        }
+
+        private async Task TryTransitionTradeSent(Scanalytics.PurchasedListing listing, dynamic tradeItem)
+        {
+            string? sentAt;
+            try { sentAt = Convert.ToString(tradeItem.steam_offer?.sent_at); }
+            catch { return; }
+            if (string.IsNullOrEmpty(sentAt)) return;
+
+            listing.TimeOfSellerToSendTradeOffer = DateTime.Parse(sentAt);
+            listing.CSFloatToSteamTradeOfferLink = "https://steamcommunity.com/tradeoffer/" + Convert.ToString(tradeItem.steam_offer.id) + "/";
+            listing.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted;
+            await scanalytics.UpdatePurchasedListing(listing);
+
+            await ServiceLog($"CSFloat listing {listing.ItemMarketHashName} with price {listing.comparison.CSFloatListing.PriceText} trade offer has been sent by the seller.");
+            await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CSFloat Trade Sent",
+                $"Listing {listing.ItemMarketHashName}\n" +
+                $"Price: {listing.comparison.CSFloatListing.PriceText}\n" +
+                $"\nTrade offer has been sent by the seller. Please accept before the deadline at {listing.TimeOfSellerToSendTradeOffer:dd/MM/yyyy HH:mm:ss}" +
+                $"\nTrade Offer Link: {listing.CSFloatToSteamTradeOfferLink}",
+                DSharpPlus.Entities.DiscordColor.Orange, new Uri(listing.comparison.CSFloatListing.ImageURL)));
+        }
+
+        private async Task TryTransitionTradeCompleted(Scanalytics.PurchasedListing listing, dynamic tradeItem)
+        {
+            string? verifySaleAt;
+            try { verifySaleAt = Convert.ToString(tradeItem.verify_sale_at); }
+            catch { return; }
+            if (string.IsNullOrEmpty(verifySaleAt)) return;
+
+            DateTime resellTime;
+            try
+            {
+                resellTime = DateTime.Parse(Convert.ToString(tradeItem.trade_protection_ends_at));
+                resellTime = resellTime.AddHours(1.1);
+            }
+            catch
+            {
+                resellTime = DateTime.Now.AddDays(8);
+            }
+
+            listing.PredictedTimeToBeResoldOnSteam = resellTime;
+            listing.CurrentStrategicStage = Scanalytics.StrategicStages.JustRetrieved;
+            listing.TimeOfItemRetrieval = DateTime.Parse(Convert.ToString(tradeItem.steam_offer.updated_at));
+            await scanalytics.UpdatePurchasedListing(listing);
+
+            string taskName = "SellCS2ArbitrageListingOnSteam" + listing.ItemMarketHashName;
+            taskName = string.Join("-", taskName.Split(Path.GetInvalidFileNameChars()));
+            await ServiceCreateScheduledTask(resellTime, taskName, "CS2ArbitrageStrategy",
+                $"{listing.ItemMarketHashName} will no longer be on steam tradelock.", true,
+                JsonConvert.SerializeObject(listing));
+
+            string message = $"CSFloat trade for skin {listing.ItemMarketHashName} of price {listing.comparison.CSFloatListing.PriceText} has been detected as completed.";
+            await ServiceLog(message);
+            await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", message);
+        }
+
+        private async Task HandleTradeListError(HttpResponseMessage response)
+        {
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                ServiceLog("CSFloat API rate limit reached. Waiting for 60 seconds before retrying.");
+                await Task.Delay(60000);
+            }
+            else if (response.StatusCode == HttpStatusCode.Unauthorized)
+            {
+                await ServiceLogError("CSFloat API key is invalid or expired. Please check your CSFloat API key.");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    "CSFloat API key is invalid or expired. Please check your CSFloat API key.");
+                throw new OperationCanceledException("Unauthorized — stopping trade monitor.");
             }
             else
             {
-                string url = "https://csfloat.com/api/v1/me/trades?limit=1000";
-                var response = await csFloatWrapper.Client.GetAsync(url);
-                string responseString = await response.Content.ReadAsStringAsync();
-                dynamic json = JsonConvert.DeserializeObject(responseString);
-                if (response.IsSuccessStatusCode)
-                {
-                    //Create copy of listings to monitor
-                    foreach (var item in json.trades)
-                    {
-                        string itemstringed = JsonConvert.SerializeObject(item);
-                        string contractID = item.contract_id;
-                        //if listingstoMonitorFromTradeList contains a csfloat listings with a listing id equal to the contract id, find it and set its strategic stage
-                        Scanalytics.PurchasedListing? listingToMonitor;
-                        try
-                        {
-                            listingToMonitor = scanalytics.AllPurchasedListingsInHistory.Where(k => k.CurrentStrategicStage < Scanalytics.StrategicStages.JustRetrieved).First(k => k.CSFloatListingID == contractID);
-                        }
-                        catch (Exception)
-                        {
-                            continue;
-                        }
-                        if (listingToMonitor != null)
-                        {
-                            try
-                            {
-                                if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatSellerToAcceptSale)
-                                {
-                                    string acceptedAt;
-                                    try
-                                    {
-                                        acceptedAt = Convert.ToString(item.accepted_at);
-                                    }
-                                    catch (Exception)
-                                    {
-                                        continue;
-                                    }
-                                    if (!string.IsNullOrEmpty(acceptedAt))
-                                    {
-                                        listingToMonitor.TimeOfSellerToAcceptSale = DateTime.Parse(acceptedAt);
-                                        //Tell Klives that this listing has been accepted
-                                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat listing {listingToMonitor.ItemMarketHashName} " +
-                                            $"with price {listingToMonitor.comparison.CSFloatListing.PriceText} has been accepted by the seller.");
-                                        ServiceLog($"CSFloat listing {listingToMonitor.ItemMarketHashName} with price {listingToMonitor.comparison.CSFloatListing.PriceText} has been accepted by the seller.");
-                                        listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent;
-                                        scanalytics.UpdatePurchasedListing(listingToMonitor);
-                                    }
-                                }
-                                else if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeSent)
-                                {
-                                    //If steam_offer or sent_at does not exist, then the trade offer has not been sent yet.
-                                    string sentAt;
-                                    try
-                                    {
-                                        sentAt = Convert.ToString(item.steam_offer.sent_at);
-                                    }
-                                    catch (Exception)
-                                    {
-                                        continue;
-                                    }
-                                    if (!string.IsNullOrEmpty(sentAt))
-                                    {
-                                        listingToMonitor.TimeOfSellerToSendTradeOffer = DateTime.Parse(sentAt);
-                                        listingToMonitor.CSFloatToSteamTradeOfferLink = "https://steamcommunity.com/tradeoffer/" + Convert.ToString(item.steam_offer.id) + "/";
-                                        //Tell Klives that this listing has been sent using an embed
-                                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CSFloat Trade Sent",
-                                            $"Listing {listingToMonitor.ItemMarketHashName}\n" +
-                                            $"Price: {listingToMonitor.comparison.CSFloatListing.PriceText}\n" +
-                                            $"\nTrade offer has been sent by the seller. Please accept before the deadline at " + listingToMonitor.TimeOfSellerToSendTradeOffer.ToString("dd/MM/yyyy HH:mm:ss")
-                                            + "\nTrade Offer Link: " + listingToMonitor.CSFloatToSteamTradeOfferLink,
-                                            DSharpPlus.Entities.DiscordColor.Orange, new Uri(listingToMonitor.comparison.CSFloatListing.ImageURL)));
-                                        //log it
-                                        ServiceLog($"CSFloat listing {listingToMonitor.ItemMarketHashName} with price {listingToMonitor.comparison.CSFloatListing.PriceText} trade offer has been sent by the seller.");
-                                        listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted;
-                                        scanalytics.UpdatePurchasedListing(listingToMonitor);
-                                    }
-                                }
-                                else if (listingToMonitor.CurrentStrategicStage == Scanalytics.StrategicStages.WaitingForCSFloatTradeToBeAccepted)
-                                {
-                                    string verifySaleAt;
-                                    try
-                                    {
-                                        verifySaleAt = Convert.ToString(item.verify_sale_at);
-                                    }
-                                    catch (Exception)
-                                    {
-                                        continue;
-                                    }
-                                    if (!string.IsNullOrEmpty(verifySaleAt))
-                                    {
-                                        DateTime reselltime;
-                                        try
-                                        {
-                                            reselltime = DateTime.Parse(Convert.ToString(item.trade_protection_ends_at));
-                                            reselltime = reselltime.AddHours(1.1);
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            reselltime = DateTime.Now.AddDays(8);
-                                        }
-                                        listingToMonitor.PredictedTimeToBeResoldOnSteam = reselltime;
-                                        string filename = "SellCS2ArbitrageListingOnSteam" + listingToMonitor.ItemMarketHashName;
-                                        filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-                                        ServiceCreateScheduledTask(listingToMonitor.PredictedTimeToBeResoldOnSteam, filename, "CS2ArbitrageStrategy", $"{listingToMonitor.ItemMarketHashName} will no longer be on steam tradelock.", true, JsonConvert.SerializeObject(listingToMonitor));
-                                        //Tell Klives that this listing has been accepted
-                                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
-                                        ServiceLog($"CSFloat trade for skin {listingToMonitor.ItemMarketHashName} of price {listingToMonitor.comparison.CSFloatListing.PriceText} has been detected as completed.");
-                                        listingToMonitor.CurrentStrategicStage = Scanalytics.StrategicStages.JustRetrieved;
-                                        listingToMonitor.TimeOfItemRetrieval = DateTime.Parse(Convert.ToString(item.steam_offer.updated_at));
-                                        scanalytics.UpdatePurchasedListing(listingToMonitor);
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                ServiceLogError(ex);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
-                    {
-                        //If the response is 429 Too Many Requests, wait for 60 seconds and try again
-                        ServiceLog("CSFloat API rate limit reached. Waiting for 60 seconds before retrying.");
-                        await Task.Delay(60000);
-                    }
-                    else if (response.StatusCode == HttpStatusCode.Unauthorized)
-                    {
-                        //If the response is 401 Unauthorized, log it and exit
-                        ServiceLogError("CSFloat API key is invalid or expired. Please check your CSFloat API key.");
-                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives("CSFloat API key is invalid or expired. Please check your CSFloat API key.");
-                        return;
-                    }
-                    else
-                    {
-                        await ServiceLogError($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
-                        //Tell Klives
-                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Failed to get trade list from CSFloat. \nStatus Code: {response.StatusCode}\nResponse: {await response.Content.ReadAsStringAsync()}");
-                    }
-                }
-                await Task.Delay(3000);
-                MonitorTradeList();
+                string body = await response.Content.ReadAsStringAsync();
+                await ServiceLogError($"Failed to get trade list from CSFloat. Status Code: {response.StatusCode}");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    $"Failed to get trade list from CSFloat.\nStatus Code: {response.StatusCode}\nResponse: {body}");
+                await Task.Delay(10000); // back off on unknown errors
             }
         }
         public async Task SnipeDealsAndAlertKlives()
@@ -429,7 +509,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error in SnipeDealsAndAlertKlives");
-                await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"Error in SnipeDealsAndAlertKlives: {ex.Message}");
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"Error in SnipeDealsAndAlertKlives: {ex.Message}");
                 await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(15), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after an error.", false);
             }
         }
@@ -464,8 +544,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         $"CSFloat Listing URL: {snipe.ListingURL}\n" +
                         $"Steam Listing URL: {correspondingListing.ListingURL}\n\n" +
                         $"Purchase Status: Purchasing...";
-                    var message = await (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
-                        bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL)));
+                    var message = (DiscordMessage)(await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found!",
+                        bodytext, DSharpPlus.Entities.DiscordColor.Orange, new Uri(snipe.ImageURL))));
 
                     bool itemPurchased = false;
                     //Purchase item
@@ -573,7 +653,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 scanalytics.UpdatePurchasedListing(purchasedListing);
 
                 //tell klives that the bot purchased what he asked him to, this is not a snipe.
-                (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Bot Purchase",
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Arbitrage Bot Purchase",
                     $"Purchased CSFloat listing {csfloatlisting.ItemMarketHashName} with price {csfloatlisting.PriceText}.\n" +
                     $"Predicted Overall Gain After {((expectedReturnSteamToCSfloat * 100)).ToString()}% Conversion: **{Math.Round((comparison.PredictedOverallArbitrageGain - 1) * 100, 2).ToString()}%**\n" +
                     $"CSFloat Listing URL: {csfloatlisting.ListingURL}\n" +
@@ -585,13 +665,21 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
         public async Task CreateRoutes()
         {
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/getscanalytics", async (request) =>
+            await CreateAPIRoute("/cs2arbitragebot/getscanalytics", async (request) =>
             {
                 try
                 {
-                    Scanalytics.ScannedComparisonAnalytics analytics = new Scanalytics.ScannedComparisonAnalytics(scanalytics.AllScannedComparisonsInHistory, scanalytics.AllPurchasedListingsInHistory, await scanalytics.ExpectedSteamToCSFloatConversionPercentage());
+                    if (cachedAnalytics == null || lastAnalyticsUpdate == null || DateTime.Now - lastAnalyticsUpdate > analyticsCacheDuration)
+                    {
+                        cachedAnalytics = new ScannedComparisonAnalytics(
+                            scanalytics.AllScannedComparisonsInHistory,
+                            scanalytics.AllPurchasedListingsInHistory,
+                            await scanalytics.ExpectedSteamToCSFloatConversionPercentage()
+                        );
+                        lastAnalyticsUpdate = DateTime.Now;
+                    }
 
-                    await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
+                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedAnalytics), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -599,7 +687,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/getscanalytics route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/scanresults", async (request) =>
+
+            await CreateAPIRoute("/cs2arbitragebot/scanresults", async (request) =>
             {
                 try
                 {
@@ -611,12 +700,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/scanresults route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/latestliquidityplan", async (request) =>
+
+            await CreateAPIRoute("/cs2arbitragebot/latestliquidityplan", async (request) =>
             {
                 try
                 {
-                    var plan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
-                    await request.ReturnResponse(JsonConvert.SerializeObject(plan), code: HttpStatusCode.OK);
+                    if (cachedLiquidityPlan == null || lastLiquidityPlanUpdate == null || DateTime.Now - lastLiquidityPlanUpdate > liquidityPlanCacheDuration)
+                    {
+                        cachedLiquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
+                        lastLiquidityPlanUpdate = DateTime.Now;
+                    }
+
+                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedLiquidityPlan), code: HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -624,7 +719,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, "Error in /cs2arbitragebot/latestliquidityplan route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/cs2arbitragebot/balanceHistory", async (request) =>
+
+            await CreateAPIRoute("/cs2arbitragebot/balanceHistory", async (request) =>
             {
                 try
                 {
@@ -637,7 +733,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-
         }
+
+        private ScannedComparisonAnalytics cachedAnalytics;
+        private DateTime? lastAnalyticsUpdate;
+        private readonly TimeSpan analyticsCacheDuration = TimeSpan.FromMinutes(5);
+
+        private object cachedLiquidityPlan;
+        private DateTime? lastLiquidityPlanUpdate;
+        private readonly TimeSpan liquidityPlanCacheDuration = TimeSpan.FromMinutes(5);
     }
 }

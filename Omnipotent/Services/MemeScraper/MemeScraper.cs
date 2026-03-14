@@ -45,11 +45,11 @@ namespace Omnipotent.Services.MemeScraper
 
             CreateRoutes();
 
-            serviceManager.timeManager.TaskDue += TimeManager_TaskDue;
+            GetTimeManagerService().TaskDue += TimeManager_TaskDue;
 
             foreach (var item in SourceManager.InstagramSources)
             {
-                if (await serviceManager.timeManager.GetTask("ScrapeAllInstagramPostsFromSource-" + item.Username) == null)
+                if (await GetTimeManagerService().GetTask("ScrapeAllInstagramPostsFromSource-" + item.Username) == null)
                 {
                     Random rnd = new();
                     ServiceCreateScheduledTask(DateTime.Now.AddMinutes(rnd.Next(0, 1000)), "ScrapeAllInstagramPostsFromSource" + item.Username,
@@ -140,7 +140,7 @@ namespace Omnipotent.Services.MemeScraper
 
         private async Task CreateRoutes()
         {
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/addInstagramSource", async (request) =>
+            await CreateAPIRoute("/memescraper/addInstagramSource", async (request) =>
             {
                 try
                 {
@@ -182,7 +182,7 @@ namespace Omnipotent.Services.MemeScraper
                     SourceManager.ProduceNewInstagramSource(username, DownloadReels, DownloadPosts, nichesList);
                     try
                     {
-                        (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives($"{request.user.Name} uploaded a new instagram source: '{username}'.");
+                        await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} uploaded a new instagram source: '{username}'.");
                     }
                     catch (Exception e) { }
                     ServiceLog($"{request.user.Name} uploaded a new instagram source: '{username}'.");
@@ -195,7 +195,7 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/getAllInstagramSources", async (request) =>
+            await CreateAPIRoute("/memescraper/getAllInstagramSources", async (request) =>
             {
                 try
                 {
@@ -207,7 +207,7 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/memeScraperAnalytics", async (request) =>
+            await CreateAPIRoute("/memescraper/memeScraperAnalytics", async (request) =>
             {
                 try
                 {
@@ -220,7 +220,7 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/memescraper/deleteInstagramSource", async (request) =>
+            await CreateAPIRoute("/memescraper/deleteInstagramSource", async (request) =>
             {
                 try
                 {

@@ -162,7 +162,7 @@ namespace Omnipotent.Service_Manager
                             //Wait for that corresponding service to be active.
                             try
                             {
-                                while (serviceManager.GetServiceByName(item.agentName).IsServiceActive() == false) { Task.Delay(100).Wait(); }
+                                while (GetServiceByName(item.agentName).IsServiceActive() == false) { Task.Delay(100).Wait(); }
                             }
                             catch (Exception) { }
                             //Wait for that service to subscribe to taskdue
@@ -267,11 +267,11 @@ namespace Omnipotent.Service_Manager
 
         private async void CreateRoutes()
         {
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/timemanager/getalltasks", async (request) =>
+            await CreateAPIRoute("/timemanager/getalltasks", async (request) =>
             {
                 await request.ReturnResponse(JsonConvert.SerializeObject(tasks), code: HttpStatusCode.OK);
             }, HttpMethod.Get, KMPermissions.Guest);
-            await (await serviceManager.GetKliveAPIService()).CreateRoute("/timemanager/prefiretask", async (request) =>
+            await CreateAPIRoute("/timemanager/prefiretask", async (request) =>
             {
                 try
                 {

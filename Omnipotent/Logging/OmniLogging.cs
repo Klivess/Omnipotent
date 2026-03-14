@@ -156,7 +156,7 @@ Data:
             };
 
 
-            (await serviceManager.GetKliveAPIService()).CreateRoute("api/logs", getLogs, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Admin);
+            await CreateAPIRoute("api/logs", getLogs, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Admin);
         }
 
         private async Task BeginLogLoop()

@@ -88,10 +88,15 @@ namespace Omnipotent.Data_Handling
             public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
             public static string KliveCloudThumbnailsDirectory = $"{KliveCloudDirectory}/Thumbnails";
 
+            //KlivesWorkoutManager
+            public static string KlivesWorkoutManagerDirectory = $"{SavedDataDirectory}/KlivesWorkoutManager";
+            public static string KlivesWorkoutManagerHevyAPIKey = $"{KlivesWorkoutManagerDirectory}/HevyAPIKey.txt";
+
             //OmniTube
             public static string FFMpegDirectory = $"FFmpeg";
             public static string FFMpegWorkingDirectory = $"{FFMpegDirectory}/FFmpegWorkingDirectory";
             public static string OmniTubeDirectory = $"{SavedDataDirectory}/OmniTube";
+            public static string OmniTubeBrandsDirectory = $"{OmniTubeDirectory}/OmniBrands";
 
 
         };
