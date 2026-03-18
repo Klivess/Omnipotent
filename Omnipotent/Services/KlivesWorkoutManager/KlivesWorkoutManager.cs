@@ -199,7 +199,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
                         string prIndicator = "";
                         double previousBest = await GetAllTimeBest1RM(exercise.ExerciseTemplateId, workoutId);
-                        Console.WriteLine($"Previous best 1RM for '{exerciseName}' (excluding current workout): {previousBest} kg. Current workout best 1RM: {bestOneRepMax} kg.");
+                        ServiceLog($"Previous best 1RM for '{exerciseName}' (excluding current workout): {previousBest} kg. Current workout best 1RM: {bestOneRepMax} kg.");
                         if (bestOneRepMax > previousBest && previousBest > 0)
                         {
                             prIndicator = " 🎉 **NEW PR!**";
@@ -209,7 +209,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
                                 if (OnNewPersonalRecord != null)
                                 {
                                     // Log the detected PR before invoking handlers
-                                    await ServiceLog($"Detected NEW PR for '{exerciseName}': previous 1RM = {Math.Round(previousBest, 2)} kg, new 1RM = {Math.Round(bestOneRepMax, 2)} kg (best set {bestSet.WeightKg}kg × {bestSet.Reps}).");
+                                    ServiceLog($"Detected NEW PR for '{exerciseName}': previous 1RM = {Math.Round(previousBest, 2)} kg, new 1RM = {Math.Round(bestOneRepMax, 2)} kg (best set {bestSet.WeightKg}kg × {bestSet.Reps}).");
 
                                     await OnNewPersonalRecord.Invoke(new NewPersonalRecordEventArgs
                                     {
