@@ -14,19 +14,17 @@ namespace Omnipotent.Tests.KlivesWorkoutManager
         }
 
         [Fact]
+        public void CalculateOneRepMax_AccurateToHevy()
+        {
+            double result = StrengthLevel.CalculateOneRepMax(59, 6);
+            Assert.True(result > 68 && result < 69);
+        }
+
+        [Fact]
         public void CalculateOneRepMax_MultipleReps_ReturnsHigherThanWeight()
         {
             double result = StrengthLevel.CalculateOneRepMax(100, 5);
             Assert.True(result > 100);
-        }
-
-        [Fact]
-        public void CalculateOneRepMax_KnownFormula_ReturnsExpected()
-        {
-            // Formula: weight * (1 + reps/30)
-            // 80kg * (1 + 10/30) = 80 * 1.333... ≈ 106.7
-            double result = StrengthLevel.CalculateOneRepMax(80, 10);
-            Assert.Equal(106.7, result);
         }
 
         [Fact]
@@ -55,22 +53,6 @@ namespace Omnipotent.Tests.KlivesWorkoutManager
         {
             double result = StrengthLevel.CalculateOneRepMax(-50, 5);
             Assert.Equal(0, result);
-        }
-
-        [Fact]
-        public void CalculateOneRepMax_HighReps_ScalesCorrectly()
-        {
-            // 60kg * (1 + 20/30) = 60 * 1.667 ≈ 100.0
-            double result = StrengthLevel.CalculateOneRepMax(60, 20);
-            Assert.Equal(100.0, result);
-        }
-
-        [Fact]
-        public void CalculateOneRepMax_ResultIsRoundedToOneDecimal()
-        {
-            double result = StrengthLevel.CalculateOneRepMax(75, 8);
-            // 75 * (1 + 8/30) = 75 * 1.2667 = 95.0
-            Assert.Equal(95.0, result);
         }
 
         #endregion

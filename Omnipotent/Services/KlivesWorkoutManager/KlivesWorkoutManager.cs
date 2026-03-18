@@ -69,8 +69,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
                     Description =
                         $"Old 1RM: **{Math.Round(arg.OldOneRepMaxKg, 2)} kg**\n" +
                         $"New 1RM: **{Math.Round(arg.NewOneRepMaxKg, 2)} kg**\n" +
-                        $"Best Set: **{arg.WeightKg} kg × {arg.Reps}**\n" +
-                        $"Strength Level: {arg.StrengthLevelRating}",
+                        $"Best Set: **{arg.WeightKg} kg × {arg.Reps}**\n",
                     Color = new DiscordColor(0x00C853), // green
                     Timestamp = DateTimeOffset.UtcNow
                 };
@@ -208,6 +207,9 @@ namespace Omnipotent.Services.KlivesWorkoutManager
                             {
                                 if (OnNewPersonalRecord != null)
                                 {
+                                    // Log the detected PR before invoking handlers
+                                    await ServiceLog($"Detected NEW PR for '{exerciseName}': previous 1RM = {Math.Round(previousBest, 2)} kg, new 1RM = {Math.Round(bestOneRepMax, 2)} kg (best set {bestSet.WeightKg}kg × {bestSet.Reps}).");
+
                                     await OnNewPersonalRecord.Invoke(new NewPersonalRecordEventArgs
                                     {
                                         ExerciseName = exerciseName,
