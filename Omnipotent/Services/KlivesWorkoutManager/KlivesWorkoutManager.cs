@@ -199,6 +199,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
                         string prIndicator = "";
                         double previousBest = await GetAllTimeBest1RM(exercise.ExerciseTemplateId, workoutId);
+                        Console.WriteLine($"Previous best 1RM for '{exerciseName}' (excluding current workout): {previousBest} kg. Current workout best 1RM: {bestOneRepMax} kg.");
                         if (bestOneRepMax > previousBest && previousBest > 0)
                         {
                             prIndicator = " 🎉 **NEW PR!**";
