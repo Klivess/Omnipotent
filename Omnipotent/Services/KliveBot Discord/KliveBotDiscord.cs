@@ -149,6 +149,21 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
             }
         }
 
+        public async Task<DiscordMessage> SendMessageToChannel(ulong guildId, ulong channelId, DiscordMessageBuilder builder)
+        {
+            try
+            {
+                while (Client == null) { await Task.Delay(100); }
+                var channel = await Client.GetChannelAsync(channelId);
+                return await channel.SendMessageAsync(builder);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Sending message to channel failed!");
+                return null;
+            }
+        }
+
         public static DiscordMessageBuilder MakeSimpleEmbed(string title, string description, DiscordColor color, string imagefilepath = "")
         {
             DiscordMessageBuilder builder = new DiscordMessageBuilder();

@@ -54,7 +54,41 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
             await hevAPI.AuthoriseHevy(hevyApiKey);
 
+            OnNewPersonalRecord += KlivesWorkoutManager_OnNewPersonalRecord;
+
             CreateRoutes();
+        }
+
+        private async Task KlivesWorkoutManager_OnNewPersonalRecord(NewPersonalRecordEventArgs arg)
+        {
+            try
+            {
+                var embed = new DiscordEmbedBuilder
+                {
+                    Title = $"GOAT KLIVES HAS JUST MADE A NEW PR IN: {arg.ExerciseName}",
+                    Description =
+                        $"Old 1RM: **{Math.Round(arg.OldOneRepMaxKg, 2)} kg**\n" +
+                        $"New 1RM: **{Math.Round(arg.NewOneRepMaxKg, 2)} kg**\n" +
+                        $"Best Set: **{arg.WeightKg} kg × {arg.Reps}**\n" +
+                        $"Strength Level: {arg.StrengthLevelRating}",
+                    Color = new DiscordColor(0x00C853), // green
+                    Timestamp = DateTimeOffset.UtcNow
+                };
+
+                var message = new DiscordMessageBuilder().AddEmbed(embed);
+
+                // Target guild and channel IDs (snowflakes)
+                // Hypixel server in the general channel
+                const ulong targetGuildId = 802103827100467240UL;
+                const ulong targetChannelId = 802103827100467243UL;
+
+                // Invoke Klive bot service to send message to the specified guild/channel.
+                await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToChannel", targetGuildId, targetChannelId, message);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to send PR notification to Discord channel.");
+            }
         }
 
         private async Task<double> GetAllTimeBest1RM(string exerciseTemplateId, string excludeWorkoutId)
