@@ -22,6 +22,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
         HevyAPI hevAPI = new HevyAPI();
         public event Func<NewPersonalRecordEventArgs, Task>? OnNewPersonalRecord;
+        public List<string> workoutsAlreadySeen;
 
         public KlivesWorkoutManager()
         {
@@ -31,7 +32,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
         protected override async void ServiceMain()
         {
-
+            workoutsAlreadySeen=new List<string>();
 
             string hevyApiKey = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesWorkoutManagerHevyAPIKey));
             if (string.IsNullOrEmpty(hevyApiKey))
@@ -97,6 +98,13 @@ namespace Omnipotent.Services.KlivesWorkoutManager
                 {
                     dynamic json = JsonConvert.DeserializeObject(req.userMessageContent);
                     string workoutId = json.workoutId;
+
+                    if (workoutsAlreadySeen.Contains(workoutId))
+                    {
+                        req.ReturnResponse("Already processed this workout.");
+                        return;
+                    }
+
                     var workout = await hevAPI.GetWorkout(workoutId);
 
                     var embedBuilder = new DiscordEmbedBuilder
@@ -186,6 +194,9 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
                     var message = new DiscordMessageBuilder().AddEmbed(embedBuilder);
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", message);
+
+                    workoutsAlreadySeen.Add(workoutId);
+                    req.ReturnResponse("OK");
                 }
                 catch (Exception e)
                 {
