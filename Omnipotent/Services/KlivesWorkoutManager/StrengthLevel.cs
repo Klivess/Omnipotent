@@ -12,7 +12,9 @@ namespace Omnipotent.Services.KlivesWorkoutManager
         {
             if (reps <= 0 || weightKg <= 0) return 0;
             if (reps == 1) return weightKg;
-            return Math.Round(weightKg * (1 + reps / 30.0), 1);
+            //Brzycki formula
+            return (weightKg / (1.0278 - (0.0278 * reps)));
+
         }
 
         public class StrengthLevelRequest
