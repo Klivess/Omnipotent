@@ -56,9 +56,6 @@ namespace Omnipotent.Services.KlivesWorkoutManager
 
             OnNewPersonalRecord += KlivesWorkoutManager_OnNewPersonalRecord;
 
-            string name = hevAPI.GetWorkouts().Result.Workouts[0].Exercises[0].ExerciseTemplateId;
-            double best = await GetAllTimeBest1RM("ex_bench_press");
-
             CreateRoutes();
         }
 
@@ -93,13 +90,13 @@ namespace Omnipotent.Services.KlivesWorkoutManager
             }
         }
 
-        private async Task<double> GetAllTimeBest1RM(string exerciseTemplateName, string excludeWorkoutId="")
+        private async Task<double> GetAllTimeBest1RM(string exerciseTemplateId, string excludeWorkoutId)
         {
             double best = 0;
             int page = 1;
             while (true)
             {
-                var history = await hevAPI.GetExerciseHistory(exerciseTemplateName, page, 10);
+                var history = await hevAPI.GetExerciseHistory(exerciseTemplateId, page, 10);
                 if (history?.History == null || history.History.Count == 0)
                     break;
 
