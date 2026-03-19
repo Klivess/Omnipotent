@@ -42,7 +42,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
             // Ensure local model is present and initialize reflective LLamaSharp wrapper if available
-            /* WAITING FOR QWEN3.5 SUPPORT https://github.com/SciSharp/LLamaSharp/issues/1340
+            // WAITING FOR QWEN3.5 SUPPORT https://github.com/SciSharp/LLamaSharp/issues/1340
             try
             {
                 await EnsureModelDownloadedAsync();
@@ -54,9 +54,9 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
 
 
-            var response = await QueryLocalLLMAsync("HELLO MY BROOOOOO");
+            var response = await QueryLocalLLMAsync("testing, say something");
             ServiceLog($"LLM Response: {response.Response}");
-            */
+
         }
 
         public async Task<string> QueryLLM(string content)
