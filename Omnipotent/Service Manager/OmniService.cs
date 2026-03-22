@@ -80,14 +80,24 @@ namespace Omnipotent.Service_Manager
             }
             var bindingFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
             System.Reflection.MethodInfo? method;
+            // Ensure args is non-null for downstream resolution
+            args ??= Array.Empty<object>();
+
             try
             {
+                // Try the simple resolution first
                 method = service[0].GetType().GetMethod(methodName, bindingFlags);
             }
             catch (System.Reflection.AmbiguousMatchException)
             {
-                var argTypes = args.Select(a => a.GetType()).ToArray();
-                method = service[0].GetType().GetMethod(methodName, bindingFlags, null, argTypes, null);
+                // Fall back to robust resolver which handles null args and overloads
+                method = ResolveMethod(service[0].GetType(), methodName, bindingFlags, args);
+            }
+
+            // If simple lookup didn't find a method (or returned ambiguous), try the resolver
+            if (method == null)
+            {
+                method = ResolveMethod(service[0].GetType(), methodName, bindingFlags, args);
             }
             if (method == null)
             {
@@ -339,5 +349,32 @@ namespace Omnipotent.Service_Manager
             }
         }
 
+        MethodInfo? ResolveMethod(Type target, string name, BindingFlags flags, object?[] args)
+        {
+            var candidates = target.GetMethods(flags).Where(m => m.Name == name && m.GetParameters().Length == args.Length);
+            foreach (var m in candidates)
+            {
+                var ps = m.GetParameters();
+                bool ok = true;
+                for (int i = 0; i < ps.Length; i++)
+                {
+                    var pType = ps[i].ParameterType;
+                    var a = args[i];
+                    if (a == null)
+                    {
+                        if (pType.IsValueType && Nullable.GetUnderlyingType(pType) == null) { ok = false; break; }
+                    }
+                    else
+                    {
+                        if (!pType.IsAssignableFrom(a.GetType()))
+                        {
+                            ok = false; break;
+                        }
+                    }
+                }
+                if (ok) return m;
+            }
+            return null;
+        }
     }
 }
