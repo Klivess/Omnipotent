@@ -393,7 +393,7 @@ namespace Omnipotent.Service_Manager
                 {
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
 
             await CreateAPIRoute("/OmniGlobalSettings/Get", async (req) =>
             {
@@ -409,7 +409,7 @@ namespace Omnipotent.Service_Manager
                 {
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
 
             await CreateAPIRoute("/OmniGlobalSettings/Set", async (req) =>
             {
@@ -426,7 +426,7 @@ namespace Omnipotent.Service_Manager
                 {
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Manager);
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
         }
     }
 }
