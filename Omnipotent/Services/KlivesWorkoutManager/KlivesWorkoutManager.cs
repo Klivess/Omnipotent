@@ -34,24 +34,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
         {
             workoutsAlreadySeen=new List<string>();
 
-            string hevyApiKey = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesWorkoutManagerHevyAPIKey));
-            if (string.IsNullOrEmpty(hevyApiKey))
-            {
-                string response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord",
-                    "Hevy API Key is not set for Klives Workout Manager.",
-                    "Get the API key from Hevy developer settings and enter it below.",
-                    TimeSpan.FromDays(7), "Enter your Hevy API key", "API key");
-                hevyApiKey = response?.Trim();
-                if (string.IsNullOrEmpty(hevyApiKey))
-                {
-                    await ServiceLogError("Hevy API Key was not provided. Exiting Klives Workout Manager service.");
-                    await TerminateService();
-                    return;
-                }
-                await GetDataHandler().WriteToFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesWorkoutManagerHevyAPIKey), hevyApiKey);
-                await ServiceLog($"Hevy API Key has been saved.");
-            }
-
+            string hevyApiKey = await GetOmniSetting("HevyAPIKey", OmniSettingType.String, true, true);
             await hevAPI.AuthoriseHevy(hevyApiKey);
 
             OnNewPersonalRecord += KlivesWorkoutManager_OnNewPersonalRecord;

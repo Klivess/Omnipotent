@@ -47,27 +47,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
                 ExchangeRate = null;
             }
-            string csfloatAPIKey = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatAPIKey));
-            if (string.IsNullOrEmpty(csfloatAPIKey))
-            {
-                await ServiceLogError("CSFloat API Key is not set. Contacting Klives");
-                string response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "CSFloat API Key is not set for CS2ArbitrageBot. Set it."
-                    , "Get the CSFloat API key by going to CSFloat Profile Developer tab", TimeSpan.FromDays(7), "Enter your API key", "API key");
-                csfloatAPIKey = response;
-                if (string.IsNullOrEmpty(csfloatAPIKey))
-                {
-                    await ServiceLogError("CSFloat API Key is still not set. Exiting CS2ArbitrageBot service.");
-                    await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "CSFloat API Key is empty.... Exiting CS2ArbitrageBot service.");
-                    await TerminateService();
-                }
-                else
-                {
-                    await GetDataHandler().WriteToFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotCSFloatAPIKey), csfloatAPIKey);
-                    await ServiceLog($"CSFloat API Key set to: {csfloatAPIKey}");
-                }
-            }
-
-
+            string csfloatAPIKey = await GetOmniSetting("CSFloatAPIKey", OmniSettingType.String, true, true);
 
             steamAPIWrapper = new SteamAPIWrapper(this);
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
