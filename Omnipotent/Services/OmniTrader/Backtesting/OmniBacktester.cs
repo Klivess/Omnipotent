@@ -7,7 +7,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
     {
         private readonly BacktestSettings _settings;
         private readonly OmniTraderStrategy _strategy;
-        private readonly RequestKlineData.OHLCCandlesData _candles;
+        private readonly OmniTraderFinanceData.OHLCCandlesData _candles;
 
         private decimal _quoteBalance;
         private decimal _baseBalance;
@@ -28,16 +28,16 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private readonly List<TradeRecord> _trades = [];
         private readonly List<decimal> _equityCurve = [];
 
-        public OmniBacktester(OmniTraderStrategy strategy, RequestKlineData.OHLCCandlesData candles, BacktestSettings? settings = null)
+        public OmniBacktester(OmniTraderStrategy strategy, OmniTraderFinanceData.OHLCCandlesData candles, BacktestSettings? settings = null)
         {
             _strategy = strategy;
             _candles = candles;
             _settings = settings ?? new BacktestSettings();
         }
-        public OmniBacktester(OmniTraderStrategy strategy, List<RequestKlineData.OHLCCandle> candles, RequestKlineData.TimeInterval interval, BacktestSettings? settings = null)
+        public OmniBacktester(OmniTraderStrategy strategy, List<OmniTraderFinanceData.OHLCCandle> candles, OmniTraderFinanceData.TimeInterval interval, BacktestSettings? settings = null)
         {
             _strategy = strategy;
-            RequestKlineData.OHLCCandlesData candlesData = new(candles, interval);
+            OmniTraderFinanceData.OHLCCandlesData candlesData = new(candles, interval);
             _candles = candlesData;
             _settings = settings ?? new BacktestSettings();
         }
@@ -77,7 +77,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                     decimal equity = _quoteBalance + _baseBalance * currentCandle.Close;
                     _equityCurve.Add(equity);
 
-                    await _strategy.Tick(currentCandle);
+                    await _strategy.CandleClose(currentCandle);
                 }
             }
             finally
@@ -112,7 +112,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _takeProfitPrice = price > 0 ? price : null;
         }
 
-        private void CheckStopLossTakeProfit(RequestKlineData.OHLCCandle candle)
+        private void CheckStopLossTakeProfit(OmniTraderFinanceData.OHLCCandle candle)
         {
             bool slHit = _stopLossPrice.HasValue && candle.Low <= _stopLossPrice.Value;
             bool tpHit = _takeProfitPrice.HasValue && candle.High >= _takeProfitPrice.Value;
@@ -137,7 +137,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             }
         }
 
-        private void ExecuteSLTPExit(RequestKlineData.OHLCCandle candle, decimal fillPrice)
+        private void ExecuteSLTPExit(OmniTraderFinanceData.OHLCCandle candle, decimal fillPrice)
         {
             decimal executionPrice = fillPrice * (1 - _settings.SlippageFraction);
             decimal grossProceeds = _baseBalance * executionPrice;
@@ -235,7 +235,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             _takeProfitPrice = null;
         }
 
-        private void ForceClosePosition(RequestKlineData.OHLCCandle candle)
+        private void ForceClosePosition(OmniTraderFinanceData.OHLCCandle candle)
         {
             decimal executionPrice = candle.Close * (1 - _settings.SlippageFraction);
             decimal grossProceeds = _baseBalance * executionPrice;

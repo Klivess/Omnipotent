@@ -51,9 +51,9 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             _inPosition = false;
 
             // Fetch training data (separate pair/interval to avoid look-ahead bias)
-            var trainingData = await parent.requestKlineData.GetCryptoCandlesDataAsync(
+            var trainingData = await parent.data.GetCryptoCandlesDataAsync(
                 "BTC", "USD",
-                RequestKlineData.TimeInterval.FifteenMinute,
+                OmniTraderFinanceData.TimeInterval.FifteenMinute,
                 2000);
 
             var candles = trainingData.candles;
@@ -85,7 +85,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         /// <summary>
         /// Replays historical signals through the RL agent to bootstrap Q-values.
         /// </summary>
-        private void PreWarmRL(IList<RequestKlineData.OHLCCandle> candles)
+        private void PreWarmRL(IList<OmniTraderFinanceData.OHLCCandle> candles)
         {
             int episodes = 0;
             int startIndex = Math.Max(MetaLabelGate.MinHistoryRequired, AvgRangeLookback);
@@ -150,7 +150,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         }
 
         // ── Tick handler ──────────────────────────────────────────────────
-        protected override Task OnTick(RequestKlineData.OHLCCandle candlesData)
+        protected override Task OnCandleClose(OmniTraderFinanceData.OHLCCandle candlesData)
         {
             if (candleHistory.Count < MinBars)
                 return Task.CompletedTask;
@@ -266,7 +266,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         }
 
         // ── IBS entry signal check ────────────────────────────────────────
-        private static bool IsIBSEntrySignal(IList<RequestKlineData.OHLCCandle> candles, int idx)
+        private static bool IsIBSEntrySignal(IList<OmniTraderFinanceData.OHLCCandle> candles, int idx)
         {
             if (idx < AvgRangeLookback - 1)
                 return false;
@@ -293,7 +293,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
         }
 
         // ── RL state computation ──────────────────────────────────────────
-        private static int ComputeRLState(IList<RequestKlineData.OHLCCandle> candles, int idx)
+        private static int ComputeRLState(IList<OmniTraderFinanceData.OHLCCandle> candles, int idx)
         {
             decimal close = candles[idx].Close;
             decimal atr = TechnicalIndicators.ATR(candles, 14, idx);

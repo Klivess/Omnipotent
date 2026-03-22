@@ -13,7 +13,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             Name = "Simple XGBoost Regression Strategy";
             Description = "A simple regression strategy using XGBoost to predict the close price of the very next candle.";
         }
-        private static (float[][] features, float[] labels) BuildFeatureMatrix(IList<RequestKlineData.OHLCCandle> candles)
+        private static (float[][] features, float[] labels) BuildFeatureMatrix(IList<OmniTraderFinanceData.OHLCCandle> candles)
         {
             int count = candles.Count - 1;
             float[][] features = new float[count][];
@@ -43,7 +43,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             //Train model (ideally we'd have the model already loaded but this is lowkey just a test strategy lol)
 
             //Prepare data
-            var data = await parent.requestKlineData.GetCryptoCandlesDataAsync("ETH", "USD", RequestKlineData.TimeInterval.OneHour, 700);
+            var data = await parent.data.GetCryptoCandlesDataAsync("ETH", "USD", OmniTraderFinanceData.TimeInterval.OneHour, 700);
 
             var allCandles = data.candles;
             var trainCandles = allCandles.Take(500).ToList();
@@ -66,7 +66,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             StrategyLog("Model trained. Test MAE: {mae:F2} USD over {predictions.Length} samples.");
         }
 
-        protected override async Task OnTick(RequestKlineData.OHLCCandle latest)
+        protected override async Task OnCandleClose(OmniTraderFinanceData.OHLCCandle latest)
         {
             if (regressor == null)
                 return;

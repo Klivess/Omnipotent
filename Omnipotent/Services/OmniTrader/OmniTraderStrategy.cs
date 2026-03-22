@@ -24,7 +24,7 @@ namespace Omnipotent.Services.OmniTrader
         internal event Action<decimal>? OnStopLossUpdated;
         internal event Action<decimal>? OnTakeProfitUpdated;
 
-        public List<RequestKlineData.OHLCCandle> candleHistory;
+        public List<OmniTraderFinanceData.OHLCCandle> candleHistory;
 
         public async Task Initialise(OmniTrader parent)
         {
@@ -38,7 +38,7 @@ namespace Omnipotent.Services.OmniTrader
         }
         protected virtual async Task OnLoad() { }
 
-        public async Task Tick(RequestKlineData.OHLCCandle candleData)
+        public async Task CandleClose(OmniTraderFinanceData.OHLCCandle candleData)
         {
             if (!IsLoaded)
                 throw new InvalidOperationException($"Strategy '{Name}' was not initialised. Call Initialise() before Tick().");
@@ -47,10 +47,10 @@ namespace Omnipotent.Services.OmniTrader
                 return;
 
             candleHistory.Add(candleData);
-            await OnTick(candleData);
+            await OnCandleClose(candleData);
         }
 
-        protected virtual Task OnTick(RequestKlineData.OHLCCandle candleData) => Task.CompletedTask;
+        protected virtual Task OnCandleClose(OmniTraderFinanceData.OHLCCandle candleData) => Task.CompletedTask;
 
         protected void RaiseBuy(AmountType amountType, decimal inputAmount, decimal? stopLossPrice = null, decimal? takeProfitPrice = null)
         {
@@ -92,7 +92,7 @@ namespace Omnipotent.Services.OmniTrader
             await parent.ServiceLog($"[{Name}] {message}");
         }
 
-        public async Task<OmniBacktestResult> BacktestStrategy(RequestKlineData.OHLCCandlesData testSet, BacktestSettings? settings = null)
+        public async Task<OmniBacktestResult> BacktestStrategy(OmniTraderFinanceData.OHLCCandlesData testSet, BacktestSettings? settings = null)
         {
             var backtester = new OmniBacktester(this, testSet, settings);
             return await backtester.RunAsync();
@@ -101,12 +101,12 @@ namespace Omnipotent.Services.OmniTrader
         public async Task<OmniBacktestResult> FindBestTimeframeForStrategy(string coin, string currency, int amountOfCandles = 500, BacktestSettings? settings = null)
         {
             OmniBacktestResult bestResult = new();
-            foreach(var frame in Enum.GetValues(typeof(RequestKlineData.TimeInterval)))
+            foreach(var frame in Enum.GetValues(typeof(OmniTraderFinanceData.TimeInterval)))
             {
-                RequestKlineData.TimeInterval interval = (RequestKlineData.TimeInterval)frame;
-                if (interval >= RequestKlineData.TimeInterval.OneWeek)
+                OmniTraderFinanceData.TimeInterval interval = (OmniTraderFinanceData.TimeInterval)frame;
+                if (interval >= OmniTraderFinanceData.TimeInterval.OneWeek)
                     break;
-                var testSet = await parent.requestKlineData.GetCryptoCandlesDataAsync(coin, currency, interval, amountOfCandles);
+                var testSet = await parent.data.GetCryptoCandlesDataAsync(coin, currency, interval, amountOfCandles);
                 var backtester = new OmniBacktester(this, testSet, settings);
                 var result = await backtester.RunAsync();
                 if (result.FinalEquity > bestResult.FinalEquity)

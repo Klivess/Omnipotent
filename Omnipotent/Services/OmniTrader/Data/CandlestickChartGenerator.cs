@@ -1,5 +1,5 @@
 using ScottPlot;
-using static Omnipotent.Services.OmniTrader.Data.RequestKlineData;
+using static Omnipotent.Services.OmniTrader.Data.OmniTraderFinanceData;
 
 namespace Omnipotent.Services.OmniTrader.Data
 {

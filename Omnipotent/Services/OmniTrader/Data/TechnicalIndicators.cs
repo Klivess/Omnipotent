@@ -10,7 +10,7 @@ namespace Omnipotent.Services.OmniTrader.Data
         /// Simple Moving Average of Close prices over the last <paramref name="period"/> candles
         /// ending at <paramref name="endIndex"/> (inclusive).
         /// </summary>
-        public static decimal SMA(IList<RequestKlineData.OHLCCandle> candles, int period, int endIndex)
+        public static decimal SMA(IList<OmniTraderFinanceData.OHLCCandle> candles, int period, int endIndex)
         {
             if (endIndex < period - 1)
                 throw new ArgumentException("Not enough candles for SMA calculation.");
@@ -25,7 +25,7 @@ namespace Omnipotent.Services.OmniTrader.Data
         /// Relative Strength Index over the last <paramref name="period"/> candles
         /// ending at <paramref name="endIndex"/> (inclusive).
         /// </summary>
-        public static decimal RSI(IList<RequestKlineData.OHLCCandle> candles, int period, int endIndex)
+        public static decimal RSI(IList<OmniTraderFinanceData.OHLCCandle> candles, int period, int endIndex)
         {
             if (endIndex < period)
                 throw new ArgumentException("Not enough candles for RSI calculation.");
@@ -51,7 +51,7 @@ namespace Omnipotent.Services.OmniTrader.Data
         /// Average True Range over the last <paramref name="period"/> candles
         /// ending at <paramref name="endIndex"/> (inclusive).
         /// </summary>
-        public static decimal ATR(IList<RequestKlineData.OHLCCandle> candles, int period, int endIndex)
+        public static decimal ATR(IList<OmniTraderFinanceData.OHLCCandle> candles, int period, int endIndex)
         {
             if (endIndex < period)
                 throw new ArgumentException("Not enough candles for ATR calculation.");
@@ -71,7 +71,7 @@ namespace Omnipotent.Services.OmniTrader.Data
         /// Ratio of the volume at <paramref name="index"/> to the average volume
         /// over the preceding <paramref name="lookback"/> candles.
         /// </summary>
-        public static decimal VolumeRatio(IList<RequestKlineData.OHLCCandle> candles, int lookback, int index)
+        public static decimal VolumeRatio(IList<OmniTraderFinanceData.OHLCCandle> candles, int lookback, int index)
         {
             if (index < lookback)
                 throw new ArgumentException("Not enough candles for volume ratio.");
@@ -87,7 +87,7 @@ namespace Omnipotent.Services.OmniTrader.Data
         /// Internal Bar Strength: (Close - Low) / (High - Low).
         /// Returns 0.5 when the bar has no range.
         /// </summary>
-        public static decimal IBS(RequestKlineData.OHLCCandle candle)
+        public static decimal IBS(OmniTraderFinanceData.OHLCCandle candle)
         {
             decimal range = candle.High - candle.Low;
             return range == 0 ? 0.5m : (candle.Close - candle.Low) / range;

@@ -1,5 +1,5 @@
 using Omnipotent.Services.OmniTrader.Data;
-using static Omnipotent.Services.OmniTrader.Data.RequestKlineData;
+using static Omnipotent.Services.OmniTrader.Data.OmniTraderFinanceData;
 
 namespace Omnipotent.Tests.OmniTrader
 {

@@ -29,7 +29,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             return Task.CompletedTask;
         }
 
-        protected override Task OnTick(RequestKlineData.OHLCCandle current)
+        protected override Task OnCandleClose(OmniTraderFinanceData.OHLCCandle current)
         {
 
             // Need at least AvgRangeLookback bars of history to evaluate signals
@@ -66,7 +66,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             return Task.CompletedTask;
         }
 
-        private static decimal CalculateIBS(RequestKlineData.OHLCCandle candle)
+        private static decimal CalculateIBS(OmniTraderFinanceData.OHLCCandle candle)
         {
             decimal range = candle.High - candle.Low;
             if (range == 0)

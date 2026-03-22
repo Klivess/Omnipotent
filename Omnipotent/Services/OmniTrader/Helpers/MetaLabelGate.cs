@@ -22,7 +22,7 @@ namespace Omnipotent.Services.OmniTrader.Helpers
         /// Builds a feature vector describing market context at the given candle index.
         /// Features: RSI(14), SMA(50) distance %, ATR(14) / price %, volume ratio (24-bar), IBS.
         /// </summary>
-        public static float[] ExtractFeatures(IList<RequestKlineData.OHLCCandle> candles, int index)
+        public static float[] ExtractFeatures(IList<OmniTraderFinanceData.OHLCCandle> candles, int index)
         {
             decimal close = candles[index].Close;
 
@@ -88,7 +88,7 @@ namespace Omnipotent.Services.OmniTrader.Helpers
         /// <paramref name="maxHoldBars"/> bars; otherwise Loss.
         /// </summary>
         public static (float[][] features, float[] labels) GenerateTrainingData(
-            IList<RequestKlineData.OHLCCandle> candles,
+            IList<OmniTraderFinanceData.OHLCCandle> candles,
             int maxHoldBars = 20)
         {
             const int highLookback = 10;
