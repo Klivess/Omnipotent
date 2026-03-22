@@ -50,6 +50,7 @@
 		<PackageReference Include="System.Management" Version="9.0.7" />
 		<PackageReference Include="Telegram.Bot" Version="22.9.5.3" />
 		<PackageReference Include="Websocket.Client" Version="5.2.0" />
+		<PackageReference Include="WTelegramClient" Version="4.4.2" />
 		<PackageReference Include="XGBoostSharp" Version="0.5.2" />
 		<PackageReference Include="XGBoostSharp-cpu" Version="0.5.2" />
 	</ItemGroup>
