@@ -17,6 +17,7 @@ namespace Omnipotent.Data_Handling
         public struct GlobalPaths
         {
             public static string SavedDataDirectory = $"SavedData"; // (hardcoded into OP monitor, do not change value)
+            public static string OmniGlobalSettingsDirectory = $"{SavedDataDirectory}/OmniGlobalSettings";
             public static string KliveBotDiscordBotDirectory = $"{SavedDataDirectory}/KliveBotDiscordBot";
             public static string KliveBotDiscordTokenText = $"{KliveBotDiscordBotDirectory}/KliveBotDiscordToken.txt";
             public static string TimeManagementTasksDirectory = $"{SavedDataDirectory}/TimeManager";
@@ -72,6 +73,7 @@ namespace Omnipotent.Data_Handling
             //OmniTrader
             public static string OmniTraderDirectory = $"{SavedDataDirectory}/OmniTrader";
             public static string OmniTraderAPIKey = $"{OmniTraderDirectory}/Trading212APIKey.txt";
+            public static string OmniTraderStrategiesDirectory = $"{OmniTraderDirectory}/Strategies";
 
             //Meme Scraper 
             public static string MemeScraperDirectory = $"{SavedDataDirectory}/MemeScraper";

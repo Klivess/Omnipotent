@@ -149,6 +149,20 @@ namespace Omnipotent.Service_Manager
             await ExecuteServiceMethod<KliveAPI>("CreateRoute", path, handler, method, permission);
         }
 
+        // Shortcut to get an omni setting from the global settings manager
+        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", name, type, sensitive, askKlivesForFulfillment);
+            return res as string;
+        }
+
+        // Convenience overload that infers caller name
+        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", type, sensitive, askKlivesForFulfillment);
+            return res as string;
+        }
+
         //intialise OmniService, don't actually use this here this class is meant to be a "template" to derive from.
         public OmniService(string name, ThreadAnteriority anteriority)
         {

@@ -1,4 +1,5 @@
-﻿using Omnipotent.Services.OmniTrader.Backtesting;
+﻿using Omnipotent.Data_Handling;
+using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
 
 namespace Omnipotent.Services.OmniTrader
@@ -26,8 +27,18 @@ namespace Omnipotent.Services.OmniTrader
 
         public List<OmniTraderFinanceData.OHLCCandle> candleHistory;
 
+        public string OmniStrategyDirectoryPath = "";
+
         public async Task Initialise(OmniTrader parent)
         {
+            string proposedDirPathName = Name;
+            foreach (char c in System.IO.Path.GetInvalidFileNameChars())
+            {
+                proposedDirPathName = proposedDirPathName.Replace(c, '_');
+            }
+            OmniStrategyDirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniTraderStrategiesDirectory), proposedDirPathName);
+            Directory.CreateDirectory(OmniStrategyDirectoryPath);
+
             this.parent = parent;
             candleHistory = new();
             if (IsLoaded)
