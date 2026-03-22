@@ -72,6 +72,13 @@ namespace Omnipotent.Services.MemeScraper
         public async Task ScrapeInstagramAccount(MemeScraperSources.InstagramSource source)
         {
             Random rnd = new();
+            if(await GetBoolOmniSetting("ScrapeInstagramAccounts", true) == false)
+            {
+                ServiceLog("Scraping Instagram accounts is currently disabled in settings. Skipping scraping.");
+                ServiceCreateScheduledTask(DateTime.Now.AddDays(3).AddMinutes(rnd.Next(0, 500)), "ScrapeAllInstagramPostsFromSource" + source.Username,
+    "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
+                return;
+            }
             try
             {
                 if (source.DownloadReels)
@@ -136,7 +143,6 @@ namespace Omnipotent.Services.MemeScraper
                     $"Go through all of {source.Username} posts and download them after an error.", false, source.AccountID);
             }
         }
-
 
         private async Task CreateRoutes()
         {

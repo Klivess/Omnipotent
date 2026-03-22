@@ -386,6 +386,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             try
             {
+                if(await GetBoolOmniSetting("PerformCS2Scans", true) == false)
+                {
+                    ServiceLog("PerformCS2Scans setting is false, skipping scan.");
+                    await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market", false);
+                    return;
+                }
+
                 if (ExchangeRate == null)
                 {
                     //try get exchange rate, if fails, log it and reschedule for 1 hour from now to try 
@@ -395,7 +402,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     }
                     catch (Exception e)
                     {
-                        ServiceLogError(e, "Error while getting exchange rate from CSFloat. Will not make any purchasing decisions for this session.");
+                        ServiceLogError(e, "Error while getting exchange rate from CSFloat.");
                         ExchangeRate = null;
                         await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(60), "SnipeCS2Deals", "CS2ArbitrageSearch", "Search through CSFloat and compare listings to Steam Market after error getting exchange rate.", false);
                         return;
@@ -529,30 +536,34 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
                     bool itemPurchased = false;
                     //Purchase item
-                    try
+
+                    if(await GetBoolOmniSetting("PurchaseCSFloatArbitrageOpportunities", true) == true)
                     {
-                        csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
-                        if (csfloatAccountInformation.BalanceInPence > snipe.PriceInPence)
+                        try
                         {
-                            var result = await csFloatWrapper.BuyCSFloatListing(snipe);
-                            if (result == true)
+                            csfloatAccountInformation = await csFloatWrapper.GetAccountInformation();
+                            if (csfloatAccountInformation.BalanceInPence > snipe.PriceInPence)
                             {
-                                itemPurchased = true;
-                                message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
-                                    bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Purchased"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                                var result = await csFloatWrapper.BuyCSFloatListing(snipe);
+                                if (result == true)
+                                {
+                                    itemPurchased = true;
+                                    message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
+                                        bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Purchased"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                                }
+                            }
+                            else
+                            {
+                                message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found but not purchased.",
+                                    bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Afford"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                             }
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found but not purchased.",
-                                bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Afford"), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
+                            ServiceLogError(ex, "Error while purchasing CSFloat listing.");
+                            message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
+                                bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Purchase - Error: " + ex.Message), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                         }
-                    }
-                    catch (Exception ex)
-                    {
-                        ServiceLogError(ex, "Error while purchasing CSFloat listing.");
-                        message.ModifyAsync(KliveBot_Discord.KliveBotDiscord.MakeSimpleEmbed("CS2 Snipe Opportunity Found and purchased!",
-                            bodytext.Replace("Purchase Status: Purchasing...", "Purchase Status: Couldnt Purchase - Error: " + ex.Message), DiscordColor.DarkRed, new Uri(snipe.ImageURL)));
                     }
 
                     //Scanalytics
