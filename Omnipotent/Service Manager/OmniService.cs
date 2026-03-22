@@ -150,16 +150,16 @@ namespace Omnipotent.Service_Manager
         }
 
         // Shortcut to get an omni setting from the global settings manager
-        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", name, type, sensitive, askKlivesForFulfillment);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", name, type, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
             return res as string;
         }
 
         // Convenience overload that infers caller name
-        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", type, sensitive, askKlivesForFulfillment);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetOmniSetting", type, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
             return res as string;
         }
 

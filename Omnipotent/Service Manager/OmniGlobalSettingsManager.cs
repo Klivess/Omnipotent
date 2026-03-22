@@ -31,7 +31,6 @@ namespace Omnipotent.Service_Manager
         private readonly string settingsFilePath;
 
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new();
-        private readonly SemaphoreSlim saveLock = new(1, 1);
 
         public OmniGlobalSettingsManager()
         {
@@ -85,20 +84,12 @@ namespace Omnipotent.Service_Manager
 
         private async Task SaveSettings()
         {
-            await saveLock.WaitAsync();
-            try
-            {
-                var list = settings.Values.ToList();
-                await GetDataHandler().SerialiseObjectToFile(settingsFilePath, list);
-            }
-            finally
-            {
-                saveLock.Release();
-            }
+            var list = settings.Values.ToList();
+            await GetDataHandler().WriteToFile(settingsFilePath, JsonConvert.SerializeObject(list));
         }
 
         // Generic getter - will create the setting if it does not exist
-        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name))
             {
@@ -106,13 +97,15 @@ namespace Omnipotent.Service_Manager
             }
             try
             {
-                // Determine calling service information
+                // Determine parent service information (use provided values if present)
                 var callerInfo = GetCallingServiceInfo();
-                var compositeKey = ComposeKey(callerInfo.serviceId, name);
+                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                var compositeKey = ComposeKey(parentServiceId, name);
 
                 if (!settings.ContainsKey(compositeKey))
                 {
-                    var s = new OmniSetting { Name = name, Type = type, Sensitive = sensitive, Value = string.Empty, ParentServiceId = callerInfo.serviceId, ParentServiceName = callerInfo.serviceName };
+                    var s = new OmniSetting { Name = name, Type = type, Sensitive = sensitive, Value = string.Empty, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
                     settings[compositeKey] = s;
                     await SaveSettings();
                 }
@@ -147,12 +140,14 @@ namespace Omnipotent.Service_Manager
         }
 
         // Convenience overload that derives a name from caller if none provided
-        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
+        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             // Derive calling service name and id, and default name
             var callerInfo = GetCallingServiceInfo();
-            string name = callerInfo.serviceName + ".Default";
-            return await GetOmniSetting(name, type, sensitive, askKlivesForFulfillment);
+            if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+            if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+            string name = parentServiceName + ".Default";
+            return await GetOmniSetting(name, type, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
         }
 
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null)
