@@ -101,7 +101,25 @@ namespace Omnipotent.Service_Manager
 
                 if (!settings.ContainsKey(key))
                 {
-                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Bool, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    // Try to find an existing setting with the same name from any parent (back-compat / migration)
+                    var existing = settings.Values.FirstOrDefault(s => s.Name == name);
+                    if (existing != null)
+                    {
+                        // adopt existing value for this parent
+                        var oldKey = ComposeKey(existing.ParentServiceId, existing.Name);
+                        existing.ParentServiceId = parentServiceId;
+                        existing.ParentServiceName = parentServiceName;
+                        settings[key] = existing;
+                        // remove old mapping if different
+                        if (oldKey != key)
+                        {
+                            settings.TryRemove(oldKey, out _);
+                        }
+                    }
+                    else
+                    {
+                        settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Bool, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    }
                     await SaveSettings();
                 }
 
@@ -147,7 +165,22 @@ namespace Omnipotent.Service_Manager
 
                 if (!settings.ContainsKey(key))
                 {
-                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Int, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    var existing = settings.Values.FirstOrDefault(s => s.Name == name);
+                    if (existing != null)
+                    {
+                        var oldKey = ComposeKey(existing.ParentServiceId, existing.Name);
+                        existing.ParentServiceId = parentServiceId;
+                        existing.ParentServiceName = parentServiceName;
+                        settings[key] = existing;
+                        if (oldKey != key)
+                        {
+                            settings.TryRemove(oldKey, out _);
+                        }
+                    }
+                    else
+                    {
+                        settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Int, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    }
                     await SaveSettings();
                 }
 
@@ -193,7 +226,22 @@ namespace Omnipotent.Service_Manager
 
                 if (!settings.ContainsKey(key))
                 {
-                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.String, Sensitive = sensitive, Value = defaultValue ?? string.Empty, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    var existing = settings.Values.FirstOrDefault(s => s.Name == name);
+                    if (existing != null)
+                    {
+                        var oldKey = ComposeKey(existing.ParentServiceId, existing.Name);
+                        existing.ParentServiceId = parentServiceId;
+                        existing.ParentServiceName = parentServiceName;
+                        settings[key] = existing;
+                        if (oldKey != key)
+                        {
+                            settings.TryRemove(oldKey, out _);
+                        }
+                    }
+                    else
+                    {
+                        settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.String, Sensitive = sensitive, Value = defaultValue ?? string.Empty, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    }
                     await SaveSettings();
                 }
 
