@@ -88,29 +88,116 @@ namespace Omnipotent.Service_Manager
             await GetDataHandler().WriteToFile(settingsFilePath, JsonConvert.SerializeObject(list));
         }
 
-        // Generic getter - will create the setting if it does not exist
-        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        // Typed getters/setters
+        public async Task<bool> GetBoolOmniSetting(string name, bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                throw new ArgumentException("Omni setting must have a name.", nameof(name));
-            }
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
             try
             {
-                // Determine parent service information (use provided values if present)
                 var callerInfo = GetCallingServiceInfo();
                 if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
                 if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
-                var compositeKey = ComposeKey(parentServiceId, name);
+                var key = ComposeKey(parentServiceId, name);
 
-                if (!settings.ContainsKey(compositeKey))
+                if (!settings.ContainsKey(key))
                 {
-                    var s = new OmniSetting { Name = name, Type = type, Sensitive = sensitive, Value = string.Empty, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
-                    settings[compositeKey] = s;
+                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Bool, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
                     await SaveSettings();
                 }
 
-                var setting = settings[compositeKey];
+                var setting = settings[key];
+
+                if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
+                {
+                    try
+                    {
+                        var prompt = $"Please provide value for setting '{name}' (bool)";
+                        var instructions = $"Enter true or false for setting '{name}'.";
+                        var response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord",
+                            prompt, instructions, TimeSpan.FromDays(7), "Setting value", "Value");
+                        if (!string.IsNullOrEmpty(response))
+                        {
+                            setting.Value = response.Trim();
+                            settings[key] = setting;
+                            await SaveSettings();
+                        }
+                    }
+                    catch { }
+                }
+
+                if (bool.TryParse(setting.Value, out var parsed)) return parsed;
+                return defaultValue;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "GetBoolOmniSetting failed");
+                return defaultValue;
+            }
+        }
+
+        public async Task<int> GetIntOmniSetting(string name, int defaultValue = 0, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            try
+            {
+                var callerInfo = GetCallingServiceInfo();
+                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                var key = ComposeKey(parentServiceId, name);
+
+                if (!settings.ContainsKey(key))
+                {
+                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Int, Sensitive = sensitive, Value = defaultValue.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    await SaveSettings();
+                }
+
+                var setting = settings[key];
+
+                if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
+                {
+                    try
+                    {
+                        var prompt = $"Please provide value for setting '{name}' (int)";
+                        var instructions = $"Enter an integer for setting '{name}'.";
+                        var response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord",
+                            prompt, instructions, TimeSpan.FromDays(7), "Setting value", "Value");
+                        if (!string.IsNullOrEmpty(response))
+                        {
+                            setting.Value = response.Trim();
+                            settings[key] = setting;
+                            await SaveSettings();
+                        }
+                    }
+                    catch { }
+                }
+
+                if (int.TryParse(setting.Value, out var parsed)) return parsed;
+                return defaultValue;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "GetIntOmniSetting failed");
+                return defaultValue;
+            }
+        }
+
+        public async Task<string> GetStringOmniSetting(string name, string defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            try
+            {
+                var callerInfo = GetCallingServiceInfo();
+                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                var key = ComposeKey(parentServiceId, name);
+
+                if (!settings.ContainsKey(key))
+                {
+                    settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.String, Sensitive = sensitive, Value = defaultValue ?? string.Empty, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    await SaveSettings();
+                }
+
+                var setting = settings[key];
 
                 if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
                 {
@@ -123,31 +210,48 @@ namespace Omnipotent.Service_Manager
                         if (!string.IsNullOrEmpty(response))
                         {
                             setting.Value = response.Trim();
-                            settings[compositeKey] = setting;
+                            settings[key] = setting;
                             await SaveSettings();
                         }
                     }
                     catch { }
                 }
 
-                return setting.Value;
+                return string.IsNullOrEmpty(setting.Value) ? defaultValue : setting.Value;
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "GetOmniSetting failed");
-                return null;
+                await ServiceLogError(ex, "GetStringOmniSetting failed");
+                return defaultValue;
             }
         }
 
-        // Convenience overload that derives a name from caller if none provided
-        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        // Convenience overloads that derive a name from caller if none provided
+        public async Task<bool> GetBoolOmniSetting(bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
-            // Derive calling service name and id, and default name
             var callerInfo = GetCallingServiceInfo();
             if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
             if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
             string name = parentServiceName + ".Default";
-            return await GetOmniSetting(name, type, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+            return await GetBoolOmniSetting(name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+        }
+
+        public async Task<int> GetIntOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, int defaultValue = 0, string parentServiceId = null, string parentServiceName = null)
+        {
+            var callerInfo = GetCallingServiceInfo();
+            if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+            if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+            string name = parentServiceName + ".Default";
+            return await GetIntOmniSetting(name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+        }
+
+        public async Task<string> GetStringOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, string defaultValue = null, string parentServiceId = null, string parentServiceName = null)
+        {
+            var callerInfo = GetCallingServiceInfo();
+            if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
+            if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+            string name = parentServiceName + ".Default";
+            return await GetStringOmniSetting(name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
         }
 
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null)
@@ -187,6 +291,58 @@ namespace Omnipotent.Service_Manager
                 await ServiceLogError(ex, "SetOmniSetting failed");
                 return false;
             }
+        }
+
+        // Typed setters
+        public async Task<bool> SetBoolOmniSetting(string name, bool value, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            try
+            {
+                if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+                {
+                    var ci = GetCallingServiceInfo();
+                    if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = ci.serviceId;
+                    if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = ci.serviceName;
+                }
+                var key = ComposeKey(parentServiceId, name);
+                settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Bool, Sensitive = false, Value = value.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                await SaveSettings();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "SetBoolOmniSetting failed");
+                return false;
+            }
+        }
+
+        public async Task<bool> SetIntOmniSetting(string name, int value, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            try
+            {
+                if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+                {
+                    var ci = GetCallingServiceInfo();
+                    if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = ci.serviceId;
+                    if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = ci.serviceName;
+                }
+                var key = ComposeKey(parentServiceId, name);
+                settings[key] = new OmniSetting { Name = name, Type = OmniSettingType.Int, Sensitive = false, Value = value.ToString(), ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                await SaveSettings();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "SetIntOmniSetting failed");
+                return false;
+            }
+        }
+
+        public async Task<bool> SetStringOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null)
+        {
+            return await SetOmniSetting(name, value, parentServiceId, parentServiceName);
         }
 
         private (string serviceName, string serviceId) GetCallingServiceInfo()
