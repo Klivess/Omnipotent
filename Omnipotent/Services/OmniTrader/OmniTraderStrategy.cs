@@ -103,6 +103,11 @@ namespace Omnipotent.Services.OmniTrader
             await parent.ServiceLog($"[{Name}] {message}");
         }
 
+        public async void StrategyLogError(Exception ex, string message)
+        {
+            await parent.ServiceLogError(ex, $"[{Name}] {message}");
+        }
+
         public async Task<OmniBacktestResult> BacktestStrategy(OmniTraderFinanceData.OHLCCandlesData testSet, BacktestSettings? settings = null)
         {
             var backtester = new OmniBacktester(this, testSet, settings);

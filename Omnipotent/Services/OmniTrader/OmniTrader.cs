@@ -4,7 +4,7 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
-using Omnipotent.Services.OmniTrader.Strategies;
+using Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy;
 using static Omnipotent.Services.OmniTrader.Data.OmniTraderFinanceData;
 
 namespace Omnipotent.Services.OmniTrader
