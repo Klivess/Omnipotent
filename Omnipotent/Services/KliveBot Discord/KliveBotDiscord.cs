@@ -118,18 +118,30 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
         {
             try
             {
-                while (Client == null) { }
+                // Use a TaskCompletionSource to avoid busy-waiting
+                await WaitForClientInitializationAsync();
+
                 if (KlivesMember == null)
                 {
                     GuildContainingKlives = await Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
                     KlivesMember = await GuildContainingKlives.GetMemberAsync(OmniPaths.KlivesDiscordAccountID);
                 }
-                return await KlivesMember.SendMessageAsync(OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "" + message);
+
+                string prefix = OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "";
+                return await KlivesMember.SendMessageAsync(prefix + message);
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Sending message to Klives failed!");
                 return null;
+            }
+        }
+
+        private async Task WaitForClientInitializationAsync()
+        {
+            while (Client == null)
+            {
+                await Task.Delay(50); // Avoid busy-waiting by yielding control
             }
         }
 
