@@ -60,8 +60,6 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             // Wire up strategy signals
             _strategy.OnLong += HandleBuy;
             _strategy.OnSell += HandleSell;
-            _strategy.OnStopLossUpdated += HandleStopLossUpdated;
-            _strategy.OnTakeProfitUpdated += HandleTakeProfitUpdated;
 
             try
             {
@@ -84,8 +82,6 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             {
                 _strategy.OnLong -= HandleBuy;
                 _strategy.OnSell -= HandleSell;
-                _strategy.OnStopLossUpdated -= HandleStopLossUpdated;
-                _strategy.OnTakeProfitUpdated -= HandleTakeProfitUpdated;
             }
 
             // If still in a position at the end, force-close at last close
