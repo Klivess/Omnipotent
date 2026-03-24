@@ -58,7 +58,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies
 
                 if (current.Close < entryThreshold && ibs < IBSThreshold)
                 {
-                    RaiseBuy(AmountType.Percentage, 100);
+                    RaiseLong(AmountType.Percentage, 100);
                     _inPosition = true;
                 }
             }

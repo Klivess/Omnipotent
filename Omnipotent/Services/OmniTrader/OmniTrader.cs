@@ -12,6 +12,7 @@ namespace Omnipotent.Services.OmniTrader
     public class OmniTrader : OmniService
     {
         public OmniTraderFinanceData data;
+        public OmniTraderSimulator simulator;
         public OmniTrader()
         {
             name = "OmniTrader";
@@ -20,13 +21,26 @@ namespace Omnipotent.Services.OmniTrader
         protected override async void ServiceMain()
         {
             data = new OmniTraderFinanceData(this);
+            simulator= new OmniTraderSimulator(this);
 
-            if (!OmniPaths.CheckIfOnServer())
+            FlowSignalTraderStrategy strategy = new();
+            await strategy.Initialise(this);
+            strategy.engine.OnSignal += async (sender, e) =>
             {
-                FlowSignalTraderStrategy strategy = new();
-                await strategy.Initialise(this);
-                ServiceLog("");
-            }
+                var s = e.Signal;
+                string msg = "\n*****************************************\n" +
+             $"NEW SIGNAL: {e.Symbol} {s.Direction}\n" +
+             $"Type: {s.SetupType} | Strength: {s.Strength}\n" +
+             $"Entry: {s.Price} | SL: {s.StopLoss} | TP: {s.TakeProfit1}\n" +
+             $"Reason: {s.Reason} | Score: {s.Score}/15\n" +
+             "*****************************************\n";
+
+
+                if (DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22)&&s.Score>=10)
+                {
+                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", msg);
+                }
+            };
         }
 
         public async Task WriteBacktestResultToDesktop(OmniBacktestResult result)

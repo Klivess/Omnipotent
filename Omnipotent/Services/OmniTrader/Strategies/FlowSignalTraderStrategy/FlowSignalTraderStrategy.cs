@@ -17,7 +17,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy
 {
     public class FlowSignalTraderStrategy : OmniTraderStrategy
     {
-        FlowSignalScalpingEngine engine;
+        public FlowSignalScalpingEngine engine;
 
         public FlowSignalTraderStrategy()
         {
@@ -76,9 +76,17 @@ namespace Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy
                              $"Reason: {s.Reason} | Score: {s.Score}/15\n" +
                              "*****************************************\n";
 
-                StrategyLog(msg);
-
-                // Execute API trade order here.
+                if(tradeSessionState.GetOpenPositions().Count > 0)
+                {
+                    StrategyLog("Already have an open position. Skipping signal.");
+                    return;
+                }
+                //if datetime is between 15:30 and 22:00 UTC time
+                else if(DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22))
+                {
+                    StrategyLog(msg);
+                    RaiseLong(AmountType.Percentage, 10, Convert.ToDecimal(s.StopLoss), Convert.ToDecimal(s.TakeProfit1));
+                }
             };
 
             // 3. Subscribe to Heartbeat/Status Updates

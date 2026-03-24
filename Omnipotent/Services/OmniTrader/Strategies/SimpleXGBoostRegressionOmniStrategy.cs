@@ -90,9 +90,9 @@ namespace Omnipotent.Services.OmniTrader.Strategies
             string reason = $"Predicted: {predictedClose:F2} | Current: {currentClose:F2} | Delta: {delta:F2}";
 
             if (delta > predictedClose*1.02)
-                RaiseBuy(AmountType.Percentage, 5);
+                RaiseLong(AmountType.Percentage, 5);
             else if(delta < predictedClose*0.98)
-                RaiseSell(AmountType.Percentage, 5);
+                RaiseShort(AmountType.Percentage, 5);
         }
     }
 }

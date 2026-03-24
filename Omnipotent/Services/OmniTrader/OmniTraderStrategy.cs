@@ -1,6 +1,7 @@
 ﻿using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
+using System.Management.Automation.Remoting;
 
 namespace Omnipotent.Services.OmniTrader
 {
@@ -11,7 +12,34 @@ namespace Omnipotent.Services.OmniTrader
         public decimal? StopLossPrice;
         public decimal? TakeProfitPrice;
     }
-
+    public enum TradeSessionType
+    {
+        None,
+        Backtester,
+        Simulator,
+        Testnet,
+        Live
+    }
+    public class TradeSessionState
+    {
+        public TradeSessionType sessionType;
+        public List<TradePosition> Positions = new();
+        public List<TradePosition> GetOpenPositions()
+        {
+            return Positions.Where(p => p.closedTime == default).ToList();
+        }
+    }
+    public class TradePosition
+    {
+        public AmountType amountType;
+        public decimal inputAmount;
+        public decimal stopLossPrice;
+        public decimal takeProfitPrice;
+        public decimal positionEntryPrice;
+        public decimal positionClosedPrice;
+        public DateTime entryTime;
+        public DateTime closedTime;
+    }
     public class OmniTraderStrategy
     {
         public string Name;
@@ -20,17 +48,21 @@ namespace Omnipotent.Services.OmniTrader
         public OmniTrader parent;
         public bool IsLoaded = false;
 
-        public event EventHandler<TradeSignalEventArgs> OnBuy;
+        public event EventHandler<TradeSignalEventArgs> OnLong;
         public event EventHandler<TradeSignalEventArgs> OnSell;
-        internal event Action<decimal>? OnStopLossUpdated;
-        internal event Action<decimal>? OnTakeProfitUpdated;
+        public event EventHandler<TradeSignalEventArgs> OnShort;
+        public event EventHandler<TradePosition> ClosePosition;
+        public TradeSessionState tradeSessionState;
+
 
         public List<OmniTraderFinanceData.OHLCCandle> candleHistory;
 
         public string OmniStrategyDirectoryPath = "";
 
+        
         public async Task Initialise(OmniTrader parent)
         {
+            tradeSessionState = new TradeSessionState { sessionType = TradeSessionType.None };
             string proposedDirPathName = Name;
             foreach (char c in System.IO.Path.GetInvalidFileNameChars())
             {
@@ -63,32 +95,37 @@ namespace Omnipotent.Services.OmniTrader
 
         protected virtual Task OnCandleClose(OmniTraderFinanceData.OHLCCandle candleData) => Task.CompletedTask;
 
-        protected void RaiseBuy(AmountType amountType, decimal inputAmount, decimal? stopLossPrice = null, decimal? takeProfitPrice = null)
+        protected void RaiseLong(AmountType amountType, decimal inputAmount, decimal? stopLossPrice = null, decimal? takeProfitPrice = null)
         {
-            OnBuy?.Invoke(this, new TradeSignalEventArgs
+            OnLong?.Invoke(this, new TradeSignalEventArgs
             {
                 amountType = amountType,
                 inputAmount = inputAmount,
                 StopLossPrice = stopLossPrice,
-                TakeProfitPrice = takeProfitPrice
+                TakeProfitPrice = takeProfitPrice,
+            });
+        }
+
+        protected void RaiseShort(AmountType amountType, decimal inputAmount, decimal? stopLossPrice = null, decimal? takeProfitPrice = null)
+        {
+            OnShort?.Invoke(this, new TradeSignalEventArgs { 
+                amountType = amountType, inputAmount = inputAmount, StopLossPrice=stopLossPrice, TakeProfitPrice=takeProfitPrice
             });
         }
 
         protected void RaiseSell(AmountType amountType, decimal inputAmount)
         {
-            OnSell?.Invoke(this, new TradeSignalEventArgs { amountType = amountType, inputAmount = inputAmount });
+            OnSell?.Invoke(this, new TradeSignalEventArgs
+            {
+                amountType = amountType,
+                inputAmount = inputAmount
+            });
         }
 
-        protected void UpdateStopLoss(decimal price)
+        protected void RaiseClosePosition(TradePosition position)
         {
-            OnStopLossUpdated?.Invoke(price);
+            ClosePosition?.Invoke(this, position);
         }
-
-        protected void UpdateTakeProfit(decimal price)
-        {
-            OnTakeProfitUpdated?.Invoke(price);
-        }
-
         /// <summary>Called by the backtester when a stop-loss order fills. Override to update internal state.</summary>
         protected virtual void OnStopLossHit(decimal fillPrice) { }
 

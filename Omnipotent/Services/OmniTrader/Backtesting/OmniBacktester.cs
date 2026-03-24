@@ -58,7 +58,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             decimal initialEquity = _quoteBalance + _baseBalance * (_candles.candles.Count > 0 ? _candles.candles[0].Close : 0);
 
             // Wire up strategy signals
-            _strategy.OnBuy += HandleBuy;
+            _strategy.OnLong += HandleBuy;
             _strategy.OnSell += HandleSell;
             _strategy.OnStopLossUpdated += HandleStopLossUpdated;
             _strategy.OnTakeProfitUpdated += HandleTakeProfitUpdated;
@@ -82,7 +82,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             }
             finally
             {
-                _strategy.OnBuy -= HandleBuy;
+                _strategy.OnLong -= HandleBuy;
                 _strategy.OnSell -= HandleSell;
                 _strategy.OnStopLossUpdated -= HandleStopLossUpdated;
                 _strategy.OnTakeProfitUpdated -= HandleTakeProfitUpdated;

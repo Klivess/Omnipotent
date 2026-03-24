@@ -72,6 +72,7 @@ namespace Omnipotent
                 {
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
 
                 testTask();
 
@@ -79,7 +80,6 @@ namespace Omnipotent
                 if (!OmniPaths.CheckIfOnServer())
                 {
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
-                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                     omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
                 }
 
