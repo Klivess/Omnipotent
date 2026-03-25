@@ -197,13 +197,43 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             {
                 if (result.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    parent.ServiceLog("Ratelimited by Steam... Waiting 25 seconds, and trying again.");
-                    Task.Delay(TimeSpan.FromSeconds(25)).Wait();
-                    return GetItemOnMarket(itemHashName).GetAwaiter().GetResult();
+                    const int maxRetries = 100;
+                    var rand = new Random();
+                    parent.ServiceLog("Ratelimited by Steam. Starting exponential backoff retries.");
+
+                    for (int attempt = 1; attempt <= maxRetries; attempt++)
+                    {
+                        double backoffSeconds = Math.Pow(2, attempt); // 2, 4, 8, ...
+                        double jitter = rand.NextDouble(); // 0..1s jitter
+                        var delay = TimeSpan.FromSeconds(backoffSeconds + jitter);
+                        parent.ServiceLog($"Retry {attempt}/{maxRetries} in {delay.TotalSeconds:F1}s...");
+                        await Task.Delay(delay);
+
+                        // resend request asynchronously
+                        result = await client.SendAsync(message);
+                        SentRequests++;
+
+                        if (result.IsSuccessStatusCode)
+                        {
+                            // Successful — re-run the method to parse a fresh response
+                            return await GetItemOnMarket(itemHashName);
+                        }
+
+                        // If we got a non-429 error, abort retries and log below
+                        if (result.StatusCode != HttpStatusCode.TooManyRequests)
+                            break;
+                    }
+
+                    // If we get here, retries exhausted or a non-429 error occurred
+                    string retryResponse = string.Empty;
+                    try { retryResponse = await result.Content.ReadAsStringAsync(); } catch { }
+                    parent.ServiceLogError($"Failed to get item from the steam market after retries. Status Code: {result.StatusCode} Response: {retryResponse}");
+                    return listing;
                 }
                 else
                 {
                     parent.ServiceLogError($"Failed to get item from the steam market. \n\n Status Code: {result.StatusCode} Response: {strResponse}");
+                    return listing;
                 }
             }
             return listing;
