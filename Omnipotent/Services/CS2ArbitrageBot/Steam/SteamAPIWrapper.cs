@@ -210,7 +210,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         await Task.Delay(delay);
 
                         // resend request asynchronously
-                        result = await client.SendAsync(message);
+                        HttpClient retryClient = new();
+                        result = await retryClient.SendAsync(message);
                         SentRequests++;
 
                         if (result.IsSuccessStatusCode)
