@@ -36,7 +36,7 @@ namespace Omnipotent.Services.OmniTrader
              "*****************************************\n";
 
 
-                if (DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22)&&s.Score>=10)
+                if (DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22)&&s.Score>=8)
                 {
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", msg);
                 }
