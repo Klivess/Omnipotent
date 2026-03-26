@@ -92,7 +92,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy
             // 3. Subscribe to Heartbeat/Status Updates
             engine.OnStatusUpdate += (sender, statusText) =>
             {
-                StrategyLog($"   > TELEMETRY: {statusText}");
+                //StrategyLog($"   > TELEMETRY: {statusText}");
             };
             await engine.RunAsync();
             await Task.Delay(-1);
