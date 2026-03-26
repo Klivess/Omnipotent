@@ -160,77 +160,59 @@ namespace Omnipotent.Service_Manager
         }
 
         // Typed shortcuts to get omni settings from the global settings manager
-        public async Task<bool> GetBoolOmniSetting(string name, bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        public async Task<bool> GetBoolOmniSetting(string name, bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetBoolOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetBoolOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
             if (res == null) return defaultValue;
             return (bool)res;
         }
 
-        public async Task<bool> GetBoolOmniSetting(bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        public async Task<bool> GetBoolOmniSetting(bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetBoolOmniSetting", defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
-            if (res == null) return defaultValue;
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetBoolOmniSetting", defaultValue, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
             return (bool)res;
         }
 
-        public async Task<int> GetIntOmniSetting(string name, int defaultValue = 0, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        public async Task<int> GetIntOmniSetting(string name, int defaultValue = 0, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetIntOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetIntOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
             if (res == null) return defaultValue;
             return (int)res;
         }
 
-        public async Task<int> GetIntOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, int defaultValue = 0, string parentServiceId = null, string parentServiceName = null)
+        public async Task<int> GetIntOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, int defaultValue = 0)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetIntOmniSetting", sensitive, askKlivesForFulfillment, defaultValue, parentServiceId, parentServiceName);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetIntOmniSetting", sensitive, askKlivesForFulfillment, defaultValue, this.serviceID, this.name);
             if (res == null) return defaultValue;
             return (int)res;
         }
 
-        public async Task<string> GetStringOmniSetting(string name, string defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        public async Task<string> GetStringOmniSetting(string name, string defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetStringOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetStringOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
             return res as string ?? defaultValue;
         }
 
-        public async Task<string> GetStringOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, string defaultValue = null, string parentServiceId = null, string parentServiceName = null)
+        public async Task<string> GetStringOmniSetting(bool sensitive = false, bool askKlivesForFulfillment = false, string defaultValue = null)
         {
-            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetStringOmniSetting", sensitive, askKlivesForFulfillment, defaultValue, parentServiceId, parentServiceName);
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetStringOmniSetting", sensitive, askKlivesForFulfillment, defaultValue, this.serviceID, this.name);
             return res as string ?? defaultValue;
         }
 
         // Backwards-compatible generic getter that returns string representation
-        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
             switch (type)
             {
                 case OmniSettingType.Bool:
-                    var b = await GetBoolOmniSetting(name, defaultValue: false, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
+                    var b = await GetBoolOmniSetting(name, defaultValue: false, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment);
                     return b.ToString();
                 case OmniSettingType.Int:
-                    var i = await GetIntOmniSetting(name, defaultValue: 0, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
+                    var i = await GetIntOmniSetting(name, defaultValue: 0, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment);
                     return i.ToString();
                 case OmniSettingType.String:
                 default:
-                    return await GetStringOmniSetting(name, defaultValue: null, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
-            }
-        }
-
-        // Backwards-compatible convenience overload
-        public async Task<string> GetOmniSetting(OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
-        {
-            switch (type)
-            {
-                case OmniSettingType.Bool:
-                    var b = await GetBoolOmniSetting(defaultValue: false, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
-                    return b.ToString();
-                case OmniSettingType.Int:
-                    var i = await GetIntOmniSetting(sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, defaultValue: 0, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
-                    return i.ToString();
-                case OmniSettingType.String:
-                default:
-                    return await GetStringOmniSetting(sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment, defaultValue: null, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
+                    return await GetStringOmniSetting(name, defaultValue: null, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment);
             }
         }
 

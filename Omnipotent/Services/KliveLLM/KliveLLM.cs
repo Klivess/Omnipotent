@@ -18,6 +18,7 @@ using LangChain.Providers;
 using System.Drawing;
 using System.Text;
 using Newtonsoft.Json;
+using System.Security.Policy;
 
 namespace Omnipotent.Services.KliveLocalLLM
 {
@@ -25,6 +26,7 @@ namespace Omnipotent.Services.KliveLocalLLM
     {
         private string huggingFaceToken = "";
         private HttpClient client;
+        private string ModelDownloadUrl = "";
         public KliveLLM()
         {
             name = "KliveLLM";
@@ -33,16 +35,10 @@ namespace Omnipotent.Services.KliveLocalLLM
 
         protected override async void ServiceMain()
         {
-            huggingFaceToken = await GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLMTokenText));
-            if (string.IsNullOrEmpty(huggingFaceToken))
-            {
-                string apparentToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, true);
-                huggingFaceToken = apparentToken.Trim();
-            }
+            ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
+            huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
-            // Ensure local model is present and initialize reflective LLamaSharp wrapper if available
-            /* WAITING FOR QWEN3.5 SUPPORT https://github.com/SciSharp/LLamaSharp/issues/1340
             try
             {
                 await EnsureModelDownloadedAsync();
@@ -52,11 +48,6 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 // Swallow to avoid crashing service at startup if local model cannot be initialized
             }
-
-
-            var response = await QueryLocalLLMAsync("HELLO MY BROOOOOO");
-            ServiceLog($"LLM Response: {response.Response}");
-            */
         }
 
         public async Task<string> QueryLLM(string content)
@@ -70,7 +61,6 @@ namespace Omnipotent.Services.KliveLocalLLM
         }
 
         // Local model support (download + reflective loader)
-        private const string ModelDownloadUrl = "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf";
         private string modelPath;
         private ModelParams modelParams;
         private LLamaWeights modelWeights;
@@ -85,7 +75,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             // store models under configured OmniPaths LLM models directory
             string modelsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLMModelsDirectory);
             Directory.CreateDirectory(modelsDir);
-            string fileName = "Qwen3.5-4B-Q4_K_M.gguf";
+            string fileName = Path.GetFileName(new Uri(ModelDownloadUrl).AbsolutePath);
             modelPath = Path.Combine(modelsDir, fileName);
             if (File.Exists(modelPath)) return;
 
