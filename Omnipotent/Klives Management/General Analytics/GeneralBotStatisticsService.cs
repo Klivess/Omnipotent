@@ -69,9 +69,9 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     var messages = logger.overallMessages;
                     stats.TotalLogs = messages.Count;
                     int statusCount = 0, errorCount = 0;
-                    for (int i = 0; i < messages.Count; i++)
+                    foreach (var msg in messages)
                     {
-                        var t = messages[i].type;
+                        var t = msg.type;
                         if (t == OmniLogging.LogType.Status) statusCount++;
                         else if (t == OmniLogging.LogType.Error) errorCount++;
                     }

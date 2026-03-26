@@ -2,18 +2,18 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Spectre.Console;
 using System;
-using System.CodeDom;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using static Omnipotent.Logging.OmniLogging;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Logging
 {
@@ -39,8 +39,8 @@ namespace Omnipotent.Logging
             public DateTime TimeOfLog;
         }
 
-        public SynchronizedCollection<LoggedMessage> messagesToLog = new();
-        public SynchronizedCollection<LoggedMessage> overallMessages = new();
+        public ConcurrentQueue<LoggedMessage> messagesToLog = new();
+        public ConcurrentQueue<LoggedMessage> overallMessages = new();
 
         public OmniLogging()
         {
@@ -143,8 +143,8 @@ Data:
 
         protected override void ServiceMain()
         {
-            BeginLogLoop();
-            SetupRoutes();
+            _ = Task.Run(BeginLogLoop);
+            _ = SetupRoutes();
         }
 
         private async Task SetupRoutes()
@@ -161,40 +161,43 @@ Data:
 
         private async Task BeginLogLoop()
         {
-            if (messagesToLog.Any())
+            while (true)
             {
-                var message = messagesToLog.First();
-                messagesToLog.Remove(messagesToLog.First());
-                try
+                if (messagesToLog.TryDequeue(out var message))
                 {
-                    if (message.appearInConsole)
+                    try
                     {
-                        if (message.type == LogType.Status)
+                        if (message.appearInConsole)
                         {
-                            await WriteStatus(message);
+                            if (message.type == LogType.Status)
+                            {
+                                await WriteStatus(message);
+                            }
+                            else if (message.type == LogType.Error)
+                            {
+                                await WriteError(message);
+                            }
+                            else if (message.type == LogType.Update)
+                            {
+                                await WriteUpdate(message);
+                            }
                         }
-                        else if (message.type == LogType.Error)
+                        else
                         {
-                            await WriteError(message);
+                            message.position = overallMessages.Count + 1;
+                            overallMessages.Enqueue(message);
                         }
-                        else if (message.type == LogType.Update)
-                        {
-                            await WriteUpdate(message);
-                        }
-                        await Task.Delay(1);
                     }
-                    else
+                    catch (Exception)
                     {
-                        overallMessages.Add(message);
+                        // Ignore any write exceptions to prevent breaking the loop
                     }
                 }
-                catch (Exception ex) { }
+                else
+                {
+                    await Task.Delay(10);
+                }
             }
-
-            await Task.Delay(10);
-            //Recursive, hopefully this doesnt cause performance issues. (it did, but GC.Collect should hopefully prevents stack overflow)
-            //GC.Collect();
-            BeginLogLoop();
         }
 
         public static int GetLineOfException(Exception ex)
@@ -219,22 +222,22 @@ Data:
 
         public LoggedMessage LogStatus(string serviceName, string message, bool appearInConsole = true)
         {
+            LoggedMessage log = new();
+            log.serviceName = serviceName;
+            log.message = message;
+            log.type = LogType.Status;
             try
             {
-                LoggedMessage log = new();
-                log.serviceName = serviceName;
-                log.message = message;
-                log.type = LogType.Status;
                 log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-                log.TimeOfLog = DateTime.Now;
-                log.appearInConsole = appearInConsole;
-                messagesToLog.Add(log);
-                return log;
             }
-            catch (ArgumentException ex)
+            catch
             {
-                return LogStatus(serviceName, message);
+                log.logID = Guid.NewGuid().ToString();
             }
+            log.TimeOfLog = DateTime.Now;
+            log.appearInConsole = appearInConsole;
+            messagesToLog.Enqueue(log);
+            return log;
         }
 
         public LoggedMessage LogError(string serviceName, Exception ex, string specialMessage = "", bool appearInConsole = true)
@@ -244,10 +247,17 @@ Data:
             log.message = specialMessage;
             log.type = LogType.Error;
             log.errorInfo = new ErrorInformation(ex);
-            log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            try
+            {
+                log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            }
+            catch
+            {
+                log.logID = Guid.NewGuid().ToString();
+            }
             log.TimeOfLog = DateTime.Now;
             log.appearInConsole = appearInConsole;
-            messagesToLog.Add(log);
+            messagesToLog.Enqueue(log);
             return log;
         }
 
@@ -256,7 +266,7 @@ Data:
             loggedmessage.oldMessage = loggedmessage.message;
             loggedmessage.message = newMessage;
             loggedmessage.type = LogType.Update;
-            messagesToLog.Add(loggedmessage);
+            messagesToLog.Enqueue(loggedmessage);
         }
 
         public LoggedMessage LogError(string serviceName, string error, bool appearInConsole = true)
@@ -266,91 +276,79 @@ Data:
             log.message = error;
             log.type = LogType.Error;
             log.errorInfo = null;
-            log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            try
+            {
+                log.logID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
+            }
+            catch
+            {
+                log.logID = Guid.NewGuid().ToString();
+            }
             log.TimeOfLog = DateTime.Now;
             log.appearInConsole = appearInConsole;
-            messagesToLog.Add(log);
+            messagesToLog.Enqueue(log);
             return log;
         }
 
-        private async Task WriteStatus(LoggedMessage message, int? position = null)
+        private Task WriteStatus(LoggedMessage message, int? position = null)
         {
+            var timeStamp = $"[grey][[[/][bold blue]{message.TimeOfLog:HH:mm:ss}[/][grey]]][/]";
             if (position != null)
             {
-                Console.SetCursorPosition(0, position.Value);
-                Console.WriteLine(new string(' ', message.message.Length + 50));
-                Console.SetCursorPosition(0, position.Value);
-                Console.ForegroundColor = ConsoleColor.DarkBlue;
+                AnsiConsole.MarkupLine($"{timeStamp} [blue]{Markup.Escape(message.serviceName)}[/] [green]|[/] [yellow](Update)[/] [green]{Markup.Escape(message.message ?? string.Empty)}[/]");
             }
             else
             {
-                Console.ForegroundColor = ConsoleColor.Blue;
-            }
-            Console.Write($"{message.serviceName}");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($" | {message.message}");
-            Console.ForegroundColor = ConsoleColor.White;
-            if (position == null)
-            {
+                AnsiConsole.MarkupLine($"{timeStamp} [blue]{Markup.Escape(message.serviceName)}[/] [green]| {Markup.Escape(message.message ?? string.Empty)}[/]");
                 message.position = overallMessages.Count + 1;
-                overallMessages.Add(message);
+                overallMessages.Enqueue(message);
             }
+            return Task.CompletedTask;
         }
 
-        private async Task WriteUpdate(LoggedMessage message)
+        private Task WriteUpdate(LoggedMessage message)
         {
             try
             {
-                var pos = overallMessages.ToList().Find(k => k.logID == message.logID).position;
-                //duct tape solution fix before developing omnilogging
                 if (message.errorInfo == null)
                 {
-                    await WriteStatus(message, pos).WaitAsync(TimeSpan.FromSeconds(10));
+                    WriteStatus(message, 1);
                 }
                 else
                 {
-                    await WriteError(message, pos).WaitAsync(TimeSpan.FromSeconds(10));
+                    WriteError(message, 1);
                 }
-                Console.SetCursorPosition(0, overallMessages.Count + 1);
             }
             catch (Exception) { }
+            return Task.CompletedTask;
         }
 
-        private async Task WriteError(LoggedMessage message, int? position = null)
+        private Task WriteError(LoggedMessage message, int? position = null)
         {
-            if (position != null)
-            {
-                Console.SetCursorPosition(0, position.Value);
-                for (global::System.Int32 i = 0; i < message.oldMessage.Length - 1; i++)
-                {
-                    Console.Write(" ");
-                }
-                Console.ForegroundColor = ConsoleColor.DarkBlue;
-            }
-            else
-            {
-                Console.ForegroundColor = ConsoleColor.Blue;
-            }
-            Console.Write($"{message.serviceName}");
-            Console.ForegroundColor = ConsoleColor.Red;
+            var timeStamp = $"[grey][[[/][bold red]{message.TimeOfLog:HH:mm:ss}[/][grey]]][/]";
+            string updateLabel = position.HasValue ? "[yellow](Update)[/] " : "";
+
+            AnsiConsole.Markup($"{timeStamp} [blue]{Markup.Escape(message.serviceName)}[/] [red]|[/] {updateLabel}[bold red]Error:[/] ");
+
             if (message.errorInfo == null)
             {
-                Console.WriteLine($" | Error: {message.message}");
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(message.message ?? string.Empty)}[/]");
             }
             else if (!string.IsNullOrEmpty(message.message))
             {
-                Console.WriteLine($" | Error: {message.errorInfo.Value.FullFormattedMessage} - {message.message}");
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(message.errorInfo.Value.FullFormattedMessage)} - {Markup.Escape(message.message)}[/]");
             }
             else
             {
-                Console.WriteLine($" | Error: {message.errorInfo.Value.FullFormattedMessage}");
+                AnsiConsole.MarkupLine($"[red]{Markup.Escape(message.errorInfo.Value.FullFormattedMessage)}[/]");
             }
-            Console.ForegroundColor = ConsoleColor.White;
+
             if (position == null)
             {
                 message.position = overallMessages.Count + 1;
-                overallMessages.Add(message);
+                overallMessages.Enqueue(message);
             }
+            return Task.CompletedTask;
         }
 
 
@@ -358,20 +356,15 @@ Data:
         // Q: "Why rename the function instead of creating an overload?" A: Creating an overload will most CERTAINLY cause me 7 hours of agony in the future
         public static void LogStatusStatic(string serviceName, string message)
         {
-            Console.ForegroundColor = ConsoleColor.Blue;
-            Console.Write($"{serviceName}");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($" | {message}");
-            Console.ForegroundColor = ConsoleColor.White;
+            var timeStamp = $"[grey][[[/][bold blue]{DateTime.Now:HH:mm:ss}[/][grey]]][/]";
+            AnsiConsole.MarkupLine($"{timeStamp} [blue]{Markup.Escape(serviceName)}[/] [green]| {Markup.Escape(message ?? string.Empty)}[/]");
         }
 
         public static void LogErrorStatic(string serviceName, Exception ex, string specialMessage = "")
         {
-            Console.ForegroundColor = ConsoleColor.Blue;
-            Console.Write($"{serviceName}");
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($" | Error: " + ex.Message + " - " + specialMessage);
-            Console.ForegroundColor = ConsoleColor.White;
+            var timeStamp = $"[grey][[[/][bold red]{DateTime.Now:HH:mm:ss}[/][grey]]][/]";
+            AnsiConsole.MarkupLine($"{timeStamp} [blue]{Markup.Escape(serviceName)}[/] [red]| Error: {Markup.Escape(ex.Message)} - {Markup.Escape(specialMessage)}[/]");
+            AnsiConsole.WriteException(ex);
         }
     }
 }
