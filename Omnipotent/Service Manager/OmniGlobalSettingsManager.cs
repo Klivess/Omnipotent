@@ -31,8 +31,6 @@ namespace Omnipotent.Service_Manager
         private readonly string settingsFilePath;
 
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new();
-
-        // Semaphore to prevent file locking/corruption when saving concurrently
         private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
 
         public OmniGlobalSettingsManager()
@@ -63,7 +61,7 @@ namespace Omnipotent.Service_Manager
             {
                 if (File.Exists(settingsFilePath))
                 {
-                    string json = await GetDataHandler().ReadDataFromFile(settingsFilePath);
+                    string json = await File.ReadAllTextAsync(settingsFilePath);
                     var list = JsonConvert.DeserializeObject<List<OmniSetting>>(json) ?? new List<OmniSetting>();
 
                     foreach (var s in list)
@@ -76,6 +74,7 @@ namespace Omnipotent.Service_Manager
                             await ServiceLogError("Skipped loading an omni setting without a name.");
                             continue;
                         }
+                        
                         settings[ComposeKey(s.ParentServiceId, s.Name)] = s;
                     }
                 }
@@ -97,7 +96,18 @@ namespace Omnipotent.Service_Manager
             {
                 var list = settings.Values.ToList();
                 string json = JsonConvert.SerializeObject(list, Formatting.Indented);
-                await GetDataHandler().WriteToFile(settingsFilePath, json);
+                
+                string tempPath = settingsFilePath + ".tmp";
+                await File.WriteAllTextAsync(tempPath, json);
+                
+                if (File.Exists(settingsFilePath))
+                {
+                    File.Replace(tempPath, settingsFilePath, null);
+                }
+                else
+                {
+                    File.Move(tempPath, settingsFilePath);
+                }
             }
             catch (Exception ex)
             {
@@ -109,13 +119,24 @@ namespace Omnipotent.Service_Manager
             }
         }
 
-        // --- Core Helper to keep code DRY and Thread-Safe ---
         private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName)
         {
             var key = ComposeKey(parentServiceId, name);
             bool isNewOrModified = false;
+            
+            // Fix async thread context loss causing misidentified callers:
+            // If the parentServiceId is unknown (0), we try to find any existing setting with the same name.
+            OmniSetting setting = null;
+            if (settings.TryGetValue(key, out var exactMatch))
+            {
+                setting = exactMatch;
+            }
+            else if (parentServiceId == "0")
+            {
+                setting = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            }
 
-            if (!settings.TryGetValue(key, out var setting))
+            if (setting == null)
             {
                 setting = new OmniSetting
                 {
@@ -126,6 +147,8 @@ namespace Omnipotent.Service_Manager
                     ParentServiceId = parentServiceId,
                     ParentServiceName = parentServiceName
                 };
+                
+                key = ComposeKey(setting.ParentServiceId, setting.Name);
                 settings[key] = setting;
                 isNewOrModified = true;
             }
@@ -142,7 +165,7 @@ namespace Omnipotent.Service_Manager
                     if (!string.IsNullOrEmpty(response))
                     {
                         setting.Value = response.Trim();
-                        settings[key] = setting;
+                        settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
                         isNewOrModified = true;
                     }
                 }
@@ -162,12 +185,11 @@ namespace Omnipotent.Service_Manager
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
 
-            // Resolve caller synchronously before any awaits
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
                 var callerInfo = GetCallingServiceInfo();
-                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
-                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? callerInfo.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
             }
 
             try
@@ -186,12 +208,11 @@ namespace Omnipotent.Service_Manager
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
 
-            // Resolve caller synchronously before any awaits
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
                 var callerInfo = GetCallingServiceInfo();
-                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
-                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? callerInfo.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
             }
 
             try
@@ -210,12 +231,11 @@ namespace Omnipotent.Service_Manager
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
 
-            // Resolve caller synchronously before any awaits
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
                 var callerInfo = GetCallingServiceInfo();
-                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = callerInfo.serviceId;
-                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = callerInfo.serviceName;
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? callerInfo.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
             }
 
             try
@@ -238,8 +258,8 @@ namespace Omnipotent.Service_Manager
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
                 var ci = GetCallingServiceInfo();
-                if (string.IsNullOrEmpty(parentServiceId)) parentServiceId = ci.serviceId;
-                if (string.IsNullOrEmpty(parentServiceName)) parentServiceName = ci.serviceName;
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? ci.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? ci.serviceName : parentServiceName;
             }
 
             try
@@ -248,14 +268,20 @@ namespace Omnipotent.Service_Manager
 
                 if (!settings.TryGetValue(key, out var s))
                 {
-                    s = new OmniSetting { Name = name, Type = type, Sensitive = false, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                    // Fallback to searching by name if ID was unfound (0) as it likely already exists
+                    if (parentServiceId == "0")
+                    {
+                        s = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    if (s == null)
+                    {
+                        s = new OmniSetting { Name = name, Type = type, Sensitive = false, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
+                        settings[key] = s;
+                    }
                 }
 
                 s.Value = value;
-                s.ParentServiceId = parentServiceId;
-                s.ParentServiceName = parentServiceName;
-
-                settings[key] = s;
                 await SaveSettings();
                 return true;
             }
@@ -343,9 +369,9 @@ namespace Omnipotent.Service_Manager
                     {
                         settings.TryGetValue(ComposeKey(parentId, name), out s);
                     }
-                    else
+                    
+                    if (s == null)
                     {
-                        // Fallback: Just grab the first setting that matches the name if parentId isn't provided
                         s = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
                     }
 
@@ -379,7 +405,6 @@ namespace Omnipotent.Service_Manager
 
                     if (string.IsNullOrEmpty(name)) { await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest); return; }
 
-                    // If API doesn't provide parent service details, attempt to update an existing one or default to "API/Global"
                     if (string.IsNullOrEmpty(parentId))
                     {
                         var existing = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
