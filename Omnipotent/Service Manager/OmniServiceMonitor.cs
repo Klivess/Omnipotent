@@ -1,5 +1,11 @@
 ﻿using ByteSizeLib;
 using System.Runtime.InteropServices;
+using System.Net.Http;
+using System.Net;
+using Newtonsoft.Json;
+using Omnipotent.Profiles;
+using Omnipotent.Services.KliveAPI;
+using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Service_Manager
 {
@@ -14,6 +20,30 @@ namespace Omnipotent.Service_Manager
         List<OmniMonitoredThread> monitoredThreads = new();
         public ByteSize MemoryUsage { get; private set; }
         public ByteSize TotalSystemRAM { get; private set; }
+
+        private UptimeStatistics uptimeStatistics = new UptimeStatistics();
+        private string UptimeLogsFilePath;
+
+        public class UptimePeriod
+        {
+            public DateTime StartTime { get; set; }
+            public DateTime LastKnownUpTime { get; set; }
+            [JsonIgnore]
+            public TimeSpan Duration => LastKnownUpTime - StartTime;
+        }
+
+        public class UptimeStatistics
+        {
+            public List<UptimePeriod> Periods { get; set; } = new List<UptimePeriod>();
+            [JsonIgnore]
+            public TimeSpan TotalUptime => TimeSpan.FromSeconds(Periods.Sum(x => x.Duration.TotalSeconds));
+            [JsonIgnore]
+            public double AverageUptimeHours => Periods.Count > 0 ? TotalUptime.TotalHours / Periods.Count : 0;
+            [JsonIgnore]
+            public TimeSpan CurrentUptime => Periods.Count > 0 ? Periods.Last().Duration : TimeSpan.Zero;
+        }
+
+        private UptimePeriod currentUptimePeriod;
 
         public struct OmniMonitoredThread
         {
@@ -51,13 +81,101 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
+                UptimeLogsFilePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProcessMonitorLogsUptimes), "OmniServiceMonitor_UptimeLogs.json");
+
+
                 Thread ramAndCpuCounters = new(UpdateCPUandRAMCounters);
                 ramAndCpuCounters.Start();
+                _ = SetupUptimeTrackingAsync();
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error in ServiceMain.");
             }
+        }
+
+        private async Task SetupUptimeTrackingAsync()
+        {
+            await InitializeUptimeDataAsync();
+            _ = StartUptimeSaveLoopAsync();
+            await SetupUptimeApiRoutesAsync();
+        }
+
+        private async Task InitializeUptimeDataAsync()
+        {
+            try
+            {
+                uptimeStatistics = await GetDataHandler().ReadAndDeserialiseDataFromFile<UptimeStatistics>(UptimeLogsFilePath);
+            }
+            catch
+            {
+                uptimeStatistics = new UptimeStatistics();
+            }
+
+            if (uptimeStatistics == null) uptimeStatistics = new UptimeStatistics();
+            if (uptimeStatistics.Periods == null) uptimeStatistics.Periods = new List<UptimePeriod>();
+
+            currentUptimePeriod = new UptimePeriod
+            {
+                StartTime = DateTime.UtcNow,
+                LastKnownUpTime = DateTime.UtcNow
+            };
+            uptimeStatistics.Periods.Add(currentUptimePeriod);
+        }
+
+        private async Task StartUptimeSaveLoopAsync()
+        {
+            while (true)
+            {
+                await Task.Delay(60000); // Wait 1 minute
+                if (currentUptimePeriod != null)
+                {
+                    currentUptimePeriod.LastKnownUpTime = DateTime.UtcNow;
+                    try
+                    {
+                        await GetDataHandler().SerialiseObjectToFile(UptimeLogsFilePath, uptimeStatistics);
+                    }
+                    catch (Exception ex)
+                    {
+                        await ServiceLogError(ex, "Failed to save uptime logs.", false);
+                    }
+                }
+            }
+        }
+
+        private async Task SetupUptimeApiRoutesAsync()
+        {
+            await CreateAPIRoute("/System/UptimeStatistics", HandleUptimeStatisticsRequest, HttpMethod.Get, KMProfileManager.KMPermissions.Admin);
+        }
+
+        private async Task HandleUptimeStatisticsRequest(UserRequest req)
+        {
+            var stats = CalculateUptimeStatistics();
+            string json = JsonConvert.SerializeObject(stats, Formatting.Indented);
+            await req.ReturnResponse(json, code: HttpStatusCode.OK);
+        }
+
+        private object CalculateUptimeStatistics()
+        {
+            // Calculate total possible time since the very first recorded start time
+            TimeSpan totalOutage = TimeSpan.Zero;
+            if (uptimeStatistics.Periods.Count > 0)
+            {
+                DateTime firstStart = uptimeStatistics.Periods.First().StartTime;
+                TimeSpan totalTimeSinceFirstStart = DateTime.UtcNow - firstStart;
+                totalOutage = totalTimeSinceFirstStart - uptimeStatistics.TotalUptime;
+                if (totalOutage.TotalSeconds < 0) totalOutage = TimeSpan.Zero;
+            }
+
+            return new
+            {
+                TotalUptimeSeconds = uptimeStatistics.TotalUptime.TotalSeconds,
+                AverageUptimeHours = uptimeStatistics.AverageUptimeHours,
+                CurrentUptimeSeconds = uptimeStatistics.CurrentUptime.TotalSeconds,
+                TotalOutageSeconds = totalOutage.TotalSeconds,
+                TotalPeriods = uptimeStatistics.Periods.Count,
+                Periods = uptimeStatistics.Periods
+            };
         }
 
         private async void UpdateCPUandRAMCounters()
