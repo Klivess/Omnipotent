@@ -129,8 +129,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             //Use Proxy
             HttpClient client = new();
-            HttpResponseMessage result = new();
-            result = client.Send(message);
+            HttpResponseMessage result = await client.SendAsync(message);
             SentRequests++;
             string strResponse = await result.Content.ReadAsStringAsync();
             if (result.IsSuccessStatusCode)
@@ -209,9 +208,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         parent.ServiceLog($"Retry {attempt}/{maxRetries} in {delay.TotalSeconds:F1}s...");
                         await Task.Delay(delay);
 
-                        // resend request asynchronously
+                        // resend request asynchronously using a fresh HttpRequestMessage (HttpRequestMessage cannot be reused)
                         HttpClient retryClient = new();
-                        result = await retryClient.SendAsync(message);
+                        var retryMessage = new HttpRequestMessage(HttpMethod.Get, url);
+                        retryMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+                        result = await retryClient.SendAsync(retryMessage);
                         SentRequests++;
 
                         if (result.IsSuccessStatusCode)
