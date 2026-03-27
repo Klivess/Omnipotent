@@ -6,10 +6,8 @@ using System.Net.Http.Headers;
 using System.Net;
 using Omnipotent.Data_Handling;
 using Omnipotent.Logging;
-using OpenQA.Selenium.Chrome;
-using OpenQA.Selenium.DevTools;
-using OpenQA.Selenium.Support.UI;
 using Json.More;
+using System.Text.RegularExpressions;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -182,8 +180,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 //Check if itemHashName exists in CS2NameIDTable
                 if (!CS2NameIDTable.ContainsKey(itemHashName))
                 {
-                    parent.ServiceLog("Item not found in CS2NameIDTable. Attempting to get NameID via Selenium.");
-                    string nameid = await GetItemNameIDViaSelenium(listing.ListingURL);
+                    parent.ServiceLog("Item not found in CS2NameIDTable. Attempting to get NameID via Steam listing HTML.");
+                    string nameid = await GetItemNameIDViaListingPage(listing.ListingURL);
+                    if (string.IsNullOrWhiteSpace(nameid))
+                    {
+                        parent.ServiceLogError($"Could not determine item_nameid for {itemHashName}. Skipping buy order lookup.");
+                        return listing;
+                    }
                     await AddToNameIDTable(itemHashName, Convert.ToInt32(nameid));
                 }
                 BuyAndSellOrders buyAndSellOrders = await GetAllBuyOrdersOfItem(CS2NameIDTable[itemHashName].ToString());
@@ -373,63 +376,43 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             };
             return orders;
         }
-        public async Task<string> GetItemNameIDViaSelenium(string steamListingUrl)
+        public async Task<string> GetItemNameIDViaListingPage(string steamListingUrl)
         {
             try
             {
-
-                var seleniumObject = (await parent.GetSeleniumManager()).CreateSeleniumObject("GetSteamItemID");
-                seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
-                seleniumObject.AddArgumentToOptions("--disable-gpu");
-                seleniumObject.AddArgumentToOptions("--no-sandbox");
-                seleniumObject.AddArgumentToOptions("--disable-dev-shm-usage");
-                seleniumObject.AddArgumentToOptions("--disable-web-security");
-                seleniumObject.AddArgumentToOptions("--disable-features=VizDisplayCompositor");
-                seleniumObject.AddArgumentToOptions("--disable-logging");
-
-
-                ChromeDriver chromeDriver = seleniumObject.UseChromeDriver();
-                parent.ServiceLog("Going to webpage: " + steamListingUrl);
-
-                IDevTools devTools = chromeDriver;
-                DevToolsSession session = devTools.GetDevToolsSession();
-                await session.Domains.Network.EnableNetwork();
-                bool found = false;
-                string item_nameid = string.Empty;
-                session.DevToolsEventReceived += (sender, e) =>
+                const int maxAttempts = 4;
+                for (int attempt = 1; attempt <= maxAttempts; attempt++)
                 {
-                    if (e.EventData.ToJsonString().Contains("https://steamcommunity.com/market/itemordershistogram") && found == false)
+                    HttpClient client = new();
+                    HttpResponseMessage response = await client.GetAsync(steamListingUrl);
+
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
                     {
-                        try
-                        {
-                            parent.ServiceLog("Found itemordershistorgram request for url: " + steamListingUrl);
-                            dynamic json = JsonConvert.DeserializeObject(e.EventData.ToJsonString());
-                            string url = json.request.url;
-                            //Parse parameters from URL
-                            var parameters = System.Web.HttpUtility.ParseQueryString(new Uri(url).Query);
-                            item_nameid = parameters["item_nameid"];
-                            parent.ServiceLog("Found nameid " + item_nameid + " for url: " + steamListingUrl);
-                            found = true;
-                        }
-                        catch (Exception ex) { }
+                        parent.ServiceLogError($"Rate-limited fetching listing page for nameid (attempt {attempt}/{maxAttempts}).");
+                        await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
+                        continue;
                     }
-                };
 
-                chromeDriver.Navigate().GoToUrl(steamListingUrl);
-                WebDriverWait wait = new WebDriverWait(chromeDriver, TimeSpan.FromSeconds(10));
-                while (found == false)
-                {
-                    await Task.Delay(100);
+                    string html = await response.Content.ReadAsStringAsync();
+                    Match itemNameIdMatch = Regex.Match(html, @"Market_LoadOrderSpread\(\s*(\d+)\s*\)", RegexOptions.IgnoreCase);
+                    if (itemNameIdMatch.Success)
+                    {
+                        string itemNameId = itemNameIdMatch.Groups[1].Value;
+                        parent.ServiceLog("Found nameid " + itemNameId + " for url: " + steamListingUrl);
+                        return itemNameId;
+                    }
+
+                    parent.ServiceLogError($"Could not parse item_nameid from listing page HTML for {steamListingUrl}. Attempt {attempt}/{maxAttempts}.");
+                    await Task.Delay(TimeSpan.FromSeconds(attempt));
                 }
-                (await parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
-                return item_nameid;
-                //IWebElement searchBox = wait.Until(d => d.FindElement(By.Name("q")));
+
+                throw new Exception("Failed to retrieve item_nameid from Steam listing page after retries.");
 
             }
             catch (Exception ex)
             {
-                LogErrorStatic("Main Thread", ex, "Error in TestTask!");
-                return null;
+                LogErrorStatic("Main Thread", ex, "Error retrieving Steam item nameid from listing page.");
+                return string.Empty;
             }
         }
     }
