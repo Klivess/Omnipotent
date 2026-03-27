@@ -30,7 +30,7 @@ namespace Omnipotent.Service_Manager
         private readonly string settingsDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGlobalSettingsDirectory);
         private readonly string settingsFilePath;
 
-        private readonly ConcurrentDictionary<string, OmniSetting> settings = new();
+        private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
         private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
 
         public OmniGlobalSettingsManager()
@@ -56,6 +56,7 @@ namespace Omnipotent.Service_Manager
 
         private async Task LoadSavedSettings()
         {
+            bool dedupedAtLoad = false;
             await _fileIOLock.WaitAsync();
             try
             {
@@ -66,16 +67,19 @@ namespace Omnipotent.Service_Manager
 
                     foreach (var s in list)
                     {
+                        s.Name = NormalizeSettingName(s.Name);
                         if (string.IsNullOrEmpty(s.ParentServiceName)) s.ParentServiceName = "UnknownService";
-                        if (string.IsNullOrEmpty(s.ParentServiceId)) s.ParentServiceId = "0";
+                        s.ParentServiceId = NormalizeParentServiceId(s.ParentServiceId);
 
                         if (string.IsNullOrWhiteSpace(s.Name))
                         {
                             await ServiceLogError("Skipped loading an omni setting without a name.");
                             continue;
                         }
-                        
-                        settings[ComposeKey(s.ParentServiceId, s.Name)] = s;
+
+                        var key = ComposeKey(s.ParentServiceId, s.Name);
+                        if (settings.ContainsKey(key)) dedupedAtLoad = true;
+                        settings[key] = s;
                     }
                 }
             }
@@ -86,6 +90,11 @@ namespace Omnipotent.Service_Manager
             finally
             {
                 _fileIOLock.Release();
+            }
+
+            if (dedupedAtLoad)
+            {
+                await SaveSettings();
             }
         }
 
@@ -121,6 +130,8 @@ namespace Omnipotent.Service_Manager
 
         private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName)
         {
+            name = NormalizeSettingName(name);
+            parentServiceId = NormalizeParentServiceId(parentServiceId);
             var key = ComposeKey(parentServiceId, name);
             bool isNewOrModified = false;
             
@@ -133,7 +144,7 @@ namespace Omnipotent.Service_Manager
             }
             else if (parentServiceId == "0")
             {
-                setting = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                setting = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase));
             }
 
             if (setting == null)
@@ -184,6 +195,7 @@ namespace Omnipotent.Service_Manager
         public async Task<bool> GetBoolOmniSetting(string name, bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
 
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
@@ -207,6 +219,7 @@ namespace Omnipotent.Service_Manager
         public async Task<int> GetIntOmniSetting(string name, int defaultValue = 0, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
 
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
@@ -230,6 +243,7 @@ namespace Omnipotent.Service_Manager
         public async Task<string> GetStringOmniSetting(string name, string defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
 
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
@@ -254,6 +268,7 @@ namespace Omnipotent.Service_Manager
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
 
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
@@ -261,6 +276,8 @@ namespace Omnipotent.Service_Manager
                 parentServiceId = string.IsNullOrEmpty(parentServiceId) ? ci.serviceId : parentServiceId;
                 parentServiceName = string.IsNullOrEmpty(parentServiceName) ? ci.serviceName : parentServiceName;
             }
+
+            parentServiceId = NormalizeParentServiceId(parentServiceId);
 
             try
             {
@@ -271,7 +288,7 @@ namespace Omnipotent.Service_Manager
                     // Fallback to searching by name if ID was unfound (0) as it likely already exists
                     if (parentServiceId == "0")
                     {
-                        s = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                        s = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase));
                     }
 
                     if (s == null)
@@ -318,7 +335,11 @@ namespace Omnipotent.Service_Manager
             return ("UnknownService", "0");
         }
 
-        private string ComposeKey(string parentServiceId, string name) => $"{parentServiceId}:{name}";
+        private static string NormalizeSettingName(string name) => (name ?? string.Empty).Trim();
+
+        private static string NormalizeParentServiceId(string parentServiceId) => string.IsNullOrWhiteSpace(parentServiceId) ? "0" : parentServiceId.Trim();
+
+        private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
 
         private string MaskSensitive(string v)
         {
@@ -372,7 +393,7 @@ namespace Omnipotent.Service_Manager
                     
                     if (s == null)
                     {
-                        s = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                        s = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(NormalizeSettingName(name), StringComparison.OrdinalIgnoreCase));
                     }
 
                     if (s == null) { await req.ReturnResponse("NotFound", code: HttpStatusCode.NotFound); return; }
