@@ -24,6 +24,7 @@ namespace Omnipotent.Services.OmniTrader
             simulator= new OmniTraderSimulator(this);
 
             FlowSignalTraderStrategy strategy = new();
+            await strategy.Initialise(this);
             strategy.engine.OnSignal += async (sender, e) =>
             {
                 try
@@ -47,7 +48,6 @@ namespace Omnipotent.Services.OmniTrader
                     ServiceLogError(ex, "Error with FlowSignalTraderStrategy signal handling");
                 }
             };
-            await strategy.Initialise(this);
 
         }
 

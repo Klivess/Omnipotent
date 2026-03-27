@@ -28,6 +28,7 @@ namespace Omnipotent.Service_Manager
         private Thread serviceThread;
         private OmniServiceManager serviceManager;
         protected Stopwatch serviceUptime;
+        private int fatalExceptionHandled;
 
         protected event Action ServiceQuitRequest;
 
@@ -232,6 +233,7 @@ namespace Omnipotent.Service_Manager
         }
         public void ServiceStart()
         {
+            Interlocked.Exchange(ref fatalExceptionHandled, 0);
             ServiceQuitRequest = new Action(() => { });
             if (string.IsNullOrEmpty(name))
             {
@@ -249,28 +251,27 @@ namespace Omnipotent.Service_Manager
                 serviceUptime = Stopwatch.StartNew();
                 serviceThread = new Thread(() =>
                 {
+                    var previousContext = SynchronizationContext.Current;
+                    var serviceExceptionContext = new ServiceExceptionSynchronizationContext(HandleUnhandledServiceException);
+                    SynchronizationContext.SetSynchronizationContext(serviceExceptionContext);
                     try
                     {
                         try
                         {
-                            //Thread Error Handler
-                            AppDomain.CurrentDomain.UnhandledException += new UnhandledExceptionEventHandler(async (sender, e) =>
-                            {
-                                ServiceLogError((Exception)e.ExceptionObject, "Thread Unhandled Error!");
-                                try
-                                {
-                                    (await serviceManager.GetKliveBotDiscordService()).SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed($"Unhandled error caught in {name} service!",
-                                    new ErrorInformation((Exception)e.ExceptionObject).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red));
-                                }
-                                catch (Exception) { }
-                            });
                             ServiceMain(); Task.Delay(-1).Wait();
                         }
-                        catch (ThreadInterruptedException interrupt) { }
+                        catch (ThreadInterruptedException)
+                        {
+                            ServiceActive = false;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        CatchError(ex);
+                        HandleUnhandledServiceException(ex);
+                    }
+                    finally
+                    {
+                        SynchronizationContext.SetSynchronizationContext(previousContext);
                     }
                 });
                 serviceThread.Name = "OmniServiceThread_" + name;
@@ -290,6 +291,42 @@ namespace Omnipotent.Service_Manager
             ServiceLogError(new Exception($"ERROR! Task {name} has crashed due to: " + ex.Message.ToString()));
         }
 
+        private void HandleUnhandledServiceException(Exception ex)
+        {
+            if (ex is ThreadInterruptedException)
+            {
+                ServiceActive = false;
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref fatalExceptionHandled, 1, 0) != 0)
+            {
+                return;
+            }
+
+            ServiceActive = false;
+
+            try
+            {
+                ServiceLogError(ex, $"Unhandled error caught in {name} service.").GetAwaiter().GetResult();
+            }
+            catch { }
+
+            try
+            {
+                var discordService = serviceManager?.GetKliveBotDiscordService().GetAwaiter().GetResult();
+                discordService?.SendMessageToKlives(KliveBotDiscord.MakeSimpleEmbed($"Unhandled error caught in {name} service!",
+                    new ErrorInformation(ex).FullFormattedMessage, DSharpPlus.Entities.DiscordColor.Red)).GetAwaiter().GetResult();
+            }
+            catch { }
+
+            try
+            {
+                TerminateService().GetAwaiter().GetResult();
+            }
+            catch { }
+        }
+
         public OmniService()
         {
             cancellationToken = new CancellationTokenSource();
@@ -299,12 +336,20 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
-                ServiceQuitRequest.Invoke();
-                Task.Delay(500).Wait();
-                ServiceLog("Ending " + name + " service.");
+                if (!ServiceActive)
+                {
+                    return true;
+                }
+
                 ServiceActive = false;
+                ServiceQuitRequest?.Invoke();
+                await Task.Delay(500);
+                await ServiceLog("Ending " + name + " service.");
                 GC.Collect();
-                serviceThread.Interrupt();
+                if (serviceThread != null && serviceThread.IsAlive && Thread.CurrentThread.ManagedThreadId != serviceThread.ManagedThreadId)
+                {
+                    serviceThread.Interrupt();
+                }
                 serviceUptime = new Stopwatch();
                 return true;
             }
@@ -357,6 +402,43 @@ namespace Omnipotent.Service_Manager
                 if (ok) return m;
             }
             return null;
+        }
+
+        private sealed class ServiceExceptionSynchronizationContext : SynchronizationContext
+        {
+            private readonly Action<Exception> exceptionHandler;
+
+            public ServiceExceptionSynchronizationContext(Action<Exception> exceptionHandler)
+            {
+                this.exceptionHandler = exceptionHandler;
+            }
+
+            public override void Post(SendOrPostCallback d, object? state)
+            {
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try
+                    {
+                        d(state);
+                    }
+                    catch (Exception ex)
+                    {
+                        exceptionHandler(ex);
+                    }
+                });
+            }
+
+            public override void Send(SendOrPostCallback d, object? state)
+            {
+                try
+                {
+                    d(state);
+                }
+                catch (Exception ex)
+                {
+                    exceptionHandler(ex);
+                }
+            }
         }
     }
 }
