@@ -2,6 +2,7 @@
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
 using System.ComponentModel;
+using System.Globalization;
 using System.Reflection.Metadata.Ecma335;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
@@ -242,42 +243,75 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         {
             try
             {
-                string url = "https://steamcommunity.com/market/listings/730/" + marketHashName;
-                var options = new OpenQA.Selenium.Chrome.ChromeOptions();
-                options.AddArgument("--headless");
-                using var driver = new OpenQA.Selenium.Chrome.ChromeDriver(options);
+                const int maxAttempts = 4;
+                string encodedName = Uri.EscapeDataString(marketHashName);
+                string url = $"https://steamcommunity.com/market/pricehistory/?appid=730&market_hash_name={encodedName}&currency=2";
 
-                driver.Navigate().GoToUrl(url);
-
-                // Wait for the page to load and execute the JavaScript  
-                var wait = new OpenQA.Selenium.Support.UI.WebDriverWait(driver, TimeSpan.FromSeconds(10));
-                wait.Until(d => ((OpenQA.Selenium.IJavaScriptExecutor)d).ExecuteScript("return document.readyState").Equals("complete"));
-
-                // Execute JavaScript to retrieve price history data  
-                string jsonData = null;
-                try
+                string? content = null;
+                for (int attempt = 1; attempt <= maxAttempts; attempt++)
                 {
-                    jsonData = (string)((OpenQA.Selenium.IJavaScriptExecutor)driver).ExecuteScript("return JSON.stringify(g_plotPriceHistory._stackData);");
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError(ex, $"Error executing JavaScript for item: {marketHashName}, assuming ratelimit, so waiting 25 seconds,");
-                    await Task.Delay(25000); // Wait for 25 seconds before retrying
-                    return await GetPriceHistoryOfSteamItem(marketHashName); // Retry the operation
+                    HttpClient client = new();
+                    HttpResponseMessage response = await client.GetAsync(url);
+                    content = await response.Content.ReadAsStringAsync();
+
+                    if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                    {
+                        parent.ServiceLogError($"Steam pricehistory rate-limited for {marketHashName} (attempt {attempt}/{maxAttempts}).");
+                        await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
+                        continue;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        parent.ServiceLogError($"Failed to fetch Steam price history for {marketHashName}. Status: {response.StatusCode} Body: {content}");
+                        return null;
+                    }
+
+                    break;
                 }
 
-                // Parse the JSON data  
-                dynamic priceHistory = Newtonsoft.Json.JsonConvert.DeserializeObject(jsonData);
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    return null;
+                }
+
+                dynamic priceHistory = Newtonsoft.Json.JsonConvert.DeserializeObject(content);
+                if (priceHistory?.prices == null)
+                {
+                    return null;
+                }
+
                 List<SteamPriceHistoryDataPoint> historyDataPoints = new List<SteamPriceHistoryDataPoint>();
 
-                foreach (var dataPoint in priceHistory[0])
+                foreach (var dataPoint in priceHistory.prices)
                 {
-                    string epoch = dataPoint[0].ToString();
+                    string dateString = Convert.ToString(dataPoint[0]);
+                    string priceString = Convert.ToString(dataPoint[1]);
+                    string qtyString = Convert.ToString(dataPoint[2]);
+
+                    if (!DateTime.TryParse(dateString, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTime recordedAt))
+                    {
+                        continue;
+                    }
+
+                    if (!double.TryParse(priceString, NumberStyles.Any, CultureInfo.InvariantCulture, out double priceInCurrencyUnits))
+                    {
+                        if (!double.TryParse(priceString, NumberStyles.Any, CultureInfo.GetCultureInfo("en-GB"), out priceInCurrencyUnits))
+                        {
+                            continue;
+                        }
+                    }
+
+                    if (!int.TryParse(qtyString, NumberStyles.Any, CultureInfo.InvariantCulture, out int quantitySold))
+                    {
+                        quantitySold = 0;
+                    }
+
                     SteamPriceHistoryDataPoint point = new SteamPriceHistoryDataPoint
                     {
-                        DateTimeRecorded = OmniPaths.EpochMsToDateTime(epoch),
-                        PriceInPounds = Convert.ToDouble(dataPoint[1]) * parent.ExchangeRate,
-                        QuantitySold = Convert.ToInt32(dataPoint[2])
+                        DateTimeRecorded = recordedAt,
+                        PriceInPounds = priceInCurrencyUnits,
+                        QuantitySold = quantitySold
                     };
                     historyDataPoints.Add(point);
                 }

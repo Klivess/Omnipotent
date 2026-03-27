@@ -63,6 +63,8 @@ namespace Omnipotent.Data_Handling
             public static string CS2ArbitrageBotCSFloatAPIKey = $"{CS2ArbitrageBotDirectory}/CSFloatAPIKey.txt";
             public static string CS2ArbitrageBotSteamLoginPassword = $"{CS2ArbitrageBotDirectory}/SteamLoginPassword.txt";
             public static string CS2ArbitrageBotSteamLoginCookies = $"{CS2ArbitrageBotDirectory}/SteamLoginCookies.txt";
+            public static string CS2ArbitrageBotSteamRefreshToken = $"{CS2ArbitrageBotDirectory}/SteamRefreshToken.txt";
+            public static string CS2ArbitrageBotSteamAuthState = $"{CS2ArbitrageBotDirectory}/SteamAuthState.json";
             //           Labs
             public static string CS2ArbitrageBotLabsDirectory = $"{CS2ArbitrageBotDirectory}/CS2ArbitrageBotLabs";
             public static string CS2ArbitrageBotScannedComparisonsDirectory = $"{CS2ArbitrageBotLabsDirectory}/ScannedComparisons";
