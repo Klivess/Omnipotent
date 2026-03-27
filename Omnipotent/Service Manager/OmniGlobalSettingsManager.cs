@@ -165,6 +165,21 @@ namespace Omnipotent.Service_Manager
                 isNewOrModified = true;
             }
 
+            if (string.IsNullOrEmpty(setting.Value))
+            {
+                var populatedMatch = settings.Values.FirstOrDefault(x =>
+                    x.Type == type &&
+                    NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrEmpty(x.Value));
+
+                if (populatedMatch != null)
+                {
+                    setting.Value = populatedMatch.Value;
+                    settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
+                    isNewOrModified = true;
+                }
+            }
+
             if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
             {
                 var trackedSettingKey = ComposeKey(setting.ParentServiceId, setting.Name);
