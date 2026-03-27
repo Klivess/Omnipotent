@@ -2,6 +2,7 @@
 using Newtonsoft.Json;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using SteamKit2;
+using SteamKit2.Authentication;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -18,7 +19,55 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         {
             public string? RefreshToken { get; set; }
             public string? AccessToken { get; set; }
+            public string? GuardData { get; set; }
             public DateTime UpdatedAtUtc { get; set; }
+        }
+
+        private sealed class SteamMobileOnlyAuthenticator : IAuthenticator
+        {
+            private readonly SteamAPIProfileWrapper wrapper;
+
+            public SteamMobileOnlyAuthenticator(SteamAPIProfileWrapper wrapper)
+            {
+                this.wrapper = wrapper;
+            }
+
+            public Task<string> GetDeviceCodeAsync(bool previousCodeWasIncorrect)
+            {
+                wrapper.parent.parent.ServiceLogError("Steam requested a device code. This bot is configured for mobile confirmation flow only.");
+                return Task.FromResult(string.Empty);
+            }
+
+            public Task<string> GetEmailCodeAsync(string email, bool previousCodeWasIncorrect)
+            {
+                wrapper.parent.parent.ServiceLogError($"Steam requested an email code for {email}. This bot is configured for mobile confirmation flow only.");
+                return Task.FromResult(string.Empty);
+            }
+
+            public async Task<bool> AcceptDeviceConfirmationAsync()
+            {
+                try
+                {
+                    string response = (string)await wrapper.parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
+                        "SendButtonsPromptToKlivesDiscord",
+                        "CS2 Arbitrage Bot — Steam Login Confirmation Required",
+                        "Please approve the Steam mobile login confirmation in your Steam app, then press **Confirmed**.",
+                        new Dictionary<string, DSharpPlus.ButtonStyle>
+                        {
+                            { "Confirmed", DSharpPlus.ButtonStyle.Success },
+                            { "Failed", DSharpPlus.ButtonStyle.Danger }
+                        },
+                        TimeSpan.FromHours(24)
+                    );
+
+                    return response == "Confirmed";
+                }
+                catch (Exception ex)
+                {
+                    wrapper.parent.parent.ServiceLogError(ex, "Error while waiting for Steam mobile login confirmation.");
+                    return false;
+                }
+            }
         }
 
         public SteamAPIProfileWrapper(SteamAPIWrapper parent)
@@ -338,22 +387,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             await authLock.WaitAsync();
             try
             {
-                if (!forceRefresh && !string.IsNullOrWhiteSpace(steamAccessToken))
-                {
-                    return true;
-                }
-
                 await LoadSteamAuthStateFromDisk();
 
-                if (string.IsNullOrWhiteSpace(steamRefreshToken))
+                if (!forceRefresh && !string.IsNullOrWhiteSpace(steamAccessToken) && !string.IsNullOrWhiteSpace(steamRefreshToken))
                 {
-                    string? providedToken = await PromptForRefreshTokenAsync();
-                    if (string.IsNullOrWhiteSpace(providedToken))
-                    {
-                        parent.parent.ServiceLogError("Steam refresh token is empty, cannot authenticate Steam session.");
-                        return false;
-                    }
-                    steamRefreshToken = providedToken;
+                    return true;
                 }
 
                 if (!ulong.TryParse(parent.SteamIDOfSteamClient, out ulong steamId64))
@@ -362,19 +400,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     return false;
                 }
 
-                SteamClient client = new();
-                var accessTokenResult = await client.Authentication.GenerateAccessTokenForAppAsync(new SteamID(steamId64), steamRefreshToken, true);
-
-                if (string.IsNullOrWhiteSpace(accessTokenResult.AccessToken))
+                if (string.IsNullOrWhiteSpace(steamRefreshToken))
                 {
-                    parent.parent.ServiceLogError("SteamKit2 returned an empty access token.");
-                    return false;
+                    bool loginWorked = await AcquireRefreshTokenProgrammatically();
+                    if (!loginWorked)
+                    {
+                        return false;
+                    }
                 }
 
-                steamAccessToken = accessTokenResult.AccessToken;
-                if (!string.IsNullOrWhiteSpace(accessTokenResult.RefreshToken))
+                bool generatedFromRefreshToken = await TryGenerateAccessTokenFromRefreshToken(steamId64);
+                if (!generatedFromRefreshToken)
                 {
-                    steamRefreshToken = accessTokenResult.RefreshToken;
+                    bool reloginWorked = await AcquireRefreshTokenProgrammatically();
+                    if (!reloginWorked)
+                    {
+                        return false;
+                    }
+
+                    if (!await TryGenerateAccessTokenFromRefreshToken(steamId64))
+                    {
+                        parent.parent.ServiceLogError("SteamKit2 failed to mint an access token even after programmatic re-login.");
+                        return false;
+                    }
                 }
 
                 steamSessionId = Guid.NewGuid().ToString("N");
@@ -390,6 +438,120 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             {
                 authLock.Release();
             }
+        }
+
+        private async Task<bool> TryGenerateAccessTokenFromRefreshToken(ulong steamId64)
+        {
+            try
+            {
+                SteamClient client = new();
+                var accessTokenResult = await client.Authentication.GenerateAccessTokenForAppAsync(new SteamID(steamId64), steamRefreshToken!, true);
+                if (string.IsNullOrWhiteSpace(accessTokenResult.AccessToken))
+                {
+                    return false;
+                }
+
+                steamAccessToken = accessTokenResult.AccessToken;
+                if (!string.IsNullOrWhiteSpace(accessTokenResult.RefreshToken))
+                {
+                    steamRefreshToken = accessTokenResult.RefreshToken;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError(ex, "Failed generating Steam access token from refresh token.");
+                steamAccessToken = null;
+                return false;
+            }
+        }
+
+        private async Task<bool> AcquireRefreshTokenProgrammatically()
+        {
+            try
+            {
+                var credentials = await LoadSteamCredentialsFromDisk();
+                if (credentials == null)
+                {
+                    parent.parent.ServiceLogError("Steam username/password not configured on disk. Cannot programmatically obtain refresh token.");
+                    return false;
+                }
+
+                SteamClient client = new();
+                var authSession = await client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+                {
+                    Username = credentials.Value.Username,
+                    Password = credentials.Value.Password,
+                    IsPersistentSession = true,
+                    GuardData = credentials.Value.GuardData,
+                    Authenticator = new SteamMobileOnlyAuthenticator(this),
+                    DeviceFriendlyName = "Omnipotent-CS2ArbitrageBot",
+                    WebsiteID = "Community"
+                });
+
+                AuthPollResult authResult = await authSession.PollingWaitForResultAsync();
+                if (string.IsNullOrWhiteSpace(authResult.RefreshToken))
+                {
+                    parent.parent.ServiceLogError("Steam login succeeded but returned no refresh token.");
+                    return false;
+                }
+
+                steamRefreshToken = authResult.RefreshToken;
+                steamAccessToken = authResult.AccessToken;
+
+                string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
+                string stateJson = await parent.parent.GetDataHandler().ReadDataFromFile(statePath);
+                SteamAuthState state = string.IsNullOrWhiteSpace(stateJson)
+                    ? new SteamAuthState()
+                    : (JsonConvert.DeserializeObject<SteamAuthState>(stateJson) ?? new SteamAuthState());
+
+                if (!string.IsNullOrWhiteSpace(authResult.NewGuardData))
+                {
+                    state.GuardData = authResult.NewGuardData;
+                }
+
+                state.RefreshToken = steamRefreshToken;
+                state.AccessToken = steamAccessToken;
+                state.UpdatedAtUtc = DateTime.UtcNow;
+                await parent.parent.GetDataHandler().WriteToFile(statePath, JsonConvert.SerializeObject(state, Formatting.Indented));
+
+                parent.parent.ServiceLog("Programmatically obtained Steam refresh token via SteamKit2 credentials flow.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError(ex, "Programmatic Steam refresh-token acquisition failed.");
+                return false;
+            }
+        }
+
+        private async Task<(string Username, string Password, string? GuardData)?> LoadSteamCredentialsFromDisk()
+        {
+            string usernamePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginUsername);
+            string passwordPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginPassword);
+
+            string username = await parent.parent.GetDataHandler().ReadDataFromFile(usernamePath);
+            string password = await parent.parent.GetDataHandler().ReadDataFromFile(passwordPath);
+
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+            {
+                return null;
+            }
+
+            string? guardData = null;
+            try
+            {
+                string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
+                string stateJson = await parent.parent.GetDataHandler().ReadDataFromFile(statePath);
+                if (!string.IsNullOrWhiteSpace(stateJson))
+                {
+                    SteamAuthState? state = JsonConvert.DeserializeObject<SteamAuthState>(stateJson);
+                    guardData = state?.GuardData;
+                }
+            }
+            catch { }
+
+            return (username.Trim(), password.Trim(), guardData);
         }
 
         private async Task LoadSteamAuthStateFromDisk()
@@ -442,27 +604,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 string refreshTokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamRefreshToken);
                 await parent.parent.GetDataHandler().WriteToFile(refreshTokenPath, steamRefreshToken);
             }
-        }
-
-        private async Task<string?> PromptForRefreshTokenAsync()
-        {
-            string result = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
-                "SendTextPromptToKlivesDiscord",
-                "CS2 Arbitrage Bot Steam Refresh Token",
-                "Please provide a Steam refresh token for SteamKit2 login. This replaces password/cookie Selenium login.",
-                TimeSpan.FromDays(7),
-                "Steam",
-                "refresh-token");
-
-            if (string.IsNullOrWhiteSpace(result))
-            {
-                await parent.parent.ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
-                    "SendMessageToKlives",
-                    "Steam refresh token was empty. Steam auth cannot continue.");
-                return null;
-            }
-
-            return result.Trim();
         }
 
         public async Task<string> ProduceCommunityCookieString()
