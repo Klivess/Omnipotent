@@ -1,17 +1,26 @@
 ﻿using DSharpPlus;
 using DSharpPlus.Entities;
+using DSharpPlus.EventArgs;
 using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
 using System.Diagnostics;
 using System.Drawing;
+using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Notifications
 {
     public class NotificationsService : OmniService
     {
         KliveBotDiscord KliveBotDiscord;
+        private readonly ConcurrentDictionary<string, PendingTextPrompt> _pendingTextPrompts = new(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class PendingTextPrompt
+        {
+            public DiscordMessage PromptMessage { get; set; }
+            public TaskCompletionSource<string> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
 
         public enum PromptType
         {
@@ -91,6 +100,38 @@ namespace Omnipotent.Services.Notifications
         }
         public async Task<string> SendTextPromptToKlivesDiscord(string title, string description, TimeSpan timeToAnswer, string modalTitle = "", string modalPlaceholder = "")
         {
+            return await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, null);
+        }
+
+        public async Task<string> SendTextPromptToKlivesDiscordTracked(string trackingId, string title, string description, TimeSpan timeToAnswer, string modalTitle = "", string modalPlaceholder = "")
+        {
+            return await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, trackingId);
+        }
+
+        public async Task<bool> CancelTrackedTextPrompt(string trackingId, string cancellationMessage)
+        {
+            if (string.IsNullOrWhiteSpace(trackingId)) return false;
+
+            if (!_pendingTextPrompts.TryRemove(trackingId.Trim(), out var pending)) return false;
+
+            try
+            {
+                if (pending.PromptMessage != null)
+                {
+                    await pending.PromptMessage.RespondAsync(string.IsNullOrWhiteSpace(cancellationMessage) ? "Notification cancelled." : cancellationMessage);
+                }
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to send tracked prompt cancellation reply");
+            }
+
+            pending.Completion.TrySetCanceled();
+            return true;
+        }
+
+        private async Task<string> SendTextPromptCore(string title, string description, TimeSpan timeToAnswer, string modalTitle, string modalPlaceholder, string trackingId)
+        {
             var embedBuilder = KliveBotDiscord.MakeSimpleEmbed($"Notification: {title}", description, DSharpPlus.Entities.DiscordColor.DarkBlue);
 
 
@@ -100,7 +141,15 @@ namespace Omnipotent.Services.Notifications
             embedBuilder.AddComponents(new DiscordButtonComponent(ButtonStyle.Primary, buttonID, "Input Text"));
 
             var message = await KliveBotDiscord.SendMessageToKlives(embedBuilder);
-            string submitted = "";
+
+            PendingTextPrompt pending = new PendingTextPrompt { PromptMessage = message };
+            string normalizedTrackingId = string.IsNullOrWhiteSpace(trackingId) ? null : trackingId.Trim();
+
+            if (!string.IsNullOrEmpty(normalizedTrackingId))
+            {
+                _pendingTextPrompts[normalizedTrackingId] = pending;
+            }
+
             KliveBotDiscord.Client.ComponentInteractionCreated += async (s, e) =>
             {
                 if (e.Id == buttonID)
@@ -112,27 +161,35 @@ namespace Omnipotent.Services.Notifications
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.Modal, modal);
                 }
             };
+
             KliveBotDiscord.Client.ModalSubmitted += async (s, e) =>
             {
-                if (e.Values.Keys.ToArray()[0].ToString() == modalID)
+                if (e.Values.ContainsKey(modalID))
                 {
                     DiscordInteractionResponseBuilder builder = new();
-                    submitted = e.Values.Values.First();
+                    string submitted = e.Values[modalID];
                     builder.WithContent($"Submitted!");
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
+                    pending.Completion.TrySetResult(submitted);
                 }
             };
 
-            Stopwatch countdown = Stopwatch.StartNew();
-            while (submitted == "")
+            try
             {
-                if (countdown.Elapsed >= timeToAnswer)
+                return await pending.Completion.Task.WaitAsync(timeToAnswer);
+            }
+            catch (TimeoutException)
+            {
+                await message.RespondAsync("Prompt timed out. KliveBot will make do on its own.");
+                throw;
+            }
+            finally
+            {
+                if (!string.IsNullOrEmpty(normalizedTrackingId))
                 {
-                    await message.RespondAsync("Prompt timed out. KliveBot will make do on its own.");
-                    throw new TimeoutException("No response to prompt.");
+                    _pendingTextPrompts.TryRemove(normalizedTrackingId, out _);
                 }
             }
-            return submitted;
         }
 
     }

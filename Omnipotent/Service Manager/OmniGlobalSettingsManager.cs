@@ -31,6 +31,7 @@ namespace Omnipotent.Service_Manager
         private readonly string settingsFilePath;
 
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, string> pendingFulfillmentPromptIds = new(StringComparer.OrdinalIgnoreCase);
         private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
 
         public OmniGlobalSettingsManager()
@@ -166,12 +167,16 @@ namespace Omnipotent.Service_Manager
 
             if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
             {
+                var trackedSettingKey = ComposeKey(setting.ParentServiceId, setting.Name);
+                var trackingId = $"setting-fulfillment:{trackedSettingKey}:{Guid.NewGuid():N}";
+                pendingFulfillmentPromptIds[trackedSettingKey] = trackingId;
+
                 try
                 {
                     var prompt = $"Please provide value for setting '{name}' ({type})";
                     var instructions = $"Enter the value for setting '{name}'.";
-                    var response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord",
-                        prompt, instructions, TimeSpan.FromDays(7), "Setting value", "Value");
+                    var response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscordTracked",
+                        trackingId, prompt, instructions, TimeSpan.FromDays(7), "Setting value", "Value");
 
                     if (!string.IsNullOrEmpty(response))
                     {
@@ -181,6 +186,10 @@ namespace Omnipotent.Service_Manager
                     }
                 }
                 catch { /* Ignore prompt failures */ }
+                finally
+                {
+                    pendingFulfillmentPromptIds.TryRemove(trackedSettingKey, out _);
+                }
             }
 
             if (isNewOrModified)
@@ -265,7 +274,7 @@ namespace Omnipotent.Service_Manager
         }
 
         // --- Setters ---
-        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String)
+        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
             name = NormalizeSettingName(name);
@@ -296,6 +305,17 @@ namespace Omnipotent.Service_Manager
                         s = new OmniSetting { Name = name, Type = type, Sensitive = false, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
                         settings[key] = s;
                     }
+                }
+
+                var resolvedKey = ComposeKey(s.ParentServiceId, s.Name);
+                if (fulfilledViaApi && pendingFulfillmentPromptIds.TryGetValue(resolvedKey, out var trackingId))
+                {
+                    try
+                    {
+                        await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("CancelTrackedTextPrompt",
+                            trackingId, $"Notification cancelled as {s.Name} was fulfilled via API instead.");
+                    }
+                    catch { }
                 }
 
                 s.Value = value;
@@ -441,7 +461,7 @@ namespace Omnipotent.Service_Manager
                         }
                     }
 
-                    await SetOmniSetting(name, value, parentId, parentName);
+                    await SetOmniSetting(name, value, parentId, parentName, OmniSettingType.String, fulfilledViaApi: true);
                     await req.ReturnResponse("OK");
                 }
                 catch (Exception ex)
