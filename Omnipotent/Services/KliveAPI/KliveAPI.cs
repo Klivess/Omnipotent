@@ -198,6 +198,8 @@ namespace Omnipotent.Services.KliveAPI
             {
                 //await CheckForSSLCertificate();
 
+                ContinueListenLoop = true;
+
                 //Create API listener
                 ControllerLookup = new();
                 WebSocketRouteLookup = new();
@@ -226,6 +228,8 @@ namespace Omnipotent.Services.KliveAPI
                 CreateAndStartService(new KliveLink.KliveLinkService());
 
                 CreateMetaKLIVEAPIRoutes();
+
+                StartWatchdog();
             }
             catch (Exception ex)
             {
@@ -252,6 +256,38 @@ namespace Omnipotent.Services.KliveAPI
                 string resp = JsonConvert.SerializeObject(copy);
                 await req.ReturnResponse(resp, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
+        }
+
+        private async void StartWatchdog()
+        {
+            using System.Net.Http.HttpClient client = new System.Net.Http.HttpClient();
+            client.Timeout = TimeSpan.FromSeconds(10);
+            await Task.Delay(15000); // Give the API time to initialize
+
+            while (ContinueListenLoop)
+            {
+                try
+                {
+                    var response = await client.GetAsync($"http://127.0.0.1:{apiHTTPPORT}/ping");
+                    response.EnsureSuccessStatusCode();
+                }
+                catch (Exception ex)
+                {
+                    if (ContinueListenLoop)
+                    {
+                        await ServiceLogError(ex, "Watchdog detected API is unresponsive. Restarting API service...");
+                        _ = RestartService();
+                        return;
+                    }
+                }
+
+                try
+                {
+                    await Task.Delay(30000, cancellationToken.Token);
+                }
+                catch (TaskCanceledException) { return; }
+                catch (ObjectDisposedException) { return; }
+            }
         }
 
         private void KliveAPI_ServiceQuitRequest()
@@ -371,7 +407,8 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     if (ContinueListenLoop)
                     {
-                        ServiceLogError(ioe, "Error in ServerListenLoop");
+                        _ = ServiceLogError(ioe, "Error in ServerListenLoop");
+                        await Task.Delay(1000); // Prevent tight spin if listener completely breaks
                     }
                 }
             }
@@ -509,6 +546,7 @@ namespace Omnipotent.Services.KliveAPI
                     else
                     {
                         ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
+                        ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"An unauthenticated request was made to route {route} which requires permission level {routeData.authenticationLevelRequired.ToString()}. This means someone is trying to access a protected route without providing valid credentials. Be on the lookout for suspicious activity!").Wait();
                         DenyRequest(request, DeniedRequestReason.NoProfile);
                     }
                 }

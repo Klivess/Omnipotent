@@ -325,6 +325,20 @@ namespace Omnipotent.Service_Manager
                 TerminateService().GetAwaiter().GetResult();
             }
             catch { }
+
+            if (threadAnteriority == ThreadAnteriority.Critical)
+            {
+                try
+                {
+                    Task.Run(async () =>
+                    {
+                        await Task.Delay(2000);
+                        await ServiceLog($"Service {name} is Critical, restarting after crash...");
+                        ServiceStart();
+                    });
+                }
+                catch { }
+            }
         }
 
         public OmniService()
@@ -364,7 +378,7 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
-                TerminateService();
+                await TerminateService();
                 //Bit odd
                 ServiceStart();
                 return true;
