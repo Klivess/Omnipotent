@@ -182,6 +182,12 @@ namespace Omnipotent.Service_Manager
 
             if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
             {
+                await Task.Delay(2000);
+                if (settings.TryGetValue(ComposeKey(setting.ParentServiceId, setting.Name), out var recheck) && !string.IsNullOrEmpty(recheck.Value))
+                {
+                    return recheck;
+                }
+
                 var trackedSettingKey = ComposeKey(setting.ParentServiceId, setting.Name);
                 var trackingId = $"setting-fulfillment:{trackedSettingKey}:{Guid.NewGuid():N}";
                 pendingFulfillmentPromptIds[trackedSettingKey] = trackingId;
