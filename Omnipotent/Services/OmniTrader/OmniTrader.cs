@@ -23,32 +23,6 @@ namespace Omnipotent.Services.OmniTrader
             data = new OmniTraderFinanceData(this);
             simulator= new OmniTraderSimulator(this);
 
-            FlowSignalTraderStrategy strategy = new();
-            await strategy.Initialise(this);
-            strategy.engine.OnSignal += async (sender, e) =>
-            {
-                try
-                {
-                    var s = e.Signal;
-                    string msg = "\n*****************************************\n" +
-                 $"NEW SIGNAL: {e.Symbol} {s.Direction}\n" +
-                 $"Type: {s.SetupType} | Strength: {s.Strength}\n" +
-                 $"Entry: {s.Price} | SL: {s.StopLoss} | TP: {s.TakeProfit1}\n" +
-                 $"Reason: {s.Reason} | Score: {s.Score}/15\n" +
-                 "*****************************************\n";
-
-
-                    if (DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22) && s.Score >= 8)
-                    {
-                        await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", msg);
-                    }
-                }
-                catch(Exception ex)
-                {
-                    ServiceLogError(ex, "Error with FlowSignalTraderStrategy signal handling");
-                }
-            };
-
         }
 
         public async Task WriteBacktestResultToDesktop(OmniBacktestResult result)
