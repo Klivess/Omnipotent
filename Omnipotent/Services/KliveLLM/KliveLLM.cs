@@ -194,10 +194,10 @@ namespace Omnipotent.Services.KliveLocalLLM
                 localModelReady = true;
                 await ServiceLog("Local model initialized successfully");
             }
-            catch
+            catch(Exception e)
             {
                 // ignore errors - leave localModelReady false
-                try { await ServiceLogError("Failed to initialize local model"); } catch { }
+                try { await ServiceLogError(e, "Failed to initialize local model"); } catch { }
             }
         }
 
