@@ -442,9 +442,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
         private async Task<bool> TryGenerateAccessTokenFromRefreshToken(ulong steamId64)
         {
+            SteamClient client = new();
             try
             {
-                SteamClient client = new();
+                if (!await ConnectSteamClientAsync(client, "generate access token from refresh token"))
+                {
+                    return false;
+                }
+
                 var accessTokenResult = await client.Authentication.GenerateAccessTokenForAppAsync(new SteamID(steamId64), steamRefreshToken!, true);
                 if (string.IsNullOrWhiteSpace(accessTokenResult.AccessToken))
                 {
@@ -464,10 +469,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 steamAccessToken = null;
                 return false;
             }
+            finally
+            {
+                client.Disconnect();
+            }
         }
 
         private async Task<bool> AcquireRefreshTokenProgrammatically()
         {
+            SteamClient client = new();
             try
             {
                 var credentials = await LoadSteamCredentialsFromDisk();
@@ -477,7 +487,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     return false;
                 }
 
-                SteamClient client = new();
+                if (!await ConnectSteamClientAsync(client, "begin credentials auth session"))
+                {
+                    return false;
+                }
+
                 var authSession = await client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
                 {
                     Username = credentials.Value.Username,
@@ -523,6 +537,57 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 parent.parent.ServiceLogError(ex, "Programmatic Steam refresh-token acquisition failed.");
                 return false;
             }
+            finally
+            {
+                client.Disconnect();
+            }
+        }
+
+        private async Task<bool> ConnectSteamClientAsync(SteamClient client, string operation)
+        {
+            TaskCompletionSource<bool> connectedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            CallbackManager callbackManager = new(client);
+
+            callbackManager.Subscribe<SteamClient.ConnectedCallback>(callback =>
+            {
+                connectedTcs.TrySetResult(true);
+            });
+
+            callbackManager.Subscribe<SteamClient.DisconnectedCallback>(_ =>
+            {
+                connectedTcs.TrySetResult(false);
+            });
+
+            client.Connect();
+
+            using CancellationTokenSource timeoutCts = new(TimeSpan.FromSeconds(20));
+            try
+            {
+                while (!connectedTcs.Task.IsCompleted && !timeoutCts.IsCancellationRequested)
+                {
+                    callbackManager.RunWaitCallbacks(TimeSpan.FromMilliseconds(250));
+                    await Task.Yield();
+                }
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError(ex, $"Steam client callback loop failed while trying to {operation}.");
+                return false;
+            }
+
+            if (!connectedTcs.Task.IsCompleted)
+            {
+                parent.parent.ServiceLogError($"Timed out connecting Steam client while trying to {operation}.");
+                return false;
+            }
+
+            bool connected = await connectedTcs.Task;
+            if (!connected)
+            {
+                parent.parent.ServiceLogError($"Steam client connection failed while trying to {operation}.");
+            }
+
+            return connected;
         }
 
         private async Task<(string Username, string Password, string? GuardData)?> LoadSteamCredentialsFromDisk()
