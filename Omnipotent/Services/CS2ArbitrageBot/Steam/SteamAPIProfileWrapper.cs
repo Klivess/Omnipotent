@@ -3,6 +3,7 @@ using Newtonsoft.Json;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using SteamKit2;
 using SteamKit2.Authentication;
+using System.Text;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
@@ -14,6 +15,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         private string? steamRefreshToken;
         private string? steamAccessToken;
         private string? steamSessionId;
+        private ulong? authenticatedSteamId64;
 
         private class SteamAuthState
         {
@@ -48,6 +50,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             {
                 try
                 {
+                    if (!await wrapper.AskKlivesReadyForSteamMobileAction("approve the Steam login confirmation"))
+                    {
+                        wrapper.parent.parent.ServiceLogError("Klives is not ready to approve Steam login confirmation.");
+                        return false;
+                    }
+
                     string response = (string)await wrapper.parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
                         "SendButtonsPromptToKlivesDiscord",
                         "CS2 Arbitrage Bot — Steam Login Confirmation Required",
@@ -93,7 +101,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
 
             string cookieString = await ProduceCommunityCookieString();
-            string steamID = parent.SteamIDOfSteamClient;
+            string steamID = GetEffectiveSteamId();
             string? lastAssetId = null;
             bool moreItems = true;
             string? foundButNotMarketableAssetId = null;
@@ -212,7 +220,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             HttpClient client = new();
             client.DefaultRequestHeaders.Add("Cookie", cookieString);
-            client.DefaultRequestHeaders.Add("Referer", $"https://steamcommunity.com/profiles/{parent.SteamIDOfSteamClient}/inventory");
+            client.DefaultRequestHeaders.Add("Referer", $"https://steamcommunity.com/profiles/{GetEffectiveSteamId()}/inventory");
 
             int retryCount = 0;
             const int maxRetries = 5;
@@ -279,6 +287,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         {
             try
             {
+                if (!await AskKlivesReadyForSteamMobileAction($"confirm Steam Market listing for {itemName}"))
+                {
+                    parent.parent.ServiceLogError($"Klives is not ready to confirm Steam Market listing for {itemName}.");
+                    return false;
+                }
+
                 string confirmResponse = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
                     "SendButtonsPromptToKlivesDiscord",
                     "CS2 Arbitrage Bot — Steam Mobile Confirmation Required",
@@ -400,6 +414,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     return false;
                 }
 
+                steamId64 = ResolveSteamIdForTokenGeneration(steamId64);
+
                 if (string.IsNullOrWhiteSpace(steamRefreshToken))
                 {
                     bool loginWorked = await AcquireRefreshTokenProgrammatically();
@@ -461,6 +477,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 {
                     steamRefreshToken = accessTokenResult.RefreshToken;
                 }
+
+                authenticatedSteamId64 = TryExtractSteamIdFromJwt(steamAccessToken) ?? TryExtractSteamIdFromJwt(steamRefreshToken) ?? steamId64;
                 return true;
             }
             catch (Exception ex)
@@ -512,6 +530,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
                 steamRefreshToken = authResult.RefreshToken;
                 steamAccessToken = authResult.AccessToken;
+                authenticatedSteamId64 = TryExtractSteamIdFromJwt(steamRefreshToken) ?? TryExtractSteamIdFromJwt(steamAccessToken);
 
                 string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
                 string stateJson = await parent.parent.GetDataHandler().ReadDataFromFile(statePath);
@@ -590,6 +609,87 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             return connected;
         }
 
+        private string GetEffectiveSteamId()
+        {
+            return (authenticatedSteamId64 ?? 0) > 0 ? authenticatedSteamId64!.Value.ToString() : parent.SteamIDOfSteamClient;
+        }
+
+        private ulong ResolveSteamIdForTokenGeneration(ulong configuredSteamId64)
+        {
+            ulong? tokenSteamId64 = TryExtractSteamIdFromJwt(steamRefreshToken);
+            if (!tokenSteamId64.HasValue)
+            {
+                return configuredSteamId64;
+            }
+
+            authenticatedSteamId64 = tokenSteamId64.Value;
+            if (tokenSteamId64.Value != configuredSteamId64)
+            {
+                parent.parent.ServiceLogError($"Configured SteamID ({configuredSteamId64}) differs from refresh-token SteamID ({tokenSteamId64.Value}). Using refresh-token SteamID for token generation.");
+                return tokenSteamId64.Value;
+            }
+
+            return configuredSteamId64;
+        }
+
+        private static ulong? TryExtractSteamIdFromJwt(string? jwt)
+        {
+            if (string.IsNullOrWhiteSpace(jwt))
+            {
+                return null;
+            }
+
+            try
+            {
+                string[] parts = jwt.Split('.');
+                if (parts.Length < 2)
+                {
+                    return null;
+                }
+
+                string payload = parts[1].Replace('-', '+').Replace('_', '/');
+                switch (payload.Length % 4)
+                {
+                    case 2: payload += "=="; break;
+                    case 3: payload += "="; break;
+                }
+
+                string payloadJson = Encoding.UTF8.GetString(Convert.FromBase64String(payload));
+                dynamic parsed = JsonConvert.DeserializeObject(payloadJson);
+                string? subject = Convert.ToString(parsed?.sub);
+                return ulong.TryParse(subject, out ulong parsedSteamId) ? parsedSteamId : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private async Task<bool> AskKlivesReadyForSteamMobileAction(string actionDescription)
+        {
+            try
+            {
+                string response = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
+                    "SendButtonsPromptToKlivesDiscord",
+                    "CS2 Arbitrage Bot — Are You Ready?",
+                    $"Are you ready to {actionDescription} in the Steam mobile app now?",
+                    new Dictionary<string, DSharpPlus.ButtonStyle>
+                    {
+                        { "Ready", DSharpPlus.ButtonStyle.Primary },
+                        { "Not Ready", DSharpPlus.ButtonStyle.Secondary }
+                    },
+                    TimeSpan.FromHours(24)
+                );
+
+                return response == "Ready";
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError(ex, "Error while asking Klives if he is ready for Steam mobile action.");
+                return false;
+            }
+        }
+
         private async Task<(string Username, string Password, string? GuardData)?> LoadSteamCredentialsFromDisk()
         {
             string username = await parent.parent.GetStringOmniSetting("CS2ArbitrageBotSteamLoginUsername", "", false, true);
@@ -627,6 +727,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     }
                 }
 
+                authenticatedSteamId64 ??= TryExtractSteamIdFromJwt(steamAccessToken) ?? TryExtractSteamIdFromJwt(steamRefreshToken);
+
                 if (string.IsNullOrWhiteSpace(steamRefreshToken))
                 {
                     string refreshTokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamRefreshToken);
@@ -634,6 +736,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     if (!string.IsNullOrWhiteSpace(rawToken))
                     {
                         steamRefreshToken = rawToken.Trim();
+                        authenticatedSteamId64 ??= TryExtractSteamIdFromJwt(steamRefreshToken);
                     }
                 }
             }
@@ -671,7 +774,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
 
             steamSessionId ??= Guid.NewGuid().ToString("N");
-            string steamLoginSecure = Uri.EscapeDataString($"{parent.SteamIDOfSteamClient}||{steamAccessToken}");
+            string steamLoginSecure = Uri.EscapeDataString($"{GetEffectiveSteamId()}||{steamAccessToken}");
             return $"sessionid={steamSessionId}; steamLoginSecure={steamLoginSecure}; steamRememberLogin=true";
         }
         public async Task<bool> CheckIfCommunityCookieStringWorks(bool reLogin = true)
