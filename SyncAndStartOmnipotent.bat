@@ -1,6 +1,6 @@
 @echo off
-taskkill /F /IM Omnipotent.exe
 taskkill /F /IM OmnipotentProcessMonitor.exe
+taskkill /F /IM Omnipotent.exe
 
 git status
 git pull origin master
