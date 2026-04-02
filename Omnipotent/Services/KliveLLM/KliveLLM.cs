@@ -29,7 +29,7 @@ namespace Omnipotent.Services.KliveLocalLLM
         private HttpClient client;
         private string ModelDownloadUrl = "";
         private static string LLamaBinariesDownloadPath = @"https://github.com/Klivess/Omnipotent/raw/e98841bf168a3d9ed7dc2c722481ef274882389f/CustomLLamaBinaries.zip";
-        private static string LLamaBinariesFolder = (OmniPaths.GlobalPaths.KliveLLamaBinariesDirectory);
+        private static string LLamaBinariesFolder = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLamaBinariesDirectory);
         public static string LLamaDLLFile = Path.Combine(LLamaBinariesFolder, "llama.dll");
         public static string LLamaMTMDFile = Path.Combine(LLamaBinariesFolder, "mtmd.dll");
         public KliveLLM()
@@ -83,6 +83,30 @@ namespace Omnipotent.Services.KliveLocalLLM
                 }
 
                 ZipFile.ExtractToDirectory(tempZipPath, LLamaBinariesFolder, overwriteFiles: true);
+
+                // Some archives place binaries in a nested folder (e.g. Release). If so, flatten all DLLs
+                // into the expected LLamaBinariesFolder so native dependencies resolve correctly.
+                string? extractedLlamaDllPath = Directory
+                    .GetFiles(LLamaBinariesFolder, "llama.dll", SearchOption.AllDirectories)
+                    .OrderBy(p => p.Length)
+                    .FirstOrDefault();
+
+                if (!string.IsNullOrWhiteSpace(extractedLlamaDllPath))
+                {
+                    string? sourceDirectory = Path.GetDirectoryName(extractedLlamaDllPath);
+                    if (!string.IsNullOrWhiteSpace(sourceDirectory)
+                        && !Path.GetFullPath(sourceDirectory).Equals(Path.GetFullPath(LLamaBinariesFolder), StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (string dllPath in Directory.GetFiles(sourceDirectory, "*.dll", SearchOption.TopDirectoryOnly))
+                        {
+                            string destination = Path.Combine(LLamaBinariesFolder, Path.GetFileName(dllPath));
+                            if (!Path.GetFullPath(dllPath).Equals(Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+                            {
+                                File.Copy(dllPath, destination, overwrite: true);
+                            }
+                        }
+                    }
+                }
 
                 if (!File.Exists(LLamaDLLFile) || !File.Exists(LLamaMTMDFile))
                 {
