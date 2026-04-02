@@ -5,6 +5,7 @@ using LLama;
 using LLama.Abstractions;
 using LLama.Common;
 using LLama.Native;
+using LLama.Sampling;
 using Markdig.Extensions.TaskLists;
 using LangChain.Providers.HuggingFace;
 using Omnipotent.Data_Handling;
@@ -360,7 +361,14 @@ namespace Omnipotent.Services.KliveLocalLLM
                 var inferenceParams = new InferenceParams()
                 {
                     MaxTokens = 256,
-                    AntiPrompts = new List<string> { "User:" }
+                    AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
+                    SamplingPipeline = new DefaultSamplingPipeline
+                    {
+                        Temperature = 0.7f,
+                        TopK = 40,
+                        TopP = 0.9f,
+                        RepeatPenalty = 1.1f
+                    }
                 };
 
                 var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
@@ -369,7 +377,11 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     sb.Append(chunk);
                 }
-                string outStr = sb.ToString();
+                string outStr = SanitizeLocalModelOutput(sb.ToString());
+                if (string.IsNullOrWhiteSpace(outStr))
+                {
+                    outStr = "I had trouble generating a clean response. Please try rephrasing.";
+                }
 
                 var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
                 session.messages.Add(assistantMsg);
@@ -393,6 +405,48 @@ namespace Omnipotent.Services.KliveLocalLLM
                 await ServiceLogError(ex, "Local model query failed");
                 return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = ex.Message };
             }
+        }
+
+        private static string SanitizeLocalModelOutput(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+
+            string text = raw.Replace("\r\n", "\n").Trim();
+
+            // Remove common leading role prefixes emitted by chat-tuned models
+            string[] leadingPrefixes = ["Assistant:", "assistant:", "[Assistant]", "[assistant]"];
+            bool removedPrefix;
+            do
+            {
+                removedPrefix = false;
+                foreach (var prefix in leadingPrefixes)
+                {
+                    if (text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        text = text.Substring(prefix.Length).TrimStart();
+                        removedPrefix = true;
+                    }
+                }
+            } while (removedPrefix);
+
+            // Cut off trailing role markers that indicate the model started the next turn
+            string[] stopMarkers = ["\nUser:", "\nSystem:", "\nAssistant:", "User:", "System:"];
+            int cutIndex = -1;
+            foreach (var marker in stopMarkers)
+            {
+                int idx = text.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0 && (cutIndex < 0 || idx < cutIndex))
+                {
+                    cutIndex = idx;
+                }
+            }
+
+            if (cutIndex >= 0)
+            {
+                text = text.Substring(0, cutIndex).Trim();
+            }
+
+            return text.Trim();
         }
 
         public string ProducePayloadString(string role, string content, string model)
