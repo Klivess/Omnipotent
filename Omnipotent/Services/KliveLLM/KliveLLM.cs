@@ -39,6 +39,17 @@ namespace Omnipotent.Services.KliveLocalLLM
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
+
+            try
+            {
+                await EnsureModelDownloadedAsync();
+                await InitializeLocalModelAsync();
+            }
+            catch
+            {
+                // Swallow to avoid crashing service at startup if local model cannot be initialized
+            }
+            ServiceLog("LocalLLM loaded and ready, heres what it has to say to Hello: "+(await QueryLocalLLMAsync("Hello!")).Response);
         }
 
         public async Task<string> QueryLLM(string content)
