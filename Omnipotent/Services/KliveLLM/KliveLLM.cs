@@ -207,46 +207,70 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
             catch { }
 
-            using var remoteStream = await response.Content.ReadAsStreamAsync();
-            using var fs = new FileStream(tempModelPath, FileMode.Create, FileAccess.Write, FileShare.None);
-            byte[] buffer = new byte[1024 * 1024];
-            long downloadedBytes = 0;
-            int lastReportedPercent = -1;
-            int bytesRead;
-            while ((bytesRead = await remoteStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            try
             {
-                await fs.WriteAsync(buffer, 0, bytesRead);
-                downloadedBytes += bytesRead;
-
-                if (totalBytes > 0)
+                using (var remoteStream = await response.Content.ReadAsStreamAsync())
+                using (var fs = new FileStream(tempModelPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    int percent = (int)((downloadedBytes * 100L) / totalBytes);
-                    if (percent >= 100) percent = 100;
-
-                    if (percent == 100 || percent >= lastReportedPercent + 5)
+                    byte[] buffer = new byte[1024 * 1024];
+                    long downloadedBytes = 0;
+                    int lastReportedPercent = -1;
+                    int bytesRead;
+                    while ((bytesRead = await remoteStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
                     {
-                        lastReportedPercent = percent;
-                        try
+                        await fs.WriteAsync(buffer, 0, bytesRead);
+                        downloadedBytes += bytesRead;
+
+                        if (totalBytes > 0)
                         {
-                            if (progressMessage != null)
+                            int percent = (int)((downloadedBytes * 100L) / totalBytes);
+                            if (percent >= 100) percent = 100;
+
+                            if (percent == 100 || percent >= lastReportedPercent + 5)
                             {
-                                await progressMessage.ModifyAsync($"Local LLM model download progress: {percent}% ({fileName})");
-                            }
-                            else
-                            {
-                                await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
-                                    "SendMessageToKlives",
-                                    $"Local LLM model download progress: {percent}% ({fileName})");
+                                lastReportedPercent = percent;
+                                try
+                                {
+                                    if (progressMessage != null)
+                                    {
+                                        await progressMessage.ModifyAsync($"Local LLM model download progress: {percent}% ({fileName})");
+                                    }
+                                    else
+                                    {
+                                        await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
+                                            "SendMessageToKlives",
+                                            $"Local LLM model download progress: {percent}% ({fileName})");
+                                    }
+                                }
+                                catch { }
                             }
                         }
-                        catch { }
                     }
                 }
+
+                File.Move(tempModelPath, modelPath, true);
+
+                try
+                {
+                    if (progressMessage != null)
+                    {
+                        await progressMessage.ModifyAsync($"Local LLM model downloaded: 100% ({fileName})");
+                    }
+                }
+                catch { }
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempModelPath))
+                    {
+                        File.Delete(tempModelPath);
+                    }
+                }
+                catch { }
             }
 
-            File.Copy(tempModelPath, modelPath, true);
-            File.Delete(tempModelPath);
-            await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",$"Local LLM model downloaded");
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
 
