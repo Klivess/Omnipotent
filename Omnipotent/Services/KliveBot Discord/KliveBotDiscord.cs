@@ -13,6 +13,7 @@ using DSharpPlus.SlashCommands;
 using System.Security.Policy;
 using Omnipotent.Services.KliveLocalLLM;
 using System.Diagnostics;
+using Humanizer;
 
 namespace Omnipotent.Services.KliveBot_Discord
 {
@@ -109,8 +110,10 @@ namespace Omnipotent.Services.KliveBot_Discord
                         if (llmService.IsServiceActive())
                         {
                             string sessionId = GetLlmSessionIdForChat(args);
+                            Stopwatch stopwatch = Stopwatch.StartNew();
                             var llmResponse = await llmService.QueryLocalLLMAsync(args.Message.Content, sessionId);
-                            await args.Message.RespondAsync(llmResponse.Response);
+                            stopwatch.Stop();
+                            await args.Message.RespondAsync(llmResponse.Response+"\n\nProcessing Time: "+stopwatch.Elapsed.Humanize());
                         }
                     }
                     catch (Exception ex)

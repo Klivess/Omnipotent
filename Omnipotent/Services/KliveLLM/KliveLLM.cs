@@ -360,13 +360,11 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 var inferenceParams = new InferenceParams()
                 {
-                    MaxTokens = 256,
+                    MaxTokens = 2048,
                     AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
                     SamplingPipeline = new DefaultSamplingPipeline
                     {
                         Temperature = 0.7f,
-                        TopK = 40,
-                        TopP = 0.9f,
                         RepeatPenalty = 1.1f
                     }
                 };
@@ -380,7 +378,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 string outStr = SanitizeLocalModelOutput(sb.ToString());
                 if (string.IsNullOrWhiteSpace(outStr))
                 {
-                    outStr = "I had trouble generating a clean response. Please try rephrasing.";
+                    outStr = "[No response. Error?]";
                 }
 
                 var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
