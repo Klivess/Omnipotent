@@ -28,7 +28,7 @@ namespace Omnipotent.Services.KliveLocalLLM
         private string huggingFaceToken = "";
         private HttpClient client;
         private string ModelDownloadUrl = "";
-        private static string LLamaBinariesDownloadPath = @"https://github.com/Klivess/Omnipotent/raw/e98841bf168a3d9ed7dc2c722481ef274882389f/CustomLLamaBinaries.zip";
+        private static string LLamaBinariesDownloadPath;
         private static string LLamaBinariesFolder = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLamaBinariesDirectory);
         public static string LLamaDLLFile = Path.Combine(LLamaBinariesFolder, "llama.dll");
         public static string LLamaMTMDFile = Path.Combine(LLamaBinariesFolder, "mtmd.dll");
@@ -40,6 +40,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
         protected override async void ServiceMain()
         {
+            LLamaBinariesDownloadPath = await GetStringOmniSetting("CustomLLamaBinariesDownloadLink", "https://github.com/Klivess/Omnipotent/raw/refs/heads/master/OldCPULLamaBinaries.zip", false, true);
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             client = new HttpClient();
