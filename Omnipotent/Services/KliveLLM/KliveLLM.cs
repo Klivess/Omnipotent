@@ -1,4 +1,5 @@
 ﻿using DSharpPlus;
+using DSharpPlus.Entities;
 using Microsoft.Extensions.AI;
 using LLama;
 using LLama.Abstractions;
@@ -190,9 +191,57 @@ namespace Omnipotent.Services.KliveLocalLLM
             // Attempt to download the file. The provided HF link is adjusted to the raw 'resolve' path above.
             using var response = await client.GetAsync(ModelDownloadUrl, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
+            long totalBytes = response.Content.Headers.ContentLength ?? -1;
+            DiscordMessage? progressMessage = null;
+
+            try
+            {
+                var msgObj = await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
+                    "SendMessageToKlives",
+                    totalBytes > 0
+                        ? $"Starting local LLM model download: 0% ({fileName})"
+                        : $"Starting local LLM model download (size unknown): {fileName}");
+                progressMessage = msgObj as DiscordMessage;
+            }
+            catch { }
+
             using var remoteStream = await response.Content.ReadAsStreamAsync();
             using var fs = new FileStream(modelPath, FileMode.Create, FileAccess.Write, FileShare.None);
-            await remoteStream.CopyToAsync(fs);
+            byte[] buffer = new byte[1024 * 1024];
+            long downloadedBytes = 0;
+            int lastReportedPercent = -1;
+            int bytesRead;
+            while ((bytesRead = await remoteStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            {
+                await fs.WriteAsync(buffer, 0, bytesRead);
+                downloadedBytes += bytesRead;
+
+                if (totalBytes > 0)
+                {
+                    int percent = (int)((downloadedBytes * 100L) / totalBytes);
+                    if (percent >= 100) percent = 100;
+
+                    if (percent == 100 || percent >= lastReportedPercent + 5)
+                    {
+                        lastReportedPercent = percent;
+                        try
+                        {
+                            if (progressMessage != null)
+                            {
+                                await progressMessage.ModifyAsync($"Local LLM model download progress: {percent}% ({fileName})");
+                            }
+                            else
+                            {
+                                await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
+                                    "SendMessageToKlives",
+                                    $"Local LLM model download progress: {percent}% ({fileName})");
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
 
