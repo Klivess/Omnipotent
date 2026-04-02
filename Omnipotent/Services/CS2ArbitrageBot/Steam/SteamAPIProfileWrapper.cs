@@ -527,16 +527,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
         private async Task<(string Username, string Password, string? GuardData)?> LoadSteamCredentialsFromDisk()
         {
-            string usernamePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginUsername);
-            string passwordPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamLoginPassword);
-
-            string username = await parent.parent.GetDataHandler().ReadDataFromFile(usernamePath);
-            string password = await parent.parent.GetDataHandler().ReadDataFromFile(passwordPath);
-
-            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
-            {
-                return null;
-            }
+            string username = await parent.parent.GetStringOmniSetting("CS2ArbitrageBotSteamLoginUsername", "", false, true);
+            string password = await parent.parent.GetStringOmniSetting("CS2ArbitrageBotSteamLoginPassword", "", true, true);
 
             string? guardData = null;
             try
