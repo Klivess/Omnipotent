@@ -86,6 +86,29 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 if (!File.Exists(LLamaDLLFile) || !File.Exists(LLamaMTMDFile))
                 {
+                    string? extractedLlamaDll = Directory
+                        .GetFiles(LLamaBinariesFolder, "llama.dll", SearchOption.AllDirectories)
+                        .FirstOrDefault();
+                    string? extractedMtmdDll = Directory
+                        .GetFiles(LLamaBinariesFolder, "mtmd.dll", SearchOption.AllDirectories)
+                        .FirstOrDefault();
+
+                    if (!string.IsNullOrWhiteSpace(extractedLlamaDll) && !string.IsNullOrWhiteSpace(extractedMtmdDll))
+                    {
+                        if (!Path.GetFullPath(extractedLlamaDll).Equals(Path.GetFullPath(LLamaDLLFile), StringComparison.OrdinalIgnoreCase))
+                        {
+                            File.Copy(extractedLlamaDll, LLamaDLLFile, overwrite: true);
+                        }
+
+                        if (!Path.GetFullPath(extractedMtmdDll).Equals(Path.GetFullPath(LLamaMTMDFile), StringComparison.OrdinalIgnoreCase))
+                        {
+                            File.Copy(extractedMtmdDll, LLamaMTMDFile, overwrite: true);
+                        }
+                    }
+                }
+
+                if (!File.Exists(LLamaDLLFile) || !File.Exists(LLamaMTMDFile))
+                {
                     throw new FileNotFoundException($"Downloaded binaries zip did not contain required files at expected paths: {LLamaDLLFile} and {LLamaMTMDFile}");
                 }
 
