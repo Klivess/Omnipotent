@@ -47,6 +47,7 @@ namespace Omnipotent.Data_Handling
 
             //KliveLocalLLM
             public static string KliveLLMDirectory = $"{SavedDataDirectory}/KliveLLM";
+            public static string KliveLLamaBinariesDirectory = $"{KliveLLMDirectory}/LLamaBinaries";
             public static string KliveLLMModelsDirectory = $"{KliveLLMDirectory}/LLMModels";
             public static string KliveLLMTokenText = $"{KliveLLMDirectory}/huggingfacetoken.txt";
 

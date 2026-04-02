@@ -19,6 +19,8 @@ using System.Drawing;
 using System.Text;
 using Newtonsoft.Json;
 using System.Security.Policy;
+using System.IO.Compression;
+using Omnipotent.Services.KliveCloud;
 
 namespace Omnipotent.Services.KliveLocalLLM
 {
@@ -27,6 +29,10 @@ namespace Omnipotent.Services.KliveLocalLLM
         private string huggingFaceToken = "";
         private HttpClient client;
         private string ModelDownloadUrl = "";
+        private static string LLamaBinariesFolder = (OmniPaths.GlobalPaths.KliveLLamaBinariesDirectory);
+        public static string LLamaDLLFile = Path.Combine(LLamaBinariesFolder, "llama.dll");
+        public static string LLamaMTMDFile = Path.Combine(LLamaBinariesFolder, "mtmd.dll");
+        private const string RequiredLlamaBinariesZipName = "llama-binaries.zip";
         public KliveLLM()
         {
             name = "KliveLLM";
@@ -40,6 +46,9 @@ namespace Omnipotent.Services.KliveLocalLLM
             client = new HttpClient();
             client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
 
+            await EnsureLlamaBinariesAvailableAsync();
+            NativeLibraryConfig.All.WithLibrary(LLamaDLLFile, LLamaMTMDFile);
+
             try
             {
                 await EnsureModelDownloadedAsync();
@@ -50,6 +59,102 @@ namespace Omnipotent.Services.KliveLocalLLM
                 // Swallow to avoid crashing service at startup if local model cannot be initialized
             }
             ServiceLog("LocalLLM loaded and ready, heres what it has to say to Hello: "+(await QueryLocalLLMAsync("Hello!")).Response);
+        }
+
+        private async Task EnsureLlamaBinariesAvailableAsync()
+        {
+            Directory.CreateDirectory(LLamaBinariesFolder);
+            if (File.Exists(LLamaDLLFile) && File.Exists(LLamaMTMDFile))
+            {
+                return;
+            }
+
+            await ServiceLogError($"LLama native binaries missing. Please upload '{RequiredLlamaBinariesZipName}' to KliveCloud with both llama.dll and mtmd.dll at zip root.");
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>(
+                    "SendMessageToKlives",
+                    $"KliveLLM needs LLama native binaries. Please upload a zip named '{RequiredLlamaBinariesZipName}' to KliveCloud containing llama.dll and mtmd.dll at the zip root.");
+            }
+            catch { }
+
+            while (true)
+            {
+                string buttonResponse = (string)(await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
+                    "SendButtonsPromptToKlivesDiscord",
+                    "KliveLLM — LLama binaries required",
+                    $"Please upload '{RequiredLlamaBinariesZipName}' to KliveCloud. When upload is complete, click **Uploaded**.",
+                    new Dictionary<string, ButtonStyle>
+                    {
+                        { "Uploaded", ButtonStyle.Success },
+                        { "Cancel startup", ButtonStyle.Danger }
+                    },
+                    TimeSpan.FromHours(24)) ?? string.Empty);
+
+                if (buttonResponse == "Cancel startup")
+                {
+                    throw new OperationCanceledException("LLama binaries upload was cancelled by Klives.");
+                }
+
+                if (await TryDownloadAndExtractUploadedLlamaBinariesZipAsync())
+                {
+                    return;
+                }
+
+                await ServiceLogError($"Could not find valid '{RequiredLlamaBinariesZipName}' in KliveCloud after upload confirmation. Please re-upload and click Uploaded again.");
+            }
+        }
+
+        private async Task<bool> TryDownloadAndExtractUploadedLlamaBinariesZipAsync()
+        {
+            var cloudItemsObject = await GetServiceObject<Omnipotent.Services.KliveCloud.KliveCloud>("CloudItems");
+            if (cloudItemsObject is not List<CloudItem> cloudItems)
+            {
+                return false;
+            }
+
+            var zipItem = cloudItems
+                .Where(x => x.ItemType == CloudItem.CloudItemType.File && x.Name.Equals(RequiredLlamaBinariesZipName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(x => x.ModifiedDate)
+                .FirstOrDefault();
+
+            if (zipItem == null)
+            {
+                return false;
+            }
+
+            var zipBytesObject = await ExecuteServiceMethod<Omnipotent.Services.KliveCloud.KliveCloud>("DownloadFile", zipItem.ItemID);
+            if (zipBytesObject is not byte[] zipBytes || zipBytes.Length == 0)
+            {
+                return false;
+            }
+
+            string tempZipPath = Path.Combine(Path.GetTempPath(), $"llama-binaries-{Guid.NewGuid():N}.zip");
+            try
+            {
+                await File.WriteAllBytesAsync(tempZipPath, zipBytes);
+                ZipFile.ExtractToDirectory(tempZipPath, LLamaBinariesFolder, overwriteFiles: true);
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(tempZipPath))
+                    {
+                        File.Delete(tempZipPath);
+                    }
+                }
+                catch { }
+            }
+
+            if (File.Exists(LLamaDLLFile) && File.Exists(LLamaMTMDFile))
+            {
+                await ServiceLog($"LLama binaries extracted from KliveCloud into {LLamaBinariesFolder}");
+                return true;
+            }
+
+            await ServiceLogError($"Uploaded zip '{RequiredLlamaBinariesZipName}' was extracted but llama.dll/mtmd.dll were not found at expected locations.");
+            return false;
         }
 
         public async Task<string> QueryLLM(string content)
