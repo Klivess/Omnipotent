@@ -74,6 +74,12 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        private static string GetLlmSessionIdForChat(DSharpPlus.EventArgs.MessageCreateEventArgs args)
+        {
+            // One Discord chat/channel = one LLM conversation session
+            return $"discord-chat-{args.Channel.Id}";
+        }
+
         private async Task Client_MessageCreated(DiscordClient sender, DSharpPlus.EventArgs.MessageCreateEventArgs args)
         {
             try
@@ -87,16 +93,24 @@ namespace Omnipotent.Services.KliveBot_Discord
                     DiscordMessage message = null;
                     try
                     {
-                        embed = MakeSimpleEmbed($"New message sent to KliveBot: {args.Author.Username}", $"Content: {args.Message.Content}" + (args.Message.Attachments.Any() ? $"" +
-$"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}" : ""), DiscordColor.Orange);
+                        embed = MakeSimpleEmbed(
+                            $"New message sent to KliveBot: {args.Author.Username}",
+                            $"Content: {args.Message.Content}" + (args.Message.Attachments.Any()
+                                ? $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url))}"
+                                : ""),
+                            DiscordColor.Orange);
+
                         if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
                         {
                             message = await SendMessageToKlives(embed);
                         }
+
                         var llmService = (KliveLocalLLM.KliveLLM)(await GetServicesByType<KliveLocalLLM.KliveLLM>())[0];
                         if (llmService.IsServiceActive())
                         {
-                            args.Message.RespondAsync(await llmService.QueryLLM(args.Message.Content));
+                            string sessionId = GetLlmSessionIdForChat(args);
+                            var llmResponse = await llmService.QueryLocalLLMAsync(args.Message.Content, sessionId);
+                            await args.Message.RespondAsync(llmResponse.Response);
                         }
                     }
                     catch (Exception ex)
@@ -104,7 +118,15 @@ $"\n\nAttachments: {string.Join("\n", args.Message.Attachments.Select(k => k.Url
                         ServiceLogError(ex, "Error responding to MessageCreated");
                         string response = "I tried to respond to this, but an exception occurred. 😢";
                         await args.Message.RespondAsync(response);
-                        await message.ModifyAsync(MakeSimpleEmbed(message.Embeds[0].Title, message.Embeds[0].Description + $"\n\nKliveBot Response: {response}", message.Embeds[0].Color.Value));
+
+                        if (message != null && message.Embeds.Any())
+                        {
+                            await message.ModifyAsync(
+                                MakeSimpleEmbed(
+                                    message.Embeds[0].Title,
+                                    message.Embeds[0].Description + $"\n\nKliveBot Response: {response}",
+                                    message.Embeds[0].Color.Value));
+                        }
                     }
                 }
             }
