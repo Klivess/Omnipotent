@@ -188,6 +188,8 @@ namespace Omnipotent.Services.KliveLocalLLM
             modelPath = Path.Combine(modelsDir, fileName);
             if (File.Exists(modelPath)) return;
 
+            string tempModelPath = Path.Combine(Path.GetTempPath(), $"{fileName}.{Guid.NewGuid():N}.download");
+
             // Attempt to download the file. The provided HF link is adjusted to the raw 'resolve' path above.
             using var response = await client.GetAsync(ModelDownloadUrl, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
@@ -206,7 +208,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             catch { }
 
             using var remoteStream = await response.Content.ReadAsStreamAsync();
-            using var fs = new FileStream(modelPath, FileMode.Create, FileAccess.Write, FileShare.None);
+            using var fs = new FileStream(tempModelPath, FileMode.Create, FileAccess.Write, FileShare.None);
             byte[] buffer = new byte[1024 * 1024];
             long downloadedBytes = 0;
             int lastReportedPercent = -1;
@@ -241,6 +243,12 @@ namespace Omnipotent.Services.KliveLocalLLM
                     }
                 }
             }
+
+            if (File.Exists(modelPath))
+            {
+                File.Delete(modelPath);
+            }
+            File.Move(tempModelPath, modelPath, true);
 
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
