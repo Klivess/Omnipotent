@@ -244,12 +244,9 @@ namespace Omnipotent.Services.KliveLocalLLM
                 }
             }
 
-            if (File.Exists(modelPath))
-            {
-                File.Delete(modelPath);
-            }
-            File.Move(tempModelPath, modelPath, true);
-
+            File.Copy(tempModelPath, modelPath, true);
+            File.Delete(tempModelPath);
+            await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",$"Local LLM model downloaded");
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
 
