@@ -284,10 +284,10 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 modelParams = new ModelParams(modelPath)
                 {
-                    ContextSize = 2048,
+                    ContextSize = 768,
                     GpuLayerCount = 0,    // Explicitly force CPU
-                    Threads = 4,
-                    BatchSize = 128
+                    Threads = Math.Max(1, Environment.ProcessorCount - 1),
+                    BatchSize = 64
                 };
 
                 // Load weights and create context/executor
@@ -360,7 +360,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 var inferenceParams = new InferenceParams()
                 {
-                    MaxTokens = 2048,
+                    MaxTokens = 256,
                     AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
                     SamplingPipeline = new DefaultSamplingPipeline
                     {
