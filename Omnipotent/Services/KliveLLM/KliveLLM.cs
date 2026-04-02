@@ -270,7 +270,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 }
                 catch { }
             }
-
+            ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",$"Local LLM model downloaded.");
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
 
