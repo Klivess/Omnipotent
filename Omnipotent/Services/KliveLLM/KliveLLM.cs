@@ -284,7 +284,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 modelParams = new ModelParams(modelPath)
                 {
-                    ContextSize = 768,
+                    ContextSize = 2048,
                     GpuLayerCount = 0,    // Explicitly force CPU
                     Threads = Math.Max(1, Environment.ProcessorCount - 1),
                     BatchSize = 64
