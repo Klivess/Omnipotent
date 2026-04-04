@@ -402,3 +402,4 @@ FodyWeavers.xsd
 *.sln.iml
 /Omnipotent/Services/KliveCloud/KliveCloud_API_Documentation.md
 /Omnipotent/Services/OmniTrader/Strategies/FlowSignalTraderStrategy/main.py
+/.github/copilot-instructions.md
