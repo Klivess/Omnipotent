@@ -196,6 +196,7 @@ namespace Omnipotent.Services.OmniTrader
                             strategy.Description
                         };
                     })
+                    .Where(x => !string.IsNullOrWhiteSpace(x.StrategyName))
                     .OrderBy(x => x.StrategyName)
                     .ToList();
 
@@ -221,14 +222,55 @@ namespace Omnipotent.Services.OmniTrader
 
             await CreateAPIRoute("/omniTrader/simulator/active-persistent", async (req) =>
             {
-                var registrations = await simulator.GetPersistedActiveDeployments();
-                await req.ReturnResponse(JsonConvert.SerializeObject(registrations));
+                try
+                {
+                    var registrations = (await simulator.GetPersistedActiveDeployments()).ToList();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Count = registrations.Count,
+                        Registrations = registrations
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Failed to read active persistent simulator deployments.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Count = 0,
+                        Registrations = Array.Empty<object>(),
+                        Error = ex.Message
+                    }), code: HttpStatusCode.InternalServerError);
+                }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await CreateAPIRoute("/omniTrader/analytics/live/all", async (req) =>
             {
-                var analytics = GetAllStrategyAnalytics();
-                await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
+                try
+                {
+                    var analytics = GetAllStrategyAnalytics();
+                    var deployments = analytics.Select(k => new
+                    {
+                        DeploymentId = k.Key,
+                        StrategyName = GetTrackedStrategyName(k.Key),
+                        Analytics = k.Value
+                    }).ToList();
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Count = deployments.Count,
+                        Deployments = deployments
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Failed to read live OmniTrader analytics.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Count = 0,
+                        Deployments = Array.Empty<object>(),
+                        Error = ex.Message
+                    }), code: HttpStatusCode.InternalServerError);
+                }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await CreateAPIRoute("/omniTrader/analytics/live/byDeployment", async (req) =>
