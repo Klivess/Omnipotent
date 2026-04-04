@@ -25,6 +25,11 @@ namespace Omnipotent.Services.OmniTrader.Strategies
 
         protected override Task OnLoad()
         {
+            return Task.CompletedTask;
+        }
+
+        protected override Task OnSessionStart()
+        {
             _inPosition = false;
             return Task.CompletedTask;
         }

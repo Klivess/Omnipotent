@@ -59,10 +59,14 @@ namespace Omnipotent.Services.OmniTrader
 
         public string OmniStrategyDirectoryPath = "";
 
-        
         public async Task Initialise(OmniTrader parent)
         {
-            tradeSessionState = new TradeSessionState { sessionType = TradeSessionType.None };
+            await PrepareForSession(parent, TradeSessionType.None);
+        }
+
+        public async Task PrepareForSession(OmniTrader parent, TradeSessionType sessionType)
+        {
+            tradeSessionState = new TradeSessionState { sessionType = sessionType };
             string proposedDirPathName = Name;
             foreach (char c in System.IO.Path.GetInvalidFileNameChars())
             {
@@ -72,14 +76,27 @@ namespace Omnipotent.Services.OmniTrader
             Directory.CreateDirectory(OmniStrategyDirectoryPath);
 
             this.parent = parent;
-            candleHistory = new();
+            candleHistory = [];
             if (IsLoaded)
+            {
+                await OnSessionStart();
                 return;
+            }
 
             await OnLoad();
+            await OnSessionStart();
             IsLoaded = true;
         }
+
+        public async Task PrepareForSession(TradeSessionType sessionType)
+        {
+            if (parent == null)
+                throw new InvalidOperationException($"Strategy '{Name}' has no parent assigned. Initialise(parent) must be called first.");
+
+            await PrepareForSession(parent, sessionType);
+        }
         protected virtual async Task OnLoad() { }
+        protected virtual Task OnSessionStart() => Task.CompletedTask;
 
         public async Task CandleClose(OmniTraderFinanceData.OHLCCandle candleData)
         {

@@ -18,6 +18,7 @@ namespace Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy
     public class FlowSignalTraderStrategy : OmniTraderStrategy
     {
         public FlowSignalScalpingEngine engine;
+        private bool signalHandlerAttached;
 
         public FlowSignalTraderStrategy()
         {
@@ -62,40 +63,58 @@ namespace Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy
         [JsonPropertyName("version")] public string Version { get; set; }
     }
 
-        protected override async Task OnLoad()
+        protected override Task OnLoad()
         {
             engine = new FlowSignalScalpingEngine(this, "BTCUSDT");
-            // Subscribe to Signal Events
-            engine.OnSignal += (sender, e) =>
+            if (!signalHandlerAttached)
             {
-                var s = e.Signal;
-                string msg = "\n*****************************************\n" +
-                             $"NEW SIGNAL: {e.Symbol} {s.Direction}\n" +
-                             $"Type: {s.SetupType} | Strength: {s.Strength}\n" +
-                             $"Entry: {s.Price} | SL: {s.StopLoss} | TP: {s.TakeProfit1}\n" +
-                             $"Reason: {s.Reason} | Score: {s.Score}/15\n" +
-                             "*****************************************\n";
-
-                if(tradeSessionState.GetOpenPositions().Count > 0)
+                // Subscribe to Signal Events
+                engine.OnSignal += (sender, e) =>
                 {
-                    StrategyLog("Already have an open position. Skipping signal.");
-                    return;
-                }
-                //if datetime is between 15:30 and 22:00 UTC time
-                else if(DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22))
-                {
-                    StrategyLog(msg);
-                    RaiseLong(AmountType.Percentage, 10, Convert.ToDecimal(s.StopLoss), Convert.ToDecimal(s.TakeProfit1));
-                }
-            };
+                    var s = e.Signal;
+                    string msg = "\n*****************************************\n" +
+                                 $"NEW SIGNAL: {e.Symbol} {s.Direction}\n" +
+                                 $"Type: {s.SetupType} | Strength: {s.Strength}\n" +
+                                 $"Entry: {s.Price} | SL: {s.StopLoss} | TP: {s.TakeProfit1}\n" +
+                                 $"Reason: {s.Reason} | Score: {s.Score}/15\n" +
+                                 "*****************************************\n";
 
-            // 3. Subscribe to Heartbeat/Status Updates
-            engine.OnStatusUpdate += (sender, statusText) =>
+                    if (tradeSessionState.GetOpenPositions().Count > 0)
+                    {
+                        //StrategyLog("Already have an open position. Skipping signal.");
+                        return;
+                    }
+                    //if datetime is between 15:30 and 22:00 UTC time
+                    else if (DateTime.UtcNow.TimeOfDay > TimeSpan.FromHours(15.5) && DateTime.UtcNow.TimeOfDay < TimeSpan.FromHours(22))
+                    {
+                        //StrategyLog(msg);
+                        RaiseLong(AmountType.Percentage, 10, Convert.ToDecimal(s.StopLoss), Convert.ToDecimal(s.TakeProfit1));
+                    }
+                };
+
+                // 3. Subscribe to Heartbeat/Status Updates
+                engine.OnStatusUpdate += (sender, statusText) =>
+                {
+                    //StrategyLog($"   > TELEMETRY: {statusText}");
+                };
+
+                signalHandlerAttached = true;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        protected override Task OnSessionStart()
+        {
+            if (tradeSessionState.sessionType == TradeSessionType.Live
+                || tradeSessionState.sessionType == TradeSessionType.Simulator
+                || tradeSessionState.sessionType == TradeSessionType.Testnet)
             {
-                //StrategyLog($"   > TELEMETRY: {statusText}");
-            };
-            await engine.RunAsync();
-            await Task.Delay(-1);
+                engine.Stop();
+                _ = engine.RunAsync();
+            }
+
+            return Task.CompletedTask;
         }
         protected override async Task OnCandleClose(OmniTraderFinanceData.OHLCCandle latest)
         {

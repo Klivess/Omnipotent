@@ -3,6 +3,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
     public class TradeRecord
     {
         public DateTime EntryTime { get; set; }
+        public bool IsShort { get; set; }
         public decimal EntryPrice { get; set; }
         public decimal EntryQuantity { get; set; }
         public decimal EntryCost { get; set; }
@@ -13,7 +14,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         public decimal ExitProceeds { get; set; }
         public decimal ExitFee { get; set; }
 
-        public decimal RealizedPnL => ExitProceeds - EntryCost;
+        public decimal RealizedPnL => IsShort ? EntryCost - ExitProceeds : ExitProceeds - EntryCost;
         public decimal RealizedPnLPercent => EntryCost == 0 ? 0 : RealizedPnL / EntryCost * 100;
         public bool IsWin => RealizedPnL > 0;
     }
