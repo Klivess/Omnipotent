@@ -1,6 +1,5 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
-using tryAGI.OpenAI;
 using System.Security.Cryptography;
 
 namespace Omnipotent.Services.MemeScraper

@@ -4,7 +4,6 @@ using DSharpPlus.EventArgs;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using SteamKit2.Internal;
-using System.Web.WebPages.Scope;
 
 namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
 {

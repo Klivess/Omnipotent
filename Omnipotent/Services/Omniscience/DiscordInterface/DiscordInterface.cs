@@ -17,7 +17,6 @@ using System.Formats.Asn1;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text;
-using System.Web.Helpers;
 using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 

@@ -11,7 +11,6 @@ using System.Linq;
 using System.Net;
 using System.Security;
 using System.Text.RegularExpressions;
-using System.Web.Mvc.Async;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.Omniscience.DiscordInterface.ChatInterface;
 using static Omnipotent.Services.Omniscience.DiscordInterface.DiscordInterface;

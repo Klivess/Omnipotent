@@ -8,8 +8,6 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.MemeScraper;
-using Polly;
-using Polly.Retry;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 
@@ -21,7 +19,6 @@ namespace Omnipotent.Services.OmniGram
         private OmniGramRoutes routes;
         private MemoryCache sessionCache;
         private readonly SemaphoreSlim processLock = new(1, 1);
-        private ResiliencePipeline retryPipeline;
 
         public OmniGram()
         {
@@ -35,15 +32,6 @@ namespace Omnipotent.Services.OmniGram
             await store.Load();
 
             sessionCache = new MemoryCache(new MemoryCacheOptions());
-            retryPipeline = new ResiliencePipelineBuilder()
-                .AddRetry(new RetryStrategyOptions
-                {
-                    MaxRetryAttempts = 3,
-                    Delay = TimeSpan.FromSeconds(2),
-                    BackoffType = DelayBackoffType.Exponential,
-                    UseJitter = true
-                })
-                .Build();
 
             routes = new OmniGramRoutes(this);
             await routes.RegisterRoutes();
@@ -290,10 +278,7 @@ namespace Omnipotent.Services.OmniGram
 
                 string caption = await ResolveCaption(post, account);
 
-                OmniGramPublishResult publishResult = await retryPipeline.ExecuteAsync(async token =>
-                {
-                    return await PublishWithInstagramApi(account, mediaPath, caption);
-                }, cancellationToken.Token);
+                OmniGramPublishResult publishResult = await PublishWithInstagramApi(account, mediaPath, caption);
 
                 if (publishResult.Success)
                 {
