@@ -100,6 +100,11 @@ namespace Omnipotent.Services.OmniTrader
             return simulator.GetAllSnapshots();
         }
 
+        public Dictionary<Guid, OmniBacktestResult> GetAllStrategyAnalyticsSummary()
+        {
+            return simulator.GetAllSnapshotSummaries();
+        }
+
         public Task<OmniBacktestResult> GetPersistedStrategyAnalytics(string strategyName)
         {
             return simulator.GetPersistedStrategySnapshot(strategyName);
@@ -205,7 +210,7 @@ namespace Omnipotent.Services.OmniTrader
 
             await CreateAPIRoute("/omniTrader/strategies/deployed", async (req) =>
             {
-                var analytics = GetAllStrategyAnalytics();
+                var analytics = GetAllStrategyAnalyticsSummary();
                 var deployed = analytics.Select(k => new
                 {
                     DeploymentId = k.Key,
@@ -224,7 +229,7 @@ namespace Omnipotent.Services.OmniTrader
             {
                 try
                 {
-                    var registrations = (await simulator.GetPersistedActiveDeployments()).ToList();
+                    var registrations = (await simulator.GetPersistedActiveDeployments(1500)).ToList();
                     await req.ReturnResponse(JsonConvert.SerializeObject(new
                     {
                         Count = registrations.Count,
@@ -247,7 +252,7 @@ namespace Omnipotent.Services.OmniTrader
             {
                 try
                 {
-                    var analytics = GetAllStrategyAnalytics();
+                    var analytics = GetAllStrategyAnalyticsSummary();
                     var deployments = analytics.Select(k => new
                     {
                         DeploymentId = k.Key,
@@ -293,28 +298,68 @@ namespace Omnipotent.Services.OmniTrader
 
             await CreateAPIRoute("/omniTrader/analytics/persisted/byStrategy", async (req) =>
             {
-                string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(strategyName))
+                try
                 {
-                    await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                    return;
-                }
+                    string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(strategyName))
+                    {
+                        await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
 
-                var analytics = await GetPersistedStrategyAnalytics(strategyName);
-                await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
+                    bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
+                    var analyticsTask = simulator.GetPersistedStrategySnapshot(strategyName, includeTrades);
+                    var analytics = await analyticsTask.WaitAsync(TimeSpan.FromSeconds(3));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
+                }
+                catch (TimeoutException)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Error = "Timed out while building persisted strategy analytics. Try includeTrades=false or retry."
+                    }), code: HttpStatusCode.RequestTimeout);
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Failed to read persisted analytics by strategy.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Error = ex.Message
+                    }), code: HttpStatusCode.InternalServerError);
+                }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await CreateAPIRoute("/omniTrader/analytics/strategyInsight", async (req) =>
             {
-                string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(strategyName))
+                try
                 {
-                    await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                    return;
-                }
+                    string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(strategyName))
+                    {
+                        await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
 
-                var insight = await simulator.GetStrategyInsight(strategyName);
-                await req.ReturnResponse(JsonConvert.SerializeObject(insight));
+                    bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
+                    var insightTask = simulator.GetStrategyInsight(strategyName, includeTrades);
+                    var insight = await insightTask.WaitAsync(TimeSpan.FromSeconds(3));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(insight));
+                }
+                catch (TimeoutException)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Error = "Timed out while building strategy insight. Try includeTrades=false or retry."
+                    }), code: HttpStatusCode.RequestTimeout);
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Failed to read strategy insight.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Error = ex.Message
+                    }), code: HttpStatusCode.InternalServerError);
+                }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await CreateAPIRoute("/omniTrader/backtest/run", async (req) =>

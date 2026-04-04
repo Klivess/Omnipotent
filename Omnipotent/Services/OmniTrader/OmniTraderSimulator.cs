@@ -310,9 +310,30 @@ namespace Omnipotent.Services.OmniTrader
             return output;
         }
 
+        public Dictionary<Guid, OmniBacktestResult> GetAllSnapshotSummaries()
+        {
+            var output = new Dictionary<Guid, OmniBacktestResult>();
+            foreach (var kvp in deployments)
+                output[kvp.Key] = BuildSnapshot(kvp.Value, includeTrades: false);
+            return output;
+        }
+
         public async Task<IReadOnlyCollection<PersistedActiveDeployment>> GetPersistedActiveDeployments()
         {
             await EnsureActiveDeploymentRegistryLoaded();
+            return activeDeploymentRegistry.Values.OrderBy(v => v.StrategyName).ToList();
+        }
+
+        public async Task<IReadOnlyCollection<PersistedActiveDeployment>> GetPersistedActiveDeployments(int timeoutMs)
+        {
+            try
+            {
+                await EnsureActiveDeploymentRegistryLoaded().WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
+            }
+            catch (TimeoutException)
+            {
+            }
+
             return activeDeploymentRegistry.Values.OrderBy(v => v.StrategyName).ToList();
         }
 
@@ -345,11 +366,11 @@ namespace Omnipotent.Services.OmniTrader
             return result;
         }
 
-        public async Task<StrategyInsightView> GetStrategyInsight(string strategyName)
+        public async Task<StrategyInsightView> GetStrategyInsight(string strategyName, bool includeTrades = false)
         {
             string strategyKey = GetStrategyKey(strategyName);
             var history = await GetOrLoadStrategyHistory(strategyName, strategyKey);
-            var persisted = BuildSnapshotFromHistory(history);
+            var persisted = BuildSnapshotFromHistory(history, includeTrades);
 
             var active = deployments.Values.FirstOrDefault(d => string.Equals(d.StrategyKey, strategyKey, StringComparison.OrdinalIgnoreCase));
 
@@ -359,7 +380,7 @@ namespace Omnipotent.Services.OmniTrader
                 StrategyKey = strategyKey,
                 IsCurrentlyDeployed = active != null,
                 ActiveDeploymentId = active?.DeploymentId,
-                LiveSnapshot = active == null ? null : BuildSnapshot(active),
+                LiveSnapshot = active == null ? null : BuildSnapshot(active, includeTrades),
                 PersistedSnapshot = persisted,
                 TotalSessions = history.Sessions.Count,
                 TotalBacktests = history.Backtests.Count,
@@ -370,11 +391,11 @@ namespace Omnipotent.Services.OmniTrader
             return insight;
         }
 
-        public async Task<OmniBacktestResult> GetPersistedStrategySnapshot(string strategyName)
+        public async Task<OmniBacktestResult> GetPersistedStrategySnapshot(string strategyName, bool includeTrades = false)
         {
             string strategyKey = GetStrategyKey(strategyName);
             var history = await GetOrLoadStrategyHistory(strategyName, strategyKey);
-            return BuildSnapshotFromHistory(history);
+            return BuildSnapshotFromHistory(history, includeTrades);
         }
 
         public async Task<Dictionary<string, OmniBacktestResult>> GetAllPersistedStrategySnapshots()
@@ -385,7 +406,7 @@ namespace Omnipotent.Services.OmniTrader
             foreach (var key in historyByStrategyKey.Keys)
             {
                 if (historyByStrategyKey.TryGetValue(key, out var cached))
-                    output[cached.StrategyName] = BuildSnapshotFromHistory(cached);
+                    output[cached.StrategyName] = BuildSnapshotFromHistory(cached, includeTrades: false);
             }
 
             return output;
@@ -764,6 +785,10 @@ namespace Omnipotent.Services.OmniTrader
             if (string.IsNullOrWhiteSpace(history.StrategyKey))
                 history.StrategyKey = strategyKey;
 
+            history.AllTrades ??= [];
+            history.Sessions ??= [];
+            history.Backtests ??= [];
+
             historyByStrategyKey[strategyKey] = history;
             return history;
         }
@@ -921,7 +946,7 @@ namespace Omnipotent.Services.OmniTrader
             return Path.Combine(GetHistoryDirectoryPath(), "active_deployments.json");
         }
 
-        private OmniBacktestResult BuildSnapshot(DeploymentState deployment)
+        private OmniBacktestResult BuildSnapshot(DeploymentState deployment, bool includeTrades = true)
         {
             lock (deployment.SyncRoot)
             {
@@ -953,13 +978,16 @@ namespace Omnipotent.Services.OmniTrader
                     StartTime = deployment.StartTimeUtc,
                     EndTime = deployment.EndTimeUtc ?? DateTime.UtcNow,
                     BacktestDuration = (deployment.EndTimeUtc ?? DateTime.UtcNow) - deployment.StartTimeUtc,
-                    Trades = [.. deployment.Trades]
+                    Trades = includeTrades ? [.. deployment.Trades] : []
                 };
             }
         }
 
-        private static OmniBacktestResult BuildSnapshotFromHistory(PersistedStrategyHistory history)
+        private static OmniBacktestResult BuildSnapshotFromHistory(PersistedStrategyHistory history, bool includeTrades)
         {
+            history.AllTrades ??= [];
+            history.Sessions ??= [];
+
             decimal markPrice = history.AllTrades.Count > 0 ? history.AllTrades[^1].ExitPrice : 0;
             decimal initialEquity = history.InitialQuoteBalance + history.InitialBaseBalance * markPrice;
             decimal finalEquity = history.LastQuoteBalance + history.LastBaseBalance * markPrice;
@@ -991,7 +1019,7 @@ namespace Omnipotent.Services.OmniTrader
                 StartTime = start,
                 EndTime = end,
                 BacktestDuration = end - start,
-                Trades = history.AllTrades.Select(CloneTrade).ToList()
+                Trades = includeTrades ? history.AllTrades.Select(CloneTrade).ToList() : []
             };
         }
 

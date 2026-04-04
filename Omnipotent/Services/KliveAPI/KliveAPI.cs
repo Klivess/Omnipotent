@@ -558,6 +558,26 @@ namespace Omnipotent.Services.KliveAPI
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
+                try
+                {
+                    if (context?.Response != null && context.Response.OutputStream.CanWrite)
+                    {
+                        context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        context.Response.ContentType = "application/json";
+                        byte[] errorBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new
+                        {
+                            Error = "Unhandled exception while processing request.",
+                            Route = context.Request?.RawUrl,
+                            Message = ex.Message
+                        }));
+                        context.Response.ContentLength64 = errorBytes.Length;
+                        await context.Response.OutputStream.WriteAsync(errorBytes, 0, errorBytes.Length);
+                        context.Response.Close();
+                    }
+                }
+                catch
+                {
+                }
             }
         }
         private enum DeniedRequestReason
