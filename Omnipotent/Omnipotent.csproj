@@ -40,7 +40,6 @@
 		<PackageReference Include="Microsoft.Extensions.AI" Version="10.4.0" />
 		<PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.4.0" />
 		<PackageReference Include="Microsoft.Extensions.AI.Evaluation" Version="9.7.0" />
-		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="11.0.0-preview.2.26159.112" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.7" />
 		<PackageReference Include="Microsoft.ML" Version="4.0.2" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
