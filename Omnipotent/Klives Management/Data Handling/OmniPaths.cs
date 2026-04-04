@@ -105,6 +105,16 @@ namespace Omnipotent.Data_Handling
             public static string OmniTubeDirectory = $"{SavedDataDirectory}/OmniTube";
             public static string OmniTubeBrandsDirectory = $"{OmniTubeDirectory}/OmniBrands";
 
+            //OmniGram
+            public static string OmniGramDirectory = $"{SavedDataDirectory}/OmniGram";
+            public static string OmniGramAccountsDirectory = $"{OmniGramDirectory}/Accounts";
+            public static string OmniGramPostsDirectory = $"{OmniGramDirectory}/Posts";
+            public static string OmniGramCampaignsDirectory = $"{OmniGramDirectory}/Campaigns";
+            public static string OmniGramSessionsDirectory = $"{OmniGramDirectory}/Sessions";
+            public static string OmniGramLogsDirectory = $"{OmniGramDirectory}/Logs";
+            public static string OmniGramEventsDirectory = $"{OmniGramLogsDirectory}/Events";
+            public static string OmniGramUploadMetricsDirectory = $"{OmniGramLogsDirectory}/UploadMetrics";
+
 
         };
 
