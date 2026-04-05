@@ -873,14 +873,6 @@ namespace Omnipotent.Services.OmniGram
             return targetPath;
         }
 
-        public async Task<string> WriteApiDocumentationToDesktop()
-        {
-            string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            string destinationPath = Path.Combine(desktop, "OmniGram_API_Documentation.md");
-            await File.WriteAllTextAsync(destinationPath, OmniGramDocumentation.BuildMarkdown());
-            return destinationPath;
-        }
-
         private static string EncryptSensitive(string plainText)
         {
             byte[] plainBytes = System.Text.Encoding.UTF8.GetBytes(plainText);
