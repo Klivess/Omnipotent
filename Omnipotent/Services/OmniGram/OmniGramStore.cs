@@ -142,6 +142,33 @@ namespace Omnipotent.Services.OmniGram
             await parent.GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(serviceEvent, Formatting.Indented));
         }
 
+        public async Task DeleteAccount(OmniGramAccount account)
+        {
+            Accounts.TryRemove(account.AccountId, out _);
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramAccountsDirectory), account.AccountId + ".json");
+            await parent.GetDataHandler().DeleteFile(path);
+        }
+
+        public async Task DeletePost(OmniGramPostPlan post)
+        {
+            Posts.TryRemove(post.PostId, out _);
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramPostsDirectory), post.PostId + ".json");
+            await parent.GetDataHandler().DeleteFile(path);
+        }
+
+        public async Task SaveCampaignSafe(OmniGramCampaign campaign)
+        {
+            if (campaign.PlannedPostIds.Count == 0)
+            {
+                Campaigns.TryRemove(campaign.CampaignId, out _);
+                string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramCampaignsDirectory), campaign.CampaignId + ".json");
+                await parent.GetDataHandler().DeleteFile(path);
+                return;
+            }
+
+            await SaveCampaign(campaign);
+        }
+
         public List<OmniGramServiceEvent> GetRecentEvents(int take = 500)
         {
             return Events.Values

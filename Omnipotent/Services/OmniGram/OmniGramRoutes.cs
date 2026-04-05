@@ -86,6 +86,26 @@ namespace Omnipotent.Services.OmniGram
                 }
             }, HttpMethod.Post, KMPermissions.Manager);
 
+            await p.CreateAPIRoute("/omnigram/accounts/delete", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<OmniGramDeleteAccountRequest>(req.userMessageContent);
+                    if (body == null)
+                    {
+                        await req.ReturnResponse("Invalid request body", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    bool success = await p.RemoveManagedAccount(body);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = success }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Post, KMPermissions.Manager);
+
             await p.CreateAPIRoute("/omnigram/accounts/live", async (req) =>
             {
                 try

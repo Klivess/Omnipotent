@@ -20,6 +20,9 @@ namespace Omnipotent.Services.OmniGram
         private MemoryCache sessionCache;
         private readonly SemaphoreSlim processLock = new(1, 1);
         private readonly Random random = new();
+        private static readonly InstagramApiSharp.Classes.Android.DeviceInfo.AndroidDevice FixedInstaDevice =
+            InstagramApiSharp.Classes.Android.DeviceInfo.AndroidDeviceGenerator.GetByName(
+                InstagramApiSharp.Classes.Android.DeviceInfo.AndroidDevices.GALAXY_S7_EDGE);
 
         public OmniGram()
         {
@@ -383,6 +386,34 @@ namespace Omnipotent.Services.OmniGram
             return true;
         }
 
+        public async Task<bool> RemoveManagedAccount(OmniGramDeleteAccountRequest request)
+        {
+            var account = GetManagedAccountOrThrow(request.accountId);
+
+            if (request.deleteAssociatedPosts)
+            {
+                var postsToDelete = store.Posts.Values.Where(x => x.AccountId == account.AccountId).ToList();
+                foreach (var post in postsToDelete)
+                {
+                    await store.DeletePost(post);
+
+                    if (store.Campaigns.TryGetValue(post.CampaignId, out var campaign))
+                    {
+                        campaign.PlannedPostIds.RemoveAll(x => x == post.PostId);
+                        await store.SaveCampaignSafe(campaign);
+                    }
+                }
+            }
+
+            sessionCache.Remove(account.AccountId);
+            string statePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramSessionsDirectory), account.AccountId + ".state");
+            await GetDataHandler().DeleteFile(statePath);
+
+            await store.DeleteAccount(account);
+            await LogEvent("Info", "Managed account removed.", account.AccountId, metadata: new { request.deleteAssociatedPosts });
+            return true;
+        }
+
         private async Task<(bool Success, bool CheckpointRequired, string? Error, string? Guidance)> ValidateInstagramCredentials(OmniGramAccount account)
         {
             try
@@ -419,6 +450,7 @@ namespace Omnipotent.Services.OmniGram
 
             var api = InstaApiBuilder.CreateBuilder()
                 .SetUser(user)
+                .SetDevice(FixedInstaDevice)
                 .UseLogger(new DebugLogger(InstagramApiSharp.Logger.LogLevel.Exceptions))
                 .Build();
 

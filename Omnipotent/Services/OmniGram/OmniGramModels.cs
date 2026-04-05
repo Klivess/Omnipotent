@@ -143,6 +143,12 @@ namespace Omnipotent.Services.OmniGram
         public int mediaType { get; set; }
     }
 
+    public class OmniGramDeleteAccountRequest
+    {
+        public string accountId { get; set; } = "";
+        public bool deleteAssociatedPosts { get; set; } = false;
+    }
+
     public class OmniGramServiceEvent
     {
         public string EventId { get; set; } = Guid.NewGuid().ToString("N");
