@@ -19,6 +19,7 @@ namespace Omnipotent.Services.OmniGram
         private OmniGramRoutes routes;
         private MemoryCache sessionCache;
         private readonly SemaphoreSlim processLock = new(1, 1);
+        private readonly Random random = new();
 
         public OmniGram()
         {
@@ -62,17 +63,21 @@ namespace Omnipotent.Services.OmniGram
             {
                 throw new Exception("username and password are required.");
             }
-            if (request.useMemeScraperSource && string.IsNullOrWhiteSpace(request.memeScraperSourceAccountId))
-            {
-                throw new Exception("memeScraperSourceAccountId is required when useMemeScraperSource is true.");
-            }
+            var requestedNiches = NormalizeNiches(request.memeNiches);
 
             if (request.useMemeScraperSource)
             {
-                var memeScraper = (Omnipotent.Services.MemeScraper.MemeScraper)(await GetServicesByType<Omnipotent.Services.MemeScraper.MemeScraper>())[0];
-                if (memeScraper.SourceManager.GetInstagramSourceByID(request.memeScraperSourceAccountId) == null)
+                if (!requestedNiches.Any())
                 {
-                    throw new Exception("Specified MemeScraper source does not exist.");
+                    throw new Exception("At least one meme niche is required when useMemeScraperSource is true.");
+                }
+
+                var memeScraper = (Omnipotent.Services.MemeScraper.MemeScraper)(await GetServicesByType<Omnipotent.Services.MemeScraper.MemeScraper>())[0];
+                bool nicheHasSources = memeScraper.SourceManager.InstagramSources.Any(source =>
+                    source.Niches != null && source.Niches.Any(n => requestedNiches.Contains(n.NicheTagName.Trim(), StringComparer.OrdinalIgnoreCase)));
+                if (!nicheHasSources)
+                {
+                    throw new Exception("No MemeScraper sources match the supplied niches.");
                 }
             }
 
@@ -90,11 +95,15 @@ namespace Omnipotent.Services.OmniGram
 
             account.EncryptedPassword = EncryptSensitive(request.password.Trim());
             account.UseMemeScraperSource = request.useMemeScraperSource;
-            account.MemeScraperSourceAccountId = request.memeScraperSourceAccountId;
+            account.PreferredMemeNiches = requestedNiches;
             account.AutonomousPostingEnabled = request.autonomousPostingEnabled ?? account.AutonomousPostingEnabled;
             if (request.autonomousPostingIntervalMinutes.HasValue && request.autonomousPostingIntervalMinutes.Value > 0)
             {
                 account.AutonomousPostingIntervalMinutes = request.autonomousPostingIntervalMinutes.Value;
+            }
+            if (request.autonomousPostingRandomOffsetMinutes.HasValue && request.autonomousPostingRandomOffsetMinutes.Value >= 0)
+            {
+                account.AutonomousPostingRandomOffsetMinutes = request.autonomousPostingRandomOffsetMinutes.Value;
             }
             account.AutonomousCaptionPrompt = request.autonomousCaptionPrompt;
             account.UpdatedAtUtc = DateTime.UtcNow;
@@ -111,6 +120,8 @@ namespace Omnipotent.Services.OmniGram
             {
                 account.AutonomousPostingEnabled,
                 account.AutonomousPostingIntervalMinutes,
+                account.AutonomousPostingRandomOffsetMinutes,
+                account.PreferredMemeNiches,
                 account.UseMemeScraperSource
             });
 
@@ -364,20 +375,32 @@ namespace Omnipotent.Services.OmniGram
                 return post.MediaPath;
             }
 
-            if (!account.UseMemeScraperSource || string.IsNullOrWhiteSpace(account.MemeScraperSourceAccountId))
+            if (!account.UseMemeScraperSource || !account.PreferredMemeNiches.Any())
             {
                 return "";
             }
 
             var memeScraper = (Omnipotent.Services.MemeScraper.MemeScraper)(await GetServicesByType<Omnipotent.Services.MemeScraper.MemeScraper>())[0];
-            var source = memeScraper.SourceManager.GetInstagramSourceByID(account.MemeScraperSourceAccountId);
-            if (source == null)
+            var accountNiches = NormalizeNiches(account.PreferredMemeNiches);
+            if (!accountNiches.Any())
             {
                 return "";
             }
 
+            var matchingSources = memeScraper.SourceManager.InstagramSources
+                .Where(source => source.Niches != null && source.Niches.Any(n => accountNiches.Contains(n.NicheTagName.Trim(), StringComparer.OrdinalIgnoreCase)))
+                .ToList();
+
+            if (!matchingSources.Any())
+            {
+                return "";
+            }
+
+            var matchingSourceOwnerIds = matchingSources.Select(s => s.AccountID).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var matchingSourceUsernames = matchingSources.Select(s => s.Username).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
             var candidates = memeScraper.mediaManager.allScrapedReels
-                .Where(x => x.OwnerID == source.AccountID || x.OwnerUsername.Equals(source.Username, StringComparison.OrdinalIgnoreCase))
+                .Where(x => matchingSourceOwnerIds.Contains(x.OwnerID) || matchingSourceUsernames.Contains(x.OwnerUsername))
                 .OrderByDescending(x => x.DateTimeReelDownloaded)
                 .ToList();
 
@@ -508,6 +531,34 @@ namespace Omnipotent.Services.OmniGram
             return store.GetRecentEvents(take);
         }
 
+        public async Task<string> SaveUploadedCampaignMedia(string originalFileName, byte[] fileBytes)
+        {
+            if (fileBytes == null || fileBytes.Length == 0)
+            {
+                throw new Exception("Uploaded media bytes are empty.");
+            }
+
+            string safeFileName = Path.GetFileName(originalFileName ?? string.Empty);
+            if (string.IsNullOrWhiteSpace(safeFileName))
+            {
+                safeFileName = "upload.bin";
+            }
+
+            string extension = Path.GetExtension(safeFileName);
+            if (string.IsNullOrWhiteSpace(extension))
+            {
+                extension = ".mp4";
+            }
+
+            string storedFileName = $"Upload_{DateTime.UtcNow:yyyyMMdd_HHmmss}_{Guid.NewGuid():N}{extension}";
+            string targetPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramUploadsDirectory), storedFileName);
+
+            await GetDataHandler().WriteBytesToFile(targetPath, fileBytes);
+            await LogEvent("Info", "Campaign media uploaded and persisted.", metadata: new { originalFileName, targetPath, fileBytes.Length });
+
+            return targetPath;
+        }
+
         public async Task<string> WriteApiDocumentationToDesktop()
         {
             string desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
@@ -543,7 +594,7 @@ namespace Omnipotent.Services.OmniGram
             if (account.Status != OmniGramAccountStatus.Active
                 || !account.AutonomousPostingEnabled
                 || !account.UseMemeScraperSource
-                || string.IsNullOrWhiteSpace(account.MemeScraperSourceAccountId))
+                || !account.PreferredMemeNiches.Any())
             {
                 return;
             }
@@ -559,7 +610,13 @@ namespace Omnipotent.Services.OmniGram
             }
 
             int intervalMinutes = Math.Max(15, account.AutonomousPostingIntervalMinutes);
-            DateTime due = DateTime.UtcNow.AddMinutes(intervalMinutes);
+            int randomOffset = Math.Max(0, account.AutonomousPostingRandomOffsetMinutes);
+            int randomDelta = randomOffset > 0 ? random.Next(-randomOffset, randomOffset + 1) : 0;
+            DateTime due = DateTime.UtcNow.AddMinutes(intervalMinutes + randomDelta);
+            if (due <= DateTime.UtcNow.AddMinutes(1))
+            {
+                due = DateTime.UtcNow.AddMinutes(1);
+            }
             await CreateAutonomousPostForAccount(account, due, reason);
         }
 
@@ -600,8 +657,20 @@ namespace Omnipotent.Services.OmniGram
             {
                 reason,
                 dueUtc,
-                intervalMinutes = account.AutonomousPostingIntervalMinutes
+                intervalMinutes = account.AutonomousPostingIntervalMinutes,
+                randomOffsetMinutes = account.AutonomousPostingRandomOffsetMinutes,
+                account.PreferredMemeNiches
             });
+        }
+
+        private static List<string> NormalizeNiches(IEnumerable<string>? niches)
+        {
+            return niches?
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList()
+                ?? new List<string>();
         }
 
         private async Task SaveUploadMetric(OmniGramPostPlan post, OmniGramAccount account, string caption)

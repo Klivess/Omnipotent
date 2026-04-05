@@ -33,7 +33,11 @@ namespace Omnipotent.Services.OmniGram
                         account.Username,
                         account.Status,
                         account.UseMemeScraperSource,
-                        account.MemeScraperSourceAccountId,
+                        account.PreferredMemeNiches,
+                        account.AutonomousPostingEnabled,
+                        account.AutonomousPostingIntervalMinutes,
+                        account.AutonomousPostingRandomOffsetMinutes,
+                        account.AutonomousCaptionPrompt,
                         account.LastAuthenticatedUtc,
                         account.CreatedAtUtc,
                         account.UpdatedAtUtc
@@ -53,9 +57,10 @@ namespace Omnipotent.Services.OmniGram
                     a.Username,
                     a.Status,
                     a.UseMemeScraperSource,
-                    a.MemeScraperSourceAccountId,
+                    a.PreferredMemeNiches,
                     a.AutonomousPostingEnabled,
                     a.AutonomousPostingIntervalMinutes,
+                    a.AutonomousPostingRandomOffsetMinutes,
                     a.AutonomousCaptionPrompt,
                     a.CreatedAtUtc,
                     a.UpdatedAtUtc,
@@ -68,7 +73,32 @@ namespace Omnipotent.Services.OmniGram
             {
                 try
                 {
-                    var body = JsonConvert.DeserializeObject<OmniGramScheduleRequest>(req.userMessageContent);
+                    OmniGramScheduleRequest? body = null;
+
+                    string? uploadedFileName = req.userParameters?["uploadedFileName"] ?? req.userParameters?["fileName"];
+                    bool hasUploadBytes = req.userMessageBytes != null && req.userMessageBytes.Length > 0 && !string.IsNullOrWhiteSpace(uploadedFileName);
+
+                    if (hasUploadBytes)
+                    {
+                        body = new OmniGramScheduleRequest
+                        {
+                            AccountId = req.userParameters?["accountId"],
+                            DispatchMode = ParseEnumOrDefault(req.userParameters?["dispatchMode"], OmniGramDispatchMode.SingleAccount),
+                            Target = ParseEnumOrDefault(req.userParameters?["target"], OmniGramPostTarget.Feed),
+                            CaptionMode = ParseEnumOrDefault(req.userParameters?["captionMode"], OmniGramCaptionMode.User),
+                            UserCaption = req.userParameters?["userCaption"],
+                            AICaptionPrompt = req.userParameters?["aiCaptionPrompt"],
+                            ScheduledForUtc = DateTime.TryParse(req.userParameters?["scheduledForUtc"], out var dueUtc) ? dueUtc : null,
+                            UploadedFileName = uploadedFileName
+                        };
+
+                        body.MediaPath = await p.SaveUploadedCampaignMedia(uploadedFileName!, req.userMessageBytes);
+                    }
+                    else
+                    {
+                        body = JsonConvert.DeserializeObject<OmniGramScheduleRequest>(req.userMessageContent);
+                    }
+
                     if (body == null)
                     {
                         await req.ReturnResponse("Invalid request body", code: HttpStatusCode.BadRequest);
@@ -122,6 +152,26 @@ namespace Omnipotent.Services.OmniGram
                     ManagerUptime = p.GetManagerUptime().ToString()
                 }));
             }, HttpMethod.Get, KMPermissions.Guest);
+        }
+
+        private static TEnum ParseEnumOrDefault<TEnum>(string? raw, TEnum fallback) where TEnum : struct
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return fallback;
+            }
+
+            if (int.TryParse(raw, out int intVal) && Enum.IsDefined(typeof(TEnum), intVal))
+            {
+                return (TEnum)Enum.ToObject(typeof(TEnum), intVal);
+            }
+
+            if (Enum.TryParse<TEnum>(raw, true, out var parsed))
+            {
+                return parsed;
+            }
+
+            return fallback;
         }
     }
 }

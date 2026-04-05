@@ -42,9 +42,10 @@ namespace Omnipotent.Services.OmniGram
         public string EncryptedPassword { get; set; } = "";
         public OmniGramAccountStatus Status { get; set; } = OmniGramAccountStatus.Active;
         public bool UseMemeScraperSource { get; set; }
-        public string? MemeScraperSourceAccountId { get; set; }
+        public List<string> PreferredMemeNiches { get; set; } = new();
         public bool AutonomousPostingEnabled { get; set; } = true;
         public int AutonomousPostingIntervalMinutes { get; set; } = 240;
+        public int AutonomousPostingRandomOffsetMinutes { get; set; } = 0;
         public string? AutonomousCaptionPrompt { get; set; }
         public List<string> PostedMemeReelPostIds { get; set; } = new();
         public DateTime CreatedAtUtc { get; set; }
@@ -93,6 +94,7 @@ namespace Omnipotent.Services.OmniGram
         public string? UserCaption { get; set; }
         public string? AICaptionPrompt { get; set; }
         public string? MediaPath { get; set; }
+        public string? UploadedFileName { get; set; }
         public DateTime? ScheduledForUtc { get; set; }
     }
 
@@ -101,9 +103,10 @@ namespace Omnipotent.Services.OmniGram
         public string username { get; set; } = "";
         public string password { get; set; } = "";
         public bool useMemeScraperSource { get; set; }
-        public string? memeScraperSourceAccountId { get; set; }
+        public List<string>? memeNiches { get; set; }
         public bool? autonomousPostingEnabled { get; set; }
         public int? autonomousPostingIntervalMinutes { get; set; }
+        public int? autonomousPostingRandomOffsetMinutes { get; set; }
         public string? autonomousCaptionPrompt { get; set; }
     }
 
