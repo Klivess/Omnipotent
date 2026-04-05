@@ -15,7 +15,6 @@ using System.Reflection;
 using System.Security.Permissions;
 using System.IO;
 using System.Linq;
-using LangChain.Providers.HuggingFace.Predefined;
 using LangChain.Providers;
 using System.Drawing;
 using System.Text;

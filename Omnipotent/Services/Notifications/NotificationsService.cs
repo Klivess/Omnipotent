@@ -5,9 +5,9 @@ using Humanizer;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
-using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Notifications
 {
@@ -22,13 +22,6 @@ namespace Omnipotent.Services.Notifications
             public TaskCompletionSource<string> Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
-        public enum PromptType
-        {
-            TextInput,
-            Button,
-            Selection
-        }
-
         public NotificationsService()
         {
             name = "Notifications";
@@ -37,8 +30,7 @@ namespace Omnipotent.Services.Notifications
 
         protected override async void ServiceMain()
         {
-            //Acquire KliveBot Discord Service
-            var search = ((await GetServicesByType<KliveBotDiscord>()));
+            var search = await GetServicesByType<KliveBotDiscord>();
             if (search == null)
             {
                 await Task.Delay(2000);
@@ -46,80 +38,68 @@ namespace Omnipotent.Services.Notifications
             }
             else
             {
-                KliveBotDiscord = (KliveBot_Discord.KliveBotDiscord)(search[0]);
+                KliveBotDiscord = (KliveBotDiscord)search[0];
             }
         }
-        public async Task<string> SendButtonsPromptToKlivesDiscord(string title, string description, Dictionary<string, ButtonStyle> buttonsInfo, TimeSpan timeToAnswer)
+
+        public async Task<string> SendButtonsPromptToKlivesDiscord(string title, string description, Dictionary<string, DiscordButtonStyle> buttonsInfo, TimeSpan timeToAnswer)
         {
-            var embedBuilder = KliveBotDiscord.MakeSimpleEmbed($"Notification: {title}",
-                description,
-                DSharpPlus.Entities.DiscordColor.DarkBlue);
+            var embedBuilder = KliveBotDiscord.MakeSimpleEmbed($"Notification: {title}", description, DiscordColor.DarkBlue);
 
-            List<DiscordComponent> components = new();
+            var buttons = new List<DiscordButtonComponent>();
+            var buttonIDs = new List<string>();
 
-            List<string> buttonIDs = new();
             foreach (var button in buttonsInfo)
             {
                 string id = button.Key + RandomGeneration.GenerateRandomLengthOfNumbers(5);
                 buttonIDs.Add(id);
-                components.Add(new DSharpPlus.Entities.DiscordButtonComponent(button.Value, id, button.Key));
+                buttons.Add(new DiscordButtonComponent(button.Value, id, button.Key));
             }
-            embedBuilder.AddComponents(components.ToArray());
-            bool cancelled = false;
-            string submitted = "";
+
+            // AddComponents was renamed to AddActionRowComponent in the nightly.
+            // See: https://dsharpplus.github.io/DSharpPlus/api/DSharpPlus.Entities.DiscordMessageBuilder.html
+            embedBuilder.AddActionRowComponent(buttons);
 
             var message = await KliveBotDiscord.SendMessageToKlives(embedBuilder);
+            var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            CancellationTokenSource token = new();
+            KliveBotDiscord.RegisterComponentHandler(async (s, e) =>
+            {
+                int idx = buttonIDs.IndexOf(e.Id);
+                if (idx < 0) return;
 
-            KliveBotDiscord.Client.ComponentInteractionCreated += async (s, e) =>
+                var response = new DiscordInteractionResponseBuilder()
+                    .WithContent($"Submitted! ||option: {e.Id}||");
+                await e.Interaction.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, response);
+                tcs.TrySetResult(buttonsInfo.ElementAt(idx).Key);
+            });
+
+            try
             {
-                for (global::System.Int32 i = 0; i < buttonIDs.Count; i++)
-                {
-                    if (e.Id == buttonIDs[i])
-                    {
-                        token.Cancel();
-                        DiscordInteractionResponseBuilder builder = new();
-                        builder.WithContent($"Submitted! ||option: {e.Id}||");
-                        await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
-                        submitted = buttonsInfo.ElementAt(i).Key;
-                        break;
-                    }
-                }
-            };
-            Stopwatch countdown = Stopwatch.StartNew();
-            while (submitted == "")
-            {
-                if (countdown.Elapsed >= timeToAnswer)
-                {
-                    await message.RespondAsync("Prompt timed out. KliveBot will make do on its own.");
-                    throw new TimeoutException("No response to prompt.");
-                }
+                return await tcs.Task.WaitAsync(timeToAnswer);
             }
-            return submitted;
+            catch (TimeoutException)
+            {
+                await message.RespondAsync("Prompt timed out. KliveBot will make do on its own.");
+                throw;
+            }
         }
+
         public async Task<string> SendTextPromptToKlivesDiscord(string title, string description, TimeSpan timeToAnswer, string modalTitle = "", string modalPlaceholder = "")
-        {
-            return await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, null);
-        }
+            => await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, null);
 
         public async Task<string> SendTextPromptToKlivesDiscordTracked(string trackingId, string title, string description, TimeSpan timeToAnswer, string modalTitle = "", string modalPlaceholder = "")
-        {
-            return await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, trackingId);
-        }
+            => await SendTextPromptCore(title, description, timeToAnswer, modalTitle, modalPlaceholder, trackingId);
 
         public async Task<bool> CancelTrackedTextPrompt(string trackingId, string cancellationMessage)
         {
             if (string.IsNullOrWhiteSpace(trackingId)) return false;
-
             if (!_pendingTextPrompts.TryRemove(trackingId.Trim(), out var pending)) return false;
 
             try
             {
                 if (pending.PromptMessage != null)
-                {
                     await pending.PromptMessage.RespondAsync(string.IsNullOrWhiteSpace(cancellationMessage) ? "Notification cancelled." : cancellationMessage);
-                }
             }
             catch (Exception ex)
             {
@@ -132,47 +112,63 @@ namespace Omnipotent.Services.Notifications
 
         private async Task<string> SendTextPromptCore(string title, string description, TimeSpan timeToAnswer, string modalTitle, string modalPlaceholder, string trackingId)
         {
-            var embedBuilder = KliveBotDiscord.MakeSimpleEmbed($"Notification: {title}", description, DSharpPlus.Entities.DiscordColor.DarkBlue);
-
+            var embedBuilder = KliveBotDiscord.MakeSimpleEmbed($"Notification: {title}", description, DiscordColor.DarkBlue);
 
             string buttonID = RandomGeneration.GenerateRandomLengthOfNumbers(5);
             string modalID = RandomGeneration.GenerateRandomLengthOfNumbers(5);
+            string inputID = RandomGeneration.GenerateRandomLengthOfNumbers(5);
 
-            embedBuilder.AddComponents(new DiscordButtonComponent(ButtonStyle.Primary, buttonID, "Input Text"));
+            // AddActionRowComponent replaces AddComponents in the nightly.
+            // See: https://dsharpplus.github.io/DSharpPlus/api/DSharpPlus.Entities.DiscordMessageBuilder.html
+            embedBuilder.AddActionRowComponent(new DiscordButtonComponent(DiscordButtonStyle.Primary, buttonID, "Input Text"));
 
             var message = await KliveBotDiscord.SendMessageToKlives(embedBuilder);
-
-            PendingTextPrompt pending = new PendingTextPrompt { PromptMessage = message };
+            var pending = new PendingTextPrompt { PromptMessage = message };
             string normalizedTrackingId = string.IsNullOrWhiteSpace(trackingId) ? null : trackingId.Trim();
 
             if (!string.IsNullOrEmpty(normalizedTrackingId))
-            {
                 _pendingTextPrompts[normalizedTrackingId] = pending;
-            }
 
-            KliveBotDiscord.Client.ComponentInteractionCreated += async (s, e) =>
+            // Button click -> respond with a modal.
+            // In the nightly, modals use the dedicated DiscordModalBuilder class with its own
+            // CreateResponseAsync overload — NOT DiscordInteractionResponseBuilder.
+            // See: https://github.com/DSharpPlus/DSharpPlus/blob/master/DSharpPlus/Entities/Interaction/DiscordInteraction.cs
+            KliveBotDiscord.RegisterComponentHandler(async (s, e) =>
             {
-                if (e.Id == buttonID)
-                {
-                    DiscordInteractionResponseBuilder modal = new DiscordInteractionResponseBuilder();
-                    modal.CustomId = modalID;
-                    modal.AddComponents(new TextInputComponent("Your input", modalID, modalPlaceholder));
-                    modal.Title = modalTitle;
-                    await e.Interaction.CreateResponseAsync(InteractionResponseType.Modal, modal);
-                }
-            };
+                if (e.Id != buttonID) return;
 
-            KliveBotDiscord.Client.ModalSubmitted += async (s, e) =>
+                DiscordTextInputComponent textInput = new DiscordTextInputComponent(
+                    customId: inputID,
+                    placeholder: modalPlaceholder,
+                    style: DiscordTextInputStyle.Short,
+                    required: true);
+
+                var modal = new DiscordModalBuilder()
+                    .WithCustomId(modalID)
+                    .WithTitle(string.IsNullOrWhiteSpace(modalTitle) ? "Input" : modalTitle)
+                    .AddTextInput(textInput, "Your input");
+
+                await e.Interaction.CreateResponseAsync(DiscordInteractionResponseType.Modal, modal);
+            });
+
+            // Modal submission handler.
+            // In the nightly, submitted values are in e.Interaction.Data.Components,
+            // each being a DiscordTextInputComponent whose Value holds the user's input.
+            KliveBotDiscord.RegisterModalHandler(async (s, e) =>
             {
-                if (e.Values.ContainsKey(modalID))
-                {
-                    DiscordInteractionResponseBuilder builder = new();
-                    string submitted = e.Values[modalID];
-                    builder.WithContent($"Submitted!");
-                    await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
-                    pending.Completion.TrySetResult(submitted);
-                }
-            };
+                if (e.Interaction.Data.CustomId != modalID) return;
+
+                // Find the text input by its customId from the submitted components.
+                var submittedInput = e.Interaction.Data.TextInputComponents?
+                    .FirstOrDefault(c => c.CustomId == inputID);
+
+                if (submittedInput == null) return;
+
+                string submitted = submittedInput.Value;
+                var builder = new DiscordInteractionResponseBuilder().WithContent("Submitted!");
+                await e.Interaction.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, builder);
+                pending.Completion.TrySetResult(submitted);
+            });
 
             try
             {
@@ -186,11 +182,8 @@ namespace Omnipotent.Services.Notifications
             finally
             {
                 if (!string.IsNullOrEmpty(normalizedTrackingId))
-                {
                     _pendingTextPrompts.TryRemove(normalizedTrackingId, out _);
-                }
             }
         }
-
     }
 }

@@ -5,7 +5,7 @@ using Omnipotent.Data_Handling;
 using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.DevTools;
-using OpenQA.Selenium.DevTools.V138.Network;
+using OpenQA.Selenium.DevTools.V145.Network;
 using OpenQA.Selenium.Support.UI;
 using System.Collections.Concurrent;
 using System.Diagnostics;

@@ -5,7 +5,6 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.MemeScraper.MemeScraper_Labs;
-using OpenQA.Selenium.DevTools.V136.Network;
 using Org.BouncyCastle.Asn1.X500;
 using System.Collections.Concurrent;
 using System.Management.Automation;

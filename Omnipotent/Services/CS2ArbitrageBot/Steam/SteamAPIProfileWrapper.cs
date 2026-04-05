@@ -60,10 +60,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         "SendButtonsPromptToKlivesDiscord",
                         "CS2 Arbitrage Bot — Steam Login Confirmation Required",
                         "Please approve the Steam mobile login confirmation in your Steam app, then press **Confirmed**.",
-                        new Dictionary<string, DSharpPlus.ButtonStyle>
+                        new Dictionary<string, DSharpPlus.Entities.DiscordButtonStyle>
                         {
-                            { "Confirmed", DSharpPlus.ButtonStyle.Success },
-                            { "Failed", DSharpPlus.ButtonStyle.Danger }
+                            { "Confirmed", DSharpPlus.Entities.DiscordButtonStyle.Success },
+                            { "Failed", DSharpPlus.Entities.DiscordButtonStyle.Danger }
                         },
                         TimeSpan.FromHours(24)
                     );
@@ -298,10 +298,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     "CS2 Arbitrage Bot — Steam Mobile Confirmation Required",
                     $"A Steam Market listing for **{itemName}** at **£{salePriceInPence / 100.0:F2}** needs to be confirmed on your Steam mobile app.\n\n" +
                     $"Please open the Steam app → Confirmations → Confirm the market listing, then press **Confirmed** below.",
-                    new Dictionary<string, DSharpPlus.ButtonStyle>
+                    new Dictionary<string, DSharpPlus.Entities.DiscordButtonStyle>
                     {
-                        { "Confirmed", DSharpPlus.ButtonStyle.Success },
-                        { "Failed", DSharpPlus.ButtonStyle.Danger }
+                        { "Confirmed", DSharpPlus.Entities.DiscordButtonStyle.Success },
+                        { "Failed", DSharpPlus.Entities.DiscordButtonStyle.Danger }
                     },
                     TimeSpan.FromHours(24)
                 );
@@ -673,10 +673,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     "SendButtonsPromptToKlivesDiscord",
                     "CS2 Arbitrage Bot — Are You Ready?",
                     $"Are you ready to {actionDescription} in the Steam mobile app now?",
-                    new Dictionary<string, DSharpPlus.ButtonStyle>
+                    new Dictionary<string, DSharpPlus.Entities.DiscordButtonStyle>
                     {
-                        { "Ready", DSharpPlus.ButtonStyle.Primary },
-                        { "Not Ready", DSharpPlus.ButtonStyle.Secondary }
+                        { "Ready", DSharpPlus.Entities.DiscordButtonStyle.Primary },
+                        { "Not Ready", DSharpPlus.Entities.DiscordButtonStyle.Secondary }
                     },
                     TimeSpan.FromHours(24)
                 );

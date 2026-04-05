@@ -4,7 +4,6 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
-using OpenQA.Selenium.DevTools.V136.CSS;
 using System.Management.Automation;
 using System.Management.Automation.Language;
 using System.Runtime.Intrinsics.X86;

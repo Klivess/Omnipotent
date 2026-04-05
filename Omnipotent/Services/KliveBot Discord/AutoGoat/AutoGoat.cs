@@ -27,7 +27,7 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
             await Task.Delay(5000);
             try
             {
-                ((KliveBotDiscord)(await GetServicesByType<KliveBotDiscord>())[0]).Client.MessageCreated += AutoGoat_MessageCreated;
+                ((KliveBotDiscord)(await GetServicesByType<KliveBotDiscord>())[0]).MessageCreated += AutoGoat_MessageCreated;
                 ServiceLog(GetName() + " is now watching.");
             }
             catch (Exception e)
@@ -37,8 +37,9 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
             }
         }
 
-        private async Task AutoGoat_MessageCreated(DiscordClient sender, MessageCreateEventArgs args)
+        private async void AutoGoat_MessageCreated(object sender, MessageCreatedEventArgs args)
         {
+            DiscordClient client = (DiscordClient)sender;
             Random rnd = new Random();
             try
             {
@@ -56,22 +57,22 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
                         //if its josue
                         if (args.Author.Id.ToString() == josueID && rnd.Next(0, 100) < 2)
                         {
-                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":wacky:"));
+                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":wacky:"));
                             ServiceLog(GetName() + " reacted to Josue's message in Hypixel with a goat emoji.");
                         }
                         if (args.Author.Id.ToString() == nourdinID && rnd.Next(0, 100) < 1)
                         {
-                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":goat:"));
+                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":goat:"));
                             ServiceLog(GetName() + " reacted to Nourdin's message in Hypixel with a goat emoji.");
                         }
                         if (args.Author.Id.ToString() == alexID && rnd.Next(0, 100) < 2)
                         {
-                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":EyeofQuok:"));
+                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":EyeofQuok:"));
                             ServiceLog(GetName() + " reacted to Alex's message in Hypixel with an eye of quok emoji.");
                         }
                         if (args.Author.Id.ToString() == victorID && rnd.Next(0, 100) < 2)
                         {
-                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(sender, ":nerd:"));
+                            await args.Message.CreateReactionAsync(DiscordEmoji.FromName(client, ":nerd:"));
                             ServiceLog(GetName() + " reacted to Victor's message in Hypixel with a nerd emoji.");
                         }
                     });
@@ -84,7 +85,7 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
             }
         }
 
-        private async Task TypeWithRegionalIndicators(DiscordClient sender, MessageCreateEventArgs args, string text)
+        private async Task TypeWithRegionalIndicators(DiscordClient sender, MessageCreatedEventArgs args, string text)
         {
             foreach(char c in text.ToLower())
             {

@@ -3,7 +3,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.DevTools;
-using OpenQA.Selenium.DevTools.V136.Network;
+using OpenQA.Selenium.DevTools.V145.Network;
 using System.IO;
 using System.Linq.Expressions;
 using System.Net;
