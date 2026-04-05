@@ -212,6 +212,18 @@ namespace Omnipotent.Services.MemeScraper
                     ServiceLogError(e, $"Error in {request.route} route.");
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+            await CreateAPIRoute("/memescraper/getAllSavedNiches", async (request) =>
+            {
+                try
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(SourceManager.AllNiches), code: HttpStatusCode.OK);
+                }
+                catch (Exception e)
+                {
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
+                    ServiceLogError(e, $"Error in {request.route} route.");
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
             await CreateAPIRoute("/memescraper/memeScraperAnalytics", async (request) =>
             {
                 try
