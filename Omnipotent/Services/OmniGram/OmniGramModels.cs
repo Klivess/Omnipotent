@@ -110,6 +110,36 @@ namespace Omnipotent.Services.OmniGram
         public string? autonomousCaptionPrompt { get; set; }
     }
 
+    public class OmniGramUpdateAccountSettingsRequest
+    {
+        public string accountId { get; set; } = "";
+        public bool? useMemeScraperSource { get; set; }
+        public List<string>? memeNiches { get; set; }
+        public bool? autonomousPostingEnabled { get; set; }
+        public int? autonomousPostingIntervalMinutes { get; set; }
+        public int? autonomousPostingRandomOffsetMinutes { get; set; }
+        public string? autonomousCaptionPrompt { get; set; }
+    }
+
+    public class OmniGramUpdateProfileRequest
+    {
+        public string accountId { get; set; } = "";
+        public string? displayName { get; set; }
+        public string? biography { get; set; }
+        public string? externalUrl { get; set; }
+        public string? email { get; set; }
+        public string? phoneNumber { get; set; }
+        public int? gender { get; set; }
+        public string? username { get; set; }
+    }
+
+    public class OmniGramDeletePostRequest
+    {
+        public string accountId { get; set; } = "";
+        public string mediaId { get; set; } = "";
+        public int mediaType { get; set; }
+    }
+
     public class OmniGramServiceEvent
     {
         public string EventId { get; set; } = Guid.NewGuid().ToString("N");

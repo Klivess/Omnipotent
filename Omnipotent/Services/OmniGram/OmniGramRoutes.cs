@@ -27,6 +27,7 @@ namespace Omnipotent.Services.OmniGram
                     }
 
                     var account = await p.AddManagedAccount(body, req.user?.Name ?? "Unknown");
+                    var live = await p.GetLiveAccountData(account.AccountId);
                     await req.ReturnResponse(JsonConvert.SerializeObject(new
                     {
                         account.AccountId,
@@ -40,8 +41,102 @@ namespace Omnipotent.Services.OmniGram
                         account.AutonomousCaptionPrompt,
                         account.LastAuthenticatedUtc,
                         account.CreatedAtUtc,
-                        account.UpdatedAtUtc
+                        account.UpdatedAtUtc,
+                        LiveVerification = live
                     }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Post, KMPermissions.Manager);
+
+            await p.CreateAPIRoute("/omnigram/accounts/updateSettings", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<OmniGramUpdateAccountSettingsRequest>(req.userMessageContent);
+                    if (body == null)
+                    {
+                        await req.ReturnResponse("Invalid request body", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = await p.UpdateManagedAccountSettings(body);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(account));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Post, KMPermissions.Manager);
+
+            await p.CreateAPIRoute("/omnigram/accounts/live", async (req) =>
+            {
+                try
+                {
+                    string accountId = req.userParameters?["accountId"] ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("Missing accountId", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var live = await p.GetLiveAccountData(accountId);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(live));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await p.CreateAPIRoute("/omnigram/accounts/liveAnalytics", async (req) =>
+            {
+                try
+                {
+                    var data = await p.GetLiveAccountsAnalytics();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(data));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            await p.CreateAPIRoute("/omnigram/accounts/updateProfile", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<OmniGramUpdateProfileRequest>(req.userMessageContent);
+                    if (body == null)
+                    {
+                        await req.ReturnResponse("Invalid request body", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var result = await p.UpdateManagedAccountProfile(body, req.userMessageBytes);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(result));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Post, KMPermissions.Manager);
+
+            await p.CreateAPIRoute("/omnigram/posts/deleteFromInstagram", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<OmniGramDeletePostRequest>(req.userMessageContent);
+                    if (body == null)
+                    {
+                        await req.ReturnResponse("Invalid request body", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    bool ok = await p.DeleteInstagramPost(body);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = ok }));
                 }
                 catch (Exception ex)
                 {

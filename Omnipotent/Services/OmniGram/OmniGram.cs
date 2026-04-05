@@ -129,6 +129,254 @@ namespace Omnipotent.Services.OmniGram
             return account;
         }
 
+        public async Task<OmniGramAccount> UpdateManagedAccountSettings(OmniGramUpdateAccountSettingsRequest request)
+        {
+            var account = GetManagedAccountOrThrow(request.accountId);
+
+            if (request.useMemeScraperSource.HasValue)
+            {
+                account.UseMemeScraperSource = request.useMemeScraperSource.Value;
+            }
+
+            if (request.memeNiches != null)
+            {
+                var normalized = NormalizeNiches(request.memeNiches);
+                if (account.UseMemeScraperSource && !normalized.Any())
+                {
+                    throw new Exception("At least one meme niche is required when MemeScraper source mode is enabled.");
+                }
+                account.PreferredMemeNiches = normalized;
+            }
+
+            if (request.autonomousPostingEnabled.HasValue)
+            {
+                account.AutonomousPostingEnabled = request.autonomousPostingEnabled.Value;
+            }
+            if (request.autonomousPostingIntervalMinutes.HasValue && request.autonomousPostingIntervalMinutes.Value > 0)
+            {
+                account.AutonomousPostingIntervalMinutes = request.autonomousPostingIntervalMinutes.Value;
+            }
+            if (request.autonomousPostingRandomOffsetMinutes.HasValue && request.autonomousPostingRandomOffsetMinutes.Value >= 0)
+            {
+                account.AutonomousPostingRandomOffsetMinutes = request.autonomousPostingRandomOffsetMinutes.Value;
+            }
+            if (request.autonomousCaptionPrompt != null)
+            {
+                account.AutonomousCaptionPrompt = request.autonomousCaptionPrompt;
+            }
+
+            account.UpdatedAtUtc = DateTime.UtcNow;
+            await store.SaveAccount(account);
+            await LogEvent("Info", "Managed account settings updated.", account.AccountId, metadata: request);
+            await EnsureAutonomousScheduleForAccount(account, "settings_updated");
+            return account;
+        }
+
+        public async Task<object> GetLiveAccountData(string accountId)
+        {
+            var account = GetManagedAccountOrThrow(accountId);
+            var api = await BuildAuthenticatedApi(account);
+            if (api == null)
+            {
+                throw new Exception("Instagram authentication failed for managed account.");
+            }
+
+            var userInfoResult = await api.UserProcessor.GetUserInfoByUsernameAsync(account.Username);
+            if (!userInfoResult.Succeeded)
+            {
+                throw new Exception(userInfoResult.Info?.Message ?? "Failed to fetch live account data from Instagram.");
+            }
+
+            var loggedUser = api.GetLoggedUser();
+            await LogEvent("Info", "Fetched live Instagram account data.", account.AccountId);
+
+            return new
+            {
+                Account = new
+                {
+                    account.AccountId,
+                    account.Username,
+                    account.Status,
+                    account.LastAuthenticatedUtc,
+                    account.UseMemeScraperSource,
+                    account.PreferredMemeNiches,
+                    account.AutonomousPostingEnabled,
+                    account.AutonomousPostingIntervalMinutes,
+                    account.AutonomousPostingRandomOffsetMinutes
+                },
+                Verification = new
+                {
+                    IsLoggedIn = true,
+                    LoggedInUsername = loggedUser?.UserName,
+                    FetchTimestampUtc = DateTime.UtcNow
+                },
+                Instagram = userInfoResult.Value
+            };
+        }
+
+        public async Task<object> GetLiveAccountsAnalytics()
+        {
+            var activeAccounts = store.Accounts.Values.Where(x => x.Status == OmniGramAccountStatus.Active).ToList();
+            var results = new List<object>();
+
+            foreach (var account in activeAccounts)
+            {
+                try
+                {
+                    var api = await BuildAuthenticatedApi(account);
+                    if (api == null)
+                    {
+                        results.Add(new
+                        {
+                            account.AccountId,
+                            account.Username,
+                            Success = false,
+                            Error = "Authentication failed"
+                        });
+                        continue;
+                    }
+
+                    var userInfoResult = await api.UserProcessor.GetUserInfoByUsernameAsync(account.Username);
+                    if (!userInfoResult.Succeeded)
+                    {
+                        results.Add(new
+                        {
+                            account.AccountId,
+                            account.Username,
+                            Success = false,
+                            Error = userInfoResult.Info?.Message ?? "Instagram user info request failed"
+                        });
+                        continue;
+                    }
+
+                    results.Add(new
+                    {
+                        account.AccountId,
+                        account.Username,
+                        Success = true,
+                        Instagram = userInfoResult.Value
+                    });
+                }
+                catch (Exception ex)
+                {
+                    results.Add(new
+                    {
+                        account.AccountId,
+                        account.Username,
+                        Success = false,
+                        Error = ex.Message
+                    });
+                }
+            }
+
+            await LogEvent("Info", "Fetched live Instagram analytics for managed accounts.", metadata: new { ActiveAccounts = activeAccounts.Count, Returned = results.Count });
+            return new
+            {
+                TimestampUtc = DateTime.UtcNow,
+                AccountCount = activeAccounts.Count,
+                Results = results
+            };
+        }
+
+        public async Task<object> UpdateManagedAccountProfile(OmniGramUpdateProfileRequest request, byte[]? profilePictureBytes)
+        {
+            var account = GetManagedAccountOrThrow(request.accountId);
+            var api = await BuildAuthenticatedApi(account);
+            if (api == null)
+            {
+                throw new Exception("Instagram authentication failed for managed account.");
+            }
+
+            var profileChanges = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(request.biography))
+            {
+                var bioResult = await api.AccountProcessor.SetBiographyAsync(request.biography);
+                if (!bioResult.Succeeded)
+                {
+                    throw new Exception(bioResult.Info?.Message ?? "Failed to set biography.");
+                }
+                profileChanges.Add("biography");
+            }
+
+            if (profilePictureBytes != null && profilePictureBytes.Length > 0)
+            {
+                var pfpResult = await api.AccountProcessor.ChangeProfilePictureAsync(profilePictureBytes);
+                if (!pfpResult.Succeeded)
+                {
+                    throw new Exception(pfpResult.Info?.Message ?? "Failed to update profile picture.");
+                }
+                profileChanges.Add("profilePicture");
+            }
+
+            bool shouldEditProfile =
+                !string.IsNullOrWhiteSpace(request.displayName)
+                || !string.IsNullOrWhiteSpace(request.externalUrl)
+                || !string.IsNullOrWhiteSpace(request.email)
+                || !string.IsNullOrWhiteSpace(request.phoneNumber)
+                || request.gender.HasValue
+                || !string.IsNullOrWhiteSpace(request.username);
+
+            if (shouldEditProfile)
+            {
+                InstagramApiSharp.Enums.InstaGenderType? gender = null;
+                if (request.gender.HasValue && Enum.IsDefined(typeof(InstagramApiSharp.Enums.InstaGenderType), request.gender.Value))
+                {
+                    gender = (InstagramApiSharp.Enums.InstaGenderType)request.gender.Value;
+                }
+
+                var editResult = await api.AccountProcessor.EditProfileAsync(
+                    request.displayName ?? string.Empty,
+                    request.biography ?? string.Empty,
+                    request.externalUrl ?? string.Empty,
+                    request.email ?? string.Empty,
+                    request.phoneNumber ?? string.Empty,
+                    gender,
+                    request.username ?? account.Username);
+
+                if (!editResult.Succeeded)
+                {
+                    throw new Exception(editResult.Info?.Message ?? "Failed to edit Instagram profile.");
+                }
+                profileChanges.Add("profileFields");
+
+                if (!string.IsNullOrWhiteSpace(request.username) && !request.username.Equals(account.Username, StringComparison.OrdinalIgnoreCase))
+                {
+                    account.Username = request.username;
+                    account.UpdatedAtUtc = DateTime.UtcNow;
+                    await store.SaveAccount(account);
+                }
+            }
+
+            await LogEvent("Info", "Managed account Instagram profile updated.", account.AccountId, metadata: new { profileChanges });
+            return await GetLiveAccountData(account.AccountId);
+        }
+
+        public async Task<bool> DeleteInstagramPost(OmniGramDeletePostRequest request)
+        {
+            var account = GetManagedAccountOrThrow(request.accountId);
+            var api = await BuildAuthenticatedApi(account);
+            if (api == null)
+            {
+                throw new Exception("Instagram authentication failed for managed account.");
+            }
+
+            if (!Enum.IsDefined(typeof(InstagramApiSharp.Classes.Models.InstaMediaType), request.mediaType))
+            {
+                throw new Exception("Invalid mediaType value.");
+            }
+
+            var mediaType = (InstagramApiSharp.Classes.Models.InstaMediaType)request.mediaType;
+            var deleteResult = await api.MediaProcessor.DeleteMediaAsync(request.mediaId, mediaType);
+            if (!deleteResult.Succeeded)
+            {
+                throw new Exception(deleteResult.Info?.Message ?? "Failed to delete media from Instagram.");
+            }
+
+            await LogEvent("Info", "Instagram media deleted.", account.AccountId, metadata: new { request.mediaId, request.mediaType });
+            return true;
+        }
+
         private async Task<bool> ValidateInstagramCredentials(OmniGramAccount account)
         {
             try
@@ -427,12 +675,60 @@ namespace Omnipotent.Services.OmniGram
             {
                 return new OmniGramPublishResult(false, "", "Instagram authentication failed.");
             }
+            if (!File.Exists(mediaPath))
+            {
+                return new OmniGramPublishResult(false, "", "Media file does not exist on disk.");
+            }
 
-            // First provider slice: use InstagramApiSharp for auth/session handling.
-            // Media publish method signatures differ across package versions,
-            // so this service currently validates readiness and returns a deterministic result.
-            // Next slice can add concrete feed/reel/story upload paths.
-            return new OmniGramPublishResult(true, "local-" + Guid.NewGuid().ToString("N"), "");
+            string extension = Path.GetExtension(mediaPath).ToLowerInvariant();
+            bool isVideo = extension is ".mp4" or ".mov" or ".m4v" or ".avi" or ".webm";
+            bool isImage = extension is ".jpg" or ".jpeg" or ".png";
+
+            try
+            {
+                if (isVideo)
+                {
+                    var videoUpload = new InstagramApiSharp.Classes.Models.InstaVideoUpload
+                    {
+                        Video = new InstagramApiSharp.Classes.Models.InstaVideo
+                        {
+                            Uri = mediaPath
+                        }
+                    };
+
+                    var uploadResult = await api.MediaProcessor.UploadVideoAsync(videoUpload, caption ?? string.Empty, null);
+                    if (uploadResult.Succeeded && uploadResult.Value != null)
+                    {
+                        return new OmniGramPublishResult(true, uploadResult.Value.Pk.ToString(), "");
+                    }
+
+                    string error = uploadResult.Info?.Message ?? "Instagram video upload failed.";
+                    return new OmniGramPublishResult(false, "", error);
+                }
+
+                if (isImage)
+                {
+                    var imageUpload = new InstagramApiSharp.Classes.Models.InstaImageUpload
+                    {
+                        Uri = mediaPath
+                    };
+
+                    var uploadResult = await api.MediaProcessor.UploadPhotoAsync(imageUpload, caption ?? string.Empty, null);
+                    if (uploadResult.Succeeded && uploadResult.Value != null)
+                    {
+                        return new OmniGramPublishResult(true, uploadResult.Value.Pk.ToString(), "");
+                    }
+
+                    string error = uploadResult.Info?.Message ?? "Instagram image upload failed.";
+                    return new OmniGramPublishResult(false, "", error);
+                }
+
+                return new OmniGramPublishResult(false, "", $"Unsupported media extension '{extension}'.");
+            }
+            catch (Exception ex)
+            {
+                return new OmniGramPublishResult(false, "", ex.Message);
+            }
         }
 
         public List<OmniGramPostPlan> GetRecentPosts(int take = 500)
@@ -661,6 +957,21 @@ namespace Omnipotent.Services.OmniGram
                 randomOffsetMinutes = account.AutonomousPostingRandomOffsetMinutes,
                 account.PreferredMemeNiches
             });
+        }
+
+        private OmniGramAccount GetManagedAccountOrThrow(string accountId)
+        {
+            if (string.IsNullOrWhiteSpace(accountId))
+            {
+                throw new Exception("accountId is required.");
+            }
+
+            if (!store.Accounts.TryGetValue(accountId, out var account))
+            {
+                throw new Exception("Managed account not found.");
+            }
+
+            return account;
         }
 
         private static List<string> NormalizeNiches(IEnumerable<string>? niches)

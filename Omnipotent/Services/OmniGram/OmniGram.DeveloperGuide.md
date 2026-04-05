@@ -139,9 +139,16 @@ Stored in `OmniGramUploadMetricsDirectory`.
 
 ## Extension Guidance
 
-### If adding real Instagram upload methods
-Current `PublishWithInstagramApi` is a placeholder success path.
-When implementing actual upload:
+### Current Instagram publishing implementation
+`PublishWithInstagramApi` now performs typed uploads through `InstagramApiSharp`:
+- `MediaProcessor.UploadVideoAsync` for `.mp4/.mov/.m4v/.avi/.webm`
+- `MediaProcessor.UploadPhotoAsync` for `.jpg/.jpeg/.png`
+
+Behavior notes:
+- Returns failure for unsupported file extensions.
+- Uses Instagram API result `Info.Message` when available.
+
+When modifying this area:
 - keep typed API calls only
 - do not use reflection
 - preserve event + metric writes on all outcomes
@@ -172,3 +179,92 @@ Follow existing route pattern used by `KliveCloudRoutes`:
 5. Schedule upload-mode campaign with raw bytes and confirm upload file saved.
 6. Trigger post processing and verify upload metrics file is created.
 7. Verify `GET /omnigram/analytics/overview` reflects new data.
+
+## What OmniGram now does
+OmniGram now performs real Instagram API interactions via `InstagramApiSharp` for:
+- account live verification/data retrieval
+- live account analytics retrieval
+- profile updates (bio, profile picture, profile fields)
+- media deletion
+- media publishing (video/image upload)
+
+It also keeps autonomous scheduling, persistent event logs, and upload metrics.
+
+## Important implementation points
+
+## 1) Live Instagram account data
+Methods added in `OmniGram.cs`:
+- `GetLiveAccountData(accountId)`
+- `GetLiveAccountsAnalytics()`
+
+Implementation uses typed calls:
+- `api.UserProcessor.GetUserInfoByUsernameAsync(account.Username)`
+- `api.GetLoggedUser()` for logged-in verification context
+
+## 2) Managed account settings updates
+Method:
+- `UpdateManagedAccountSettings(OmniGramUpdateAccountSettingsRequest)`
+
+This updates MemeScraper niches/autonomous settings and persists account state.
+
+## 3) Profile mutation routes
+Method:
+- `UpdateManagedAccountProfile(OmniGramUpdateProfileRequest, byte[]? profilePictureBytes)`
+
+Typed Instagram calls used:
+- `api.AccountProcessor.SetBiographyAsync(...)`
+- `api.AccountProcessor.ChangeProfilePictureAsync(...)`
+- `api.AccountProcessor.EditProfileAsync(...)`
+
+## 4) Media deletion
+Method:
+- `DeleteInstagramPost(OmniGramDeletePostRequest)`
+
+Typed Instagram call used:
+- `api.MediaProcessor.DeleteMediaAsync(mediaId, mediaType)`
+
+## 5) Publishing
+Method:
+- `PublishWithInstagramApi(...)`
+
+Typed Instagram calls used:
+- `api.MediaProcessor.UploadVideoAsync(...)`
+- `api.MediaProcessor.UploadPhotoAsync(...)`
+
+## 6) Routes added/updated
+In `OmniGramRoutes.cs`:
+- `POST /omnigram/accounts/updateSettings`
+- `GET /omnigram/accounts/live`
+- `GET /omnigram/accounts/liveAnalytics`
+- `POST /omnigram/accounts/updateProfile`
+- `POST /omnigram/posts/deleteFromInstagram`
+
+Also:
+- `POST /omnigram/accounts/add` now returns `LiveVerification` payload.
+
+## 7) Account creation behavior
+Automatic Instagram account creation is not implemented in OmniGram.
+The public package usage in this build does not provide a stable typed signup flow wired in service routes.
+
+## 8) Persistence and telemetry
+Still persisted under:
+- `SavedData/OmniGram/Accounts`
+- `SavedData/OmniGram/Posts`
+- `SavedData/OmniGram/Campaigns`
+- `SavedData/OmniGram/Sessions`
+- `SavedData/OmniGram/Uploads`
+- `SavedData/OmniGram/Logs/Events`
+- `SavedData/OmniGram/Logs/UploadMetrics`
+
+## 9) Frontend integration guidance
+For frontend team:
+- use `/accounts/live` and `/accounts/liveAnalytics` for actual Instagram live data views
+- use `/accounts/updateSettings` for service behavior config
+- use `/accounts/updateProfile` for mutable Instagram profile fields
+- use `/posts/deleteFromInstagram` for deleting existing Instagram media
+- treat `/accounts/createInstagramAccount` as capability probe endpoint (currently not implemented)
+
+## 10) Caution notes
+- `EditProfileAsync` requires all parameters in its signature; non-provided values are currently passed as empty strings.
+- Profile picture route expects raw bytes in request body.
+- `mediaType` for deletion must map correctly to `InstaMediaType` enum numeric values.
