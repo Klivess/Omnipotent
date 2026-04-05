@@ -27,7 +27,9 @@ namespace Omnipotent.Services.MemeScraper
         }
         protected override async void ServiceMain()
         {
+            CreateRoutes();
             SourceManager = new MemeScraperSources(this);
+            await SourceManager.LoadNiches();
             instagramScrapeUtilities = new InstagramScrapeUtilities(this);
             mediaManager = new MemeScraperMedia(this);
             memeScraperLabs = new(this);
@@ -41,9 +43,6 @@ namespace Omnipotent.Services.MemeScraper
             }
 
             //CheckForBrokenFilePaths();
-
-            CreateRoutes();
-
             GetTimeManagerService().TaskDue += TimeManager_TaskDue;
 
             foreach (var item in SourceManager.InstagramSources)
