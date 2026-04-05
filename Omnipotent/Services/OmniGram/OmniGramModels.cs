@@ -51,6 +51,9 @@ namespace Omnipotent.Services.OmniGram
         public DateTime CreatedAtUtc { get; set; }
         public DateTime UpdatedAtUtc { get; set; }
         public DateTime? LastAuthenticatedUtc { get; set; }
+        public bool CheckpointRequired { get; set; }
+        public string? LastAuthenticationError { get; set; }
+        public string? LastAuthenticationGuidance { get; set; }
         public string AddedBy { get; set; } = "";
     }
 

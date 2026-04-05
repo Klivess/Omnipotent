@@ -27,7 +27,19 @@ namespace Omnipotent.Services.OmniGram
                     }
 
                     var account = await p.AddManagedAccount(body, req.user?.Name ?? "Unknown");
-                    var live = await p.GetLiveAccountData(account.AccountId);
+
+                    object? live = null;
+                    if (!account.CheckpointRequired && account.Status == OmniGramAccountStatus.Active)
+                    {
+                        try
+                        {
+                            live = await p.GetLiveAccountData(account.AccountId);
+                        }
+                        catch (Exception ex)
+                        {
+                            live = new { error = ex.Message };
+                        }
+                    }
                     await req.ReturnResponse(JsonConvert.SerializeObject(new
                     {
                         account.AccountId,
@@ -39,6 +51,9 @@ namespace Omnipotent.Services.OmniGram
                         account.AutonomousPostingIntervalMinutes,
                         account.AutonomousPostingRandomOffsetMinutes,
                         account.AutonomousCaptionPrompt,
+                        account.CheckpointRequired,
+                        account.LastAuthenticationError,
+                        account.LastAuthenticationGuidance,
                         account.LastAuthenticatedUtc,
                         account.CreatedAtUtc,
                         account.UpdatedAtUtc,
@@ -157,6 +172,9 @@ namespace Omnipotent.Services.OmniGram
                     a.AutonomousPostingIntervalMinutes,
                     a.AutonomousPostingRandomOffsetMinutes,
                     a.AutonomousCaptionPrompt,
+                    a.CheckpointRequired,
+                    a.LastAuthenticationError,
+                    a.LastAuthenticationGuidance,
                     a.CreatedAtUtc,
                     a.UpdatedAtUtc,
                     a.LastAuthenticatedUtc

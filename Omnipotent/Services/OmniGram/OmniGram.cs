@@ -108,9 +108,12 @@ namespace Omnipotent.Services.OmniGram
             account.AutonomousCaptionPrompt = request.autonomousCaptionPrompt;
             account.UpdatedAtUtc = DateTime.UtcNow;
 
-            bool canAuth = await ValidateInstagramCredentials(account);
-            account.Status = canAuth ? OmniGramAccountStatus.Active : OmniGramAccountStatus.NeedsVerification;
-            if (canAuth)
+            var auth = await ValidateInstagramCredentials(account);
+            account.Status = auth.Success ? OmniGramAccountStatus.Active : OmniGramAccountStatus.NeedsVerification;
+            account.CheckpointRequired = auth.CheckpointRequired;
+            account.LastAuthenticationError = auth.Error;
+            account.LastAuthenticationGuidance = auth.Guidance;
+            if (auth.Success)
             {
                 account.LastAuthenticatedUtc = DateTime.UtcNow;
             }
@@ -202,7 +205,10 @@ namespace Omnipotent.Services.OmniGram
                     account.PreferredMemeNiches,
                     account.AutonomousPostingEnabled,
                     account.AutonomousPostingIntervalMinutes,
-                    account.AutonomousPostingRandomOffsetMinutes
+                    account.AutonomousPostingRandomOffsetMinutes,
+                    account.CheckpointRequired,
+                    account.LastAuthenticationError,
+                    account.LastAuthenticationGuidance
                 },
                 Verification = new
                 {
@@ -377,25 +383,31 @@ namespace Omnipotent.Services.OmniGram
             return true;
         }
 
-        private async Task<bool> ValidateInstagramCredentials(OmniGramAccount account)
+        private async Task<(bool Success, bool CheckpointRequired, string? Error, string? Guidance)> ValidateInstagramCredentials(OmniGramAccount account)
         {
             try
             {
-                var api = await BuildAuthenticatedApi(account);
-                return api != null;
+                var auth = await BuildAuthenticatedApiDetailed(account);
+                return (auth.Api != null, auth.CheckpointRequired, auth.Error, auth.Guidance);
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, $"OmniGram login validation failed for account {account.Username}");
-                return false;
+                return (false, false, ex.Message, null);
             }
         }
 
         private async Task<IInstaApi?> BuildAuthenticatedApi(OmniGramAccount account)
         {
+            var auth = await BuildAuthenticatedApiDetailed(account);
+            return auth.Api;
+        }
+
+        private async Task<(IInstaApi? Api, bool CheckpointRequired, string? Error, string? Guidance)> BuildAuthenticatedApiDetailed(OmniGramAccount account)
+        {
             if (sessionCache.TryGetValue(account.AccountId, out IInstaApi cachedApi))
             {
-                return cachedApi;
+                return (cachedApi, false, null, null);
             }
 
             string statePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGramSessionsDirectory), account.AccountId + ".state");
@@ -420,7 +432,13 @@ namespace Omnipotent.Services.OmniGram
             var login = await api.LoginAsync();
             if (!login.Succeeded)
             {
-                return null;
+                string loginError = login.Info?.Message ?? "Instagram login failed.";
+                bool checkpointRequired = loginError.Contains("checkpoint_required", StringComparison.OrdinalIgnoreCase);
+                string? guidance = checkpointRequired
+                    ? "Instagram requires a 'This was me' confirmation in the Instagram app. Confirm the login attempt in-app, then retry."
+                    : null;
+
+                return (null, checkpointRequired, loginError, guidance);
             }
 
             await using (var stateStream = api.GetStateDataAsStream())
@@ -430,7 +448,7 @@ namespace Omnipotent.Services.OmniGram
             }
 
             sessionCache.Set(account.AccountId, api, TimeSpan.FromMinutes(20));
-            return api;
+            return (api, false, null, null);
         }
 
         public async Task<OmniGramCampaign> SchedulePost(OmniGramScheduleRequest request, string createdBy)
