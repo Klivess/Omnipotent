@@ -59,17 +59,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 // Swallow to avoid crashing service at startup if local model cannot be initialized
             }
-            StringBuilder helloResponseBuilder = new StringBuilder();
-            await foreach (var token in QueryLocalLLMAsync("Hello!"))
-            {
-                helloResponseBuilder.Append(token);
-            }
-            string helloResponse = SanitizeLocalModelOutput(helloResponseBuilder.ToString());
-            if (string.IsNullOrWhiteSpace(helloResponse))
-            {
-                helloResponse = "[No response. Error?]";
-            }
-            ServiceLog("LocalLLM loaded and ready, heres what it has to say to Hello: " + helloResponse);
+            ServiceLog("LocalLLM loaded and ready, heres what it has to say to Hello: "+(await QueryLocalLLMAsync("Hello!")).Response);
         }
 
         private async Task EnsureLlamaBinariesAvailableAsync()
@@ -323,18 +313,15 @@ namespace Omnipotent.Services.KliveLocalLLM
             public string ErrorMessage { get; set; }
         }
 
-        public async IAsyncEnumerable<string> QueryLocalLLMAsync(string prompt, string? sessionId = null)
+        public async Task<KliveLLMResponse> QueryLocalLLMAsync(string prompt, string? sessionId = null)
         {
+            var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = string.Empty };
             if (!localModelReady || executor == null)
             {
-                await ServiceLogError("Local model not available");
-                yield break;
+                resp.ErrorMessage = "Local model not available";
+                await ServiceLogError(resp.ErrorMessage);
+                return resp;
             }
-
-            KliveLLMSession session;
-            InferenceParams inferenceParams;
-            ChatHistory.Message chatMsg;
-            StringBuilder sb = new StringBuilder();
 
             try
             {
@@ -349,6 +336,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                     }
                 }
 
+                KliveLLMSession session;
                 lock (sessions)
                 {
                     if (!sessions.TryGetValue(sessionId, out session))
@@ -369,7 +357,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                     throw new InvalidOperationException("Local LLama executor or session not initialized");
                 }
 
-                inferenceParams = new InferenceParams()
+                var inferenceParams = new InferenceParams()
                 {
                     MaxTokens = 256,
                     AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
@@ -380,49 +368,12 @@ namespace Omnipotent.Services.KliveLocalLLM
                     }
                 };
 
-                chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
-            }
-            catch (TargetInvocationException tie)
-            {
-                await ServiceLogError(tie, "Error invoking local model");
-                yield break;
-            }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "Local model query failed");
-                yield break;
-            }
-
-            await using var chunkEnumerator = session.chatSession.ChatAsync(chatMsg, inferenceParams).GetAsyncEnumerator();
-            while (true)
-            {
-                string chunk;
-                try
+                var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
+                StringBuilder sb = new StringBuilder();
+                await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams))
                 {
-                    if (!await chunkEnumerator.MoveNextAsync())
-                    {
-                        break;
-                    }
-
-                    chunk = chunkEnumerator.Current;
+                    sb.Append(chunk);
                 }
-                catch (TargetInvocationException tie)
-                {
-                    await ServiceLogError(tie, "Error invoking local model");
-                    yield break;
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Local model query failed");
-                    yield break;
-                }
-
-                sb.Append(chunk);
-                yield return chunk;
-            }
-
-            try
-            {
                 string outStr = SanitizeLocalModelOutput(sb.ToString());
                 if (string.IsNullOrWhiteSpace(outStr))
                 {
@@ -432,13 +383,27 @@ namespace Omnipotent.Services.KliveLocalLLM
                 var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
                 session.messages.Add(assistantMsg);
                 session.lastUpdated = DateTime.UtcNow;
+
+                resp.Response = outStr;
+                resp.SessionId = sessionId;
+                resp.Conversation = session.messages;
+                resp.Success = true;
                 try { await ServiceLog($"Local model returned response for session {sessionId}"); } catch { }
+                return resp;
+            }
+            catch (TargetInvocationException tie)
+            {
+                var err = tie.InnerException?.Message ?? tie.Message;
+                await ServiceLogError(tie, "Error invoking local model");
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = err };
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "Local model post-processing failed");
+                await ServiceLogError(ex, "Local model query failed");
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = ex.Message };
             }
         }
+
         private static string SanitizeLocalModelOutput(string raw)
         {
             if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
@@ -480,6 +445,7 @@ namespace Omnipotent.Services.KliveLocalLLM
 
             return text.Trim();
         }
+
         public string ProducePayloadString(string role, string content, string model)
         {
             string payload = $"{{\"messages\":[{{\"role\":\"{role}\",\"content\":\"{content}\"}}],\"model\":\"{model}\",\"stream\":false}}";
@@ -505,6 +471,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 chatSession = new ChatSession(executor, chatHistory);
             }
         }
+
         public class KliveLLMMessage
         {
             public string content;
