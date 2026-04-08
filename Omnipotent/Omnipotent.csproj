@@ -42,6 +42,7 @@
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
 		<PackageReference Include="Microsoft.ML" Version="5.0.0" />
 		<PackageReference Include="Newtonsoft.Json" Version="13.0.5-beta1" />
+		<PackageReference Include="NewTumblrSharp" Version="1.2.1.160" />
 		<PackageReference Include="protobuf-net" Version="3.2.56" />
 		<PackageReference Include="ScottPlot" Version="5.1.58" />
 		<PackageReference Include="Selenium.WebDriver" Version="4.41.0" />

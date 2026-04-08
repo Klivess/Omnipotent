@@ -116,6 +116,15 @@ namespace Omnipotent.Data_Handling
             public static string OmniGramEventsDirectory = $"{OmniGramLogsDirectory}/Events";
             public static string OmniGramUploadMetricsDirectory = $"{OmniGramLogsDirectory}/UploadMetrics";
 
+            //OmniTumblr
+            public static string OmniTumblrDirectory = $"{SavedDataDirectory}/OmniTumblr";
+            public static string OmniTumblrAccountsDirectory = $"{OmniTumblrDirectory}/Accounts";
+            public static string OmniTumblrPostsDirectory = $"{OmniTumblrDirectory}/Posts";
+            public static string OmniTumblrCampaignsDirectory = $"{OmniTumblrDirectory}/Campaigns";
+            public static string OmniTumblrUploadsDirectory = $"{OmniTumblrDirectory}/Uploads";
+            public static string OmniTumblrLogsDirectory = $"{OmniTumblrDirectory}/Logs";
+            public static string OmniTumblrEventsDirectory = $"{OmniTumblrLogsDirectory}/Events";
+
 
         };
 
