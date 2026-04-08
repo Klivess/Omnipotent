@@ -8,6 +8,7 @@ using System.Drawing;
 using DSharpPlus.EventArgs;
 using Humanizer;
 using System.Diagnostics;
+using System.Text;
 using Omnipotent.Services.KliveLocalLLM;
 
 namespace Omnipotent.Services.KliveBot_Discord
@@ -140,9 +141,16 @@ namespace Omnipotent.Services.KliveBot_Discord
                         {
                             string sessionId = GetLlmSessionIdForChat(args);
                             Stopwatch stopwatch = Stopwatch.StartNew();
-                            var llmResponse = await llmService.QueryLocalLLMAsync(args.Message.Content, sessionId);
+
+                            string responseString = "";
+                            var response = await args.Message.RespondAsync("[Responding...]");
+                            await foreach (var token in llmService.QueryLocalLLMAsync(args.Message.Content, sessionId))
+                            {
+                                responseString += token;
+                                response = await response.ModifyAsync(responseString);
+                            }
                             stopwatch.Stop();
-                            await args.Message.RespondAsync(llmResponse.Response + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
+                            response = await response.ModifyAsync(responseString+ "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
                         }
                     }
                     catch (Exception ex)
