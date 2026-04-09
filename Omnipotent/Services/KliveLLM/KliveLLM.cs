@@ -386,29 +386,25 @@ namespace Omnipotent.Services.KliveLocalLLM
                              .Replace("<|im_end|>", "")
                              .Replace("<|endoftext|>", "");
 
-                    // Strip echoed prompt/executor prefix
-                    int assistantIdx = raw.LastIndexOf("Assistant:", StringComparison.OrdinalIgnoreCase);
-                    if (assistantIdx >= 0)
+                    // Remove everything up to and including </think> — covers the full echo + think block
+                    int thinkEndIdx = raw.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+                    if (thinkEndIdx >= 0)
+                        raw = raw.Substring(thinkEndIdx + "</think>".Length);
+
+                    // If no </think>, fall back to stripping after last "Assistant:"
+                    else
                     {
-                        raw = raw.Substring(assistantIdx + "Assistant:".Length);
+                        int assistantIdx = raw.LastIndexOf("Assistant:", StringComparison.OrdinalIgnoreCase);
+                        if (assistantIdx >= 0)
+                            raw = raw.Substring(assistantIdx + "Assistant:".Length);
                     }
 
-                    // Strip Qwen thinking tags block
-                    int thinkStart = raw.IndexOf("<think>", StringComparison.OrdinalIgnoreCase);
-                    int thinkEnd = raw.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
-                    if (thinkStart >= 0 && thinkEnd >= 0)
-                    {
-                        raw = raw.Substring(thinkEnd + "</think>".Length);
-                    }
-
-                    // Strip stray trailing code fences
-                    raw = raw.TrimEnd('`').Trim();
+                    // Strip trailing backticks Qwen sometimes appends
+                    raw = raw.Trim('`', '\n', '\r', ' ');
 
                     string outStr = raw.Trim();
                     if (string.IsNullOrWhiteSpace(outStr))
-                    {
                         outStr = "[No response. Error?]";
-                    }
 
                     var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
                     session.messages.Add(assistantMsg);
