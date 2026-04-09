@@ -364,7 +364,10 @@ namespace Omnipotent.Services.KliveLocalLLM
                         Temperature = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTemperature", "0.1").GetAwaiter().GetResult()),
                         TopK = GetIntOmniSetting("InferenceParameterTopK", 40).GetAwaiter().GetResult(),
                         TopP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTopP", "0.95").GetAwaiter().GetResult()),
-                        MinP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterMinimumP", "0.05").GetAwaiter().GetResult())
+                        MinP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterMinimumP", "0.05").GetAwaiter().GetResult()),
+                        RepeatPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterRepeatPenalty", "1.1").GetAwaiter().GetResult()),
+                        PresencePenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterPresencePenalty", "2.0").GetAwaiter().GetResult()),
+                        FrequencyPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterFrequencyPenalty", "2.0").GetAwaiter().GetResult()),
                     }
                 };
 
