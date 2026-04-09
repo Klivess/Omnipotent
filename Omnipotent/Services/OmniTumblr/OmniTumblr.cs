@@ -470,8 +470,8 @@ namespace Omnipotent.Services.OmniTumblr
 
         private TumblrClient CreateTumblrClient(OmniTumblrAccount account)
         {
-            string consumerKey = GetStringOmniSetting("OmniTumblrConsumerKey", defaultValue: "").GetAwaiter().GetResult();
-            string consumerSecret = GetStringOmniSetting("OmniTumblrConsumerSecret", defaultValue: "").GetAwaiter().GetResult();
+            string consumerKey = account.OAuthTokenKey;
+            string consumerSecret = account.OAuthTokenSecret;
             if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret))
             {
                 throw new Exception("OmniTumblrConsumerKey and OmniTumblrConsumerSecret settings are required.");
