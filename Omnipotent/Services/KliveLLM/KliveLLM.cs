@@ -283,10 +283,9 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 modelParams = new ModelParams(modelPath)
                 {
-                    ContextSize = 2048,
+                    ContextSize = Convert.ToUInt32(GetIntOmniSetting("ModelParameterContextSize", 26000).GetAwaiter().GetResult()),
                     GpuLayerCount = 0,    // Explicitly force CPU
                     Threads = Math.Max(1, Environment.ProcessorCount - 1),
-                    BatchSize = 64
                 };
 
                 // Load weights and create context/executor
@@ -359,12 +358,13 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                 var inferenceParams = new InferenceParams()
                 {
-                    MaxTokens = 256,
                     AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
                     SamplingPipeline = new DefaultSamplingPipeline
                     {
-                        Temperature = 0.7f,
-                        RepeatPenalty = 1.1f
+                        Temperature = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTemperature", "0.1").GetAwaiter().GetResult()),
+                        TopK = GetIntOmniSetting("InferenceParameterTopK", 40).GetAwaiter().GetResult(),
+                        TopP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTopP", "0.95").GetAwaiter().GetResult()),
+                        MinP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterMinimumP", "0.05").GetAwaiter().GetResult())
                     }
                 };
 
