@@ -55,11 +55,11 @@ namespace Omnipotent.Services.KliveLocalLLM
                 await EnsureModelDownloadedAsync();
                 await InitializeLocalModelAsync();
             }
-            catch
+            catch (Exception ex)
             {
-                // Swallow to avoid crashing service at startup if local model cannot be initialized
+                await ServiceLogError(ex, $"INIT FAILED: {ex.Message} | Inner: {ex.InnerException?.Message} | Stack: {ex.StackTrace}");
+                return;
             }
-            ServiceLog("LocalLLM loaded and ready, heres what it has to say to Hello: "+(await QueryLocalLLMAsync("Hello!")).Response);
         }
 
         private async Task EnsureLlamaBinariesAvailableAsync()
@@ -173,8 +173,6 @@ namespace Omnipotent.Services.KliveLocalLLM
         private string modelPath;
         private ModelParams modelParams;
         private LLamaWeights modelWeights;
-        private LLamaContext? llmContext = null;
-        private InteractiveExecutor? executor = null;
         private bool localModelReady = false;
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
 
@@ -284,14 +282,13 @@ namespace Omnipotent.Services.KliveLocalLLM
                 modelParams = new ModelParams(modelPath)
                 {
                     ContextSize = Convert.ToUInt32(GetIntOmniSetting("ModelParameterContextSize", 26000).GetAwaiter().GetResult()),
+                    //ContextSize=4096,
                     GpuLayerCount = 0,    // Explicitly force CPU
                     Threads = Math.Max(1, Environment.ProcessorCount - 1),
                 };
 
-                // Load weights and create context/executor
+                // Load weights once; contexts/executors are created per session
                 modelWeights = LLamaWeights.LoadFromFile(modelParams);
-                llmContext = modelWeights.CreateContext(modelParams);
-                executor = new InteractiveExecutor(llmContext);
 
                 localModelReady = true;
                 await ServiceLog("Local model initialized successfully");
@@ -315,7 +312,7 @@ namespace Omnipotent.Services.KliveLocalLLM
         public async Task<KliveLLMResponse> QueryLocalLLMAsync(string prompt, string? sessionId = null)
         {
             var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = string.Empty };
-            if (!localModelReady || executor == null)
+            if (!localModelReady || modelWeights == null)
             {
                 resp.ErrorMessage = "Local model not available";
                 await ServiceLogError(resp.ErrorMessage);
@@ -328,7 +325,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 if (string.IsNullOrEmpty(sessionId))
                 {
                     sessionId = Guid.NewGuid().ToString();
-                    var s = new KliveLLMSession(this, executor) { sessionId = sessionId };
+                    var s = new KliveLLMSession(this, modelWeights, modelParams) { sessionId = sessionId };
                     lock (sessions)
                     {
                         sessions[sessionId] = s;
@@ -340,70 +337,106 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     if (!sessions.TryGetValue(sessionId, out session))
                     {
-                        session = new KliveLLMSession(this, executor) { sessionId = sessionId };
+                        session = new KliveLLMSession(this, modelWeights, modelParams) { sessionId = sessionId };
                         sessions[sessionId] = session;
                     }
                 }
 
-                var userMsg = new KliveLLMMessage() { role = "user", content = prompt };
-                session.messages.Add(userMsg);
-                session.lastUpdated = DateTime.UtcNow;
-                try { await ServiceLog($"Querying local model for session {sessionId}"); } catch { }
-
-                // Use LLama ChatSession to generate response
-                if (executor == null || session.chatSession == null)
+                await session.sessionLock.WaitAsync();
+                try
                 {
-                    throw new InvalidOperationException("Local LLama executor or session not initialized");
-                }
+                    var userMsg = new KliveLLMMessage() { role = "user", content = prompt };
+                    session.messages.Add(userMsg);
+                    session.lastUpdated = DateTime.UtcNow;
+                    try { await ServiceLog($"Querying local model for session {sessionId}"); } catch { }
 
-                var inferenceParams = new InferenceParams()
-                {
-                    AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
-                    SamplingPipeline = new DefaultSamplingPipeline
+                    // Use LLama ChatSession to generate response
+                    if (session.executor == null || session.chatSession == null)
                     {
-                        Temperature = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTemperature", "0.1").GetAwaiter().GetResult()),
-                        TopK = GetIntOmniSetting("InferenceParameterTopK", 40).GetAwaiter().GetResult(),
-                        TopP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTopP", "0.95").GetAwaiter().GetResult()),
-                        MinP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterMinimumP", "0.05").GetAwaiter().GetResult()),
-                        RepeatPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterRepeatPenalty", "1.1").GetAwaiter().GetResult()),
-                        PresencePenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterPresencePenalty", "2.0").GetAwaiter().GetResult()),
-                        FrequencyPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterFrequencyPenalty", "2.0").GetAwaiter().GetResult()),
+                        throw new InvalidOperationException("Local LLama executor or session not initialized");
                     }
-                };
 
-                var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
-                StringBuilder sb = new StringBuilder();
-                await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams))
-                {
-                    sb.Append(chunk);
+                    var inferenceParams = new InferenceParams()
+                    {
+                        MaxTokens = GetIntOmniSetting("InferenceParameterMaxTokens", 1024).GetAwaiter().GetResult(),
+                        //AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
+                        SamplingPipeline = new DefaultSamplingPipeline
+                        {
+                            Temperature = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTemperature", "0.6").GetAwaiter().GetResult()),
+                            TopK = GetIntOmniSetting("InferenceParameterTopK", 40).GetAwaiter().GetResult(),
+                            TopP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTopP", "0.95").GetAwaiter().GetResult()),
+                            MinP = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterMinimumP", "0.05").GetAwaiter().GetResult()),
+                            RepeatPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterRepeatPenalty", "1.1").GetAwaiter().GetResult()),
+                            PresencePenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterPresencePenalty", "1.5").GetAwaiter().GetResult()),
+                            FrequencyPenalty = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterFrequencyPenalty", "0.5").GetAwaiter().GetResult()),
+                        }
+                    };
+
+                    var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
+                    StringBuilder sb = new StringBuilder();
+                    await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams))
+                    {
+                        sb.Append(chunk);
+
+                    }
+                    string raw = sb.ToString();
+
+                    // Strip Qwen special tokens
+                    raw = raw.Replace("<|im_start|>", "")
+                             .Replace("<|im_end|>", "")
+                             .Replace("<|endoftext|>", "");
+
+                    // Strip echoed prompt/executor prefix
+                    int assistantIdx = raw.LastIndexOf("Assistant:", StringComparison.OrdinalIgnoreCase);
+                    if (assistantIdx >= 0)
+                    {
+                        raw = raw.Substring(assistantIdx + "Assistant:".Length);
+                    }
+
+                    // Strip Qwen thinking tags block
+                    int thinkStart = raw.IndexOf("<think>", StringComparison.OrdinalIgnoreCase);
+                    int thinkEnd = raw.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+                    if (thinkStart >= 0 && thinkEnd >= 0)
+                    {
+                        raw = raw.Substring(thinkEnd + "</think>".Length);
+                    }
+
+                    // Strip stray trailing code fences
+                    raw = raw.TrimEnd('`').Trim();
+
+                    string outStr = raw.Trim();
+                    if (string.IsNullOrWhiteSpace(outStr))
+                    {
+                        outStr = "[No response. Error?]";
+                    }
+
+                    var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
+                    session.messages.Add(assistantMsg);
+                    session.lastUpdated = DateTime.UtcNow;
+
+                    resp.Response = outStr;
+                    resp.SessionId = sessionId;
+                    resp.Conversation = session.messages;
+                    resp.Success = true;
+                    try { await ServiceLog($"Local model returned response for session {sessionId}"); } catch { }
+                    return resp;
                 }
-                string outStr = SanitizeLocalModelOutput(sb.ToString());
-                if (string.IsNullOrWhiteSpace(outStr))
+                finally
                 {
-                    outStr = "[No response. Error?]";
+                    session.sessionLock.Release();
                 }
-
-                var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
-                session.messages.Add(assistantMsg);
-                session.lastUpdated = DateTime.UtcNow;
-
-                resp.Response = outStr;
-                resp.SessionId = sessionId;
-                resp.Conversation = session.messages;
-                resp.Success = true;
-                try { await ServiceLog($"Local model returned response for session {sessionId}"); } catch { }
-                return resp;
             }
             catch (TargetInvocationException tie)
             {
-                var err = tie.InnerException?.Message ?? tie.Message;
-                await ServiceLogError(tie, "Error invoking local model");
-                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = err };
+                string fullError = $"{tie.GetType().Name}: {tie.Message} | Inner: {tie.InnerException?.GetType().Name}: {tie.InnerException?.Message} | Stack: {tie.StackTrace}";
+                await ServiceLogError(tie, fullError);
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "Local model query failed");
-                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = ex.Message };
+                string fullError = $"{ex.GetType().Name}: {ex.Message} | Inner: {ex.InnerException?.GetType().Name}: {ex.InnerException?.Message} | Stack: {ex.StackTrace}";
+                await ServiceLogError(ex, fullError);
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
             }
         }
 
@@ -430,7 +463,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             } while (removedPrefix);
 
             // Cut off trailing role markers that indicate the model started the next turn
-            string[] stopMarkers = ["\nUser:", "\nSystem:", "\nAssistant:", "User:", "System:"];
+            string[] stopMarkers = ["\nUser:", "\nSystem:", "\nAssistant:"];
             int cutIndex = -1;
             foreach (var marker in stopMarkers)
             {
@@ -463,14 +496,19 @@ namespace Omnipotent.Services.KliveLocalLLM
             public DateTime lastUpdated;
             public ChatHistory chatHistory;
             public ChatSession chatSession;
+            public LLamaContext context;
+            public InteractiveExecutor executor;
+            public readonly System.Threading.SemaphoreSlim sessionLock = new System.Threading.SemaphoreSlim(1, 1);
 
-            public KliveLLMSession(KliveLLM parentService, InteractiveExecutor executor)
+            public KliveLLMSession(KliveLLM parentService, LLamaWeights modelWeights, ModelParams modelParams)
             {
                 this.parentService = parentService;
                 this.lastUpdated = DateTime.UtcNow;
+                context = modelWeights.CreateContext(modelParams);
+                executor = new InteractiveExecutor(context);
                 chatHistory = new ChatHistory();
                 // Seed system prompt - can be customized
-                chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant.");
+                chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant. /no_think");
                 chatSession = new ChatSession(executor, chatHistory);
             }
         }
