@@ -55,6 +55,20 @@ namespace Omnipotent.Services.KliveChat
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
 
+            // GET /klivechat/me returns the current user's profile details
+            await CreateAPIRoute("/klivechat/me", async (req) =>
+            {
+                if (req.user != null)
+                {
+                    var response = new { name = req.user.Name, rank = (int)req.user.KlivesManagementRank };
+                    await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+                }
+                else
+                {
+                    await req.ReturnResponse("{}", "application/json", null!, System.Net.HttpStatusCode.Unauthorized);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
+
             // POST /klivechat/create requires Guest or above as per prompt
             await CreateAPIRoute("/klivechat/create", async (req) =>
             {
