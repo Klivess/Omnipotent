@@ -68,6 +68,48 @@ namespace Omnipotent.Services.KliveChat
                 await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
             }, HttpMethod.Post, KMPermissions.Guest);
 
+            // POST /klivechat/delete requires Guest or above
+            await CreateAPIRoute("/klivechat/delete", async (req) =>
+            {
+                string? roomId = req.userParameters["id"];
+                if (string.IsNullOrEmpty(roomId))
+                {
+                    await req.ReturnResponse("Missing room ID", "text/plain", null!, System.Net.HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                if (ActiveRooms.TryGetValue(roomId, out var room))
+                {
+                    // Allow deletion if the user is the creator or an Admin/Owner
+                    if (room.CreatedBy == req.user?.Name || req.user?.KlivesManagementRank >= KMPermissions.Admin)
+                    {
+                        ActiveRooms.TryRemove(roomId, out _);
+                        _ = ServiceLog($"Room {roomId} deleted by {req.user?.Name}");
+                        
+                        // Close all connected clients in the room before deleting
+                        foreach (var client in room.Users.Values)
+                        {
+                            if (client.Socket.State == WebSocketState.Open)
+                            {
+                                await client.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Room deleted", CancellationToken.None);
+                            }
+                        }
+
+                        // Also notify frontend
+                        var response = new { success = true, roomId = roomId };
+                        await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+                    }
+                    else
+                    {
+                        await req.ReturnResponse("Unauthorized to delete this room", "text/plain", null!, System.Net.HttpStatusCode.Unauthorized);
+                    }
+                }
+                else
+                {
+                    await req.ReturnResponse("Room not found", "text/plain", null!, System.Net.HttpStatusCode.NotFound);
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
             // WebSocket route for connections
             await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivechat/ws", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
             {
