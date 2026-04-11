@@ -27,51 +27,51 @@ namespace Omnipotent.Services.KliveChat
         protected override async void ServiceMain()
         {
             // GET /klivechat/rooms to list basic details or get by id
-            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/rooms", (Func<KliveAPI.KliveAPI.UserRequest, Task>)(async (req) =>
+            await CreateAPIRoute("/klivechat/rooms", async (req) =>
             {
                 var id = req.userParameters["id"];
-                    if (!string.IsNullOrEmpty(id))
+                if (!string.IsNullOrEmpty(id))
+                {
+                    if (ActiveRooms.TryGetValue(id, out var specificRoom))
                     {
-                        if (ActiveRooms.TryGetValue(id, out var specificRoom))
-                        {
-                            var response = new 
-                            { 
-                                roomId = specificRoom.Id, 
-                                name = specificRoom.Name, 
-                                createdBy = specificRoom.CreatedBy, 
-                                userCount = specificRoom.Users.Count 
-                            };
-                            await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
-                        }
-                        else
-                        {
-                            await req.ReturnResponse("Room not found", "text/plain", null, System.Net.HttpStatusCode.NotFound);
-                        }
+                        var response = new 
+                        { 
+                            roomId = specificRoom.Id, 
+                            name = specificRoom.Name, 
+                            createdBy = specificRoom.CreatedBy, 
+                            userCount = specificRoom.Users.Count 
+                        };
+                        await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
                     }
                     else
                     {
-                        var rooms = ActiveRooms.Values.Select(r => new { roomId = r.Id, name = r.Name, createdBy = r.CreatedBy, userCount = r.Users.Count }).ToList();
-                        await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
+                        await req.ReturnResponse("Room not found", "text/plain", null!, System.Net.HttpStatusCode.NotFound);
                     }
-            }), KMPermissions.Anybody);
+                }
+                else
+                {
+                    var rooms = ActiveRooms.Values.Select(r => new { roomId = r.Id, name = r.Name, createdBy = r.CreatedBy, userCount = r.Users.Count }).ToList();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
 
             // POST /klivechat/create requires Guest or above as per prompt
-            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/create", (Func<KliveAPI.KliveAPI.UserRequest, Task>)(async (req) =>
+            await CreateAPIRoute("/klivechat/create", async (req) =>
             {
-                    string roomId = Guid.NewGuid().ToString().Substring(0, 8); // Short ID for shareability
-                    string roomName = req.userParameters["name"] ?? "KliveChat Room";
-                    var room = new KliveChatRoom(roomId, roomName, req.user?.Name ?? "Guest");
-                    ActiveRooms.TryAdd(roomId, room);
+                string roomId = Guid.NewGuid().ToString().Substring(0, 8); // Short ID for shareability
+                string roomName = req.userParameters["name"] ?? "KliveChat Room";
+                var room = new KliveChatRoom(roomId, roomName, req.user?.Name ?? "Guest");
+                ActiveRooms.TryAdd(roomId, room);
 
-                    _ = ServiceLog($"Created new room {roomId} by {room.CreatedBy}");
-                    var response = new { roomId = roomId, name = roomName, createdBy = room.CreatedBy };
-                    await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
-            }), KMPermissions.Guest);
+                _ = ServiceLog($"Created new room {roomId} by {room.CreatedBy}");
+                var response = new { roomId = roomId, name = roomName, createdBy = room.CreatedBy };
+                await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+            }, HttpMethod.Post, KMPermissions.Guest);
 
             // WebSocket route for connections
             await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivechat/ws", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
             {
-                string roomId = queryParams["roomId"];
+                string? roomId = queryParams["roomId"];
                 if (string.IsNullOrEmpty(roomId) || !ActiveRooms.TryGetValue(roomId, out var room))
                 {
                     await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Invalid Room ID", CancellationToken.None);
