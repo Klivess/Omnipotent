@@ -325,8 +325,7 @@ namespace Omnipotent.Service_Manager
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(new { error = "Command cannot be empty" }),
                         "application/json",
-                        null,
-                        HttpStatusCode.BadRequest);
+                        code: HttpStatusCode.BadRequest);
                     return;
                 }
 
@@ -360,8 +359,7 @@ namespace Omnipotent.Service_Manager
                         message = "Command queued for execution"
                     }),
                     "application/json",
-                    null,
-                    HttpStatusCode.Accepted);
+                    code: HttpStatusCode.Accepted);
 
                 await ServiceLog($"Command queued by {req.user?.Name}: {command.Substring(0, Math.Min(100, command.Length))}");
             }
@@ -371,8 +369,7 @@ namespace Omnipotent.Service_Manager
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Failed to execute command", details = ex.Message }),
                     "application/json",
-                    null,
-                    HttpStatusCode.InternalServerError);
+                    code: HttpStatusCode.InternalServerError);
             }
         }
 
@@ -386,8 +383,7 @@ namespace Omnipotent.Service_Manager
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(new { error = "Command ID required" }),
                         "application/json",
-                        null,
-                        HttpStatusCode.BadRequest);
+                        code: HttpStatusCode.BadRequest);
                     return;
                 }
 
@@ -402,8 +398,7 @@ namespace Omnipotent.Service_Manager
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(new { error = "Command not found" }),
                         "application/json",
-                        null,
-                        HttpStatusCode.NotFound);
+                        code: HttpStatusCode.NotFound);
                     return;
                 }
 
@@ -428,8 +423,7 @@ namespace Omnipotent.Service_Manager
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Failed to retrieve status", details = ex.Message }),
                     "application/json",
-                    null,
-                    HttpStatusCode.InternalServerError);
+                    code: HttpStatusCode.InternalServerError);
             }
         }
 
@@ -467,8 +461,7 @@ namespace Omnipotent.Service_Manager
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Failed to retrieve history", details = ex.Message }),
                     "application/json",
-                    null,
-                    HttpStatusCode.InternalServerError);
+                    code: HttpStatusCode.InternalServerError);
             }
         }
 
@@ -492,8 +485,7 @@ namespace Omnipotent.Service_Manager
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Failed to clear history", details = ex.Message }),
                     "application/json",
-                    null,
-                    HttpStatusCode.InternalServerError);
+                    code: HttpStatusCode.InternalServerError);
             }
         }
 
