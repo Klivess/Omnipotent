@@ -27,11 +27,9 @@ namespace Omnipotent.Services.KliveChat
         protected override async void ServiceMain()
         {
             // GET /klivechat/rooms to list basic details or get by id
-            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/rooms", (Func<KliveAPI.UserRequest, Task>)(async (req) =>
+            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/rooms", (Func<KliveAPI.KliveAPI.UserRequest, Task>)(async (req) =>
             {
-                if (req.method == System.Net.Http.HttpMethod.Get)
-                {
-                    var id = req.userParameters["id"];
+                var id = req.userParameters["id"];
                     if (!string.IsNullOrEmpty(id))
                     {
                         if (ActiveRooms.TryGetValue(id, out var specificRoom))
@@ -55,23 +53,19 @@ namespace Omnipotent.Services.KliveChat
                         var rooms = ActiveRooms.Values.Select(r => new { roomId = r.Id, name = r.Name, createdBy = r.CreatedBy, userCount = r.Users.Count }).ToList();
                         await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
                     }
-                }
             }), KMPermissions.Anybody);
 
             // POST /klivechat/create requires Guest or above as per prompt
-            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/create", (Func<KliveAPI.UserRequest, Task>)(async (req) =>
+            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateAPIRoute", "/klivechat/create", (Func<KliveAPI.KliveAPI.UserRequest, Task>)(async (req) =>
             {
-                if (req.method == System.Net.Http.HttpMethod.Post)
-                {
                     string roomId = Guid.NewGuid().ToString().Substring(0, 8); // Short ID for shareability
                     string roomName = req.userParameters["name"] ?? "KliveChat Room";
                     var room = new KliveChatRoom(roomId, roomName, req.user?.Name ?? "Guest");
                     ActiveRooms.TryAdd(roomId, room);
 
-                    ServiceLog($"Created new room {roomId} by {room.CreatedBy}");
+                    _ = ServiceLog($"Created new room {roomId} by {room.CreatedBy}");
                     var response = new { roomId = roomId, name = roomName, createdBy = room.CreatedBy };
                     await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
-                }
             }), KMPermissions.Guest);
 
             // WebSocket route for connections
@@ -95,7 +89,7 @@ namespace Omnipotent.Services.KliveChat
                 await room.AddClient(client, this);
             }), KMPermissions.Anybody);
 
-            ServiceLog("KliveChatService started. Listening on /klivechat/ endpoints.");
+            _ = ServiceLog("KliveChatService started. Listening on /klivechat/ endpoints.");
         }
     }
 }
