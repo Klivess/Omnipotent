@@ -400,7 +400,7 @@ namespace Omnipotent.Services.OmniTrader
 
         public async Task<Dictionary<string, OmniBacktestResult>> GetAllPersistedStrategySnapshots()
         {
-            await EnsureHistoryDirectoryExists();
+            EnsureHistoryDirectoryExists();
 
             var output = new Dictionary<string, OmniBacktestResult>(StringComparer.OrdinalIgnoreCase);
             foreach (var key in historyByStrategyKey.Keys)

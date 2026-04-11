@@ -3,6 +3,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Data;
+using Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -27,12 +28,33 @@ namespace Omnipotent.Services.OmniTrader
             threadAnteriority = ThreadAnteriority.Critical;
         }
 
-        protected override void ServiceMain()
+        protected override async void ServiceMain()
         {
             data = new OmniTraderFinanceData(this);
             simulator = new OmniTraderSimulator(this);
 
             _ = InitialiseRoutesAndAutoRedeploy();
+
+
+            FlowSignalTraderStrategy engine = new();
+            await engine.Initialise(this);
+            var guid = await simulator.Deploy(engine, "BTCUSDT", OmniTraderFinanceData.TimeInterval.OneMinute);
+            while (true)
+            {
+                var strategy = await simulator.GetPersistedStrategySnapshot("FlowSignalTraderStrategy");
+
+                if (strategy is not null)
+                {
+                    await ServiceLog(
+                        $"[FlowSignalTraderStrategy] FinalEquity={strategy.FinalEquity}, " +
+                        $"Trades={strategy.TotalTrades}, " +
+                        $"PnL%={strategy.TotalPnLPercent}, " +
+                        $"WinRate={strategy.WinRate}, " +
+                        $"Fees={strategy.TotalFeesPaid}");
+                }
+
+                await Task.Delay(1000);
+            }
         }
 
         private async Task InitialiseRoutesAndAutoRedeploy()
@@ -48,7 +70,7 @@ namespace Omnipotent.Services.OmniTrader
             }
         }
 
-        public async Task<Guid> DeployStrategy(
+        public async Task<Guid> StartStrategyDeployment(
             OmniTraderStrategy strategy,
             string symbol,
             OmniTraderFinanceData.TimeInterval interval,
@@ -63,7 +85,7 @@ namespace Omnipotent.Services.OmniTrader
             return deploymentId;
         }
 
-        public async Task<bool> UndeployStrategy(Guid deploymentId)
+        public async Task<bool> StopStrategyDeployment(Guid deploymentId)
         {
             bool removed = await simulator.Undeploy(deploymentId);
             if (removed)
@@ -76,7 +98,7 @@ namespace Omnipotent.Services.OmniTrader
             return removed;
         }
 
-        public Task UndeployAllStrategies()
+        public Task StopAllStrategyDeployments()
         {
             lock (deploymentStrategyNames)
             {
@@ -85,17 +107,17 @@ namespace Omnipotent.Services.OmniTrader
             return simulator.UndeployAll();
         }
 
-        public IReadOnlyCollection<Guid> GetDeployedStrategyIds()
+        public IReadOnlyCollection<Guid> GetActiveDeploymentIds()
         {
             return simulator.GetDeploymentIds();
         }
 
-        public OmniBacktestResult GetStrategyAnalytics(Guid deploymentId)
+        public OmniBacktestResult GetAnalyticsForDeployment(Guid deploymentId)
         {
             return simulator.GetSnapshot(deploymentId);
         }
 
-        public Dictionary<Guid, OmniBacktestResult> GetAllStrategyAnalytics()
+        public Dictionary<Guid, OmniBacktestResult> GetAnalyticsForAllDeployments()
         {
             return simulator.GetAllSnapshots();
         }
@@ -130,7 +152,7 @@ namespace Omnipotent.Services.OmniTrader
                 try
                 {
                     OmniTraderStrategy strategy = CreateStrategyInstance(registration.StrategyName);
-                    await DeployStrategy(strategy, registration.Symbol, registration.Interval, registration.Settings);
+                    await StartStrategyDeployment(strategy, registration.Symbol, registration.Interval, registration.Settings);
                     await ServiceLog($"Auto-redeployed strategy '{registration.StrategyName}' on {registration.Symbol} {registration.Interval}.");
                 }
                 catch (Exception ex)
@@ -173,20 +195,20 @@ namespace Omnipotent.Services.OmniTrader
         private async Task CreateRoutes()
         {
 
-            await CreateAPIRoute("/omniTrader/status", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/status", async (req) =>
             {
                 var summary = new
                 {
                     Service = "OmniTrader",
-                    DeployedCount = GetDeployedStrategyIds().Count,
-                    ActiveDeploymentIds = GetDeployedStrategyIds(),
+                    DeployedCount = GetActiveDeploymentIds().Count,
+                    ActiveDeploymentIds = GetActiveDeploymentIds(),
                     Uptime = GetServiceUptime().ToString(),
                     ManagerUptime = GetManagerUptime().ToString()
                 };
                 await req.ReturnResponse(JsonConvert.SerializeObject(summary));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/strategies/available", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/strategies", async (req) =>
             {
                 var map = GetStrategyTypeMap();
                 var available = map
@@ -208,7 +230,7 @@ namespace Omnipotent.Services.OmniTrader
                 await req.ReturnResponse(JsonConvert.SerializeObject(available));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/strategies/deployed", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/simulator/deployments", async (req) =>
             {
                 var analytics = GetAllStrategyAnalyticsSummary();
                 var deployed = analytics.Select(k => new
@@ -225,7 +247,7 @@ namespace Omnipotent.Services.OmniTrader
                 await req.ReturnResponse(JsonConvert.SerializeObject(deployed));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/simulator/active-persistent", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/simulator/active", async (req) =>
             {
                 try
                 {
@@ -248,7 +270,7 @@ namespace Omnipotent.Services.OmniTrader
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/analytics/live/all", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/analytics/live", async (req) =>
             {
                 try
                 {
@@ -278,7 +300,7 @@ namespace Omnipotent.Services.OmniTrader
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/analytics/live/byDeployment", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/analytics/live/deployment", async (req) =>
             {
                 if (!Guid.TryParse(req.userParameters.Get("deploymentId"), out var deploymentId))
                 {
@@ -286,17 +308,17 @@ namespace Omnipotent.Services.OmniTrader
                     return;
                 }
 
-                var result = GetStrategyAnalytics(deploymentId);
+                var result = GetAnalyticsForDeployment(deploymentId);
                 await req.ReturnResponse(JsonConvert.SerializeObject(result));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/analytics/persisted/all", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/analytics/persisted", async (req) =>
             {
                 var analytics = await GetAllPersistedStrategyAnalytics();
                 await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/analytics/persisted/byStrategy", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/analytics/persisted/strategy", async (req) =>
             {
                 try
                 {
@@ -308,16 +330,8 @@ namespace Omnipotent.Services.OmniTrader
                     }
 
                     bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
-                    var analyticsTask = simulator.GetPersistedStrategySnapshot(strategyName, includeTrades);
-                    var analytics = await analyticsTask.WaitAsync(TimeSpan.FromSeconds(3));
+                    var analytics = await simulator.GetPersistedStrategySnapshot(strategyName, includeTrades);
                     await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
-                }
-                catch (TimeoutException)
-                {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Error = "Timed out while building persisted strategy analytics. Try includeTrades=false or retry."
-                    }), code: HttpStatusCode.RequestTimeout);
                 }
                 catch (Exception ex)
                 {
@@ -329,7 +343,7 @@ namespace Omnipotent.Services.OmniTrader
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/analytics/strategyInsight", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/analytics/insight", async (req) =>
             {
                 try
                 {
@@ -341,16 +355,8 @@ namespace Omnipotent.Services.OmniTrader
                     }
 
                     bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
-                    var insightTask = simulator.GetStrategyInsight(strategyName, includeTrades);
-                    var insight = await insightTask.WaitAsync(TimeSpan.FromSeconds(3));
+                    var insight = await simulator.GetStrategyInsight(strategyName, includeTrades);
                     await req.ReturnResponse(JsonConvert.SerializeObject(insight));
-                }
-                catch (TimeoutException)
-                {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Error = "Timed out while building strategy insight. Try includeTrades=false or retry."
-                    }), code: HttpStatusCode.RequestTimeout);
                 }
                 catch (Exception ex)
                 {
@@ -362,7 +368,7 @@ namespace Omnipotent.Services.OmniTrader
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/backtest/run", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/backtest", async (req) =>
             {
                 string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
                 if (string.IsNullOrWhiteSpace(strategyName))
@@ -399,7 +405,7 @@ namespace Omnipotent.Services.OmniTrader
                 }));
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Guest);
 
-            await CreateAPIRoute("/omniTrader/simulator/deploy", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/simulator/deploy", async (req) =>
             {
                 string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
                 if (string.IsNullOrWhiteSpace(strategyName))
@@ -420,7 +426,7 @@ namespace Omnipotent.Services.OmniTrader
                 };
 
                 OmniTraderStrategy strategy = CreateStrategyInstance(strategyName);
-                Guid deploymentId = await DeployStrategy(strategy, symbol, interval, settings);
+                Guid deploymentId = await StartStrategyDeployment(strategy, symbol, interval, settings);
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
@@ -432,7 +438,7 @@ namespace Omnipotent.Services.OmniTrader
                 }));
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
-            await CreateAPIRoute("/omniTrader/simulator/undeploy", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/simulator/undeploy", async (req) =>
             {
                 if (!Guid.TryParse(req.userParameters.Get("deploymentId"), out var deploymentId))
                 {
@@ -440,7 +446,7 @@ namespace Omnipotent.Services.OmniTrader
                     return;
                 }
 
-                bool result = await UndeployStrategy(deploymentId);
+                bool result = await StopStrategyDeployment(deploymentId);
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
                     Message = result ? "Strategy undeployed" : "Deployment not found",
@@ -449,9 +455,9 @@ namespace Omnipotent.Services.OmniTrader
                 }), code: result ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
-            await CreateAPIRoute("/omniTrader/simulator/undeployAll", async (req) =>
+            await CreateAPIRoute("/api/omnitrader/simulator/undeploy-all", async (req) =>
             {
-                await UndeployAllStrategies();
+                await StopAllStrategyDeployments();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
                     Message = "All strategies undeployed"
