@@ -239,61 +239,51 @@ namespace Omnipotent.Services.KliveLocalLLM
                         2,
                         80);
 
-                    var payloadMessages = new JArray
-                    {
-                        new JObject
-                        {
-                            ["role"] = "system",
-                            ["content"] = "You are a helpful assistant. /no_think"
-                        }
-                    };
+                    int contextCharBudget = Math.Clamp(
+                        await GetIntOmniSetting("HuggingFaceChatContextCharBudget", 18000),
+                        2000,
+                        120000);
 
-                    foreach (var message in session.messages.TakeLast(contextMessagesToInclude))
-                    {
-                        if (string.IsNullOrWhiteSpace(message?.content))
-                        {
-                            continue;
-                        }
+                    var selectedMessages = SelectMessagesForOnlineContext(
+                        session.messages,
+                        contextMessagesToInclude,
+                        contextCharBudget);
 
-                        payloadMessages.Add(new JObject
-                        {
-                            ["role"] = NormalizeChatRole(message.role),
-                            ["content"] = message.content
-                        });
+                    var primaryRequestBody = BuildHuggingFaceChatCompletionBody(selectedMessages, maxTokensOverride);
+                    var primaryAttempt = await SendHuggingFaceChatCompletionAsync(primaryRequestBody);
+                    if (!primaryAttempt.RequestSucceeded)
+                    {
+                        RemoveLastUserMessageIfUnanswered(session, userMessage);
+                        resp.ErrorMessage = primaryAttempt.ErrorMessage;
+                        await ServiceLogError($"{resp.ErrorMessage} | {primaryAttempt.Diagnostic}");
+                        return resp;
                     }
 
-                var body = new JObject
-                {
-                    ["messages"] = payloadMessages,
-                    ["model"] = "openai/gpt-oss-120b:novita",
-                    ["stream"] = false
-                };
+                    var outStr = primaryAttempt.Output;
+                    if (string.IsNullOrWhiteSpace(outStr))
+                    {
+                        // If context gets too large/noisy, retry once with only current prompt.
+                        var retryRequestBody = BuildHuggingFaceChatCompletionBody(new List<KliveLLMMessage> { userMessage }, maxTokensOverride);
+                        var retryAttempt = await SendHuggingFaceChatCompletionAsync(retryRequestBody);
+                        if (!retryAttempt.RequestSucceeded)
+                        {
+                            RemoveLastUserMessageIfUnanswered(session, userMessage);
+                            resp.ErrorMessage = retryAttempt.ErrorMessage;
+                            await ServiceLogError($"{resp.ErrorMessage} | primary={primaryAttempt.Diagnostic} | retry={retryAttempt.Diagnostic}");
+                            return resp;
+                        }
 
-                if (maxTokensOverride.HasValue)
-                {
-                    body["max_tokens"] = Math.Clamp(maxTokensOverride.Value, 32, 4096);
-                }
+                        outStr = retryAttempt.Output;
+                        if (string.IsNullOrWhiteSpace(outStr))
+                        {
+                            RemoveLastUserMessageIfUnanswered(session, userMessage);
+                            resp.ErrorMessage = "HuggingFace router returned empty content.";
+                            await ServiceLogError($"{resp.ErrorMessage} | primary={primaryAttempt.Diagnostic} | retry={retryAttempt.Diagnostic}");
+                            return resp;
+                        }
 
-                using var httpcontent = new StringContent(body.ToString(Formatting.None), Encoding.UTF8);
-                httpcontent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-                var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", httpcontent);
-                var llmResp = await response.Content.ReadAsStringAsync();
-
-                if (!response.IsSuccessStatusCode)
-                {
-                    resp.ErrorMessage = $"HuggingFace router request failed ({(int)response.StatusCode}): {llmResp}";
-                    await ServiceLogError(resp.ErrorMessage);
-                    return resp;
-                }
-
-                var json = JObject.Parse(llmResp);
-                var rawText = ExtractChatCompletionContent(json["choices"]?[0]?["message"]?["content"]);
-                var outStr = SanitizeLocalModelOutput(rawText);
-                if (string.IsNullOrWhiteSpace(outStr))
-                {
-                    resp.ErrorMessage = "HuggingFace router returned empty content.";
-                    return resp;
-                }
+                        await ServiceLog($"HuggingFace empty-content retry succeeded for session {sessionId}. primary={primaryAttempt.Diagnostic}; retry={retryAttempt.Diagnostic}");
+                    }
 
                 session.messages.Add(new KliveLLMMessage() { role = "assistant", content = outStr });
                 session.lastUpdated = DateTime.UtcNow;
@@ -331,6 +321,148 @@ namespace Omnipotent.Services.KliveLocalLLM
             }
         }
 
+        private async Task<(bool RequestSucceeded, string Output, string ErrorMessage, string Diagnostic)> SendHuggingFaceChatCompletionAsync(JObject body)
+        {
+            using var httpcontent = new StringContent(body.ToString(Formatting.None), Encoding.UTF8);
+            httpcontent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            using var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", httpcontent);
+            var llmResp = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                return (
+                    false,
+                    string.Empty,
+                    $"HuggingFace router request failed ({(int)response.StatusCode}): {TruncateForLog(llmResp, 1200)}",
+                    $"status={(int)response.StatusCode};snippet={TruncateForLog(llmResp, 500)}");
+            }
+
+            JObject json;
+            try
+            {
+                json = JObject.Parse(llmResp);
+            }
+            catch (Exception ex)
+            {
+                return (
+                    false,
+                    string.Empty,
+                    $"HuggingFace router returned invalid JSON payload: {ex.Message}",
+                    $"invalid-json-snippet={TruncateForLog(llmResp, 800)}");
+            }
+
+            var rawText = ExtractChatCompletionContentFromResponse(json);
+            var outStr = SanitizeLocalModelOutput(rawText);
+            var finishReason = json["choices"]?[0]?["finish_reason"]?.ToString()
+                ?? json["finish_reason"]?.ToString()
+                ?? "unknown";
+            var diagnostic = $"finish_reason={finishReason};raw_chars={rawText.Length};sanitized_chars={outStr.Length};snippet={TruncateForLog(llmResp, 500)}";
+
+            return (true, outStr, string.Empty, diagnostic);
+        }
+
+        private static JObject BuildHuggingFaceChatCompletionBody(IEnumerable<KliveLLMMessage> messages, int? maxTokensOverride)
+        {
+            var payloadMessages = new JArray
+            {
+                new JObject
+                {
+                    ["role"] = "system",
+                    ["content"] = "You are a helpful assistant. /no_think"
+                }
+            };
+
+            foreach (var message in messages)
+            {
+                if (string.IsNullOrWhiteSpace(message?.content))
+                {
+                    continue;
+                }
+
+                payloadMessages.Add(new JObject
+                {
+                    ["role"] = NormalizeChatRole(message.role),
+                    ["content"] = message.content
+                });
+            }
+
+            var body = new JObject
+            {
+                ["messages"] = payloadMessages,
+                ["model"] = "openai/gpt-oss-120b:novita",
+                ["stream"] = false
+            };
+
+            if (maxTokensOverride.HasValue)
+            {
+                body["max_tokens"] = Math.Clamp(maxTokensOverride.Value, 32, 4096);
+            }
+
+            return body;
+        }
+
+        private static List<KliveLLMMessage> SelectMessagesForOnlineContext(
+            IReadOnlyList<KliveLLMMessage> messages,
+            int maxMessages,
+            int maxCharacters)
+        {
+            var selected = new List<KliveLLMMessage>();
+            var remaining = Math.Max(1000, maxCharacters);
+
+            for (int i = messages.Count - 1; i >= 0; i--)
+            {
+                var message = messages[i];
+                if (string.IsNullOrWhiteSpace(message?.content))
+                {
+                    continue;
+                }
+
+                var messageCost = message.content.Length + 16;
+                if (selected.Count > 0 && remaining - messageCost < 0)
+                {
+                    break;
+                }
+
+                selected.Add(message);
+                remaining -= messageCost;
+                if (selected.Count >= maxMessages)
+                {
+                    break;
+                }
+            }
+
+            selected.Reverse();
+            return selected;
+        }
+
+        private static void RemoveLastUserMessageIfUnanswered(KliveOnlineLLMSession session, KliveLLMMessage userMessage)
+        {
+            if (session.messages.Count == 0)
+            {
+                return;
+            }
+
+            if (ReferenceEquals(session.messages[^1], userMessage))
+            {
+                session.messages.RemoveAt(session.messages.Count - 1);
+            }
+        }
+
+        private static string TruncateForLog(string? value, int maxChars)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            if (value.Length <= maxChars)
+            {
+                return value;
+            }
+
+            return value.Substring(0, Math.Max(0, maxChars - 3)) + "...";
+        }
+
         private static string NormalizeChatRole(string? role)
         {
             if (string.IsNullOrWhiteSpace(role))
@@ -351,6 +483,58 @@ namespace Omnipotent.Services.KliveLocalLLM
             return "user";
         }
 
+        private static string ExtractChatCompletionContentFromResponse(JObject responseJson)
+        {
+            var firstChoice = responseJson["choices"]?.FirstOrDefault();
+            var contentCandidates = new List<JToken?>
+            {
+                firstChoice?["message"]?["content"],
+                firstChoice?["message"]?["refusal"],
+                firstChoice?["delta"]?["content"],
+                firstChoice?["text"],
+                responseJson["generated_text"],
+                responseJson["output_text"],
+                responseJson["completion"],
+                responseJson["response"],
+                responseJson["content"]
+            };
+
+            foreach (var candidate in contentCandidates)
+            {
+                var text = ExtractChatCompletionContent(candidate);
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    return text;
+                }
+            }
+
+            if (responseJson["output"] is JArray outputArray)
+            {
+                foreach (var outputItem in outputArray)
+                {
+                    var text = ExtractChatCompletionContent(outputItem?["content"] ?? outputItem?["message"] ?? outputItem?["text"]);
+                    if (!string.IsNullOrWhiteSpace(text))
+                    {
+                        return text;
+                    }
+                }
+            }
+
+            if (firstChoice?["message"]?["tool_calls"] is JArray toolCalls)
+            {
+                foreach (var toolCall in toolCalls.OfType<JObject>())
+                {
+                    var arguments = toolCall["function"]?["arguments"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(arguments))
+                    {
+                        return arguments;
+                    }
+                }
+            }
+
+            return string.Empty;
+        }
+
         private static string ExtractChatCompletionContent(JToken? contentToken)
         {
             if (contentToken == null)
@@ -366,8 +550,25 @@ namespace Omnipotent.Services.KliveLocalLLM
             if (contentToken.Type == JTokenType.Array)
             {
                 var parts = contentToken
-                    .Children<JObject>()
-                    .Select(token => token["text"]?.ToString() ?? token["content"]?.ToString() ?? string.Empty)
+                    .Children()
+                    .Select(token =>
+                    {
+                        if (token.Type == JTokenType.String)
+                        {
+                            return token.ToString();
+                        }
+
+                        if (token.Type == JTokenType.Object)
+                        {
+                            return token["text"]?.ToString()
+                                ?? token["content"]?.ToString()
+                                ?? token["value"]?.ToString()
+                                ?? token["arguments"]?.ToString()
+                                ?? string.Empty;
+                        }
+
+                        return token.ToString();
+                    })
                     .Where(text => !string.IsNullOrWhiteSpace(text));
 
                 return string.Join("\n", parts);
@@ -375,9 +576,35 @@ namespace Omnipotent.Services.KliveLocalLLM
 
             if (contentToken.Type == JTokenType.Object)
             {
-                return contentToken["text"]?.ToString()
-                    ?? contentToken["content"]?.ToString()
-                    ?? string.Empty;
+                var direct = contentToken["text"]?.ToString()
+                    ?? contentToken["value"]?.ToString()
+                    ?? contentToken["arguments"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(direct))
+                {
+                    return direct;
+                }
+
+                var nestedContent = contentToken["content"];
+                if (nestedContent != null)
+                {
+                    var nested = ExtractChatCompletionContent(nestedContent);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                    {
+                        return nested;
+                    }
+                }
+
+                var nestedMessage = contentToken["message"];
+                if (nestedMessage != null)
+                {
+                    var nested = ExtractChatCompletionContent(nestedMessage);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                    {
+                        return nested;
+                    }
+                }
+
+                return string.Empty;
             }
 
             return contentToken.ToString();
