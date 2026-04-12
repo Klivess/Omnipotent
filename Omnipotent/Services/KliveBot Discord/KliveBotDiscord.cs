@@ -140,7 +140,12 @@ namespace Omnipotent.Services.KliveBot_Discord
                         {
                             string sessionId = GetLlmSessionIdForChat(args);
                             Stopwatch stopwatch = Stopwatch.StartNew();
-                            var llmResponse = await llmService.QueryLocalLLMAsync(args.Message.Content, sessionId);
+                            var llmResponse = await llmService.QueryLLM(
+                                args.Message.Content,
+                                sessionId,
+                                maxTokensOverride: 220,
+                                resetSessionBeforeQuery: false,
+                                resetSessionAfterQuery: false);
                             stopwatch.Stop();
                             await args.Message.RespondAsync(llmResponse.Response + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
                         }

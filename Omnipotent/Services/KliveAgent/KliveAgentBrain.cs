@@ -10,7 +10,10 @@ namespace Omnipotent.Services.KliveAgent
     {
         private readonly KliveAgent _agent;
         private const int MaxActionsPerDecision = 3;
-        private static readonly TimeSpan LlmDecisionTimeout = TimeSpan.FromSeconds(65);
+        private static readonly TimeSpan ManualDecisionTimeout = TimeSpan.FromSeconds(120);
+        private static readonly TimeSpan LiveEventDecisionTimeout = TimeSpan.FromSeconds(150);
+        private const int ManualDecisionMaxTokens = 220;
+        private const int LiveEventDecisionMaxTokens = 280;
 
         public KliveAgentBrain(KliveAgent agent)
         {
@@ -39,6 +42,11 @@ namespace Omnipotent.Services.KliveAgent
                     Summary = "Goal was empty.",
                     FinalResponse = "No goal was provided for KliveAgent to execute."
                 };
+            }
+
+            if (IsSimpleGreeting(goal) && string.IsNullOrWhiteSpace(request.Context))
+            {
+                return BuildGreetingFastPathResult(missionType, profileScope, goal);
             }
 
             var memoryHits = _agent.SearchMemory(goal, 8);
@@ -70,7 +78,10 @@ namespace Omnipotent.Services.KliveAgent
             var profileScope = "autonomous-event-loop";
             var llmSessionId = BuildLlmSessionId(missionType, profileScope, "autonomy");
             var memoryQuery = $"{observed.ServiceName} {observed.Message} {observed.ExceptionType} {observed.ExceptionMessage}";
-            var memoryHits = _agent.SearchMemory(memoryQuery, 8);
+            var memoryHits = _agent.SearchMemory(memoryQuery, 8)
+                .OrderByDescending(hit => MemoryAppearsRelevantForService(hit.Memory, observed.ServiceName))
+                .ThenByDescending(hit => hit.Score)
+                .ToList();
             var memoryEntries = BuildMemoryEntries(memoryHits, 6);
             var eventEntries = BuildEventEntries(recentEvents, 12);
             var matchedRuleEntries = matchingRules.Take(8)
@@ -118,15 +129,22 @@ namespace Omnipotent.Services.KliveAgent
                     return BuildFallbackResult(result, "KliveLLM service is unavailable.", observed);
                 }
 
-                var llmTask = llm.QueryLocalLLMAsync(prompt, llmSessionId);
-                var timeoutTask = Task.Delay(LlmDecisionTimeout, cancellationToken);
+                var timeout = missionType == "live-event" ? LiveEventDecisionTimeout : ManualDecisionTimeout;
+                var maxTokens = missionType == "live-event" ? LiveEventDecisionMaxTokens : ManualDecisionMaxTokens;
+                var llmTask = llm.QueryLLM(
+                    prompt,
+                    llmSessionId,
+                    maxTokensOverride: maxTokens,
+                    resetSessionBeforeQuery: true,
+                    resetSessionAfterQuery: true);
+                var timeoutTask = Task.Delay(timeout, cancellationToken);
                 var completedTask = await Task.WhenAny(llmTask, timeoutTask);
                 if (!ReferenceEquals(completedTask, llmTask))
                 {
                     llm.ResetSession(llmSessionId);
                     return BuildFallbackResult(
                         result,
-                        $"KliveLLM timed out after {(int)LlmDecisionTimeout.TotalSeconds} seconds.",
+                        $"KliveLLM timed out after {(int)timeout.TotalSeconds} seconds.",
                         observed);
                 }
 
@@ -295,6 +313,8 @@ namespace Omnipotent.Services.KliveAgent
             var sb = new StringBuilder();
             sb.AppendLine("You are KliveAgent, a Jarvis-like autonomous operator for Omnipotent.");
             sb.AppendLine("Decide the best next actions to achieve the goal. Scripts are OPTIONAL and should only be used when direct actions are insufficient.");
+            sb.AppendLine("Never output chain-of-thought or analysis prose.");
+            sb.AppendLine("Return exactly one JSON object and nothing else.");
             sb.AppendLine();
             sb.AppendLine("Allowed action types:");
             sb.AppendLine("- notify_klives: send a message to Klives.");
@@ -318,15 +338,15 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             sb.AppendLine("Relevant memories:");
-            foreach (var hit in memoryHits.Take(6))
+            foreach (var hit in memoryHits.Take(4))
             {
-                sb.AppendLine($"- [{hit.Memory.Type}] {hit.Memory.Title} :: {hit.Memory.Content}");
+                sb.AppendLine($"- [{hit.Memory.Type}] {LimitForPrompt(hit.Memory.Title, 80)} :: {LimitForPrompt(hit.Memory.Content, 220)}");
             }
 
             sb.AppendLine("Recent system events:");
-            foreach (var ev in recentEvents.TakeLast(10))
+            foreach (var ev in recentEvents.TakeLast(6))
             {
-                sb.AppendLine($"- {ev.OccurredAtUtc:O} | {ev.ServiceName} | {ev.LogType} | {ev.Message}");
+                sb.AppendLine($"- {ev.OccurredAtUtc:O} | {LimitForPrompt(ev.ServiceName, 48)} | {ev.LogType} | {LimitForPrompt(ev.Message, 180)}");
             }
 
             return sb.ToString();
@@ -341,6 +361,8 @@ namespace Omnipotent.Services.KliveAgent
             var sb = new StringBuilder();
             sb.AppendLine("You are KliveAgent, a Jarvis-like autonomous operator watching live Omnipotent events.");
             sb.AppendLine("Decide if this event requires action. Scripts are OPTIONAL; use them only when needed to complete a concrete task.");
+            sb.AppendLine("Never output chain-of-thought or analysis prose.");
+            sb.AppendLine("Return exactly one JSON object and nothing else.");
             sb.AppendLine();
             sb.AppendLine("Allowed action types:");
             sb.AppendLine("- notify_klives");
@@ -351,12 +373,12 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine();
             sb.AppendLine("Observed event:");
             sb.AppendLine($"- Time: {observed.OccurredAtUtc:O}");
-            sb.AppendLine($"- Service: {observed.ServiceName}");
+            sb.AppendLine($"- Service: {LimitForPrompt(observed.ServiceName, 60)}");
             sb.AppendLine($"- Type: {observed.LogType}");
-            sb.AppendLine($"- Message: {observed.Message}");
+            sb.AppendLine($"- Message: {LimitForPrompt(observed.Message, 240)}");
             if (!string.IsNullOrWhiteSpace(observed.ExceptionType) || !string.IsNullOrWhiteSpace(observed.ExceptionMessage))
             {
-                sb.AppendLine($"- Exception: {observed.ExceptionType} :: {observed.ExceptionMessage}");
+                sb.AppendLine($"- Exception: {LimitForPrompt(observed.ExceptionType, 80)} :: {LimitForPrompt(observed.ExceptionMessage, 220)}");
             }
 
             sb.AppendLine("Matching policy rules:");
@@ -366,15 +388,28 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             sb.AppendLine("Relevant memories:");
-            foreach (var hit in memoryHits.Take(6))
+            foreach (var hit in memoryHits.Take(4))
             {
-                sb.AppendLine($"- [{hit.Memory.Type}] {hit.Memory.Title} :: {hit.Memory.Content}");
+                sb.AppendLine($"- [{hit.Memory.Type}] {LimitForPrompt(hit.Memory.Title, 80)} :: {LimitForPrompt(hit.Memory.Content, 220)}");
             }
 
             sb.AppendLine("Recent events around this incident:");
-            foreach (var ev in recentEvents.TakeLast(12))
+            var focusedEvents = recentEvents
+                .Where(ev =>
+                    ev.LogType >= OmniLogging.LogType.Error ||
+                    ev.ServiceName.Contains(observed.ServiceName, StringComparison.OrdinalIgnoreCase) ||
+                    observed.ServiceName.Contains(ev.ServiceName, StringComparison.OrdinalIgnoreCase))
+                .TakeLast(6)
+                .ToList();
+
+            if (focusedEvents.Count == 0)
             {
-                sb.AppendLine($"- {ev.OccurredAtUtc:O} | {ev.ServiceName} | {ev.LogType} | {ev.Message}");
+                focusedEvents = recentEvents.TakeLast(4).ToList();
+            }
+
+            foreach (var ev in focusedEvents)
+            {
+                sb.AppendLine($"- {ev.OccurredAtUtc:O} | {LimitForPrompt(ev.ServiceName, 48)} | {ev.LogType} | {LimitForPrompt(ev.Message, 180)}");
             }
 
             return sb.ToString();
@@ -402,11 +437,14 @@ namespace Omnipotent.Services.KliveAgent
 
             if (observed != null && observed.LogType == OmniLogging.LogType.Error)
             {
+                var alertReason = reason.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+                    ? "KliveLLM busy; using rule-based escalation"
+                    : reason;
                 seed.Decision.Actions.Add(new KliveAgentBrainAction
                 {
                     ActionType = "notify_klives",
                     Reason = "Fallback escalation for error event",
-                    Message = BuildObservedEventFallbackMessage(observed, reason)
+                    Message = BuildObservedEventFallbackMessage(observed, alertReason)
                 });
             }
 
@@ -583,6 +621,96 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return $"[KliveAgent Fallback] {reason}\n{summary}";
+        }
+
+        private static bool IsSimpleGreeting(string goal)
+        {
+            if (string.IsNullOrWhiteSpace(goal))
+            {
+                return false;
+            }
+
+            var normalized = new string(goal
+                .Trim()
+                .ToLowerInvariant()
+                .Where(ch => char.IsLetterOrDigit(ch) || char.IsWhiteSpace(ch))
+                .ToArray())
+                .Trim();
+
+            if (normalized.Length > 24)
+            {
+                return false;
+            }
+
+            return normalized is "hi" or "hello" or "hey" or "yo" or "sup" or "hello there";
+        }
+
+        private static KliveAgentBrainExecutionResult BuildGreetingFastPathResult(string missionType, string profileScope, string goal)
+        {
+            return new KliveAgentBrainExecutionResult
+            {
+                DecisionId = Guid.NewGuid().ToString("N"),
+                MissionType = missionType,
+                RequestedAtUtc = DateTime.UtcNow,
+                CompletedAtUtc = DateTime.UtcNow,
+                LlmSessionId = "fast-path:greeting",
+                Summary = "Handled greeting using fast path.",
+                FinalResponse = "Hello. KliveAgent is online and ready.",
+                RawModelOutput = string.Empty,
+                ApproxOutputTokens = 0,
+                UsedFallback = false,
+                ContextUsed = new KliveAgentBrainContextSnapshot
+                {
+                    RequestingProfileScope = profileScope,
+                    Goal = goal,
+                    UserContext = string.Empty,
+                    PromptUsed = "fast-path:greeting",
+                    MemoryEntries = new List<string>(),
+                    RecentEventEntries = new List<string>(),
+                    MatchedRuleEntries = new List<string>()
+                },
+                Decision = new KliveAgentBrainDecisionEnvelope
+                {
+                    Summary = "Handled greeting using fast path.",
+                    ShouldAct = false,
+                    Confidence = 1.0,
+                    FinalResponse = "Hello. KliveAgent is online and ready.",
+                    Actions = new List<KliveAgentBrainAction>()
+                },
+                ActionResults = new List<KliveAgentBrainActionResult>()
+            };
+        }
+
+        private static bool MemoryAppearsRelevantForService(KliveAgentMemoryRecord memory, string serviceName)
+        {
+            if (string.IsNullOrWhiteSpace(serviceName))
+            {
+                return false;
+            }
+
+            return (memory.Title?.Contains(serviceName, StringComparison.OrdinalIgnoreCase) ?? false)
+                || (memory.Content?.Contains(serviceName, StringComparison.OrdinalIgnoreCase) ?? false)
+                || (memory.Tags?.Any(tag => tag.Contains(serviceName, StringComparison.OrdinalIgnoreCase)) ?? false);
+        }
+
+        private static string LimitForPrompt(string? value, int maxLength)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
+            }
+
+            var normalized = value
+                .Replace("\r", " ")
+                .Replace("\n", " ")
+                .Trim();
+
+            if (normalized.Length <= maxLength)
+            {
+                return normalized;
+            }
+
+            return normalized[..Math.Max(3, maxLength - 3)] + "...";
         }
 
         private static string BuildLlmSessionId(string missionType, string profileScope, string? conversationId)

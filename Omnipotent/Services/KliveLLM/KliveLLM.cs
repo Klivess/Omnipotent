@@ -19,8 +19,10 @@ using LangChain.Providers;
 using System.Drawing;
 using System.Text;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Security.Policy;
 using System.IO.Compression;
+using System.Net.Http.Headers;
 
 namespace Omnipotent.Services.KliveLocalLLM
 {
@@ -159,14 +161,226 @@ namespace Omnipotent.Services.KliveLocalLLM
         }
 
 
-        public async Task<string> QueryLLM(string content)
+        public async Task<KliveLLMResponse> QueryLLM(
+            string prompt,
+            string? sessionId = null,
+            int? maxTokensOverride = null,
+            bool resetSessionBeforeQuery = false,
+            bool resetSessionAfterQuery = false)
         {
-            string payload = ProducePayloadString("user", content, "openai/gpt-oss-120b:cerebras");
-            HttpContent httpcontent = new StringContent(payload, System.Text.Encoding.UTF8, "application/json");
-            var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", httpcontent);
-            string llmResp = await response.Content.ReadAsStringAsync();
-            dynamic json = JsonConvert.DeserializeObject(llmResp);
-            return json.choices[0].message.content;
+            var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", false);
+            if (useHuggingFaceProvider)
+            {
+                return await QueryLLMViaHuggingFaceAsync(
+                    prompt,
+                    sessionId,
+                    maxTokensOverride,
+                    resetSessionBeforeQuery,
+                    resetSessionAfterQuery);
+            }
+
+            return await QueryLocalLLMAsync(
+                prompt,
+                sessionId,
+                maxTokensOverride,
+                resetSessionBeforeQuery,
+                resetSessionAfterQuery);
+        }
+
+        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(
+            string prompt,
+            string? sessionId,
+            int? maxTokensOverride,
+            bool resetSessionBeforeQuery = false,
+            bool resetSessionAfterQuery = false)
+        {
+            var resp = new KliveLLMResponse()
+            {
+                Response = string.Empty,
+                Conversation = new List<KliveLLMMessage>(),
+                Success = false,
+                ErrorMessage = string.Empty,
+                SessionId = string.IsNullOrWhiteSpace(sessionId) ? string.Empty : sessionId
+            };
+
+            try
+            {
+                if (resetSessionBeforeQuery && !string.IsNullOrWhiteSpace(sessionId))
+                {
+                    ResetSession(sessionId);
+                }
+
+                if (string.IsNullOrWhiteSpace(sessionId))
+                {
+                    sessionId = Guid.NewGuid().ToString();
+                }
+
+                resp.SessionId = sessionId;
+
+                KliveOnlineLLMSession session;
+                lock (onlineSessions)
+                {
+                    if (!onlineSessions.TryGetValue(sessionId, out session))
+                    {
+                        session = new KliveOnlineLLMSession() { sessionId = sessionId };
+                        onlineSessions[sessionId] = session;
+                    }
+                }
+
+                await session.sessionLock.WaitAsync();
+                try
+                {
+                    var userMessage = new KliveLLMMessage() { role = "user", content = prompt };
+                    session.messages.Add(userMessage);
+                    session.lastUpdated = DateTime.UtcNow;
+
+                    int contextMessagesToInclude = Math.Clamp(
+                        await GetIntOmniSetting("HuggingFaceChatContextMessageCount", 24),
+                        2,
+                        80);
+
+                    var payloadMessages = new JArray
+                    {
+                        new JObject
+                        {
+                            ["role"] = "system",
+                            ["content"] = "You are a helpful assistant. /no_think"
+                        }
+                    };
+
+                    foreach (var message in session.messages.TakeLast(contextMessagesToInclude))
+                    {
+                        if (string.IsNullOrWhiteSpace(message?.content))
+                        {
+                            continue;
+                        }
+
+                        payloadMessages.Add(new JObject
+                        {
+                            ["role"] = NormalizeChatRole(message.role),
+                            ["content"] = message.content
+                        });
+                    }
+
+                var body = new JObject
+                {
+                    ["messages"] = payloadMessages,
+                    ["model"] = "openai/gpt-oss-120b:novita",
+                    ["stream"] = false
+                };
+
+                if (maxTokensOverride.HasValue)
+                {
+                    body["max_tokens"] = Math.Clamp(maxTokensOverride.Value, 32, 4096);
+                }
+
+                using var httpcontent = new StringContent(body.ToString(Formatting.None), Encoding.UTF8);
+                httpcontent.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+                var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", httpcontent);
+                var llmResp = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    resp.ErrorMessage = $"HuggingFace router request failed ({(int)response.StatusCode}): {llmResp}";
+                    await ServiceLogError(resp.ErrorMessage);
+                    return resp;
+                }
+
+                var json = JObject.Parse(llmResp);
+                var rawText = ExtractChatCompletionContent(json["choices"]?[0]?["message"]?["content"]);
+                var outStr = SanitizeLocalModelOutput(rawText);
+                if (string.IsNullOrWhiteSpace(outStr))
+                {
+                    resp.ErrorMessage = "HuggingFace router returned empty content.";
+                    return resp;
+                }
+
+                session.messages.Add(new KliveLLMMessage() { role = "assistant", content = outStr });
+                session.lastUpdated = DateTime.UtcNow;
+
+                resp.Response = outStr;
+                resp.Conversation = session.messages
+                    .Select(msg => new KliveLLMMessage() { role = msg.role, content = msg.content })
+                    .ToList();
+                resp.Success = true;
+
+                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                {
+                    ResetSession(sessionId);
+                }
+
+                return resp;
+            }
+                finally
+                {
+                    session.sessionLock.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                string fullError = $"{ex.GetType().Name}: {ex.Message} | Inner: {ex.InnerException?.GetType().Name}: {ex.InnerException?.Message} | Stack: {ex.StackTrace}";
+                await ServiceLogError(ex, fullError);
+                resp.ErrorMessage = fullError;
+
+                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                {
+                    ResetSession(sessionId);
+                }
+
+                return resp;
+            }
+        }
+
+        private static string NormalizeChatRole(string? role)
+        {
+            if (string.IsNullOrWhiteSpace(role))
+            {
+                return "user";
+            }
+
+            if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+            {
+                return "assistant";
+            }
+
+            if (role.Equals("system", StringComparison.OrdinalIgnoreCase))
+            {
+                return "system";
+            }
+
+            return "user";
+        }
+
+        private static string ExtractChatCompletionContent(JToken? contentToken)
+        {
+            if (contentToken == null)
+            {
+                return string.Empty;
+            }
+
+            if (contentToken.Type == JTokenType.String)
+            {
+                return contentToken.ToString();
+            }
+
+            if (contentToken.Type == JTokenType.Array)
+            {
+                var parts = contentToken
+                    .Children<JObject>()
+                    .Select(token => token["text"]?.ToString() ?? token["content"]?.ToString() ?? string.Empty)
+                    .Where(text => !string.IsNullOrWhiteSpace(text));
+
+                return string.Join("\n", parts);
+            }
+
+            if (contentToken.Type == JTokenType.Object)
+            {
+                return contentToken["text"]?.ToString()
+                    ?? contentToken["content"]?.ToString()
+                    ?? string.Empty;
+            }
+
+            return contentToken.ToString();
         }
 
         // Local model support (download + reflective loader)
@@ -175,6 +389,7 @@ namespace Omnipotent.Services.KliveLocalLLM
         private LLamaWeights modelWeights;
         private bool localModelReady = false;
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
+        private Dictionary<string, KliveOnlineLLMSession> onlineSessions = new Dictionary<string, KliveOnlineLLMSession>();
 
         private async Task EnsureModelDownloadedAsync()
         {
@@ -320,9 +535,19 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 sessions.Remove(sessionId);
             }
+
+            lock (onlineSessions)
+            {
+                onlineSessions.Remove(sessionId);
+            }
         }
 
-        public async Task<KliveLLMResponse> QueryLocalLLMAsync(string prompt, string? sessionId = null)
+        private async Task<KliveLLMResponse> QueryLocalLLMAsync(
+            string prompt,
+            string? sessionId = null,
+            int? maxTokensOverride = null,
+            bool resetSessionBeforeQuery = false,
+            bool resetSessionAfterQuery = false)
         {
             var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = string.Empty };
             if (!localModelReady || modelWeights == null)
@@ -330,6 +555,11 @@ namespace Omnipotent.Services.KliveLocalLLM
                 resp.ErrorMessage = "Local model not available";
                 await ServiceLogError(resp.ErrorMessage);
                 return resp;
+            }
+
+            if (resetSessionBeforeQuery && !string.IsNullOrWhiteSpace(sessionId))
+            {
+                ResetSession(sessionId);
             }
 
             try
@@ -371,8 +601,11 @@ namespace Omnipotent.Services.KliveLocalLLM
 
                     var inferenceParams = new InferenceParams()
                     {
-                        MaxTokens = GetIntOmniSetting("InferenceParameterMaxTokens", 1024).GetAwaiter().GetResult(),
-                        //AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:" },
+                        MaxTokens = Math.Clamp(
+                            maxTokensOverride ?? GetIntOmniSetting("InferenceParameterMaxTokens", 1024).GetAwaiter().GetResult(),
+                            32,
+                            2048),
+                        AntiPrompts = new List<string> { "User:", "\nUser:", "System:", "\nSystem:", "Assistant:", "\nAssistant:", "<|im_start|>", "<|im_end|>" },
                         SamplingPipeline = new DefaultSamplingPipeline
                         {
                             Temperature = (float)Convert.ToDouble(GetStringOmniSetting("InferenceParameterTemperature", "0.6").GetAwaiter().GetResult()),
@@ -394,28 +627,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                     }
                     string raw = sb.ToString();
 
-                    // Strip Qwen special tokens
-                    raw = raw.Replace("<|im_start|>", "")
-                             .Replace("<|im_end|>", "")
-                             .Replace("<|endoftext|>", "");
-
-                    // Remove everything up to and including </think> — covers the full echo + think block
-                    int thinkEndIdx = raw.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
-                    if (thinkEndIdx >= 0)
-                        raw = raw.Substring(thinkEndIdx + "</think>".Length);
-
-                    // If no </think>, fall back to stripping after last "Assistant:"
-                    else
-                    {
-                        int assistantIdx = raw.LastIndexOf("Assistant:", StringComparison.OrdinalIgnoreCase);
-                        if (assistantIdx >= 0)
-                            raw = raw.Substring(assistantIdx + "Assistant:".Length);
-                    }
-
-                    // Strip trailing backticks Qwen sometimes appends
-                    raw = raw.Trim('`', '\n', '\r', ' ');
-
-                    string outStr = raw.Trim();
+                    string outStr = SanitizeLocalModelOutput(raw);
                     if (string.IsNullOrWhiteSpace(outStr))
                         outStr = "[No response. Error?]";
 
@@ -427,6 +639,10 @@ namespace Omnipotent.Services.KliveLocalLLM
                     resp.SessionId = sessionId;
                     resp.Conversation = session.messages;
                     resp.Success = true;
+                    if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                    {
+                        ResetSession(sessionId);
+                    }
                     try { await ServiceLog($"Local model returned response for session {sessionId}"); } catch { }
                     return resp;
                 }
@@ -439,24 +655,46 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 string fullError = $"{tie.GetType().Name}: {tie.Message} | Inner: {tie.InnerException?.GetType().Name}: {tie.InnerException?.Message} | Stack: {tie.StackTrace}";
                 await ServiceLogError(tie, fullError);
+                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                {
+                    ResetSession(sessionId);
+                }
                 return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
             }
             catch (Exception ex)
             {
                 string fullError = $"{ex.GetType().Name}: {ex.Message} | Inner: {ex.InnerException?.GetType().Name}: {ex.InnerException?.Message} | Stack: {ex.StackTrace}";
                 await ServiceLogError(ex, fullError);
+                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                {
+                    ResetSession(sessionId);
+                }
                 return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
             }
         }
 
         private static string SanitizeLocalModelOutput(string raw)
         {
-            if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+            if (string.IsNullOrWhiteSpace(raw))
+            {
+                return string.Empty;
+            }
 
-            string text = raw.Replace("\r\n", "\n").Trim();
+            string text = raw
+                .Replace("\r\n", "\n")
+                .Replace("<|im_start|>", "")
+                .Replace("<|im_end|>", "")
+                .Replace("<|endoftext|>", "")
+                .Trim();
 
-            // Remove common leading role prefixes emitted by chat-tuned models
-            string[] leadingPrefixes = ["Assistant:", "assistant:", "[Assistant]", "[assistant]"];
+            int thinkEndIdx = text.LastIndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+            if (thinkEndIdx >= 0)
+            {
+                text = text.Substring(thinkEndIdx + "</think>".Length).TrimStart();
+            }
+
+            // Remove common leading role prefixes emitted by chat-tuned models.
+            string[] leadingPrefixes = ["Assistant:", "assistant:", "[Assistant]", "[assistant]", "System:", "system:"];
             bool removedPrefix;
             do
             {
@@ -471,13 +709,13 @@ namespace Omnipotent.Services.KliveLocalLLM
                 }
             } while (removedPrefix);
 
-            // Cut off trailing role markers that indicate the model started the next turn
-            string[] stopMarkers = ["\nUser:", "\nSystem:", "\nAssistant:"];
+            // Cut off when the model starts printing another role block.
+            string[] stopMarkers = ["\nUser:", "\nSystem:", "\nAssistant:", "User:", "System:", "Assistant:"];
             int cutIndex = -1;
             foreach (var marker in stopMarkers)
             {
                 int idx = text.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0 && (cutIndex < 0 || idx < cutIndex))
+                if (idx > 0 && (cutIndex < 0 || idx < cutIndex))
                 {
                     cutIndex = idx;
                 }
@@ -488,7 +726,14 @@ namespace Omnipotent.Services.KliveLocalLLM
                 text = text.Substring(0, cutIndex).Trim();
             }
 
-            return text.Trim();
+            var lines = text
+                .Split('\n')
+                .Select(line => line.Trim())
+                .Where(line => !string.IsNullOrWhiteSpace(line))
+                .Where(line => !line.StartsWith("Processing Time:", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            return string.Join("\n", lines).Trim('`', '\n', '\r', ' ');
         }
 
         public string ProducePayloadString(string role, string content, string model)
@@ -526,6 +771,14 @@ namespace Omnipotent.Services.KliveLocalLLM
         {
             public string content;
             public string role;
+        }
+
+        public class KliveOnlineLLMSession
+        {
+            public string sessionId = string.Empty;
+            public List<KliveLLMMessage> messages = new List<KliveLLMMessage>();
+            public DateTime lastUpdated = DateTime.UtcNow;
+            public readonly System.Threading.SemaphoreSlim sessionLock = new System.Threading.SemaphoreSlim(1, 1);
         }
     }
 }
