@@ -320,16 +320,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- notify_klives: send a message to Klives.");
             sb.AppendLine("- save_memory: persist long-term memory.");
             sb.AppendLine("- run_script: execute C# script asynchronously (only if necessary).\n");
-            sb.AppendLine("Return ONLY valid JSON matching this schema:");
-            sb.AppendLine("{");
-            sb.AppendLine("  \"summary\": \"...\",");
-            sb.AppendLine("  \"should_act\": true,");
-            sb.AppendLine("  \"confidence\": 0.0,");
-            sb.AppendLine("  \"final_response\": \"...\",");
-            sb.AppendLine("  \"actions\": [");
-            sb.AppendLine("    { \"action_type\": \"notify_klives|save_memory|run_script\", \"reason\": \"...\", \"message\": \"...\", \"memory_type\": \"Note\", \"memory_title\": \"...\", \"memory_content\": \"...\", \"memory_tags\": [\"...\"], \"memory_importance\": 0.7, \"script_code\": \"...\" }");
-            sb.AppendLine("  ]");
-            sb.AppendLine("}");
+            sb.AppendLine("Return ONLY valid JSON matching this schema. Do NOT include comments, markdown, or trailing prose:");
+            AppendDecisionSchema(sb);
             sb.AppendLine();
             sb.AppendLine($"Goal:\n{goal}");
             if (!string.IsNullOrWhiteSpace(context))
@@ -369,7 +361,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- save_memory");
             sb.AppendLine("- run_script");
             sb.AppendLine();
-            sb.AppendLine("Return ONLY valid JSON with the same schema as requested before.");
+            sb.AppendLine("Return ONLY valid JSON matching this schema. Do NOT include comments, markdown, or trailing prose:");
+            AppendDecisionSchema(sb);
             sb.AppendLine();
             sb.AppendLine("Observed event:");
             sb.AppendLine($"- Time: {observed.OccurredAtUtc:O}");
@@ -491,7 +484,12 @@ namespace Omnipotent.Services.KliveAgent
 
             try
             {
-                var root = JObject.Parse(json);
+                var root = ParseJsonObjectLenient(json);
+                if (root == null)
+                {
+                    return null;
+                }
+
                 var envelope = new KliveAgentBrainDecisionEnvelope
                 {
                     Summary = root.Value<string>("summary")
@@ -517,43 +515,38 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
-                        var action = new KliveAgentBrainAction
-                        {
-                            ActionType = actionObj.Value<string>("action_type")
-                                ?? actionObj.Value<string>("actionType")
-                                ?? actionObj.Value<string>("type")
-                                ?? "none",
-                            Reason = actionObj.Value<string>("reason") ?? string.Empty,
-                            Message = actionObj.Value<string>("message") ?? string.Empty,
-                            ScriptCode = actionObj.Value<string>("script_code")
-                                ?? actionObj.Value<string>("scriptCode")
-                                ?? actionObj.Value<string>("script")
-                                ?? string.Empty,
-                            MemoryType = actionObj.Value<string>("memory_type")
-                                ?? actionObj.Value<string>("memoryType")
-                                ?? "Note",
-                            MemoryTitle = actionObj.Value<string>("memory_title")
-                                ?? actionObj.Value<string>("memoryTitle")
-                                ?? string.Empty,
-                            MemoryContent = actionObj.Value<string>("memory_content")
-                                ?? actionObj.Value<string>("memoryContent")
-                                ?? string.Empty,
-                            MemoryImportance = actionObj.Value<double?>("memory_importance")
-                                ?? actionObj.Value<double?>("memoryImportance")
-                                ?? 0.7
-                        };
-
-                        var tagsToken = actionObj["memory_tags"] ?? actionObj["memoryTags"] ?? actionObj["tags"];
-                        if (tagsToken is JArray tagsArray)
-                        {
-                            action.MemoryTags = tagsArray
-                                .Select(t => t?.ToString() ?? string.Empty)
-                                .Where(t => !string.IsNullOrWhiteSpace(t))
-                                .ToList();
-                        }
-
-                        envelope.Actions.Add(action);
+                        envelope.Actions.Add(ParseActionObject(actionObj));
                     }
+                }
+
+                // Accept compact/single-action payloads used by some models:
+                // { "action": "notify_klives", "details": { ... } }
+                if (envelope.Actions.Count == 0)
+                {
+                    var compactAction = ParseCompactAction(root);
+                    if (compactAction != null)
+                    {
+                        envelope.Actions.Add(compactAction);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(envelope.Summary))
+                {
+                    envelope.Summary = envelope.Actions.Count > 0
+                        ? $"Model selected action '{NormalizeActionType(envelope.Actions[0].ActionType)}'."
+                        : "No decision summary provided.";
+                }
+
+                if (string.IsNullOrWhiteSpace(envelope.FinalResponse))
+                {
+                    envelope.FinalResponse = envelope.Actions.FirstOrDefault()?.Message
+                        ?? envelope.Summary;
+                }
+
+                bool hasShouldAct = root["should_act"] != null || root["shouldAct"] != null;
+                if (!hasShouldAct)
+                {
+                    envelope.ShouldAct = envelope.Actions.Count > 0;
                 }
 
                 return envelope;
@@ -562,6 +555,236 @@ namespace Omnipotent.Services.KliveAgent
             {
                 return null;
             }
+        }
+
+        private static KliveAgentBrainAction ParseActionObject(JObject actionObj)
+        {
+            var action = new KliveAgentBrainAction
+            {
+                ActionType = actionObj.Value<string>("action_type")
+                    ?? actionObj.Value<string>("actionType")
+                    ?? actionObj.Value<string>("type")
+                    ?? actionObj.Value<string>("action")
+                    ?? "none",
+                Reason = actionObj.Value<string>("reason") ?? string.Empty,
+                Message = actionObj.Value<string>("message")
+                    ?? actionObj.Value<string>("message_summary")
+                    ?? string.Empty,
+                ScriptCode = actionObj.Value<string>("script_code")
+                    ?? actionObj.Value<string>("scriptCode")
+                    ?? actionObj.Value<string>("script")
+                    ?? string.Empty,
+                MemoryType = actionObj.Value<string>("memory_type")
+                    ?? actionObj.Value<string>("memoryType")
+                    ?? "Note",
+                MemoryTitle = actionObj.Value<string>("memory_title")
+                    ?? actionObj.Value<string>("memoryTitle")
+                    ?? string.Empty,
+                MemoryContent = actionObj.Value<string>("memory_content")
+                    ?? actionObj.Value<string>("memoryContent")
+                    ?? string.Empty,
+                MemoryImportance = actionObj.Value<double?>("memory_importance")
+                    ?? actionObj.Value<double?>("memoryImportance")
+                    ?? 0.7
+            };
+
+            var tagsToken = actionObj["memory_tags"] ?? actionObj["memoryTags"] ?? actionObj["tags"];
+            if (tagsToken is JArray tagsArray)
+            {
+                action.MemoryTags = tagsArray
+                    .Select(t => t?.ToString() ?? string.Empty)
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .ToList();
+            }
+
+            return action;
+        }
+
+        private static KliveAgentBrainAction? ParseCompactAction(JObject root)
+        {
+            var actionType = root.Value<string>("action")
+                ?? root.Value<string>("action_type")
+                ?? root.Value<string>("actionType")
+                ?? root.Value<string>("type");
+            if (string.IsNullOrWhiteSpace(actionType))
+            {
+                return null;
+            }
+
+            var details = root["details"] as JObject;
+            var action = new KliveAgentBrainAction
+            {
+                ActionType = actionType,
+                Reason = root.Value<string>("reason")
+                    ?? details?.Value<string>("type")
+                    ?? "compact-action",
+                Message = root.Value<string>("message")
+                    ?? details?.Value<string>("message")
+                    ?? details?.Value<string>("message_summary")
+                    ?? string.Empty,
+                ScriptCode = root.Value<string>("script_code")
+                    ?? root.Value<string>("scriptCode")
+                    ?? details?.Value<string>("script")
+                    ?? string.Empty,
+                MemoryType = root.Value<string>("memory_type")
+                    ?? root.Value<string>("memoryType")
+                    ?? details?.Value<string>("memory_type")
+                    ?? "Note",
+                MemoryTitle = root.Value<string>("memory_title")
+                    ?? root.Value<string>("memoryTitle")
+                    ?? details?.Value<string>("memory_title")
+                    ?? string.Empty,
+                MemoryContent = root.Value<string>("memory_content")
+                    ?? root.Value<string>("memoryContent")
+                    ?? details?.Value<string>("memory_content")
+                    ?? string.Empty,
+                MemoryImportance = root.Value<double?>("memory_importance")
+                    ?? root.Value<double?>("memoryImportance")
+                    ?? 0.7
+            };
+
+            var tagsToken = root["memory_tags"]
+                ?? root["memoryTags"]
+                ?? details?["memory_tags"]
+                ?? details?["tags"];
+            if (tagsToken is JArray tagsArray)
+            {
+                action.MemoryTags = tagsArray
+                    .Select(t => t?.ToString() ?? string.Empty)
+                    .Where(t => !string.IsNullOrWhiteSpace(t))
+                    .ToList();
+            }
+
+            var serviceName = details?.Value<string>("service") ?? string.Empty;
+            if (!string.IsNullOrWhiteSpace(serviceName) && !string.IsNullOrWhiteSpace(action.Message))
+            {
+                action.Message = $"[{serviceName}] {action.Message}";
+            }
+
+            return action;
+        }
+
+        private static JObject? ParseJsonObjectLenient(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return null;
+            }
+
+            try
+            {
+                return JObject.Parse(json);
+            }
+            catch
+            {
+                // Try again after removing line/block comments that some models inject.
+            }
+
+            try
+            {
+                var withoutComments = StripJsonComments(json);
+                return JObject.Parse(withoutComments);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string StripJsonComments(string input)
+        {
+            if (string.IsNullOrEmpty(input))
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder(input.Length);
+            bool inString = false;
+            bool escaped = false;
+
+            for (int i = 0; i < input.Length; i++)
+            {
+                var c = input[i];
+
+                if (inString)
+                {
+                    sb.Append(c);
+                    if (escaped)
+                    {
+                        escaped = false;
+                        continue;
+                    }
+
+                    if (c == '\\')
+                    {
+                        escaped = true;
+                        continue;
+                    }
+
+                    if (c == '"')
+                    {
+                        inString = false;
+                    }
+
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                    sb.Append(c);
+                    continue;
+                }
+
+                if (c == '/' && i + 1 < input.Length)
+                {
+                    var next = input[i + 1];
+                    if (next == '/')
+                    {
+                        i += 2;
+                        while (i < input.Length && input[i] != '\n' && input[i] != '\r')
+                        {
+                            i++;
+                        }
+
+                        if (i < input.Length)
+                        {
+                            sb.Append(input[i]);
+                        }
+
+                        continue;
+                    }
+
+                    if (next == '*')
+                    {
+                        i += 2;
+                        while (i + 1 < input.Length && !(input[i] == '*' && input[i + 1] == '/'))
+                        {
+                            i++;
+                        }
+
+                        i = Math.Min(i + 1, input.Length - 1);
+                        continue;
+                    }
+                }
+
+                sb.Append(c);
+            }
+
+            return sb.ToString();
+        }
+
+        private static void AppendDecisionSchema(StringBuilder sb)
+        {
+            sb.AppendLine("{");
+            sb.AppendLine("  \"summary\": \"...\",");
+            sb.AppendLine("  \"should_act\": true,");
+            sb.AppendLine("  \"confidence\": 0.0,");
+            sb.AppendLine("  \"final_response\": \"...\",");
+            sb.AppendLine("  \"actions\": [");
+            sb.AppendLine("    { \"action_type\": \"notify_klives|save_memory|run_script\", \"reason\": \"...\", \"message\": \"...\", \"memory_type\": \"Note\", \"memory_title\": \"...\", \"memory_content\": \"...\", \"memory_tags\": [\"...\"], \"memory_importance\": 0.7, \"script_code\": \"...\" }");
+            sb.AppendLine("  ]");
+            sb.AppendLine("}");
         }
 
         private static string ExtractJson(string raw)
