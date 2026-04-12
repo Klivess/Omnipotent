@@ -296,11 +296,14 @@ namespace Omnipotent.Services.OmniGram
                 throw new Exception("Instagram authentication failed for managed account.");
             }
 
+            string? biography = !string.IsNullOrWhiteSpace(request.biography) ? request.biography : request.bio;
+            string? externalUrl = !string.IsNullOrWhiteSpace(request.externalUrl) ? request.externalUrl : request.website;
+
             var profileChanges = new List<string>();
 
-            if (!string.IsNullOrWhiteSpace(request.biography))
+            if (!string.IsNullOrWhiteSpace(biography))
             {
-                var bioResult = await api.AccountProcessor.SetBiographyAsync(request.biography);
+                var bioResult = await api.AccountProcessor.SetBiographyAsync(biography);
                 if (!bioResult.Succeeded)
                 {
                     throw new Exception(bioResult.Info?.Message ?? "Failed to set biography.");
@@ -320,7 +323,7 @@ namespace Omnipotent.Services.OmniGram
 
             bool shouldEditProfile =
                 !string.IsNullOrWhiteSpace(request.displayName)
-                || !string.IsNullOrWhiteSpace(request.externalUrl)
+                || !string.IsNullOrWhiteSpace(externalUrl)
                 || !string.IsNullOrWhiteSpace(request.email)
                 || !string.IsNullOrWhiteSpace(request.phoneNumber)
                 || request.gender.HasValue
@@ -336,8 +339,8 @@ namespace Omnipotent.Services.OmniGram
 
                 var editResult = await api.AccountProcessor.EditProfileAsync(
                     request.displayName ?? string.Empty,
-                    request.biography ?? string.Empty,
-                    request.externalUrl ?? string.Empty,
+                    biography ?? string.Empty,
+                    externalUrl ?? string.Empty,
                     request.email ?? string.Empty,
                     request.phoneNumber ?? string.Empty,
                     gender,
@@ -370,20 +373,50 @@ namespace Omnipotent.Services.OmniGram
                 throw new Exception("Instagram authentication failed for managed account.");
             }
 
-            if (!Enum.IsDefined(typeof(InstagramApiSharp.Classes.Models.InstaMediaType), request.mediaType))
+            string mediaId = !string.IsNullOrWhiteSpace(request.mediaId)
+                ? request.mediaId
+                : request.instagramMediaId ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(mediaId))
             {
-                throw new Exception("Invalid mediaType value.");
+                throw new Exception("mediaId (or instagramMediaId) is required.");
             }
 
-            var mediaType = (InstagramApiSharp.Classes.Models.InstaMediaType)request.mediaType;
-            var deleteResult = await api.MediaProcessor.DeleteMediaAsync(request.mediaId, mediaType);
-            if (!deleteResult.Succeeded)
+            var mediaTypesToTry = new List<InstagramApiSharp.Classes.Models.InstaMediaType>();
+            if (request.mediaType.HasValue)
             {
-                throw new Exception(deleteResult.Info?.Message ?? "Failed to delete media from Instagram.");
+                if (!Enum.IsDefined(typeof(InstagramApiSharp.Classes.Models.InstaMediaType), request.mediaType.Value))
+                {
+                    throw new Exception("Invalid mediaType value.");
+                }
+
+                mediaTypesToTry.Add((InstagramApiSharp.Classes.Models.InstaMediaType)request.mediaType.Value);
+            }
+            else
+            {
+                foreach (InstagramApiSharp.Classes.Models.InstaMediaType mediaType in Enum.GetValues(typeof(InstagramApiSharp.Classes.Models.InstaMediaType)))
+                {
+                    if (!mediaTypesToTry.Contains(mediaType))
+                    {
+                        mediaTypesToTry.Add(mediaType);
+                    }
+                }
             }
 
-            await LogEvent("Info", "Instagram media deleted.", account.AccountId, metadata: new { request.mediaId, request.mediaType });
-            return true;
+            var failedTypes = new List<string>();
+            foreach (var mediaType in mediaTypesToTry)
+            {
+                var deleteResult = await api.MediaProcessor.DeleteMediaAsync(mediaId, mediaType);
+                if (deleteResult.Succeeded)
+                {
+                    await LogEvent("Info", "Instagram media deleted.", account.AccountId, metadata: new { mediaId, mediaType });
+                    return true;
+                }
+
+                failedTypes.Add($"{mediaType}: {deleteResult.Info?.Message ?? "Unknown"}");
+            }
+
+            throw new Exception("Failed to delete media from Instagram. " + string.Join(" | ", failedTypes));
         }
 
         public async Task<bool> RemoveManagedAccount(OmniGramDeleteAccountRequest request)
@@ -424,7 +457,7 @@ namespace Omnipotent.Services.OmniGram
             catch (Exception ex)
             {
                 await ServiceLogError(ex, $"OmniGram login validation failed for account {account.Username}");
-                return (false, false, ex.Message, null);
+                return (false, false, ex.Message, "Instagram auth failed due to a network or provider issue. Retry in a few minutes, then check /omnigram/accounts/live for detailed diagnostics.");
             }
         }
 
@@ -465,10 +498,9 @@ namespace Omnipotent.Services.OmniGram
             if (!login.Succeeded)
             {
                 string loginError = login.Info?.Message ?? "Instagram login failed.";
-                bool checkpointRequired = loginError.Contains("checkpoint_required", StringComparison.OrdinalIgnoreCase);
-                string? guidance = checkpointRequired
-                    ? "Instagram requires a 'This was me' confirmation in the Instagram app. Confirm the login attempt in-app, then retry."
-                    : null;
+                bool checkpointRequired = loginError.Contains("checkpoint_required", StringComparison.OrdinalIgnoreCase)
+                    || loginError.Contains("challenge_required", StringComparison.OrdinalIgnoreCase);
+                string guidance = BuildInstagramAuthGuidance(loginError, checkpointRequired);
 
                 return (null, checkpointRequired, loginError, guidance);
             }
@@ -481,6 +513,35 @@ namespace Omnipotent.Services.OmniGram
 
             sessionCache.Set(account.AccountId, api, TimeSpan.FromMinutes(20));
             return (api, false, null, null);
+        }
+
+        private static string BuildInstagramAuthGuidance(string loginError, bool checkpointRequired)
+        {
+            if (checkpointRequired)
+            {
+                return "Instagram requires a 'This was me' confirmation in the Instagram app. Confirm the login attempt in-app, then retry verification from /omnigram/accounts/live.";
+            }
+
+            if (loginError.Contains("bad_password", StringComparison.OrdinalIgnoreCase)
+                || loginError.Contains("invalid", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Credentials were rejected by Instagram. Re-enter the account username/password and retry onboarding.";
+            }
+
+            if (loginError.Contains("login_required", StringComparison.OrdinalIgnoreCase)
+                || loginError.Contains("session", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Instagram session appears expired. Retry verification; if it persists, remove and re-add the managed account.";
+            }
+
+            if (loginError.Contains("wait", StringComparison.OrdinalIgnoreCase)
+                || loginError.Contains("rate", StringComparison.OrdinalIgnoreCase)
+                || loginError.Contains("throttle", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Instagram is rate-limiting this login. Wait 5-15 minutes before retrying verification.";
+            }
+
+            return "Instagram returned an authentication error. Retry /omnigram/accounts/live and inspect LastAuthenticationError for details.";
         }
 
         public async Task<OmniGramCampaign> SchedulePost(OmniGramScheduleRequest request, string createdBy)

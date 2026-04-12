@@ -42,6 +42,7 @@ namespace Omnipotent.Services.OmniTumblr
         public DateTime UpdatedAtUtc { get; set; }
         public DateTime? LastAuthenticatedUtc { get; set; }
         public string? LastAuthenticationError { get; set; }
+        public string? LastAuthenticationGuidance { get; set; }
         public string AddedBy { get; set; } = "";
     }
 

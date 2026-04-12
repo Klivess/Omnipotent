@@ -112,6 +112,7 @@ namespace Omnipotent.Services.OmniTumblr
             var auth = await ValidateTumblrCredentials(account);
             account.Status = auth.Success ? OmniTumblrAccountStatus.Active : OmniTumblrAccountStatus.NeedsVerification;
             account.LastAuthenticationError = auth.Error;
+            account.LastAuthenticationGuidance = auth.Guidance;
             if (auth.Success)
             {
                 account.LastAuthenticatedUtc = DateTime.UtcNow;
@@ -452,7 +453,7 @@ namespace Omnipotent.Services.OmniTumblr
             }
         }
 
-        private async Task<(bool Success, string? Error)> ValidateTumblrCredentials(OmniTumblrAccount account)
+        private async Task<(bool Success, string? Error, string? Guidance)> ValidateTumblrCredentials(OmniTumblrAccount account)
         {
             try
             {
@@ -460,11 +461,17 @@ namespace Omnipotent.Services.OmniTumblr
                 var user = await client.GetUserInfoAsync();
                 var blog = await client.GetBlogInfoAsync(account.BlogName);
                 bool success = user != null && blog != null;
-                return (success, success ? null : "Tumblr authentication check failed.");
+                if (success)
+                {
+                    return (true, null, null);
+                }
+
+                const string failedMessage = "Tumblr authentication check failed.";
+                return (false, failedMessage, BuildTumblrAuthGuidance(failedMessage));
             }
             catch (Exception ex)
             {
-                return (false, ex.Message);
+                return (false, ex.Message, BuildTumblrAuthGuidance(ex.Message));
             }
         }
 
@@ -474,15 +481,38 @@ namespace Omnipotent.Services.OmniTumblr
             string consumerSecret = account.OAuthTokenSecret;
             if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret))
             {
-                throw new Exception("OmniTumblrConsumerKey and OmniTumblrConsumerSecret settings are required.");
-            }
-            if (string.IsNullOrWhiteSpace(account.OAuthTokenKey) || string.IsNullOrWhiteSpace(account.OAuthTokenSecret))
-            {
                 throw new Exception("oauthTokenKey and oauthTokenSecret are required for Tumblr API access.");
             }
 
             var factory = new TumblrClientFactory();
             return factory.Create<TumblrClient>(consumerKey, consumerSecret, new Token(account.OAuthTokenKey, account.OAuthTokenSecret));
+        }
+
+        private static string BuildTumblrAuthGuidance(string error)
+        {
+            if (error.Contains("unauthorized", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("401", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("forbidden", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("403", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Tumblr rejected credentials. Verify oauthTokenKey/oauthTokenSecret and ensure token permissions allow blog access and post publishing.";
+            }
+
+            if (error.Contains("blog", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("404", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("not found", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Tumblr blog lookup failed. Verify blogName exactly matches the managed Tumblr blog handle.";
+            }
+
+            if (error.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("connection", StringComparison.OrdinalIgnoreCase)
+                || error.Contains("network", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Tumblr verification failed due to a network issue. Retry in a few minutes and run /omnitumblr/accounts/live for diagnostics.";
+            }
+
+            return "Tumblr verification failed. Retry /omnitumblr/accounts/live and inspect LastAuthenticationError for details.";
         }
 
         public List<OmniTumblrAccount> GetAccounts()

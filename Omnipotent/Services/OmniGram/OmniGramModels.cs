@@ -129,7 +129,9 @@ namespace Omnipotent.Services.OmniGram
         public string accountId { get; set; } = "";
         public string? displayName { get; set; }
         public string? biography { get; set; }
+        public string? bio { get; set; }
         public string? externalUrl { get; set; }
+        public string? website { get; set; }
         public string? email { get; set; }
         public string? phoneNumber { get; set; }
         public int? gender { get; set; }
@@ -140,7 +142,8 @@ namespace Omnipotent.Services.OmniGram
     {
         public string accountId { get; set; } = "";
         public string mediaId { get; set; } = "";
-        public int mediaType { get; set; }
+        public string? instagramMediaId { get; set; }
+        public int? mediaType { get; set; }
     }
 
     public class OmniGramDeleteAccountRequest

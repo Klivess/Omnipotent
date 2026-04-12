@@ -28,16 +28,28 @@ namespace Omnipotent.Services.OmniGram
 
                     var account = await p.AddManagedAccount(body, req.user?.Name ?? "Unknown");
 
+                    bool includeLiveVerification = bool.TryParse(req.userParameters?["includeLiveVerification"], out var parsedVerify) && parsedVerify;
+                    string verificationState = account.Status == OmniGramAccountStatus.Active && !account.CheckpointRequired
+                        ? "Verified"
+                        : account.CheckpointRequired
+                            ? "CheckpointRequired"
+                            : "NeedsVerification";
+
                     object? live = null;
-                    if (!account.CheckpointRequired && account.Status == OmniGramAccountStatus.Active)
+                    if (includeLiveVerification && !account.CheckpointRequired && account.Status == OmniGramAccountStatus.Active)
                     {
-                        try
+                        var (completed, result) = await TryWithTimeout(p.GetLiveAccountData(account.AccountId), TimeSpan.FromSeconds(20));
+                        if (completed)
                         {
-                            live = await p.GetLiveAccountData(account.AccountId);
+                            live = result;
                         }
-                        catch (Exception ex)
+                        else
                         {
-                            live = new { error = ex.Message };
+                            live = new
+                            {
+                                error = "Timed out while fetching live account data.",
+                                guidance = "Account was saved. Retry live verification through /omnigram/accounts/live."
+                            };
                         }
                     }
                     await req.ReturnResponse(JsonConvert.SerializeObject(new
@@ -54,9 +66,12 @@ namespace Omnipotent.Services.OmniGram
                         account.CheckpointRequired,
                         account.LastAuthenticationError,
                         account.LastAuthenticationGuidance,
+                        VerificationState = verificationState,
+                        VerificationGuidance = account.LastAuthenticationGuidance,
                         account.LastAuthenticatedUtc,
                         account.CreatedAtUtc,
                         account.UpdatedAtUtc,
+                        LiveVerificationRequested = includeLiveVerification,
                         LiveVerification = live
                     }));
                 }
@@ -117,7 +132,18 @@ namespace Omnipotent.Services.OmniGram
                         return;
                     }
 
-                    var live = await p.GetLiveAccountData(accountId);
+                    var (completed, result) = await TryWithTimeout(p.GetLiveAccountData(accountId), TimeSpan.FromSeconds(25));
+                    if (!completed)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            error = "Timed out while fetching live account data.",
+                            guidance = "Retry in a moment. If this persists, re-validate credentials with /omnigram/accounts/add."
+                        }), code: HttpStatusCode.GatewayTimeout);
+                        return;
+                    }
+
+                    var live = result;
                     await req.ReturnResponse(JsonConvert.SerializeObject(live));
                 }
                 catch (Exception ex)
@@ -130,7 +156,18 @@ namespace Omnipotent.Services.OmniGram
             {
                 try
                 {
-                    var data = await p.GetLiveAccountsAnalytics();
+                    var (completed, result) = await TryWithTimeout(p.GetLiveAccountsAnalytics(), TimeSpan.FromSeconds(35));
+                    if (!completed)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            error = "Timed out while collecting live analytics.",
+                            guidance = "Retry with fewer active accounts or run /omnigram/accounts/live per account."
+                        }), code: HttpStatusCode.GatewayTimeout);
+                        return;
+                    }
+
+                    var data = result;
                     await req.ReturnResponse(JsonConvert.SerializeObject(data));
                 }
                 catch (Exception ex)
@@ -305,6 +342,17 @@ namespace Omnipotent.Services.OmniGram
             }
 
             return fallback;
+        }
+
+        private static async Task<(bool Completed, T? Result)> TryWithTimeout<T>(Task<T> task, TimeSpan timeout)
+        {
+            var completedTask = await Task.WhenAny(task, Task.Delay(timeout));
+            if (completedTask != task)
+            {
+                return (false, default);
+            }
+
+            return (true, await task);
         }
     }
 }

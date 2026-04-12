@@ -17,8 +17,8 @@ namespace Omnipotent.Services.OmniTrader
 {
     public class OmniTrader : OmniService
     {
-        public OmniTraderFinanceData data;
-        public OmniTraderSimulator simulator;
+        public OmniTraderFinanceData data = null!;
+        public OmniTraderSimulator simulator = null!;
 
         private readonly Dictionary<Guid, string> deploymentStrategyNames = new();
 
@@ -252,21 +252,12 @@ namespace Omnipotent.Services.OmniTrader
                 try
                 {
                     var registrations = (await simulator.GetPersistedActiveDeployments(1500)).ToList();
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Count = registrations.Count,
-                        Registrations = registrations
-                    }));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(registrations));
                 }
                 catch (Exception ex)
                 {
                     await ServiceLogError(ex, "Failed to read active persistent simulator deployments.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Count = 0,
-                        Registrations = Array.Empty<object>(),
-                        Error = ex.Message
-                    }), code: HttpStatusCode.InternalServerError);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(Array.Empty<object>()), code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
@@ -275,28 +266,12 @@ namespace Omnipotent.Services.OmniTrader
                 try
                 {
                     var analytics = GetAllStrategyAnalyticsSummary();
-                    var deployments = analytics.Select(k => new
-                    {
-                        DeploymentId = k.Key,
-                        StrategyName = GetTrackedStrategyName(k.Key),
-                        Analytics = k.Value
-                    }).ToList();
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Count = deployments.Count,
-                        Deployments = deployments
-                    }));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
                 }
                 catch (Exception ex)
                 {
                     await ServiceLogError(ex, "Failed to read live OmniTrader analytics.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Count = 0,
-                        Deployments = Array.Empty<object>(),
-                        Error = ex.Message
-                    }), code: HttpStatusCode.InternalServerError);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new Dictionary<string, OmniBacktestResult>()), code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 

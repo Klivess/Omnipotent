@@ -41,6 +41,8 @@ namespace Omnipotent.Logging
 
         public ConcurrentQueue<LoggedMessage> messagesToLog = new();
         public ConcurrentQueue<LoggedMessage> overallMessages = new();
+        
+        public event EventHandler<LoggedMessage> OnLogMessage;
 
         public OmniLogging()
         {
@@ -167,6 +169,8 @@ Data:
                 {
                     try
                     {
+                        OnLogMessage?.Invoke(this, message);
+
                         if (message.appearInConsole)
                         {
                             if (message.type == LogType.Status)
