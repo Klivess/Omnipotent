@@ -6,6 +6,7 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using System.Collections.Concurrent;
+using System.Text;
 using System.Threading.Channels;
 using static Omnipotent.Profiles.KMProfileManager;
 using UserRequest = Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
@@ -15,6 +16,8 @@ namespace Omnipotent.Services.KliveAgent
     public class KliveAgent : OmniService
     {
         private readonly Channel<KliveAgentObservedEvent> _eventChannel = Channel.CreateUnbounded<KliveAgentObservedEvent>();
+        private readonly ConcurrentQueue<KliveAgentObservedEvent> _recentEvents = new();
+        private readonly ConcurrentQueue<KliveAgentBrainExecutionResult> _decisionHistory = new();
         private readonly ConcurrentDictionary<string, DateTime> _cooldownIndex = new(StringComparer.OrdinalIgnoreCase);
         private readonly Queue<DateTime> _autonomyActionWindow = new();
         private readonly object _autonomyLock = new();
@@ -23,8 +26,11 @@ namespace Omnipotent.Services.KliveAgent
         private OmniLogging? _logger;
         private KliveAgentMemory _memory = null!;
         private KliveAgentScripting _scripting = null!;
+        private KliveAgentBrain _brain = null!;
 
         private const int MaxAutonomousActionsPerMinute = 6;
+        private const int MaxRecentEvents = 300;
+        private const int MaxDecisionHistory = 150;
         private static readonly TimeSpan DefaultEventCooldown = TimeSpan.FromMinutes(2);
 
         public KliveAgent()
@@ -44,13 +50,14 @@ namespace Omnipotent.Services.KliveAgent
                 await _memory.InitializeAsync();
 
                 _scripting = new KliveAgentScripting(this);
+                _brain = new KliveAgentBrain(this);
 
                 await EnsureDefaultRulesAsync();
                 SubscribeToLogFeed();
                 _ = Task.Run(() => ProcessEventsAsync(_shutdownToken.Token));
 
                 await SetupRoutesAsync();
-                await ServiceLog("KliveAgent online. Memory, scripting, and event autonomy are active.");
+                await ServiceLog("KliveAgent online. Memory, LLM brain, scripting, and event autonomy are active.");
             }
             catch (Exception ex)
             {
@@ -82,6 +89,55 @@ namespace Omnipotent.Services.KliveAgent
         public List<KliveAgentMemorySearchResult> SearchMemory(string query, int maxCount = 6)
         {
             return _memory.Search(query, maxCount);
+        }
+
+        public List<KliveAgentObservedEvent> GetRecentEventsSnapshot(int maxCount = 30)
+        {
+            return _recentEvents
+                .ToArray()
+                .TakeLast(Math.Max(1, maxCount))
+                .ToList();
+        }
+
+        public List<KliveAgentBrainExecutionResult> GetRecentDecisions(int maxCount = 20)
+        {
+            return _decisionHistory
+                .ToArray()
+                .TakeLast(Math.Max(1, maxCount))
+                .Reverse()
+                .ToList();
+        }
+
+        internal async Task<KliveAgentScriptRunRecord> ExecuteScriptFromBrainAsync(string scriptCode, string trigger, KliveAgentObservedEvent? observed)
+        {
+            return await _scripting.ExecuteScriptAsync(scriptCode, trigger, observed, runInBackground: true);
+        }
+
+        internal async Task SendMessageToKlivesFromBrainAsync(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return;
+            }
+
+            var discord = await ResolveServiceAsync<KliveBotDiscord>();
+            if (discord == null)
+            {
+                return;
+            }
+
+            await discord.SendMessageToKlives(message);
+        }
+
+        internal async Task<KliveAgentMemoryRecord> SaveMemoryFromBrainAsync(KliveAgentMemoryRecord record)
+        {
+            return await _memory.SaveMemoryAsync(record);
+        }
+
+        internal void RecordDecision(KliveAgentBrainExecutionResult result)
+        {
+            _decisionHistory.Enqueue(result);
+            while (_decisionHistory.Count > MaxDecisionHistory && _decisionHistory.TryDequeue(out _)) { }
         }
 
         public async Task OnScriptRunUpdated(KliveAgentScriptRunRecord runRecord)
@@ -160,7 +216,10 @@ namespace Omnipotent.Services.KliveAgent
                 return;
             }
 
-            _eventChannel.Writer.TryWrite(KliveAgentObservedEvent.FromLoggedMessage(message));
+            var observed = KliveAgentObservedEvent.FromLoggedMessage(message);
+            _recentEvents.Enqueue(observed);
+            while (_recentEvents.Count > MaxRecentEvents && _recentEvents.TryDequeue(out _)) { }
+            _eventChannel.Writer.TryWrite(observed);
         }
 
         private async Task ProcessEventsAsync(CancellationToken cancellationToken)
@@ -212,44 +271,46 @@ namespace Omnipotent.Services.KliveAgent
                 .OrderByDescending(r => r.MinimumLogType)
                 .ToList();
 
-            var acted = false;
-            foreach (var rule in matchingRules)
+            var shouldAskBrain = matchingRules.Any() || ShouldEscalateByDefault(observed);
+            if (!shouldAskBrain)
             {
-                var cooldownKey = $"rule:{rule.Id}:{observed.Fingerprint}";
-                var cooldown = TimeSpan.FromSeconds(Math.Max(5, rule.CooldownSeconds));
-                if (IsInCooldown(cooldownKey, cooldown))
-                {
-                    continue;
-                }
-
-                if (!TryClaimAutonomousActionSlot())
-                {
-                    await ServiceLog("KliveAgent skipped rule action due to autonomy rate limit.", false);
-                    break;
-                }
-
-                rule.LastTriggeredAtUtc = DateTime.UtcNow;
-                await _memory.UpsertRuleAsync(rule);
-
-                if (rule.NotifyKlives)
-                {
-                    await NotifyKlivesAsync(observed, rule.Name);
-                }
-
-                if (!string.IsNullOrWhiteSpace(rule.ScriptCode))
-                {
-                    await _scripting.ExecuteScriptAsync(rule.ScriptCode, $"event-rule:{rule.Name}", observed, runInBackground: true);
-                }
-
-                acted = true;
+                return;
             }
 
-            if (!acted && ShouldEscalateByDefault(observed))
+            var cooldownSeconds = matchingRules.Any()
+                ? matchingRules.Min(r => Math.Max(5, r.CooldownSeconds))
+                : (int)DefaultEventCooldown.TotalSeconds;
+            var cooldownKey = $"brain:{observed.Fingerprint}";
+
+            if (IsInCooldown(cooldownKey, TimeSpan.FromSeconds(cooldownSeconds)))
             {
-                var cooldownKey = $"default:{observed.Fingerprint}";
-                if (!IsInCooldown(cooldownKey, DefaultEventCooldown) && TryClaimAutonomousActionSlot())
+                return;
+            }
+
+            if (!TryClaimAutonomousActionSlot())
+            {
+                await ServiceLog("KliveAgent skipped brain analysis due to autonomy rate limit.", false);
+                return;
+            }
+
+            foreach (var rule in matchingRules)
+            {
+                rule.LastTriggeredAtUtc = DateTime.UtcNow;
+                await _memory.UpsertRuleAsync(rule);
+            }
+
+            var recentEvents = GetRecentEventsSnapshot(25);
+            var decisionResult = await _brain.DecideForEventAsync(observed, matchingRules, recentEvents, _shutdownToken.Token);
+            RecordDecision(decisionResult);
+
+            if (decisionResult.UsedFallback && decisionResult.Decision.Actions.Any())
+            {
+                foreach (var action in decisionResult.Decision.Actions)
                 {
-                    await NotifyKlivesAsync(observed, "default-critical-escalation");
+                    if (string.Equals(action.ActionType, "notify_klives", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await SendMessageToKlivesFromBrainAsync(action.Message);
+                    }
                 }
             }
         }
@@ -360,6 +421,10 @@ namespace Omnipotent.Services.KliveAgent
             await CreateAPIRoute("/kliveagent/scripts/runs", HandleGetScriptRuns, HttpMethod.Get, KMPermissions.Admin);
             await CreateAPIRoute("/kliveagent/scripts/running", HandleGetRunningScripts, HttpMethod.Get, KMPermissions.Admin);
             await CreateAPIRoute("/kliveagent/scripts/cancel", HandleCancelScript, HttpMethod.Post, KMPermissions.Admin);
+
+            await CreateAPIRoute("/kliveagent/brain/execute", HandleBrainExecute, HttpMethod.Post, KMPermissions.Admin);
+            await CreateAPIRoute("/kliveagent/brain/execute-stream", HandleBrainExecuteStream, HttpMethod.Post, KMPermissions.Admin);
+            await CreateAPIRoute("/kliveagent/brain/decisions", HandleBrainDecisions, HttpMethod.Get, KMPermissions.Admin);
         }
 
         private async Task HandleRecentMemories(UserRequest req)
@@ -487,6 +552,115 @@ namespace Omnipotent.Services.KliveAgent
             await req.ReturnResponse(JsonConvert.SerializeObject(new { cancelled }), "application/json");
         }
 
+        private async Task HandleBrainExecute(UserRequest req)
+        {
+            var model = TryParseJson<KliveAgentBrainExecutionRequest>(req.userMessageContent);
+            if (model == null || string.IsNullOrWhiteSpace(model.Goal))
+            {
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { error = "Invalid payload. Expected goal." }),
+                    code: System.Net.HttpStatusCode.BadRequest);
+                return;
+            }
+
+            if (!TryClaimAutonomousActionSlot())
+            {
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { error = "KliveAgent is rate-limited. Try again shortly." }),
+                    code: System.Net.HttpStatusCode.TooManyRequests);
+                return;
+            }
+
+            var result = await _brain.DecideForTaskAsync(model, _shutdownToken.Token);
+            RecordDecision(result);
+
+            if (model.NotifyKlivesOnCompletion && !string.IsNullOrWhiteSpace(result.FinalResponse))
+            {
+                await SendMessageToKlivesFromBrainAsync("[KliveAgent Task Result] " + result.FinalResponse);
+            }
+
+            await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
+        }
+
+        private async Task HandleBrainExecuteStream(UserRequest req)
+        {
+            var response = req.context.Response;
+            response.ContentType = "text/event-stream";
+            response.SendChunked = true;
+            response.KeepAlive = true;
+            response.Headers.Set("Cache-Control", "no-cache, no-transform");
+            response.Headers.Set("X-Accel-Buffering", "no");
+            response.Headers.Set("Access-Control-Allow-Origin", "*");
+            response.Headers.Set("Access-Control-Expose-Headers", "*");
+
+            await using var writer = new StreamWriter(response.OutputStream, Encoding.UTF8, 1024, leaveOpen: false);
+
+            try
+            {
+                var model = TryParseJson<KliveAgentBrainExecutionRequest>(req.userMessageContent);
+                if (model == null || string.IsNullOrWhiteSpace(model.Goal))
+                {
+                    await WriteSseEventAsync(writer, "error", "Invalid payload. Expected goal.");
+                    await WriteSseEventAsync(writer, "done", "error");
+                    return;
+                }
+
+                if (!TryClaimAutonomousActionSlot())
+                {
+                    await WriteSseEventAsync(writer, "error", "KliveAgent is rate-limited. Try again shortly.");
+                    await WriteSseEventAsync(writer, "done", "rate_limited");
+                    return;
+                }
+
+                await WriteSseEventAsync(writer, "status", "Gathering context and consulting LLM brain...");
+
+                var result = await _brain.DecideForTaskAsync(model, _shutdownToken.Token);
+                RecordDecision(result);
+
+                var finalText = string.IsNullOrWhiteSpace(result.FinalResponse)
+                    ? (string.IsNullOrWhiteSpace(result.Summary) ? "No response generated." : result.Summary)
+                    : result.FinalResponse;
+
+                await WriteSseEventAsync(writer, "meta", JsonConvert.SerializeObject(new
+                {
+                    result.DecisionId,
+                    result.MissionType,
+                    result.LlmSessionId,
+                    result.ApproxOutputTokens,
+                    usedFallback = result.UsedFallback,
+                    contextMemoryCount = result.ContextUsed?.MemoryEntries?.Count ?? 0,
+                    contextEventCount = result.ContextUsed?.RecentEventEntries?.Count ?? 0,
+                    contextRuleCount = result.ContextUsed?.MatchedRuleEntries?.Count ?? 0
+                }));
+
+                foreach (var token in SplitForStreaming(finalText))
+                {
+                    await WriteSseEventAsync(writer, "token", JsonConvert.SerializeObject(new { token }));
+                }
+
+                if (model.NotifyKlivesOnCompletion && !string.IsNullOrWhiteSpace(result.FinalResponse))
+                {
+                    await SendMessageToKlivesFromBrainAsync("[KliveAgent Task Result] " + result.FinalResponse);
+                }
+
+                await WriteSseEventAsync(writer, "result", JsonConvert.SerializeObject(result));
+                await WriteSseEventAsync(writer, "done", "ok");
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "KliveAgent execute-stream failed", false);
+                await WriteSseEventAsync(writer, "error", ex.Message);
+                await WriteSseEventAsync(writer, "done", "error");
+            }
+        }
+
+        private async Task HandleBrainDecisions(UserRequest req)
+        {
+            int count = ParseInt(req.userParameters["count"], 20, 1, 100);
+            var decisions = GetRecentDecisions(count);
+            await req.ReturnResponse(JsonConvert.SerializeObject(decisions), "application/json");
+        }
+
         private static int ParseInt(string? value, int fallback, int min, int max)
         {
             if (!int.TryParse(value, out var parsed))
@@ -495,6 +669,46 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return Math.Clamp(parsed, min, max);
+        }
+
+        private static IEnumerable<string> SplitForStreaming(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                yield break;
+            }
+
+            var current = new StringBuilder();
+            foreach (var ch in text)
+            {
+                current.Append(ch);
+                if (char.IsWhiteSpace(ch) || current.Length >= 18)
+                {
+                    yield return current.ToString();
+                    current.Clear();
+                }
+            }
+
+            if (current.Length > 0)
+            {
+                yield return current.ToString();
+            }
+        }
+
+        private static async Task WriteSseEventAsync(StreamWriter writer, string eventName, string data)
+        {
+            await writer.WriteAsync("event: ");
+            await writer.WriteLineAsync(eventName);
+
+            var lines = (data ?? string.Empty).Replace("\r", string.Empty).Split('\n');
+            foreach (var line in lines)
+            {
+                await writer.WriteAsync("data: ");
+                await writer.WriteLineAsync(line);
+            }
+
+            await writer.WriteLineAsync();
+            await writer.FlushAsync();
         }
 
         private static T? TryParseJson<T>(string? json) where T : class

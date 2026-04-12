@@ -154,4 +154,69 @@ namespace Omnipotent.Services.KliveAgent
         public string ScriptCode { get; set; } = string.Empty;
         public string Trigger { get; set; } = "manual";
     }
+
+    public sealed class KliveAgentBrainExecutionRequest
+    {
+        public string Goal { get; set; } = string.Empty;
+        public string Context { get; set; } = string.Empty;
+        public bool AllowScriptExecution { get; set; } = true;
+        public bool NotifyKlivesOnCompletion { get; set; } = false;
+    }
+
+    public sealed class KliveAgentBrainContextSnapshot
+    {
+        public string Goal { get; set; } = string.Empty;
+        public string UserContext { get; set; } = string.Empty;
+        public string PromptUsed { get; set; } = string.Empty;
+        public List<string> MemoryEntries { get; set; } = new();
+        public List<string> RecentEventEntries { get; set; } = new();
+        public List<string> MatchedRuleEntries { get; set; } = new();
+    }
+
+    public sealed class KliveAgentBrainAction
+    {
+        public string ActionType { get; set; } = "none";
+        public string Reason { get; set; } = string.Empty;
+        public string Message { get; set; } = string.Empty;
+        public string ScriptCode { get; set; } = string.Empty;
+        public string MemoryType { get; set; } = "Note";
+        public string MemoryTitle { get; set; } = string.Empty;
+        public string MemoryContent { get; set; } = string.Empty;
+        public List<string> MemoryTags { get; set; } = new();
+        public double MemoryImportance { get; set; } = 0.7;
+    }
+
+    public sealed class KliveAgentBrainDecisionEnvelope
+    {
+        public string Summary { get; set; } = string.Empty;
+        public bool ShouldAct { get; set; } = false;
+        public double Confidence { get; set; } = 0.0;
+        public string FinalResponse { get; set; } = string.Empty;
+        public List<KliveAgentBrainAction> Actions { get; set; } = new();
+    }
+
+    public sealed class KliveAgentBrainActionResult
+    {
+        public string ActionType { get; set; } = "none";
+        public string Status { get; set; } = "skipped";
+        public string Details { get; set; } = string.Empty;
+        public string? ScriptRunId { get; set; }
+    }
+
+    public sealed class KliveAgentBrainExecutionResult
+    {
+        public string DecisionId { get; set; } = Guid.NewGuid().ToString("N");
+        public string MissionType { get; set; } = "manual-task";
+        public DateTime RequestedAtUtc { get; set; } = DateTime.UtcNow;
+        public DateTime CompletedAtUtc { get; set; }
+        public string LlmSessionId { get; set; } = string.Empty;
+        public string Summary { get; set; } = string.Empty;
+        public string FinalResponse { get; set; } = string.Empty;
+        public string RawModelOutput { get; set; } = string.Empty;
+        public int ApproxOutputTokens { get; set; } = 0;
+        public bool UsedFallback { get; set; } = false;
+        public KliveAgentBrainContextSnapshot ContextUsed { get; set; } = new();
+        public KliveAgentBrainDecisionEnvelope Decision { get; set; } = new();
+        public List<KliveAgentBrainActionResult> ActionResults { get; set; } = new();
+    }
 }
