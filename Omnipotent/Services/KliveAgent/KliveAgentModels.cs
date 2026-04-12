@@ -159,12 +159,17 @@ namespace Omnipotent.Services.KliveAgent
     {
         public string Goal { get; set; } = string.Empty;
         public string Context { get; set; } = string.Empty;
+        public string ConversationId { get; set; } = string.Empty;
         public bool AllowScriptExecution { get; set; } = true;
         public bool NotifyKlivesOnCompletion { get; set; } = false;
+
+        [JsonIgnore]
+        public string RequestingProfileScope { get; set; } = string.Empty;
     }
 
     public sealed class KliveAgentBrainContextSnapshot
     {
+        public string RequestingProfileScope { get; set; } = string.Empty;
         public string Goal { get; set; } = string.Empty;
         public string UserContext { get; set; } = string.Empty;
         public string PromptUsed { get; set; } = string.Empty;

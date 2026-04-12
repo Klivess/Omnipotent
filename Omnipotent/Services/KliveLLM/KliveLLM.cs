@@ -309,6 +309,19 @@ namespace Omnipotent.Services.KliveLocalLLM
             public string ErrorMessage { get; set; }
         }
 
+        public void ResetSession(string? sessionId)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId))
+            {
+                return;
+            }
+
+            lock (sessions)
+            {
+                sessions.Remove(sessionId);
+            }
+        }
+
         public async Task<KliveLLMResponse> QueryLocalLLMAsync(string prompt, string? sessionId = null)
         {
             var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = string.Empty };

@@ -10,6 +10,7 @@ namespace Omnipotent.Services.KliveAgent
     {
         private readonly KliveAgent _agent;
         private const int MaxActionsPerDecision = 3;
+        private static readonly TimeSpan LlmDecisionTimeout = TimeSpan.FromSeconds(65);
 
         public KliveAgentBrain(KliveAgent agent)
         {
@@ -22,6 +23,10 @@ namespace Omnipotent.Services.KliveAgent
         {
             var goal = request.Goal?.Trim() ?? string.Empty;
             var missionType = "manual-task";
+            var profileScope = string.IsNullOrWhiteSpace(request.RequestingProfileScope)
+                ? "unknown-profile"
+                : request.RequestingProfileScope.Trim();
+            var llmSessionId = BuildLlmSessionId(missionType, profileScope, request.ConversationId);
 
             if (string.IsNullOrWhiteSpace(goal))
             {
@@ -43,6 +48,7 @@ namespace Omnipotent.Services.KliveAgent
             var prompt = BuildTaskPrompt(goal, request.Context, memoryHits, recentEvents);
             var contextSnapshot = new KliveAgentBrainContextSnapshot
             {
+                RequestingProfileScope = profileScope,
                 Goal = goal,
                 UserContext = request.Context ?? string.Empty,
                 PromptUsed = prompt,
@@ -51,7 +57,7 @@ namespace Omnipotent.Services.KliveAgent
                 MatchedRuleEntries = new List<string>()
             };
 
-            return await QueryAndExecuteAsync(missionType, prompt, request.AllowScriptExecution, contextSnapshot, null, cancellationToken);
+            return await QueryAndExecuteAsync(missionType, llmSessionId, prompt, request.AllowScriptExecution, contextSnapshot, null, cancellationToken);
         }
 
         public async Task<KliveAgentBrainExecutionResult> DecideForEventAsync(
@@ -61,6 +67,8 @@ namespace Omnipotent.Services.KliveAgent
             CancellationToken cancellationToken)
         {
             var missionType = "live-event";
+            var profileScope = "autonomous-event-loop";
+            var llmSessionId = BuildLlmSessionId(missionType, profileScope, "autonomy");
             var memoryQuery = $"{observed.ServiceName} {observed.Message} {observed.ExceptionType} {observed.ExceptionMessage}";
             var memoryHits = _agent.SearchMemory(memoryQuery, 8);
             var memoryEntries = BuildMemoryEntries(memoryHits, 6);
@@ -71,6 +79,7 @@ namespace Omnipotent.Services.KliveAgent
             var prompt = BuildEventPrompt(observed, matchingRules, memoryHits, recentEvents);
             var contextSnapshot = new KliveAgentBrainContextSnapshot
             {
+                RequestingProfileScope = profileScope,
                 Goal = $"Handle live event from {observed.ServiceName}",
                 UserContext = BuildObservedEventFallbackMessage(observed, "live-event-context"),
                 PromptUsed = prompt,
@@ -79,11 +88,12 @@ namespace Omnipotent.Services.KliveAgent
                 MatchedRuleEntries = matchedRuleEntries
             };
 
-            return await QueryAndExecuteAsync(missionType, prompt, allowScriptExecution: true, contextSnapshot, observed, cancellationToken);
+            return await QueryAndExecuteAsync(missionType, llmSessionId, prompt, allowScriptExecution: true, contextSnapshot, observed, cancellationToken);
         }
 
         private async Task<KliveAgentBrainExecutionResult> QueryAndExecuteAsync(
             string missionType,
+            string llmSessionId,
             string prompt,
             bool allowScriptExecution,
             KliveAgentBrainContextSnapshot contextSnapshot,
@@ -96,6 +106,7 @@ namespace Omnipotent.Services.KliveAgent
                 MissionType = missionType,
                 RequestedAtUtc = DateTime.UtcNow,
                 CompletedAtUtc = DateTime.UtcNow,
+                LlmSessionId = llmSessionId,
                 ContextUsed = contextSnapshot
             };
 
@@ -107,7 +118,19 @@ namespace Omnipotent.Services.KliveAgent
                     return BuildFallbackResult(result, "KliveLLM service is unavailable.", observed);
                 }
 
-                var llmResponse = await llm.QueryLocalLLMAsync(prompt, $"kliveagent-brain-{missionType}");
+                var llmTask = llm.QueryLocalLLMAsync(prompt, llmSessionId);
+                var timeoutTask = Task.Delay(LlmDecisionTimeout, cancellationToken);
+                var completedTask = await Task.WhenAny(llmTask, timeoutTask);
+                if (!ReferenceEquals(completedTask, llmTask))
+                {
+                    llm.ResetSession(llmSessionId);
+                    return BuildFallbackResult(
+                        result,
+                        $"KliveLLM timed out after {(int)LlmDecisionTimeout.TotalSeconds} seconds.",
+                        observed);
+                }
+
+                var llmResponse = await llmTask;
                 if (!llmResponse.Success || string.IsNullOrWhiteSpace(llmResponse.Response))
                 {
                     var error = string.IsNullOrWhiteSpace(llmResponse.ErrorMessage)
@@ -117,7 +140,9 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 result.RawModelOutput = llmResponse.Response;
-                result.LlmSessionId = llmResponse.SessionId ?? string.Empty;
+                result.LlmSessionId = string.IsNullOrWhiteSpace(llmResponse.SessionId)
+                    ? llmSessionId
+                    : llmResponse.SessionId;
                 result.ApproxOutputTokens = EstimateTokenCount(llmResponse.Response);
                 var decision = ParseDecisionEnvelope(llmResponse.Response);
                 if (decision == null)
@@ -558,6 +583,42 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return $"[KliveAgent Fallback] {reason}\n{summary}";
+        }
+
+        private static string BuildLlmSessionId(string missionType, string profileScope, string? conversationId)
+        {
+            var safeMission = SanitizeSessionSegment(missionType, "mission");
+            var safeProfile = SanitizeSessionSegment(profileScope, "profile");
+            var safeConversation = SanitizeSessionSegment(conversationId, "default");
+            var sessionId = $"kliveagent-brain-{safeMission}-{safeProfile}-{safeConversation}";
+            return sessionId.Length > 140 ? sessionId[..140] : sessionId;
+        }
+
+        private static string SanitizeSessionSegment(string? value, string fallback)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return fallback;
+            }
+
+            var chars = value
+                .Trim()
+                .Select(ch => char.IsLetterOrDigit(ch) ? char.ToLowerInvariant(ch) : '-')
+                .ToArray();
+
+            var normalized = new string(chars);
+            while (normalized.Contains("--", StringComparison.Ordinal))
+            {
+                normalized = normalized.Replace("--", "-", StringComparison.Ordinal);
+            }
+
+            normalized = normalized.Trim('-');
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return fallback;
+            }
+
+            return normalized.Length > 50 ? normalized[..50] : normalized;
         }
     }
 }

@@ -19,8 +19,10 @@ namespace Omnipotent.Services.KliveAgent
         private readonly ConcurrentQueue<KliveAgentObservedEvent> _recentEvents = new();
         private readonly ConcurrentQueue<KliveAgentBrainExecutionResult> _decisionHistory = new();
         private readonly ConcurrentDictionary<string, DateTime> _cooldownIndex = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, Queue<DateTime>> _manualActionWindows = new(StringComparer.OrdinalIgnoreCase);
         private readonly Queue<DateTime> _autonomyActionWindow = new();
         private readonly object _autonomyLock = new();
+        private readonly object _manualActionLock = new();
 
         private CancellationTokenSource _shutdownToken = new();
         private OmniLogging? _logger;
@@ -29,6 +31,7 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentBrain _brain = null!;
 
         private const int MaxAutonomousActionsPerMinute = 6;
+        private const int MaxManualActionsPerMinutePerProfile = 10;
         private const int MaxRecentEvents = 300;
         private const int MaxDecisionHistory = 150;
         private static readonly TimeSpan DefaultEventCooldown = TimeSpan.FromMinutes(2);
@@ -362,6 +365,30 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
+        private bool TryClaimManualActionSlot(string profileScope)
+        {
+            var scope = string.IsNullOrWhiteSpace(profileScope) ? "anonymous" : profileScope;
+
+            lock (_manualActionLock)
+            {
+                var window = _manualActionWindows.GetOrAdd(scope, _ => new Queue<DateTime>());
+                var now = DateTime.UtcNow;
+
+                while (window.Count > 0 && (now - window.Peek()).TotalSeconds > 60)
+                {
+                    window.Dequeue();
+                }
+
+                if (window.Count >= MaxManualActionsPerMinutePerProfile)
+                {
+                    return false;
+                }
+
+                window.Enqueue(now);
+                return true;
+            }
+        }
+
         private async Task NotifyKlivesAsync(KliveAgentObservedEvent observed, string reason)
         {
             var discord = await ResolveServiceAsync<KliveBotDiscord>();
@@ -563,10 +590,16 @@ namespace Omnipotent.Services.KliveAgent
                 return;
             }
 
-            if (!TryClaimAutonomousActionSlot())
+            model.RequestingProfileScope = BuildProfileScope(req);
+            if (string.IsNullOrWhiteSpace(model.ConversationId))
+            {
+                model.ConversationId = "default";
+            }
+
+            if (!TryClaimManualActionSlot(model.RequestingProfileScope))
             {
                 await req.ReturnResponse(
-                    JsonConvert.SerializeObject(new { error = "KliveAgent is rate-limited. Try again shortly." }),
+                    JsonConvert.SerializeObject(new { error = "KliveAgent request rate limit reached for this profile. Try again shortly." }),
                     code: System.Net.HttpStatusCode.TooManyRequests);
                 return;
             }
@@ -605,9 +638,15 @@ namespace Omnipotent.Services.KliveAgent
                     return;
                 }
 
-                if (!TryClaimAutonomousActionSlot())
+                model.RequestingProfileScope = BuildProfileScope(req);
+                if (string.IsNullOrWhiteSpace(model.ConversationId))
                 {
-                    await WriteSseEventAsync(writer, "error", "KliveAgent is rate-limited. Try again shortly.");
+                    model.ConversationId = "default";
+                }
+
+                if (!TryClaimManualActionSlot(model.RequestingProfileScope))
+                {
+                    await WriteSseEventAsync(writer, "error", "KliveAgent request rate limit reached for this profile. Try again shortly.");
                     await WriteSseEventAsync(writer, "done", "rate_limited");
                     return;
                 }
@@ -669,6 +708,45 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return Math.Clamp(parsed, min, max);
+        }
+
+        private static string BuildProfileScope(UserRequest req)
+        {
+            if (req.user == null)
+            {
+                return "anonymous";
+            }
+
+            var userId = SanitizeScopeSegment(req.user.UserID, "nouid");
+            var name = SanitizeScopeSegment(req.user.Name, "unknown");
+            return $"{name}-{userId}";
+        }
+
+        private static string SanitizeScopeSegment(string? value, string fallback)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return fallback;
+            }
+
+            var chars = value
+                .Trim()
+                .Select(ch => char.IsLetterOrDigit(ch) ? char.ToLowerInvariant(ch) : '-')
+                .ToArray();
+
+            var normalized = new string(chars);
+            while (normalized.Contains("--", StringComparison.Ordinal))
+            {
+                normalized = normalized.Replace("--", "-", StringComparison.Ordinal);
+            }
+
+            normalized = normalized.Trim('-');
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return fallback;
+            }
+
+            return normalized.Length > 32 ? normalized[..32] : normalized;
         }
 
         private static IEnumerable<string> SplitForStreaming(string text)
