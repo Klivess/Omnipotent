@@ -23,6 +23,7 @@ using Newtonsoft.Json.Linq;
 using System.Security.Policy;
 using System.IO.Compression;
 using System.Net.Http.Headers;
+using HuggingFace;
 
 namespace Omnipotent.Services.KliveLocalLLM
 {
@@ -172,12 +173,32 @@ namespace Omnipotent.Services.KliveLocalLLM
             var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", false);
             if (useHuggingFaceProvider)
             {
-                return await QueryLLMViaHuggingFaceAsync(
+                var hfResponse = await QueryLLMViaHuggingFaceAsync(
                     prompt,
                     sessionId,
                     maxTokensOverride,
                     resetSessionBeforeQuery,
                     resetSessionAfterQuery);
+
+                if (!hfResponse.Success && ShouldFallbackToLocalForHuggingFaceError(hfResponse.ErrorMessage))
+                {
+                    await ServiceLog($"HuggingFace provider unavailable for model '{HuggingFaceNovitaModelId}'. Falling back to local model. Error={hfResponse.ErrorMessage}");
+                    var localFallback = await QueryLocalLLMAsync(
+                        prompt,
+                        sessionId,
+                        maxTokensOverride,
+                        resetSessionBeforeQuery,
+                        resetSessionAfterQuery);
+
+                    if (localFallback.Success)
+                    {
+                        return localFallback;
+                    }
+
+                    await ServiceLogError($"Local fallback also failed after HuggingFace error. HuggingFace={hfResponse.ErrorMessage} | Local={localFallback.ErrorMessage}");
+                }
+
+                return hfResponse;
             }
 
             return await QueryLocalLLMAsync(
@@ -325,47 +346,97 @@ namespace Omnipotent.Services.KliveLocalLLM
             int? maxTokensOverride,
             string? sessionId)
         {
-            try
+            var modelCandidates = new List<string> { HuggingFaceNovitaModelId };
+            var aliasSeparatorIndex = HuggingFaceNovitaModelId.IndexOf(':');
+            if (aliasSeparatorIndex > 0)
             {
-                var configuration = new HuggingFaceConfiguration
-                {
-                    ApiKey = huggingFaceToken,
-                    ModelId = HuggingFaceNovitaModelId,
-                    MaxNewTokens = Math.Clamp(maxTokensOverride ?? 256, 32, 4096)
-                };
-
-                var provider = new HuggingFaceProvider(configuration, client);
-                var chatModel = new HuggingFaceChatModel(provider, HuggingFaceNovitaModelId);
-
-                var providerMessages = BuildProviderMessages(messages);
-                if (providerMessages.Count == 0)
-                {
-                    return (false, string.Empty, "HuggingFace provider request had no valid messages.", "no-messages");
-                }
-
-                var request = ChatRequest.ToChatRequest(providerMessages);
-                var settings = new ChatSettings()
-                {
-                    UseStreaming = false,
-                    User = string.IsNullOrWhiteSpace(sessionId) ? "kliveagent" : sessionId
-                };
-
-                var response = await chatModel.GenerateAsync(request, settings, CancellationToken.None);
-                var rawText = ExtractContentFromProviderResponse(response);
-                var outStr = SanitizeLocalModelOutput(rawText);
-                var finishReason = response?.FinishReason.ToString() ?? "unknown";
-                var diagnostic = $"finish_reason={finishReason};raw_chars={rawText.Length};sanitized_chars={outStr.Length};messages={providerMessages.Count}";
-
-                return (true, outStr, string.Empty, diagnostic);
+                modelCandidates.Add(HuggingFaceNovitaModelId[..aliasSeparatorIndex]);
             }
-            catch (Exception ex)
+
+            Exception? lastException = null;
+            string lastDiagnostic = string.Empty;
+
+            foreach (var modelId in modelCandidates.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var configuration = new HuggingFaceConfiguration
+                    {
+                        ApiKey = huggingFaceToken,
+                        ModelId = modelId,
+                        MaxNewTokens = Math.Clamp(maxTokensOverride ?? 256, 32, 4096)
+                    };
+
+                    var provider = new HuggingFaceProvider(configuration, client);
+                    var chatModel = new HuggingFaceChatModel(provider, modelId);
+
+                    var providerMessages = BuildProviderMessages(messages);
+                    if (providerMessages.Count == 0)
+                    {
+                        return (false, string.Empty, "HuggingFace provider request had no valid messages.", "no-messages");
+                    }
+
+                    var request = ChatRequest.ToChatRequest(providerMessages);
+                    var settings = new ChatSettings()
+                    {
+                        UseStreaming = false,
+                        User = string.IsNullOrWhiteSpace(sessionId) ? "kliveagent" : sessionId
+                    };
+
+                    var response = await chatModel.GenerateAsync(request, settings, CancellationToken.None);
+                    var rawText = ExtractContentFromProviderResponse(response);
+                    var outStr = SanitizeLocalModelOutput(rawText);
+                    var finishReason = response?.FinishReason.ToString() ?? "unknown";
+                    var diagnostic = $"model={modelId};finish_reason={finishReason};raw_chars={rawText.Length};sanitized_chars={outStr.Length};messages={providerMessages.Count}";
+
+                    return (true, outStr, string.Empty, diagnostic);
+                }
+                catch (ApiException apiEx) when (apiEx.StatusCode == HttpStatusCode.Gone || apiEx.StatusCode == HttpStatusCode.NotFound)
+                {
+                    lastException = apiEx;
+                    lastDiagnostic = $"model={modelId};status={(int)apiEx.StatusCode};body={TruncateForLog(apiEx.ResponseBody, 800)}";
+                    continue;
+                }
+                catch (Exception ex)
+                {
+                    lastException = ex;
+                    lastDiagnostic = $"model={modelId};{ex.GetType().Name}:{TruncateForLog(ex.Message, 400)}";
+                    break;
+                }
+            }
+
+            if (lastException is ApiException finalApiException)
             {
                 return (
                     false,
                     string.Empty,
-                    $"HuggingFace provider request failed: {ex.Message}",
-                    $"{ex.GetType().Name}: {TruncateForLog(ex.StackTrace, 600)}");
+                    $"HuggingFace provider request failed: {(int)finalApiException.StatusCode} {finalApiException.StatusCode}",
+                    lastDiagnostic);
             }
+
+            if (lastException != null)
+            {
+                return (
+                    false,
+                    string.Empty,
+                    $"HuggingFace provider request failed: {lastException.Message}",
+                    lastDiagnostic);
+            }
+
+            return (false, string.Empty, "HuggingFace provider request failed: Unknown error", "unknown-error");
+        }
+
+        private static bool ShouldFallbackToLocalForHuggingFaceError(string? errorMessage)
+        {
+            if (string.IsNullOrWhiteSpace(errorMessage))
+            {
+                return false;
+            }
+
+            return errorMessage.Contains(" 410 ", StringComparison.OrdinalIgnoreCase)
+                || errorMessage.Contains("gone", StringComparison.OrdinalIgnoreCase)
+                || errorMessage.Contains("notfound", StringComparison.OrdinalIgnoreCase)
+                || errorMessage.Contains("not found", StringComparison.OrdinalIgnoreCase);
         }
 
         private static IReadOnlyList<Message> BuildProviderMessages(IReadOnlyList<KliveLLMMessage> messages)
