@@ -56,6 +56,9 @@ namespace Omnipotent.Data_Handling
             public static string KliveAgentMemoryDirectory = $"{KliveAgentDirectory}/Memory";
             public static string KliveAgentPlaybooksDirectory = $"{KliveAgentDirectory}/Playbooks";
             public static string KliveAgentEventsDirectory = $"{KliveAgentDirectory}/Events";
+            public static string KliveAgentVoiceModelsDirectory = $"{KliveAgentDirectory}/VoiceModels";
+            public static string SileroVadModelsDirectory = $"{KliveAgentVoiceModelsDirectory}/SileroVAD";
+            public static string FastSttModelsDirectory = $"{KliveAgentVoiceModelsDirectory}/FastSTT";
 
             //KliveTechHub
             public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
