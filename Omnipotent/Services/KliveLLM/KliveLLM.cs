@@ -7,7 +7,6 @@ using LLama.Common;
 using LLama.Native;
 using LLama.Sampling;
 using Markdig.Extensions.TaskLists;
-using LangChain.Providers.HuggingFace;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System.Net;
@@ -24,19 +23,25 @@ using System.Security.Policy;
 using System.IO.Compression;
 using System.Net.Http.Headers;
 using HuggingFace;
+using Omnipotent.Services.KliveLLM;
+using System.ServiceModel;
 
-namespace Omnipotent.Services.KliveLocalLLM
+namespace Omnipotent.Services.KliveLLM
 {
     public class KliveLLM : OmniService
     {
         private string huggingFaceToken = "";
         private HttpClient client;
         private string ModelDownloadUrl = "";
-        private const string HuggingFaceNovitaModelId = "openai/gpt-oss-120b:novita";
         private static string LLamaBinariesDownloadPath;
         private static string LLamaBinariesFolder = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLamaBinariesDirectory);
         public static string LLamaDLLFile = Path.Combine(LLamaBinariesFolder, "llama.dll");
         public static string LLamaMTMDFile = Path.Combine(LLamaBinariesFolder, "mtmd.dll");
+        private string modelPath;
+        private ModelParams modelParams;
+        private LLamaWeights modelWeights;
+        private bool localModelReady = false;
+        private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
         public KliveLLM()
         {
             name = "KliveLLM";
@@ -54,15 +59,18 @@ namespace Omnipotent.Services.KliveLocalLLM
             await EnsureLlamaBinariesAvailableAsync();
             NativeLibraryConfig.All.WithLibrary(LLamaDLLFile, LLamaMTMDFile);
 
-            try
+            if (await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
             {
-                await EnsureModelDownloadedAsync();
-                await InitializeLocalModelAsync();
-            }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, $"INIT FAILED: {ex.Message} | Inner: {ex.InnerException?.Message} | Stack: {ex.StackTrace}");
-                return;
+                try
+                {
+                    await EnsureModelDownloadedAsync();
+                    await InitializeLocalModelAsync();
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"INIT FAILED: {ex.Message} | Inner: {ex.InnerException?.Message} | Stack: {ex.StackTrace}");
+                    return;
+                }
             }
         }
 
@@ -166,37 +174,15 @@ namespace Omnipotent.Services.KliveLocalLLM
         public async Task<KliveLLMResponse> QueryLLM(
             string prompt,
             string? sessionId = null,
-            int? maxTokensOverride = null,
-            bool resetSessionBeforeQuery = false,
-            bool resetSessionAfterQuery = false)
+            int? maxTokensOverride = null)
         {
-            var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", false);
+            var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", true);
             if (useHuggingFaceProvider)
             {
                 var hfResponse = await QueryLLMViaHuggingFaceAsync(
                     prompt,
                     sessionId,
-                    maxTokensOverride,
-                    resetSessionBeforeQuery,
-                    resetSessionAfterQuery);
-
-                if (!hfResponse.Success && ShouldFallbackToLocalForHuggingFaceError(hfResponse.ErrorMessage))
-                {
-                    await ServiceLog($"HuggingFace provider unavailable for model '{HuggingFaceNovitaModelId}'. Falling back to local model. Error={hfResponse.ErrorMessage}");
-                    var localFallback = await QueryLocalLLMAsync(
-                        prompt,
-                        sessionId,
-                        maxTokensOverride,
-                        resetSessionBeforeQuery,
-                        resetSessionAfterQuery);
-
-                    if (localFallback.Success)
-                    {
-                        return localFallback;
-                    }
-
-                    await ServiceLogError($"Local fallback also failed after HuggingFace error. HuggingFace={hfResponse.ErrorMessage} | Local={localFallback.ErrorMessage}");
-                }
+                    maxTokensOverride);
 
                 return hfResponse;
             }
@@ -204,404 +190,62 @@ namespace Omnipotent.Services.KliveLocalLLM
             return await QueryLocalLLMAsync(
                 prompt,
                 sessionId,
-                maxTokensOverride,
-                resetSessionBeforeQuery,
-                resetSessionAfterQuery);
+                maxTokensOverride);
         }
 
-        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(
-            string prompt,
-            string? sessionId,
-            int? maxTokensOverride,
-            bool resetSessionBeforeQuery = false,
-            bool resetSessionAfterQuery = false)
+        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(string prompt, string? sessionId, int? maxTokensOverride)
         {
-            var resp = new KliveLLMResponse()
+            // ensure session
+            if (string.IsNullOrEmpty(sessionId))
             {
-                Response = string.Empty,
-                Conversation = new List<KliveLLMMessage>(),
-                Success = false,
-                ErrorMessage = string.Empty,
-                SessionId = string.IsNullOrWhiteSpace(sessionId) ? string.Empty : sessionId
-            };
+                sessionId = Guid.NewGuid().ToString();
+                var s = new KliveLLMSession(this, false) { sessionId = sessionId };
+                lock (sessions)
+                {
+                    sessions[sessionId] = s;
+                }
+            }
 
-            try
+            KliveLLMSession session;
+            lock (sessions)
             {
-                if (resetSessionBeforeQuery && !string.IsNullOrWhiteSpace(sessionId))
+                if (!sessions.TryGetValue(sessionId, out session))
                 {
-                    ResetSession(sessionId);
+                    session = new KliveLLMSession(this, false) { sessionId = sessionId };
+                    sessions[sessionId] = session;
                 }
-
-                if (string.IsNullOrWhiteSpace(sessionId))
-                {
-                    sessionId = Guid.NewGuid().ToString();
-                }
-
-                resp.SessionId = sessionId;
-
-                KliveOnlineLLMSession session;
-                lock (onlineSessions)
-                {
-                    if (!onlineSessions.TryGetValue(sessionId, out session))
-                    {
-                        session = new KliveOnlineLLMSession() { sessionId = sessionId };
-                        onlineSessions[sessionId] = session;
-                    }
-                }
-
-                await session.sessionLock.WaitAsync();
-                try
-                {
-                    var userMessage = new KliveLLMMessage() { role = "user", content = prompt };
-                    session.messages.Add(userMessage);
-                    session.lastUpdated = DateTime.UtcNow;
-
-                    int contextMessagesToInclude = Math.Clamp(
-                        await GetIntOmniSetting("HuggingFaceChatContextMessageCount", 24),
-                        2,
-                        80);
-
-                    int contextCharBudget = Math.Clamp(
-                        await GetIntOmniSetting("HuggingFaceChatContextCharBudget", 18000),
-                        2000,
-                        120000);
-
-                    var selectedMessages = SelectMessagesForOnlineContext(
-                        session.messages,
-                        contextMessagesToInclude,
-                        contextCharBudget);
-
-                    var primaryAttempt = await SendHuggingFaceChatCompletionAsync(selectedMessages, maxTokensOverride, sessionId);
-                    if (!primaryAttempt.RequestSucceeded)
-                    {
-                        RemoveLastUserMessageIfUnanswered(session, userMessage);
-                        resp.ErrorMessage = primaryAttempt.ErrorMessage;
-                        await ServiceLogError($"{resp.ErrorMessage} | {primaryAttempt.Diagnostic}");
-                        return resp;
-                    }
-
-                    var outStr = primaryAttempt.Output;
-                    if (string.IsNullOrWhiteSpace(outStr))
-                    {
-                        // If context gets too large/noisy, retry once with only current prompt.
-                        var retryAttempt = await SendHuggingFaceChatCompletionAsync(new List<KliveLLMMessage> { userMessage }, maxTokensOverride, sessionId);
-                        if (!retryAttempt.RequestSucceeded)
-                        {
-                            RemoveLastUserMessageIfUnanswered(session, userMessage);
-                            resp.ErrorMessage = retryAttempt.ErrorMessage;
-                            await ServiceLogError($"{resp.ErrorMessage} | primary={primaryAttempt.Diagnostic} | retry={retryAttempt.Diagnostic}");
-                            return resp;
-                        }
-
-                        outStr = retryAttempt.Output;
-                        if (string.IsNullOrWhiteSpace(outStr))
-                        {
-                            RemoveLastUserMessageIfUnanswered(session, userMessage);
-                            resp.ErrorMessage = "HuggingFace router returned empty content.";
-                            await ServiceLogError($"{resp.ErrorMessage} | primary={primaryAttempt.Diagnostic} | retry={retryAttempt.Diagnostic}");
-                            return resp;
-                        }
-
-                        await ServiceLog($"HuggingFace empty-content retry succeeded for session {sessionId}. primary={primaryAttempt.Diagnostic}; retry={retryAttempt.Diagnostic}");
-                    }
-
-                session.messages.Add(new KliveLLMMessage() { role = "assistant", content = outStr });
+            }
+            session.chatHistory.AddMessage(AuthorRole.User, prompt);
+            var response = await SendHFAIInferenceRequest(session.chatHistory);
+            {
+                session.chatHistory.AddMessage(AuthorRole.Assistant, response.choices[0].message.content);
                 session.lastUpdated = DateTime.UtcNow;
 
-                resp.Response = outStr;
-                resp.Conversation = session.messages
-                    .Select(msg => new KliveLLMMessage() { role = msg.role, content = msg.content })
-                    .ToList();
-                resp.Success = true;
-
-                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
+                return new KliveLLMResponse()
                 {
-                    ResetSession(sessionId);
-                }
-
-                return resp;
-            }
-                finally
-                {
-                    session.sessionLock.Release();
-                }
-            }
-            catch (Exception ex)
-            {
-                string fullError = $"{ex.GetType().Name}: {ex.Message} | Inner: {ex.InnerException?.GetType().Name}: {ex.InnerException?.Message} | Stack: {ex.StackTrace}";
-                await ServiceLogError(ex, fullError);
-                resp.ErrorMessage = fullError;
-
-                if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
-                {
-                    ResetSession(sessionId);
-                }
-
-                return resp;
+                    Response = response.choices[0].message.content,
+                    SessionId = sessionId,
+                    Conversation = session.chatHistory,
+                    Success = true,
+                };
             }
         }
 
-        private async Task<(bool RequestSucceeded, string Output, string ErrorMessage, string Diagnostic)> SendHuggingFaceChatCompletionAsync(
-            IReadOnlyList<KliveLLMMessage> messages,
-            int? maxTokensOverride,
-            string? sessionId)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendHFAIInferenceRequest(ChatHistory messages)
         {
-            var modelCandidates = new List<string> { HuggingFaceNovitaModelId };
-            var aliasSeparatorIndex = HuggingFaceNovitaModelId.IndexOf(':');
-            if (aliasSeparatorIndex > 0)
+            var modelCandidates = new List<string> { await GetStringOmniSetting("HuggingFaceModelID", "meta-llama/Llama-3.1-8B-Instruct:cerebras") };
+
+            HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
-                modelCandidates.Add(HuggingFaceNovitaModelId[..aliasSeparatorIndex]);
-            }
-
-            Exception? lastException = null;
-            string lastDiagnostic = string.Empty;
-
-            foreach (var modelId in modelCandidates.Distinct(StringComparer.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    var configuration = new HuggingFaceConfiguration
-                    {
-                        ApiKey = huggingFaceToken,
-                        ModelId = modelId,
-                        MaxNewTokens = Math.Clamp(maxTokensOverride ?? 256, 32, 4096)
-                    };
-
-                    var provider = new HuggingFaceProvider(configuration, client);
-                    var chatModel = new HuggingFaceChatModel(provider, modelId);
-
-                    var providerMessages = BuildProviderMessages(messages);
-                    if (providerMessages.Count == 0)
-                    {
-                        return (false, string.Empty, "HuggingFace provider request had no valid messages.", "no-messages");
-                    }
-
-                    var request = ChatRequest.ToChatRequest(providerMessages);
-                    var settings = new ChatSettings()
-                    {
-                        UseStreaming = false,
-                        User = string.IsNullOrWhiteSpace(sessionId) ? "kliveagent" : sessionId
-                    };
-
-                    var response = await chatModel.GenerateAsync(request, settings, CancellationToken.None);
-                    var rawText = ExtractContentFromProviderResponse(response);
-                    var outStr = SanitizeLocalModelOutput(rawText);
-                    var finishReason = response?.FinishReason.ToString() ?? "unknown";
-                    var diagnostic = $"model={modelId};finish_reason={finishReason};raw_chars={rawText.Length};sanitized_chars={outStr.Length};messages={providerMessages.Count}";
-
-                    return (true, outStr, string.Empty, diagnostic);
-                }
-                catch (ApiException apiEx) when (apiEx.StatusCode == HttpStatusCode.Gone || apiEx.StatusCode == HttpStatusCode.NotFound)
-                {
-                    lastException = apiEx;
-                    lastDiagnostic = $"model={modelId};status={(int)apiEx.StatusCode};body={TruncateForLog(apiEx.ResponseBody, 800)}";
-                    continue;
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    lastDiagnostic = $"model={modelId};{ex.GetType().Name}:{TruncateForLog(ex.Message, 400)}";
-                    break;
-                }
-            }
-
-            if (lastException is ApiException finalApiException)
-            {
-                return (
-                    false,
-                    string.Empty,
-                    $"HuggingFace provider request failed: {(int)finalApiException.StatusCode} {finalApiException.StatusCode}",
-                    lastDiagnostic);
-            }
-
-            if (lastException != null)
-            {
-                return (
-                    false,
-                    string.Empty,
-                    $"HuggingFace provider request failed: {lastException.Message}",
-                    lastDiagnostic);
-            }
-
-            return (false, string.Empty, "HuggingFace provider request failed: Unknown error", "unknown-error");
-        }
-
-        private static bool ShouldFallbackToLocalForHuggingFaceError(string? errorMessage)
-        {
-            if (string.IsNullOrWhiteSpace(errorMessage))
-            {
-                return false;
-            }
-
-            return errorMessage.Contains(" 410 ", StringComparison.OrdinalIgnoreCase)
-                || errorMessage.Contains("gone", StringComparison.OrdinalIgnoreCase)
-                || errorMessage.Contains("notfound", StringComparison.OrdinalIgnoreCase)
-                || errorMessage.Contains("not found", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static IReadOnlyList<Message> BuildProviderMessages(IReadOnlyList<KliveLLMMessage> messages)
-        {
-            var providerMessages = new List<Message>
-            {
-                new Message("You are a helpful assistant. /no_think", MessageRole.System, string.Empty)
+                model = modelCandidates[0],
+                stream = false
             };
-
-            foreach (var message in messages)
-            {
-                if (string.IsNullOrWhiteSpace(message?.content))
-                {
-                    continue;
-                }
-
-                providerMessages.Add(new Message(
-                    message.content,
-                    ToProviderMessageRole(message.role),
-                    string.Empty));
-            }
-
-            return providerMessages;
+            payload.BuildMessagesFromChatHistory(messages);
+            var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json"));
+            string responseContent = await response.Content.ReadAsStringAsync();
+            var hfResponse = JsonConvert.DeserializeObject<HFWrapper.HFLLMInferenceResponse>(responseContent);
+            return hfResponse;
         }
-
-        private static MessageRole ToProviderMessageRole(string? role)
-        {
-            if (string.IsNullOrWhiteSpace(role))
-            {
-                return MessageRole.Human;
-            }
-
-            if (role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
-            {
-                return MessageRole.Ai;
-            }
-
-            if (role.Equals("system", StringComparison.OrdinalIgnoreCase))
-            {
-                return MessageRole.System;
-            }
-
-            return MessageRole.Human;
-        }
-
-        private static List<KliveLLMMessage> SelectMessagesForOnlineContext(
-            IReadOnlyList<KliveLLMMessage> messages,
-            int maxMessages,
-            int maxCharacters)
-        {
-            var selected = new List<KliveLLMMessage>();
-            var remaining = Math.Max(1000, maxCharacters);
-
-            for (int i = messages.Count - 1; i >= 0; i--)
-            {
-                var message = messages[i];
-                if (string.IsNullOrWhiteSpace(message?.content))
-                {
-                    continue;
-                }
-
-                var messageCost = message.content.Length + 16;
-                if (selected.Count > 0 && remaining - messageCost < 0)
-                {
-                    break;
-                }
-
-                selected.Add(message);
-                remaining -= messageCost;
-                if (selected.Count >= maxMessages)
-                {
-                    break;
-                }
-            }
-
-            selected.Reverse();
-            return selected;
-        }
-
-        private static void RemoveLastUserMessageIfUnanswered(KliveOnlineLLMSession session, KliveLLMMessage userMessage)
-        {
-            if (session.messages.Count == 0)
-            {
-                return;
-            }
-
-            if (ReferenceEquals(session.messages[^1], userMessage))
-            {
-                session.messages.RemoveAt(session.messages.Count - 1);
-            }
-        }
-
-        private static string TruncateForLog(string? value, int maxChars)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return string.Empty;
-            }
-
-            if (value.Length <= maxChars)
-            {
-                return value;
-            }
-
-            return value.Substring(0, Math.Max(0, maxChars - 3)) + "...";
-        }
-
-        private static string ExtractContentFromProviderResponse(LangChain.Providers.ChatResponse? response)
-        {
-            if (response == null)
-            {
-                return string.Empty;
-            }
-
-            if (!string.IsNullOrWhiteSpace(response.LastMessageContent))
-            {
-                return response.LastMessageContent;
-            }
-
-            var lastMessageText = response.LastMessage.ToString();
-            if (!string.IsNullOrWhiteSpace(lastMessageText))
-            {
-                return lastMessageText;
-            }
-
-            if (!string.IsNullOrWhiteSpace(response.Delta?.Content))
-            {
-                return response.Delta.Content;
-            }
-
-            if (response.Messages != null)
-            {
-                foreach (var msg in response.Messages.Reverse())
-                {
-                    var msgText = msg.ToString();
-                    if (!string.IsNullOrWhiteSpace(msgText))
-                    {
-                        return msgText;
-                    }
-                }
-            }
-
-            if (response.ToolCalls != null)
-            {
-                var toolArgs = response.ToolCalls
-                    .Select(call => call.ToolArguments ?? string.Empty)
-                    .Where(arg => !string.IsNullOrWhiteSpace(arg))
-                    .ToList();
-                if (toolArgs.Count > 0)
-                {
-                    return string.Join("\n", toolArgs);
-                }
-            }
-
-            return string.Empty;
-        }
-
-        // Local model support (download + reflective loader)
-        private string modelPath;
-        private ModelParams modelParams;
-        private LLamaWeights modelWeights;
-        private bool localModelReady = false;
-        private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
-        private Dictionary<string, KliveOnlineLLMSession> onlineSessions = new Dictionary<string, KliveOnlineLLMSession>();
-
         private async Task EnsureModelDownloadedAsync()
         {
             try { await ServiceLog($"Ensuring model exists at startup: {ModelDownloadUrl}"); } catch { }
@@ -694,10 +338,9 @@ namespace Omnipotent.Services.KliveLocalLLM
                 }
                 catch { }
             }
-            ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",$"Local LLM model downloaded.");
+            ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"Local LLM model downloaded.");
             try { await ServiceLog($"Downloaded model to {modelPath}"); } catch { }
         }
-
         private async Task InitializeLocalModelAsync()
         {
             await Task.Yield();
@@ -719,22 +362,20 @@ namespace Omnipotent.Services.KliveLocalLLM
                 localModelReady = true;
                 await ServiceLog("Local model initialized successfully");
             }
-            catch(Exception e)
+            catch (Exception e)
             {
                 // ignore errors - leave localModelReady false
                 try { await ServiceLogError(e, "Failed to initialize local model"); } catch { }
             }
         }
-
         public class KliveLLMResponse
         {
             public string Response { get; set; }
             public string SessionId { get; set; }
-            public List<KliveLLMMessage> Conversation { get; set; }
+            public ChatHistory Conversation { get; set; }
             public bool Success { get; set; }
             public string ErrorMessage { get; set; }
         }
-
         public void ResetSession(string? sessionId)
         {
             if (string.IsNullOrWhiteSpace(sessionId))
@@ -746,11 +387,6 @@ namespace Omnipotent.Services.KliveLocalLLM
             {
                 sessions.Remove(sessionId);
             }
-
-            lock (onlineSessions)
-            {
-                onlineSessions.Remove(sessionId);
-            }
         }
 
         private async Task<KliveLLMResponse> QueryLocalLLMAsync(
@@ -760,7 +396,7 @@ namespace Omnipotent.Services.KliveLocalLLM
             bool resetSessionBeforeQuery = false,
             bool resetSessionAfterQuery = false)
         {
-            var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = string.Empty };
+            var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new ChatHistory(), Success = false, ErrorMessage = string.Empty };
             if (!localModelReady || modelWeights == null)
             {
                 resp.ErrorMessage = "Local model not available";
@@ -779,7 +415,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 if (string.IsNullOrEmpty(sessionId))
                 {
                     sessionId = Guid.NewGuid().ToString();
-                    var s = new KliveLLMSession(this, modelWeights, modelParams) { sessionId = sessionId };
+                    var s = new KliveLLMSession(this, true) { sessionId = sessionId };
                     lock (sessions)
                     {
                         sessions[sessionId] = s;
@@ -791,7 +427,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     if (!sessions.TryGetValue(sessionId, out session))
                     {
-                        session = new KliveLLMSession(this, modelWeights, modelParams) { sessionId = sessionId };
+                        session = new KliveLLMSession(this, true) { sessionId = sessionId };
                         sessions[sessionId] = session;
                     }
                 }
@@ -799,8 +435,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 await session.sessionLock.WaitAsync();
                 try
                 {
-                    var userMsg = new KliveLLMMessage() { role = "user", content = prompt };
-                    session.messages.Add(userMsg);
+                    session.chatHistory.AddMessage(AuthorRole.User, prompt);
                     session.lastUpdated = DateTime.UtcNow;
                     try { await ServiceLog($"Querying local model for session {sessionId}"); } catch { }
 
@@ -842,13 +477,12 @@ namespace Omnipotent.Services.KliveLocalLLM
                     if (string.IsNullOrWhiteSpace(outStr))
                         outStr = "[No response. Error?]";
 
-                    var assistantMsg = new KliveLLMMessage() { role = "assistant", content = outStr };
-                    session.messages.Add(assistantMsg);
+                    session.chatHistory.AddMessage(AuthorRole.Assistant, outStr);
                     session.lastUpdated = DateTime.UtcNow;
 
                     resp.Response = outStr;
                     resp.SessionId = sessionId;
-                    resp.Conversation = session.messages;
+                    resp.Conversation = session.chatHistory;
                     resp.Success = true;
                     if (resetSessionAfterQuery && !string.IsNullOrWhiteSpace(sessionId))
                     {
@@ -870,7 +504,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     ResetSession(sessionId);
                 }
-                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new ChatHistory(), Success = false, ErrorMessage = fullError };
             }
             catch (Exception ex)
             {
@@ -880,7 +514,7 @@ namespace Omnipotent.Services.KliveLocalLLM
                 {
                     ResetSession(sessionId);
                 }
-                return new KliveLLMResponse() { Response = string.Empty, Conversation = new List<KliveLLMMessage>(), Success = false, ErrorMessage = fullError };
+                return new KliveLLMResponse() { Response = string.Empty, Conversation = new ChatHistory(), Success = false, ErrorMessage = fullError };
             }
         }
 
@@ -957,39 +591,32 @@ namespace Omnipotent.Services.KliveLocalLLM
             private KliveLLM parentService;
 
             public string sessionId;
-            public List<KliveLLMMessage> messages = new List<KliveLLMMessage>();
             public DateTime lastUpdated;
             public ChatHistory chatHistory;
-            public ChatSession chatSession;
-            public LLamaContext context;
-            public InteractiveExecutor executor;
-            public readonly System.Threading.SemaphoreSlim sessionLock = new System.Threading.SemaphoreSlim(1, 1);
 
-            public KliveLLMSession(KliveLLM parentService, LLamaWeights modelWeights, ModelParams modelParams)
+
+            //local
+            public LLamaContext? context;
+            public InteractiveExecutor? executor;
+            public bool isLocalLLM;
+            public readonly System.Threading.SemaphoreSlim sessionLock = new System.Threading.SemaphoreSlim(1, 1);
+            public ChatSession? chatSession;
+
+            public KliveLLMSession(KliveLLM parentService, bool isLocalLLM, LLamaWeights modelWeights=null, ModelParams modelParams=null)
             {
+                this.isLocalLLM = isLocalLLM;
                 this.parentService = parentService;
                 this.lastUpdated = DateTime.UtcNow;
-                context = modelWeights.CreateContext(modelParams);
-                executor = new InteractiveExecutor(context);
+                if (isLocalLLM)
+                {
+                    context = modelWeights.CreateContext(modelParams);
+                    executor = new InteractiveExecutor(context);
+                    chatSession = new ChatSession(executor, chatHistory);
+                }
                 chatHistory = new ChatHistory();
                 // Seed system prompt - can be customized
                 chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant. /no_think");
-                chatSession = new ChatSession(executor, chatHistory);
             }
-        }
-
-        public class KliveLLMMessage
-        {
-            public string content;
-            public string role;
-        }
-
-        public class KliveOnlineLLMSession
-        {
-            public string sessionId = string.Empty;
-            public List<KliveLLMMessage> messages = new List<KliveLLMMessage>();
-            public DateTime lastUpdated = DateTime.UtcNow;
-            public readonly System.Threading.SemaphoreSlim sessionLock = new System.Threading.SemaphoreSlim(1, 1);
         }
     }
 }

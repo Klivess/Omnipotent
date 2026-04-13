@@ -6,7 +6,7 @@ using Microsoft.Extensions.Caching.Memory;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
-using Omnipotent.Services.KliveLocalLLM;
+using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.MemeScraper;
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
@@ -718,7 +718,7 @@ namespace Omnipotent.Services.OmniGram
 
             try
             {
-                var aiResponse = await ExecuteServiceMethod<KliveLLM>("QueryLLM", prompt);
+                var aiResponse = await ExecuteServiceMethod<KliveLLM.KliveLLM>("QueryLLM", prompt);
                 return aiResponse?.ToString() ?? post.UserCaption ?? "";
             }
             catch

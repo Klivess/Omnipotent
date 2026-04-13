@@ -4,7 +4,6 @@ using DontPanic.TumblrSharp.OAuth;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
-using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.MemeScraper;
 using System.Security.Cryptography;
 
@@ -679,7 +678,7 @@ namespace Omnipotent.Services.OmniTumblr
 
             try
             {
-                var aiResponse = await ExecuteServiceMethod<KliveLLM>("QueryLLM", prompt);
+                var aiResponse = await ExecuteServiceMethod<KliveLLM.KliveLLM>("QueryLLM", prompt);
                 return aiResponse?.ToString() ?? post.UserCaption ?? "";
             }
             catch

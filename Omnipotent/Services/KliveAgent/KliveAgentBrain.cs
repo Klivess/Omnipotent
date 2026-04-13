@@ -1,7 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Logging;
-using Omnipotent.Services.KliveLocalLLM;
 using System.Text;
 
 namespace Omnipotent.Services.KliveAgent
@@ -123,7 +122,7 @@ namespace Omnipotent.Services.KliveAgent
 
             try
             {
-                var llm = await _agent.ResolveServiceAsync<KliveLLM>();
+                var llm = await _agent.ResolveServiceAsync<KliveLLM.KliveLLM>();
                 if (llm == null || !llm.IsServiceActive())
                 {
                     return BuildFallbackResult(result, "KliveLLM service is unavailable.", observed);
@@ -134,9 +133,7 @@ namespace Omnipotent.Services.KliveAgent
                 var llmTask = llm.QueryLLM(
                     prompt,
                     llmSessionId,
-                    maxTokensOverride: maxTokens,
-                    resetSessionBeforeQuery: true,
-                    resetSessionAfterQuery: true);
+                    maxTokensOverride: 30000);
                 var timeoutTask = Task.Delay(timeout, cancellationToken);
                 var completedTask = await Task.WhenAny(llmTask, timeoutTask);
                 if (!ReferenceEquals(completedTask, llmTask))

@@ -7,7 +7,7 @@ using Omnipotent.Logging;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveLink;
-using Omnipotent.Services.KliveLocalLLM;
+using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.OmniStartupManager;
 using ProtoBuf;

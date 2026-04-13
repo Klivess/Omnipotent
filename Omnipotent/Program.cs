@@ -16,7 +16,6 @@ using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveBot_Discord.AutoGoat;
 using Omnipotent.Services.KliveCloud;
 using Omnipotent.Services.KliveAgent;
-using Omnipotent.Services.KliveLocalLLM;
 using Omnipotent.Services.KlivesWorkoutManager;
 using Omnipotent.Services.KliveTechHub;
 using Omnipotent.Services.MemeScraper;
@@ -36,6 +35,7 @@ using System;
 using System.Drawing;
 using System.Text.RegularExpressions;
 using static System.Net.Mime.MediaTypeNames;
+using Omnipotent.Services.KliveLLM;
 
 namespace Omnipotent
 {

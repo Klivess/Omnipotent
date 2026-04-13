@@ -8,7 +8,7 @@ using System.Drawing;
 using DSharpPlus.EventArgs;
 using Humanizer;
 using System.Diagnostics;
-using Omnipotent.Services.KliveLocalLLM;
+using Omnipotent.Services.KliveLLM;
 
 namespace Omnipotent.Services.KliveBot_Discord
 {
@@ -135,7 +135,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                         if (args.Author.Id != OmniPaths.KlivesDiscordAccountID)
                             message = await SendMessageToKlives(embed);
 
-                        var llmService = (KliveLLM)(await GetServicesByType<KliveLLM>())[0];
+                        var llmService = (KliveLLM.KliveLLM)(await GetServicesByType<KliveLLM.KliveLLM>())[0];
                         if (llmService.IsServiceActive())
                         {
                             string sessionId = GetLlmSessionIdForChat(args);
@@ -143,9 +143,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                             var llmResponse = await llmService.QueryLLM(
                                 args.Message.Content,
                                 sessionId,
-                                maxTokensOverride: 220,
-                                resetSessionBeforeQuery: false,
-                                resetSessionAfterQuery: false);
+                                maxTokensOverride: 30000);
                             stopwatch.Stop();
                             await args.Message.RespondAsync(llmResponse.Response + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
                         }
