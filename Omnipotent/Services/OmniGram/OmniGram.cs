@@ -113,6 +113,13 @@ namespace Omnipotent.Services.OmniGram
                     await ServiceCreateScheduledTask(DateTime.Now.AddDays(1),
                         "OmniGram_MediaCleanup", "OmniGram", "Clean up old media files", false);
                 }
+                else if (task.taskName == "OmniGram_AutoSchedule")
+                {
+                    await PostScheduler.AutoScheduleForAllAccounts();
+                    await PostScheduler.PullFromMemeScraperAsync();
+                    await ServiceCreateScheduledTask(DateTime.Now.AddHours(6),
+                        "OmniGram_AutoSchedule", "OmniGram", "Auto-schedule posts for all accounts", false);
+                }
             }
             catch (Exception ex)
             {
@@ -139,6 +146,10 @@ namespace Omnipotent.Services.OmniGram
             // Media cleanup daily
             await ServiceCreateScheduledTask(DateTime.Today.AddDays(1).AddHours(3),
                 "OmniGram_MediaCleanup", "OmniGram", "Clean up old media files", false);
+
+            // Auto-schedule: perpetual posting even if commander doesn't intervene
+            await ServiceCreateScheduledTask(DateTime.Now.AddMinutes(10),
+                "OmniGram_AutoSchedule", "OmniGram", "Auto-schedule posts for all accounts", false);
 
             await ServiceLog("[OmniGram] Recurring tasks scheduled.");
         }

@@ -85,6 +85,7 @@ namespace Omnipotent.Services.OmniGram.Models
         public int MinIntervalMinutes { get; set; } = 120;
         public List<int> PreferredPostHoursUTC { get; set; } = new() { 9, 13, 18 };
         public List<int> ActiveDaysOfWeek { get; set; } = new() { 0, 1, 2, 3, 4, 5, 6 };
+        public int ScheduleRandomOffsetMinutes { get; set; } = 30;
 
         // MemeScraper-specific
         public string MemeScraperNicheFilter { get; set; } = "";

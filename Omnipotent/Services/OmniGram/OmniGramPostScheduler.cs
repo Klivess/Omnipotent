@@ -5,6 +5,7 @@ using InstagramApiSharp.Classes.Models;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.OmniGram.Models;
 using System.Collections.Concurrent;
 
@@ -232,6 +233,7 @@ namespace Omnipotent.Services.OmniGram
                         account.LastPostTime = DateTime.UtcNow;
                         accountManager.RecordAction(account.AccountId);
                         await service.ServiceLog($"[OmniGram] Successfully posted {post.ContentType} to {account.Username} (MediaId: {post.InstagramMediaId}).");
+                        await NotifyPostToDiscord(account, post);
                     }
                     else if (result != null)
                     {
@@ -320,6 +322,7 @@ namespace Omnipotent.Services.OmniGram
                     account.LastPostTime = DateTime.UtcNow;
                     accountManager.RecordAction(account.AccountId);
                     await service.ServiceLog($"[OmniGram] Story video posted to {account.Username}.");
+                    await NotifyPostToDiscord(account, post);
                 }
                 else
                 {
@@ -340,6 +343,7 @@ namespace Omnipotent.Services.OmniGram
                     account.LastPostTime = DateTime.UtcNow;
                     accountManager.RecordAction(account.AccountId);
                     await service.ServiceLog($"[OmniGram] Story photo posted to {account.Username}.");
+                    await NotifyPostToDiscord(account, post);
                 }
                 else
                 {
@@ -611,10 +615,14 @@ namespace Omnipotent.Services.OmniGram
             var config = account.ContentConfig;
             var now = DateTime.UtcNow;
             var today = now.Date;
+            var rng = new Random();
 
             // Find next available preferred hour
             var preferredHours = config.PreferredPostHoursUTC.OrderBy(h => h).ToList();
             if (preferredHours.Count == 0) preferredHours = new List<int> { 9, 13, 18 };
+
+            // Random offset range (configurable per account to reduce bot-like behavior)
+            var offsetRange = Math.Max(0, config.ScheduleRandomOffsetMinutes);
 
             // Find next slot
             var candidateTimes = new List<DateTime>();
@@ -625,7 +633,10 @@ namespace Omnipotent.Services.OmniGram
 
                 foreach (var hour in preferredHours)
                 {
-                    var candidate = day.AddHours(hour).AddMinutes(new Random().Next(0, 30));
+                    var baseTime = day.AddHours(hour);
+                    // Apply random offset: schedules within [baseTime - offset, baseTime + offset]
+                    var randomOffset = offsetRange > 0 ? rng.Next(-offsetRange, offsetRange + 1) : 0;
+                    var candidate = baseTime.AddMinutes(randomOffset);
                     if (candidate > now)
                         candidateTimes.Add(candidate);
                 }
@@ -637,6 +648,102 @@ namespace Omnipotent.Services.OmniGram
             return slotOffset < candidateTimes.Count
                 ? candidateTimes[slotOffset]
                 : candidateTimes.Last().AddMinutes(config.MinIntervalMinutes * (slotOffset - candidateTimes.Count + 1));
+        }
+
+        // ── Autonomous Auto-Scheduling ──
+
+        public async Task AutoScheduleForAllAccounts()
+        {
+            try
+            {
+                var eligibleAccounts = accountManager.GetAllAccounts()
+                    .Where(a => a.IsActive && !a.IsPaused && a.LoginStatus == OmniGramLoginStatus.LoggedIn)
+                    .ToList();
+
+                int totalScheduled = 0;
+
+                foreach (var account in eligibleAccounts)
+                {
+                    var config = account.ContentConfig;
+
+                    // Count how many posts are already queued for today and tomorrow
+                    var upcomingPosts = posts.Values.Count(p =>
+                        p.AccountId == account.AccountId
+                        && p.Status == OmniGramPostStatus.Queued
+                        && p.ScheduledTime >= DateTime.UtcNow
+                        && p.ScheduledTime <= DateTime.UtcNow.AddDays(2));
+
+                    // Calculate how many posts should be queued for the next 2 days
+                    var targetQueueSize = config.PostsPerDay * 2;
+                    var slotsToFill = targetQueueSize - upcomingPosts;
+                    if (slotsToFill <= 0) continue;
+
+                    // Attempt to pull content based on source type
+                    if (config.ContentSource == OmniGramContentSource.MemeScraper)
+                    {
+                        // MemeScraper pull handles its own scheduling
+                        continue;
+                    }
+                    else if (config.ContentSource == OmniGramContentSource.ContentFolder
+                        && !string.IsNullOrEmpty(config.ContentFolderPath)
+                        && Directory.Exists(config.ContentFolderPath))
+                    {
+                        var allFiles = Directory.GetFiles(config.ContentFolderPath)
+                            .Where(f => service.MediaManager.IsSupported(f)
+                                && !config.UsedContentPaths.Contains(f))
+                            .ToList();
+
+                        var filteredFiles = allFiles.Where(f =>
+                        {
+                            var inferredType = service.MediaManager.InferContentType(f);
+                            return config.AllowedContentTypes.Contains(inferredType);
+                        }).ToList();
+
+                        if (filteredFiles.Count == 0) continue;
+
+                        var rng = new Random();
+                        List<string> selectedFiles = config.SelectionMode == OmniGramContentSelectionMode.Random
+                            ? filteredFiles.OrderBy(_ => rng.Next()).Take(slotsToFill).ToList()
+                            : filteredFiles.Take(slotsToFill).ToList();
+
+                        int slotIndex = upcomingPosts;
+                        foreach (var file in selectedFiles)
+                        {
+                            var contentType = service.MediaManager.InferContentType(file);
+                            var scheduledTime = GetNextScheduledTime(account, slotIndex);
+                            var caption = GenerateCaptionForAccount(config);
+                            var hashtags = SelectHashtagsForAccount(config);
+                            var storedPath = await service.MediaManager.StoreUploadedMedia(file, account.AccountId);
+
+                            var post = new OmniGramPost
+                            {
+                                AccountId = account.AccountId,
+                                ContentType = contentType,
+                                MediaPaths = new List<string> { storedPath },
+                                Caption = caption,
+                                Hashtags = hashtags,
+                                ScheduledTime = scheduledTime,
+                                SourceType = OmniGramContentSource.ContentFolder,
+                                SourceId = Path.GetFileName(file)
+                            };
+
+                            await SchedulePostAsync(post);
+                            config.UsedContentPaths.Add(file);
+                            totalScheduled++;
+                            slotIndex++;
+                        }
+
+                        await accountManager.SaveAccountToDisk(account);
+                    }
+                }
+
+                if (totalScheduled > 0)
+                    await service.ServiceLog($"[OmniGram] Auto-scheduled {totalScheduled} posts across fleet.");
+            }
+            catch (Exception ex)
+            {
+                await service.ServiceLogError(ex, "[OmniGram] Failed during auto-scheduling");
+            }
         }
 
         // ── Persistence ──
@@ -660,6 +767,57 @@ namespace Omnipotent.Services.OmniGram
         public OmniGramDashboardStats GetDashboardStats()
         {
             return service.AnalyticsTracker.GetFleetDashboardStats();
+        }
+
+        // ── Discord Post Notifications ──
+
+        private async Task NotifyPostToDiscord(OmniGramAccount account, OmniGramPost post)
+        {
+            try
+            {
+                string settingName = post.ContentType switch
+                {
+                    OmniGramContentType.Photo => "OmniGram_NotifyKlivesOnPhotoPost",
+                    OmniGramContentType.Reel => "OmniGram_NotifyKlivesOnReelPost",
+                    OmniGramContentType.Story => "OmniGram_NotifyKlivesOnStoryPost",
+                    OmniGramContentType.Carousel => "OmniGram_NotifyKlivesOnCarouselPost",
+                    _ => null
+                };
+
+                if (settingName == null) return;
+                var shouldNotify = await service.GetBoolOmniSetting(settingName, defaultValue: true);
+                if (!shouldNotify) return;
+
+                string typeEmoji = post.ContentType switch
+                {
+                    OmniGramContentType.Photo => "📷",
+                    OmniGramContentType.Reel => "🎬",
+                    OmniGramContentType.Story => "📖",
+                    OmniGramContentType.Carousel => "🎠",
+                    _ => "📤"
+                };
+
+                string caption = string.IsNullOrEmpty(post.Caption)
+                    ? "(no caption)"
+                    : (post.Caption.Length > 100 ? post.Caption[..100] + "..." : post.Caption);
+
+                var description = $"{typeEmoji} **{post.ContentType}** posted to **@{account.Username}**\n\n" +
+                                  $"📝 {caption}\n" +
+                                  $"👥 {account.FollowerCount:N0} followers\n" +
+                                  $"🕐 {DateTime.UtcNow:HH:mm} UTC\n" +
+                                  $"📂 Source: {post.SourceType}";
+
+                var embed = KliveBotDiscord.MakeSimpleEmbed(
+                    $"OmniGram — {post.ContentType} Posted",
+                    description,
+                    DSharpPlus.Entities.DiscordColor.Magenta);
+
+                await service.ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", embed);
+            }
+            catch (Exception ex)
+            {
+                await service.ServiceLogError(ex, "[OmniGram] Failed to send Discord post notification");
+            }
         }
     }
 }

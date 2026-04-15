@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniGram.Models;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
@@ -19,6 +20,7 @@ namespace Omnipotent.Services.OmniGram
         {
             await RegisterDashboardRoutes();
             await RegisterAccountRoutes();
+            await RegisterProfileRoutes();
             await RegisterPostRoutes();
             await RegisterAnalyticsRoutes();
             await RegisterContentConfigRoutes();
@@ -258,6 +260,229 @@ namespace Omnipotent.Services.OmniGram
 
                     await service.AccountManager.SaveAccountToDisk(account);
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+        }
+
+        // ── Profile Editing ──
+
+        private async Task RegisterProfileRoutes()
+        {
+            // Get current profile data from Instagram
+            await service.CreateAPIRoute("/omnigram/accounts/profile", async (req) =>
+            {
+                try
+                {
+                    var accountId = req.userParameters.Get("accountId");
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var instaApi = service.AccountManager.GetApiInstance(accountId);
+                    if (instaApi == null || account.LoginStatus != Models.OmniGramLoginStatus.LoggedIn)
+                    {
+                        // Return cached data if not logged in
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            account.AccountId,
+                            account.Username,
+                            account.Biography,
+                            account.ProfilePicUrl,
+                            account.FollowerCount,
+                            account.FollowingCount,
+                            account.MediaCount,
+                            IsLive = false
+                        }));
+                        return;
+                    }
+
+                    // Fetch live profile data
+                    var profileResult = await instaApi.AccountProcessor.GetRequestForEditProfileAsync();
+                    if (profileResult.Succeeded)
+                    {
+                        var p = profileResult.Value;
+                        account.Biography = p.Biography;
+                        account.ProfilePicUrl = p.ProfilePicUrl;
+                        await service.AccountManager.SaveAccountToDisk(account);
+
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            account.AccountId,
+                            Username = p.Username,
+                            FullName = p.FullName,
+                            Biography = p.Biography,
+                            ProfilePicUrl = p.ProfilePicUrl,
+                            ExternalUrl = p.ExternalUrl,
+                            Email = p.Email,
+                            PhoneNumber = p.PhoneNumber,
+                            IsPrivate = p.IsPrivate,
+                            account.FollowerCount,
+                            account.FollowingCount,
+                            account.MediaCount,
+                            IsLive = true
+                        }));
+                    }
+                    else
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            account.AccountId,
+                            account.Username,
+                            account.Biography,
+                            account.ProfilePicUrl,
+                            account.FollowerCount,
+                            account.FollowingCount,
+                            account.MediaCount,
+                            IsLive = false,
+                            Error = profileResult.Info?.Message
+                        }));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Edit profile (bio, name, username, url)
+            await service.CreateAPIRoute("/omnigram/accounts/profile/edit", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string accountId = body.accountId;
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var instaApi = service.AccountManager.GetApiInstance(accountId);
+                    if (instaApi == null || account.LoginStatus != Models.OmniGramLoginStatus.LoggedIn)
+                    {
+                        await req.ReturnResponse("Account is not logged in.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    string fullName = body.fullName;
+                    string biography = body.biography;
+                    string url = body.url;
+                    string newUsername = body.newUsername;
+                    string email = body.email;
+                    string phone = body.phone;
+
+                    var result = await service.AccountManager.loginHandler.ExecuteWithChallengeHandlingAsync(
+                        instaApi, account,
+                        () => instaApi.AccountProcessor.EditProfileAsync(fullName, biography, url, email, phone, null, newUsername));
+
+                    if (result.Succeeded)
+                    {
+                        if (biography != null) account.Biography = biography;
+                        if (newUsername != null && !string.IsNullOrEmpty(newUsername)) account.Username = newUsername;
+                        await service.AccountManager.SaveAccountToDisk(account);
+                        await service.AnalyticsTracker.LogEvent(accountId, "ProfileEdited", "Instagram profile updated by commander.");
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true }));
+                    }
+                    else
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            success = false,
+                            error = result.Info?.Message ?? "Profile update failed"
+                        }), code: HttpStatusCode.BadRequest);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
+            // Upload profile picture (raw bytes in body, accountId in query)
+            await service.CreateAPIRoute("/omnigram/accounts/profile/picture", async (req) =>
+            {
+                try
+                {
+                    var accountId = req.userParameters.Get("accountId");
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var instaApi = service.AccountManager.GetApiInstance(accountId);
+                    if (instaApi == null || account.LoginStatus != Models.OmniGramLoginStatus.LoggedIn)
+                    {
+                        await req.ReturnResponse("Account is not logged in.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    byte[] pictureBytes = req.userMessageBytes;
+                    if (pictureBytes == null || pictureBytes.Length == 0)
+                    {
+                        await req.ReturnResponse("No image data provided.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    if (pictureBytes.Length > 8 * 1024 * 1024)
+                    {
+                        await req.ReturnResponse("Image exceeds 8MB limit.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var result = await service.AccountManager.loginHandler.ExecuteWithChallengeHandlingAsync(
+                        instaApi, account,
+                        () => instaApi.AccountProcessor.ChangeProfilePictureAsync(pictureBytes));
+
+                    if (result.Succeeded)
+                    {
+                        account.ProfilePicUrl = result.Value?.ProfilePicUrl ?? account.ProfilePicUrl;
+                        await service.AccountManager.SaveAccountToDisk(account);
+                        await service.AnalyticsTracker.LogEvent(accountId, "ProfilePictureChanged", "Profile picture updated by commander.");
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            success = true,
+                            profilePicUrl = account.ProfilePicUrl
+                        }));
+                    }
+                    else
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            success = false,
+                            error = result.Info?.Message ?? "Profile picture update failed"
+                        }), code: HttpStatusCode.BadRequest);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -578,6 +803,134 @@ namespace Omnipotent.Services.OmniGram
                     await service.PostScheduler.PullFromMemeScraperAsync();
                     await service.PostScheduler.PullFromContentFoldersAsync();
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = "Content pull triggered." }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+            // Draft post to multiple accounts at once
+            await service.CreateAPIRoute("/omnigram/posts/draft", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string contentTypeStr = body.contentType;
+                    string caption = body.caption ?? "";
+                    string hashtags = body.hashtags ?? "";
+                    string scheduledTimeStr = body.scheduledTime;
+                    var mediaPathsToken = body.mediaPaths;
+                    var accountIdsToken = body.accountIds;
+
+                    if (accountIdsToken == null)
+                    {
+                        await req.ReturnResponse("accountIds array is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var accountIds = JsonConvert.DeserializeObject<List<string>>(accountIdsToken.ToString());
+                    if (accountIds == null || accountIds.Count == 0)
+                    {
+                        await req.ReturnResponse("At least one accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var contentType = Enum.TryParse<OmniGramContentType>(contentTypeStr, true, out var ct)
+                        ? ct : OmniGramContentType.Photo;
+
+                    var scheduledTime = DateTime.TryParse(scheduledTimeStr, out var st)
+                        ? st : DateTime.Now.AddMinutes(5);
+
+                    var mediaPaths = mediaPathsToken != null
+                        ? JsonConvert.DeserializeObject<List<string>>(mediaPathsToken.ToString())
+                        : new List<string>();
+
+                    var hashtagList = ((string)hashtags).Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+                    var results = new List<object>();
+                    foreach (var accountId in accountIds)
+                    {
+                        var account = service.AccountManager.GetAccountById(accountId);
+                        if (account == null)
+                        {
+                            results.Add(new { accountId, success = false, error = "Account not found" });
+                            continue;
+                        }
+
+                        var post = new OmniGramPost
+                        {
+                            AccountId = accountId,
+                            ContentType = contentType,
+                            Caption = caption,
+                            Hashtags = hashtagList,
+                            ScheduledTime = scheduledTime,
+                            MediaPaths = new List<string>(mediaPaths),
+                            SourceType = OmniGramContentSource.ManualUpload
+                        };
+
+                        var scheduled = await service.PostScheduler.SchedulePostAsync(post);
+                        await service.AnalyticsTracker.LogEvent(accountId, "DraftPostScheduled",
+                            $"Draft {contentType} post scheduled for {scheduledTime:g}.");
+                        results.Add(new
+                        {
+                            accountId,
+                            success = true,
+                            postId = scheduled.PostId,
+                            scheduledTime = scheduled.ScheduledTime
+                        });
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, results }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
+            // Upload media file for manual posts (raw bytes in body, filename in query)
+            await service.CreateAPIRoute("/omnigram/media/upload", async (req) =>
+            {
+                try
+                {
+                    var fileName = req.userParameters.Get("fileName");
+                    var accountId = req.userParameters.Get("accountId");
+
+                    if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("fileName and accountId are required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    byte[] fileData = req.userMessageBytes;
+                    if (fileData == null || fileData.Length == 0)
+                    {
+                        await req.ReturnResponse("No file data provided.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    if (fileData.Length > 100 * 1024 * 1024)
+                    {
+                        await req.ReturnResponse("File exceeds 100MB limit.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    // Save to uploads directory
+                    var ext = Path.GetExtension(fileName).ToLowerInvariant();
+                    var safeFileName = $"{Guid.NewGuid()}{ext}";
+                    var uploadDir = Path.Combine(OmniPaths.GlobalPaths.OmniGramUploadsDirectory, accountId);
+                    Directory.CreateDirectory(uploadDir);
+                    var uploadPath = Path.Combine(uploadDir, safeFileName);
+                    await File.WriteAllBytesAsync(uploadPath, fileData);
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        success = true,
+                        filePath = uploadPath,
+                        fileName = safeFileName
+                    }));
                 }
                 catch (Exception ex)
                 {
