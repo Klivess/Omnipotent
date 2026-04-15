@@ -121,6 +121,8 @@ namespace Omnipotent.Data_Handling
             public static string OmniGramCampaignsDirectory = $"{OmniGramDirectory}/Campaigns";
             public static string OmniGramSessionsDirectory = $"{OmniGramDirectory}/Sessions";
             public static string OmniGramUploadsDirectory = $"{OmniGramDirectory}/Uploads";
+            public static string OmniGramMediaDirectory = $"{OmniGramDirectory}/Media";
+            public static string OmniGramAnalyticsDirectory = $"{OmniGramDirectory}/Analytics";
             public static string OmniGramLogsDirectory = $"{OmniGramDirectory}/Logs";
             public static string OmniGramEventsDirectory = $"{OmniGramLogsDirectory}/Events";
             public static string OmniGramUploadMetricsDirectory = $"{OmniGramLogsDirectory}/UploadMetrics";

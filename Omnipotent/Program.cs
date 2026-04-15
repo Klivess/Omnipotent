@@ -21,6 +21,7 @@ using Omnipotent.Services.KliveTechHub;
 using Omnipotent.Services.MemeScraper;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Services.Omniscience;
+using Omnipotent.Services.OmniGram;
 using Omnipotent.Services.OmniStartupManager;
 using Omnipotent.Services.OmniTrader;
 using Omnipotent.Services.OmniTube;
@@ -70,6 +71,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KlivesWorkoutManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTube());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGram());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveChat.KliveChatService());
                 if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
                 {
