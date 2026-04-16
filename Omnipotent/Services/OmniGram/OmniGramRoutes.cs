@@ -267,9 +267,66 @@ namespace Omnipotent.Services.OmniGram
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
-        }
 
-        // ── Profile Editing ──
+            // Force re-login (clears session and retries full login + challenge flow)
+            await service.CreateAPIRoute("/omnigram/accounts/relogin", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string accountId = body.accountId;
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var instaApi = service.AccountManager.GetApiInstance(accountId);
+                    if (instaApi == null)
+                    {
+                        await req.ReturnResponse("No API instance for this account.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    await service.ServiceLog($"[OmniGram] Commander requested re-login for {account.Username}.");
+
+                    // Clear old session file
+                    var sessionPath = Path.Combine(OmniPaths.GlobalPaths.OmniGramSessionsDirectory, $"{account.Username}.session");
+                    if (File.Exists(sessionPath))
+                        File.Delete(sessionPath);
+
+                    // Reset state
+                    account.LoginRetryCount = 0;
+                    account.LoginErrorMessage = null;
+                    account.IsPaused = false;
+
+                    // Attempt fresh login (will trigger challenge/2FA flows via Discord)
+                    var loginStatus = await service.AccountManager.loginHandler.HandleLoginAsync(instaApi, account);
+                    await service.AccountManager.SaveAccountToDisk(account);
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        success = loginStatus == OmniGramLoginStatus.LoggedIn,
+                        loginStatus = loginStatus.ToString(),
+                        message = loginStatus == OmniGramLoginStatus.LoggedIn
+                            ? "Successfully re-authenticated."
+                            : $"Login flow returned: {loginStatus}. Check Discord for challenge prompts."
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+        }
 
         private async Task RegisterProfileRoutes()
         {
@@ -310,8 +367,10 @@ namespace Omnipotent.Services.OmniGram
                         return;
                     }
 
-                    // Fetch live profile data
-                    var profileResult = await instaApi.AccountProcessor.GetRequestForEditProfileAsync();
+                    // Fetch live profile data (with challenge handling)
+                    var profileResult = await service.AccountManager.loginHandler.ExecuteWithChallengeHandlingAsync(
+                        instaApi, account,
+                        () => instaApi.AccountProcessor.GetRequestForEditProfileAsync());
                     if (profileResult.Succeeded)
                     {
                         var p = profileResult.Value;

@@ -231,6 +231,10 @@ namespace Omnipotent.Services.OmniGram
         {
             try
             {
+                // Reset any stale challenge state before requesting new verification methods
+                try { await instaApi.ResetChallengeRequireVerifyMethodAsync(); }
+                catch { /* not critical — may fail if no prior challenge was active */ }
+
                 var challengeResult = await instaApi.GetChallengeRequireVerifyMethodAsync();
                 if (!challengeResult.Succeeded)
                 {
@@ -478,6 +482,17 @@ namespace Omnipotent.Services.OmniGram
             account.LoginRetryCount = 0;
             account.LoginErrorMessage = null;
 
+            // Persist device fingerprint so it survives session clears and re-logins
+            try
+            {
+                var stateJson = instaApi.GetStateDataAsString();
+                var stateObj = Newtonsoft.Json.Linq.JObject.Parse(stateJson);
+                var deviceToken = stateObj["DeviceInfo"];
+                if (deviceToken != null)
+                    account.DeviceData = deviceToken.ToString(Formatting.None);
+            }
+            catch { /* non-critical */ }
+
             // Persist session
             try
             {
@@ -563,12 +578,18 @@ namespace Omnipotent.Services.OmniGram
 
             // Check if the failure is a challenge/login-required response
             var responseType = result.Info?.ResponseType ?? ResponseType.Unknown;
-            if (responseType == ResponseType.ChallengeRequired ||
-                responseType == ResponseType.LoginRequired)
+            var errorMsg = (result.Info?.Message ?? "").ToLowerInvariant();
+            bool isCheckpoint = responseType == ResponseType.ChallengeRequired
+                || responseType == ResponseType.LoginRequired
+                || errorMsg.Contains("checkpoint_required")
+                || errorMsg.Contains("challenge_required")
+                || errorMsg.Contains("login_required");
+
+            if (isCheckpoint)
             {
                 await service.ServiceLog($"[OmniGram] Runtime challenge triggered for {account.Username} during API call. Entering challenge flow.");
                 account.IsPaused = true;
-                var loginStatus = await HandleChallengeAsync(instaApi, account);
+                var loginStatus = await HandleLoginAsync(instaApi, account);
                 if (loginStatus == OmniGramLoginStatus.LoggedIn)
                 {
                     account.IsPaused = false;

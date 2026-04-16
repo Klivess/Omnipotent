@@ -385,7 +385,39 @@ namespace Omnipotent.Services.OmniGram
             await SavePostToDisk(post);
             await service.ServiceLogError($"[OmniGram] Post {post.PostId} failed for {account.Username}: {errorMessage}");
 
-            // Schedule single retry in 30 minutes
+            // Detect checkpoint / login-required — re-login instead of blind retry
+            var lowerError = (errorMessage ?? "").ToLowerInvariant();
+            if (lowerError.Contains("checkpoint_required") || lowerError.Contains("challenge_required")
+                || lowerError.Contains("login_required") || lowerError.Contains("temporary failure"))
+            {
+                await service.ServiceLog($"[OmniGram] Checkpoint/auth failure detected for {account.Username}. Triggering re-authentication...");
+                account.LoginStatus = OmniGramLoginStatus.CheckpointRequired;
+                await accountManager.SaveAccountToDisk(account);
+                try
+                {
+                    await accountManager.loginHandler.HandleLoginAsync(instaApi, account);
+                    await accountManager.SaveAccountToDisk(account);
+                }
+                catch (Exception ex)
+                {
+                    await service.ServiceLogError(ex, $"[OmniGram] Re-auth failed for {account.Username}");
+                }
+
+                // Re-queue if login succeeded
+                if (account.LoginStatus == OmniGramLoginStatus.LoggedIn)
+                {
+                    post.Status = OmniGramPostStatus.Queued;
+                    post.ScheduledTime = DateTime.Now.AddMinutes(5);
+                    post.ErrorMessage = $"Re-queued after re-authentication (was: {errorMessage})";
+                    await SavePostToDisk(post);
+                    await service.ServiceCreateScheduledTask(post.ScheduledTime,
+                        $"OmniGramPostRetry_{post.PostId}", "Instagram Posting",
+                        $"Retry post to {account.Username} after re-auth", false, post.PostId);
+                }
+                return;
+            }
+
+            // Schedule single retry in 30 minutes for non-checkpoint errors
             var retryTaskName = $"OmniGramPostRetry_{post.PostId}";
             post.Status = OmniGramPostStatus.Queued;
             post.ScheduledTime = DateTime.Now.AddMinutes(30);

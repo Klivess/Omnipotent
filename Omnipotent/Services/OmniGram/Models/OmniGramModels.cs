@@ -125,6 +125,9 @@ namespace Omnipotent.Services.OmniGram.Models
         public int LoginRetryCount { get; set; }
         public string LoginErrorMessage { get; set; }
 
+        /// <summary>Serialised AndroidDevice JSON. Persisted so the same device fingerprint is reused across sessions, reducing checkpoint triggers.</summary>
+        public string DeviceData { get; set; }
+
         public OmniGramAccountContentConfig ContentConfig { get; set; } = new();
     }
 

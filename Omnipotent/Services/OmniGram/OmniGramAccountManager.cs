@@ -2,8 +2,10 @@ using InstagramApiSharp;
 using InstagramApiSharp.API;
 using InstagramApiSharp.API.Builder;
 using InstagramApiSharp.Classes;
+using InstagramApiSharp.Classes.Android.DeviceInfo;
 using InstagramApiSharp.Logger;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniGram.Models;
 using System.Collections.Concurrent;
@@ -164,6 +166,18 @@ namespace Omnipotent.Services.OmniGram
                 .UseLogger(new DebugLogger(InstagramApiSharp.Logger.LogLevel.None))
                 .SetRequestDelay(RequestDelay.FromSeconds(1, 3));
 
+            // Reuse persisted device fingerprint to avoid checkpoint triggers from device changes
+            if (!string.IsNullOrEmpty(account.DeviceData))
+            {
+                try
+                {
+                    var device = JsonConvert.DeserializeObject<AndroidDevice>(account.DeviceData);
+                    if (device != null)
+                        builder.SetDevice(device);
+                }
+                catch { /* fall through to default device */ }
+            }
+
             if (!string.IsNullOrWhiteSpace(account.ProxyAddress))
             {
                 builder.UseHttpClientHandler(new System.Net.Http.HttpClientHandler
@@ -215,6 +229,24 @@ namespace Omnipotent.Services.OmniGram
                     {
                         using var stream = File.OpenRead(sessionPath);
                         await instaApi.LoadStateDataFromStreamAsync(stream);
+
+                        // Capture device fingerprint from restored session if not yet persisted
+                        if (string.IsNullOrEmpty(account.DeviceData))
+                        {
+                            try
+                            {
+                                var stateJson = instaApi.GetStateDataAsString();
+                                var stateObj = JObject.Parse(stateJson);
+                                var deviceToken = stateObj["DeviceInfo"];
+                                if (deviceToken != null)
+                                {
+                                    account.DeviceData = deviceToken.ToString(Formatting.None);
+                                    await SaveAccountToDisk(account);
+                                }
+                            }
+                            catch { /* non-critical */ }
+                        }
+
                         await service.ServiceLog($"[OmniGram] Restored session for {account.Username}.");
                     }
 
@@ -284,9 +316,12 @@ namespace Omnipotent.Services.OmniGram
                     if (!userResult.Succeeded)
                     {
                         var responseType = userResult.Info?.ResponseType ?? ResponseType.Unknown;
-                        if (responseType == ResponseType.LoginRequired || responseType == ResponseType.ChallengeRequired)
+                        var errorMsg = (userResult.Info?.Message ?? "").ToLowerInvariant();
+                        if (responseType == ResponseType.LoginRequired || responseType == ResponseType.ChallengeRequired
+                            || errorMsg.Contains("checkpoint_required") || errorMsg.Contains("challenge_required"))
                         {
-                            await service.ServiceLog($"[OmniGram] Session invalid for {account.Username}, re-authenticating...");
+                            await service.ServiceLog($"[OmniGram] Session invalid/checkpoint for {account.Username}, re-authenticating...");
+                            account.LoginStatus = OmniGramLoginStatus.CheckpointRequired;
                             await loginHandler.HandleLoginAsync(instaApi, account);
                             await SaveAccountToDisk(account);
                         }
