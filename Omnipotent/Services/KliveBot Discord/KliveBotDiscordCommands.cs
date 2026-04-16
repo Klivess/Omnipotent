@@ -23,7 +23,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         public async Task PingAsync(InteractionContext ctx)
         {
             Stopwatch sw = new Stopwatch();
-            await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Pong - latency is {ctx.Client.GetConnectionLatency(ctx.Guild.Id).Humanize()}."));
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Pong - latency is {ctx.Client.Ping} ms."));
             sw.Stop();
         }
 
@@ -36,7 +36,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             {
                 uptimes += $"Service - {item.GetName()}: {(item.IsServiceActive() ? item.GetServiceUptime().Humanize() : "Inactive")}\n";
             }
-            await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(uptimes));
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(uptimes));
         }
         [SlashCommand("getConnectedKliveTechGadgets", "Gets all connected KliveTech gadgets and their actions.")]
         public async Task GetKliveTechGadgets(InteractionContext ctx)
@@ -54,11 +54,11 @@ namespace Omnipotent.Services.KliveBot_Discord
                     }
                     gadgets += "\n\n";
                 }
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
             }
             catch (Exception ex)
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
 
@@ -67,12 +67,12 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (ctx.Member.Id == OmniPaths.KlivesDiscordAccountID)
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Quitting KliveBot..."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Quitting KliveBot..."));
                 ExistentialBotUtilities.QuitBot();
             }
             else
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
 
@@ -110,26 +110,26 @@ namespace Omnipotent.Services.KliveBot_Discord
                             }
                             else
                             {
-                                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
+                                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
                                 return;
                             }
                         }
                     }
                     else
                     {
-                        await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find action by the name of {gadgetAction}"));
+                        await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find action by the name of {gadgetAction}"));
                         return;
                     }
                 }
                 else
                 {
-                    await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
+                    await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Couldn't find gadget by the name of {gadgetName}"));
                     return;
                 }
             }
             catch (Exception ex)
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent($"Kinda awkward but an error just occurred so I can't do this, sorry."));
             }
         }
         /*
@@ -141,11 +141,11 @@ namespace Omnipotent.Services.KliveBot_Discord
                 //Get member by ID and send message to them
                 var member = await ctx.Guild.GetMemberAsync(ulong.Parse(id));
                 await member.SendMessageAsync(message);
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Done!"));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Done!"));
             }
             else
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
         */
@@ -155,7 +155,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (!OmniPaths.CheckIfOnServer())
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 ModelInput sampleData = new ModelInput()
                 {
                     Col0 = text,
@@ -169,14 +169,14 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
             else
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Feature not available on production build yet, sorry :("));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Feature not available on production build yet, sorry :("));
             }
         }
 
         [SlashCommand("serviceRestart", "Restarts a service")]
         public async Task ServiceRestartAsync(InteractionContext ctx, [Option("serviceName", "The service to restart")] string serviceName)
         {
-            await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
             if (ctx.User.Id != OmniPaths.KlivesDiscordAccountID)
             {
                 await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("You do not have permission to use this command."));
@@ -198,13 +198,13 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (ctx.User.Id == OmniPaths.KlivesDiscordAccountID)
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 await ctx.EditResponseAsync(new DiscordWebhookBuilder().WithContent("Restarting bot."));
                 ExistentialBotUtilities.UpdateBot();
             }
             else
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
 
@@ -213,7 +213,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             if (ctx.User.Id == OmniPaths.KlivesDiscordAccountID)
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 try
                 {
                     var copy = new List<OmniLogging.LoggedMessage>(parent.GetLoggerService().overallMessages.ToList());
@@ -238,7 +238,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
             else
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Only Klives can use this command."));
             }
         }
 
@@ -246,7 +246,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         [SlashCommand("produceliquidityplan", "Produces a liquidity strategy for the CS2 Arbitrage Bot.")]
         public async Task ProduceAndDisplayLiquidityPlan(InteractionContext ctx)
         {
-            await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+            await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
             var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
             var scanalytics = cs2Service.scanalytics;
 
@@ -338,7 +338,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.DeferredChannelMessageWithSource);
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
                 var scanalytics = cs2Service.scanalytics;
                 // Fix: Pass the required third argument (currentExpectedReturnCoefficientOfSteamToCSFloat)
@@ -387,7 +387,7 @@ namespace Omnipotent.Services.KliveBot_Discord
             catch (Exception ex)
             {
                 //Return apology message to 
-                await ctx.CreateResponseAsync(DiscordInteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Kinda awkward but an error just occurred so I can't do this, sorry."));
+                await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent("Kinda awkward but an error just occurred so I can't do this, sorry."));
                 parent.ServiceLogError(ex);
             }
         }

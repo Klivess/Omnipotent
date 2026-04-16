@@ -1,3 +1,4 @@
+using DSharpPlus;
 using DSharpPlus.Entities;
 using InstagramApiSharp;
 using InstagramApiSharp.API;
@@ -144,10 +145,10 @@ namespace Omnipotent.Services.OmniGram
                     var method = await PromptButtons(
                         $"OmniGram 2FA: {account.Username}",
                         $"Two-factor authentication required for **{account.Username}**.\nChoose verification method:",
-                        new Dictionary<string, DiscordButtonStyle>
+                        new Dictionary<string, ButtonStyle>
                         {
-                            { "🔐 Authenticator App", DiscordButtonStyle.Primary },
-                            { "📱 SMS", DiscordButtonStyle.Secondary }
+                            { "🔐 Authenticator App", ButtonStyle.Primary },
+                            { "📱 SMS", ButtonStyle.Secondary }
                         });
 
                     if (method == null) return await On2FATimeout(account);
@@ -289,10 +290,10 @@ namespace Omnipotent.Services.OmniGram
                 var choice = await PromptButtons(
                     $"OmniGram Challenge: {account.Username}",
                     $"Instagram challenge for **{account.Username}**.\nChoose verification method:",
-                    new Dictionary<string, DiscordButtonStyle>
+                    new Dictionary<string, ButtonStyle>
                     {
-                        { $"📧 Email ({challenge.StepData.Email})", DiscordButtonStyle.Primary },
-                        { $"📱 Phone ({challenge.StepData.PhoneNumber})", DiscordButtonStyle.Secondary }
+                        { $"📧 Email ({challenge.StepData.Email})", ButtonStyle.Primary },
+                        { $"📱 Phone ({challenge.StepData.PhoneNumber})", ButtonStyle.Secondary }
                     });
 
                 if (choice == null)
@@ -335,10 +336,10 @@ namespace Omnipotent.Services.OmniGram
             var resendChoice = await PromptButtons(
                 $"OmniGram Code Failed: {account.Username}",
                 $"Verification code failed for **{account.Username}**.",
-                new Dictionary<string, DiscordButtonStyle>
+                new Dictionary<string, ButtonStyle>
                 {
-                    { "🔄 Resend Code", DiscordButtonStyle.Primary },
-                    { "❌ Cancel", DiscordButtonStyle.Danger }
+                    { "🔄 Resend Code", ButtonStyle.Primary },
+                    { "❌ Cancel", ButtonStyle.Danger }
                 });
 
             if (resendChoice == null || resendChoice.Contains("Cancel"))
@@ -381,10 +382,10 @@ namespace Omnipotent.Services.OmniGram
             var choice = await PromptButtons(
                 $"OmniGram Suspicious Login: {account.Username}",
                 $"Instagram flagged a suspicious login for **{account.Username}**. Was this you?",
-                new Dictionary<string, DiscordButtonStyle>
+                new Dictionary<string, ButtonStyle>
                 {
-                    { "✅ It Was Me", DiscordButtonStyle.Success },
-                    { "❌ It Wasn't Me", DiscordButtonStyle.Danger }
+                    { "✅ It Was Me", ButtonStyle.Success },
+                    { "❌ It Wasn't Me", ButtonStyle.Danger }
                 });
 
             if (choice == null)
@@ -641,7 +642,7 @@ namespace Omnipotent.Services.OmniGram
             }
         }
 
-        private async Task<string> PromptButtons(string title, string description, Dictionary<string, DiscordButtonStyle> buttons)
+        private async Task<string> PromptButtons(string title, string description, Dictionary<string, ButtonStyle> buttons)
         {
             try
             {

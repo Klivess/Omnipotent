@@ -185,10 +185,10 @@ namespace Omnipotent.Services.KliveAPI
                 catch (Exception ex)
                 {
                     await parent.ServiceLogError(ex, "Asking Klives on what to do next.");
-                    Dictionary<string, DiscordButtonStyle> dict = new Dictionary<string, DiscordButtonStyle>
+                    Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
                         {
-                            {"Yes", DiscordButtonStyle.Primary },
-                            {"No", DiscordButtonStyle.Danger },
+                            {"Yes", ButtonStyle.Primary },
+                            {"No", ButtonStyle.Danger },
                         };
                     string resp = (string)await parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord", "Error loading PEM key for Let's Encrypt.",
                         "Should I delete the existing PEM key and create another?", dict, TimeSpan.FromDays(7));
@@ -221,9 +221,9 @@ namespace Omnipotent.Services.KliveAPI
             //Get Klives to confirm
             try
             {
-                Dictionary<string, DiscordButtonStyle> dict = new Dictionary<string, DiscordButtonStyle>
+                Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
                         {
-                            {"Done", DiscordButtonStyle.Primary },
+                            {"Done", ButtonStyle.Primary },
                         };
                 string addedDNSText = (string)await parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord", $"Add a DNS record to {KliveAPI.domainName}.",
                     "Please add a new DNS record so that Omnipotent can solve this challenge and acquire the certificate needed for HTTPS.\n" +
@@ -246,10 +246,10 @@ namespace Omnipotent.Services.KliveAPI
             //Ask Klives if to wait for DNS to propagate
             try
             {
-                Dictionary<string, DiscordButtonStyle> dict = new Dictionary<string, DiscordButtonStyle>
+                Dictionary<string, ButtonStyle> dict = new Dictionary<string, ButtonStyle>
                         {
-                            {"Yes, wait 1 hour.", DiscordButtonStyle.Primary },
-                            {"No, don't wait.", DiscordButtonStyle.Primary }
+                            {"Yes, wait 1 hour.", ButtonStyle.Primary },
+                            {"No, don't wait.", ButtonStyle.Primary }
                         };
                 string addedDNSText = (string)await parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord", $"Should I wait 1 hour for DNS to propagate?",
                     $"Click No if the dns TXT value '{dnsTxt}' is already propagated.", dict, TimeSpan.FromDays(7));

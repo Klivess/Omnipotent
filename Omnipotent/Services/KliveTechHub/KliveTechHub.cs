@@ -364,7 +364,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
                 else
                 {
-                    var result = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord", "Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, DiscordButtonStyle>() { { "Retry", DiscordButtonStyle.Primary } }, TimeSpan.FromDays(3));
+                    var result = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendButtonsPromptToKlivesDiscord", "Discover klivetech gadgets failed!", $"Error: {new ErrorInformation(ex).FullFormattedMessage}", new Dictionary<string, ButtonStyle>() { { "Retry", ButtonStyle.Primary } }, TimeSpan.FromDays(3));
                     if (result == "Retry")
                     {
                         DiscoverNewKliveTechGadgets();
