@@ -163,17 +163,15 @@ Rules:
 
         // ── Brain Orchestration ──
 
+        private const int MaxAgentIterations = 5;
+
         public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation)
         {
             try
             {
-                // Build the full system prompt with conversation context
                 var systemPrompt = await BuildSystemPrompt(userMessage);
-
-                // Create a unique session ID for this conversation's LLM interaction
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
 
-                // Get KliveLLM and query it
                 var llmServices = await agentService.GetServicesByType<KliveLLM.KliveLLM>();
                 if (llmServices == null || llmServices.Length == 0)
                 {
@@ -187,100 +185,110 @@ Rules:
                 }
 
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
-
-                // Reset session and inject the system prompt + history for a clean context
                 llm.ResetSession(llmSessionId);
 
-                // Build the combined prompt: system + conversation history + user message
-                var fullPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage);
+                var allScriptsExecuted = new List<AgentScriptResult>();
+                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage);
 
-                var llmResponse = await llm.QueryLLM(fullPrompt, llmSessionId);
-                if (!llmResponse.Success)
+                // Agent loop: LLM responds → scripts execute → results fed back → repeat
+                for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
                 {
-                    return new AgentChatResponse
+                    KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
+                    try
                     {
-                        ConversationId = conversation.ConversationId,
-                        Response = "Something went wrong with my brain. " + (llmResponse.ErrorMessage ?? "Unknown error."),
-                        Success = false,
-                        ErrorMessage = llmResponse.ErrorMessage
-                    };
-                }
-
-                // Reset session after use to avoid context bloat
-                llm.ResetSession(llmSessionId);
-
-                // Parse the LLM response into text and script segments
-                var segments = ParseLLMResponse(llmResponse.Response);
-                var scriptsExecuted = new List<AgentScriptResult>();
-                var finalResponse = new StringBuilder();
-
-                foreach (var segment in segments)
-                {
-                    if (!segment.IsScript)
-                    {
-                        finalResponse.AppendLine(segment.Content);
+                        llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId);
                     }
-                    else
+                    catch (Exception llmEx)
                     {
-                        // Execute the script
+                        return new AgentChatResponse
+                        {
+                            ConversationId = conversation.ConversationId,
+                            Response = $"LLM query failed: {llmEx.Message}",
+                            Success = false,
+                            ErrorMessage = llmEx.ToString()
+                        };
+                    }
+
+                    if (llmResponse == null || !llmResponse.Success)
+                    {
+                        return new AgentChatResponse
+                        {
+                            ConversationId = conversation.ConversationId,
+                            Response = "Something went wrong with my brain. " + (llmResponse?.ErrorMessage ?? "LLM returned null."),
+                            Success = false,
+                            ErrorMessage = llmResponse?.ErrorMessage ?? "LLM returned null response."
+                        };
+                    }
+
+                    var segments = ParseLLMResponse(llmResponse.Response ?? "");
+                    var hasScripts = segments.Any(s => s.IsScript);
+
+                    // No scripts → this is the final text response, return it
+                    if (!hasScripts)
+                    {
+                        var finalText = string.Join("\n", segments.Where(s => !s.IsScript).Select(s => s.Content)).Trim();
+                        llm.ResetSession(llmSessionId);
+
+                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
+                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = finalText });
+                        conversation.LastUpdated = DateTime.UtcNow;
+
+                        return new AgentChatResponse
+                        {
+                            ConversationId = conversation.ConversationId,
+                            Response = finalText,
+                            ScriptsExecuted = allScriptsExecuted,
+                            Success = true
+                        };
+                    }
+
+                    // Has scripts → execute them and build a follow-up prompt with results
+                    var resultsSummary = new StringBuilder();
+                    foreach (var segment in segments)
+                    {
+                        if (!segment.IsScript) continue;
+
                         var globals = new ScriptGlobals(agentService);
                         var result = await scriptEngine.ExecuteScriptAsync(segment.Content, globals);
-                        scriptsExecuted.Add(result);
+                        allScriptsExecuted.Add(result);
 
-                        if (result.Success && !string.IsNullOrEmpty(result.Output))
+                        if (result.Success)
                         {
-                            // Feed result back to LLM for interpretation
-                            var interpretPrompt = $"Script executed successfully. Output:\n{result.Output}\n\nInterpret and present this result naturally to the user.";
-                            var interpretResponse = await llm.QueryLLM(interpretPrompt);
-                            llm.ResetSession(interpretResponse.SessionId);
-
-                            if (interpretResponse.Success)
-                            {
-                                finalResponse.AppendLine(interpretResponse.Response);
-                            }
-                            else
-                            {
-                                finalResponse.AppendLine($"Script output: {result.Output}");
-                            }
+                            resultsSummary.AppendLine($"[Script OK] {(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}");
                         }
-                        else if (!result.Success)
+                        else
                         {
-                            finalResponse.AppendLine($"[Script failed: {result.ErrorMessage}]");
+                            resultsSummary.AppendLine($"[Script FAILED] {result.ErrorMessage}");
                         }
                     }
+
+                    // Feed results back as the next user turn so the LLM can act on them
+                    currentPrompt = $"[Script Results]\n{resultsSummary}\n\nNow continue: if you have what you need, give the user a final answer (no scripts). If you need to take further action based on these results, write the next script.";
                 }
 
-                var responseText = finalResponse.ToString().Trim();
-
-                // Record messages in conversation
-                conversation.Messages.Add(new AgentMessage
-                {
-                    Role = AgentMessageRole.User,
-                    Content = userMessage
-                });
-                conversation.Messages.Add(new AgentMessage
-                {
-                    Role = AgentMessageRole.Agent,
-                    Content = responseText,
-                });
+                // If we hit the iteration cap, return whatever we have
+                llm.ResetSession(llmSessionId);
+                conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
+                conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = "[Reached maximum reasoning steps]" });
                 conversation.LastUpdated = DateTime.UtcNow;
 
                 return new AgentChatResponse
                 {
                     ConversationId = conversation.ConversationId,
-                    Response = responseText,
-                    ScriptsExecuted = scriptsExecuted,
+                    Response = "I hit my maximum number of reasoning steps. Here's what I managed to do so far.",
+                    ScriptsExecuted = allScriptsExecuted,
                     Success = true
                 };
             }
             catch (Exception ex)
             {
+                await agentService.ServiceLogError(ex, "KliveAgentBrain.ProcessMessageAsync");
                 return new AgentChatResponse
                 {
                     ConversationId = conversation.ConversationId,
                     Response = $"Something broke in my brain: {ex.Message}",
                     Success = false,
-                    ErrorMessage = ex.Message
+                    ErrorMessage = ex.ToString()
                 };
             }
         }
