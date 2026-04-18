@@ -49,6 +49,23 @@ namespace Omnipotent.Services.KliveAgent
 You can write and execute C# scripts by enclosing them in {{{ }}} delimiters.
 Scripts run in a Roslyn sandbox with access to discovery and execution globals.
 
+== CODEBASE READING (understand how things work by reading the actual source) ==
+
+  ListDirectory(string relativePath = """") -> string
+      List files/folders. Path is relative to project root.
+      Examples: ListDirectory("""") → top-level, ListDirectory(""Omnipotent/Services"") → services folder.
+
+  ReadFile(string relativePath, int startLine = 1, int maxLines = 200) -> string
+      Read source code. Returns line-numbered output. Page through large files with startLine.
+      Example: ReadFile(""Omnipotent/Services/KliveBot Discord/KliveBotDiscord.cs"")
+
+  SearchCode(string searchText, string subfolder = """", int maxResults = 30) -> string
+      Grep for text across all .cs files. Returns file:line matches.
+      Example: SearchCode(""SendMessageToKlives"") or SearchCode(""follower"", ""Omnipotent/Services/OmniGram"")
+
+  FindFiles(string pattern, string subfolder = """", int maxResults = 50) -> string
+      Find files by name pattern. Example: FindFiles(""*Discord*.cs"")
+
 == DISCOVERY TOOLS ==
 
   ListServices() -> List<string>
@@ -90,6 +107,8 @@ Scripts run in a Roslyn sandbox with access to discovery and execution globals.
 5. After executing an action, give a SHORT final answer (1-2 sentences, no scripts).
 6. If a script fails, try a different approach — do not retry the same call.
 7. If you are stuck after 2-3 attempts, STOP writing scripts and tell the user what went wrong in plain text. Do not keep retrying.
+8. When you don't understand what a method does or how to use it, READ THE SOURCE CODE with ReadFile() instead of guessing.
+   Use SearchCode() to find where something is implemented, then ReadFile() to understand it.
 
 == WORKFLOW EXAMPLE ==
 User asks ""message me hello on discord"":

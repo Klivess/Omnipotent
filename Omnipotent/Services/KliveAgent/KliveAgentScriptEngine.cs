@@ -339,6 +339,135 @@ namespace Omnipotent.Services.KliveAgent
             await Task.Delay(milliseconds, CancellationToken);
         }
 
+        // ── Codebase Reading ──
+
+        private static readonly string CodebaseRoot = Omnipotent.Data_Handling.OmniPaths.CodebaseDirectory;
+        private static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".cs", ".csproj", ".sln", ".json", ".xml", ".config", ".txt", ".md",
+            ".yaml", ".yml", ".props", ".targets", ".razor", ".cshtml"
+        };
+
+        private string ResolvePath(string relativePath)
+        {
+            var full = Path.GetFullPath(Path.Combine(CodebaseRoot, relativePath));
+            if (!full.StartsWith(Path.GetFullPath(CodebaseRoot), StringComparison.OrdinalIgnoreCase))
+                return null; // prevent directory traversal
+            return full;
+        }
+
+        /// <summary>List files and folders in a codebase directory. Path is relative to the project root (e.g. "Omnipotent/Services").</summary>
+        public string ListDirectory(string relativePath = "")
+        {
+            var dir = ResolvePath(relativePath);
+            if (dir == null) return "Invalid path.";
+            if (!Directory.Exists(dir)) return $"Directory not found: {relativePath}";
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Contents of {relativePath}/:");
+
+            foreach (var d in Directory.GetDirectories(dir).OrderBy(d => d))
+                sb.AppendLine($"  [DIR]  {Path.GetFileName(d)}/");
+
+            foreach (var f in Directory.GetFiles(dir).OrderBy(f => f))
+            {
+                var ext = Path.GetExtension(f);
+                if (AllowedExtensions.Contains(ext))
+                {
+                    var size = new FileInfo(f).Length;
+                    sb.AppendLine($"  [FILE] {Path.GetFileName(f)} ({size:N0} bytes)");
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>Read a source file from the codebase. Path is relative to project root (e.g. "Omnipotent/Services/KliveAgent/KliveAgent.cs"). 
+        /// Returns up to maxLines lines starting from startLine (1-based). Use startLine/maxLines to page through large files.</summary>
+        public string ReadFile(string relativePath, int startLine = 1, int maxLines = 200)
+        {
+            var file = ResolvePath(relativePath);
+            if (file == null) return "Invalid path.";
+            if (!File.Exists(file)) return $"File not found: {relativePath}";
+
+            var ext = Path.GetExtension(file);
+            if (!AllowedExtensions.Contains(ext))
+                return $"Cannot read files with extension '{ext}'. Allowed: {string.Join(", ", AllowedExtensions)}";
+
+            var lines = File.ReadAllLines(file);
+            var totalLines = lines.Length;
+            startLine = Math.Max(1, startLine);
+            var endLine = Math.Min(totalLines, startLine + maxLines - 1);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"File: {relativePath} (lines {startLine}-{endLine} of {totalLines})");
+            for (int i = startLine - 1; i < endLine; i++)
+                sb.AppendLine($"{i + 1,5} | {lines[i]}");
+
+            if (endLine < totalLines)
+                sb.AppendLine($"... {totalLines - endLine} more lines. Use ReadFile(\"{relativePath}\", startLine: {endLine + 1}) to continue.");
+
+            return sb.ToString();
+        }
+
+        /// <summary>Search for a text pattern across all .cs files in the codebase. Returns matching file paths and line numbers with context.
+        /// subfolder limits search scope (e.g. "Omnipotent/Services"). maxResults limits total matches.</summary>
+        public string SearchCode(string searchText, string subfolder = "", int maxResults = 30)
+        {
+            if (string.IsNullOrWhiteSpace(searchText)) return "Search text cannot be empty.";
+
+            var dir = ResolvePath(subfolder);
+            if (dir == null || !Directory.Exists(dir)) return $"Directory not found: {subfolder}";
+
+            var results = new List<string>();
+
+            foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (results.Count >= maxResults) break;
+
+                try
+                {
+                    var lines = File.ReadAllLines(file);
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (lines[i].Contains(searchText, StringComparison.OrdinalIgnoreCase))
+                        {
+                            var relPath = Path.GetRelativePath(CodebaseRoot, file).Replace('\\', '/');
+                            results.Add($"{relPath}:{i + 1}  {lines[i].Trim()}");
+                            if (results.Count >= maxResults) break;
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            if (results.Count == 0) return $"No matches for '{searchText}' in {(string.IsNullOrEmpty(subfolder) ? "codebase" : subfolder)}.";
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {results.Count} match(es) for '{searchText}':");
+            foreach (var r in results) sb.AppendLine($"  {r}");
+            if (results.Count >= maxResults) sb.AppendLine($"  ... (capped at {maxResults} results)");
+            return sb.ToString();
+        }
+
+        /// <summary>Find all files matching a filename pattern (e.g. "*.cs", "KliveBot*"). subfolder limits scope.</summary>
+        public string FindFiles(string pattern, string subfolder = "", int maxResults = 50)
+        {
+            var dir = ResolvePath(subfolder);
+            if (dir == null || !Directory.Exists(dir)) return $"Directory not found: {subfolder}";
+
+            var files = Directory.EnumerateFiles(dir, pattern, SearchOption.AllDirectories)
+                .Take(maxResults)
+                .Select(f => Path.GetRelativePath(CodebaseRoot, f).Replace('\\', '/'))
+                .ToList();
+
+            if (files.Count == 0) return $"No files matching '{pattern}' in {(string.IsNullOrEmpty(subfolder) ? "codebase" : subfolder)}.";
+            var sb = new StringBuilder();
+            sb.AppendLine($"Found {files.Count} file(s) matching '{pattern}':");
+            foreach (var f in files) sb.AppendLine($"  {f}");
+            if (files.Count >= maxResults) sb.AppendLine($"  ... (capped at {maxResults} results)");
+            return sb.ToString();
+        }
+
         // ── Internal helpers ──
 
         private Type ResolveType(string typeName)

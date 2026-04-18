@@ -12,7 +12,7 @@ namespace Omnipotent.Data_Handling
         public static bool useACMECert = true;
 
         public static DateTime LastOmnipotentUpdate = File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe"));
-
+        public static string CodebaseDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..");
         //surely theres a better way of doing this
         public struct GlobalPaths
         {
