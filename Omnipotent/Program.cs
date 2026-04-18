@@ -15,7 +15,6 @@ using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveBot_Discord.AutoGoat;
 using Omnipotent.Services.KliveCloud;
-using Omnipotent.Services.KliveAgent;
 using Omnipotent.Services.KlivesWorkoutManager;
 using Omnipotent.Services.KliveTechHub;
 using Omnipotent.Services.MemeScraper;
@@ -66,7 +65,6 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveCloud());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLLM());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAgent());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new MemeScraper());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KlivesWorkoutManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());
