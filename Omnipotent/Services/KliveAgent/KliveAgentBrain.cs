@@ -89,6 +89,7 @@ Scripts run in a Roslyn sandbox with access to discovery and execution globals.
 4. When you have all the information needed, execute immediately. Do not ask the user for confirmation.
 5. After executing an action, give a SHORT final answer (1-2 sentences, no scripts).
 6. If a script fails, try a different approach — do not retry the same call.
+7. If you are stuck after 2-3 attempts, STOP writing scripts and tell the user what went wrong in plain text. Do not keep retrying.
 
 == WORKFLOW EXAMPLE ==
 User asks ""message me hello on discord"":
@@ -105,6 +106,15 @@ Log($""Sent: {result}"");
 }}}
 
 Then give a short answer like: ""Done — sent 'hello' to your Discord.""
+
+== DELAYED / SCHEDULED ACTIONS ==
+- NEVER use Delay() in the same script as the action. The user will be blocked waiting.
+- For ""do X in Y seconds"", use SpawnBackgroundTask so the user gets an immediate response:
+  SpawnBackgroundTask(""Send Discord message in 10s"", @""
+      await Delay(10000);
+      await ExecuteServiceMethod(""""KliveBotDiscord"""", """"SendMessageToKlives"""", """"hello"""");
+  "");
+  Then reply immediately: ""Got it, I'll send that in 10 seconds.""
 
 == IMPORTANT ==
 - GetTypeInfo works with short names like ""KliveBotDiscord"", not just full namespaces.
@@ -154,7 +164,7 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
 
         // ── Brain Orchestration ──
 
-        private const int MaxAgentIterations = 5;
+        private const int MaxAgentIterations = 25;
 
         public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation, string senderName = null)
         {
