@@ -65,6 +65,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveCloud());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveLLM());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveAgent.KliveAgent());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new MemeScraper());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KlivesWorkoutManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());

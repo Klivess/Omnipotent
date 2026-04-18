@@ -106,14 +106,38 @@ namespace Omnipotent.Services.KliveBot_Discord
                             message = await SendMessageToKlives(embed);
                         }
 
-                        var llmService = (KliveLLM.KliveLLM)(await GetServicesByType<KliveLLM.KliveLLM>())[0];
-                        if (llmService.IsServiceActive())
+                        // Try KliveAgent first if it's active
+                        bool handledByAgent = false;
+                        try
                         {
-                            string sessionId = GetLlmSessionIdForChat(args);
-                            Stopwatch stopwatch = Stopwatch.StartNew();
-                            var llmResponse = await llmService.QueryLLM(args.Message.Content, sessionId);
-                            stopwatch.Stop();
-                            await args.Message.RespondAsync(llmResponse.Response + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
+                            var agentServices = await GetServicesByType<Omnipotent.Services.KliveAgent.KliveAgent>();
+                            if (agentServices != null && agentServices.Length > 0 && agentServices[0].IsServiceActive())
+                            {
+                                var agent = (Omnipotent.Services.KliveAgent.KliveAgent)agentServices[0];
+                                if (agent.DiscordDMHandler != null)
+                                {
+                                    Stopwatch stopwatch = Stopwatch.StartNew();
+                                    string agentResponse = await agent.DiscordDMHandler(args.Message.Content, args.Channel.Id.ToString());
+                                    stopwatch.Stop();
+                                    await args.Message.RespondAsync(agentResponse + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
+                                    handledByAgent = true;
+                                }
+                            }
+                        }
+                        catch { }
+
+                        // Fall back to plain KliveLLM if agent didn't handle it
+                        if (!handledByAgent)
+                        {
+                            var llmService = (KliveLLM.KliveLLM)(await GetServicesByType<KliveLLM.KliveLLM>())[0];
+                            if (llmService.IsServiceActive())
+                            {
+                                string sessionId = GetLlmSessionIdForChat(args);
+                                Stopwatch stopwatch = Stopwatch.StartNew();
+                                var llmResponse = await llmService.QueryLLM(args.Message.Content, sessionId);
+                                stopwatch.Stop();
+                                await args.Message.RespondAsync(llmResponse.Response + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
+                            }
                         }
                     }
                     catch (Exception ex)

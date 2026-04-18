@@ -127,6 +127,12 @@ namespace Omnipotent.Data_Handling
             public static string OmniTumblrLogsDirectory = $"{OmniTumblrDirectory}/Logs";
             public static string OmniTumblrEventsDirectory = $"{OmniTumblrLogsDirectory}/Events";
 
+            //KliveAgent
+            public static string KliveAgentDirectory = $"{SavedDataDirectory}/KliveAgent";
+            public static string KliveAgentMemoriesDirectory = $"{KliveAgentDirectory}/Memories";
+            public static string KliveAgentConversationsDirectory = $"{KliveAgentDirectory}/Conversations";
+            public static string KliveAgentBackgroundTasksDirectory = $"{KliveAgentDirectory}/BackgroundTasks";
+            public static string KliveAgentScriptLogsDirectory = $"{KliveAgentDirectory}/ScriptLogs";
 
         };
 
