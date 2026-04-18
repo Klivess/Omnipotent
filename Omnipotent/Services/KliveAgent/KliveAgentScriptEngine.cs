@@ -135,14 +135,10 @@ namespace Omnipotent.Services.KliveAgent
             if (string.IsNullOrWhiteSpace(query)) return "Query cannot be empty.";
 
             var results = new List<string>();
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies()
-                .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location)
-                    && (a.FullName?.Contains("Omnipotent") == true || a.GetTypes().Any(t => t.Namespace?.Contains("Omnipotent") == true)));
 
-            foreach (var asm in assemblies)
+            foreach (var asm in GetOmnipotentAssemblies())
             {
-                Type[] types;
-                try { types = asm.GetTypes(); } catch { continue; }
+                var types = SafeGetTypes(asm);
 
                 foreach (var type in types)
                 {
@@ -195,13 +191,10 @@ namespace Omnipotent.Services.KliveAgent
         public string BrowseNamespace(string namespaceName, int maxResults = 30)
         {
             var results = new List<string>();
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies()
-                .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location));
 
-            foreach (var asm in assemblies)
+            foreach (var asm in GetOmnipotentAssemblies())
             {
-                Type[] types;
-                try { types = asm.GetTypes(); } catch { continue; }
+                var types = SafeGetTypes(asm);
 
                 foreach (var type in types)
                 {
@@ -355,21 +348,39 @@ namespace Omnipotent.Services.KliveAgent
                 .FirstOrDefault(s => s.GetType().Name.Equals(typeName, StringComparison.OrdinalIgnoreCase));
             if (svc != null) return svc.GetType();
 
-            // Then search all loaded Omnipotent assemblies
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            // Then search all loaded assemblies
+            foreach (var asm in GetOmnipotentAssemblies())
             {
-                if (asm.IsDynamic) continue;
-                try
-                {
-                    var type = asm.GetTypes().FirstOrDefault(t =>
-                        t.Name.Equals(typeName, StringComparison.OrdinalIgnoreCase) ||
-                        t.FullName?.Equals(typeName, StringComparison.OrdinalIgnoreCase) == true);
-                    if (type != null) return type;
-                }
-                catch { }
+                var type = SafeGetTypes(asm).FirstOrDefault(t =>
+                    t.Name.Equals(typeName, StringComparison.OrdinalIgnoreCase) ||
+                    t.FullName?.Equals(typeName, StringComparison.OrdinalIgnoreCase) == true);
+                if (type != null) return type;
             }
 
             return null;
+        }
+
+        private static IEnumerable<Assembly> GetOmnipotentAssemblies()
+        {
+            return AppDomain.CurrentDomain.GetAssemblies()
+                .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location)
+                    && a.FullName?.Contains("Omnipotent") == true);
+        }
+
+        private static Type[] SafeGetTypes(Assembly asm)
+        {
+            try
+            {
+                return asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                return ex.Types.Where(t => t != null).ToArray();
+            }
+            catch
+            {
+                return Array.Empty<Type>();
+            }
         }
 
         private static MethodInfo ResolveMethod(Type target, string name, BindingFlags flags, object[] args)

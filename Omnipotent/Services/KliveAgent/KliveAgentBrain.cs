@@ -49,29 +49,24 @@ namespace Omnipotent.Services.KliveAgent
 You can write and execute C# scripts by enclosing them in {{{ }}} delimiters.
 Scripts run in a Roslyn sandbox with access to discovery and execution globals.
 
-== DISCOVERY TOOLS (use these to find the right APIs before executing) ==
+== DISCOVERY TOOLS ==
 
   ListServices() -> List<string>
-      Returns all active OmniService names and types. Start here.
+      Returns all active OmniService names and types.
 
   SearchSymbols(string query, int maxResults = 25) -> string
-      Search for types, methods, or properties by keyword across all Omnipotent code.
-      Example: SearchSymbols(""Discord"") finds all Discord-related symbols.
+      Search by keyword across all Omnipotent types, methods, properties.
 
   GetTypeInfo(string typeName) -> string
-      Get full details (methods, properties, fields) for any type by name.
-      Works with service type names or any loaded type.
+      Get methods, properties, and fields for a type by short or full name.
 
   GetMethodSignature(string typeName, string methodName) -> string
-      Get detailed parameter info for a specific method.
+      Get parameter details for a method.
 
   BrowseNamespace(string namespaceName, int maxResults = 30) -> string
-      List all types in a namespace. Example: BrowseNamespace(""Omnipotent.Services"")
-
   GetFullTypeHierarchy(string typeName) -> string
-      See the inheritance chain and all public methods including inherited ones.
 
-== EXECUTION TOOLS (use after you've discovered the right APIs) ==
+== EXECUTION TOOLS ==
 
   ExecuteServiceMethod(string serviceTypeName, string methodName, params object[] args) -> Task<object>
       Call any method on any running service.
@@ -79,46 +74,42 @@ Scripts run in a Roslyn sandbox with access to discovery and execution globals.
   GetServiceObject(string serviceTypeName, string objectName) -> object
       Read any field or property from a running service.
 
+  Log(string message)          — Output text you'll see in the result.
   GetOmnipotentUptime() -> TimeSpan
-
-  Log(string message)
-      Output text back to you (you'll see it in the script result).
-
   SaveMemory(string content, string[] tags, int importance)
   RecallMemories(string query, int maxResults) -> List<AgentMemoryEntry>
-
   SpawnBackgroundTask(string description, string code) -> string taskId
-      Spawn a long-running task. The code runs in its own ScriptGlobals context.
-
   Delay(int ms)
 
-== WORKFLOW ==
-When the user asks you to do something and you don't already know the exact API:
-1. FIRST: Use a discovery script to find the right service/method
-2. THEN: Use an execution script with the exact API you discovered
-You can do both in a single response using multiple {{{ }}} blocks.
+== CRITICAL RULES ==
+1. DO NOT repeat the same discovery call. If you already have the info, use it.
+2. After ONE discovery script, you MUST act on the results in the NEXT script.
+   Do NOT just describe what you found — write the execution script.
+3. You can put MULTIPLE {{{ }}} blocks in one response: first discovers, second executes.
+4. When you have all the information needed, execute immediately. Do not ask the user for confirmation.
+5. After executing an action, give a SHORT final answer (1-2 sentences, no scripts).
+6. If a script fails, try a different approach — do not retry the same call.
 
-Example — user asks ""how many followers does my Instagram have?"":
+== WORKFLOW EXAMPLE ==
+User asks ""message me hello on discord"":
 
-Step 1 - Discover:
 {{{
-Log(SearchSymbols(""follower""));
+Log(GetTypeInfo(""KliveBotDiscord""));
 }}}
 
-Step 2 - After seeing the results, call the right method:
+After seeing SendMessageToKlives(string), immediately write:
+
 {{{
-var result = await ExecuteServiceMethod(""OmniGram"", ""GetFollowerCount"");
-Log($""Follower count: {result}"");
+var result = await ExecuteServiceMethod(""KliveBotDiscord"", ""SendMessageToKlives"", ""hello"");
+Log($""Sent: {result}"");
 }}}
 
-If you already know the exact API from a previous conversation or memory, skip discovery and execute directly.
+Then give a short answer like: ""Done — sent 'hello' to your Discord.""
 
-Rules:
-- Only use scripts when the user's request requires data retrieval or action execution.
-- Always explain what you're doing in natural language alongside scripts.
-- Script output is fed back to you so you can interpret results naturally.
-- Use Log() to capture values you want to see and report on.
-- If a method isn't found, use discovery tools to find the correct name — don't guess.";
+== IMPORTANT ==
+- GetTypeInfo works with short names like ""KliveBotDiscord"", not just full namespaces.
+- For Discord messages, the service is KliveBotDiscord with SendMessageToKlives(string).
+- Only use scripts when you need to DO something or LOOK UP something. Casual conversation needs no scripts.";
         }
 
         // ── Response Parsing ──
@@ -165,7 +156,7 @@ Rules:
 
         private const int MaxAgentIterations = 5;
 
-        public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation)
+        public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation, string senderName = null)
         {
             try
             {
@@ -188,7 +179,7 @@ Rules:
                 llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
-                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage);
+                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
 
                 // Agent loop: LLM responds → scripts execute → results fed back → repeat
                 for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
@@ -293,13 +284,19 @@ Rules:
             }
         }
 
-        private string BuildConversationPrompt(string systemPrompt, AgentConversation conversation, string userMessage)
+        private string BuildConversationPrompt(string systemPrompt, AgentConversation conversation, string userMessage, string senderName = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine("[System]");
             sb.AppendLine(systemPrompt);
             sb.AppendLine();
 
+            if (!string.IsNullOrEmpty(senderName))
+            {
+                sb.AppendLine($"[Current User: {senderName}]");
+                sb.AppendLine($"Channel: {conversation.SourceChannel}");
+                sb.AppendLine();
+            }
             // Include recent conversation history (last 20 messages to keep context manageable)
             var recentMessages = conversation.Messages.TakeLast(20).ToList();
             if (recentMessages.Count > 0)

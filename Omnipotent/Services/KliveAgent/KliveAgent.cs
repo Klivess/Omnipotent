@@ -84,7 +84,7 @@ namespace Omnipotent.Services.KliveAgent
             });
 
             // Process through the brain
-            var response = await brain.ProcessMessageAsync(message, conversation);
+            var response = await brain.ProcessMessageAsync(message, conversation, senderName);
 
             // Persist conversation periodically (every 5 messages)
             if (conversation.Messages.Count % 5 == 0)
