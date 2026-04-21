@@ -15,7 +15,7 @@ namespace KliveLink
     {
         private const string DefaultServerUri = "ws://klive.dev:5100/klivelink";
         private const string MutexName = "Global\\SysMonWatchdog";
-        private static NotifyIcon? _trayIcon;
+        private static NotifyIcon? _trayIcon = null;
         private static KliveLinkClient? _client;
 
         [STAThread]
@@ -38,14 +38,14 @@ namespace KliveLink
             if (currentPath != targetPath)
             {
                 if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
-                string sourceDir = Path.GetDirectoryName(currentPath);
+                string sourceDir = Path.GetDirectoryName(currentPath) ?? targetDir;
                 foreach (string file in Directory.GetFiles(sourceDir))
                 {
                     string destFile = Path.Combine(targetDir, Path.GetFileName(file));
                     File.Copy(file, destFile, true);
                 }
                 // Set auto-start
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true))
+                using (RegistryKey? key = Registry.CurrentUser.OpenSubKey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true))
                 {
                     if (key != null)
                     {

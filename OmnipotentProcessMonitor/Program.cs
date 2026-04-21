@@ -78,9 +78,6 @@ namespace OmnipotentProcessMonitor
                 }
                 Task.Delay(5000).Wait();
             }
-
-            // Nothing past this line will execute.  
-            Application.Run();
         }
     }
 }
