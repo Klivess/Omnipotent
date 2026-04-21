@@ -90,7 +90,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
   SaveShortcut(string title, string content, string[] tags)
       Save a reusable procedure you just figured out. Call this immediately after solving a non-obvious
       task so you can skip re-discovery next time. Example: after finding a guild ID and sending a message,
-      save a shortcut titled "Send Discord message to <GuildName>" with the exact steps.
+      save a shortcut titled ""Send Discord message to <GuildName>"" with the exact steps.
   GetShortcuts() -> string       — List all saved shortcuts.
   RecallMemories(string query, int maxResults) -> List<AgentMemoryEntry>
   SpawnBackgroundTask(string description, string code) -> string taskId
@@ -179,7 +179,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
 
         private const int MaxAgentIterations = 25;
 
-        public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation, string senderName = null)
+        public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation, string? senderName = null)
         {
             try
             {
@@ -286,7 +286,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
                         if (!segment.IsScript) continue;
 
                         var globals = new ScriptGlobals(agentService);
-                        var result = await scriptEngine.ExecuteScriptAsync(segment.Content, globals);
+                        var result = await scriptEngine.ExecuteScriptAsync(segment.Content ?? "", globals);
                         allScriptsExecuted.Add(result);
 
                         if (result.Success)
@@ -333,7 +333,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
             }
         }
 
-        private string BuildConversationPrompt(string systemPrompt, AgentConversation conversation, string userMessage, string senderName = null)
+        private string BuildConversationPrompt(string systemPrompt, AgentConversation conversation, string userMessage, string? senderName = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine("[System]");
@@ -376,6 +376,6 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
     public class ResponseSegment
     {
         public bool IsScript { get; set; }
-        public string Content { get; set; }
+        public string? Content { get; set; }
     }
 }
