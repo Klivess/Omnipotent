@@ -114,6 +114,14 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("content")]
         public string Content { get; set; }
 
+        /// <summary>"general" (default) or "shortcut" (reusable how-to recipe)</summary>
+        [JsonProperty("memoryType")]
+        public string MemoryType { get; set; } = "general";
+
+        /// <summary>Short human-readable title, mainly used for shortcuts.</summary>
+        [JsonProperty("title")]
+        public string Title { get; set; }
+
         [JsonProperty("tags")]
         public List<string> Tags { get; set; } = new();
 
@@ -152,5 +160,14 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("errorMessage")]
         public string ErrorMessage { get; set; }
+
+        [JsonProperty("promptTokens")]
+        public int PromptTokens { get; set; }
+
+        [JsonProperty("completionTokens")]
+        public int CompletionTokens { get; set; }
+
+        [JsonProperty("iterations")]
+        public int Iterations { get; set; }
     }
 }

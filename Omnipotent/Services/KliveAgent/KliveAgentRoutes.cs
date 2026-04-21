@@ -22,6 +22,7 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterConversationRoutes();
             await RegisterTaskRoutes();
             await RegisterMemoryRoutes();
+            await RegisterStatsRoutes();
         }
 
         // ── Chat ──
@@ -230,6 +231,40 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            await service.CreateAPIRoute("/kliveagent/shortcuts", async (req) =>
+            {
+                try
+                {
+                    var shortcuts = await service.Memory.GetShortcutsAsync();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(shortcuts));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+        }
+
+        // ── Stats ──
+
+        private async Task RegisterStatsRoutes()
+        {
+            await service.CreateAPIRoute("/kliveagent/stats", async (req) =>
+            {
+                try
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.GetSummary()));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
     }
 }

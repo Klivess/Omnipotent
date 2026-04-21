@@ -52,14 +52,16 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        public async Task<AgentMemoryEntry> SaveMemoryAsync(string content, string[] tags = null, string source = "agent", int importance = 1)
+        public async Task<AgentMemoryEntry> SaveMemoryAsync(string content, string[] tags = null, string source = "agent", int importance = 1, string memoryType = "general", string title = null)
         {
             var entry = new AgentMemoryEntry
             {
                 Content = content,
                 Tags = tags?.ToList() ?? new List<string>(),
                 Source = source,
-                Importance = Math.Clamp(importance, 1, 5)
+                Importance = Math.Clamp(importance, 1, 5),
+                MemoryType = memoryType,
+                Title = title
             };
 
             var path = Path.Combine(
@@ -159,18 +161,54 @@ namespace Omnipotent.Services.KliveAgent
             return true;
         }
 
+        public async Task<List<AgentMemoryEntry>> GetShortcutsAsync()
+        {
+            if (!cacheLoaded) await LoadCacheAsync();
+
+            await cacheLock.WaitAsync();
+            try
+            {
+                return cachedMemories
+                    .Where(m => m.MemoryType == "shortcut")
+                    .OrderByDescending(m => m.Importance)
+                    .ThenByDescending(m => m.CreatedAt)
+                    .ToList();
+            }
+            finally
+            {
+                cacheLock.Release();
+            }
+        }
+
         public async Task<string> FormatMemoriesForPrompt(string conversationContext, int maxMemories = 8)
         {
+            var shortcuts = await GetShortcutsAsync();
             var relevant = await RecallMemoriesAsync(conversationContext, maxMemories);
-            if (relevant.Count == 0) return "";
+            // Don't duplicate shortcuts that also appear in recall results
+            var regularMemories = relevant.Where(m => m.MemoryType != "shortcut").ToList();
 
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine("\n[Your Persistent Memories]");
-            foreach (var mem in relevant)
+
+            if (shortcuts.Count > 0)
             {
-                var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
-                sb.AppendLine($"- {mem.Content}{tagStr} (saved {mem.CreatedAt:yyyy-MM-dd})");
+                sb.AppendLine("\n[Your Shortcuts — Learned procedures you can use directly without re-discovering]");
+                foreach (var sc in shortcuts)
+                {
+                    var title = string.IsNullOrEmpty(sc.Title) ? "" : $"**{sc.Title}**: ";
+                    sb.AppendLine($"- {title}{sc.Content}");
+                }
             }
+
+            if (regularMemories.Count > 0)
+            {
+                sb.AppendLine("\n[Your Persistent Memories]");
+                foreach (var mem in regularMemories)
+                {
+                    var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
+                    sb.AppendLine($"- {mem.Content}{tagStr} (saved {mem.CreatedAt:yyyy-MM-dd})");
+                }
+            }
+
             return sb.ToString();
         }
     }

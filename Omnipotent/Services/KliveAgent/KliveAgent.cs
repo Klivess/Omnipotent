@@ -10,6 +10,7 @@ namespace Omnipotent.Services.KliveAgent
     {
         public KliveAgentMemory Memory { get; private set; }
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
+        public KliveAgentStats Stats { get; private set; } = new();
 
         private KliveAgentBrain brain;
         private KliveAgentScriptEngine scriptEngine;
@@ -108,15 +109,14 @@ namespace Omnipotent.Services.KliveAgent
         {
             return conversations.Values
                 .OrderByDescending(c => c.LastUpdated)
-                .Select(c => new
+                .Select(c => (object)new
                 {
-                    c.ConversationId,
-                    c.SourceChannel,
-                    c.LastUpdated,
-                    MessageCount = c.Messages.Count,
-                    LastMessage = c.Messages.LastOrDefault()?.Content?.Substring(0, Math.Min(c.Messages.LastOrDefault()?.Content?.Length ?? 0, 100))
+                    conversationId = c.ConversationId,
+                    sourceChannel = c.SourceChannel.ToString(),
+                    lastUpdated = c.LastUpdated,
+                    messageCount = c.Messages.Count,
+                    lastMessage = c.Messages.LastOrDefault()?.Content?.Substring(0, Math.Min(c.Messages.LastOrDefault()?.Content?.Length ?? 0, 100))
                 })
-                .Cast<object>()
                 .ToList();
         }
 

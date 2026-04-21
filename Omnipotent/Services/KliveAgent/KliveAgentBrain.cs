@@ -49,39 +49,31 @@ namespace Omnipotent.Services.KliveAgent
 You can write and execute C# scripts by enclosing them in {{{ }}} delimiters.
 Scripts run in a Roslyn sandbox with access to discovery and execution globals.
 
-== CODEBASE READING (understand how things work by reading the actual source) ==
+== DISCORD RUNTIME TOOLS (use these first for any Discord task — do NOT search code) ==
 
-  ListDirectory(string relativePath = """") -> string
-      List files/folders. Path is relative to project root.
-      Examples: ListDirectory("""") → top-level, ListDirectory(""Omnipotent/Services"") → services folder.
+  GetDiscordGuilds() -> Task<string>
+      Returns all guilds (servers) the bot is currently in, with their IDs and names.
+      ALWAYS call this first when you need a guild ID — never guess or search code for IDs.
 
-  ReadFile(string relativePath, int startLine = 1, int maxLines = 200) -> string
-      Read source code. Returns line-numbered output. Page through large files with startLine.
-      Example: ReadFile(""Omnipotent/Services/KliveBot Discord/KliveBotDiscord.cs"")
+  GetDiscordChannels(ulong guildId) -> Task<string>
+      Returns all text channels in a guild with their IDs.
+      Call after GetDiscordGuilds() to find the channel ID.
 
-  SearchCode(string searchText, string subfolder = """", int maxResults = 30) -> string
-      Grep for text across all .cs files. Returns file:line matches.
-      Example: SearchCode(""SendMessageToKlives"") or SearchCode(""follower"", ""Omnipotent/Services/OmniGram"")
+  SendDiscordMessage(ulong guildId, ulong channelId, string message) -> Task<string>
+      Send a message to a channel. Requires IDs from the above two tools.
 
-  FindFiles(string pattern, string subfolder = """", int maxResults = 50) -> string
-      Find files by name pattern. Example: FindFiles(""*Discord*.cs"")
-
-== DISCOVERY TOOLS ==
-
-  ListServices() -> List<string>
-      Returns all active OmniService names and types.
-
-  SearchSymbols(string query, int maxResults = 25) -> string
-      Search by keyword across all Omnipotent types, methods, properties.
-
-  GetTypeInfo(string typeName) -> string
-      Get methods, properties, and fields for a type by short or full name.
-
-  GetMethodSignature(string typeName, string methodName) -> string
-      Get parameter details for a method.
-
-  BrowseNamespace(string namespaceName, int maxResults = 30) -> string
-  GetFullTypeHierarchy(string typeName) -> string
+Example — user asks ""send 'hello' to #general in Hypixel server"":
+{{{
+Log(await GetDiscordGuilds());
+}}}
+Then (using the ID from output):
+{{{
+Log(await GetDiscordChannels(12345678901234567));
+}}}
+Then:
+{{{
+Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
+}}}
 
 == EXECUTION TOOLS ==
 
@@ -91,44 +83,46 @@ Scripts run in a Roslyn sandbox with access to discovery and execution globals.
   GetServiceObject(string serviceTypeName, string objectName) -> object
       Read any field or property from a running service.
 
-  Log(string message)          — Output text you'll see in the result.
   GetOmnipotentUptime() -> TimeSpan
+  Log(string message)          — Output text you'll see in the result.
   SaveMemory(string content, string[] tags, int importance)
+      Save a fact or observation for future conversations. Call this when you learn something useful.
+  SaveShortcut(string title, string content, string[] tags)
+      Save a reusable procedure you just figured out. Call this immediately after solving a non-obvious
+      task so you can skip re-discovery next time. Example: after finding a guild ID and sending a message,
+      save a shortcut titled "Send Discord message to <GuildName>" with the exact steps.
+  GetShortcuts() -> string       — List all saved shortcuts.
   RecallMemories(string query, int maxResults) -> List<AgentMemoryEntry>
   SpawnBackgroundTask(string description, string code) -> string taskId
   Delay(int ms)
 
+== MEMORY / SHORTCUT RULES ==
+- After completing any non-trivial action (Discord message, service call, etc.) ALWAYS save a memory noting what you did.
+- After figuring out a multi-step process (e.g. finding a guild ID then sending a message), ALWAYS save a shortcut so you can skip those steps next time.
+- Shortcuts are shown at the top of every prompt — check them before running discovery scripts.
+
+== DISCOVERY TOOLS (for understanding the codebase, not for finding live runtime IDs) ==
+
+  ListServices() -> List<string>
+  SearchSymbols(string query) -> string
+  GetTypeInfo(string typeName) -> string
+  GetMethodSignature(string typeName, string methodName) -> string
+  SearchCode(string text, string subfolder = """") -> string
+  ReadFile(string relativePath, int startLine = 1, int maxLines = 200) -> string
+  ListDirectory(string relativePath = """") -> string
+  FindFiles(string pattern) -> string
+
 == CRITICAL RULES ==
-1. DO NOT repeat the same discovery call. If you already have the info, use it.
-2. After ONE discovery script, you MUST act on the results in the NEXT script.
-   Do NOT just describe what you found — write the execution script.
-3. You can put MULTIPLE {{{ }}} blocks in one response: first discovers, second executes.
-4. When you have all the information needed, execute immediately. Do not ask the user for confirmation.
-5. After executing an action, give a SHORT final answer (1-2 sentences, no scripts).
-6. If a script fails, try a different approach — do not retry the same call.
-7. If you are stuck after 2-3 attempts, STOP writing scripts and tell the user what went wrong in plain text. Do not keep retrying.
-8. When you don't understand what a method does or how to use it, READ THE SOURCE CODE with ReadFile() instead of guessing.
-   Use SearchCode() to find where something is implemented, then ReadFile() to understand it.
-
-== WORKFLOW EXAMPLE ==
-User asks ""message me hello on discord"":
-
-{{{
-Log(GetTypeInfo(""KliveBotDiscord""));
-}}}
-
-After seeing SendMessageToKlives(string), immediately write:
-
-{{{
-var result = await ExecuteServiceMethod(""KliveBotDiscord"", ""SendMessageToKlives"", ""hello"");
-Log($""Sent: {result}"");
-}}}
-
-Then give a short answer like: ""Done — sent 'hello' to your Discord.""
+1. For Discord tasks: use GetDiscordGuilds() / GetDiscordChannels() to find IDs at RUNTIME. Never search source code to find guild or channel IDs.
+2. DO NOT repeat the same discovery call. If you already have the info, act on it.
+3. After ONE discovery script, write the execution script immediately — do not describe the results.
+4. You can put MULTIPLE {{{ }}} blocks in one response.
+5. If a script fails, try a different approach — do not retry the same call.
+6. If stuck after 2-3 attempts, stop and explain to the user in plain text.
 
 == DELAYED / SCHEDULED ACTIONS ==
-- NEVER use Delay() in the same script as the action. The user will be blocked waiting.
-- For ""do X in Y seconds"", use SpawnBackgroundTask so the user gets an immediate response:
+- NEVER use Delay() in the same script as the action.
+- Use SpawnBackgroundTask for ""do X in Y seconds"":
   SpawnBackgroundTask(""Send Discord message in 10s"", @""
       await Delay(10000);
       await ExecuteServiceMethod(""""KliveBotDiscord"""", """"SendMessageToKlives"""", """"hello"""");
@@ -209,10 +203,14 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
                 var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
+                int totalPromptTokens = 0;
+                int totalCompletionTokens = 0;
+                int iterationsDone = 0;
 
                 // Agent loop: LLM responds → scripts execute → results fed back → repeat
                 for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
                 {
+                    iterationsDone = iteration + 1;
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
@@ -231,6 +229,7 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
 
                     if (llmResponse == null || !llmResponse.Success)
                     {
+                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
                         return new AgentChatResponse
                         {
                             ConversationId = conversation.ConversationId,
@@ -239,6 +238,9 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
                             ErrorMessage = llmResponse?.ErrorMessage ?? "LLM returned null response."
                         };
                     }
+
+                    totalPromptTokens += llmResponse.PromptTokens;
+                    totalCompletionTokens += llmResponse.CompletionTokens;
 
                     var segments = ParseLLMResponse(llmResponse.Response ?? "");
                     var hasScripts = segments.Any(s => s.IsScript);
@@ -253,12 +255,27 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
                         conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = finalText });
                         conversation.LastUpdated = DateTime.UtcNow;
 
+                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+
+                        // Auto-record a memory when scripts were successfully run (non-trivial action completed)
+                        if (allScriptsExecuted.Count > 0 && allScriptsExecuted.Any(s => s.Success))
+                        {
+                            _ = memory.SaveMemoryAsync(
+                                $"Completed task: \"{TruncateForMemory(userMessage, 120)}\" — {TruncateForMemory(finalText, 200)}",
+                                tags: new[] { "auto", "completed-task" },
+                                source: "agent",
+                                importance: 2);
+                        }
+
                         return new AgentChatResponse
                         {
                             ConversationId = conversation.ConversationId,
                             Response = finalText,
                             ScriptsExecuted = allScriptsExecuted,
-                            Success = true
+                            Success = true,
+                            PromptTokens = totalPromptTokens,
+                            CompletionTokens = totalCompletionTokens,
+                            Iterations = iterationsDone
                         };
                     }
 
@@ -291,13 +308,16 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
                 conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
                 conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = "[Reached maximum reasoning steps]" });
                 conversation.LastUpdated = DateTime.UtcNow;
-
+                agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
                 return new AgentChatResponse
                 {
                     ConversationId = conversation.ConversationId,
                     Response = "I hit my maximum number of reasoning steps. Here's what I managed to do so far.",
                     ScriptsExecuted = allScriptsExecuted,
-                    Success = true
+                    Success = true,
+                    PromptTokens = totalPromptTokens,
+                    CompletionTokens = totalCompletionTokens,
+                    Iterations = iterationsDone
                 };
             }
             catch (Exception ex)
@@ -327,7 +347,7 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
                 sb.AppendLine();
             }
             // Include recent conversation history (last 20 messages to keep context manageable)
-            var recentMessages = conversation.Messages.TakeLast(20).ToList();
+            var recentMessages = conversation.Messages.TakeLast(6).ToList();
             if (recentMessages.Count > 0)
             {
                 sb.AppendLine("[Conversation History]");
@@ -343,6 +363,13 @@ Then give a short answer like: ""Done — sent 'hello' to your Discord.""
             sb.AppendLine($"User: {userMessage}");
 
             return sb.ToString();
+        }
+
+        private static string TruncateForMemory(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            s = s.Replace('\n', ' ').Replace('\r', ' ');
+            return s.Length <= max ? s : s[..max] + "…";
         }
     }
 

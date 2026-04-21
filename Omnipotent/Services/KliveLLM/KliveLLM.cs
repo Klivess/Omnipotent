@@ -227,6 +227,8 @@ namespace Omnipotent.Services.KliveLLM
                     SessionId = sessionId,
                     Conversation = session.chatHistory,
                     Success = true,
+                    PromptTokens = response.usage?.prompt_tokens ?? 0,
+                    CompletionTokens = response.usage?.completion_tokens ?? 0,
                 };
             }
         }
@@ -375,6 +377,8 @@ namespace Omnipotent.Services.KliveLLM
             public ChatHistory Conversation { get; set; }
             public bool Success { get; set; }
             public string ErrorMessage { get; set; }
+            public int PromptTokens { get; set; }
+            public int CompletionTokens { get; set; }
         }
         public void ResetSession(string? sessionId)
         {

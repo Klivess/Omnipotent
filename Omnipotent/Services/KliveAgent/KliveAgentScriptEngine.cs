@@ -1,3 +1,5 @@
+using DSharpPlus;
+using DSharpPlus.Entities;
 using Microsoft.CodeAnalysis.CSharp.Scripting;
 using Microsoft.CodeAnalysis.Scripting;
 using Omnipotent.Service_Manager;
@@ -311,10 +313,33 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Memory ──
 
-        /// <summary>Save a persistent memory entry.</summary>
+        /// <summary>Save a persistent memory entry so you can recall it in future conversations.</summary>
         public async Task SaveMemory(string content, string[] tags = null, int importance = 1)
         {
-            await agentService.Memory.SaveMemoryAsync(content, tags, "agent", importance);
+            await agentService.Memory.SaveMemoryAsync(content, tags, "agent", importance, "general");
+        }
+
+        /// <summary>
+        /// Save a shortcut — a reusable recipe you discovered for completing a type of task.
+        /// Use this immediately after figuring out how to do something non-obvious (e.g. sending a Discord message
+        /// to a guild by name). Shortcuts are shown at the top of every prompt so you can skip re-discovery.
+        /// title: short label, e.g. "Send Discord message to guild by name"
+        /// content: the exact script steps to follow next time (concise, step-by-step).
+        /// </summary>
+        public async Task SaveShortcut(string title, string content, string[] tags = null)
+        {
+            await agentService.Memory.SaveMemoryAsync(content, tags, "agent", 5, "shortcut", title);
+        }
+
+        /// <summary>List all saved shortcuts.</summary>
+        public async Task<string> GetShortcuts()
+        {
+            var shortcuts = await agentService.Memory.GetShortcutsAsync();
+            if (shortcuts.Count == 0) return "No shortcuts saved yet.";
+            var sb = new StringBuilder();
+            foreach (var sc in shortcuts)
+                sb.AppendLine($"[{sc.Title ?? "Untitled"}] {sc.Content}");
+            return sb.ToString();
         }
 
         /// <summary>Search persistent memories.</summary>
@@ -337,6 +362,78 @@ namespace Omnipotent.Services.KliveAgent
         public async Task Delay(int milliseconds)
         {
             await Task.Delay(milliseconds, CancellationToken);
+        }
+
+        // ── Discord Runtime Helpers ──
+
+        /// <summary>Returns all Discord guilds (servers) the bot is currently in, with their IDs and names.
+        /// Use this to look up a guild ID by name — do NOT search source code for guild IDs.</summary>
+        public async Task<string> GetDiscordGuilds()
+        {
+            var bot = agentService.GetActiveServices()
+                .FirstOrDefault(s => s.GetType().Name == "KliveBotDiscord");
+            if (bot == null) return "KliveBotDiscord service not found.";
+
+            var clientProp = bot.GetType().GetProperty("Client", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (clientProp == null) return "Could not find Client property on KliveBotDiscord.";
+
+            var client = clientProp.GetValue(bot) as DSharpPlus.DiscordClient;
+            if (client == null) return "Discord client is null.";
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Bot is in {client.Guilds.Count} guild(s):");
+            foreach (var kvp in client.Guilds.OrderBy(g => g.Value.Name))
+                sb.AppendLine($"  {kvp.Value.Name} (ID: {kvp.Key})");
+            return sb.ToString();
+        }
+
+        /// <summary>Returns all text channels in a Discord guild by its ID. Use GetDiscordGuilds() to find the ID first.</summary>
+        public async Task<string> GetDiscordChannels(ulong guildId)
+        {
+            var bot = agentService.GetActiveServices()
+                .FirstOrDefault(s => s.GetType().Name == "KliveBotDiscord");
+            if (bot == null) return "KliveBotDiscord service not found.";
+
+            var clientProp = bot.GetType().GetProperty("Client", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            var client = clientProp?.GetValue(bot) as DSharpPlus.DiscordClient;
+            if (client == null) return "Discord client is null.";
+
+            DSharpPlus.Entities.DiscordGuild guild;
+            try { guild = await client.GetGuildAsync(guildId); }
+            catch (Exception ex) { return $"Failed to fetch guild {guildId}: {ex.Message}"; }
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Channels in {guild.Name}:");
+            foreach (var ch in guild.Channels.Values.OrderBy(c => c.Position))
+            {
+                if (ch.Type == DSharpPlus.ChannelType.Text || ch.Type == DSharpPlus.ChannelType.News)
+                    sb.AppendLine($"  #{ch.Name} (ID: {ch.Id}) [{ch.Type}]");
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Send a plain-text message to a specific channel in a specific guild.
+        /// Use GetDiscordGuilds() + GetDiscordChannels() first to look up the IDs.</summary>
+        public async Task<string> SendDiscordMessage(ulong guildId, ulong channelId, string message)
+        {
+            var bot = agentService.GetActiveServices()
+                .FirstOrDefault(s => s.GetType().Name == "KliveBotDiscord");
+            if (bot == null) return "KliveBotDiscord service not found.";
+
+            var clientProp = bot.GetType().GetProperty("Client", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            var client = clientProp?.GetValue(bot) as DSharpPlus.DiscordClient;
+            if (client == null) return "Discord client is null.";
+
+            try
+            {
+                var channel = await client.GetChannelAsync(channelId);
+                var msg = await channel.SendMessageAsync(message);
+                return $"Sent message (ID: {msg.Id}) to #{channel.Name} in guild {guildId}.";
+            }
+            catch (Exception ex)
+            {
+                return $"Failed to send message: {ex.Message}";
+            }
         }
 
         // ── Codebase Reading ──
