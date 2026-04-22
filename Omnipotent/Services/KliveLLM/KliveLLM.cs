@@ -296,7 +296,7 @@ namespace Omnipotent.Services.KliveLLM
                             int percent = (int)((downloadedBytes * 100L) / totalBytes);
                             if (percent >= 100) percent = 100;
 
-                            if (percent == 100 || percent >= lastReportedPercent + 5)
+                            if (percent == 100 || percent >= lastReportedPercent + 1)
                             {
                                 lastReportedPercent = percent;
                                 try
