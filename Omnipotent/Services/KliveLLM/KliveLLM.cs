@@ -439,7 +439,6 @@ namespace Omnipotent.Services.KliveLLM
                 await session.sessionLock.WaitAsync();
                 try
                 {
-                    session.chatHistory.AddMessage(AuthorRole.User, prompt);
                     session.lastUpdated = DateTime.UtcNow;
                     try { await ServiceLog($"Querying local model for session {sessionId}"); } catch { }
 
@@ -481,7 +480,6 @@ namespace Omnipotent.Services.KliveLLM
                     if (string.IsNullOrWhiteSpace(outStr))
                         outStr = "[No response. Error?]";
 
-                    session.chatHistory.AddMessage(AuthorRole.Assistant, outStr);
                     session.lastUpdated = DateTime.UtcNow;
 
                     resp.Response = outStr;
