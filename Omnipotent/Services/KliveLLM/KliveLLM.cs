@@ -218,12 +218,14 @@ namespace Omnipotent.Services.KliveLLM
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
             var response = await SendHFAIInferenceRequest(session.chatHistory);
             {
-                session.chatHistory.AddMessage(AuthorRole.Assistant, response.choices[0].message.content);
+                var content = response.choices[0].message.content;
+                session.chatHistory.AddMessage(AuthorRole.Assistant, content);
                 session.lastUpdated = DateTime.UtcNow;
 
                 return new KliveLLMResponse()
                 {
-                    Response = response.choices[0].message.content,
+                    Response = content,
+                    RawResponse = content,
                     SessionId = sessionId,
                     Conversation = session.chatHistory,
                     Success = true,
@@ -373,6 +375,7 @@ namespace Omnipotent.Services.KliveLLM
         public class KliveLLMResponse
         {
             public string Response { get; set; }
+            public string RawResponse { get; set; }
             public string SessionId { get; set; }
             public ChatHistory Conversation { get; set; }
             public bool Success { get; set; }
@@ -482,6 +485,7 @@ namespace Omnipotent.Services.KliveLLM
 
                     session.lastUpdated = DateTime.UtcNow;
 
+                    resp.RawResponse = raw;
                     resp.Response = outStr;
                     resp.SessionId = sessionId;
                     resp.Conversation = session.chatHistory;
@@ -538,6 +542,22 @@ namespace Omnipotent.Services.KliveLLM
             if (thinkEndIdx >= 0)
             {
                 text = text.Substring(thinkEndIdx + "</think>".Length).TrimStart();
+            }
+
+            // Clean up potentially unclosed or badly formatted XML-like thoughts common in some local agent models
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"(?s)<analysis>.*?(</analysis>|$)", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"(?s)<decision>.*?(</decision>|</analysis>|$)", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            text = System.Text.RegularExpressions.Regex.Replace(text, @"(?s)Analysis:.*?(</analysis>|$)", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            // If the output is enveloped entirely in a response block or contains one, try to extract the inner content
+            var responseMatch = System.Text.RegularExpressions.Regex.Match(text, @"<response>(.*?)</response>", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+            if (responseMatch.Success)
+            {
+                text = responseMatch.Groups[1].Value;
+            }
+            else
+            {
+                text = text.Replace("<response>", "").Replace("</response>", "");
             }
 
             // Remove common leading role prefixes emitted by chat-tuned models.
