@@ -79,6 +79,226 @@ namespace Omnipotent.Services.KliveAgent.Models
         public long ExecutionTimeMs { get; set; }
     }
 
+    public class AgentTypeSchema
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("fullName")]
+        public string? FullName { get; set; }
+
+        [JsonProperty("baseType")]
+        public string? BaseType { get; set; }
+
+        [JsonProperty("interfaces")]
+        public List<string> Interfaces { get; set; } = new();
+
+        [JsonProperty("methods")]
+        public List<AgentTypeMethodSchema> Methods { get; set; } = new();
+
+        [JsonProperty("properties")]
+        public List<AgentTypePropertySchema> Properties { get; set; } = new();
+
+        [JsonProperty("fields")]
+        public List<AgentTypeFieldSchema> Fields { get; set; } = new();
+    }
+
+    public class AgentTypeMethodSchema
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("declaringType")]
+        public string DeclaringType { get; set; } = string.Empty;
+
+        [JsonProperty("returnType")]
+        public string ReturnType { get; set; } = string.Empty;
+
+        [JsonProperty("isStatic")]
+        public bool IsStatic { get; set; }
+
+        [JsonProperty("parameters")]
+        public List<AgentTypeParameterSchema> Parameters { get; set; } = new();
+    }
+
+    public class AgentTypeParameterSchema
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonProperty("hasDefaultValue")]
+        public bool HasDefaultValue { get; set; }
+
+        [JsonProperty("defaultValue")]
+        public string? DefaultValue { get; set; }
+    }
+
+    public class AgentTypePropertySchema
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("declaringType")]
+        public string DeclaringType { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonProperty("canRead")]
+        public bool CanRead { get; set; }
+
+        [JsonProperty("canWrite")]
+        public bool CanWrite { get; set; }
+
+        [JsonProperty("isStatic")]
+        public bool IsStatic { get; set; }
+    }
+
+    public class AgentTypeFieldSchema
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("declaringType")]
+        public string DeclaringType { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonProperty("isStatic")]
+        public bool IsStatic { get; set; }
+    }
+
+    public class DiscordGuildInfo
+    {
+        [JsonProperty("id")]
+        public ulong Id { get; set; }
+
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        public override string ToString() => $"{Name} ({Id})";
+    }
+
+    public class DiscordChannelInfo
+    {
+        [JsonProperty("id")]
+        public ulong Id { get; set; }
+
+        [JsonProperty("guildId")]
+        public ulong GuildId { get; set; }
+
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonProperty("position")]
+        public int Position { get; set; }
+
+        public override string ToString() => $"#{Name} ({Id}) [{Type}]";
+    }
+
+    public class DiscordMessageInfo
+    {
+        [JsonProperty("id")]
+        public ulong Id { get; set; }
+
+        [JsonProperty("channelId")]
+        public ulong ChannelId { get; set; }
+
+        [JsonProperty("authorId")]
+        public ulong AuthorId { get; set; }
+
+        [JsonProperty("authorName")]
+        public string AuthorName { get; set; } = string.Empty;
+
+        [JsonProperty("content")]
+        public string Content { get; set; } = string.Empty;
+
+        [JsonProperty("timestampUtc")]
+        public DateTime TimestampUtc { get; set; }
+
+        public override string ToString() => $"{AuthorName}: {Content}";
+    }
+
+    public class ProjectClassInfo
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("fullName")]
+        public string FullName { get; set; } = string.Empty;
+
+        [JsonProperty("namespace")]
+        public string Namespace { get; set; } = string.Empty;
+
+        [JsonProperty("relativePath")]
+        public string RelativePath { get; set; } = string.Empty;
+
+        [JsonProperty("lineNumber")]
+        public int LineNumber { get; set; }
+
+        [JsonProperty("kind")]
+        public string Kind { get; set; } = "class";
+
+        [JsonProperty("summary")]
+        public string? Summary { get; set; }
+
+        public override string ToString() => $"{FullName} ({RelativePath}:{LineNumber})";
+    }
+
+    public class ProjectParameterDocumentation
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        [JsonProperty("hasDefaultValue")]
+        public bool HasDefaultValue { get; set; }
+
+        [JsonProperty("defaultValue")]
+        public string? DefaultValue { get; set; }
+
+        [JsonProperty("documentation")]
+        public string? Documentation { get; set; }
+    }
+
+    public class ProjectMethodDocumentation
+    {
+        [JsonProperty("typeName")]
+        public string TypeName { get; set; } = string.Empty;
+
+        [JsonProperty("methodName")]
+        public string MethodName { get; set; } = string.Empty;
+
+        [JsonProperty("signature")]
+        public string Signature { get; set; } = string.Empty;
+
+        [JsonProperty("summary")]
+        public string? Summary { get; set; }
+
+        [JsonProperty("returns")]
+        public string? Returns { get; set; }
+
+        [JsonProperty("relativePath")]
+        public string RelativePath { get; set; } = string.Empty;
+
+        [JsonProperty("lineNumber")]
+        public int LineNumber { get; set; }
+
+        [JsonProperty("parameters")]
+        public List<ProjectParameterDocumentation> Parameters { get; set; } = new();
+
+        public override string ToString() => Signature;
+    }
+
     public class AgentBackgroundTaskInfo
     {
         [JsonProperty("taskId")]

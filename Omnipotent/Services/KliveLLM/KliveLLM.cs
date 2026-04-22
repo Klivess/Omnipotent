@@ -611,13 +611,15 @@ namespace Omnipotent.Services.KliveLLM
                 this.isLocalLLM = isLocalLLM;
                 this.parentService = parentService;
                 this.lastUpdated = DateTime.UtcNow;
+                chatHistory = new ChatHistory();
                 if (isLocalLLM)
                 {
+                    modelWeights ??= parentService.modelWeights;
+                    modelParams ??= parentService.modelParams;
                     context = modelWeights.CreateContext(modelParams);
                     executor = new InteractiveExecutor(context);
                     chatSession = new ChatSession(executor, chatHistory);
                 }
-                chatHistory = new ChatHistory();
                 // Seed system prompt - can be customized
                 chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant. /no_think");
             }

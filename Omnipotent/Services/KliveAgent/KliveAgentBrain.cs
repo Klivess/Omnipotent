@@ -46,93 +46,13 @@ namespace Omnipotent.Services.KliveAgent
         private string GetScriptInstructions()
         {
             return @"[Script Execution]
-You can write and execute C# scripts by enclosing them in {{{ }}} delimiters.
-Scripts run in a Roslyn sandbox with access to discovery and execution globals.
-
-== DISCORD RUNTIME TOOLS (use these first for any Discord task — do NOT search code) ==
-
-  GetDiscordGuilds() -> Task<string>
-      Returns all guilds (servers) the bot is currently in, with their IDs and names.
-      ALWAYS call this first when you need a guild ID — never guess or search code for IDs.
-
-  GetDiscordChannels(ulong guildId) -> Task<string>
-      Returns all text channels in a guild with their IDs.
-      Call after GetDiscordGuilds() to find the channel ID.
-
-  SendDiscordMessage(ulong guildId, ulong channelId, string message) -> Task<string>
-      Send a message to a channel. Requires IDs from the above two tools.
-
-Example — user asks ""send 'hello' to #general in Hypixel server"":
-{{{
-Log(await GetDiscordGuilds());
-}}}
-Then (using the ID from output):
-{{{
-Log(await GetDiscordChannels(12345678901234567));
-}}}
-Then:
-{{{
-Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
-}}}
-
-== EXECUTION TOOLS ==
-
-  ExecuteServiceMethod(string serviceTypeName, string methodName, params object[] args) -> Task<object>
-      Call any method on any running service.
-
-  GetServiceObject(string serviceTypeName, string objectName) -> object
-      Read any field or property from a running service.
-
-  GetOmnipotentUptime() -> TimeSpan
-  Log(string message)          — Output text you'll see in the result.
-  SaveMemory(string content, string[] tags, int importance)
-      Save a fact or observation for future conversations. Call this when you learn something useful.
-  SaveShortcut(string title, string content, string[] tags)
-      Save a reusable procedure you just figured out. Call this immediately after solving a non-obvious
-      task so you can skip re-discovery next time. Example: after finding a guild ID and sending a message,
-      save a shortcut titled ""Send Discord message to <GuildName>"" with the exact steps.
-  GetShortcuts() -> string       — List all saved shortcuts.
-  RecallMemories(string query, int maxResults) -> List<AgentMemoryEntry>
-  SpawnBackgroundTask(string description, string code) -> string taskId
-  Delay(int ms)
-
-== MEMORY / SHORTCUT RULES ==
-- After completing any non-trivial action (Discord message, service call, etc.) ALWAYS save a memory noting what you did.
-- After figuring out a multi-step process (e.g. finding a guild ID then sending a message), ALWAYS save a shortcut so you can skip those steps next time.
-- Shortcuts are shown at the top of every prompt — check them before running discovery scripts.
-
-== DISCOVERY TOOLS (for understanding the codebase, not for finding live runtime IDs) ==
-
-  ListServices() -> List<string>
-  SearchSymbols(string query) -> string
-  GetTypeInfo(string typeName) -> string
-  GetMethodSignature(string typeName, string methodName) -> string
-  SearchCode(string text, string subfolder = """") -> string
-  ReadFile(string relativePath, int startLine = 1, int maxLines = 200) -> string
-  ListDirectory(string relativePath = """") -> string
-  FindFiles(string pattern) -> string
-
-== CRITICAL RULES ==
-1. For Discord tasks: use GetDiscordGuilds() / GetDiscordChannels() to find IDs at RUNTIME. Never search source code to find guild or channel IDs.
-2. DO NOT repeat the same discovery call. If you already have the info, act on it.
-3. After ONE discovery script, write the execution script immediately — do not describe the results.
-4. You can put MULTIPLE {{{ }}} blocks in one response.
-5. If a script fails, try a different approach — do not retry the same call.
-6. If stuck after 2-3 attempts, stop and explain to the user in plain text.
-
-== DELAYED / SCHEDULED ACTIONS ==
-- NEVER use Delay() in the same script as the action.
-- Use SpawnBackgroundTask for ""do X in Y seconds"":
-  SpawnBackgroundTask(""Send Discord message in 10s"", @""
-      await Delay(10000);
-      await ExecuteServiceMethod(""""KliveBotDiscord"""", """"SendMessageToKlives"""", """"hello"""");
-  "");
-  Then reply immediately: ""Got it, I'll send that in 10 seconds.""
-
-== IMPORTANT ==
-- GetTypeInfo works with short names like ""KliveBotDiscord"", not just full namespaces.
-- For Discord messages, the service is KliveBotDiscord with SendMessageToKlives(string).
-- Only use scripts when you need to DO something or LOOK UP something. Casual conversation needs no scripts.";
+- Use C# inside {{{ }}} only when you need runtime data, codebase inspection, or to take an action.
+- Multiple script blocks in the same reply share locals and execution state.
+- Prefer structured discovery over guessing. Inspect types, classes, methods, files, and documentation before using unfamiliar APIs.
+- Generic discovery helpers: ListProjectClasses(...), FindProjectClass(...), ExploreClassCode(...), GetTypeSchema(...), GetTypeInfo(...), GetMethodDocumentationEntries(...), GetMethodDocumentation(...), SearchSymbols(...), SearchCode(...), ReadFile(...), ListDirectory(...), FindFiles(...).
+- Runtime/action helpers remain available too, but do not hardcode assumptions when the codebase can tell you the answer.
+- If a script fails, change approach instead of repeating the same failing call.
+- When you already have enough information, stop scripting and answer plainly.";
         }
 
         // ── Response Parsing ──
@@ -203,6 +123,8 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
                 var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
+                var sharedGlobals = new ScriptGlobals(agentService);
+                var scriptSession = scriptEngine.CreateSession(sharedGlobals);
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
@@ -285,8 +207,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
                     {
                         if (!segment.IsScript) continue;
 
-                        var globals = new ScriptGlobals(agentService);
-                        var result = await scriptEngine.ExecuteScriptAsync(segment.Content ?? "", globals);
+                        var result = await scriptSession.ExecuteAsync(segment.Content ?? "");
                         allScriptsExecuted.Add(result);
 
                         if (result.Success)
@@ -300,7 +221,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
                     }
 
                     // Feed results back as the next user turn so the LLM can act on them
-                    currentPrompt = $"[Script Results]\n{resultsSummary}\n\nNow continue: if you have what you need, give the user a final answer (no scripts). If you need to take further action based on these results, write the next script.";
+                    currentPrompt = $"[Script Results]\n{resultsSummary}\n\nEarlier successful script locals are still available. Now continue: if you have what you need, give the user a final answer (no scripts). If you need to take further action based on these results, write the next script.";
                 }
 
                 // If we hit the iteration cap, return whatever we have
@@ -371,6 +292,7 @@ Log(await SendDiscordMessage(12345678901234567, 98765432109876543, ""hello""));
             s = s.Replace('\n', ' ').Replace('\r', ' ');
             return s.Length <= max ? s : s[..max] + "…";
         }
+
     }
 
     public class ResponseSegment

@@ -161,17 +161,43 @@ namespace Omnipotent.Services.KliveAgent
             return true;
         }
 
-        public async Task<List<AgentMemoryEntry>> GetShortcutsAsync()
+        public async Task<List<AgentMemoryEntry>> GetShortcutsAsync(string? query = null, int maxResults = int.MaxValue)
         {
             if (!cacheLoaded) await LoadCacheAsync();
 
             await cacheLock.WaitAsync();
             try
             {
-                return cachedMemories
+                var shortcuts = cachedMemories
                     .Where(m => m.MemoryType == "shortcut")
-                    .OrderByDescending(m => m.Importance)
-                    .ThenByDescending(m => m.CreatedAt)
+                    .ToList();
+
+                if (string.IsNullOrWhiteSpace(query))
+                {
+                    return shortcuts
+                        .OrderByDescending(m => m.Importance)
+                        .ThenByDescending(m => m.CreatedAt)
+                        .Take(maxResults)
+                        .ToList();
+                }
+
+                var queryTerms = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                return shortcuts
+                    .Select(m => new
+                    {
+                        Memory = m,
+                        Score = queryTerms.Sum(term =>
+                            (m.Title?.ToLowerInvariant().Contains(term) == true ? 4 : 0) +
+                            (m.Content?.ToLowerInvariant().Contains(term) == true ? 2 : 0) +
+                            (m.Tags?.Any(t => t.ToLowerInvariant().Contains(term)) == true ? 3 : 0)) +
+                            m.Importance
+                    })
+                    .Where(x => x.Score > 0)
+                    .OrderByDescending(x => x.Score)
+                    .ThenByDescending(x => x.Memory.CreatedAt)
+                    .Take(maxResults)
+                    .Select(x => x.Memory)
                     .ToList();
             }
             finally
@@ -180,9 +206,9 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        public async Task<string> FormatMemoriesForPrompt(string conversationContext, int maxMemories = 8)
+        public async Task<string> FormatMemoriesForPrompt(string conversationContext, int maxMemories = 6, int maxShortcuts = 3)
         {
-            var shortcuts = await GetShortcutsAsync();
+            var shortcuts = await GetShortcutsAsync(conversationContext, maxShortcuts);
             var relevant = await RecallMemoriesAsync(conversationContext, maxMemories);
             // Don't duplicate shortcuts that also appear in recall results
             var regularMemories = relevant.Where(m => m.MemoryType != "shortcut").ToList();
@@ -194,8 +220,8 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("\n[Your Shortcuts — Learned procedures you can use directly without re-discovering]");
                 foreach (var sc in shortcuts)
                 {
-                    var title = string.IsNullOrEmpty(sc.Title) ? "" : $"**{sc.Title}**: ";
-                    sb.AppendLine($"- {title}{sc.Content}");
+                    var title = string.IsNullOrEmpty(sc.Title) ? string.Empty : $"{TruncateForPrompt(sc.Title, 80)}: ";
+                    sb.AppendLine($"- {title}{TruncateForPrompt(sc.Content, 220)}");
                 }
             }
 
@@ -205,11 +231,19 @@ namespace Omnipotent.Services.KliveAgent
                 foreach (var mem in regularMemories)
                 {
                     var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
-                    sb.AppendLine($"- {mem.Content}{tagStr} (saved {mem.CreatedAt:yyyy-MM-dd})");
+                    sb.AppendLine($"- {TruncateForPrompt(mem.Content, 180)}{tagStr} (saved {mem.CreatedAt:yyyy-MM-dd})");
                 }
             }
 
             return sb.ToString();
+        }
+
+        private static string TruncateForPrompt(string? value, int maxLength)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Length <= maxLength)
+                return value ?? string.Empty;
+
+            return value[..Math.Max(0, maxLength - 3)] + "...";
         }
     }
 }
