@@ -153,6 +153,23 @@ namespace Omnipotent.Service_Manager
         public bool CreateAndStartService(OmniService service, bool overrideDuplicate = false) => serviceManager.CreateAndStartNewMonitoredOmniService(service, overrideDuplicate);
         public async Task<OmniService[]> GetServicesByType<T>() => await serviceManager.GetServiceByClassType<T>();
 
+        public event EventHandler<OmniSettingsChangedEventArgs> OnOmniSettingsChanged
+        {
+            add => GetOmniGlobalSettingsManager().GetAwaiter().GetResult().OnSettingsChanged += value;
+            remove => GetOmniGlobalSettingsManager().GetAwaiter().GetResult().OnSettingsChanged -= value;
+        }
+
+        public async Task<OmniGlobalSettingsManager> GetOmniGlobalSettingsManager()
+        {
+            var services = await serviceManager.GetServiceByClassType<OmniGlobalSettingsManager>();
+            if (services == null || services.Length == 0)
+            {
+                throw new InvalidOperationException($"Service of type {typeof(OmniGlobalSettingsManager).Name} not found.");
+            }
+
+            return (OmniGlobalSettingsManager)services[0];
+        }
+
         // Common cross-service helper for API route creation (wraps ExecuteServiceMethod)
         public async Task CreateAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission)
         {

@@ -25,6 +25,13 @@ namespace Omnipotent.Service_Manager
         public string ParentServiceId { get; set; }
     }
 
+    public class OmniSettingsChangedEventArgs : EventArgs
+    {
+        public OmniSetting Setting { get; init; }
+        public string PreviousValue { get; init; }
+        public bool IsNewSetting { get; init; }
+    }
+
     public class OmniGlobalSettingsManager : OmniService
     {
         private readonly string settingsDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGlobalSettingsDirectory);
@@ -33,6 +40,8 @@ namespace Omnipotent.Service_Manager
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> pendingFulfillmentPromptIds = new(StringComparer.OrdinalIgnoreCase);
         private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
+
+        public event EventHandler<OmniSettingsChangedEventArgs> OnSettingsChanged;
 
         public OmniGlobalSettingsManager()
         {
@@ -135,6 +144,8 @@ namespace Omnipotent.Service_Manager
             parentServiceId = NormalizeParentServiceId(parentServiceId);
             var key = ComposeKey(parentServiceId, name);
             bool isNewOrModified = false;
+            bool isNewSetting = false;
+            string previousValue = null;
             
             // Fix async thread context loss causing misidentified callers:
             // If the parentServiceId is unknown (0), we try to find any existing setting with the same name.
@@ -163,6 +174,7 @@ namespace Omnipotent.Service_Manager
                 key = ComposeKey(setting.ParentServiceId, setting.Name);
                 settings[key] = setting;
                 isNewOrModified = true;
+                isNewSetting = true;
             }
 
             if (string.IsNullOrEmpty(setting.Value))
@@ -174,6 +186,7 @@ namespace Omnipotent.Service_Manager
 
                 if (populatedMatch != null)
                 {
+                    previousValue = setting.Value;
                     setting.Value = populatedMatch.Value;
                     settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
                     isNewOrModified = true;
@@ -201,6 +214,7 @@ namespace Omnipotent.Service_Manager
 
                     if (!string.IsNullOrEmpty(response))
                     {
+                        previousValue = setting.Value;
                         setting.Value = response.Trim();
                         settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
                         isNewOrModified = true;
@@ -216,6 +230,7 @@ namespace Omnipotent.Service_Manager
             if (isNewOrModified)
             {
                 await SaveSettings();
+                RaiseSettingsChanged(setting, previousValue, isNewSetting);
             }
 
             return setting;
@@ -312,6 +327,7 @@ namespace Omnipotent.Service_Manager
             try
             {
                 var key = ComposeKey(parentServiceId, name);
+                bool isNewSetting = false;
 
                 if (!settings.TryGetValue(key, out var s))
                 {
@@ -325,6 +341,7 @@ namespace Omnipotent.Service_Manager
                     {
                         s = new OmniSetting { Name = name, Type = type, Sensitive = false, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
                         settings[key] = s;
+                        isNewSetting = true;
                     }
                 }
 
@@ -339,8 +356,15 @@ namespace Omnipotent.Service_Manager
                     catch { }
                 }
 
+                var previousValue = s.Value;
+                if (!isNewSetting && string.Equals(previousValue, value, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
                 s.Value = value;
                 await SaveSettings();
+                RaiseSettingsChanged(s, previousValue, isNewSetting);
                 return true;
             }
             catch (Exception ex)
@@ -381,6 +405,16 @@ namespace Omnipotent.Service_Manager
         private static string NormalizeParentServiceId(string parentServiceId) => string.IsNullOrWhiteSpace(parentServiceId) ? "0" : parentServiceId.Trim();
 
         private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
+
+        private void RaiseSettingsChanged(OmniSetting setting, string previousValue, bool isNewSetting)
+        {
+            OnSettingsChanged?.Invoke(this, new OmniSettingsChangedEventArgs
+            {
+                Setting = setting,
+                PreviousValue = previousValue,
+                IsNewSetting = isNewSetting
+            });
+        }
 
         private string MaskSensitive(string v)
         {

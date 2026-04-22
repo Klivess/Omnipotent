@@ -61,16 +61,45 @@ namespace Omnipotent.Services.KliveLLM
 
             if (await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
             {
-                try
+                await SetupLocalLLM();
+            }
+
+            OnOmniSettingsChanged += KliveLLM_OnOmniSettingsChanged;
+        }
+
+        private async void KliveLLM_OnOmniSettingsChanged(object? sender, OmniSettingsChangedEventArgs e)
+        {
+            if (e.Setting.Name == "UseHuggingFaceProvider" && e.IsNewSetting)
+            {
+                if(e.Setting.Value == "false")
                 {
-                    await EnsureModelDownloadedAsync();
-                    await InitializeLocalModelAsync();
+                    await SetupLocalLLM();
+                    ServiceLog("Switched to local LLama provider. Model resources have been initialized.");
                 }
-                catch (Exception ex)
+                else
                 {
-                    await ServiceLogError(ex, $"INIT FAILED: {ex.Message} | Inner: {ex.InnerException?.Message} | Stack: {ex.StackTrace}");
-                    return;
+                    modelWeights.Dispose();
+                    ServiceLog("Switched to HuggingFace provider. Local model resources have been released.");
                 }
+            }
+            if(e.Setting.Name == "LocalLLMGGUFDownloadURL" && e.IsNewSetting && await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
+            {
+                ServiceLog("Local LLM model URL updated. Setting up local model...");
+                await SetupLocalLLM();
+                ServiceLog("Local LLM model URL updated. Model resources have been re-initialized with the new model.");
+            }
+        }
+        private async Task SetupLocalLLM()
+        {
+            try
+            {
+                await EnsureModelDownloadedAsync();
+                await InitializeLocalModelAsync();
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"INIT FAILED: {ex.Message} | Inner: {ex.InnerException?.Message} | Stack: {ex.StackTrace}");
+                return;
             }
         }
 
