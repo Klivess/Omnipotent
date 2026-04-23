@@ -10,7 +10,13 @@ namespace Omnipotent.Services.KliveAgent
     {
         public KliveAgentMemory Memory { get; private set; }
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
+        public KliveAgentCapabilityRegistry Capabilities { get; private set; }
         public KliveAgentStats Stats { get; private set; } = new();
+
+        // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
+        public KliveAgentCodebaseIndex CodebaseIndex { get; private set; }
+        public KliveAgentSymbolGraph SymbolGraph { get; private set; }
+        public KliveAgentRepoMap RepoMap { get; private set; }
 
         private KliveAgentBrain brain;
         private KliveAgentScriptEngine scriptEngine;
@@ -49,6 +55,19 @@ namespace Omnipotent.Services.KliveAgent
             BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
             await BackgroundTasks.InitializeAsync();
 
+            Capabilities = new KliveAgentCapabilityRegistry(this);
+
+            // Initialize codebase intelligence (spec Ch. 3, 4, 7)
+            var codebaseRoot = ResolveCodebaseRoot();
+            var indexCacheDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory);
+            CodebaseIndex = new KliveAgentCodebaseIndex(codebaseRoot, indexCacheDir);
+            await CodebaseIndex.InitializeAsync();
+
+            SymbolGraph = new KliveAgentSymbolGraph(CodebaseIndex);
+            await SymbolGraph.BuildAsync();
+
+            RepoMap = new KliveAgentRepoMap(CodebaseIndex, SymbolGraph);
+
             brain = new KliveAgentBrain(this, scriptEngine, Memory);
 
             // Register API routes
@@ -62,6 +81,29 @@ namespace Omnipotent.Services.KliveAgent
             await LoadConversationsAsync();
 
             await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
+        }
+
+        // ── Codebase Root Resolution ──
+
+        internal static string ResolveCodebaseRoot()
+        {
+            var candidates = new[]
+            {
+                AppDomain.CurrentDomain.BaseDirectory,
+                OmniPaths.CodebaseDirectory
+            };
+            foreach (var candidate in candidates)
+            {
+                var dir = candidate;
+                for (int i = 0; i < 8 && dir != null; i++)
+                {
+                    if (File.Exists(Path.Combine(dir, "Omnipotent.sln")) ||
+                        Directory.Exists(Path.Combine(dir, "Omnipotent")))
+                        return dir;
+                    dir = Path.GetDirectoryName(dir);
+                }
+            }
+            return AppDomain.CurrentDomain.BaseDirectory;
         }
 
         // ── Message Handling ──
@@ -124,6 +166,16 @@ namespace Omnipotent.Services.KliveAgent
         {
             conversations.TryGetValue(conversationId, out var conversation);
             return conversation;
+        }
+
+        public List<AgentCapabilityDefinition> GetCapabilities(string? category = null)
+        {
+            return Capabilities.GetCapabilities(category);
+        }
+
+        public Task<AgentCapabilityInvocationResult> ExecuteCapabilityAsync(AgentCapabilityInvocationRequest request, AgentCapabilityInvocationContext context)
+        {
+            return Capabilities.ExecuteAsync(request, context);
         }
 
         // ── Persistence ──

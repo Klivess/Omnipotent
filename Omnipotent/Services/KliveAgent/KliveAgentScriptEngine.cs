@@ -309,10 +309,46 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString();
         }
 
+        /// <summary>List the explicit typed capabilities KliveAgent can execute without relying on raw reflection.</summary>
+        public List<AgentCapabilityDefinition> ListAgentCapabilities(string? category = null)
+        {
+            if (agentService == null) return new List<AgentCapabilityDefinition>();
+            return agentService.GetCapabilities(category);
+        }
+
+        /// <summary>Execute an explicit typed capability exposed by KliveAgent.</summary>
+        public async Task<AgentCapabilityInvocationResult> ExecuteAgentCapabilityAsync(
+            string capabilityName,
+            Dictionary<string, object?>? arguments = null,
+            bool confirmed = false,
+            string? senderName = null,
+            bool hasElevatedPermissions = false)
+        {
+            if (agentService == null)
+                throw new InvalidOperationException("KliveAgent service is unavailable in this script context.");
+
+            var request = new AgentCapabilityInvocationRequest
+            {
+                Capability = capabilityName,
+                Arguments = arguments ?? new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase),
+                Confirmed = confirmed
+            };
+
+            var context = new AgentCapabilityInvocationContext
+            {
+                SenderName = string.IsNullOrWhiteSpace(senderName) ? "KliveAgent" : senderName,
+                SourceChannel = AgentSourceChannel.API,
+                Confirmed = confirmed,
+                HasElevatedPermissions = hasElevatedPermissions
+            };
+
+            return await agentService.ExecuteCapabilityAsync(request, context);
+        }
+
         // ── Service Interaction ──
 
         /// <summary>Execute any method on any OmniService by type name and method name.</summary>
-        public async Task<object> ExecuteServiceMethod(string serviceTypeName, string methodName, params object[] args)
+        public async Task<object?> ExecuteServiceMethod(string serviceTypeName, string methodName, params object[] args)
         {
             if (agentService == null)
                 throw new InvalidOperationException("KliveAgent service is unavailable in this script context.");
@@ -342,7 +378,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Read any field or property from any OmniService by type name.</summary>
-        public object GetServiceObject(string serviceTypeName, string objectName)
+        public object? GetServiceObject(string serviceTypeName, string objectName)
         {
             if (agentService == null)
                 throw new InvalidOperationException("KliveAgent service is unavailable in this script context.");
@@ -364,6 +400,102 @@ namespace Omnipotent.Services.KliveAgent
 
         /// <summary>Get the overall Omnipotent uptime.</summary>
         public TimeSpan GetOmnipotentUptime() => agentService.GetManagerUptime();
+
+        // ── Deep Object Navigation (private field/method access on sub-objects) ──
+
+        private static readonly BindingFlags DeepFlags =
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+        /// <summary>
+        /// Read any field or property — including private ones — from any arbitrary object.
+        /// Use this to navigate into sub-objects returned by GetServiceObject() or a previous GetObjectMember().
+        /// Walks the full inheritance chain, so inherited private fields are reachable too.
+        /// Example: var accounts = GetObjectMember(accountManager, "_accounts");
+        /// </summary>
+        public object? GetObjectMember(object? obj, string memberName)
+        {
+            if (obj == null) throw new ArgumentNullException(nameof(obj), "Object is null — check that the previous GetServiceObject/GetObjectMember call succeeded.");
+            if (string.IsNullOrWhiteSpace(memberName)) throw new ArgumentException("memberName cannot be empty.");
+
+            var t = obj.GetType();
+            while (t != null && t != typeof(object))
+            {
+                var field = t.GetField(memberName, DeepFlags);
+                if (field != null) return field.GetValue(obj);
+
+                var prop = t.GetProperty(memberName, DeepFlags);
+                if (prop != null) return prop.GetValue(obj);
+
+                t = t.BaseType;
+            }
+
+            throw new MissingMemberException($"'{memberName}' not found on '{obj.GetType().FullName}' or any base type. Use GetObjectTypeInfo(obj) to see available members.");
+        }
+
+        /// <summary>
+        /// Invoke any method — including private and async ones — on any arbitrary object.
+        /// Handles Task and Task&lt;T&gt; automatically (awaits and unwraps the result).
+        /// Use this to call methods on sub-objects returned by GetServiceObject() or GetObjectMember().
+        /// Example: await CallObjectMethod(accountManager, "PauseAccountAsync", "account-id-123");
+        /// </summary>
+        public async Task<object?> CallObjectMethod(object? obj, string methodName, params object[] args)
+        {
+            if (obj == null) throw new ArgumentNullException(nameof(obj), "Object is null — check that the previous call succeeded.");
+            if (string.IsNullOrWhiteSpace(methodName)) throw new ArgumentException("methodName cannot be empty.");
+
+            args ??= Array.Empty<object>();
+            var method = ResolveMethod(obj.GetType(), methodName, DeepFlags, args);
+            if (method == null)
+                throw new MissingMethodException($"Method '{methodName}' not found on '{obj.GetType().FullName}'. Use GetObjectTypeInfo(obj) to see available methods.");
+
+            var result = method.Invoke(obj, args.Length > 0 ? args : null);
+            if (result is Task task)
+            {
+                await task;
+                var taskType = task.GetType();
+                if (taskType.IsGenericType)
+                    return taskType.GetProperty("Result")?.GetValue(task);
+                return null;
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Returns a human-readable summary of all public AND private fields, properties, and methods
+        /// on any object's type. Use immediately after GetServiceObject() or GetObjectMember() to
+        /// understand what you're holding before calling GetObjectMember/CallObjectMethod on it.
+        /// Example: Log(GetObjectTypeInfo(accountManager));
+        /// </summary>
+        public string GetObjectTypeInfo(object? obj)
+        {
+            if (obj == null) return "(null)";
+            var type = obj.GetType();
+            var sb = new StringBuilder();
+            sb.AppendLine($"Type: {type.FullName}");
+            if (type.BaseType != null && type.BaseType != typeof(object))
+                sb.AppendLine($"Base: {type.BaseType.FullName}");
+
+            var fields = type.GetFields(DeepFlags)
+                .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
+                .OrderBy(f => f.Name);
+            foreach (var f in fields)
+                sb.AppendLine($"  field [{(f.IsPublic ? "pub" : "prv")}] {SimplifyTypeName(f.FieldType)} {f.Name}");
+
+            foreach (var p in type.GetProperties(DeepFlags)
+                .Where(p => p.GetIndexParameters().Length == 0)
+                .OrderBy(p => p.Name))
+                sb.AppendLine($"  prop  {SimplifyTypeName(p.PropertyType)} {p.Name}");
+
+            foreach (var m in type.GetMethods(DeepFlags)
+                .Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object))
+                .OrderBy(m => m.Name))
+            {
+                var pars = string.Join(", ", m.GetParameters().Select(p => $"{SimplifyTypeName(p.ParameterType)} {p.Name}"));
+                sb.AppendLine($"  method [{(m.IsPublic ? "pub" : "prv")}] {SimplifyTypeName(m.ReturnType)} {m.Name}({pars})");
+            }
+
+            return sb.ToString().TrimEnd();
+        }
 
         // ── Output ──
 
@@ -387,9 +519,9 @@ namespace Omnipotent.Services.KliveAgent
         // ── Memory ──
 
         /// <summary>Save a persistent memory entry so you can recall it in future conversations.</summary>
-        public async Task SaveMemory(string content, string[] tags = null, int importance = 1)
+        public async Task SaveMemory(string content, string[]? tags = null, int importance = 1)
         {
-            await agentService.Memory.SaveMemoryAsync(content, tags, "agent", importance, "general");
+            await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", importance, "general");
         }
 
         /// <summary>
@@ -399,9 +531,9 @@ namespace Omnipotent.Services.KliveAgent
         /// title: short label, e.g. "Send Discord message to guild by name"
         /// content: the exact script steps to follow next time (concise, step-by-step).
         /// </summary>
-        public async Task SaveShortcut(string title, string content, string[] tags = null)
+        public async Task SaveShortcut(string title, string content, string[]? tags = null)
         {
-            await agentService.Memory.SaveMemoryAsync(content, tags, "agent", 5, "shortcut", title);
+            await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", 5, "shortcut", title);
         }
 
         /// <summary>List all saved shortcuts.</summary>
@@ -826,7 +958,178 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString().TrimEnd('-', '\r', '\n');
         }
 
+        // ── Spec Ch.3/4/6/7 — Codebase Index & Graph Discovery Tools ──
+
+        /// <summary>Returns the file path and line number where a type or method is defined.</summary>
+        public string FindDefinition(string symbolName)
+        {
+            if (agentService.CodebaseIndex == null) return "Codebase index not ready.";
+            var defs = agentService.CodebaseIndex.FindDefinitions(symbolName);
+            if (defs.Count == 0) return $"No definition found for '{symbolName}'.";
+            var sb = new StringBuilder();
+            foreach (var d in defs)
+                sb.AppendLine($"{d.FilePath}:{d.LineNumber}  ({d.Kind}: {d.Name})");
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>Returns all files that reference the given type name.</summary>
+        public string FindReferences(string typeName)
+        {
+            if (agentService.CodebaseIndex == null) return "Codebase index not ready.";
+            var files = agentService.CodebaseIndex.FindReferencingFiles(typeName);
+            if (files.Count == 0) return $"No files reference '{typeName}'.";
+            return string.Join("\n", files);
+        }
+
+        /// <summary>Lists all symbols declared in the given file (relative path from codebase root).</summary>
+        public string GetFileSymbols(string relativePath)
+        {
+            if (agentService.CodebaseIndex == null) return "Codebase index not ready.";
+            var symbols = agentService.CodebaseIndex.GetFileSymbols(relativePath);
+            if (symbols.Count == 0) return $"No symbols found in '{relativePath}' (check path is relative to codebase root).";
+            var sb = new StringBuilder();
+            sb.AppendLine($"Symbols in {relativePath}:");
+            foreach (var s in symbols)
+            {
+                var parent = string.IsNullOrEmpty(s.DeclaringType) ? "" : $" (in {s.DeclaringType})";
+                sb.AppendLine($"  {s.Kind,-12} {s.Name}{parent}  line {s.LineNumber}");
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>Regex-based search across .cs source files.</summary>
+        public string SearchCodeRegex(string pattern, string subfolder = "", int maxResults = 30)
+        {
+            var root = ResolveCodebaseRoot();
+            var searchDir = string.IsNullOrEmpty(subfolder)
+                ? root
+                : Path.Combine(root, subfolder.Replace('/', Path.DirectorySeparatorChar));
+            if (!Directory.Exists(searchDir)) return $"Directory not found: {searchDir}";
+
+            var sb = new StringBuilder();
+            int count = 0;
+            foreach (var file in Directory.EnumerateFiles(searchDir, "*.cs", SearchOption.AllDirectories))
+            {
+                if (file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") ||
+                    file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")) continue;
+                try
+                {
+                    var lines = File.ReadAllLines(file);
+                    for (int i = 0; i < lines.Length; i++)
+                    {
+                        if (System.Text.RegularExpressions.Regex.IsMatch(lines[i], pattern))
+                        {
+                            sb.AppendLine($"{MakeRelative(root, file)}:{i + 1}: {lines[i].Trim()}");
+                            if (++count >= maxResults) goto done;
+                        }
+                    }
+                }
+                catch { }
+            }
+            done:
+            if (count == 0) return $"No matches for pattern '{pattern}'.";
+            if (count >= maxResults) sb.AppendLine($"[truncated at {maxResults} results]");
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>BM25-ranked search across .cs source files (best relevance for natural-language queries).</summary>
+        public string SearchCodeHybrid(string query, int maxResults = 25)
+        {
+            var root = ResolveCodebaseRoot();
+            var queryTerms = query.ToLowerInvariant()
+                .Split(new[] { ' ', '_', '.', '(', ')', ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(t => t.Length >= 2).ToList();
+            if (queryTerms.Count == 0) return "Query too short.";
+
+            var files = Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories)
+                .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") &&
+                            !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
+                .ToList();
+
+            // BM25 scoring at line level — k1=1.5, b=0.75
+            const double k1 = 1.5, b = 0.75;
+            var allLines = new List<(string rel, int lineNo, string text)>();
+            foreach (var file in files)
+            {
+                try
+                {
+                    var rel = MakeRelative(root, file);
+                    var lines = File.ReadAllLines(file);
+                    for (int i = 0; i < lines.Length; i++)
+                        if (!string.IsNullOrWhiteSpace(lines[i]))
+                            allLines.Add((rel, i + 1, lines[i]));
+                }
+                catch { }
+            }
+
+            double avgLen = allLines.Count == 0 ? 1 : allLines.Average(l => l.text.Length);
+            int N = allLines.Count;
+
+            var scored = new List<(double score, string rel, int lineNo, string text)>();
+            foreach (var (rel, lineNo, text) in allLines)
+            {
+                var lower = text.ToLowerInvariant();
+                double score = 0;
+                foreach (var term in queryTerms)
+                {
+                    int tf = CountOccurrences(lower, term);
+                    if (tf == 0) continue;
+                    int df = allLines.Count(l => l.text.ToLowerInvariant().Contains(term));
+                    double idf = Math.Log((N - df + 0.5) / (df + 0.5) + 1);
+                    score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * text.Length / avgLen));
+                }
+                if (score > 0) scored.Add((score, rel, lineNo, text));
+            }
+
+            var top = scored.OrderByDescending(x => x.score).Take(maxResults).ToList();
+            if (top.Count == 0) return $"No matches for '{query}'.";
+            var sb = new StringBuilder();
+            foreach (var (_, rel, lineNo, text) in top)
+                sb.AppendLine($"{rel}:{lineNo}: {text.Trim()}");
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>Returns the current token-budgeted repo map (personalised to the seed query if provided).</summary>
+        public string GetRepoMap(int maxTokens = 4000)
+        {
+            if (agentService.RepoMap == null) return "Repo map not ready.";
+            return agentService.RepoMap.GetRepoMap(maxTokens);
+        }
+
+        /// <summary>Returns the top N files ranked by structural PageRank (optionally seeded by a query string).</summary>
+        public string GetRankedFiles(int max = 20, string seed = "")
+        {
+            if (agentService.SymbolGraph == null) return "Symbol graph not ready.";
+            IEnumerable<string>? seeds = string.IsNullOrWhiteSpace(seed) ? null
+                : agentService.CodebaseIndex?.FindDefinitions(seed).Select(d => d.FilePath);
+            var ranked = agentService.SymbolGraph.GetRankedFiles(seeds, max);
+            if (ranked.Count == 0) return "No ranked files available.";
+            var sb = new StringBuilder();
+            sb.AppendLine($"Top {ranked.Count} files by PageRank:");
+            foreach (var (path, score) in ranked)
+                sb.AppendLine($"  {score:F4}  {path}");
+            return sb.ToString().TrimEnd();
+        }
+
         // ── Internal helpers ──
+
+        private static string MakeRelative(string root, string fullPath)
+        {
+            if (!root.EndsWith(Path.DirectorySeparatorChar))
+                root += Path.DirectorySeparatorChar;
+            return fullPath.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                ? fullPath[root.Length..]
+                : fullPath;
+        }
+
+        private static int CountOccurrences(string haystack, string needle)
+        {
+            if (string.IsNullOrEmpty(needle)) return 0;
+            int count = 0, index = 0;
+            while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+            { count++; index += needle.Length; }
+            return count;
+        }
 
         private static string ResolveCodebaseRoot()
         {
@@ -1326,7 +1629,7 @@ namespace Omnipotent.Services.KliveAgent
     public class KliveAgentScriptEngine
     {
         private readonly KliveAgent agentService;
-        private ScriptOptions scriptOptions;
+        private ScriptOptions scriptOptions = null!;
 
         public KliveAgentScriptEngine(KliveAgent agentService)
         {

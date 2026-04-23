@@ -34,13 +34,7 @@ namespace Omnipotent.Services.KliveChat
                 {
                     if (ActiveRooms.TryGetValue(id, out var specificRoom))
                     {
-                        var response = new 
-                        { 
-                            roomId = specificRoom.Id, 
-                            name = specificRoom.Name, 
-                            createdBy = specificRoom.CreatedBy, 
-                            userCount = specificRoom.Users.Count 
-                        };
+                        var response = ToRoomSummary(specificRoom);
                         await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
                     }
                     else
@@ -50,7 +44,7 @@ namespace Omnipotent.Services.KliveChat
                 }
                 else
                 {
-                    var rooms = ActiveRooms.Values.Select(r => new { roomId = r.Id, name = r.Name, createdBy = r.CreatedBy, userCount = r.Users.Count }).ToList();
+                    var rooms = ListRoomSummaries();
                     await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
@@ -72,14 +66,8 @@ namespace Omnipotent.Services.KliveChat
             // POST /klivechat/create requires Guest or above as per prompt
             await CreateAPIRoute("/klivechat/create", async (req) =>
             {
-                string roomId = Guid.NewGuid().ToString().Substring(0, 8); // Short ID for shareability
-                string roomName = req.userParameters["name"] ?? "KliveChat Room";
-                var room = new KliveChatRoom(roomId, roomName, req.user?.Name ?? "Guest");
-                ActiveRooms.TryAdd(roomId, room);
-
-                _ = ServiceLog($"Created new room {roomId} by {room.CreatedBy}");
-                var response = new { roomId = roomId, name = roomName, createdBy = room.CreatedBy };
-                await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+                var response = CreateRoom(req.userParameters["name"], req.user?.Name);
+                await req.ReturnResponse(JsonConvert.SerializeObject(response.Room), "application/json");
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // POST /klivechat/delete requires Guest or above
@@ -92,35 +80,21 @@ namespace Omnipotent.Services.KliveChat
                     return;
                 }
 
-                if (ActiveRooms.TryGetValue(roomId, out var room))
-                {
-                    // Allow deletion if the user is the creator or an Admin/Owner
-                    if (room.CreatedBy == req.user?.Name || req.user?.KlivesManagementRank >= KMPermissions.Admin)
-                    {
-                        ActiveRooms.TryRemove(roomId, out _);
-                        _ = ServiceLog($"Room {roomId} deleted by {req.user?.Name}");
-                        
-                        // Close all connected clients in the room before deleting
-                        foreach (var client in room.Users.Values)
-                        {
-                            if (client.Socket.State == WebSocketState.Open)
-                            {
-                                await client.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Room deleted", CancellationToken.None);
-                            }
-                        }
+                var result = await DeleteRoomAsync(
+                    roomId,
+                    req.user?.Name,
+                    (req.user?.KlivesManagementRank ?? KMPermissions.Anybody) >= KMPermissions.Admin);
 
-                        // Also notify frontend
-                        var response = new { success = true, roomId = roomId };
-                        await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
-                    }
-                    else
-                    {
-                        await req.ReturnResponse("Unauthorized to delete this room", "text/plain", null!, System.Net.HttpStatusCode.Unauthorized);
-                    }
+                if (result.Success)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, roomId }), "application/json");
                 }
                 else
                 {
-                    await req.ReturnResponse("Room not found", "text/plain", null!, System.Net.HttpStatusCode.NotFound);
+                    var statusCode = result.Message.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase)
+                        ? System.Net.HttpStatusCode.Unauthorized
+                        : System.Net.HttpStatusCode.NotFound;
+                    await req.ReturnResponse(result.Message, "text/plain", null!, statusCode);
                 }
             }, HttpMethod.Post, KMPermissions.Guest);
 
@@ -146,6 +120,96 @@ namespace Omnipotent.Services.KliveChat
             }), KMPermissions.Anybody);
 
             _ = ServiceLog("KliveChatService started. Listening on /klivechat/ endpoints.");
+        }
+
+        public List<KliveChatRoomSummary> ListRoomSummaries()
+        {
+            return ActiveRooms.Values
+                .OrderBy(room => room.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(ToRoomSummary)
+                .ToList();
+        }
+
+        public KliveChatRoomMutationResult CreateRoom(string? requestedName, string? createdBy = null)
+        {
+            string roomId = Guid.NewGuid().ToString("N")[..8];
+            string roomName = string.IsNullOrWhiteSpace(requestedName) ? "KliveChat Room" : requestedName.Trim();
+            string creator = string.IsNullOrWhiteSpace(createdBy) ? "Guest" : createdBy.Trim();
+
+            var room = new KliveChatRoom(roomId, roomName, creator);
+            ActiveRooms[roomId] = room;
+
+            TryLog($"Created new room {roomId} by {creator}");
+
+            return new KliveChatRoomMutationResult
+            {
+                Success = true,
+                Message = $"Created room {roomId}.",
+                Room = ToRoomSummary(room)
+            };
+        }
+
+        public async Task<KliveChatRoomMutationResult> DeleteRoomAsync(string roomId, string? requestedBy, bool hasElevatedPermissions = false)
+        {
+            if (!ActiveRooms.TryGetValue(roomId, out var room))
+            {
+                return new KliveChatRoomMutationResult
+                {
+                    Success = false,
+                    Message = "Room not found"
+                };
+            }
+
+            string actor = string.IsNullOrWhiteSpace(requestedBy) ? "Guest" : requestedBy.Trim();
+            if (!hasElevatedPermissions && !string.Equals(room.CreatedBy, actor, StringComparison.OrdinalIgnoreCase))
+            {
+                return new KliveChatRoomMutationResult
+                {
+                    Success = false,
+                    Message = "Unauthorized to delete this room"
+                };
+            }
+
+            ActiveRooms.TryRemove(roomId, out _);
+            TryLog($"Room {roomId} deleted by {actor}");
+
+            foreach (var client in room.Users.Values)
+            {
+                if (client.Socket != null && client.Socket.State == WebSocketState.Open)
+                {
+                    await client.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Room deleted", CancellationToken.None);
+                }
+            }
+
+            return new KliveChatRoomMutationResult
+            {
+                Success = true,
+                Message = $"Deleted room {roomId}.",
+                Room = ToRoomSummary(room)
+            };
+        }
+
+        private static KliveChatRoomSummary ToRoomSummary(KliveChatRoom room)
+        {
+            return new KliveChatRoomSummary
+            {
+                RoomId = room.Id,
+                Name = room.Name,
+                CreatedBy = room.CreatedBy,
+                UserCount = room.Users.Count,
+                RoomPath = $"/shared/klivechat/{room.Id}"
+            };
+        }
+
+        private void TryLog(string message)
+        {
+            try
+            {
+                _ = ServiceLog(message);
+            }
+            catch
+            {
+            }
         }
     }
 }

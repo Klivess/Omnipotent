@@ -1,5 +1,4 @@
-using LLama.Common;
-using Omnipotent.Service_Manager;
+﻿using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
 using System.Text;
@@ -7,11 +6,65 @@ using System.Text.RegularExpressions;
 
 namespace Omnipotent.Services.KliveAgent
 {
+    /// <summary>
+    /// The central orchestration brain for KliveAgent.
+    ///
+    /// Every user message goes through a Think â†’ Script â†’ Observe loop:
+    ///   1. Build a rich system prompt: personality + repo map (task-personalised) + BM25 memories + tool catalogue.
+    ///   2. LLM responds with a planning statement and optional {{{ C# script }}} blocks.
+    ///   3. Scripts are executed; structured observations are fed back.
+    ///   4. Loop continues until the LLM produces a text-only response (the final answer).
+    ///
+    /// Spec references:
+    ///   Chapter 7  â€” Repo map injected in every prompt
+    ///   Chapter 9  â€” Agentic Loop Architecture
+    ///   Chapter 10 â€” Context Window Management &amp; Token Budgeting
+    /// </summary>
     public class KliveAgentBrain
     {
         private readonly KliveAgent agentService;
         private readonly KliveAgentScriptEngine scriptEngine;
         private readonly KliveAgentMemory memory;
+
+        // Tool catalogue injected into every system prompt â€” tells the LLM exactly what is callable.
+        private const string ToolCatalogue = @"
+[Discovery Tools â€” call inside {{{ }}} to explore the codebase before acting]
+  SearchCode(text, subfolder?, maxResults?)          â€” text search across .cs files
+  SearchCodeRegex(pattern, subfolder?, maxResults?)  â€” regex search across .cs files
+  SearchCodeHybrid(query, maxResults?)               â€” BM25-ranked search (best relevance)
+  FindDefinition(symbolName)                         â€” file + line where a type/method is defined
+  FindReferences(typeName)                           â€” all files that reference a given type
+  GetFileSymbols(relativePath)                       â€” symbols declared in a specific file
+  GetRankedFiles(max?, seed?)                        â€” PageRank-ranked files by structural importance
+  GetRepoMap(maxTokens?)                             â€” full live repo map (already in prompt; refresh if needed)
+  ReadFile(relativePath, startLine?, maxLines?)      â€” read source file with pagination
+  ListDirectory(relativePath?)                       â€” list files/folders at a path
+  FindFiles(pattern, subfolder?)                     â€” glob-style file search
+  ListProjectClasses(query?, maxResults?)            â€” all classes/interfaces/enums in source
+  FindProjectClass(typeName)                         â€” locate a type's source file + line
+  ExploreClassCode(typeName, maxLines?)              â€” read source around a type declaration
+  GetTypeSchema(typeName)                            â€” reflection-based type structure
+  GetTypeInfo(typeName)                              â€” human-readable type API
+  GetMethodDocumentation(typeName, methodName)       â€” source-level docs + signature
+  SearchSymbols(query, maxResults?)                  â€” symbol search across loaded assemblies
+  BrowseNamespace(namespaceName)                     â€” list types in a namespace
+  GetFullTypeHierarchy(typeName)                     â€” full inheritance chain with all members
+
+[Action Tools]
+  ExecuteServiceMethod(serviceType, method, args...) â€” invoke any method on any OmniService
+  GetServiceObject(serviceType, objectName)          -- read any field/property (incl. private) from a service
+  GetObjectMember(obj, memberName)                   -- read any field/property (incl. private) on any object; walks full inheritance chain
+  CallObjectMethod(obj, methodName, args...)         -- invoke any method (incl. private/async) on any object; awaits Task<T> automatically
+  GetObjectTypeInfo(obj)                             -- list ALL fields, properties, and methods (public + private) of any object's type
+  ListServices()                                     â€” list all active OmniServices
+  ListAgentCapabilities(category?)                   â€” list typed capabilities
+  ExecuteAgentCapabilityAsync(name, args?, confirmed?) â€” invoke a typed capability
+  SpawnBackgroundTask(description, code)             â€” launch a long-running background script
+  SaveMemory(content, tags?, importance?)            â€” persist information across sessions
+  SaveShortcut(title, content, tags?)                â€” save a reusable procedure you discovered
+  RecallMemories(query, maxResults?)                 â€” search your persistent memory
+  Log(message)                                       â€” append to script output buffer
+";
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
         {
@@ -20,42 +73,72 @@ namespace Omnipotent.Services.KliveAgent
             this.memory = memory;
         }
 
-        // ── Prompt Assembly ──
+        // â”€â”€ Prompt Assembly â”€â”€
 
-        public async Task<string> BuildSystemPrompt(string conversationContext)
+        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation)
         {
             var personality = await agentService.GetStringOmniSetting(
                 "KliveAgent_Personality",
                 defaultValue: KliveAgentPersonality.Default);
 
-            var memories = await memory.FormatMemoriesForPrompt(conversationContext);
+            // Extract PascalCase seed words from the user message for repo map personalisation
+            var seeds = KliveAgentRepoMap.ExtractSeedsFromText(userMessage);
+
+            // Build token-budgeted, task-personalised repo map
+            var repoMap = string.Empty;
+            try
+            {
+                if (agentService.RepoMap != null)
+                    repoMap = agentService.RepoMap.GetRepoMap(KliveAgentContextBudget.RepoMapBudget, seeds);
+            }
+            catch { /* best-effort */ }
+
+            // BM25-ranked memories, budget-capped
+            var memoriesSection = string.Empty;
+            try
+            {
+                memoriesSection = await memory.FormatMemoriesForPrompt(
+                    userMessage,
+                    maxMemories: 6,
+                    maxShortcuts: 4,
+                    maxTokens: KliveAgentContextBudget.MemoryBudget);
+            }
+            catch { }
 
             var sb = new StringBuilder();
+
             sb.AppendLine(personality);
             sb.AppendLine();
-            sb.AppendLine(GetScriptInstructions());
 
-            if (!string.IsNullOrEmpty(memories))
+            sb.AppendLine("[Script Execution Rules]");
+            sb.AppendLine("- Write C# inside {{{ }}} to inspect the codebase or take action.");
+            sb.AppendLine("- Multiple script blocks in the same reply share state â€” locals persist between blocks.");
+            sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
+            sb.AppendLine("- If a script fails, read the error and change your approach â€” never retry the same failing code.");
+            sb.AppendLine("- When you have completed the task, give a final text-only answer with no script blocks.");
+            sb.AppendLine("- On your FIRST reply to a new task: write 1â€“3 sentences describing your plan before any script.");
+            sb.AppendLine();
+
+            sb.Append(ToolCatalogue);
+
+            if (!string.IsNullOrWhiteSpace(repoMap))
             {
-                sb.AppendLine(memories);
+                sb.AppendLine();
+                sb.Append(repoMap);
             }
 
-            return sb.ToString();
+            if (!string.IsNullOrWhiteSpace(memoriesSection))
+            {
+                sb.AppendLine();
+                sb.Append(memoriesSection);
+            }
+
+            return KliveAgentContextBudget.TruncateToTokens(
+                sb.ToString(),
+                KliveAgentContextBudget.TotalSystemPromptBudget);
         }
 
-        private string GetScriptInstructions()
-        {
-            return @"[Script Execution]
-- Use C# inside {{{ }}} only when you need runtime data, codebase inspection, or to take an action.
-- Multiple script blocks in the same reply share locals and execution state.
-- Prefer structured discovery over guessing. Inspect types, classes, methods, files, and documentation before using unfamiliar APIs.
-- Generic discovery helpers: ListProjectClasses(...), FindProjectClass(...), ExploreClassCode(...), GetTypeSchema(...), GetTypeInfo(...), GetMethodDocumentationEntries(...), GetMethodDocumentation(...), SearchSymbols(...), SearchCode(...), ReadFile(...), ListDirectory(...), FindFiles(...).
-- Runtime/action helpers remain available too, but do not hardcode assumptions when the codebase can tell you the answer.
-- If a script fails, change approach instead of repeating the same failing call.
-- When you already have enough information, stop scripting and answer plainly.";
-        }
-
-        // ── Response Parsing ──
+        // â”€â”€ Response Parsing â”€â”€
 
         public static List<ResponseSegment> ParseLLMResponse(string response)
         {
@@ -68,7 +151,6 @@ namespace Omnipotent.Services.KliveAgent
             int lastIndex = 0;
             foreach (Match match in matches)
             {
-                // Text before the script
                 if (match.Index > lastIndex)
                 {
                     var text = response.Substring(lastIndex, match.Index - lastIndex).Trim();
@@ -76,7 +158,6 @@ namespace Omnipotent.Services.KliveAgent
                         segments.Add(new ResponseSegment { IsScript = false, Content = text });
                 }
 
-                // The script itself
                 var code = match.Groups[1].Value.Trim();
                 if (!string.IsNullOrEmpty(code))
                     segments.Add(new ResponseSegment { IsScript = true, Content = code });
@@ -84,7 +165,6 @@ namespace Omnipotent.Services.KliveAgent
                 lastIndex = match.Index + match.Length;
             }
 
-            // Text after last script
             if (lastIndex < response.Length)
             {
                 var text = response.Substring(lastIndex).Trim();
@@ -95,15 +175,18 @@ namespace Omnipotent.Services.KliveAgent
             return segments;
         }
 
-        // ── Brain Orchestration ──
+        // â”€â”€ Brain Orchestration â”€â”€
 
         private const int MaxAgentIterations = 25;
 
-        public async Task<AgentChatResponse> ProcessMessageAsync(string userMessage, AgentConversation conversation, string? senderName = null)
+        public async Task<AgentChatResponse> ProcessMessageAsync(
+            string userMessage,
+            AgentConversation conversation,
+            string? senderName = null)
         {
             try
             {
-                var systemPrompt = await BuildSystemPrompt(userMessage);
+                var systemPrompt = await BuildSystemPrompt(userMessage, conversation);
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
 
                 var llmServices = await agentService.GetServicesByType<KliveLLM.KliveLLM>();
@@ -122,17 +205,19 @@ namespace Omnipotent.Services.KliveAgent
                 llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
-                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
                 var sharedGlobals = new ScriptGlobals(agentService);
                 var scriptSession = scriptEngine.CreateSession(sharedGlobals);
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
 
-                // Agent loop: LLM responds → scripts execute → results fed back → repeat
+                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
+
+                // â”€â”€ Agentic Loop: Think â†’ Script â†’ Observe â†’ repeat â”€â”€
                 for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
                 {
                     iterationsDone = iteration + 1;
+
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
@@ -151,7 +236,8 @@ namespace Omnipotent.Services.KliveAgent
 
                     if (llmResponse == null || !llmResponse.Success)
                     {
-                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
                         return new AgentChatResponse
                         {
                             ConversationId = conversation.ConversationId,
@@ -167,23 +253,27 @@ namespace Omnipotent.Services.KliveAgent
                     var segments = ParseLLMResponse(llmResponse.Response ?? "");
                     var hasScripts = segments.Any(s => s.IsScript);
 
-                    // No scripts → this is the final text response, return it
+                    // No scripts â†’ this is the final answer
                     if (!hasScripts)
                     {
-                        var finalText = string.Join("\n", segments.Where(s => !s.IsScript).Select(s => s.Content)).Trim();
+                        var finalText = string.Join("\n", segments
+                            .Where(s => !s.IsScript)
+                            .Select(s => s.Content)).Trim();
+
                         llm.ResetSession(llmSessionId);
 
                         conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
                         conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = finalText });
                         conversation.LastUpdated = DateTime.UtcNow;
 
-                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+                        agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
 
-                        // Auto-record a memory when scripts were successfully run (non-trivial action completed)
+                        // Auto-save a codebase-pattern memory when non-trivial scripts succeeded
                         if (allScriptsExecuted.Count > 0 && allScriptsExecuted.Any(s => s.Success))
                         {
                             _ = memory.SaveMemoryAsync(
-                                $"Completed task: \"{TruncateForMemory(userMessage, 120)}\" — {TruncateForMemory(finalText, 200)}",
+                                $"Completed: \"{TruncateForMemory(userMessage, 120)}\" â€” {TruncateForMemory(finalText, 200)}",
                                 tags: new[] { "auto", "completed-task" },
                                 source: "agent",
                                 importance: 2);
@@ -201,39 +291,60 @@ namespace Omnipotent.Services.KliveAgent
                         };
                     }
 
-                    // Has scripts → execute them and build a follow-up prompt with results
-                    var resultsSummary = new StringBuilder();
+                    // Execute scripts â†’ collect structured observations
+                    var observationSb = new StringBuilder();
+                    observationSb.AppendLine("[Script Observations]");
+
                     foreach (var segment in segments)
                     {
-                        if (!segment.IsScript) continue;
+                        if (!segment.IsScript)
+                        {
+                            if (!string.IsNullOrWhiteSpace(segment.Content))
+                                observationSb.AppendLine($"[Agent thought] {segment.Content.Trim()}");
+                            continue;
+                        }
 
-                        var result = await scriptSession.ExecuteAsync(segment.Content ?? "");
+                        var result = await scriptSession.ExecuteAsync(segment.Content);
                         allScriptsExecuted.Add(result);
 
                         if (result.Success)
                         {
-                            resultsSummary.AppendLine($"[Script OK] {(string.IsNullOrEmpty(result.Output) ? "(no output)" : result.Output)}");
+                            var output = KliveAgentContextBudget.TruncateToTokens(
+                                result.Output ?? string.Empty,
+                                KliveAgentContextBudget.ScriptOutputBudget);
+
+                            observationSb.AppendLine($"[OK | {result.ExecutionTimeMs}ms]");
+                            if (!string.IsNullOrWhiteSpace(output))
+                                observationSb.AppendLine(output);
                         }
                         else
                         {
-                            resultsSummary.AppendLine($"[Script FAILED] {result.ErrorMessage}");
+                            observationSb.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
+                            observationSb.AppendLine(result.ErrorMessage ?? "Unknown error.");
                         }
+
+                        observationSb.AppendLine();
                     }
 
-                    // Feed results back as the next user turn so the LLM can act on them
-                    currentPrompt = $"[Script Results]\n{resultsSummary}\n\nEarlier successful script locals are still available. Now continue: if you have what you need, give the user a final answer (no scripts). If you need to take further action based on these results, write the next script.";
+                    // Feed observations back as the next prompt turn
+                    currentPrompt = observationSb.ToString().TrimEnd()
+                        + "\n\nEarlier script state is preserved. If you have what you need, give the final answer now (no scripts). "
+                        + "Otherwise write your next script(s).";
                 }
 
-                // If we hit the iteration cap, return whatever we have
+                // Hit iteration cap
                 llm.ResetSession(llmSessionId);
                 conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
                 conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = "[Reached maximum reasoning steps]" });
                 conversation.LastUpdated = DateTime.UtcNow;
-                agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone, allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+
+                agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                    allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+
                 return new AgentChatResponse
                 {
                     ConversationId = conversation.ConversationId,
-                    Response = "I hit my maximum number of reasoning steps. Here's what I managed to do so far.",
+                    Response = "I hit my maximum number of reasoning steps. Here is what I managed to complete so far.",
                     ScriptsExecuted = allScriptsExecuted,
                     Success = true,
                     PromptTokens = totalPromptTokens,
@@ -254,7 +365,13 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        private string BuildConversationPrompt(string systemPrompt, AgentConversation conversation, string userMessage, string? senderName = null)
+        // â”€â”€ Conversation Prompt Builder â”€â”€
+
+        private string BuildConversationPrompt(
+            string systemPrompt,
+            AgentConversation conversation,
+            string userMessage,
+            string? senderName = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine("[System]");
@@ -267,23 +384,72 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine($"Channel: {conversation.SourceChannel}");
                 sb.AppendLine();
             }
-            // Include recent conversation history (last 20 messages to keep context manageable)
-            var recentMessages = conversation.Messages.TakeLast(6).ToList();
-            if (recentMessages.Count > 0)
+
+            // Budget-aware conversation history selection
+            if (conversation.Messages.Count > 0)
             {
-                sb.AppendLine("[Conversation History]");
-                foreach (var msg in recentMessages)
+                var historyMessages = SelectHistoryMessages(
+                    conversation.Messages, userMessage, KliveAgentContextBudget.HistoryBudget);
+
+                if (historyMessages.Count > 0)
                 {
-                    var role = msg.Role == AgentMessageRole.User ? "User" : "KliveAgent";
-                    sb.AppendLine($"{role}: {msg.Content}");
+                    sb.AppendLine("[Conversation History]");
+                    foreach (var msg in historyMessages)
+                    {
+                        var role = msg.Role == AgentMessageRole.User ? "User" : "KliveAgent";
+                        sb.AppendLine($"{role}: {msg.Content}");
+                    }
+                    sb.AppendLine();
                 }
-                sb.AppendLine();
             }
 
             sb.AppendLine("[New Message]");
-            sb.AppendLine($"User: {userMessage}");
+            sb.AppendLine(string.IsNullOrEmpty(senderName) ? $"User: {userMessage}" : $"{senderName}: {userMessage}");
 
             return sb.ToString();
+        }
+
+        private static List<AgentMessage> SelectHistoryMessages(
+            List<AgentMessage> messages,
+            string currentQuery,
+            int maxTokens)
+        {
+            if (messages.Count == 0) return new List<AgentMessage>();
+
+            var pairs = new List<(int idx, AgentMessage user, AgentMessage? agent, double score)>();
+            for (int i = 0; i < messages.Count; i++)
+            {
+                if (messages[i].Role != AgentMessageRole.User) continue;
+                var agent = (i + 1 < messages.Count && messages[i + 1].Role == AgentMessageRole.Agent)
+                    ? messages[i + 1] : null;
+
+                var indexFromEnd = messages.Count - i;
+                var score = KliveAgentContextBudget.ScoreMessage(
+                    messages[i].Content + " " + (agent?.Content ?? ""),
+                    currentQuery,
+                    indexFromEnd);
+
+                pairs.Add((i, messages[i], agent, score));
+            }
+
+            var usedTokens = 0;
+            var selected = new List<(int idx, AgentMessage user, AgentMessage? agent)>();
+
+            foreach (var (idx, user, agent, _) in pairs.OrderByDescending(p => p.score))
+            {
+                var cost = KliveAgentContextBudget.EstimateTokens(
+                    user.Content + " " + (agent?.Content ?? ""));
+                if (usedTokens + cost > maxTokens) continue;
+                usedTokens += cost;
+                selected.Add((idx, user, agent));
+            }
+
+            return selected
+                .OrderBy(x => x.idx)
+                .SelectMany(x => x.agent != null
+                    ? new[] { x.user, x.agent }
+                    : new[] { x.user })
+                .ToList();
         }
 
         private static string TruncateForMemory(string s, int max)
@@ -292,7 +458,6 @@ namespace Omnipotent.Services.KliveAgent
             s = s.Replace('\n', ' ').Replace('\r', ' ');
             return s.Length <= max ? s : s[..max] + "…";
         }
-
     }
 
     public class ResponseSegment

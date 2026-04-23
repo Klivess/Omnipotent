@@ -99,16 +99,20 @@ namespace Omnipotent.Services.KliveAgent
                         .ToList();
                 }
 
-                var queryTerms = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var queryTerms = query.ToLowerInvariant()
+                    .Split(new[] { ' ', ',', '.', ';', ':', '?' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(t => t.Length >= 2).ToList();
+                var corpus = cachedMemories.Select(m =>
+                    ((m.Content ?? "") + " " + string.Join(" ", m.Tags ?? new List<string>())).ToLowerInvariant()).ToList();
+                double avgLen = corpus.Count == 0 ? 1 : corpus.Average(c => c.Length);
+                int N = corpus.Count;
 
                 return cachedMemories
-                    .Select(m => new
+                    .Select((m, i) =>
                     {
-                        Memory = m,
-                        Score = queryTerms.Sum(term =>
-                            (m.Content?.ToLowerInvariant().Contains(term) == true ? 2 : 0) +
-                            (m.Tags?.Any(t => t.ToLowerInvariant().Contains(term)) == true ? 3 : 0)) +
-                            m.Importance
+                        var doc = corpus[i];
+                        double bm25 = Bm25Score(queryTerms, doc, N, corpus, avgLen);
+                        return new { Memory = m, Score = bm25 + m.Importance * 0.5 };
                     })
                     .Where(x => x.Score > 0)
                     .OrderByDescending(x => x.Score)
@@ -181,17 +185,21 @@ namespace Omnipotent.Services.KliveAgent
                         .ToList();
                 }
 
-                var queryTerms = query.ToLowerInvariant().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var queryTerms = query.ToLowerInvariant()
+                    .Split(new[] { ' ', ',', '.', ';', ':', '?' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Where(t => t.Length >= 2).ToList();
+                var corpus = shortcuts.Select(m =>
+                    ((m.Title ?? "") + " " + (m.Content ?? "") + " " +
+                     string.Join(" ", m.Tags ?? new List<string>())).ToLowerInvariant()).ToList();
+                double avgLen = corpus.Count == 0 ? 1 : corpus.Average(c => c.Length);
+                int N = corpus.Count;
 
                 return shortcuts
-                    .Select(m => new
+                    .Select((m, i) =>
                     {
-                        Memory = m,
-                        Score = queryTerms.Sum(term =>
-                            (m.Title?.ToLowerInvariant().Contains(term) == true ? 4 : 0) +
-                            (m.Content?.ToLowerInvariant().Contains(term) == true ? 2 : 0) +
-                            (m.Tags?.Any(t => t.ToLowerInvariant().Contains(term)) == true ? 3 : 0)) +
-                            m.Importance
+                        var doc = corpus[i];
+                        double bm25 = Bm25Score(queryTerms, doc, N, corpus, avgLen);
+                        return new { Memory = m, Score = bm25 + m.Importance * 0.5 };
                     })
                     .Where(x => x.Score > 0)
                     .OrderByDescending(x => x.Score)
@@ -206,34 +214,44 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        public async Task<string> FormatMemoriesForPrompt(string conversationContext, int maxMemories = 6, int maxShortcuts = 3)
+        public async Task<string> FormatMemoriesForPrompt(
+            string conversationContext,
+            int maxMemories = 6,
+            int maxShortcuts = 4,
+            int maxTokens = KliveAgentContextBudget.MemoryBudget)
         {
             var shortcuts = await GetShortcutsAsync(conversationContext, maxShortcuts);
             var relevant = await RecallMemoriesAsync(conversationContext, maxMemories);
-            // Don't duplicate shortcuts that also appear in recall results
             var regularMemories = relevant.Where(m => m.MemoryType != "shortcut").ToList();
 
+            // Budget-aware formatting: fit as many items as possible within the token limit
+            var allItems = new List<(string text, double score)>();
+
+            foreach (var sc in shortcuts)
+            {
+                var title = string.IsNullOrEmpty(sc.Title) ? string.Empty : $"{TruncateForPrompt(sc.Title, 80)}: ";
+                allItems.Add(($"[Shortcut] {title}{TruncateForPrompt(sc.Content, 220)}", sc.Importance + 1.5));
+            }
+            foreach (var mem in regularMemories)
+            {
+                var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
+                allItems.Add(($"[Memory] {TruncateForPrompt(mem.Content, 200)}{tagStr}", mem.Importance));
+            }
+
+            if (allItems.Count == 0) return string.Empty;
+
+            var fitted = KliveAgentContextBudget.FitItemsInBudget(
+                allItems,
+                maxTokens,
+                item => item.text,
+                item => item.score);
+
+            if (fitted.Count == 0) return string.Empty;
+
             var sb = new System.Text.StringBuilder();
-
-            if (shortcuts.Count > 0)
-            {
-                sb.AppendLine("\n[Your Shortcuts — Learned procedures you can use directly without re-discovering]");
-                foreach (var sc in shortcuts)
-                {
-                    var title = string.IsNullOrEmpty(sc.Title) ? string.Empty : $"{TruncateForPrompt(sc.Title, 80)}: ";
-                    sb.AppendLine($"- {title}{TruncateForPrompt(sc.Content, 220)}");
-                }
-            }
-
-            if (regularMemories.Count > 0)
-            {
-                sb.AppendLine("\n[Your Persistent Memories]");
-                foreach (var mem in regularMemories)
-                {
-                    var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
-                    sb.AppendLine($"- {TruncateForPrompt(mem.Content, 180)}{tagStr} (saved {mem.CreatedAt:yyyy-MM-dd})");
-                }
-            }
+            sb.AppendLine("[Memories & Shortcuts]");
+            foreach (var (text, _) in fitted)
+                sb.AppendLine($"- {text}");
 
             return sb.ToString();
         }
@@ -244,6 +262,36 @@ namespace Omnipotent.Services.KliveAgent
                 return value ?? string.Empty;
 
             return value[..Math.Max(0, maxLength - 3)] + "...";
+        }
+
+        // BM25 scorer (k1=1.5, b=0.75) — spec Chapter 5
+        private static double Bm25Score(
+            List<string> queryTerms,
+            string document,
+            int N,
+            List<string> corpus,
+            double avgDocLen)
+        {
+            const double k1 = 1.5, b = 0.75;
+            double score = 0;
+            foreach (var term in queryTerms)
+            {
+                int tf = CountOccurrences(document, term);
+                if (tf == 0) continue;
+                int df = corpus.Count(d => d.Contains(term, StringComparison.Ordinal));
+                double idf = Math.Log((N - df + 0.5) / (df + 0.5) + 1);
+                score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * document.Length / avgDocLen));
+            }
+            return score;
+        }
+
+        private static int CountOccurrences(string haystack, string needle)
+        {
+            if (string.IsNullOrEmpty(needle)) return 0;
+            int count = 0, index = 0;
+            while ((index = haystack.IndexOf(needle, index, StringComparison.Ordinal)) >= 0)
+            { count++; index += needle.Length; }
+            return count;
         }
     }
 }

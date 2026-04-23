@@ -28,6 +28,175 @@ namespace Omnipotent.Services.KliveAgent.Models
         Failed
     }
 
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum AgentCapabilityPermissionTier
+    {
+        Safe,
+        Moderate,
+        Dangerous
+    }
+
+    public class AgentCapabilityParameterDefinition
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("type")]
+        public string Type { get; set; } = "string";
+
+        [JsonProperty("description")]
+        public string Description { get; set; } = string.Empty;
+
+        [JsonProperty("required")]
+        public bool Required { get; set; }
+
+        [JsonProperty("defaultValue")]
+        public object? DefaultValue { get; set; }
+    }
+
+    public class AgentCapabilityDefinition
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("displayName")]
+        public string DisplayName { get; set; } = string.Empty;
+
+        [JsonProperty("category")]
+        public string Category { get; set; } = string.Empty;
+
+        [JsonProperty("description")]
+        public string Description { get; set; } = string.Empty;
+
+        [JsonProperty("permissionTier")]
+        public AgentCapabilityPermissionTier PermissionTier { get; set; }
+
+        [JsonProperty("requiresConfirmation")]
+        public bool RequiresConfirmation { get; set; }
+
+        [JsonProperty("confirmationMessage")]
+        public string? ConfirmationMessage { get; set; }
+
+        [JsonProperty("parameters")]
+        public List<AgentCapabilityParameterDefinition> Parameters { get; set; } = new();
+
+        [JsonProperty("tags")]
+        public List<string> Tags { get; set; } = new();
+
+        [JsonProperty("exampleInvocation")]
+        public string? ExampleInvocation { get; set; }
+    }
+
+    public class AgentCapabilityInvocationRequest
+    {
+        [JsonProperty("capability")]
+        public string Capability { get; set; } = string.Empty;
+
+        [JsonProperty("arguments")]
+        public Dictionary<string, object?> Arguments { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        [JsonProperty("confirmed")]
+        public bool Confirmed { get; set; }
+    }
+
+    public class AgentCapabilityExecutionRequest : AgentCapabilityInvocationRequest
+    {
+        [JsonProperty("capabilityName")]
+        public string CapabilityName
+        {
+            get => Capability;
+            set => Capability = value;
+        }
+    }
+
+    public class AgentCapabilityExecutionContext
+    {
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("senderName")]
+        public string? SenderName { get; set; }
+
+        [JsonProperty("sourceChannel")]
+        public AgentSourceChannel SourceChannel { get; set; } = AgentSourceChannel.API;
+
+        [JsonProperty("confirmed")]
+        public bool Confirmed { get; set; }
+
+        [JsonProperty("hasElevatedPermissions")]
+        public bool HasElevatedPermissions { get; set; }
+    }
+
+    public class AgentCapabilityInvocationResult
+    {
+        [JsonProperty("capability")]
+        public string Capability { get; set; } = string.Empty;
+
+        [JsonProperty("success")]
+        public bool Success { get; set; }
+
+        [JsonProperty("message")]
+        public string Message { get; set; } = string.Empty;
+
+        [JsonProperty("errorMessage")]
+        public string? ErrorMessage { get; set; }
+
+        [JsonProperty("permissionTier")]
+        public AgentCapabilityPermissionTier PermissionTier { get; set; }
+
+        [JsonProperty("requiresConfirmation")]
+        public bool RequiresConfirmation { get; set; }
+
+        [JsonProperty("confirmationMessage")]
+        public string? ConfirmationMessage { get; set; }
+
+        [JsonProperty("data")]
+        public object? Data { get; set; }
+
+        [JsonProperty("durationMs")]
+        public long DurationMs { get; set; }
+    }
+
+    public class AgentCapabilityExecutionResult : AgentCapabilityInvocationResult
+    {
+    }
+
+    public class AgentCapabilityInvocationContext
+    {
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("senderName")]
+        public string? SenderName { get; set; }
+
+        [JsonProperty("sourceChannel")]
+        public AgentSourceChannel SourceChannel { get; set; }
+
+        [JsonProperty("confirmed")]
+        public bool Confirmed { get; set; }
+
+        [JsonProperty("hasElevatedPermissions")]
+        public bool HasElevatedPermissions { get; set; }
+    }
+
+    public class AgentServiceStatusSummary
+    {
+        [JsonProperty("serviceName")]
+        public string ServiceName { get; set; } = string.Empty;
+
+        [JsonProperty("serviceType")]
+        public string ServiceType { get; set; } = string.Empty;
+
+        [JsonProperty("isActive")]
+        public bool IsActive { get; set; }
+
+        [JsonProperty("uptime")]
+        public TimeSpan Uptime { get; set; }
+
+        [JsonProperty("uptimeHumanized")]
+        public string UptimeHumanized { get; set; } = string.Empty;
+    }
+
     public class AgentMessage
     {
         [JsonProperty("role")]

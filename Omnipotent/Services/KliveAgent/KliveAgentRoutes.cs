@@ -19,10 +19,12 @@ namespace Omnipotent.Services.KliveAgent
         public async Task RegisterRoutes()
         {
             await RegisterChatRoutes();
+            await RegisterCapabilityRoutes();
             await RegisterConversationRoutes();
             await RegisterTaskRoutes();
             await RegisterMemoryRoutes();
             await RegisterStatsRoutes();
+            await RegisterIndexRoutes();
         }
 
         // ── Chat ──
@@ -49,6 +51,64 @@ namespace Omnipotent.Services.KliveAgent
                         req.user?.Name ?? "API");
 
                     await req.ReturnResponse(JsonConvert.SerializeObject(response));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+        }
+
+        private async Task RegisterCapabilityRoutes()
+        {
+            await service.CreateAPIRoute("/kliveagent/capabilities", async (req) =>
+            {
+                try
+                {
+                    var category = req.userParameters["category"];
+                    var capabilities = service.GetCapabilities(category);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(capabilities), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await service.CreateAPIRoute("/kliveagent/capabilities/execute", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<AgentCapabilityInvocationRequest>(req.userMessageContent);
+                    if (body == null || string.IsNullOrWhiteSpace(body.Capability))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "capability is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var context = new AgentCapabilityInvocationContext
+                    {
+                        ConversationId = req.userParameters["conversationId"],
+                        SenderName = req.user?.Name ?? "API",
+                        SourceChannel = AgentSourceChannel.API,
+                        Confirmed = body.Confirmed,
+                        HasElevatedPermissions = (req.user?.KlivesManagementRank ?? KMPermissions.Anybody) >= KMPermissions.Admin
+                    };
+
+                    var result = await service.ExecuteCapabilityAsync(body, context);
+                    var responseCode = result.RequiresConfirmation && !result.Success
+                        ? HttpStatusCode.Conflict
+                        : result.Success
+                            ? HttpStatusCode.OK
+                            : HttpStatusCode.BadRequest;
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(result), code: responseCode);
                 }
                 catch (Exception ex)
                 {
@@ -266,5 +326,40 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
         }
+
+        private async Task RegisterIndexRoutes()
+        {
+            // POST /kliveagent/reindex — trigger a full codebase index rebuild
+            await service.CreateAPIRoute("/kliveagent/reindex", async (req) =>
+            {
+                try
+                {
+                    if (service.CodebaseIndex == null)
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "Codebase index not initialized." }),
+                            code: HttpStatusCode.ServiceUnavailable);
+                        return;
+                    }
+
+                    _ = Task.Run(async () =>
+                    {
+                        await service.CodebaseIndex.RebuildAsync();
+                        if (service.SymbolGraph != null)
+                            await service.SymbolGraph.BuildAsync();
+                    });
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(
+                        new { status = "Rebuild started in background." }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+        }
     }
 }
+
