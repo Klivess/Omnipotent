@@ -88,7 +88,10 @@ namespace Omnipotent.Services.KliveAgent
             var repoMap = string.Empty;
             try
             {
-                if (agentService.RepoMap != null)
+                // Only inject the repo map when the task has code-exploration signals (PascalCase
+                // type/service names found in the message). For plain action requests like
+                // "send me a Discord message" there are no seeds and the map adds pure token waste.
+                if (agentService.RepoMap != null && seeds.Count > 0)
                     repoMap = agentService.RepoMap.GetRepoMap(KliveAgentContextBudget.RepoMapBudget, seeds);
             }
             catch { /* best-effort */ }
@@ -116,7 +119,13 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
             sb.AppendLine("- If a script fails, read the error and change your approach â€” never retry the same failing code.");
             sb.AppendLine("- When you have completed the task, give a final text-only answer with no script blocks.");
-            sb.AppendLine("- On your FIRST reply to a new task: write 1â€“3 sentences describing your plan before any script.");
+            sb.AppendLine("- On your FIRST reply to a new task: write 1-3 sentences describing your plan before any script.");
+            sb.AppendLine();
+            sb.AppendLine("[CRITICAL - No Pretending]");
+            sb.AppendLine("- If the task requires taking ANY action (sending a message, creating data, calling a service, modifying state), you MUST run a script that actually performs it.");
+            sb.AppendLine("- NEVER describe an action as done, complete, or successful unless a script in THIS session already executed it and returned OK.");
+            sb.AppendLine("- A text-only final answer is valid ONLY for: (1) purely conversational/informational replies that require zero system calls, OR (2) confirming completion after your scripts already ran.");
+            sb.AppendLine("- Saying 'All set!' or 'Done!' without a preceding script is a hallucination. Do not do it.");
             sb.AppendLine();
 
             sb.Append(ToolCatalogue);
@@ -125,6 +134,11 @@ namespace Omnipotent.Services.KliveAgent
             {
                 sb.AppendLine();
                 sb.Append(repoMap);
+            }
+            else
+            {
+                sb.AppendLine();
+                sb.AppendLine("[Repo Map] Not pre-loaded (no specific type/service names found in this task). Call GetRepoMap() or FindDefinition() inside a script if you need codebase context.");
             }
 
             if (!string.IsNullOrWhiteSpace(memoriesSection))
@@ -211,7 +225,10 @@ namespace Omnipotent.Services.KliveAgent
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
 
-                var currentPrompt = BuildConversationPrompt(systemPrompt, conversation, userMessage, senderName);
+                // First iteration: pass system prompt so KliveLLM sets it as the system role (not stuffed into the user turn).
+                // Subsequent iterations only send observations — the session retains the system message.
+                var currentPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+                string? firstIterationSystemPrompt = systemPrompt;
 
                 // â”€â”€ Agentic Loop: Think â†’ Script â†’ Observe â†’ repeat â”€â”€
                 for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
@@ -221,7 +238,11 @@ namespace Omnipotent.Services.KliveAgent
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
-                        llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId);
+                        // Pass system prompt only on iteration 0 so it is set as the LLM session's
+                        // system role message once — not re-injected into every user turn.
+                        llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
+                            systemPrompt: firstIterationSystemPrompt);
+                        firstIterationSystemPrompt = null; // don't resend
                     }
                     catch (Exception llmEx)
                     {
@@ -367,16 +388,17 @@ namespace Omnipotent.Services.KliveAgent
 
         // â”€â”€ Conversation Prompt Builder â”€â”€
 
-        private string BuildConversationPrompt(
-            string systemPrompt,
+        /// <summary>
+        /// Builds the user-turn portion of the prompt (history + new message).
+        /// The system prompt is no longer embedded here — it is passed separately to KliveLLM
+        /// so it lands in the 'system' role of the chat, not the 'user' role.
+        /// </summary>
+        private string BuildUserPrompt(
             AgentConversation conversation,
             string userMessage,
             string? senderName = null)
         {
             var sb = new StringBuilder();
-            sb.AppendLine("[System]");
-            sb.AppendLine(systemPrompt);
-            sb.AppendLine();
 
             if (!string.IsNullOrEmpty(senderName))
             {

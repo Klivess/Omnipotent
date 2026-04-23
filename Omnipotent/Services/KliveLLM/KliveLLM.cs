@@ -203,7 +203,8 @@ namespace Omnipotent.Services.KliveLLM
         public async Task<KliveLLMResponse> QueryLLM(
             string prompt,
             string? sessionId = null,
-            int? maxTokensOverride = null)
+            int? maxTokensOverride = null,
+            string? systemPrompt = null)
         {
             var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", true);
             if (useHuggingFaceProvider)
@@ -211,7 +212,8 @@ namespace Omnipotent.Services.KliveLLM
                 var hfResponse = await QueryLLMViaHuggingFaceAsync(
                     prompt,
                     sessionId,
-                    maxTokensOverride);
+                    maxTokensOverride,
+                    systemPrompt);
 
                 return hfResponse;
             }
@@ -222,13 +224,18 @@ namespace Omnipotent.Services.KliveLLM
                 maxTokensOverride);
         }
 
-        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(string prompt, string? sessionId, int? maxTokensOverride)
+        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
             {
                 sessionId = Guid.NewGuid().ToString();
                 var s = new KliveLLMSession(this, false) { sessionId = sessionId };
+                if (!string.IsNullOrWhiteSpace(systemPrompt))
+                {
+                    s.chatHistory.Messages.Clear();
+                    s.chatHistory.AddMessage(AuthorRole.System, systemPrompt);
+                }
                 lock (sessions)
                 {
                     sessions[sessionId] = s;
@@ -241,6 +248,11 @@ namespace Omnipotent.Services.KliveLLM
                 if (!sessions.TryGetValue(sessionId, out session))
                 {
                     session = new KliveLLMSession(this, false) { sessionId = sessionId };
+                    if (!string.IsNullOrWhiteSpace(systemPrompt))
+                    {
+                        session.chatHistory.Messages.Clear();
+                        session.chatHistory.AddMessage(AuthorRole.System, systemPrompt);
+                    }
                     sessions[sessionId] = session;
                 }
             }

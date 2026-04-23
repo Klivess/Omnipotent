@@ -12,19 +12,19 @@ namespace Omnipotent.Services.KliveAgent
         // ── Budget constants ──
 
         /// <summary>Max tokens reserved for the repo map in every system prompt.</summary>
-        public const int RepoMapBudget = 3000;
+        public const int RepoMapBudget = 2000;
 
         /// <summary>Max tokens reserved for memory entries in every system prompt.</summary>
-        public const int MemoryBudget = 1500;
+        public const int MemoryBudget = 1000;
 
         /// <summary>Max tokens reserved for conversation history selection.</summary>
-        public const int HistoryBudget = 4000;
+        public const int HistoryBudget = 3000;
 
         /// <summary>Max tokens to surface from a single script execution output before truncating.</summary>
-        public const int ScriptOutputBudget = 2500;
+        public const int ScriptOutputBudget = 2000;
 
         /// <summary>Hard cap on the total system prompt (personality + repo map + memories + tools).</summary>
-        public const int TotalSystemPromptBudget = 14000;
+        public const int TotalSystemPromptBudget = 8000;
 
         /// <summary>Chars-per-token ratio used for estimation.</summary>
         private const double CharsPerToken = 4.0;
