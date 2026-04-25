@@ -16,9 +16,9 @@ namespace Omnipotent.Services.KliveAgent
     ///   4. Loop continues until the LLM produces a text-only response (the final answer).
     ///
     /// Spec references:
-    ///   Chapter 7  â€” Repo map injected in every prompt
-    ///   Chapter 9  â€” Agentic Loop Architecture
-    ///   Chapter 10 â€” Context Window Management &amp; Token Budgeting
+    ///   Chapter 7  -- Repo map injected in every prompt
+    ///   Chapter 9  -- Agentic Loop Architecture
+    ///   Chapter 10 -- Context Window Management &amp; Token Budgeting
     /// </summary>
     public class KliveAgentBrain
     {
@@ -51,13 +51,12 @@ namespace Omnipotent.Services.KliveAgent
   GetFullTypeHierarchy(typeName)                     -- full inheritance chain with all members
 
 [Action Tools]
-  ListServices()                                     -- list active OmniServices; returns List<ServiceInfo> with .Name, .TypeName, .Uptime
-  GetService(serviceName)                            -- get the LIVE service instance by TypeName or Name (use this + CallObjectMethod for action tasks)
-  ExecuteServiceMethod(serviceType, method, args...) -- invoke a method directly on a service (simplest path; no GetService step needed)
-  GetServiceMember(serviceType, memberName)          -- read a field/property VALUE from a service (NOT the service itself -- use GetService() for that)
+  ExecuteServiceMethod(serviceType, method, args...) -- invoke any method on any OmniService
+  GetServiceObject(serviceType, objectName)          -- read any field/property (incl. private) from a service
   GetObjectMember(obj, memberName)                   -- read any field/property (incl. private) on any object; walks full inheritance chain
   CallObjectMethod(obj, methodName, args...)         -- invoke any method (incl. private/async) on any object; awaits Task<T> automatically
   GetObjectTypeInfo(obj)                             -- list ALL fields, properties, and methods (public + private) of any object's type
+  ListServices()                                     -- list all active OmniServices
   ListAgentCapabilities(category?)                   -- list typed capabilities
   ExecuteAgentCapabilityAsync(name, args?, confirmed?) -- invoke a typed capability
   SpawnBackgroundTask(description, code)             -- launch a long-running background script
@@ -65,21 +64,6 @@ namespace Omnipotent.Services.KliveAgent
   SaveShortcut(title, content, tags?)                -- save a reusable procedure you discovered
   RecallMemories(query, maxResults?)                 -- search your persistent memory
   Log(message)                                       -- append to script output buffer
-
-[Pattern: Calling a method on a service -- ALWAYS start here for action tasks]
-  // Preferred: one-step direct call
-  var result = await ExecuteServiceMethod(""KliveBotDiscord"", ""SendMessageToUserAsync"", ""Klives"", ""Hello!"");
-  Log(result?.ToString() ?? ""done"");
-
-  // Alternative two-step: get instance first, then call (use when you need the object for multiple calls)
-  var svc = GetService(""KliveBotDiscord"");           // returns the live service instance
-  Log(GetObjectTypeInfo(svc));                         // inspect available methods before calling
-  await CallObjectMethod(svc, ""SendMessageToUserAsync"", ""Klives"", ""Hello!"");
-
-  // Find available services and their TypeNames
-  var services = ListServices();                       // returns List<ServiceInfo>
-  var discord = services.FirstOrDefault(s => s.TypeName == ""KliveBotDiscord"");
-  Log(discord?.Name ?? ""not found"");
 ";
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
@@ -131,11 +115,17 @@ namespace Omnipotent.Services.KliveAgent
 
             sb.AppendLine("[Script Execution Rules]");
             sb.AppendLine("- Write C# inside {{{ }}} to inspect the codebase or take action.");
-            sb.AppendLine("- Multiple script blocks in the same reply share state â€” locals persist between blocks.");
+            sb.AppendLine("- Multiple script blocks in the same reply share state — locals persist between blocks.");
             sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
-            sb.AppendLine("- If a script fails, read the error and change your approach â€” never retry the same failing code.");
+            sb.AppendLine("- If a script fails, read the error and change your approach — never retry the same failing code.");
             sb.AppendLine("- When you have completed the task, give a final text-only answer with no script blocks.");
             sb.AppendLine("- On your FIRST reply to a new task: write 1-3 sentences describing your plan before any script.");
+            sb.AppendLine("- Code fences (```csharp or ```) are also recognised as script blocks — use {{{ }}} by default.");
+            sb.AppendLine();
+            sb.AppendLine("[Background Tasks]");
+            sb.AppendLine("- SpawnBackgroundTask() runs in a SEPARATE isolated scope — it cannot read or set variables in your current session.");
+            sb.AppendLine("- Background tasks communicate results ONLY via SaveMemory() / Log(). They cannot return values to your session directly.");
+            sb.AppendLine("- Do NOT assume a variable set inside SpawnBackgroundTask() is accessible in your outer script — it will not be.");
             sb.AppendLine();
             sb.AppendLine("[CRITICAL - No Pretending]");
             sb.AppendLine("- If the task requires taking ANY action (sending a message, creating data, calling a service, modifying state), you MUST run a script that actually performs it.");
@@ -167,15 +157,15 @@ namespace Omnipotent.Services.KliveAgent
                 sb.ToString(),
                 KliveAgentContextBudget.TotalSystemPromptBudget);
         }
-
-        // â”€â”€ Response Parsing â”€â”€
-
         public static List<ResponseSegment> ParseLLMResponse(string response)
         {
             var segments = new List<ResponseSegment>();
             if (string.IsNullOrEmpty(response)) return segments;
 
-            var pattern = @"\{\{\{(.*?)\}\}\}";
+            // Primary delimiter: {{{ ... }}}
+            // Fallback delimiter: ```csharp ... ``` (or plain ``` ... ```)
+            // Both are matched in a single pass by alternation so their relative order is preserved.
+            var pattern = @"\{\{\{(.*?)\}\}\}|```(?:csharp|cs)?\s*\n(.*?)```";
             var matches = Regex.Matches(response, pattern, RegexOptions.Singleline);
 
             int lastIndex = 0;
@@ -188,7 +178,8 @@ namespace Omnipotent.Services.KliveAgent
                         segments.Add(new ResponseSegment { IsScript = false, Content = text });
                 }
 
-                var code = match.Groups[1].Value.Trim();
+                // Group 1 = {{{ }}} capture, Group 2 = ``` ``` capture
+                var code = (match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value).Trim();
                 if (!string.IsNullOrEmpty(code))
                     segments.Add(new ResponseSegment { IsScript = true, Content = code });
 
@@ -204,9 +195,6 @@ namespace Omnipotent.Services.KliveAgent
 
             return segments;
         }
-
-        // â”€â”€ Brain Orchestration â”€â”€
-
         private const int MaxAgentIterations = 25;
 
         public async Task<AgentChatResponse> ProcessMessageAsync(
@@ -310,7 +298,7 @@ namespace Omnipotent.Services.KliveAgent
                         if (allScriptsExecuted.Count > 0 && allScriptsExecuted.Any(s => s.Success))
                         {
                             _ = memory.SaveMemoryAsync(
-                                $"Completed: \"{TruncateForMemory(userMessage, 120)}\" â€” {TruncateForMemory(finalText, 200)}",
+                                $"Completed: \"{TruncateForMemory(userMessage, 120)}\" -- {TruncateForMemory(finalText, 200)}",
                                 tags: new[] { "auto", "completed-task" },
                                 source: "agent",
                                 importance: 2);
