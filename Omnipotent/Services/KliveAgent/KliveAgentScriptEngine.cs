@@ -32,14 +32,19 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Symbol Discovery ──
 
-        /// <summary>List all active OmniServices (name and type only — lightweight).</summary>
-        public List<string> ListServices()
+        /// <summary>List all active OmniServices as structured objects. Use TypeName/Name properties directly.</summary>
+        public List<ServiceInfo> ListServices()
         {
-            if (agentService == null) return new List<string>();
+            if (agentService == null) return new List<ServiceInfo>();
 
             return agentService.GetActiveServices()
                 .Where(s => s.IsServiceActive())
-                .Select(s => $"{s.GetType().Name} (\"{s.GetName()}\", uptime: {s.GetServiceUptime():hh\\:mm\\:ss})")
+                .Select(s => new ServiceInfo
+                {
+                    Name     = s.GetName(),
+                    TypeName = s.GetType().Name,
+                    Uptime   = s.GetServiceUptime().ToString(@"hh\:mm\:ss")
+                })
                 .ToList();
         }
 
@@ -377,26 +382,53 @@ namespace Omnipotent.Services.KliveAgent
             return result;
         }
 
-        /// <summary>Read any field or property from any OmniService by type name.</summary>
-        public object? GetServiceObject(string serviceTypeName, string objectName)
+        /// <summary>
+        /// Get the live instance of a named OmniService for direct method/field access.
+        /// Match by TypeName or Name (case-insensitive). Use with CallObjectMethod / GetObjectMember.
+        /// Example: var svc = GetService("KliveBotDiscord"); Log(GetObjectTypeInfo(svc));
+        /// </summary>
+        public object? GetService(string serviceName)
+        {
+            if (agentService == null)
+                throw new InvalidOperationException("KliveAgent service is unavailable in this script context.");
+
+            return agentService.GetActiveServices()
+                .FirstOrDefault(s =>
+                    s.GetType().Name.Equals(serviceName, StringComparison.OrdinalIgnoreCase) ||
+                    s.GetName().Equals(serviceName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>Read a field or property FROM a service by member name. Use GetService() first if you want the service instance itself.</summary>
+        public object? GetServiceMember(string serviceTypeName, string memberName)
         {
             if (agentService == null)
                 throw new InvalidOperationException("KliveAgent service is unavailable in this script context.");
 
             var services = agentService.GetActiveServices();
-            var target = services.FirstOrDefault(s => s.GetType().Name.Equals(serviceTypeName, StringComparison.OrdinalIgnoreCase));
+            var target = services.FirstOrDefault(s => s.GetType().Name.Equals(serviceTypeName, StringComparison.OrdinalIgnoreCase)
+                                                   || s.GetName().Equals(serviceTypeName, StringComparison.OrdinalIgnoreCase));
             if (target == null)
                 throw new InvalidOperationException($"Service '{serviceTypeName}' not found among active services.");
 
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-            var field = target.GetType().GetField(objectName, flags);
-            if (field != null) return field.GetValue(target);
+            var t = target.GetType();
+            while (t != null && t != typeof(object))
+            {
+                var field = t.GetField(memberName, flags);
+                if (field != null) return field.GetValue(target);
 
-            var prop = target.GetType().GetProperty(objectName, flags);
-            if (prop != null) return prop.GetValue(target);
+                var prop = t.GetProperty(memberName, flags);
+                if (prop != null) return prop.GetValue(target);
 
-            throw new MissingMemberException($"'{objectName}' not found on service '{serviceTypeName}'. Use GetTypeInfo(\"{serviceTypeName}\") to see available members.");
+                t = t.BaseType;
+            }
+
+            throw new MissingMemberException($"'{memberName}' not found on service '{serviceTypeName}'. Use GetObjectTypeInfo(GetService(\"{serviceTypeName}\")) to see available members.");
         }
+
+        /// <summary>Alias for GetServiceMember — kept for backward compatibility.</summary>
+        public object? GetServiceObject(string serviceTypeName, string memberName) =>
+            GetServiceMember(serviceTypeName, memberName);
 
         /// <summary>Get the overall Omnipotent uptime.</summary>
         public TimeSpan GetOmnipotentUptime() => agentService.GetManagerUptime();
@@ -1690,7 +1722,11 @@ namespace Omnipotent.Services.KliveAgent
 
                     globals.TakeOutput();
 
-                    var diagnostics = BuildScript(code).Compile(cts.Token);
+                    // Compile once and reuse the same Script object for execution — avoids a
+                    // second internal parse/compile that CSharpScript.RunAsync / ContinueWithAsync
+                    // would otherwise perform when given a raw code string.
+                    var script = BuildScript(code);
+                    var diagnostics = script.Compile(cts.Token);
                     var errors = diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error).ToList();
                     if (errors.Count > 0)
                     {
@@ -1705,9 +1741,12 @@ namespace Omnipotent.Services.KliveAgent
                         };
                     }
 
+                    // Run the already-compiled Script object directly.
+                    // For continuations, Script.RunAsync(previousState) chains off the prior state
+                    // while executing the script that was built via state.Script.ContinueWith().
                     state = state == null
-                        ? await CSharpScript.RunAsync(code, scriptOptions, globals, typeof(ScriptGlobals), cts.Token)
-                        : await state.ContinueWithAsync(code, scriptOptions, cancellationToken: cts.Token);
+                        ? await script.RunAsync(globals, catchException: null, cancellationToken: cts.Token)
+                        : await script.RunAsync(state, catchException: null, cancellationToken: cts.Token);
 
                     stopwatch.Stop();
 

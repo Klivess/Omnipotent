@@ -341,6 +341,20 @@ namespace Omnipotent.Services.KliveAgent.Models
         public bool IsStatic { get; set; }
     }
 
+    public class ServiceInfo
+    {
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("typeName")]
+        public string TypeName { get; set; } = string.Empty;
+
+        [JsonProperty("uptime")]
+        public string Uptime { get; set; } = string.Empty;
+
+        public override string ToString() => $"{TypeName} (\"{Name}\", uptime: {Uptime})";
+    }
+
     public class DiscordGuildInfo
     {
         [JsonProperty("id")]

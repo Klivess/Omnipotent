@@ -26,44 +26,60 @@ namespace Omnipotent.Services.KliveAgent
         private readonly KliveAgentScriptEngine scriptEngine;
         private readonly KliveAgentMemory memory;
 
-        // Tool catalogue injected into every system prompt â€” tells the LLM exactly what is callable.
+        // Tool catalogue injected into every system prompt -- tells the LLM exactly what is callable.
         private const string ToolCatalogue = @"
-[Discovery Tools â€” call inside {{{ }}} to explore the codebase before acting]
-  SearchCode(text, subfolder?, maxResults?)          â€” text search across .cs files
-  SearchCodeRegex(pattern, subfolder?, maxResults?)  â€” regex search across .cs files
-  SearchCodeHybrid(query, maxResults?)               â€” BM25-ranked search (best relevance)
-  FindDefinition(symbolName)                         â€” file + line where a type/method is defined
-  FindReferences(typeName)                           â€” all files that reference a given type
-  GetFileSymbols(relativePath)                       â€” symbols declared in a specific file
-  GetRankedFiles(max?, seed?)                        â€” PageRank-ranked files by structural importance
-  GetRepoMap(maxTokens?)                             â€” full live repo map (already in prompt; refresh if needed)
-  ReadFile(relativePath, startLine?, maxLines?)      â€” read source file with pagination
-  ListDirectory(relativePath?)                       â€” list files/folders at a path
-  FindFiles(pattern, subfolder?)                     â€” glob-style file search
-  ListProjectClasses(query?, maxResults?)            â€” all classes/interfaces/enums in source
-  FindProjectClass(typeName)                         â€” locate a type's source file + line
-  ExploreClassCode(typeName, maxLines?)              â€” read source around a type declaration
-  GetTypeSchema(typeName)                            â€” reflection-based type structure
-  GetTypeInfo(typeName)                              â€” human-readable type API
-  GetMethodDocumentation(typeName, methodName)       â€” source-level docs + signature
-  SearchSymbols(query, maxResults?)                  â€” symbol search across loaded assemblies
-  BrowseNamespace(namespaceName)                     â€” list types in a namespace
-  GetFullTypeHierarchy(typeName)                     â€” full inheritance chain with all members
+[Discovery Tools -- call inside {{{ }}} to explore the codebase before acting]
+  SearchCode(text, subfolder?, maxResults?)          -- text search across .cs files
+  SearchCodeRegex(pattern, subfolder?, maxResults?)  -- regex search across .cs files
+  SearchCodeHybrid(query, maxResults?)               -- BM25-ranked search (best relevance)
+  FindDefinition(symbolName)                         -- file + line where a type/method is defined
+  FindReferences(typeName)                           -- all files that reference a given type
+  GetFileSymbols(relativePath)                       -- symbols declared in a specific file
+  GetRankedFiles(max?, seed?)                        -- PageRank-ranked files by structural importance
+  GetRepoMap(maxTokens?)                             -- full live repo map (already in prompt; refresh if needed)
+  ReadFile(relativePath, startLine?, maxLines?)      -- read source file with pagination
+  ListDirectory(relativePath?)                       -- list files/folders at a path
+  FindFiles(pattern, subfolder?)                     -- glob-style file search
+  ListProjectClasses(query?, maxResults?)            -- all classes/interfaces/enums in source
+  FindProjectClass(typeName)                         -- locate a type's source file + line
+  ExploreClassCode(typeName, maxLines?)              -- read source around a type declaration
+  GetTypeSchema(typeName)                            -- reflection-based type structure
+  GetTypeInfo(typeName)                              -- human-readable type API
+  GetMethodDocumentation(typeName, methodName)       -- source-level docs + signature
+  SearchSymbols(query, maxResults?)                  -- symbol search across loaded assemblies
+  BrowseNamespace(namespaceName)                     -- list types in a namespace
+  GetFullTypeHierarchy(typeName)                     -- full inheritance chain with all members
 
 [Action Tools]
-  ExecuteServiceMethod(serviceType, method, args...) â€” invoke any method on any OmniService
-  GetServiceObject(serviceType, objectName)          -- read any field/property (incl. private) from a service
+  ListServices()                                     -- list active OmniServices; returns List<ServiceInfo> with .Name, .TypeName, .Uptime
+  GetService(serviceName)                            -- get the LIVE service instance by TypeName or Name (use this + CallObjectMethod for action tasks)
+  ExecuteServiceMethod(serviceType, method, args...) -- invoke a method directly on a service (simplest path; no GetService step needed)
+  GetServiceMember(serviceType, memberName)          -- read a field/property VALUE from a service (NOT the service itself -- use GetService() for that)
   GetObjectMember(obj, memberName)                   -- read any field/property (incl. private) on any object; walks full inheritance chain
   CallObjectMethod(obj, methodName, args...)         -- invoke any method (incl. private/async) on any object; awaits Task<T> automatically
   GetObjectTypeInfo(obj)                             -- list ALL fields, properties, and methods (public + private) of any object's type
-  ListServices()                                     â€” list all active OmniServices
-  ListAgentCapabilities(category?)                   â€” list typed capabilities
-  ExecuteAgentCapabilityAsync(name, args?, confirmed?) â€” invoke a typed capability
-  SpawnBackgroundTask(description, code)             â€” launch a long-running background script
-  SaveMemory(content, tags?, importance?)            â€” persist information across sessions
-  SaveShortcut(title, content, tags?)                â€” save a reusable procedure you discovered
-  RecallMemories(query, maxResults?)                 â€” search your persistent memory
-  Log(message)                                       â€” append to script output buffer
+  ListAgentCapabilities(category?)                   -- list typed capabilities
+  ExecuteAgentCapabilityAsync(name, args?, confirmed?) -- invoke a typed capability
+  SpawnBackgroundTask(description, code)             -- launch a long-running background script
+  SaveMemory(content, tags?, importance?)            -- persist information across sessions
+  SaveShortcut(title, content, tags?)                -- save a reusable procedure you discovered
+  RecallMemories(query, maxResults?)                 -- search your persistent memory
+  Log(message)                                       -- append to script output buffer
+
+[Pattern: Calling a method on a service -- ALWAYS start here for action tasks]
+  // Preferred: one-step direct call
+  var result = await ExecuteServiceMethod(""KliveBotDiscord"", ""SendMessageToUserAsync"", ""Klives"", ""Hello!"");
+  Log(result?.ToString() ?? ""done"");
+
+  // Alternative two-step: get instance first, then call (use when you need the object for multiple calls)
+  var svc = GetService(""KliveBotDiscord"");           // returns the live service instance
+  Log(GetObjectTypeInfo(svc));                         // inspect available methods before calling
+  await CallObjectMethod(svc, ""SendMessageToUserAsync"", ""Klives"", ""Hello!"");
+
+  // Find available services and their TypeNames
+  var services = ListServices();                       // returns List<ServiceInfo>
+  var discord = services.FirstOrDefault(s => s.TypeName == ""KliveBotDiscord"");
+  Log(discord?.Name ?? ""not found"");
 ";
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
