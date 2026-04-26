@@ -740,6 +740,27 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
+        /// <summary>Send a Discord DM (direct message) to a user by their Discord user ID (ulong).
+        /// Use RecallMemories("DiscordId") to retrieve a saved ID, or find it via GetDiscordGuilds() + member inspection.
+        /// Returns a success or error string.</summary>
+        public async Task<string> SendDiscordDM(ulong userId, string message)
+        {
+            var client = await GetDiscordClientAsync();
+            if (client == null) return "Discord client is null — KliveBotDiscord may not be running.";
+
+            try
+            {
+                var member = await client.GetUserAsync(userId);
+                var dm = await member.CreateDmChannelAsync();
+                var msg = await dm.SendMessageAsync(message);
+                return $"DM sent to user {userId} (message ID: {msg.Id}).";
+            }
+            catch (Exception ex)
+            {
+                return $"Failed to send DM to user {userId}: {ex.Message}";
+            }
+        }
+
         public async Task<string> ReactToDiscordMessage(ulong channelId, ulong messageId, string emoji)
         {
             var client = await GetDiscordClientAsync();
@@ -1722,31 +1743,36 @@ namespace Omnipotent.Services.KliveAgent
 
                     globals.TakeOutput();
 
-                    // Compile once and reuse the same Script object for execution — avoids a
-                    // second internal parse/compile that CSharpScript.RunAsync / ContinueWithAsync
-                    // would otherwise perform when given a raw code string.
-                    var script = BuildScript(code);
-                    var diagnostics = script.Compile(cts.Token);
-                    var errors = diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error).ToList();
-                    if (errors.Count > 0)
+                    if (state == null)
                     {
-                        stopwatch.Stop();
-                        var errorMsg = string.Join("\n", errors.Select(e => e.GetMessage()));
-                        return new AgentScriptResult
+                        // First script in the session: compile explicitly to surface structured
+                        // diagnostics before running. ScriptGlobals is the top-level globals type.
+                        var script = CSharpScript.Create(code, scriptOptions, typeof(ScriptGlobals));
+                        var diagnostics = script.Compile(cts.Token);
+                        var errors = diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error).ToList();
+                        if (errors.Count > 0)
                         {
-                            Code = code,
-                            Success = false,
-                            ErrorMessage = $"Compilation errors:\n{errorMsg}",
-                            ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                        };
-                    }
+                            stopwatch.Stop();
+                            var errorMsg = string.Join("\n", errors.Select(e => e.GetMessage()));
+                            return new AgentScriptResult
+                            {
+                                Code = code,
+                                Success = false,
+                                ErrorMessage = $"Compilation errors:\n{errorMsg}",
+                                ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                            };
+                        }
 
-                    // Run the already-compiled Script object directly.
-                    // For continuations, Script.RunAsync(previousState) chains off the prior state
-                    // while executing the script that was built via state.Script.ContinueWith().
-                    state = state == null
-                        ? await script.RunAsync(globals, catchException: null, cancellationToken: cts.Token)
-                        : await script.RunAsync(state, catchException: null, cancellationToken: cts.Token);
+                        state = await script.RunAsync(globals, catchException: null, cancellationToken: cts.Token);
+                    }
+                    else
+                    {
+                        // Continuation: ContinueWithAsync chains off the prior ScriptState correctly.
+                        // Calling .Compile() on a state.Script.ContinueWith() result triggers a Roslyn
+                        // globals-type mismatch (ScriptState<object> vs ScriptGlobals) that poisons all
+                        // subsequent scripts in the session. ContinueWithAsync avoids this entirely.
+                        state = await state.ContinueWithAsync(code, scriptOptions, catchException: null, cancellationToken: cts.Token);
+                    }
 
                     stopwatch.Stop();
 
@@ -1761,6 +1787,21 @@ namespace Omnipotent.Services.KliveAgent
                         Code = code,
                         Output = output,
                         Success = true,
+                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                    };
+                }
+                catch (Microsoft.CodeAnalysis.Scripting.CompilationErrorException cex)
+                {
+                    // ContinueWithAsync throws CompilationErrorException on compile failure
+                    // (rather than returning diagnostics like the first-run path does).
+                    stopwatch.Stop();
+                    var errorMsg = string.Join("\n", cex.Diagnostics.Select(d => d.GetMessage()));
+                    return new AgentScriptResult
+                    {
+                        Code = code,
+                        Success = false,
+                        ErrorMessage = $"Compilation errors:\n{errorMsg}",
+                        Output = globals.TakeOutput(),
                         ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                     };
                 }
@@ -1787,13 +1828,6 @@ namespace Omnipotent.Services.KliveAgent
                         ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                     };
                 }
-            }
-
-            private Script<object> BuildScript(string code)
-            {
-                return state == null
-                    ? CSharpScript.Create(code, scriptOptions, typeof(ScriptGlobals))
-                    : state.Script.ContinueWith(code, scriptOptions);
             }
         }
     }

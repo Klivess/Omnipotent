@@ -28,42 +28,47 @@ namespace Omnipotent.Services.KliveAgent
 
         // Tool catalogue injected into every system prompt -- tells the LLM exactly what is callable.
         private const string ToolCatalogue = @"
-[Discovery Tools -- call inside {{{ }}} to explore the codebase before acting]
-  SearchCode(text, subfolder?, maxResults?)          -- text search across .cs files
-  SearchCodeRegex(pattern, subfolder?, maxResults?)  -- regex search across .cs files
-  SearchCodeHybrid(query, maxResults?)               -- BM25-ranked search (best relevance)
-  FindDefinition(symbolName)                         -- file + line where a type/method is defined
-  FindReferences(typeName)                           -- all files that reference a given type
-  GetFileSymbols(relativePath)                       -- symbols declared in a specific file
-  GetRankedFiles(max?, seed?)                        -- PageRank-ranked files by structural importance
-  GetRepoMap(maxTokens?)                             -- full live repo map (already in prompt; refresh if needed)
-  ReadFile(relativePath, startLine?, maxLines?)      -- read source file with pagination
-  ListDirectory(relativePath?)                       -- list files/folders at a path
-  FindFiles(pattern, subfolder?)                     -- glob-style file search
-  ListProjectClasses(query?, maxResults?)            -- all classes/interfaces/enums in source
-  FindProjectClass(typeName)                         -- locate a type's source file + line
-  ExploreClassCode(typeName, maxLines?)              -- read source around a type declaration
-  GetTypeSchema(typeName)                            -- reflection-based type structure
-  GetTypeInfo(typeName)                              -- human-readable type API
-  GetMethodDocumentation(typeName, methodName)       -- source-level docs + signature
-  SearchSymbols(query, maxResults?)                  -- symbol search across loaded assemblies
-  BrowseNamespace(namespaceName)                     -- list types in a namespace
-  GetFullTypeHierarchy(typeName)                     -- full inheritance chain with all members
+[Discovery Tools -- SYNC unless marked async; call inside {{{ }}} to explore the codebase before acting]
+  SearchCode(text, subfolder?, maxResults?)            -> string        SYNC  -- text search across .cs files
+  SearchCodeRegex(pattern, subfolder?, maxResults?)    -> string        SYNC  -- regex search across .cs files
+  SearchCodeHybrid(query, maxResults?)                 -> string        SYNC  -- BM25-ranked search (best relevance)
+  FindDefinition(symbolName)                           -> string        SYNC  -- file + line where a type/method is defined
+  FindReferences(typeName)                             -> string        SYNC  -- all files that reference a given type
+  GetFileSymbols(relativePath)                         -> string        SYNC  -- symbols declared in a specific file
+  GetRankedFiles(max?, seed?)                          -> string        SYNC  -- PageRank-ranked files by structural importance
+  GetRepoMap(maxTokens?)                               -> string        SYNC  -- full live repo map (already in prompt; refresh if needed)
+  ReadFile(relativePath, startLine?, maxLines?)        -> string        SYNC  -- read source file with pagination
+  ListDirectory(relativePath?)                         -> string        SYNC  -- list files/folders at a path
+  FindFiles(pattern, subfolder?)                       -> string        SYNC  -- glob-style file search
+  ListProjectClasses(query?, maxResults?)              -> List<ProjectClassInfo>  SYNC  -- all classes/interfaces/enums in source
+  FindProjectClass(typeName)                           -> ProjectClassInfo?       SYNC  -- locate a type's source file + line
+  ExploreClassCode(typeName, maxLines?)                -> string        SYNC  -- read source around a type declaration
+  GetTypeSchema(typeName)                              -> AgentTypeSchema?        SYNC  -- reflection-based type structure
+  GetTypeInfo(typeName)                                -> string        SYNC  -- human-readable type API
+  GetMethodDocumentation(typeName, methodName)         -> string        SYNC  -- source-level docs + signature
+  SearchSymbols(query, maxResults?)                    -> string        SYNC  -- symbol search across loaded assemblies
+  BrowseNamespace(namespaceName)                       -> string        SYNC  -- list types in a namespace
+  GetFullTypeHierarchy(typeName)                       -> string        SYNC  -- full inheritance chain with all members
 
-[Action Tools]
-  ExecuteServiceMethod(serviceType, method, args...) -- invoke any method on any OmniService
-  GetServiceObject(serviceType, objectName)          -- read any field/property (incl. private) from a service
-  GetObjectMember(obj, memberName)                   -- read any field/property (incl. private) on any object; walks full inheritance chain
-  CallObjectMethod(obj, methodName, args...)         -- invoke any method (incl. private/async) on any object; awaits Task<T> automatically
-  GetObjectTypeInfo(obj)                             -- list ALL fields, properties, and methods (public + private) of any object's type
-  ListServices()                                     -- list all active OmniServices
-  ListAgentCapabilities(category?)                   -- list typed capabilities
-  ExecuteAgentCapabilityAsync(name, args?, confirmed?) -- invoke a typed capability
-  SpawnBackgroundTask(description, code)             -- launch a long-running background script
-  SaveMemory(content, tags?, importance?)            -- persist information across sessions
-  SaveShortcut(title, content, tags?)                -- save a reusable procedure you discovered
-  RecallMemories(query, maxResults?)                 -- search your persistent memory
-  Log(message)                                       -- append to script output buffer
+[Action Tools -- return types and sync/async are EXACT; do not guess]
+  ExecuteServiceMethod(serviceType, method, args...)   -> Task<object?> ASYNC -- invoke any method on any OmniService
+  GetServiceObject(serviceType, memberName)            -> object?       SYNC  -- read a field/property from a service by type name; NO await
+  GetService(serviceName)                              -> object?       SYNC  -- get the live service instance by type or display name; NO await
+  GetObjectMember(obj, memberName)                     -> object?       SYNC  -- read any field/property (incl. private) on any object
+  CallObjectMethod(obj, methodName, args...)           -> Task<object?> ASYNC -- invoke any method (incl. private/async); MUST await
+  GetObjectTypeInfo(obj)                               -> string        SYNC  -- list ALL fields, properties, and methods of any object's type
+  ListServices()                                       -> List<ServiceInfo>   SYNC  -- list active OmniServices; NO await; use .TypeName (not .Type)
+  ListAgentCapabilities(category?)                     -> List<AgentCapabilityDefinition>  SYNC
+  ExecuteAgentCapabilityAsync(name, args?, confirmed?) -> Task<AgentCapabilityInvocationResult>  ASYNC
+  SpawnBackgroundTask(description, code)               -> string        SYNC  -- launch a long-running background script
+  SaveMemory(content, tags?, importance?)              -> Task          ASYNC
+  SaveShortcut(title, content, tags?)                  -> Task          ASYNC
+  RecallMemories(query, maxResults?)                   -> Task<List<AgentMemoryEntry>>  ASYNC; use .Count (not .Length)
+  Log(message)                                         -> void          SYNC  -- append to script output buffer
+
+  A good idea for tool use is to first call a discovery tool to inspect the codebase, then call an action tool to perform the action. For example, if you need to call an unfamiliar API, first call GetTypeSchema() or ExploreClassCode() to understand its structure and usage, then call CallObjectMethod() to invoke it.
+  Don't immediately try to call an API you haven't seen before — always discover first. If your first attempt at calling an API fails, read the error message and adjust your approach. Never retry the same failing code without changing it, or you'll just get the same error again.
+  A good place to start is by calling ListProjectClasses() to get an overview of the available types in the codebase, or GetRepoMap() to see a high-level map of the repo structure.
 ";
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
