@@ -10,6 +10,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniGram.Models;
 using System.Collections.Concurrent;
 using System.Net;
+using tryAGI.OpenAI;
 
 namespace Omnipotent.Services.OmniGram
 {
@@ -186,8 +187,9 @@ namespace Omnipotent.Services.OmniGram
                     UseProxy = true
                 });
             }
-
-            return builder.Build();
+            var api = builder.Build();
+            api.SetDevice(JsonConvert.DeserializeObject<AndroidDevice>(account.DeviceData));
+            return api;
         }
 
         private async Task LoadAccountsFromDisk()

@@ -355,60 +355,6 @@ namespace Omnipotent.Services.KliveAgent.Models
         public override string ToString() => $"{TypeName} (\"{Name}\", uptime: {Uptime})";
     }
 
-    public class DiscordGuildInfo
-    {
-        [JsonProperty("id")]
-        public ulong Id { get; set; }
-
-        [JsonProperty("name")]
-        public string Name { get; set; } = string.Empty;
-
-        public override string ToString() => $"{Name} ({Id})";
-    }
-
-    public class DiscordChannelInfo
-    {
-        [JsonProperty("id")]
-        public ulong Id { get; set; }
-
-        [JsonProperty("guildId")]
-        public ulong GuildId { get; set; }
-
-        [JsonProperty("name")]
-        public string Name { get; set; } = string.Empty;
-
-        [JsonProperty("type")]
-        public string Type { get; set; } = string.Empty;
-
-        [JsonProperty("position")]
-        public int Position { get; set; }
-
-        public override string ToString() => $"#{Name} ({Id}) [{Type}]";
-    }
-
-    public class DiscordMessageInfo
-    {
-        [JsonProperty("id")]
-        public ulong Id { get; set; }
-
-        [JsonProperty("channelId")]
-        public ulong ChannelId { get; set; }
-
-        [JsonProperty("authorId")]
-        public ulong AuthorId { get; set; }
-
-        [JsonProperty("authorName")]
-        public string AuthorName { get; set; } = string.Empty;
-
-        [JsonProperty("content")]
-        public string Content { get; set; } = string.Empty;
-
-        [JsonProperty("timestampUtc")]
-        public DateTime TimestampUtc { get; set; }
-
-        public override string ToString() => $"{AuthorName}: {Content}";
-    }
-
     public class ProjectClassInfo
     {
         [JsonProperty("name")]

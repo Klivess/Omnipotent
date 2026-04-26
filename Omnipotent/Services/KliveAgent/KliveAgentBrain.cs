@@ -1,6 +1,8 @@
 ﻿using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
+using System.Globalization;
+using System.Reflection;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -26,50 +28,57 @@ namespace Omnipotent.Services.KliveAgent
         private readonly KliveAgentScriptEngine scriptEngine;
         private readonly KliveAgentMemory memory;
 
-        // Tool catalogue injected into every system prompt -- tells the LLM exactly what is callable.
-        private const string ToolCatalogue = @"
-[Discovery Tools -- SYNC unless marked async; call inside {{{ }}} to explore the codebase before acting]
-  SearchCode(text, subfolder?, maxResults?)            -> string        SYNC  -- text search across .cs files
-  SearchCodeRegex(pattern, subfolder?, maxResults?)    -> string        SYNC  -- regex search across .cs files
-  SearchCodeHybrid(query, maxResults?)                 -> string        SYNC  -- BM25-ranked search (best relevance)
-  FindDefinition(symbolName)                           -> string        SYNC  -- file + line where a type/method is defined
-  FindReferences(typeName)                             -> string        SYNC  -- all files that reference a given type
-  GetFileSymbols(relativePath)                         -> string        SYNC  -- symbols declared in a specific file
-  GetRankedFiles(max?, seed?)                          -> string        SYNC  -- PageRank-ranked files by structural importance
-  GetRepoMap(maxTokens?)                               -> string        SYNC  -- full live repo map (already in prompt; refresh if needed)
-  ReadFile(relativePath, startLine?, maxLines?)        -> string        SYNC  -- read source file with pagination
-  ListDirectory(relativePath?)                         -> string        SYNC  -- list files/folders at a path
-  FindFiles(pattern, subfolder?)                       -> string        SYNC  -- glob-style file search
-  ListProjectClasses(query?, maxResults?)              -> List<ProjectClassInfo>  SYNC  -- all classes/interfaces/enums in source
-  FindProjectClass(typeName)                           -> ProjectClassInfo?       SYNC  -- locate a type's source file + line
-  ExploreClassCode(typeName, maxLines?)                -> string        SYNC  -- read source around a type declaration
-  GetTypeSchema(typeName)                              -> AgentTypeSchema?        SYNC  -- reflection-based type structure
-  GetTypeInfo(typeName)                                -> string        SYNC  -- human-readable type API
-  GetMethodDocumentation(typeName, methodName)         -> string        SYNC  -- source-level docs + signature
-  SearchSymbols(query, maxResults?)                    -> string        SYNC  -- symbol search across loaded assemblies
-  BrowseNamespace(namespaceName)                       -> string        SYNC  -- list types in a namespace
-  GetFullTypeHierarchy(typeName)                       -> string        SYNC  -- full inheritance chain with all members
+        private sealed record PromptToolDescriptor(string MethodName, string Description);
 
-[Action Tools -- return types and sync/async are EXACT; do not guess]
-  ExecuteServiceMethod(serviceType, method, args...)   -> Task<object?> ASYNC -- invoke any method on any OmniService
-  GetServiceObject(serviceType, memberName)            -> object?       SYNC  -- read a field/property from a service by type name; NO await
-  GetService(serviceName)                              -> object?       SYNC  -- get the live service instance by type or display name; NO await
-  GetObjectMember(obj, memberName)                     -> object?       SYNC  -- read any field/property (incl. private) on any object
-  CallObjectMethod(obj, methodName, args...)           -> Task<object?> ASYNC -- invoke any method (incl. private/async); MUST await
-  GetObjectTypeInfo(obj)                               -> string        SYNC  -- list ALL fields, properties, and methods of any object's type
-  ListServices()                                       -> List<ServiceInfo>   SYNC  -- list active OmniServices; NO await; use .TypeName (not .Type)
-  ListAgentCapabilities(category?)                     -> List<AgentCapabilityDefinition>  SYNC
-  ExecuteAgentCapabilityAsync(name, args?, confirmed?) -> Task<AgentCapabilityInvocationResult>  ASYNC
-  SpawnBackgroundTask(description, code)               -> string        SYNC  -- launch a long-running background script
-  SaveMemory(content, tags?, importance?)              -> Task          ASYNC
-  SaveShortcut(title, content, tags?)                  -> Task          ASYNC
-  RecallMemories(query, maxResults?)                   -> Task<List<AgentMemoryEntry>>  ASYNC; use .Count (not .Length)
-  Log(message)                                         -> void          SYNC  -- append to script output buffer
+        private static readonly PromptToolDescriptor[] StarterTools =
+        [
+            new("ListProjectClasses", "Browse project types by name, namespace, or path."),
+            new("FindProjectClass", "Jump straight to a likely project type when you already know its name."),
+            new("ExploreClassCode", "Read the implementation around a target type declaration."),
+            new("GetMethodDocumentation", "Inspect exact method signatures, defaults, and XML docs before calling unfamiliar APIs."),
+            new("GetTypeSchema", "Inspect exact members and parameter types for any type, including ScriptGlobals itself."),
+            new("ListServices", "See which OmniServices are live right now."),
+            new("GetService", "Fetch a live service instance by type name or display name."),
+            new("GetObjectTypeInfo", "Inspect a live object's members before calling or reading them."),
+            new("ExecuteServiceMethod", "Call a known service method directly when you already know the exact service type and method name."),
+            new("CallObjectMethod", "Invoke a method on a live object after inspecting it. Await Task-returning methods."),
+            new("Log", "Write short structured observations back to the loop.")
+        ];
 
-  A good idea for tool use is to first call a discovery tool to inspect the codebase, then call an action tool to perform the action. For example, if you need to call an unfamiliar API, first call GetTypeSchema() or ExploreClassCode() to understand its structure and usage, then call CallObjectMethod() to invoke it.
-  Don't immediately try to call an API you haven't seen before — always discover first. If your first attempt at calling an API fails, read the error message and adjust your approach. Never retry the same failing code without changing it, or you'll just get the same error again.
-  A good place to start is by calling ListProjectClasses() to get an overview of the available types in the codebase, or GetRepoMap() to see a high-level map of the repo structure.
-";
+        private static readonly PromptToolDescriptor[] DiscoveryTools =
+        [
+            new("SearchCodeHybrid", "Use BM25 search when you need a relevant code entry point fast."),
+            new("FindDefinition", "Jump to the exact definition of a type or method."),
+            new("FindReferences", "See where a type is used before changing behavior."),
+            new("ReadFile", "Read the source directly with line pagination."),
+            new("GetFileSymbols", "List the symbols declared in one file."),
+            new("ListDirectory", "Browse a directory relative to the codebase root."),
+            new("GetRepoMap", "Refresh the live repo map if you need broader structure."),
+            new("SearchCode", "Use plain-text search only when a narrower type lookup did not find the target."),
+            new("SearchCodeRegex", "Use regex search for signature-shaped lookups.")
+        ];
+
+        private static readonly PromptToolDescriptor[] AdvancedRuntimeTools =
+        [
+            new("GetServiceObject", "Read a field or property from a live service by type name."),
+            new("GetObjectMember", "Inspect a specific field or property on a live object."),
+            new("GetTypeInfo", "Get a human-readable API summary for a type."),
+            new("SearchSymbols", "Search loaded Omnipotent assemblies for matching types, methods, or properties."),
+            new("BrowseNamespace", "Browse public types inside a namespace."),
+            new("GetFullTypeHierarchy", "Inspect inherited members before calling into framework or base-class behavior."),
+            new("ListAgentCapabilities", "See if an explicit typed capability already exists for the task."),
+            new("ExecuteAgentCapabilityAsync", "Run an explicit capability when one exists instead of stitching raw reflection together."),
+            new("SpawnBackgroundTask", "Launch long-running work only when the task truly needs isolation."),
+            new("Delay", "Pause inside long-running scripts while respecting cancellation.")
+        ];
+
+        private static readonly PromptToolDescriptor[] MemoryTools =
+        [
+            new("SaveMemory", "Persist a durable note. Tags must be a string array, for example new[] { \"service\", \"workflow\" }."),
+            new("RecallMemories", "Search saved memories for prior discoveries or IDs."),
+            new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task."),
+            new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow.")
+        ];
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
         {
@@ -122,6 +131,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- Write C# inside {{{ }}} to inspect the codebase or take action.");
             sb.AppendLine("- Multiple script blocks in the same reply share state — locals persist between blocks.");
             sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
+            sb.AppendLine("- Prefer one narrow lookup over broad searching. Find the target type/service first, then inspect it.");
+            sb.AppendLine("- Await methods that return Task or Task<T>. Sync methods should not be awaited.");
             sb.AppendLine("- If a script fails, read the error and change your approach — never retry the same failing code.");
             sb.AppendLine("- When you have completed the task, give a final text-only answer with no script blocks.");
             sb.AppendLine("- On your FIRST reply to a new task: write 1-3 sentences describing your plan before any script.");
@@ -139,7 +150,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- Saying 'All set!' or 'Done!' without a preceding script is a hallucination. Do not do it.");
             sb.AppendLine();
 
-            sb.Append(ToolCatalogue);
+            sb.Append(BuildToolGuide(userMessage));
 
             if (!string.IsNullOrWhiteSpace(repoMap))
             {
@@ -334,7 +345,7 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
-                        var result = await scriptSession.ExecuteAsync(segment.Content);
+                        var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
                         allScriptsExecuted.Add(result);
 
                         if (result.Success)
@@ -481,6 +492,165 @@ namespace Omnipotent.Services.KliveAgent
                     ? new[] { x.user, x.agent }
                     : new[] { x.user })
                 .ToList();
+        }
+
+        public static string BuildToolGuide(string userMessage)
+        {
+            var sb = new StringBuilder();
+
+            sb.AppendLine("[Runtime Workflow]");
+            sb.AppendLine("1. Tools are the public methods on ScriptGlobals.");
+            sb.AppendLine("2. Narrow the task to one target type, service, or method before doing anything else.");
+            sb.AppendLine("3. Inspect exact signatures before calling unfamiliar APIs.");
+            sb.AppendLine("4. Act with the smallest script that can prove progress, then stop when you have the answer.");
+            sb.AppendLine();
+
+            AppendToolSection(sb, "Starter Tools", StarterTools);
+
+            if (ShouldIncludeDiscoveryTools(userMessage))
+            {
+                sb.AppendLine();
+                AppendToolSection(sb, "Codebase Tools", DiscoveryTools);
+            }
+
+            if (ShouldIncludeAdvancedRuntimeTools(userMessage))
+            {
+                sb.AppendLine();
+                AppendToolSection(sb, "Advanced Runtime Tools", AdvancedRuntimeTools);
+            }
+
+            if (ShouldIncludeMemoryTools(userMessage))
+            {
+                sb.AppendLine();
+                AppendToolSection(sb, "Memory Tools", MemoryTools);
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("[Tool Self-Discovery]");
+            sb.AppendLine("If a needed tool is not listed above, inspect ScriptGlobals itself before using it:");
+            sb.AppendLine("  GetTypeSchema(\"ScriptGlobals\")");
+            sb.AppendLine("  GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\")");
+            sb.AppendLine("  ExploreClassCode(\"ScriptGlobals\")");
+
+            return sb.ToString().TrimEnd();
+        }
+
+        private static void AppendToolSection(StringBuilder sb, string title, IEnumerable<PromptToolDescriptor> tools)
+        {
+            sb.AppendLine($"[{title}]");
+            foreach (var tool in tools)
+            {
+                var signature = FormatToolSignature(tool.MethodName);
+                if (string.IsNullOrWhiteSpace(signature))
+                    continue;
+
+                sb.AppendLine($"  {signature} -- {tool.Description}");
+            }
+        }
+
+        private static string? FormatToolSignature(string methodName)
+        {
+            var method = typeof(ScriptGlobals)
+                .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+                .FirstOrDefault(m => m.Name.Equals(methodName, StringComparison.Ordinal));
+
+            if (method == null)
+                return null;
+
+            var parameters = string.Join(", ", method.GetParameters().Select(FormatParameterSignature));
+            return $"{method.Name}({parameters}) -> {FormatTypeName(method.ReturnType)}";
+        }
+
+        private static string FormatParameterSignature(ParameterInfo parameter)
+        {
+            var prefix = parameter.GetCustomAttribute<ParamArrayAttribute>() != null ? "params " : string.Empty;
+            var signature = $"{prefix}{FormatTypeName(parameter.ParameterType)} {parameter.Name}";
+
+            if (parameter.HasDefaultValue)
+                signature += $" = {FormatDefaultValue(parameter.DefaultValue)}";
+
+            return signature;
+        }
+
+        private static string FormatTypeName(Type type)
+        {
+            if (type == typeof(void))
+                return "void";
+
+            var nullable = Nullable.GetUnderlyingType(type);
+            if (nullable != null)
+                return $"{FormatTypeName(nullable)}?";
+
+            if (type.IsArray)
+                return $"{FormatTypeName(type.GetElementType()!)}[]";
+
+            if (type.IsGenericType)
+            {
+                var genericName = type.Name;
+                var tickIndex = genericName.IndexOf('`');
+                if (tickIndex >= 0)
+                    genericName = genericName[..tickIndex];
+
+                var genericArguments = string.Join(", ", type.GetGenericArguments().Select(FormatTypeName));
+                return $"{genericName}<{genericArguments}>";
+            }
+
+            return type.Name switch
+            {
+                nameof(String) => "string",
+                nameof(Int32) => "int",
+                nameof(Int64) => "long",
+                nameof(UInt32) => "uint",
+                nameof(UInt64) => "ulong",
+                nameof(Int16) => "short",
+                nameof(UInt16) => "ushort",
+                nameof(Boolean) => "bool",
+                nameof(Object) => "object",
+                nameof(Double) => "double",
+                nameof(Single) => "float",
+                nameof(Decimal) => "decimal",
+                nameof(Byte) => "byte",
+                nameof(SByte) => "sbyte",
+                nameof(Char) => "char",
+                _ => type.Name,
+            };
+        }
+
+        private static string FormatDefaultValue(object? value)
+        {
+            return value switch
+            {
+                null => "null",
+                string text => $"\"{text}\"",
+                char character => $"'{character}'",
+                bool boolean => boolean ? "true" : "false",
+                Enum enumValue => $"{enumValue.GetType().Name}.{enumValue}",
+                _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? "null",
+            };
+        }
+
+        private static bool ShouldIncludeDiscoveryTools(string userMessage)
+        {
+            return KliveAgentRepoMap.ExtractSeedsFromText(userMessage).Count > 0
+                || ContainsAny(userMessage, "code", "class", "method", "file", "repo", "source", "implementation", "where", "why", "how");
+        }
+
+        private static bool ShouldIncludeAdvancedRuntimeTools(string userMessage)
+        {
+            return ContainsAny(userMessage, "service", "capability", "background", "task", "property", "field", "member", "invoke", "call", "execute");
+        }
+
+        private static bool ShouldIncludeMemoryTools(string userMessage)
+        {
+            return ContainsAny(userMessage, "memory", "memories", "remember", "recall", "shortcut");
+        }
+
+        private static bool ContainsAny(string userMessage, params string[] keywords)
+        {
+            if (string.IsNullOrWhiteSpace(userMessage))
+                return false;
+
+            return keywords.Any(keyword => userMessage.Contains(keyword, StringComparison.OrdinalIgnoreCase));
         }
 
         private static string TruncateForMemory(string s, int max)
