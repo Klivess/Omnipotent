@@ -6,7 +6,8 @@ namespace Omnipotent.Services.KliveMultiTool
     {
         Running,
         Completed,
-        Failed
+        Failed,
+        Cancelled
     }
 
     public class KliveToolJob
@@ -20,6 +21,10 @@ namespace Omnipotent.Services.KliveMultiTool
         [JsonProperty("functionName")]
         public string FunctionName { get; set; } = string.Empty;
 
+        /// <summary>Value of the first parameter, shown as a human-readable label in the UI.</summary>
+        [JsonProperty("label")]
+        public string? Label { get; set; }
+
         [JsonProperty("status")]
         [JsonConverter(typeof(Newtonsoft.Json.Converters.StringEnumConverter))]
         public KliveToolJobStatus Status { get; set; } = KliveToolJobStatus.Running;
@@ -32,5 +37,19 @@ namespace Omnipotent.Services.KliveMultiTool
 
         [JsonProperty("result")]
         public KliveToolResult? Result { get; set; }
+
+        [JsonIgnore]
+        public CancellationTokenSource Cts { get; } = new CancellationTokenSource();
+
+        public void Cancel()
+        {
+            if (Status == KliveToolJobStatus.Running)
+            {
+                Cts.Cancel();
+                Status = KliveToolJobStatus.Cancelled;
+                EndTime = DateTime.UtcNow;
+                Result = KliveToolResult.Fail("Cancelled by user.");
+            }
+        }
     }
 }

@@ -184,7 +184,15 @@ namespace Omnipotent.Services.KliveMultiTool
 
                     if (isAsync)
                     {
-                        var job = new KliveToolJob { ToolName = toolName!, FunctionName = functionName! };
+                        var firstParamValue = descriptor.Parameters.Count > 0
+                            ? inputs.GetValueOrDefault(descriptor.Parameters[0].Name)
+                            : null;
+                        var job = new KliveToolJob
+                        {
+                            ToolName = toolName!,
+                            FunctionName = functionName!,
+                            Label = firstParamValue
+                        };
                         activeJobs[job.JobId] = job;
                         _ = RunJobAsync(job, descriptor, inputs);
                         await req.ReturnResponse(JsonConvert.SerializeObject(new { jobId = job.JobId }), code: HttpStatusCode.Accepted);
@@ -216,6 +224,24 @@ namespace Omnipotent.Services.KliveMultiTool
                 await req.ReturnResponse(JsonConvert.SerializeObject(observables), code: HttpStatusCode.OK);
             }, HttpMethod.Get, KMPermissions.Admin);
 
+            // Cancel a running job
+            await CreateAPIRoute("/KliveMultiTool/job/cancel", async (req) =>
+            {
+                var jobId = req.userParameters.Get("id");
+                if (!activeJobs.TryGetValue(jobId ?? "", out var job))
+                {
+                    await req.ReturnResponse($"Job '{jobId}' not found.", code: HttpStatusCode.NotFound);
+                    return;
+                }
+                if (job.Status != KliveToolJobStatus.Running)
+                {
+                    await req.ReturnResponse("Job is not running.", code: HttpStatusCode.BadRequest);
+                    return;
+                }
+                job.Cancel();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { cancelled = true, jobId }), code: HttpStatusCode.OK);
+            }, HttpMethod.Post, KMPermissions.Admin);
+
             // Single job
             await CreateAPIRoute("/KliveMultiTool/job", async (req) =>
             {
@@ -242,8 +268,18 @@ namespace Omnipotent.Services.KliveMultiTool
         {
             try
             {
+                descriptor.OwnerTool.SetCancellationToken(job.Cts.Token);
                 job.Result = await InvokeFunction(descriptor, inputs);
-                job.Status = job.Result.Success ? KliveToolJobStatus.Completed : KliveToolJobStatus.Failed;
+                if (job.Status != KliveToolJobStatus.Cancelled)
+                    job.Status = job.Result.Success ? KliveToolJobStatus.Completed : KliveToolJobStatus.Failed;
+            }
+            catch (OperationCanceledException)
+            {
+                if (job.Status != KliveToolJobStatus.Cancelled)
+                {
+                    job.Status = KliveToolJobStatus.Cancelled;
+                    job.Result = KliveToolResult.Fail("Cancelled.");
+                }
             }
             catch (Exception ex)
             {
@@ -252,7 +288,9 @@ namespace Omnipotent.Services.KliveMultiTool
             }
             finally
             {
-                job.EndTime = DateTime.UtcNow;
+                if (!job.EndTime.HasValue)
+                    job.EndTime = DateTime.UtcNow;
+                descriptor.OwnerTool.SetCancellationToken(CancellationToken.None);
             }
         }
 

@@ -13,6 +13,11 @@ namespace Omnipotent.Services.KliveMultiTool
         internal KliveMultiTool Parent { get; private set; } = null!;
         internal List<KliveToolFunctionDescriptor> Functions { get; set; } = new();
 
+        /// <summary>Set by KliveMultiTool before each async job invocation. Tools should pass this to any long-running operations.</summary>
+        protected CancellationToken JobCancellationToken { get; private set; } = CancellationToken.None;
+
+        internal void SetCancellationToken(CancellationToken token) => JobCancellationToken = token;
+
         internal void SetParent(KliveMultiTool parent)
         {
             Parent = parent;

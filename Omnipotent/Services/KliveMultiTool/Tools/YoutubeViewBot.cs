@@ -53,8 +53,9 @@ namespace Omnipotent.Services.KliveMultiTool.Tools
             await Log($"YoutubeViewBot starting: {viewCount} views, concurrency={concurrency}, url={url}");
 
             var seleniumManager = await Parent.GetSeleniumManager();
+            var cts = JobCancellationToken;
             var semaphore = new SemaphoreSlim(concurrency, concurrency);
-            var tasks = Enumerable.Range(0, viewCount).Select(i => RunSingleView(url, i, semaphore, (SeleniumMgr)seleniumManager));
+            var tasks = Enumerable.Range(0, viewCount).Select(i => RunSingleView(url, i, semaphore, (SeleniumMgr)seleniumManager, cts));
 
             await Task.WhenAll(tasks);
 
@@ -63,7 +64,7 @@ namespace Omnipotent.Services.KliveMultiTool.Tools
             return KliveToolResult.Ok(Status);
         }
 
-        private async Task RunSingleView(string url, int index, SemaphoreSlim semaphore, SeleniumMgr seleniumManager)
+        private async Task RunSingleView(string url, int index, SemaphoreSlim semaphore, SeleniumMgr seleniumManager, CancellationToken ct)
         {
             await semaphore.WaitAsync();
             Interlocked.Increment(ref _activeInstances);
@@ -84,15 +85,15 @@ namespace Omnipotent.Services.KliveMultiTool.Tools
                 driver.Navigate().GoToUrl(url);
 
                 // Wait for page load then dismiss consent dialogs (EU region)
-                await Task.Delay(3000);
+                await Task.Delay(3000, ct);
                 TryDismissConsent(driver);
 
                 // Send mute key to player as a fallback (--mute-audio handles audio at OS level)
-                await Task.Delay(2000);
+                await Task.Delay(2000, ct);
                 TryMute(driver);
 
                 // Watch for 2 minutes
-                await Task.Delay(TimeSpan.FromMinutes(2));
+                await Task.Delay(TimeSpan.FromMinutes(2), ct);
 
                 Interlocked.Increment(ref _completedViews);
                 CompletedViews = _completedViews;
