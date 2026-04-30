@@ -34,6 +34,7 @@ using System.Drawing;
 using System.Text.RegularExpressions;
 using static System.Net.Mime.MediaTypeNames;
 using Omnipotent.Services.KliveLLM;
+using Omnipotent.Services.KliveMultiTool;
 
 namespace Omnipotent
 {
@@ -77,6 +78,7 @@ namespace Omnipotent
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 }
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
 
                 testTask();
 
