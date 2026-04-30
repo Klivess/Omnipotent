@@ -351,7 +351,18 @@ namespace Omnipotent.Services.KliveMultiTool
                 description = f.Description,
                 requiredPermission = (int)f.RequiredPermission,
                 requiredPermissionName = f.RequiredPermission.ToString(),
-                parameters = f.Parameters
+                parameters = f.Parameters.Select(p => new
+                {
+                    name = p.Name,
+                    description = p.Description,
+                    type = p.Type.ToString(),
+                    required = p.Required,
+                    defaultValue = p.DefaultValue,
+                    options = p.Options,
+                    min = p.Min,
+                    max = p.Max,
+                    step = p.Step
+                })
             })
         };
 
