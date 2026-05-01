@@ -18,10 +18,10 @@ namespace Omnipotent.Services.OmniTumblr
 
         private class PendingOAuthFlow
         {
-            public string FlowId { get; set; }
-            public string ConsumerKey { get; set; }
-            public string ConsumerSecret { get; set; }
-            public Token RequestToken { get; set; }
+            public string? FlowId { get; set; }
+            public string? ConsumerKey { get; set; }
+            public string? ConsumerSecret { get; set; }
+            public Token? RequestToken { get; set; }
             public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         }
 
@@ -32,18 +32,18 @@ namespace Omnipotent.Services.OmniTumblr
 
         public IReadOnlyCollection<OmniTumblrAccount> GetAllAccounts() => accounts.Values.ToList().AsReadOnly();
 
-        public OmniTumblrAccount GetAccountById(string accountId)
+        public OmniTumblrAccount? GetAccountById(string accountId)
         {
             accounts.TryGetValue(accountId, out var account);
             return account;
         }
 
-        public OmniTumblrAccount GetAccountByBlogName(string blogName)
+        public OmniTumblrAccount? GetAccountByBlogName(string blogName)
         {
             return accounts.Values.FirstOrDefault(a => a.BlogName.Equals(blogName, StringComparison.OrdinalIgnoreCase));
         }
 
-        public TumblrClient GetApiInstance(string accountId)
+        public TumblrClient? GetApiInstance(string accountId)
         {
             apiInstances.TryGetValue(accountId, out var client);
             return client;
@@ -68,7 +68,7 @@ namespace Omnipotent.Services.OmniTumblr
 
         // ── Account CRUD ──
 
-        public async Task<OmniTumblrAccount> AddAccountAsync(string blogName, string consumerKey, string consumerSecret, string oauthToken, string oauthTokenSecret)
+        public async Task<OmniTumblrAccount> AddAccountAsync(string blogName, string consumerKey, string consumerSecret, string? oauthToken = null, string? oauthTokenSecret = null)
         {
             if (GetAccountByBlogName(blogName) != null)
                 throw new InvalidOperationException($"Account '{blogName}' already exists.");
@@ -134,43 +134,14 @@ namespace Omnipotent.Services.OmniTumblr
             }
         }
 
-        // ── OAuth PIN Flow ──
-
-        public async Task<(string flowId, string authorizeUrl)> BeginOAuthFlowAsync(string consumerKey, string consumerSecret)
-        {
-            var requestToken = await new TumblrClientFactory().GetRequestTokenAsync(consumerKey, consumerSecret, "oob");
-            var flowId = Guid.NewGuid().ToString("N");
-            pendingFlows[flowId] = new PendingOAuthFlow
-            {
-                FlowId = flowId,
-                ConsumerKey = consumerKey,
-                ConsumerSecret = consumerSecret,
-                RequestToken = requestToken
-            };
-            var authorizeUrl = $"https://www.tumblr.com/oauth/authorize?oauth_token={requestToken.Key}";
-            return (flowId, authorizeUrl);
-        }
-
-        public async Task<OmniTumblrAccount> CompleteOAuthFlowAsync(string flowId, string verifier, string blogName)
-        {
-            if (!pendingFlows.TryRemove(flowId, out var flow))
-                throw new InvalidOperationException("OAuth flow not found or already completed. Please start a new flow.");
-
-            if ((DateTime.UtcNow - flow.CreatedAt).TotalMinutes > 30)
-                throw new InvalidOperationException("OAuth flow has expired. Please start a new flow.");
-
-            var accessToken = await new TumblrClientFactory().GetAccessTokenAsync(
-                flow.ConsumerKey, flow.ConsumerSecret, flow.RequestToken, verifier);
-
-            return await AddAccountAsync(blogName, flow.ConsumerKey, flow.ConsumerSecret, accessToken.Key, accessToken.Secret);
-        }
-
         // ── Client Building ──
 
         private TumblrClient BuildTumblrClient(OmniTumblrAccount account)
         {
-            var token = new Token(account.OAuthToken, account.OAuthTokenSecret);
-            return new TumblrClientFactory().Create<TumblrClient>(account.ConsumerKey, account.ConsumerSecret, token);
+            Token? token = null;
+            if (!string.IsNullOrEmpty(account.OAuthToken) && !string.IsNullOrEmpty(account.OAuthTokenSecret))
+                token = new Token(account.OAuthToken, account.OAuthTokenSecret);
+            return new TumblrClientFactory().Create<TumblrClient>(account.ConsumerKey, account.ConsumerSecret, token!);
         }
 
         // ── Connection Validation ──
@@ -183,7 +154,7 @@ namespace Omnipotent.Services.OmniTumblr
                 if (blogInfo != null)
                 {
                     account.ConnectionStatus = OmniTumblrConnectionStatus.Connected;
-                    account.ConnectionErrorMessage = null;
+                    account.ConnectionErrorMessage = null!;
                     account.PostCount = blogInfo.PostsCount;
                     account.Title = blogInfo.Title;
                     account.Description = blogInfo.Description;
@@ -284,10 +255,10 @@ namespace Omnipotent.Services.OmniTumblr
             {
                 try
                 {
-                    if (string.IsNullOrEmpty(account.ConsumerKey) || string.IsNullOrEmpty(account.OAuthToken))
+                    if (string.IsNullOrEmpty(account.ConsumerKey))
                     {
                         account.ConnectionStatus = OmniTumblrConnectionStatus.Disconnected;
-                        account.ConnectionErrorMessage = "Missing OAuth credentials in settings.";
+                        account.ConnectionErrorMessage = "Missing Consumer Key in settings.";
                         await SaveAccountToDisk(account);
                         continue;
                     }
@@ -325,8 +296,10 @@ namespace Omnipotent.Services.OmniTumblr
             var settingsManager = await service.GetOmniGlobalSettingsManager();
             await settingsManager.SetStringOmniSetting($"OmniTumblr_ConsumerKey_{account.BlogName}", account.ConsumerKey);
             await settingsManager.SetStringOmniSetting($"OmniTumblr_ConsumerSecret_{account.BlogName}", account.ConsumerSecret);
-            await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthToken_{account.BlogName}", account.OAuthToken);
-            await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthTokenSecret_{account.BlogName}", account.OAuthTokenSecret);
+            if (account.OAuthToken != null)
+                await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthToken_{account.BlogName}", account.OAuthToken);
+            if (account.OAuthTokenSecret != null)
+                await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthTokenSecret_{account.BlogName}", account.OAuthTokenSecret);
         }
     }
 }

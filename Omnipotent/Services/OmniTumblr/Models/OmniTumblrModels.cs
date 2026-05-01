@@ -98,9 +98,9 @@ namespace Omnipotent.Services.OmniTumblr.Models
         [JsonIgnore]
         public string ConsumerSecret { get; set; }
         [JsonIgnore]
-        public string OAuthToken { get; set; }
+        public string? OAuthToken { get; set; }
         [JsonIgnore]
-        public string OAuthTokenSecret { get; set; }
+        public string? OAuthTokenSecret { get; set; }
 
         public bool IsActive { get; set; } = true;
         public bool IsPaused { get; set; }
