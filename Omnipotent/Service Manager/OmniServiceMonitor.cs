@@ -8,6 +8,9 @@ using Omnipotent.Services.KliveAPI;
 using Omnipotent.Data_Handling;
 using System.Diagnostics;
 using System.Text;
+using System.Collections.Concurrent;
+using System.Management.Automation;
+using System.Management.Automation.Runspaces;
 
 namespace Omnipotent.Service_Manager
 {
@@ -48,6 +51,7 @@ namespace Omnipotent.Service_Manager
         private sealed class CommandRecord
         {
             public string CommandId { get; set; } = Guid.NewGuid().ToString().Substring(0, 8);
+            public string SessionId { get; set; } = string.Empty;
             public string Command { get; set; } = string.Empty;
             public DateTime ExecutedAtUtc { get; set; }
             public DateTime? CompletedAtUtc { get; set; }
@@ -56,13 +60,45 @@ namespace Omnipotent.Service_Manager
             public int? ExitCode { get; set; }
             public string Status { get; set; } = "pending"; // pending, running, completed, error
             public string ExecutedByUser { get; set; } = string.Empty;
+            public string WorkingDirectory { get; set; } = string.Empty;
+        }
+
+        private sealed class TerminalSession : IDisposable
+        {
+            public string SessionId { get; init; } = Guid.NewGuid().ToString("N");
+            public string ExecutedByUser { get; init; } = string.Empty;
+            public DateTime CreatedAtUtc { get; init; } = DateTime.UtcNow;
+            public DateTime LastActivityUtc { get; set; } = DateTime.UtcNow;
+            public string CurrentPath { get; set; } = string.Empty;
+            public Runspace Runspace { get; init; } = null!;
+            public SemaphoreSlim ExecutionLock { get; } = new(1, 1);
+            public List<CommandRecord> History { get; } = new();
+
+            public void Dispose()
+            {
+                try
+                {
+                    Runspace.Dispose();
+                }
+                catch { }
+
+                ExecutionLock.Dispose();
+            }
+        }
+
+        private sealed class TerminalSessionRequest
+        {
+            public string? SessionId { get; set; }
+            public string? Command { get; set; }
         }
 
         private UptimePeriod currentUptimePeriod;
 
         private readonly List<CommandRecord> commandHistory = new();
+        private readonly ConcurrentDictionary<string, TerminalSession> terminalSessions = new();
         private readonly object historyLock = new();
         private const int MaxHistorySize = 1000;
+        private const int MaxSessionHistorySize = 250;
         private const int CommandTimeout = 60000; // 60 seconds
 
         public struct OmniMonitoredThread
@@ -308,10 +344,413 @@ namespace Omnipotent.Service_Manager
 
         private async Task SetupTerminalApiRoutesAsync()
         {
+            await CreateAPIRoute("/admin/terminal/session/open", HandleTerminalSessionOpen, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            await CreateAPIRoute("/admin/terminal/session/execute", HandleTerminalSessionExecute, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            await CreateAPIRoute("/admin/terminal/session/reset", HandleTerminalSessionReset, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            await CreateAPIRoute("/admin/terminal/session/close", HandleTerminalSessionClose, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
             await CreateAPIRoute("/admin/terminal/execute", HandleTerminalExecute, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
             await CreateAPIRoute("/admin/terminal/status", HandleTerminalStatus, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
             await CreateAPIRoute("/admin/terminal/history", HandleTerminalHistory, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
             await CreateAPIRoute("/admin/terminal/clear", HandleTerminalClear, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+        }
+
+        private static TerminalSessionRequest ParseTerminalSessionRequest(string requestBody)
+        {
+            if (string.IsNullOrWhiteSpace(requestBody))
+            {
+                return new TerminalSessionRequest();
+            }
+
+            try
+            {
+                return JsonConvert.DeserializeObject<TerminalSessionRequest>(requestBody) ?? new TerminalSessionRequest();
+            }
+            catch
+            {
+                return new TerminalSessionRequest();
+            }
+        }
+
+        private static string GetDefaultTerminalDirectory()
+        {
+            return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        }
+
+        private async Task<TerminalSession> CreateTerminalSessionAsync(string userName)
+        {
+            var runspace = RunspaceFactory.CreateRunspace(InitialSessionState.CreateDefault());
+            runspace.Open();
+
+            var session = new TerminalSession
+            {
+                SessionId = Guid.NewGuid().ToString("N"),
+                ExecutedByUser = userName,
+                Runspace = runspace,
+                CurrentPath = GetDefaultTerminalDirectory(),
+                CreatedAtUtc = DateTime.UtcNow,
+                LastActivityUtc = DateTime.UtcNow,
+            };
+
+            await SetRunspaceLocationAsync(session, session.CurrentPath);
+            terminalSessions[session.SessionId] = session;
+            return session;
+        }
+
+        private async Task SetRunspaceLocationAsync(TerminalSession session, string path)
+        {
+            using var ps = PowerShell.Create();
+            ps.Runspace = session.Runspace;
+            ps.AddCommand("Set-Location").AddParameter("LiteralPath", path);
+            await Task.Run(() => ps.Invoke());
+            session.CurrentPath = await GetRunspaceLocationAsync(session);
+        }
+
+        private async Task<string> GetRunspaceLocationAsync(TerminalSession session)
+        {
+            using var ps = PowerShell.Create();
+            ps.Runspace = session.Runspace;
+            ps.AddScript("(Get-Location).Path");
+            var result = await Task.Run(() => ps.Invoke());
+            return result.FirstOrDefault()?.ToString()?.Trim() ?? session.CurrentPath ?? GetDefaultTerminalDirectory();
+        }
+
+        private static void AppendPrefixedStream<TRecord>(StringBuilder builder, string prefix, IEnumerable<TRecord> records)
+        {
+            foreach (var record in records)
+            {
+                string text = record?.ToString()?.TrimEnd() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                if (builder.Length > 0 && builder[^1] != '\n')
+                {
+                    builder.AppendLine();
+                }
+
+                builder.AppendLine($"[{prefix}] {text}");
+            }
+        }
+
+        private static string BuildTerminalOutput(
+            ICollection<PSObject> results,
+            PSDataCollection<WarningRecord> warnings,
+            PSDataCollection<VerboseRecord> verbose,
+            PSDataCollection<DebugRecord> debug,
+            PSDataCollection<InformationRecord> information)
+        {
+            var builder = new StringBuilder();
+
+            foreach (var result in results)
+            {
+                string text = result?.ToString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                builder.Append(text);
+                if (!text.EndsWith(Environment.NewLine, StringComparison.Ordinal))
+                {
+                    builder.AppendLine();
+                }
+            }
+
+            AppendPrefixedStream(builder, "warning", warnings);
+            AppendPrefixedStream(builder, "verbose", verbose);
+            AppendPrefixedStream(builder, "debug", debug);
+
+            foreach (var info in information)
+            {
+                string text = info?.MessageData?.ToString()?.TrimEnd()
+                    ?? info?.ToString()?.TrimEnd()
+                    ?? string.Empty;
+
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    continue;
+                }
+
+                if (builder.Length > 0 && builder[^1] != '\n')
+                {
+                    builder.AppendLine();
+                }
+
+                builder.AppendLine(text);
+            }
+
+            return builder.ToString().TrimEnd();
+        }
+
+        private static string BuildTerminalError(PSDataCollection<ErrorRecord> errors)
+        {
+            return string.Join(Environment.NewLine, errors
+                .Select(error => error?.ToString()?.TrimEnd())
+                .Where(text => string.IsNullOrWhiteSpace(text) == false));
+        }
+
+        private void AddCommandToGlobalHistory(CommandRecord record)
+        {
+            lock (historyLock)
+            {
+                commandHistory.Add(record);
+                if (commandHistory.Count > MaxHistorySize)
+                {
+                    commandHistory.RemoveAt(0);
+                }
+            }
+        }
+
+        private static void AddCommandToSessionHistory(TerminalSession session, CommandRecord record)
+        {
+            lock (session.History)
+            {
+                session.History.Add(record);
+                if (session.History.Count > MaxSessionHistorySize)
+                {
+                    session.History.RemoveAt(0);
+                }
+            }
+        }
+
+        private async Task<CommandRecord> ExecuteTerminalSessionCommandAsync(TerminalSession session, string userName, string command)
+        {
+            var record = new CommandRecord
+            {
+                SessionId = session.SessionId,
+                Command = command,
+                ExecutedAtUtc = DateTime.UtcNow,
+                Status = "running",
+                ExecutedByUser = userName,
+                WorkingDirectory = session.CurrentPath
+            };
+
+            await session.ExecutionLock.WaitAsync();
+            try
+            {
+                session.LastActivityUtc = DateTime.UtcNow;
+
+                using var ps = PowerShell.Create();
+                ps.Runspace = session.Runspace;
+                ps.AddScript(command);
+                ps.AddCommand("Out-String").AddParameter("Width", 4096);
+
+                var results = await Task.Run(() => ps.Invoke());
+                record.Output = BuildTerminalOutput(results, ps.Streams.Warning, ps.Streams.Verbose, ps.Streams.Debug, ps.Streams.Information);
+                record.Error = BuildTerminalError(ps.Streams.Error);
+                record.ExitCode = ps.HadErrors ? 1 : 0;
+                record.Status = ps.HadErrors ? "error" : "completed";
+                record.CompletedAtUtc = DateTime.UtcNow;
+
+                session.CurrentPath = await GetRunspaceLocationAsync(session);
+                record.WorkingDirectory = session.CurrentPath;
+                session.LastActivityUtc = DateTime.UtcNow;
+            }
+            catch (Exception ex)
+            {
+                record.Error = $"Execution error: {ex.Message}";
+                record.ExitCode = -1;
+                record.Status = "error";
+                record.CompletedAtUtc = DateTime.UtcNow;
+                await ServiceLogError(ex, $"Error executing terminal session command for {userName}");
+            }
+            finally
+            {
+                session.ExecutionLock.Release();
+            }
+
+            AddCommandToSessionHistory(session, record);
+            AddCommandToGlobalHistory(record);
+            return record;
+        }
+
+        private object BuildTerminalSessionResponse(TerminalSession session)
+        {
+            List<object> history;
+            lock (session.History)
+            {
+                history = session.History
+                    .OrderBy(record => record.ExecutedAtUtc)
+                    .Select(record => new
+                    {
+                        commandId = record.CommandId,
+                        sessionId = record.SessionId,
+                        command = record.Command,
+                        output = record.Output,
+                        error = record.Error,
+                        exitCode = record.ExitCode,
+                        status = record.Status,
+                        executedAt = record.ExecutedAtUtc,
+                        completedAt = record.CompletedAtUtc,
+                        workingDirectory = record.WorkingDirectory
+                    })
+                    .Cast<object>()
+                    .ToList();
+            }
+
+            return new
+            {
+                sessionId = session.SessionId,
+                createdAt = session.CreatedAtUtc,
+                lastActivityAt = session.LastActivityUtc,
+                currentPath = session.CurrentPath,
+                history,
+                welcomeMessage = $"Connected to Omnipotent PowerShell. Session state is preserved in {session.CurrentPath}."
+            };
+        }
+
+        private bool TryGetTerminalSessionForUser(string? sessionId, string userName, out TerminalSession? session)
+        {
+            session = null;
+            if (string.IsNullOrWhiteSpace(sessionId))
+            {
+                return false;
+            }
+
+            if (!terminalSessions.TryGetValue(sessionId, out var existingSession))
+            {
+                return false;
+            }
+
+            if (!string.Equals(existingSession.ExecutedByUser, userName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            session = existingSession;
+            return true;
+        }
+
+        private async Task HandleTerminalSessionOpen(UserRequest req)
+        {
+            try
+            {
+                string userName = req.user?.Name ?? "Unknown";
+                var payload = ParseTerminalSessionRequest(req.userMessageContent);
+                bool createdNewSession = false;
+
+                if (!TryGetTerminalSessionForUser(payload.SessionId, userName, out var session) || session == null)
+                {
+                    session = await CreateTerminalSessionAsync(userName);
+                    createdNewSession = true;
+                    await ServiceLog($"Terminal session created for {userName}: {session.SessionId}");
+                }
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    success = true,
+                    isNewSession = createdNewSession,
+                    session = BuildTerminalSessionResponse(session)
+                }));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error opening terminal session");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = false, error = "Failed to open terminal session", details = ex.Message }),
+                    code: HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private async Task HandleTerminalSessionExecute(UserRequest req)
+        {
+            try
+            {
+                string userName = req.user?.Name ?? "Unknown";
+                var payload = ParseTerminalSessionRequest(req.userMessageContent);
+                if (string.IsNullOrWhiteSpace(payload.Command))
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { success = false, error = "Command cannot be empty." }),
+                        code: HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                if (!TryGetTerminalSessionForUser(payload.SessionId, userName, out var session) || session == null)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { success = false, error = "Terminal session not found." }),
+                        code: HttpStatusCode.NotFound);
+                    return;
+                }
+
+                var record = await ExecuteTerminalSessionCommandAsync(session, userName, payload.Command.Trim());
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    success = true,
+                    sessionId = session.SessionId,
+                    commandId = record.CommandId,
+                    command = record.Command,
+                    output = record.Output,
+                    error = record.Error,
+                    exitCode = record.ExitCode,
+                    status = record.Status,
+                    executedAt = record.ExecutedAtUtc,
+                    completedAt = record.CompletedAtUtc,
+                    currentPath = session.CurrentPath,
+                }));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error executing terminal session command");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = false, error = "Failed to execute terminal command", details = ex.Message }),
+                    code: HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private async Task HandleTerminalSessionReset(UserRequest req)
+        {
+            try
+            {
+                string userName = req.user?.Name ?? "Unknown";
+                var payload = ParseTerminalSessionRequest(req.userMessageContent);
+
+                if (TryGetTerminalSessionForUser(payload.SessionId, userName, out var existingSession) && existingSession != null)
+                {
+                    terminalSessions.TryRemove(existingSession.SessionId, out _);
+                    existingSession.Dispose();
+                }
+
+                var newSession = await CreateTerminalSessionAsync(userName);
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    success = true,
+                    session = BuildTerminalSessionResponse(newSession)
+                }));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error resetting terminal session");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = false, error = "Failed to reset terminal session", details = ex.Message }),
+                    code: HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private async Task HandleTerminalSessionClose(UserRequest req)
+        {
+            try
+            {
+                string userName = req.user?.Name ?? "Unknown";
+                var payload = ParseTerminalSessionRequest(req.userMessageContent);
+
+                if (TryGetTerminalSessionForUser(payload.SessionId, userName, out var session) && session != null)
+                {
+                    terminalSessions.TryRemove(session.SessionId, out _);
+                    session.Dispose();
+                }
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true }));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error closing terminal session");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = false, error = "Failed to close terminal session", details = ex.Message }),
+                    code: HttpStatusCode.InternalServerError);
+            }
         }
 
         private async Task HandleTerminalExecute(UserRequest req)
@@ -432,6 +871,38 @@ namespace Omnipotent.Service_Manager
             try
             {
                 var limit = int.TryParse(req.userParameters["limit"], out var l) ? Math.Min(l, 100) : 50;
+                string sessionId = req.userParameters["sessionId"] ?? string.Empty;
+                string userName = req.user?.Name ?? "Unknown";
+
+                if (!string.IsNullOrWhiteSpace(sessionId)
+                    && TryGetTerminalSessionForUser(sessionId, userName, out var session)
+                    && session != null)
+                {
+                    List<object> sessionHistory;
+                    lock (session.History)
+                    {
+                        sessionHistory = session.History
+                            .OrderByDescending(c => c.ExecutedAtUtc)
+                            .Take(limit)
+                            .Select(c => new
+                            {
+                                commandId = c.CommandId,
+                                sessionId = c.SessionId,
+                                command = c.Command,
+                                status = c.Status,
+                                executedAt = c.ExecutedAtUtc,
+                                completedAt = c.CompletedAtUtc,
+                                executedBy = c.ExecutedByUser,
+                                workingDirectory = c.WorkingDirectory,
+                                outputPreview = c.Output.Length > 200 ? c.Output.Substring(0, 200) + "..." : c.Output
+                            })
+                            .Cast<object>()
+                            .ToList();
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(sessionHistory), "application/json");
+                    return;
+                }
 
                 List<object> history = new();
                 lock (historyLock)
@@ -442,11 +913,13 @@ namespace Omnipotent.Service_Manager
                         .Select(c => new
                         {
                             commandId = c.CommandId,
+                            sessionId = c.SessionId,
                             command = c.Command,
                             status = c.Status,
                             executedAt = c.ExecutedAtUtc,
                             completedAt = c.CompletedAtUtc,
                             executedBy = c.ExecutedByUser,
+                            workingDirectory = c.WorkingDirectory,
                             outputPreview = c.Output.Length > 200 ? c.Output.Substring(0, 200) + "..." : c.Output
                         })
                         .Cast<object>()
@@ -469,9 +942,27 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
+                var payload = ParseTerminalSessionRequest(req.userMessageContent);
+                string userName = req.user?.Name ?? "Unknown";
+
+                if (TryGetTerminalSessionForUser(payload.SessionId, userName, out var session) && session != null)
+                {
+                    lock (session.History)
+                    {
+                        session.History.Clear();
+                    }
+                }
+
                 lock (historyLock)
                 {
-                    commandHistory.Clear();
+                    if (string.IsNullOrWhiteSpace(payload.SessionId))
+                    {
+                        commandHistory.Clear();
+                    }
+                    else
+                    {
+                        commandHistory.RemoveAll(record => string.Equals(record.SessionId, payload.SessionId, StringComparison.OrdinalIgnoreCase));
+                    }
                 }
 
                 await ServiceLog($"Terminal history cleared by {req.user?.Name}");

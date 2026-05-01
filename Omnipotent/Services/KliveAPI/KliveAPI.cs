@@ -185,6 +185,7 @@ namespace Omnipotent.Services.KliveAPI
         public ConcurrentDictionary<string, WebSocketRouteInfo> WebSocketRouteLookup;
 
         private KMProfileManager profileManager;
+        private KliveApiStatisticsStore? apiStatistics;
 
         private CertificateInstaller certInstaller;
         public KliveAPI()
@@ -201,6 +202,8 @@ namespace Omnipotent.Services.KliveAPI
                 //await CheckForSSLCertificate();
 
                 ContinueListenLoop = true;
+                apiStatistics = new KliveApiStatisticsStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPIStatisticsFile));
+                await apiStatistics.InitializeAsync();
 
                 //Create API listener
                 ControllerLookup = new(StringComparer.OrdinalIgnoreCase);
@@ -258,6 +261,34 @@ namespace Omnipotent.Services.KliveAPI
                 string resp = JsonConvert.SerializeObject(copy);
                 await req.ReturnResponse(resp, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
+            await CreateRoute("/KliveAPI/Statistics", async (req) =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary() ?? new
+                {
+                    lifetime = new
+                    {
+                        totalRequests = 0,
+                        successfulRequests = 0,
+                        clientErrorRequests = 0,
+                        serverErrorRequests = 0,
+                        notFoundRequests = 0,
+                        unauthorizedRequests = 0,
+                        avgResponseMs = 0,
+                        maxResponseMs = 0,
+                        availabilityPct = 100,
+                        lastRequestAt = (DateTime?)null
+                    },
+                    historyWindow = new
+                    {
+                        firstDay = (string?)null,
+                        lastDay = (string?)null,
+                        totalDays = 0
+                    },
+                    dailyHistory = Array.Empty<object>(),
+                    topRoutes = Array.Empty<object>(),
+                    slowestRoutes = Array.Empty<object>()
+                }), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
         }
 
         private async void StartWatchdog()
@@ -486,11 +517,19 @@ namespace Omnipotent.Services.KliveAPI
 
         private async Task ProcessRequestAsync(HttpListenerContext context)
         {
+            Stopwatch requestStopwatch = Stopwatch.StartNew();
+            bool matchedRoute = false;
+            bool shouldRecordStatistics = true;
+            string statsRoute = context?.Request?.Url?.AbsolutePath ?? context?.Request?.RawUrl ?? "/";
+            string statsMethod = NormalizeMethod(context?.Request?.HttpMethod ?? string.Empty);
+
             try
             {
                 HttpListenerRequest req = context.Request;
                 string query = req.Url?.Query ?? string.Empty;
                 string route = NormalizeRoute(req.Url?.AbsolutePath ?? req.RawUrl);
+                statsRoute = route;
+                statsMethod = NormalizeMethod(req.HttpMethod);
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
                     ? new NameValueCollection()
                     : HttpUtility.ParseQueryString(query);
@@ -507,6 +546,7 @@ namespace Omnipotent.Services.KliveAPI
                 //HANDLE PREFLIGHT REQUESTS
                 if (NormalizeMethod(request.req.HttpMethod) == "OPTIONS")
                 {
+                    shouldRecordStatistics = false;
                     await request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
                     return;
                 }
@@ -514,6 +554,7 @@ namespace Omnipotent.Services.KliveAPI
                 // --- WebSocket upgrade handling ---
                 if (req.IsWebSocketRequest && WebSocketRouteLookup.TryGetValue(route, out WebSocketRouteInfo wsRouteData))
                 {
+                    shouldRecordStatistics = false;
                     if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
                     {
                         request.user = await ResolveRequestUserAsync(req);
@@ -535,6 +576,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
+                    matchedRoute = true;
                     if (NormalizeMethod(req.HttpMethod) != routeData.normalizedMethod)
                     {
                         await DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
@@ -613,6 +655,15 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 catch
                 {
+                }
+            }
+            finally
+            {
+                if (shouldRecordStatistics && apiStatistics != null)
+                {
+                    requestStopwatch.Stop();
+                    int statusCode = context?.Response?.StatusCode > 0 ? context.Response.StatusCode : (int)HttpStatusCode.InternalServerError;
+                    apiStatistics.RecordRequest(statsRoute, statsMethod, statusCode, requestStopwatch.Elapsed, matchedRoute);
                 }
             }
         }

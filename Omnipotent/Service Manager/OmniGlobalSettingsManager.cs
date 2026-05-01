@@ -45,6 +45,7 @@ namespace Omnipotent.Service_Manager
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> pendingFulfillmentPromptIds = new(StringComparer.OrdinalIgnoreCase);
         private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
+        private readonly TaskCompletionSource<bool> settingsLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public event EventHandler<OmniSettingsChangedEventArgs> OnSettingsChanged;
 
@@ -67,7 +68,13 @@ namespace Omnipotent.Service_Manager
             {
                 await ServiceLogError(ex, "Failed to start OmniGlobalSettingsManager");
             }
+            finally
+            {
+                settingsLoaded.TrySetResult(true);
+            }
         }
+
+        private Task EnsureSettingsLoadedAsync() => settingsLoaded.Task;
 
         private async Task LoadSavedSettings()
         {
@@ -151,6 +158,8 @@ namespace Omnipotent.Service_Manager
 
         private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName, IEnumerable<string>? dropdownOptions = null)
         {
+            await EnsureSettingsLoadedAsync();
+
             name = NormalizeSettingName(name);
             parentServiceId = NormalizeParentServiceId(parentServiceId);
             List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
@@ -399,6 +408,8 @@ namespace Omnipotent.Service_Manager
         // --- Setters ---
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null)
         {
+            await EnsureSettingsLoadedAsync();
+
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
             name = NormalizeSettingName(name);
 
@@ -512,6 +523,8 @@ namespace Omnipotent.Service_Manager
 
         public async Task<bool> DeleteOmniSetting(string name, string parentServiceId = null)
         {
+            await EnsureSettingsLoadedAsync();
+
             if (string.IsNullOrWhiteSpace(name))
             {
                 return false;

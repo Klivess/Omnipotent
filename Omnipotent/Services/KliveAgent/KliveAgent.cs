@@ -17,7 +17,7 @@ namespace Omnipotent.Services.KliveAgent
         public KliveAgentMemory Memory { get; private set; }
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
         public KliveAgentCapabilityRegistry Capabilities { get; private set; }
-        public KliveAgentStats Stats { get; private set; } = new();
+        public KliveAgentStats Stats { get; private set; } = null!;
 
         // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
         public KliveAgentCodebaseIndex CodebaseIndex { get; private set; }
@@ -60,6 +60,11 @@ namespace Omnipotent.Services.KliveAgent
 
                 // Ensure data directories exist
                 await EnsureDirectories();
+
+                Stats = new KliveAgentStats(Path.Combine(
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory),
+                    "KliveAgentStats.json"));
+                await Stats.InitializeAsync();
 
                 // Initialize subsystems
                 scriptEngine = new KliveAgentScriptEngine(this);
@@ -238,9 +243,14 @@ namespace Omnipotent.Services.KliveAgent
             return Capabilities.GetCapabilities(category);
         }
 
-        public Task<AgentCapabilityInvocationResult> ExecuteCapabilityAsync(AgentCapabilityInvocationRequest request, AgentCapabilityInvocationContext context)
+        public async Task<AgentCapabilityInvocationResult> ExecuteCapabilityAsync(AgentCapabilityInvocationRequest request, AgentCapabilityInvocationContext context)
         {
-            return Capabilities.ExecuteAsync(request, context);
+            var result = await Capabilities.ExecuteAsync(request, context);
+            Stats.RecordCapability(
+                request.Capability,
+                result.Success,
+                result.RequiresConfirmation && !result.Success);
+            return result;
         }
 
         // ── Persistence ──
