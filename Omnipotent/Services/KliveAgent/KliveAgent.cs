@@ -3,11 +3,17 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using System.Collections.Concurrent;
+using System.Net;
+using System.Threading;
 
 namespace Omnipotent.Services.KliveAgent
 {
     public class KliveAgent : OmniService
     {
+        private const int InitializationStateStarting = 0;
+        private const int InitializationStateReady = 1;
+        private const int InitializationStateFailed = 2;
+
         public KliveAgentMemory Memory { get; private set; }
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
         public KliveAgentCapabilityRegistry Capabilities { get; private set; }
@@ -21,6 +27,8 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentBrain brain;
         private KliveAgentScriptEngine scriptEngine;
         private readonly ConcurrentDictionary<string, AgentConversation> conversations = new();
+        private int initializationState = InitializationStateStarting;
+        private string initializationMessage = "KliveAgent is initializing.";
 
         // Discord DM handler delegate — set by KliveBotDiscord when agent is active
         public Func<string, string, Task<string>> DiscordDMHandler { get; private set; }
@@ -42,45 +50,81 @@ namespace Omnipotent.Services.KliveAgent
 
             await ServiceLog("[KliveAgent] Initializing...");
 
-            // Ensure data directories exist
-            await EnsureDirectories();
-
-            // Initialize subsystems
-            scriptEngine = new KliveAgentScriptEngine(this);
-            scriptEngine.Initialize();
-
-            Memory = new KliveAgentMemory(this);
-            await Memory.InitializeAsync();
-
-            BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
-            await BackgroundTasks.InitializeAsync();
-
-            Capabilities = new KliveAgentCapabilityRegistry(this);
-
-            // Initialize codebase intelligence (spec Ch. 3, 4, 7)
-            var codebaseRoot = ResolveCodebaseRoot();
-            var indexCacheDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory);
-            CodebaseIndex = new KliveAgentCodebaseIndex(codebaseRoot, indexCacheDir);
-            await CodebaseIndex.InitializeAsync();
-
-            SymbolGraph = new KliveAgentSymbolGraph(CodebaseIndex);
-            await SymbolGraph.BuildAsync();
-
-            RepoMap = new KliveAgentRepoMap(CodebaseIndex, SymbolGraph);
-
-            brain = new KliveAgentBrain(this, scriptEngine, Memory);
-
-            // Register API routes
             var routes = new KliveAgentRoutes(this);
             await routes.RegisterRoutes();
+            await ServiceLog("[KliveAgent] API routes registered.");
 
-            // Set up Discord DM handler
-            DiscordDMHandler = HandleDiscordDM;
+            try
+            {
+                initializationMessage = "KliveAgent is warming up internal subsystems.";
 
-            // Load persisted conversations
-            await LoadConversationsAsync();
+                // Ensure data directories exist
+                await EnsureDirectories();
 
-            await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
+                // Initialize subsystems
+                scriptEngine = new KliveAgentScriptEngine(this);
+                scriptEngine.Initialize();
+
+                Memory = new KliveAgentMemory(this);
+                await Memory.InitializeAsync();
+
+                BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
+                await BackgroundTasks.InitializeAsync();
+
+                Capabilities = new KliveAgentCapabilityRegistry(this);
+
+                // Initialize codebase intelligence (spec Ch. 3, 4, 7)
+                var codebaseRoot = ResolveCodebaseRoot();
+                var indexCacheDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory);
+                CodebaseIndex = new KliveAgentCodebaseIndex(codebaseRoot, indexCacheDir);
+                await CodebaseIndex.InitializeAsync();
+
+                SymbolGraph = new KliveAgentSymbolGraph(CodebaseIndex);
+                await SymbolGraph.BuildAsync();
+
+                RepoMap = new KliveAgentRepoMap(CodebaseIndex, SymbolGraph);
+
+                brain = new KliveAgentBrain(this, scriptEngine, Memory);
+
+                // Set up Discord DM handler
+                DiscordDMHandler = HandleDiscordDM;
+
+                // Load persisted conversations
+                await LoadConversationsAsync();
+
+                initializationMessage = "KliveAgent is ready.";
+                Interlocked.Exchange(ref initializationState, InitializationStateReady);
+
+                await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
+            }
+            catch (Exception ex)
+            {
+                initializationMessage = $"KliveAgent failed to initialize: {ex.Message}";
+                Interlocked.Exchange(ref initializationState, InitializationStateFailed);
+                await ServiceLogError(ex, "[KliveAgent] Initialization failed.");
+            }
+        }
+
+        public bool TryGetApiAvailability(out HttpStatusCode statusCode, out string message)
+        {
+            var currentState = Volatile.Read(ref initializationState);
+            if (currentState == InitializationStateReady)
+            {
+                statusCode = HttpStatusCode.OK;
+                message = string.Empty;
+                return true;
+            }
+
+            if (currentState == InitializationStateFailed)
+            {
+                statusCode = HttpStatusCode.ServiceUnavailable;
+                message = initializationMessage;
+                return false;
+            }
+
+            statusCode = HttpStatusCode.Accepted;
+            message = initializationMessage;
+            return false;
         }
 
         // ── Codebase Root Resolution ──
@@ -114,6 +158,16 @@ namespace Omnipotent.Services.KliveAgent
             string conversationId = null,
             string senderName = null)
         {
+            if (!TryGetApiAvailability(out _, out var availabilityMessage))
+            {
+                return new AgentChatResponse
+                {
+                    Success = false,
+                    Response = availabilityMessage,
+                    ErrorMessage = availabilityMessage
+                };
+            }
+
             var enabled = await GetBoolOmniSetting("KliveAgent_Enabled", defaultValue: true);
             if (!enabled)
             {

@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveAgent.Models;
 using System.Net;
 using System.Text;
@@ -27,11 +28,27 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterIndexRoutes();
         }
 
+        private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
+        {
+            await service.CreateAPIRoute(path, async (req) =>
+            {
+                if (!service.TryGetApiAvailability(out var statusCode, out var message))
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { success = false, error = message }),
+                        code: statusCode);
+                    return;
+                }
+
+                await handler(req);
+            }, method, permission);
+        }
+
         // ── Chat ──
 
         private async Task RegisterChatRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/chat", async (req) =>
+            await CreateRoute("/kliveagent/chat", async (req) =>
             {
                 try
                 {
@@ -63,7 +80,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterCapabilityRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/capabilities", async (req) =>
+            await CreateRoute("/kliveagent/capabilities", async (req) =>
             {
                 try
                 {
@@ -79,7 +96,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/capabilities/execute", async (req) =>
+            await CreateRoute("/kliveagent/capabilities/execute", async (req) =>
             {
                 try
                 {
@@ -123,7 +140,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterConversationRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/conversations", async (req) =>
+            await CreateRoute("/kliveagent/conversations", async (req) =>
             {
                 try
                 {
@@ -138,7 +155,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/conversations/get", async (req) =>
+            await CreateRoute("/kliveagent/conversations/get", async (req) =>
             {
                 try
                 {
@@ -175,7 +192,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterTaskRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/tasks", async (req) =>
+            await CreateRoute("/kliveagent/tasks", async (req) =>
             {
                 try
                 {
@@ -190,7 +207,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/tasks/cancel", async (req) =>
+            await CreateRoute("/kliveagent/tasks/cancel", async (req) =>
             {
                 try
                 {
@@ -220,7 +237,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterMemoryRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/memories", async (req) =>
+            await CreateRoute("/kliveagent/memories", async (req) =>
             {
                 try
                 {
@@ -238,7 +255,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/memories/add", async (req) =>
+            await CreateRoute("/kliveagent/memories/add", async (req) =>
             {
                 try
                 {
@@ -267,7 +284,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/memories/delete", async (req) =>
+            await CreateRoute("/kliveagent/memories/delete", async (req) =>
             {
                 try
                 {
@@ -292,7 +309,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await service.CreateAPIRoute("/kliveagent/shortcuts", async (req) =>
+            await CreateRoute("/kliveagent/shortcuts", async (req) =>
             {
                 try
                 {
@@ -312,7 +329,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterStatsRoutes()
         {
-            await service.CreateAPIRoute("/kliveagent/stats", async (req) =>
+            await CreateRoute("/kliveagent/stats", async (req) =>
             {
                 try
                 {
@@ -330,7 +347,7 @@ namespace Omnipotent.Services.KliveAgent
         private async Task RegisterIndexRoutes()
         {
             // POST /kliveagent/reindex — trigger a full codebase index rebuild
-            await service.CreateAPIRoute("/kliveagent/reindex", async (req) =>
+            await CreateRoute("/kliveagent/reindex", async (req) =>
             {
                 try
                 {

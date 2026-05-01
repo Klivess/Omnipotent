@@ -1,4 +1,5 @@
 ﻿using Newtonsoft.Json;
+using Omnipotent.Service_Manager;
 using System.Diagnostics;
 
 namespace Omnipotent.Klives_Management.General_Analytics
@@ -10,6 +11,79 @@ namespace Omnipotent.Klives_Management.General_Analytics
         {
             this.g = generalBotStatisticsService;
             CreateRoutes();
+        }
+
+        private static string GetRequestedServiceName(string requestBody)
+        {
+            if (string.IsNullOrWhiteSpace(requestBody))
+            {
+                return string.Empty;
+            }
+
+            try
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(requestBody);
+                return body?.serviceName?.ToString()?.Trim()
+                    ?? body?.ServiceName?.ToString()?.Trim()
+                    ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private async Task HandleServiceAction(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string actionName, Func<OmniService, Task<bool>> action)
+        {
+            try
+            {
+                string requestedServiceName = GetRequestedServiceName(req.userMessageContent);
+                if (string.IsNullOrWhiteSpace(requestedServiceName))
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = "A serviceName is required." }), code: System.Net.HttpStatusCode.BadRequest);
+                    return;
+                }
+
+                var service = g.GetServiceByName(requestedServiceName);
+                if (service == null)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = $"Service '{requestedServiceName}' was not found." }), code: System.Net.HttpStatusCode.NotFound);
+                    return;
+                }
+
+                string resolvedServiceName = service.GetName();
+                string actionDisplay = actionName.Equals("restart", StringComparison.OrdinalIgnoreCase) ? "Restart" : "Quit";
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    Success = true,
+                    Action = actionName,
+                    ServiceName = resolvedServiceName,
+                    Message = $"{actionDisplay} scheduled for {resolvedServiceName}."
+                }));
+
+                string requesterName = req.user?.Name ?? "Unknown User";
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await g.ServiceLog($"{requesterName} requested {actionName} for service {resolvedServiceName}.");
+                        bool succeeded = await action(service);
+                        if (!succeeded)
+                        {
+                            await g.ServiceLogError($"Failed to {actionName} service {resolvedServiceName}.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        await g.ServiceLogError(ex, $"Failed to {actionName} service {resolvedServiceName}.");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
+            }
         }
 
         public async void CreateRoutes()
@@ -73,6 +147,16 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+
+            await g.CreateAPIRoute("/GeneralBotStatistics/RestartService", async (req) =>
+            {
+                await HandleServiceAction(req, "restart", service => service.RestartService());
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+
+            await g.CreateAPIRoute("/GeneralBotStatistics/QuitService", async (req) =>
+            {
+                await HandleServiceAction(req, "quit", service => service.TerminateService());
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
 
             // Process / GC diagnostics
             await g.CreateAPIRoute("/GeneralBotStatistics/GetProcessStats", async (req) =>

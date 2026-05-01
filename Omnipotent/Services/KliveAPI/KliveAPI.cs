@@ -45,6 +45,7 @@ namespace Omnipotent.Services.KliveAPI
             public Func<UserRequest, Task> action;
             public KMProfileManager.KMPermissions authenticationLevelRequired;
             public HttpMethod method;
+            public string normalizedMethod;
 
             public List<TimeSpan> TimeTakenToProcess;
             public async Task InvokeAction(UserRequest request)
@@ -111,7 +112,7 @@ namespace Omnipotent.Services.KliveAPI
                     resp.ContentLength64 = buffer.Length;
                     resp.StatusCode = (int)code;
                     using Stream ros = resp.OutputStream;
-                    ros.Write(buffer, 0, buffer.Length);
+                    await ros.WriteAsync(buffer, 0, buffer.Length);
                 }
                 catch (Exception ex)
                 {
@@ -190,7 +191,8 @@ namespace Omnipotent.Services.KliveAPI
         {
             name = "KliveAPI";
             threadAnteriority = ThreadAnteriority.Critical;
-            ControllerLookup = new ConcurrentDictionary<string, RouteInfo>();
+            ControllerLookup = new ConcurrentDictionary<string, RouteInfo>(StringComparer.OrdinalIgnoreCase);
+            WebSocketRouteLookup = new ConcurrentDictionary<string, WebSocketRouteInfo>(StringComparer.OrdinalIgnoreCase);
         }
         protected override async void ServiceMain()
         {
@@ -201,8 +203,8 @@ namespace Omnipotent.Services.KliveAPI
                 ContinueListenLoop = true;
 
                 //Create API listener
-                ControllerLookup = new();
-                WebSocketRouteLookup = new();
+                ControllerLookup = new(StringComparer.OrdinalIgnoreCase);
+                WebSocketRouteLookup = new(StringComparer.OrdinalIgnoreCase);
 
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
@@ -361,16 +363,12 @@ namespace Omnipotent.Services.KliveAPI
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
         public async Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
-            //while (!listener.IsListening) { await Task.Delay(10); }
-            if (!route.StartsWith('/'))
-            {
-                //Add a / to the beginning of the route if it doesn't have one
-                route = "/" + route;
-            }
+            route = NormalizeRoute(route);
             RouteInfo routeInfo = new();
             routeInfo.action = handler;
             routeInfo.authenticationLevelRequired = authenticationLevelRequired;
             routeInfo.method = method;
+            routeInfo.normalizedMethod = NormalizeMethod(method.Method);
             if (ControllerLookup.TryAdd(route, routeInfo))
             {
                 ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
@@ -379,10 +377,7 @@ namespace Omnipotent.Services.KliveAPI
 
         public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
-            if (!route.StartsWith('/'))
-            {
-                route = "/" + route;
-            }
+            route = NormalizeRoute(route);
             var info = new WebSocketRouteInfo
             {
                 handler = handler,
@@ -394,6 +389,81 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        private static string NormalizeRoute(string route)
+        {
+            if (string.IsNullOrWhiteSpace(route))
+            {
+                return "/";
+            }
+
+            int queryStart = route.IndexOf('?');
+            if (queryStart >= 0)
+            {
+                route = route[..queryStart];
+            }
+
+            route = route.Trim();
+            if (!route.StartsWith('/'))
+            {
+                route = "/" + route;
+            }
+
+            if (route.Length > 1)
+            {
+                route = route.TrimEnd('/');
+            }
+
+            return route;
+        }
+
+        private static string NormalizeMethod(string method)
+        {
+            return (method ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private static bool CanRequestCarryBody(string method)
+        {
+            var normalizedMethod = NormalizeMethod(method);
+            return normalizedMethod == "POST" || normalizedMethod == "PUT" || normalizedMethod == "PATCH";
+        }
+
+        private static bool ShouldResolveUser(HttpListenerRequest req, KMPermissions requiredPermission)
+        {
+            return requiredPermission != KMPermissions.Anybody || !string.IsNullOrWhiteSpace(req.Headers["Authorization"]);
+        }
+
+        private async Task<KMProfileManager.KMProfile?> ResolveRequestUserAsync(HttpListenerRequest req)
+        {
+            string password = req.Headers["Authorization"];
+            if (string.IsNullOrWhiteSpace(password) || profileManager == null)
+            {
+                return null;
+            }
+
+            return await profileManager.GetProfileByPassword(password);
+        }
+
+        private async Task<(byte[] BodyBytes, string BodyText)> ReadRequestBodyAsync(HttpListenerRequest req)
+        {
+            if (!req.HasEntityBody || !CanRequestCarryBody(req.HttpMethod))
+            {
+                return (Array.Empty<byte>(), string.Empty);
+            }
+
+            int bodyCapacity = req.ContentLength64 > 0 && req.ContentLength64 <= int.MaxValue
+                ? (int)req.ContentLength64
+                : 0;
+
+            using MemoryStream bodyStream = bodyCapacity > 0 ? new MemoryStream(bodyCapacity) : new MemoryStream();
+            await req.InputStream.CopyToAsync(bodyStream);
+            byte[] bodyBytes = bodyStream.ToArray();
+            string bodyText = bodyBytes.Length == 0
+                ? string.Empty
+                : Encoding.UTF8.GetString(bodyBytes);
+
+            return (bodyBytes, bodyText);
+        }
+
         private async void ServerListenLoop()
         {
             while (ContinueListenLoop)
@@ -401,7 +471,7 @@ namespace Omnipotent.Services.KliveAPI
                 try
                 {
                     HttpListenerContext context = await listener.GetContextAsync();
-                    _ = Task.Run(() => ProcessRequestAsync(context));
+                    _ = ProcessRequestAsync(context);
                 }
                 catch (Exception ioe)
                 {
@@ -419,67 +489,40 @@ namespace Omnipotent.Services.KliveAPI
             try
             {
                 HttpListenerRequest req = context.Request;
-                string route = req.RawUrl;
-                string query = req.Url.Query;
-                NameValueCollection nameValueCollection = HttpUtility.ParseQueryString(query);
+                string query = req.Url?.Query ?? string.Empty;
+                string route = NormalizeRoute(req.Url?.AbsolutePath ?? req.RawUrl);
+                NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
+                    ? new NameValueCollection()
+                    : HttpUtility.ParseQueryString(query);
                 UserRequest request = new();
                 request.req = req;
                 request.route = route;
                 request.context = context;
                 request.ParentService = this;
-
-                // Only read body for methods that carry a payload
-                if (req.HttpMethod == "POST" || req.HttpMethod == "PUT" || req.HttpMethod == "PATCH")
-                {
-                    using (MemoryStream bodyStream = new MemoryStream())
-                    {
-                        await req.InputStream.CopyToAsync(bodyStream);
-                        request.userMessageBytes = bodyStream.ToArray();
-                    }
-                    request.userMessageContent = Encoding.UTF8.GetString(request.userMessageBytes);
-                }
-                else
-                {
-                    request.userMessageBytes = Array.Empty<byte>();
-                    request.userMessageContent = string.Empty;
-                }
-
                 request.userParameters = nameValueCollection;
                 request.user = null;
+                request.userMessageBytes = Array.Empty<byte>();
+                request.userMessageContent = string.Empty;
 
                 //HANDLE PREFLIGHT REQUESTS
-                if (request.req.HttpMethod == "OPTIONS")
+                if (NormalizeMethod(request.req.HttpMethod) == "OPTIONS")
                 {
                     await request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
                     return;
                 }
 
-
-                if (!string.IsNullOrEmpty(query))
-                {
-                    route = route.Replace(query, "");
-                }
-                if (req.Headers.AllKeys.Contains("Authorization"))
-                {
-                    string password = req.Headers.Get("Authorization");
-                    if (profileManager != null && profileManager.CheckIfProfileExists(password))
-                    {
-                        request.user = await profileManager.GetProfileByPassword(password);
-                    }
-                    else
-                    {
-                        request.user = null;
-                    }
-                }
-
                 // --- WebSocket upgrade handling ---
                 if (req.IsWebSocketRequest && WebSocketRouteLookup.TryGetValue(route, out WebSocketRouteInfo wsRouteData))
                 {
+                    if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
+                    {
+                        request.user = await ResolveRequestUserAsync(req);
+                    }
+
                     if (wsRouteData.authenticationLevelRequired == KMPermissions.Anybody
                         || (request.user != null && request.user.KlivesManagementRank >= wsRouteData.authenticationLevelRequired))
                     {
                         var wsContext = await context.AcceptWebSocketAsync(subProtocol: null);
-                        ServiceLog($"WebSocket accepted for route {route}");
                         await wsRouteData.handler(context, wsContext.WebSocket, nameValueCollection, request.user);
                     }
                     else
@@ -492,62 +535,55 @@ namespace Omnipotent.Services.KliveAPI
 
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
+                    if (NormalizeMethod(req.HttpMethod) != routeData.normalizedMethod)
+                    {
+                        await DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
+                        return;
+                    }
+
+                    if (ShouldResolveUser(req, routeData.authenticationLevelRequired))
+                    {
+                        request.user = await ResolveRequestUserAsync(req);
+                    }
+
+                    if (CanRequestCarryBody(req.HttpMethod))
+                    {
+                        (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req);
+                    }
+
                     bool isUserNull = request.user == null;
                     if (isUserNull != true)
                     {
                         if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                         {
-                            ServiceLog($"Route {route} has been requested by a user that can't login.");
-                            DenyRequest(request, DeniedRequestReason.ProfileDisabled);
+                            await DenyRequest(request, DeniedRequestReason.ProfileDisabled);
                             return;
                         }
-                        else
+
+                        if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                         {
-                            if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
-                            {
-                                ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
-                                DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
-                            }
-                            else
-                            {
-                                if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
-                                {
-                                    //ServiceLog($"Unauthenticated route {route} has been requested.");
-                                    await routeData.InvokeAction(request);
-                                }
-                                else
-                                {
-                                    if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
-                                    {
-                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}.");
-                                        await routeData.InvokeAction(request);
-                                    }
-                                    else
-                                    {
-                                        ServiceLog($"{request.user.Name} requested an authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()}, but requester doesn't have permission.");
-                                        DenyRequest(request, DeniedRequestReason.TooLowClearance);
-                                    }
-                                }
-                            }
+                            await routeData.InvokeAction(request);
+                            return;
                         }
+
+                        if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
+                        {
+                            await routeData.InvokeAction(request);
+                            return;
+                        }
+
+                        _ = ServiceLog($"{request.user.Name} requested route {route} without sufficient permission.");
+                        await DenyRequest(request, DeniedRequestReason.TooLowClearance);
                     }
                     else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
                     {
-                        if (req.HttpMethod.Trim().ToLower() != routeData.method.Method.Trim().ToLower())
-                        {
-                            ServiceLog($"Route {route} has been requested with an incorrect HTTP method.");
-                            DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
-                        }
-                        else
-                        {
-                            await routeData.InvokeAction(request);
-                        }
+                        await routeData.InvokeAction(request);
                     }
                     else
                     {
-                        ServiceLog($"Authenticated route {route} with permission level {routeData.authenticationLevelRequired.ToString()} has been requested, but requester doesn't have an account. Scary!!");
-                        ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"An unauthenticated request was made to route {route} which requires permission level {routeData.authenticationLevelRequired.ToString()}. This means someone is trying to access a protected route without providing valid credentials. Be on the lookout for suspicious activity!").Wait();
-                        DenyRequest(request, DeniedRequestReason.NoProfile);
+                        _ = ServiceLog($"Authenticated route {route} was requested without valid credentials.");
+                        _ = ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"An unauthenticated request was made to route {route} which requires permission level {routeData.authenticationLevelRequired.ToString()}. This means someone is trying to access a protected route without providing valid credentials. Be on the lookout for suspicious activity!");
+                        await DenyRequest(request, DeniedRequestReason.NoProfile);
                     }
                 }
                 else
@@ -588,7 +624,7 @@ namespace Omnipotent.Services.KliveAPI
             IncorrectHTTPMethod = 3,
             ProfileDisabled = 4
         }
-        private async void DenyRequest(UserRequest request, DeniedRequestReason reason)
+        private async Task DenyRequest(UserRequest request, DeniedRequestReason reason)
         {
             NameValueCollection headers = new();
             headers.Add("RequestDeniedReason", reason.ToString());
