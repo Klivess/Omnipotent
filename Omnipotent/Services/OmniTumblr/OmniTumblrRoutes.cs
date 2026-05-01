@@ -109,7 +109,7 @@ namespace Omnipotent.Services.OmniTumblr
                         $"<p>Please close this tab and try again from the dashboard.</p></body></html>",
                         contentType: "text/html", code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, KMPermissions.Anybody);
 
             // GET /omnitumblr/oauth/callback-url — returns the configured OAuth callback URL
             await service.CreateAPIRoute("/omnitumblr/oauth/callback-url", async (req) =>
