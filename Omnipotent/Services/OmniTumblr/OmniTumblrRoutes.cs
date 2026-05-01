@@ -82,6 +82,7 @@ namespace Omnipotent.Services.OmniTumblr
                 {
                     var requestToken = req.userParameters.Get("oauth_token");
                     var verifier     = req.userParameters.Get("oauth_verifier");
+                    var callbackQuery = req.req.Url.Query;
 
                     if (string.IsNullOrWhiteSpace(requestToken) || string.IsNullOrWhiteSpace(verifier))
                     {
@@ -91,7 +92,7 @@ namespace Omnipotent.Services.OmniTumblr
                         return;
                     }
 
-                    var account = await service.AccountManager.CompleteOAuthCallbackAsync(requestToken, verifier);
+                    var account = await service.AccountManager.CompleteOAuthCallbackAsync(requestToken, callbackQuery);
 
                     await req.ReturnResponse(
                         $"<html><body style='font-family:sans-serif;background:#111;color:#e0e0e0;padding:40px;text-align:center'>" +

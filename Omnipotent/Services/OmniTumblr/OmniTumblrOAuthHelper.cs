@@ -1,4 +1,5 @@
 using DontPanic.TumblrSharp.OAuth;
+using System.Text;
 
 namespace Omnipotent.Services.OmniTumblr
 {
@@ -34,16 +35,26 @@ namespace Omnipotent.Services.OmniTumblr
         /// <summary>Exchanges the temporary request token + verifier PIN for a permanent access token pair.</summary>
         public static async Task<(string AccessToken, string AccessTokenSecret)> GetAccessTokenAsync(
             string consumerKey, string consumerSecret,
+            Token requestToken,
+            string verifierUrl)
+        {
+            var oauthClient = new OAuthClientFactory().Create(consumerKey, consumerSecret);
+            var accessToken = await oauthClient.GetAccessTokenAsync(requestToken, verifierUrl);
+            return (accessToken.Key, accessToken.Secret);
+        }
+
+        /// <summary>Exchanges the temporary request token + verifier PIN for a permanent access token pair.</summary>
+        public static async Task<(string AccessToken, string AccessTokenSecret)> GetAccessTokenAsync(
+            string consumerKey, string consumerSecret,
             string requestToken, string requestTokenSecret,
             string verifier)
         {
-            var oauthClient = new OAuthClientFactory().Create(consumerKey, consumerSecret);
-            var accessToken = await oauthClient.GetAccessTokenAsync(
+            var verifierUrl = $"oauth_token={Uri.EscapeDataString(requestToken)}&oauth_verifier={Uri.EscapeDataString(verifier.Trim())}";
+            return await GetAccessTokenAsync(
+                consumerKey,
+                consumerSecret,
                 new Token(requestToken, requestTokenSecret),
-                requestToken,
-                verifier.Trim());
-
-            return (accessToken.Key, accessToken.Secret);
+                verifierUrl);
         }
     }
 }

@@ -115,24 +115,35 @@ namespace Omnipotent.Services.OmniTumblr
         /// Called by the GET /omnitumblr/oauth/callback route when Tumblr redirects back.
         /// Looks up the pending flow by request token, exchanges for access tokens, and creates the account.
         /// </summary>
-        public async Task<OmniTumblrAccount> CompleteOAuthCallbackAsync(string requestToken, string verifier)
+        public async Task<OmniTumblrAccount> CompleteOAuthCallbackAsync(string requestToken, string callbackQuery)
         {
-            if (!requestTokenIndex.TryRemove(requestToken, out var flowId))
+            if (!requestTokenIndex.TryGetValue(requestToken, out var flowId))
                 throw new InvalidOperationException("No pending OAuth flow found for the returned request token. It may have expired.");
 
-            if (!pendingFlows.TryRemove(flowId, out var flow))
+            if (!pendingFlows.TryGetValue(flowId, out var flow))
                 throw new InvalidOperationException("OAuth flow expired before the callback was received.");
 
-            var (accessToken, accessTokenSecret) = await OmniTumblrOAuthHelper.GetAccessTokenAsync(
-                flow.ConsumerKey!, flow.ConsumerSecret!,
-                flow.RequestToken!.Key, flow.RequestToken.Secret,
-                verifier);
+            try
+            {
+                var (accessToken, accessTokenSecret) = await OmniTumblrOAuthHelper.GetAccessTokenAsync(
+                    flow.ConsumerKey!, flow.ConsumerSecret!,
+                    flow.RequestToken!,
+                    callbackQuery);
 
-            await service.ServiceLog($"[OmniTumblr] OAuth callback received for flow {flowId}, blog '{flow.BlogName}'.");
+                requestTokenIndex.TryRemove(requestToken, out _);
+                pendingFlows.TryRemove(flowId, out _);
 
-            var account = await AddAccountAsync(flow.BlogName!, flow.ConsumerKey!, flow.ConsumerSecret!, accessToken, accessTokenSecret);
-            completedCallbackFlows[flowId] = account;
-            return account;
+                await service.ServiceLog($"[OmniTumblr] OAuth callback received for flow {flowId}, blog '{flow.BlogName}'.");
+
+                var account = await AddAccountAsync(flow.BlogName!, flow.ConsumerKey!, flow.ConsumerSecret!, accessToken, accessTokenSecret);
+                completedCallbackFlows[flowId] = account;
+                return account;
+            }
+            catch (Exception ex)
+            {
+                await service.ServiceLog($"[OmniTumblr] OAuth access-token exchange failed for flow {flowId}. CallbackQueryLength={callbackQuery?.Length ?? 0}, RequestTokenMatches={string.Equals(flow.RequestToken?.Key, requestToken, StringComparison.Ordinal)}, Error={ex.Message}");
+                throw;
+            }
         }
 
         /// <summary>
