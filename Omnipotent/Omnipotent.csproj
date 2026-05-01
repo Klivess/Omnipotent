@@ -28,7 +28,8 @@
 		<PackageReference Include="FFMpegCore" Version="5.4.0" />
 		<PackageReference Include="HevySharp" Version="1.0.6" />
 		<PackageReference Include="Humanizer.Core" Version="3.0.10" />
-		<PackageReference Include="InstagramApiSharp" Version="1.8.1" />		<PackageReference Include="KrakenExchange.Net" Version="7.9.0" />
+		<PackageReference Include="InstagramApiSharp" Version="1.8.1" />
+		<PackageReference Include="NewTumblrSharp" Version="1.2.1.160" />		<PackageReference Include="KrakenExchange.Net" Version="7.9.0" />
 		<PackageReference Include="LangChain" Version="0.17.1-dev.94" />
 		<PackageReference Include="LangChain.Providers.HuggingFace" Version="0.17.1-dev.65" />
 		<PackageReference Include="LLamaSharp" Version="0.26.0" />

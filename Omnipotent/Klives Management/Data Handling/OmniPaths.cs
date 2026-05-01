@@ -123,7 +123,9 @@ namespace Omnipotent.Data_Handling
             public static string OmniTumblrAccountsDirectory = $"{OmniTumblrDirectory}/Accounts";
             public static string OmniTumblrPostsDirectory = $"{OmniTumblrDirectory}/Posts";
             public static string OmniTumblrCampaignsDirectory = $"{OmniTumblrDirectory}/Campaigns";
+            public static string OmniTumblrMediaDirectory = $"{OmniTumblrDirectory}/Media";
             public static string OmniTumblrUploadsDirectory = $"{OmniTumblrDirectory}/Uploads";
+            public static string OmniTumblrAnalyticsDirectory = $"{OmniTumblrDirectory}/Analytics";
             public static string OmniTumblrLogsDirectory = $"{OmniTumblrDirectory}/Logs";
             public static string OmniTumblrEventsDirectory = $"{OmniTumblrLogsDirectory}/Events";
 

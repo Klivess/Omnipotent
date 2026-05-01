@@ -114,6 +114,17 @@ namespace Omnipotent.Services.KliveAgent
             string conversationId = null,
             string senderName = null)
         {
+            var enabled = await GetBoolOmniSetting("KliveAgent_Enabled", defaultValue: true);
+            if (!enabled)
+            {
+                return new AgentChatResponse
+                {
+                    Success = false,
+                    Response = "KliveAgent is currently disabled.",
+                    ErrorMessage = "KliveAgent is disabled via OmniSettings."
+                };
+            }
+
             // Get or create conversation
             if (string.IsNullOrEmpty(conversationId))
             {
