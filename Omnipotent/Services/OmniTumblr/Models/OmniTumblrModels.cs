@@ -28,7 +28,8 @@ namespace Omnipotent.Services.OmniTumblr.Models
     public enum OmniTumblrContentSource
     {
         ManualUpload,
-        ContentFolder
+        ContentFolder,
+        MemeScraper
     }
 
     [JsonConverter(typeof(StringEnumConverter))]
@@ -84,6 +85,10 @@ namespace Omnipotent.Services.OmniTumblr.Models
 
         // Content folder tracking
         public List<string> UsedContentPaths { get; set; } = new();
+
+        // MemeScraper-specific
+        public string MemeScraperNicheFilter { get; set; } = "";
+        public bool UseAICaptionsForMemeScraper { get; set; }
     }
 
     // ── Account ──

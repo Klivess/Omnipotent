@@ -20,6 +20,7 @@ namespace Omnipotent.Services.OmniTumblr
         {
             await RegisterDashboardRoutes();
             await RegisterAccountRoutes();
+            await RegisterProfileRoutes();
             await RegisterContentConfigRoutes();
             await RegisterPostRoutes();
             await RegisterAnalyticsRoutes();
@@ -291,6 +292,111 @@ namespace Omnipotent.Services.OmniTumblr
             }, HttpMethod.Post, KMPermissions.Admin);
         }
 
+        // ── Profile ──
+
+        private async Task RegisterProfileRoutes()
+        {
+            // GET /omnitumblr/accounts/profile
+            await service.CreateAPIRoute("/omnitumblr/accounts/profile", async (req) =>
+            {
+                try
+                {
+                    var accountId = req.userParameters.Get("accountId");
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    // Attempt live refresh from Tumblr
+                    var client = service.AccountManager.GetApiInstance(accountId);
+                    bool isLive = false;
+                    if (client != null)
+                    {
+                        try
+                        {
+                            await service.AccountManager.ValidateConnection(client, account);
+                            await service.AccountManager.SaveAccountToDisk(account);
+                            isLive = true;
+                        }
+                        catch { /* use cached data */ }
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        account.AccountId,
+                        account.BlogName,
+                        account.Title,
+                        account.Description,
+                        account.AvatarUrl,
+                        account.Url,
+                        account.FollowerCount,
+                        account.PostCount,
+                        account.LikesCount,
+                        account.Notes,
+                        IsLive = isLive,
+                        ConnectionStatus = account.ConnectionStatus.ToString()
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // POST /omnitumblr/accounts/profile/edit
+            // Note: TumblrSharp does not expose a blog-info update method.
+            // Title and Description are stored locally. Notes are persisted to OmniTumblr data.
+            await service.CreateAPIRoute("/omnitumblr/accounts/profile/edit", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string accountId = body.accountId;
+                    if (string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    string title = body.title;
+                    string description = body.description;
+                    string notes = body.notes;
+
+                    if (title != null) account.Title = title;
+                    if (description != null) account.Description = description;
+                    if (notes != null) account.Notes = notes;
+
+                    await service.AccountManager.SaveAccountToDisk(account);
+                    await service.AnalyticsTracker.LogEvent(accountId, "ProfileEdited", $"Profile info updated locally for '{account.BlogName}'.");
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        success = true,
+                        note = "Title and description are stored locally. To update the live Tumblr blog profile, use the Tumblr dashboard directly."
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+        }
+
         // ── Content Config ──
 
         private async Task RegisterContentConfigRoutes()
@@ -495,13 +601,144 @@ namespace Omnipotent.Services.OmniTumblr
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
 
+            // POST /omnitumblr/posts/publish-now
+            await service.CreateAPIRoute("/omnitumblr/posts/publish-now", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string accountId = body.accountId;
+                    var account = service.AccountManager.GetAccountById(accountId);
+                    if (account == null) { await req.ReturnResponse("Account not found.", code: HttpStatusCode.NotFound); return; }
+
+                    var post = new OmniTumblrPost
+                    {
+                        AccountId = accountId,
+                        PostType = Enum.TryParse<OmniTumblrPostType>((string)body.postType, out var pt) ? pt : OmniTumblrPostType.Photo,
+                        Caption = body.caption ?? "",
+                        Title = body.title ?? "",
+                        SourceUrl = body.sourceUrl ?? "",
+                        QuoteSource = body.quoteSource ?? "",
+                        Tags = body.tags != null ? JsonConvert.DeserializeObject<List<string>>(body.tags.ToString()) : new List<string>(),
+                        ScheduledTime = DateTime.UtcNow,
+                        SourceType = OmniTumblrContentSource.ManualUpload,
+                        MediaPaths = body.mediaPaths != null ? JsonConvert.DeserializeObject<List<string>>(body.mediaPaths.ToString()) : new List<string>()
+                    };
+
+                    var scheduled = await service.PostScheduler.SchedulePostAsync(post);
+                    await service.AnalyticsTracker.LogEvent(accountId, "PostPublishNow", $"{post.PostType} post queued for immediate publish to '{account.BlogName}'.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { scheduled.PostId, Status = "Queued for immediate publish" }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
+            // POST /omnitumblr/posts/draft  — schedule to multiple accounts
+            await service.CreateAPIRoute("/omnitumblr/posts/draft", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    var accountIdsToken = body.accountIds;
+                    if (accountIdsToken == null)
+                    {
+                        await req.ReturnResponse("accountIds array is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var accountIds = JsonConvert.DeserializeObject<List<string>>(accountIdsToken.ToString());
+                    if (accountIds == null || accountIds.Count == 0)
+                    {
+                        await req.ReturnResponse("At least one accountId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var postType = Enum.TryParse<OmniTumblrPostType>((string)body.postType, out var pt) ? pt : OmniTumblrPostType.Photo;
+                    string caption = body.caption ?? "";
+                    string title = body.title ?? "";
+                    string scheduledTimeStr = body.scheduledTime;
+                    var scheduledTime = DateTime.TryParse(scheduledTimeStr, out var st) ? st : DateTime.UtcNow.AddMinutes(5);
+                    var tags = body.tags != null ? JsonConvert.DeserializeObject<List<string>>(body.tags.ToString()) : new List<string>();
+                    var mediaPaths = body.mediaPaths != null ? JsonConvert.DeserializeObject<List<string>>(body.mediaPaths.ToString()) : new List<string>();
+
+                    var results = new List<object>();
+                    foreach (var accountId in accountIds)
+                    {
+                        var account = service.AccountManager.GetAccountById(accountId);
+                        if (account == null) { results.Add(new { accountId, success = false, error = "Account not found" }); continue; }
+
+                        var post = new OmniTumblrPost
+                        {
+                            AccountId = accountId,
+                            PostType = postType,
+                            Caption = caption,
+                            Title = title,
+                            Tags = new List<string>(tags),
+                            ScheduledTime = scheduledTime,
+                            SourceType = OmniTumblrContentSource.ManualUpload,
+                            MediaPaths = new List<string>(mediaPaths)
+                        };
+
+                        var scheduled = await service.PostScheduler.SchedulePostAsync(post);
+                        await service.AnalyticsTracker.LogEvent(accountId, "DraftPostScheduled", $"Draft {postType} post scheduled for '{account.BlogName}' at {scheduledTime:g}.");
+                        results.Add(new { accountId, success = true, postId = scheduled.PostId, scheduledTime = scheduled.ScheduledTime });
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, results }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
+            // POST /omnitumblr/media/upload — raw bytes in body, fileName + accountId in query
+            await service.CreateAPIRoute("/omnitumblr/media/upload", async (req) =>
+            {
+                try
+                {
+                    var fileName = req.userParameters.Get("fileName");
+                    var accountId = req.userParameters.Get("accountId");
+
+                    if (string.IsNullOrWhiteSpace(fileName) || string.IsNullOrWhiteSpace(accountId))
+                    {
+                        await req.ReturnResponse("fileName and accountId are required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    byte[] fileData = req.userMessageBytes;
+                    if (fileData == null || fileData.Length == 0)
+                    {
+                        await req.ReturnResponse("No file data provided.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    if (fileData.Length > 100 * 1024 * 1024)
+                    {
+                        await req.ReturnResponse("File exceeds 100 MB limit.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var safeFileName = Path.GetFileName(fileName);
+                    var uploadPath = await service.MediaManager.StoreUploadedMediaFromBytes(fileData, safeFileName, accountId);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, filePath = uploadPath, fileName = Path.GetFileName(uploadPath) }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
             // POST /omnitumblr/posts/trigger-pull
             await service.CreateAPIRoute("/omnitumblr/posts/trigger-pull", async (req) =>
             {
                 try
                 {
+                    _ = service.PostScheduler.PullFromMemeScraperAsync();
                     _ = service.PostScheduler.PullFromContentFoldersAsync();
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = "Content pull triggered." }));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = "Content pull triggered (MemeScraper + Content Folders)." }));
                 }
                 catch (Exception ex)
                 {

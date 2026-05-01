@@ -12,6 +12,7 @@ namespace Omnipotent.Services.OmniTumblr
         private readonly OmniTumblr service;
         private readonly OmniTumblrAccountManager accountManager;
         private readonly ConcurrentDictionary<string, OmniTumblrPost> posts = new();
+        private readonly HashSet<string> postedSourceIds = new();
 
         public OmniTumblrPostScheduler(OmniTumblr service, OmniTumblrAccountManager accountManager)
         {
@@ -35,7 +36,14 @@ namespace Omnipotent.Services.OmniTumblr
         public async Task InitializeAsync()
         {
             await LoadPostsFromDisk();
+            LoadPostedSourceIds();
             await ScheduleQueuedPosts();
+        }
+
+        private void LoadPostedSourceIds()
+        {
+            foreach (var post in posts.Values.Where(p => p.SourceType == OmniTumblrContentSource.MemeScraper && !string.IsNullOrEmpty(p.SourceId)))
+                postedSourceIds.Add(post.SourceId);
         }
 
         private async Task LoadPostsFromDisk()
@@ -343,6 +351,83 @@ namespace Omnipotent.Services.OmniTumblr
                 $"Retry failed post to '{account.BlogName}'",
                 false,
                 post.PostId);
+        }
+
+        // ── MemeScraper Integration ──
+
+        public async Task PullFromMemeScraperAsync()
+        {
+            try
+            {
+                var memeScraperServices = await service.GetServicesByType<Omnipotent.Services.MemeScraper.MemeScraper>();
+                if (memeScraperServices == null || memeScraperServices.Length == 0) return;
+
+                var memeScraper = (Omnipotent.Services.MemeScraper.MemeScraper)memeScraperServices[0];
+                if (memeScraper.mediaManager?.allScrapedReels == null) return;
+
+                var eligibleAccounts = accountManager.GetAllAccounts()
+                    .Where(a => a.IsActive && !a.IsPaused
+                        && a.ConnectionStatus == OmniTumblrConnectionStatus.Connected
+                        && a.ContentConfig.ContentSource == OmniTumblrContentSource.MemeScraper)
+                    .ToList();
+
+                if (eligibleAccounts.Count == 0) return;
+
+                int newPosts = 0;
+                foreach (var account in eligibleAccounts)
+                {
+                    var config = account.ContentConfig;
+                    var nicheFilter = config.MemeScraperNicheFilter;
+
+                    var todayPosts = posts.Values.Count(p =>
+                        p.AccountId == account.AccountId
+                        && (p.Status == OmniTumblrPostStatus.Queued || p.Status == OmniTumblrPostStatus.Posted)
+                        && p.ScheduledTime.Date == DateTime.UtcNow.Date);
+                    var slotsRemaining = config.PostsPerDay - todayPosts;
+                    if (slotsRemaining <= 0) continue;
+
+                    var reels = memeScraper.mediaManager.allScrapedReels
+                        .Where(r => !postedSourceIds.Contains(r.PostID)
+                            && !string.IsNullOrEmpty(r.VideoDownloadURL)
+                            && File.Exists(r.InstagramReelVideoFilePath)
+                            && (string.IsNullOrEmpty(nicheFilter) || (r.Description != null && r.Description.Contains(nicheFilter, StringComparison.OrdinalIgnoreCase))))
+                        .Take(slotsRemaining);
+
+                    int slotIndex = 0;
+                    foreach (var reel in reels)
+                    {
+                        var scheduledTime = GetNextScheduledTime(account, slotIndex);
+                        var caption = config.UseAICaptionsForMemeScraper
+                            ? (reel.Description ?? "")
+                            : GenerateCaptionForAccount(config);
+                        var tags = SelectTagsForAccount(config);
+
+                        var post = new OmniTumblrPost
+                        {
+                            AccountId = account.AccountId,
+                            PostType = OmniTumblrPostType.Video,
+                            MediaPaths = new List<string> { reel.InstagramReelVideoFilePath },
+                            Caption = caption,
+                            Tags = tags,
+                            ScheduledTime = scheduledTime,
+                            SourceType = OmniTumblrContentSource.MemeScraper,
+                            SourceId = reel.PostID
+                        };
+
+                        await SchedulePostAsync(post);
+                        postedSourceIds.Add(reel.PostID);
+                        newPosts++;
+                        slotIndex++;
+                    }
+                }
+
+                if (newPosts > 0)
+                    await service.ServiceLog($"[OmniTumblr] Pulled {newPosts} reels from MemeScraper into post queue.");
+            }
+            catch (Exception ex)
+            {
+                await service.ServiceLogError(ex, "[OmniTumblr] Failed to pull from MemeScraper");
+            }
         }
 
         // ── Content Folder Integration ──
