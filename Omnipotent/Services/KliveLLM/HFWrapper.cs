@@ -19,6 +19,9 @@ namespace Omnipotent.Services.KliveLLM
             public string model;
             public bool stream;
 
+            [JsonProperty("max_tokens", NullValueHandling = NullValueHandling.Ignore)]
+            public int? max_tokens;
+
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {
                 List<HFMessage> hFMessages = new();

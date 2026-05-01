@@ -11,7 +11,8 @@ namespace Omnipotent.Service_Manager
     {
         String = 0,
         Bool = 1,
-        Int = 2
+        Int = 2,
+        Dropdown = 3,
     }
 
     public class OmniSetting
@@ -23,6 +24,7 @@ namespace Omnipotent.Service_Manager
         // Parent service information
         public string ParentServiceName { get; set; }
         public string ParentServiceId { get; set; }
+        public List<string> DropdownOptions { get; set; } = new();
     }
 
     public class OmniSettingsChangedEventArgs : EventArgs
@@ -80,6 +82,12 @@ namespace Omnipotent.Service_Manager
                         s.Name = NormalizeSettingName(s.Name);
                         if (string.IsNullOrEmpty(s.ParentServiceName)) s.ParentServiceName = "UnknownService";
                         s.ParentServiceId = NormalizeParentServiceId(s.ParentServiceId);
+                        s.DropdownOptions = NormalizeDropdownOptions(s.DropdownOptions);
+
+                        if (s.Type == OmniSettingType.Dropdown && s.DropdownOptions.Count > 0)
+                        {
+                            s.Value = NormalizeDropdownValue(s.Value, s.DropdownOptions);
+                        }
 
                         if (string.IsNullOrWhiteSpace(s.Name))
                         {
@@ -138,10 +146,22 @@ namespace Omnipotent.Service_Manager
             }
         }
 
-        private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName)
+        private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName, IEnumerable<string>? dropdownOptions = null)
         {
             name = NormalizeSettingName(name);
             parentServiceId = NormalizeParentServiceId(parentServiceId);
+            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
+
+            if (type == OmniSettingType.Dropdown)
+            {
+                if (normalizedDropdownOptions.Count == 0)
+                {
+                    throw new ArgumentException("Dropdown settings must provide at least one option.", nameof(dropdownOptions));
+                }
+
+                defaultValue = NormalizeDropdownValue(defaultValue, normalizedDropdownOptions);
+            }
+
             var key = ComposeKey(parentServiceId, name);
             bool isNewOrModified = false;
             bool isNewSetting = false;
@@ -168,13 +188,48 @@ namespace Omnipotent.Service_Manager
                     Sensitive = sensitive,
                     Value = defaultValue ?? string.Empty,
                     ParentServiceId = parentServiceId,
-                    ParentServiceName = parentServiceName
+                    ParentServiceName = parentServiceName,
+                    DropdownOptions = normalizedDropdownOptions,
                 };
                 
                 key = ComposeKey(setting.ParentServiceId, setting.Name);
                 settings[key] = setting;
                 isNewOrModified = true;
                 isNewSetting = true;
+            }
+
+            if (setting.Type != type)
+            {
+                setting.Type = type;
+                isNewOrModified = true;
+            }
+
+            if (setting.Sensitive != sensitive)
+            {
+                setting.Sensitive = sensitive;
+                isNewOrModified = true;
+            }
+
+            if (type == OmniSettingType.Dropdown)
+            {
+                if (DropdownOptionsMatch(setting.DropdownOptions, normalizedDropdownOptions) == false)
+                {
+                    setting.DropdownOptions = normalizedDropdownOptions;
+                    isNewOrModified = true;
+                }
+
+                string normalizedValue = NormalizeDropdownValue(setting.Value, normalizedDropdownOptions);
+                if (string.Equals(setting.Value, normalizedValue, StringComparison.Ordinal) == false)
+                {
+                    previousValue ??= setting.Value;
+                    setting.Value = normalizedValue;
+                    isNewOrModified = true;
+                }
+            }
+            else if (setting.DropdownOptions.Count > 0)
+            {
+                setting.DropdownOptions = new List<string>();
+                isNewOrModified = true;
             }
 
             if (string.IsNullOrEmpty(setting.Value))
@@ -309,11 +364,49 @@ namespace Omnipotent.Service_Manager
             }
         }
 
-        // --- Setters ---
-        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false)
+        public async Task<string> GetDropdownOmniSetting(string name, string defaultValue, IEnumerable<string> dropdownOptions, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
             name = NormalizeSettingName(name);
+
+            if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+            {
+                var callerInfo = GetCallingServiceInfo();
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? callerInfo.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
+            }
+
+            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
+
+            try
+            {
+                var setting = await GetOrCreateSettingAsync(name, OmniSettingType.Dropdown, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName, normalizedDropdownOptions);
+                return NormalizeDropdownValue(setting.Value, normalizedDropdownOptions);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "GetDropdownOmniSetting failed");
+                return NormalizeDropdownValue(defaultValue, normalizedDropdownOptions);
+            }
+        }
+
+        // --- Setters ---
+        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
+
+            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
+
+            if (type == OmniSettingType.Dropdown)
+            {
+                if (normalizedDropdownOptions.Count == 0)
+                {
+                    throw new ArgumentException("Dropdown settings must provide at least one option.", nameof(dropdownOptions));
+                }
+
+                value = NormalizeDropdownValue(value, normalizedDropdownOptions);
+            }
 
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
@@ -344,6 +437,9 @@ namespace Omnipotent.Service_Manager
                         isNewSetting = true;
                     }
                 }
+
+                s.Type = type;
+                s.DropdownOptions = type == OmniSettingType.Dropdown ? normalizedDropdownOptions : new List<string>();
 
                 var resolvedKey = ComposeKey(s.ParentServiceId, s.Name);
                 if (fulfilledViaApi && pendingFulfillmentPromptIds.TryGetValue(resolvedKey, out var trackingId))
@@ -383,6 +479,9 @@ namespace Omnipotent.Service_Manager
         public Task<bool> SetStringOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null) =>
             SetOmniSetting(name, value, parentServiceId, parentServiceName, OmniSettingType.String);
 
+        public Task<bool> SetDropdownOmniSetting(string name, string value, IEnumerable<string> dropdownOptions, string parentServiceId = null, string parentServiceName = null) =>
+            SetOmniSetting(name, value, parentServiceId, parentServiceName, OmniSettingType.Dropdown, dropdownOptions: dropdownOptions);
+
 
         // --- Utilities & Routes ---
         private (string serviceName, string serviceId) GetCallingServiceInfo()
@@ -403,6 +502,41 @@ namespace Omnipotent.Service_Manager
         private static string NormalizeSettingName(string name) => (name ?? string.Empty).Trim();
 
         private static string NormalizeParentServiceId(string parentServiceId) => string.IsNullOrWhiteSpace(parentServiceId) ? "0" : parentServiceId.Trim();
+
+        private static List<string> NormalizeDropdownOptions(IEnumerable<string>? dropdownOptions)
+        {
+            return (dropdownOptions ?? Enumerable.Empty<string>())
+                .Select(option => option?.Trim())
+                .Where(option => string.IsNullOrWhiteSpace(option) == false)
+                .Cast<string>()
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static bool DropdownOptionsMatch(IReadOnlyCollection<string>? left, IReadOnlyCollection<string>? right)
+        {
+            left ??= Array.Empty<string>();
+            right ??= Array.Empty<string>();
+
+            return left.Count == right.Count && left.SequenceEqual(right, StringComparer.OrdinalIgnoreCase);
+        }
+
+        private static string NormalizeDropdownValue(string? value, IReadOnlyList<string> dropdownOptions)
+        {
+            if (dropdownOptions.Count == 0)
+            {
+                return string.Empty;
+            }
+
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return dropdownOptions[0];
+            }
+
+            string trimmedValue = value.Trim();
+            string? matchedValue = dropdownOptions.FirstOrDefault(option => option.Equals(trimmedValue, StringComparison.OrdinalIgnoreCase));
+            return matchedValue ?? dropdownOptions[0];
+        }
 
         private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
 
@@ -440,6 +574,7 @@ namespace Omnipotent.Service_Manager
                         s.Sensitive,
                         s.ParentServiceId,
                         s.ParentServiceName,
+                        s.DropdownOptions,
                         Value = (s.Sensitive && !revealSensitive) ? MaskSensitive(s.Value) : s.Value
                     }).ToList();
 
@@ -480,6 +615,7 @@ namespace Omnipotent.Service_Manager
                         s.Sensitive,
                         s.ParentServiceId,
                         s.ParentServiceName,
+                        s.DropdownOptions,
                         Value = s.Sensitive ? MaskSensitive(s.Value) : s.Value
                     }), "application/json");
                 }
@@ -501,11 +637,19 @@ namespace Omnipotent.Service_Manager
 
                     if (string.IsNullOrEmpty(name)) { await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest); return; }
 
+                    OmniSetting existingSetting = null;
+
+                    if (!string.IsNullOrEmpty(parentId))
+                    {
+                        settings.TryGetValue(ComposeKey(parentId, name), out existingSetting);
+                    }
+
                     if (string.IsNullOrEmpty(parentId))
                     {
                         var existing = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
                         if (existing != null)
                         {
+                            existingSetting = existing;
                             parentId = existing.ParentServiceId;
                             parentName = existing.ParentServiceName;
                         }
@@ -516,7 +660,14 @@ namespace Omnipotent.Service_Manager
                         }
                     }
 
-                    await SetOmniSetting(name, value, parentId, parentName, OmniSettingType.String, fulfilledViaApi: true);
+                    await SetOmniSetting(
+                        name,
+                        value,
+                        parentId,
+                        parentName,
+                        existingSetting?.Type ?? OmniSettingType.String,
+                        fulfilledViaApi: true,
+                        dropdownOptions: existingSetting?.DropdownOptions);
                     await req.ReturnResponse("OK");
                 }
                 catch (Exception ex)

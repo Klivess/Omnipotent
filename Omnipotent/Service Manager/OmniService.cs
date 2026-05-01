@@ -216,6 +216,12 @@ namespace Omnipotent.Service_Manager
             return res as string ?? defaultValue;
         }
 
+        public async Task<string> GetDropdownOmniSetting(string name, string defaultValue, IEnumerable<string> dropdownOptions, bool sensitive = false, bool askKlivesForFulfillment = false)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetDropdownOmniSetting", name, defaultValue, dropdownOptions, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
+            return res as string ?? defaultValue;
+        }
+
         // Backwards-compatible generic getter that returns string representation
         public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
         {
@@ -227,6 +233,7 @@ namespace Omnipotent.Service_Manager
                 case OmniSettingType.Int:
                     var i = await GetIntOmniSetting(name, defaultValue: 0, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment);
                     return i.ToString();
+                case OmniSettingType.Dropdown:
                 case OmniSettingType.String:
                 default:
                     return await GetStringOmniSetting(name, defaultValue: null, sensitive: sensitive, askKlivesForFulfillment: askKlivesForFulfillment);

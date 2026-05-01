@@ -30,6 +30,9 @@ namespace Omnipotent.Services.KliveLLM
 {
     public class KliveLLM : OmniService
     {
+        private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
+        private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
+
         private string huggingFaceToken = "";
         private HttpClient client;
         private string ModelDownloadUrl = "";
@@ -42,6 +45,31 @@ namespace Omnipotent.Services.KliveLLM
         private LLamaWeights modelWeights;
         private bool localModelReady = false;
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
+
+        private enum RemoteLLMProvider
+        {
+            HuggingFace,
+            OpenRouter,
+        }
+
+        private sealed class RemoteLLMProviderConfiguration
+        {
+            public RemoteLLMProviderConfiguration(RemoteLLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model)
+            {
+                Provider = provider;
+                DisplayName = displayName;
+                ChatCompletionsEndpoint = chatCompletionsEndpoint;
+                ApiKey = apiKey;
+                Model = model;
+            }
+
+            public RemoteLLMProvider Provider { get; }
+            public string DisplayName { get; }
+            public string ChatCompletionsEndpoint { get; }
+            public string ApiKey { get; }
+            public string Model { get; }
+        }
+
         public KliveLLM()
         {
             name = "KliveLLM";
@@ -54,7 +82,6 @@ namespace Omnipotent.Services.KliveLLM
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             client = new HttpClient();
-            client.DefaultRequestHeaders.Add("Authorization", "Bearer " + huggingFaceToken);
 
             await EnsureLlamaBinariesAvailableAsync();
             NativeLibraryConfig.All.WithLibrary(LLamaDLLFile, LLamaMTMDFile);
@@ -78,8 +105,8 @@ namespace Omnipotent.Services.KliveLLM
                 }
                 else
                 {
-                    modelWeights.Dispose();
-                    ServiceLog("Switched to HuggingFace provider. Local model resources have been released.");
+                    modelWeights?.Dispose();
+                    ServiceLog("Switched to remote LLM provider. Local model resources have been released.");
                 }
             }
             if(e.Setting.Name == "LocalLLMGGUFDownloadURL" && e.IsNewSetting && await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
@@ -209,7 +236,7 @@ namespace Omnipotent.Services.KliveLLM
             var useHuggingFaceProvider = await GetBoolOmniSetting("UseHuggingFaceProvider", true);
             if (useHuggingFaceProvider)
             {
-                var hfResponse = await QueryLLMViaHuggingFaceAsync(
+                var hfResponse = await QueryRemoteLLMAsync(
                     prompt,
                     sessionId,
                     maxTokensOverride,
@@ -224,7 +251,7 @@ namespace Omnipotent.Services.KliveLLM
                 maxTokensOverride);
         }
 
-        private async Task<KliveLLMResponse> QueryLLMViaHuggingFaceAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -257,7 +284,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
-            var response = await SendHFAIInferenceRequest(session.chatHistory);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride);
             {
                 var content = response.choices[0].message.content;
                 session.chatHistory.AddMessage(AuthorRole.Assistant, content);
@@ -276,19 +303,83 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendHFAIInferenceRequest(ChatHistory messages)
+        private async Task<RemoteLLMProviderConfiguration> GetRemoteProviderConfigurationAsync()
         {
-            var modelCandidates = new List<string> { await GetStringOmniSetting("HuggingFaceModelID", "meta-llama/Llama-3.1-8B-Instruct:cerebras") };
+            string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", new[] { "HuggingFace", "OpenRouter" }, false, true);
+
+            if (string.Equals(configuredProvider, "OpenRouter", StringComparison.OrdinalIgnoreCase))
+            {
+                string openRouterToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
+                string openRouterModel = await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true);
+
+                if (string.IsNullOrWhiteSpace(openRouterToken))
+                {
+                    throw new InvalidOperationException("OpenRouterLLMToken is missing.");
+                }
+
+                return new RemoteLLMProviderConfiguration(
+                    RemoteLLMProvider.OpenRouter,
+                    "OpenRouter",
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    openRouterToken,
+                    openRouterModel);
+            }
+
+            string huggingFaceModel = await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true);
+            string huggingFaceApiKey = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
+
+            if (string.IsNullOrWhiteSpace(huggingFaceApiKey))
+            {
+                throw new InvalidOperationException("HuggingFaceLLMToken is missing.");
+            }
+
+            return new RemoteLLMProviderConfiguration(
+                RemoteLLMProvider.HuggingFace,
+                "HuggingFace",
+                "https://router.huggingface.co/v1/chat/completions",
+                huggingFaceApiKey,
+                huggingFaceModel);
+        }
+
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride)
+        {
+            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync();
 
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
-                model = modelCandidates[0],
-                stream = false
+                model = remoteProvider.Model,
+                stream = false,
+                max_tokens = maxTokensOverride,
             };
             payload.BuildMessagesFromChatHistory(messages);
-            var response = await client.PostAsync("https://router.huggingface.co/v1/chat/completions", new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json"));
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
+            {
+                Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json")
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+
+            if (remoteProvider.Provider == RemoteLLMProvider.OpenRouter)
+            {
+                request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
+                request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
+            }
+
+            var response = await client.SendAsync(request);
             string responseContent = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException($"{remoteProvider.DisplayName} request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {responseContent}");
+            }
+
             var hfResponse = JsonConvert.DeserializeObject<HFWrapper.HFLLMInferenceResponse>(responseContent);
+
+            if (hfResponse?.choices == null || hfResponse.choices.Count == 0)
+            {
+                throw new InvalidOperationException($"{remoteProvider.DisplayName} returned an empty completion payload.");
+            }
+
             return hfResponse;
         }
         private async Task EnsureModelDownloadedAsync()
@@ -304,7 +395,15 @@ namespace Omnipotent.Services.KliveLLM
             string tempModelPath = Path.Combine(Path.GetTempPath(), $"{fileName}.{Guid.NewGuid():N}.download");
 
             // Attempt to download the file. The provided HF link is adjusted to the raw 'resolve' path above.
-            using var response = await client.GetAsync(ModelDownloadUrl, HttpCompletionOption.ResponseHeadersRead);
+            using var request = new HttpRequestMessage(HttpMethod.Get, ModelDownloadUrl);
+            if (Uri.TryCreate(ModelDownloadUrl, UriKind.Absolute, out var modelUri)
+                && modelUri.Host.Contains("huggingface.co", StringComparison.OrdinalIgnoreCase)
+                && string.IsNullOrWhiteSpace(huggingFaceToken) == false)
+            {
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", huggingFaceToken);
+            }
+
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
             response.EnsureSuccessStatusCode();
             long totalBytes = response.Content.Headers.ContentLength ?? -1;
             DiscordMessage? progressMessage = null;
