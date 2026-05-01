@@ -35,6 +35,7 @@ namespace Omnipotent.Services.OmniTumblr
             http.DefaultRequestHeaders.Add("User-Agent", "OmniTumblr/1.0");
             var request = new HttpRequestMessage(HttpMethod.Post, RequestTokenUrl);
             request.Headers.Add("Authorization", header);
+            request.Content = new StringContent("", Encoding.UTF8, "application/x-www-form-urlencoded");
 
             var response = await http.SendAsync(request);
             var body = await response.Content.ReadAsStringAsync();
@@ -74,6 +75,7 @@ namespace Omnipotent.Services.OmniTumblr
             http.DefaultRequestHeaders.Add("User-Agent", "OmniTumblr/1.0");
             var request = new HttpRequestMessage(HttpMethod.Post, AccessTokenUrl);
             request.Headers.Add("Authorization", header);
+            request.Content = new StringContent("", Encoding.UTF8, "application/x-www-form-urlencoded");
 
             var response = await http.SendAsync(request);
             var body = await response.Content.ReadAsStringAsync();
