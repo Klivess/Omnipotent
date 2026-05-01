@@ -134,6 +134,63 @@ namespace Omnipotent.Services.OmniTumblr
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
+            // POST /omnitumblr/accounts/oauth/begin
+            await service.CreateAPIRoute("/omnitumblr/accounts/oauth/begin", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string consumerKey = body.consumerKey;
+                    string consumerSecret = body.consumerSecret;
+                    if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret))
+                    {
+                        await req.ReturnResponse("consumerKey and consumerSecret are required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var (flowId, authorizeUrl) = await service.AccountManager.BeginOAuthFlowAsync(consumerKey, consumerSecret);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { flowId, authorizeUrl }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
+            // POST /omnitumblr/accounts/oauth/complete
+            await service.CreateAPIRoute("/omnitumblr/accounts/oauth/complete", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string flowId = body.flowId;
+                    string verifier = body.verifier;
+                    string blogName = body.blogName;
+                    if (string.IsNullOrWhiteSpace(flowId) || string.IsNullOrWhiteSpace(verifier) || string.IsNullOrWhiteSpace(blogName))
+                    {
+                        await req.ReturnResponse("flowId, verifier, and blogName are required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var account = await service.AccountManager.CompleteOAuthFlowAsync(flowId, verifier, blogName);
+                    await service.AnalyticsTracker.LogEvent(account.AccountId, "AccountAdded", $"Blog '{blogName}' added via OAuth PIN flow.");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        account.AccountId,
+                        account.BlogName,
+                        ConnectionStatus = account.ConnectionStatus.ToString(),
+                        account.FollowerCount,
+                        account.PostCount
+                    }));
+                }
+                catch (InvalidOperationException ex)
+                {
+                    await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Admin);
+
             // POST /omnitumblr/accounts/add
             await service.CreateAPIRoute("/omnitumblr/accounts/add", async (req) =>
             {

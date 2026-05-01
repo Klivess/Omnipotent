@@ -14,6 +14,16 @@ namespace Omnipotent.Services.OmniTumblr
         private readonly ConcurrentDictionary<string, OmniTumblrAccount> accounts = new();
         private readonly ConcurrentDictionary<string, TumblrClient> apiInstances = new();
         private readonly ConcurrentDictionary<string, DateTime> lastActionTimestamps = new();
+        private readonly ConcurrentDictionary<string, PendingOAuthFlow> pendingFlows = new();
+
+        private class PendingOAuthFlow
+        {
+            public string FlowId { get; set; }
+            public string ConsumerKey { get; set; }
+            public string ConsumerSecret { get; set; }
+            public Token RequestToken { get; set; }
+            public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        }
 
         public OmniTumblrAccountManager(OmniTumblr service)
         {
@@ -122,6 +132,37 @@ namespace Omnipotent.Services.OmniTumblr
                 await SaveAccountToDisk(account);
                 await service.ServiceLog($"[OmniTumblr] Resumed account '{account.BlogName}'.");
             }
+        }
+
+        // ── OAuth PIN Flow ──
+
+        public async Task<(string flowId, string authorizeUrl)> BeginOAuthFlowAsync(string consumerKey, string consumerSecret)
+        {
+            var requestToken = await new TumblrClientFactory().GetRequestTokenAsync(consumerKey, consumerSecret, "oob");
+            var flowId = Guid.NewGuid().ToString("N");
+            pendingFlows[flowId] = new PendingOAuthFlow
+            {
+                FlowId = flowId,
+                ConsumerKey = consumerKey,
+                ConsumerSecret = consumerSecret,
+                RequestToken = requestToken
+            };
+            var authorizeUrl = $"https://www.tumblr.com/oauth/authorize?oauth_token={requestToken.Key}";
+            return (flowId, authorizeUrl);
+        }
+
+        public async Task<OmniTumblrAccount> CompleteOAuthFlowAsync(string flowId, string verifier, string blogName)
+        {
+            if (!pendingFlows.TryRemove(flowId, out var flow))
+                throw new InvalidOperationException("OAuth flow not found or already completed. Please start a new flow.");
+
+            if ((DateTime.UtcNow - flow.CreatedAt).TotalMinutes > 30)
+                throw new InvalidOperationException("OAuth flow has expired. Please start a new flow.");
+
+            var accessToken = await new TumblrClientFactory().GetAccessTokenAsync(
+                flow.ConsumerKey, flow.ConsumerSecret, flow.RequestToken, verifier);
+
+            return await AddAccountAsync(blogName, flow.ConsumerKey, flow.ConsumerSecret, accessToken.Key, accessToken.Secret);
         }
 
         // ── Client Building ──
