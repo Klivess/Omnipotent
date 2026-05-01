@@ -10,6 +10,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System;
+using Omnipotent.Profiles;
 using static Omnipotent.Profiles.KMProfileManager;
 
 namespace Omnipotent.Services.KliveChat
@@ -17,6 +18,7 @@ namespace Omnipotent.Services.KliveChat
     public class KliveChatService : OmniService
     {
         public ConcurrentDictionary<string, KliveChatRoom> ActiveRooms { get; } = new();
+        private KMProfileManager? profileManager;
 
         public KliveChatService()
         {
@@ -54,7 +56,13 @@ namespace Omnipotent.Services.KliveChat
             {
                 if (req.user != null)
                 {
-                    var response = new { name = req.user.Name, rank = (int)req.user.KlivesManagementRank };
+                    var response = new
+                    {
+                        name = req.user.Name,
+                        rank = (int)req.user.KlivesManagementRank,
+                        userId = req.user.UserID,
+                        canModerate = req.user.KlivesManagementRank >= KMPermissions.Associate
+                    };
                     await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
                 }
                 else
@@ -108,12 +116,17 @@ namespace Omnipotent.Services.KliveChat
                     return;
                 }
 
-                string userName = queryParams["name"] ?? "Guest_" + Guid.NewGuid().ToString().Substring(0, 4);
+                KMProfile? resolvedUser = user ?? await ResolveSocketUserAsync(queryParams["authorization"]);
+                string userName = !string.IsNullOrWhiteSpace(resolvedUser?.Name)
+                    ? resolvedUser.Name
+                    : queryParams["name"] ?? "Guest_" + Guid.NewGuid().ToString().Substring(0, 4);
 
                 var client = new KliveChatClient
                 {
                     Name = userName,
-                    Socket = socket
+                    Socket = socket,
+                    UserId = resolvedUser?.UserID,
+                    Rank = resolvedUser?.KlivesManagementRank ?? KMPermissions.Anybody
                 };
 
                 await room.AddClient(client, this);
@@ -210,6 +223,30 @@ namespace Omnipotent.Services.KliveChat
             catch
             {
             }
+        }
+
+        private async Task<KMProfile?> ResolveSocketUserAsync(string? authorization)
+        {
+            if (string.IsNullOrWhiteSpace(authorization))
+            {
+                return null;
+            }
+
+            if (profileManager == null)
+            {
+                var services = await GetServicesByType<KMProfileManager>();
+                if (services != null && services.Any())
+                {
+                    profileManager = (KMProfileManager)services[0];
+                }
+            }
+
+            if (profileManager == null)
+            {
+                return null;
+            }
+
+            return await profileManager.GetProfileByPassword(authorization);
         }
     }
 }

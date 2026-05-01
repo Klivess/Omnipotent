@@ -71,6 +71,13 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(metadataFilePath, json);
         }
 
+        public enum SharePermissionMode
+        {
+            ReadOnly = 0,
+            Write = 1,
+            WriteDelete = 2
+        }
+
         public class ShareLink
         {
             public string ShareCode;
@@ -78,6 +85,7 @@ namespace Omnipotent.Services.KliveCloud
             public string CreatedByUserID;
             public DateTime CreatedDate;
             public DateTime? ExpirationDate;
+            public SharePermissionMode PermissionMode = SharePermissionMode.ReadOnly;
         }
 
         private async Task LoadShareLinks()
@@ -104,15 +112,33 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(shareLinksFilePath, json);
         }
 
-        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate)
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly)
         {
+            var item = GetItemByID(itemID);
+            if (item == null)
+            {
+                throw new Exception("Item not found.");
+            }
+
+            if (item.ItemType != CloudItemType.Folder)
+            {
+                permissionMode = SharePermissionMode.ReadOnly;
+            }
+
+            var existingLink = await GetReusableShareLink(itemID);
+            if (existingLink != null)
+            {
+                return existingLink;
+            }
+
             var link = new ShareLink
             {
                 ShareCode = Guid.NewGuid().ToString("N"),
                 ItemID = itemID,
                 CreatedByUserID = createdByUserID,
                 CreatedDate = DateTime.Now,
-                ExpirationDate = expirationDate
+                ExpirationDate = expirationDate,
+                PermissionMode = permissionMode
             };
             ShareLinks.Add(link);
             await SaveShareLinks();
@@ -125,6 +151,25 @@ namespace Omnipotent.Services.KliveCloud
             return ShareLinks.FirstOrDefault(k => k.ShareCode == shareCode);
         }
 
+        public async Task<ShareLink?> GetReusableShareLink(string itemID)
+        {
+            bool removedExpiredLinks = false;
+            foreach (var expiredLink in ShareLinks
+                .Where(k => k.ItemID == itemID && k.ExpirationDate.HasValue && k.ExpirationDate.Value < DateTime.Now)
+                .ToList())
+            {
+                ShareLinks.Remove(expiredLink);
+                removedExpiredLinks = true;
+            }
+
+            if (removedExpiredLinks)
+            {
+                await SaveShareLinks();
+            }
+
+            return ShareLinks.FirstOrDefault(k => k.ItemID == itemID);
+        }
+
         public async Task<bool> DeleteShareLink(string shareCode)
         {
             var link = GetShareLinkByCode(shareCode);
@@ -132,6 +177,36 @@ namespace Omnipotent.Services.KliveCloud
             ShareLinks.Remove(link);
             await SaveShareLinks();
             return true;
+        }
+
+        public bool CanWriteThroughShareLink(ShareLink link, CloudItem sharedItem)
+        {
+            return sharedItem.ItemType == CloudItemType.Folder && link.PermissionMode >= SharePermissionMode.Write;
+        }
+
+        public bool CanDeleteThroughShareLink(ShareLink link, CloudItem sharedItem)
+        {
+            return sharedItem.ItemType == CloudItemType.Folder && link.PermissionMode >= SharePermissionMode.WriteDelete;
+        }
+
+        public bool IsItemWithinSharedScope(CloudItem sharedItem, CloudItem targetItem, bool includeSharedItem = true)
+        {
+            if (sharedItem == null || targetItem == null)
+            {
+                return false;
+            }
+
+            if (string.Equals(sharedItem.ItemID, targetItem.ItemID, StringComparison.OrdinalIgnoreCase))
+            {
+                return includeSharedItem;
+            }
+
+            if (sharedItem.ItemType != CloudItemType.Folder)
+            {
+                return false;
+            }
+
+            return IsDescendantOfFolder(sharedItem.ItemID, targetItem);
         }
 
         private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
@@ -168,20 +243,115 @@ namespace Omnipotent.Services.KliveCloud
         public List<CloudItem> GetItemsInFolder(string folderID, KMPermissions userPermission)
         {
             return CloudItems
-                .Where(k => k.ParentFolderID == folderID && k.MinimumPermissionLevel <= userPermission)
+                .Where(k => k.ParentFolderID == folderID && CanAccessItem(k, userPermission))
+                .Select(CloneWithEffectivePermission)
                 .ToList();
         }
 
         public List<CloudItem> GetRootItems(KMPermissions userPermission)
         {
             return CloudItems
-                .Where(k => string.IsNullOrEmpty(k.ParentFolderID) && k.MinimumPermissionLevel <= userPermission)
+                .Where(k => string.IsNullOrEmpty(k.ParentFolderID) && CanAccessItem(k, userPermission))
+                .Select(CloneWithEffectivePermission)
+                .ToList();
+        }
+
+        public bool CanAccessItem(CloudItem item, KMPermissions userPermission)
+        {
+            return GetEffectiveMinimumPermission(item) <= userPermission;
+        }
+
+        public CloudItem CloneWithEffectivePermission(CloudItem item)
+        {
+            return new CloudItem
+            {
+                ItemID = item.ItemID,
+                Name = item.Name,
+                RelativePath = item.RelativePath,
+                ParentFolderID = item.ParentFolderID,
+                CreatedDate = item.CreatedDate,
+                ModifiedDate = item.ModifiedDate,
+                CreatedByUserID = item.CreatedByUserID,
+                ItemType = item.ItemType,
+                MinimumPermissionLevel = GetEffectiveMinimumPermission(item),
+                FileSizeBytes = item.FileSizeBytes
+            };
+        }
+
+        public KMPermissions GetEffectiveMinimumPermission(CloudItem item)
+        {
+            KMPermissions effectivePermission = item.MinimumPermissionLevel;
+            string parentFolderID = item.ParentFolderID;
+            HashSet<string> visitedFolderIds = new(StringComparer.OrdinalIgnoreCase);
+
+            while (!string.IsNullOrWhiteSpace(parentFolderID) && visitedFolderIds.Add(parentFolderID))
+            {
+                var parentFolder = GetItemByID(parentFolderID);
+                if (parentFolder == null)
+                {
+                    break;
+                }
+
+                effectivePermission = (KMPermissions)Math.Max((int)effectivePermission, (int)parentFolder.MinimumPermissionLevel);
+                parentFolderID = parentFolder.ParentFolderID;
+            }
+
+            return effectivePermission;
+        }
+
+        public KMPermissions ApplyParentPermissionFloor(string parentFolderID, KMPermissions requestedPermission)
+        {
+            if (string.IsNullOrWhiteSpace(parentFolderID))
+            {
+                return requestedPermission;
+            }
+
+            var parentFolder = GetItemByID(parentFolderID);
+            if (parentFolder == null)
+            {
+                throw new Exception("Parent folder not found.");
+            }
+
+            return (KMPermissions)Math.Max((int)requestedPermission, (int)GetEffectiveMinimumPermission(parentFolder));
+        }
+
+        public bool IsDescendantOfFolder(string folderID, CloudItem item)
+        {
+            string parentFolderID = item.ParentFolderID;
+            HashSet<string> visitedFolderIds = new(StringComparer.OrdinalIgnoreCase);
+
+            while (!string.IsNullOrWhiteSpace(parentFolderID) && visitedFolderIds.Add(parentFolderID))
+            {
+                if (string.Equals(parentFolderID, folderID, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                var parentFolder = GetItemByID(parentFolderID);
+                if (parentFolder == null)
+                {
+                    break;
+                }
+
+                parentFolderID = parentFolder.ParentFolderID;
+            }
+
+            return false;
+        }
+
+        public List<CloudItem> GetFolderDescendantsForShare(string folderID)
+        {
+            return CloudItems
+                .Where(item => IsDescendantOfFolder(folderID, item))
+                .Select(CloneWithEffectivePermission)
+                .OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
         public async Task<CloudItem> CreateFolder(string name, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
         {
             ValidateItemName(name);
+            minimumPermission = ApplyParentPermissionFloor(parentFolderID, minimumPermission);
 
             string relativePath;
             if (string.IsNullOrEmpty(parentFolderID))
@@ -225,6 +395,7 @@ namespace Omnipotent.Services.KliveCloud
         public async Task<CloudItem> UploadFile(string fileName, byte[] fileData, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
         {
             ValidateItemName(fileName);
+            minimumPermission = ApplyParentPermissionFloor(parentFolderID, minimumPermission);
 
             string relativePath;
             if (string.IsNullOrEmpty(parentFolderID))
@@ -271,6 +442,11 @@ namespace Omnipotent.Services.KliveCloud
 
         public async Task<bool> DeleteItem(string itemID, KMProfile user)
         {
+            return await DeleteItem(itemID, user?.Name ?? "Unknown user");
+        }
+
+        public async Task<bool> DeleteItem(string itemID, string deletedByLabel)
+        {
             var item = GetItemByID(itemID);
             if (item == null) return false;
 
@@ -279,7 +455,7 @@ namespace Omnipotent.Services.KliveCloud
                 var children = CloudItems.Where(k => k.ParentFolderID == itemID).ToList();
                 foreach (var child in children)
                 {
-                    await DeleteItem(child.ItemID, user);
+                    await DeleteItem(child.ItemID, deletedByLabel);
                 }
 
                 string fullPath = GetFullItemPath(item);
@@ -295,7 +471,7 @@ namespace Omnipotent.Services.KliveCloud
 
             CloudItems.Remove(item);
             await SaveMetadata();
-            ServiceLog($"Item '{item.Name}' deleted by user {user.Name}.");
+            ServiceLog($"Item '{item.Name}' deleted by {deletedByLabel}.");
             return true;
         }
 
@@ -303,10 +479,10 @@ namespace Omnipotent.Services.KliveCloud
         {
             var item = GetItemByID(itemID);
             if (item == null) return null;
-            item.MinimumPermissionLevel = newPermission;
+            item.MinimumPermissionLevel = ApplyParentPermissionFloor(item.ParentFolderID, newPermission);
             item.ModifiedDate = DateTime.Now;
             await SaveMetadata();
-            return item;
+            return CloneWithEffectivePermission(item);
         }
 
         public async Task<byte[]> DownloadFile(string itemID)

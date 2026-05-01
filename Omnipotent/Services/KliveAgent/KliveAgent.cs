@@ -27,6 +27,7 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentBrain brain;
         private KliveAgentScriptEngine scriptEngine;
         private readonly ConcurrentDictionary<string, AgentConversation> conversations = new();
+        private readonly ConcurrentDictionary<string, AgentPendingChatResponse> pendingApiResponses = new();
         private int initializationState = InitializationStateStarting;
         private string initializationMessage = "KliveAgent is initializing.";
 
@@ -206,6 +207,98 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return response;
+        }
+
+        public async Task<AgentChatResponse> QueueIncomingApiMessageAsync(
+            string message,
+            string conversationId = null,
+            string senderName = null)
+        {
+            if (!TryGetApiAvailability(out _, out var availabilityMessage))
+            {
+                return new AgentChatResponse
+                {
+                    Success = false,
+                    Response = availabilityMessage,
+                    ErrorMessage = availabilityMessage
+                };
+            }
+
+            var enabled = await GetBoolOmniSetting("KliveAgent_Enabled", defaultValue: true);
+            if (!enabled)
+            {
+                return new AgentChatResponse
+                {
+                    Success = false,
+                    Response = "KliveAgent is currently disabled.",
+                    ErrorMessage = "KliveAgent is disabled via OmniSettings."
+                };
+            }
+
+            if (string.IsNullOrEmpty(conversationId))
+            {
+                conversationId = Guid.NewGuid().ToString("N");
+            }
+
+            var pendingResponse = new AgentPendingChatResponse
+            {
+                ConversationId = conversationId,
+                Response = BuildPendingApiResponseText()
+            };
+
+            pendingApiResponses[pendingResponse.RequestId] = pendingResponse;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var response = await HandleIncomingMessage(message, AgentSourceChannel.API, conversationId, senderName);
+                    pendingResponse.FinalResponse = response;
+                    pendingResponse.Status = response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
+                    pendingResponse.ErrorMessage = response.Success ? null : response.ErrorMessage;
+
+                    if (conversations.TryGetValue(conversationId, out var conversation))
+                    {
+                        await PersistConversationAsync(conversation);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    pendingResponse.Status = AgentTaskStatus.Failed;
+                    pendingResponse.ErrorMessage = ex.Message;
+                    pendingResponse.FinalResponse = new AgentChatResponse
+                    {
+                        Success = false,
+                        ConversationId = conversationId,
+                        Response = "KliveAgent failed while completing the request.",
+                        ErrorMessage = ex.ToString()
+                    };
+                }
+                finally
+                {
+                    pendingResponse.CompletedAt = DateTime.UtcNow;
+                }
+            });
+
+            return new AgentChatResponse
+            {
+                Success = true,
+                ConversationId = conversationId,
+                Response = pendingResponse.Response,
+                IsPending = true,
+                PendingRequestId = pendingResponse.RequestId
+            };
+        }
+
+        public AgentPendingChatResponse GetPendingApiResponse(string requestId)
+        {
+            pendingApiResponses.TryGetValue(requestId, out var pendingResponse);
+            return pendingResponse;
+        }
+
+        private static string BuildPendingApiResponseText()
+        {
+            return "I’m on it. I’m inspecting the request and running any needed scripts now. I’ll send the finished answer as soon as execution completes.";
         }
 
         private async Task<string> HandleDiscordDM(string message, string channelId)

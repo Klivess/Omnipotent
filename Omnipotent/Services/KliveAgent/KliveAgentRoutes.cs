@@ -61,9 +61,8 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    var response = await service.HandleIncomingMessage(
+                    var response = await service.QueueIncomingApiMessageAsync(
                         body.Message,
-                        AgentSourceChannel.API,
                         body.ConversationId,
                         req.user?.Name ?? "API");
 
@@ -76,6 +75,38 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            await CreateRoute("/kliveagent/chat/pending", async (req) =>
+            {
+                try
+                {
+                    string requestId = req.userParameters["requestId"];
+                    if (string.IsNullOrWhiteSpace(requestId))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "requestId is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var pendingResponse = service.GetPendingApiResponse(requestId);
+                    if (pendingResponse == null)
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "Pending response not found." }),
+                            code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(pendingResponse));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         private async Task RegisterCapabilityRoutes()

@@ -518,5 +518,38 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("iterations")]
         public int Iterations { get; set; }
+
+        [JsonProperty("isPending")]
+        public bool IsPending { get; set; }
+
+        [JsonProperty("pendingRequestId")]
+        public string PendingRequestId { get; set; }
+    }
+
+    public class AgentPendingChatResponse
+    {
+        [JsonProperty("requestId")]
+        public string RequestId { get; set; } = Guid.NewGuid().ToString("N");
+
+        [JsonProperty("conversationId")]
+        public string ConversationId { get; set; }
+
+        [JsonProperty("status")]
+        public AgentTaskStatus Status { get; set; } = AgentTaskStatus.Running;
+
+        [JsonProperty("response")]
+        public string Response { get; set; }
+
+        [JsonProperty("finalResponse")]
+        public AgentChatResponse FinalResponse { get; set; }
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        [JsonProperty("completedAt")]
+        public DateTime? CompletedAt { get; set; }
+
+        [JsonProperty("errorMessage")]
+        public string ErrorMessage { get; set; }
     }
 }
