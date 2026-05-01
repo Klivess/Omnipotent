@@ -15,6 +15,7 @@ namespace Omnipotent.Services.OmniTumblr
         private const string RequestTokenUrl = "https://www.tumblr.com/oauth/request_token";
         private const string AccessTokenUrl  = "https://www.tumblr.com/oauth/access_token";
         private const string AuthorizeUrl    = "https://www.tumblr.com/oauth/authorize";
+        internal const string CallbackUrl    = "https://klive.dev/omnitumblr/oauth/callback";
 
         // ── Step 1 ──
 
@@ -23,7 +24,7 @@ namespace Omnipotent.Services.OmniTumblr
             string consumerKey, string consumerSecret)
         {
             var oauthParams = BuildBaseParams(consumerKey);
-            oauthParams["oauth_callback"] = "oob"; // PIN-based flow
+            oauthParams["oauth_callback"] = CallbackUrl;
 
             var signature = ComputeSignature(HttpMethod.Post.Method, RequestTokenUrl, oauthParams, consumerSecret, "");
             oauthParams["oauth_signature"] = signature;

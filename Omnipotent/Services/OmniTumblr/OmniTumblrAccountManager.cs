@@ -15,10 +15,15 @@ namespace Omnipotent.Services.OmniTumblr
         private readonly ConcurrentDictionary<string, TumblrClient> apiInstances = new();
         private readonly ConcurrentDictionary<string, DateTime> lastActionTimestamps = new();
         private readonly ConcurrentDictionary<string, PendingOAuthFlow> pendingFlows = new();
+        // Maps request-token key → flowId so we can look up the flow from Tumblr's callback redirect
+        private readonly ConcurrentDictionary<string, string> requestTokenIndex = new();
+        // Completed callback flows awaiting the frontend to acknowledge
+        private readonly ConcurrentDictionary<string, OmniTumblrAccount> completedCallbackFlows = new();
 
         private class PendingOAuthFlow
         {
             public string? FlowId { get; set; }
+            public string? BlogName { get; set; }
             public string? ConsumerKey { get; set; }
             public string? ConsumerSecret { get; set; }
             public Token? RequestToken { get; set; }
@@ -73,48 +78,91 @@ namespace Omnipotent.Services.OmniTumblr
         /// <summary>
         /// Step 1: Exchange consumer key/secret for a temporary request token and return the
         /// Tumblr authorization URL the user must visit to authorize the app.
-        /// Returns a flowId that must be supplied to CompleteOAuthFlowAsync.
+        /// Returns a flowId that must be supplied to check GetFlowStatus after Tumblr redirects back.
         /// </summary>
-        public async Task<(string FlowId, string AuthorizationUrl)> BeginOAuthFlowAsync(string consumerKey, string consumerSecret)
+        public async Task<(string FlowId, string AuthorizationUrl)> BeginOAuthFlowAsync(string consumerKey, string consumerSecret, string blogName)
         {
             var (requestToken, requestTokenSecret) = await OmniTumblrOAuthHelper.GetRequestTokenAsync(consumerKey, consumerSecret);
 
             var flowId = Guid.NewGuid().ToString("N");
-            pendingFlows[flowId] = new PendingOAuthFlow
+            var flow = new PendingOAuthFlow
             {
-                FlowId        = flowId,
+                FlowId         = flowId,
+                BlogName       = blogName,
                 ConsumerKey    = consumerKey,
                 ConsumerSecret = consumerSecret,
                 RequestToken   = new DontPanic.TumblrSharp.OAuth.Token(requestToken, requestTokenSecret)
             };
+            pendingFlows[flowId] = flow;
+            requestTokenIndex[requestToken] = flowId;
 
             // Expire flows older than 30 minutes
             var staleKeys = pendingFlows
                 .Where(kv => (DateTime.UtcNow - kv.Value.CreatedAt).TotalMinutes > 30)
                 .Select(kv => kv.Key).ToList();
-            foreach (var k in staleKeys) pendingFlows.TryRemove(k, out _);
+            foreach (var k in staleKeys)
+            {
+                if (pendingFlows.TryRemove(k, out var stale) && stale.RequestToken != null)
+                    requestTokenIndex.TryRemove(stale.RequestToken.Key, out _);
+            }
 
             var authUrl = OmniTumblrOAuthHelper.BuildAuthorizationUrl(requestToken);
-            await service.ServiceLog($"[OmniTumblr] OAuth flow {flowId} started. Auth URL: {authUrl}");
+            await service.ServiceLog($"[OmniTumblr] OAuth flow {flowId} started for blog '{blogName}'.");
             return (flowId, authUrl);
         }
 
         /// <summary>
-        /// Step 3: Given the flowId, the verifier PIN the user received, and their blog name,
-        /// exchange for permanent access tokens and create the account.
+        /// Called by the GET /omnitumblr/oauth/callback route when Tumblr redirects back.
+        /// Looks up the pending flow by request token, exchanges for access tokens, and creates the account.
         /// </summary>
-        public async Task<OmniTumblrAccount> CompleteOAuthFlowAsync(string flowId, string verifier, string blogName)
+        public async Task<OmniTumblrAccount> CompleteOAuthCallbackAsync(string requestToken, string verifier)
         {
+            if (!requestTokenIndex.TryRemove(requestToken, out var flowId))
+                throw new InvalidOperationException("No pending OAuth flow found for the returned request token. It may have expired.");
+
             if (!pendingFlows.TryRemove(flowId, out var flow))
-                throw new InvalidOperationException("OAuth flow not found or expired. Please start a new authorization.");
+                throw new InvalidOperationException("OAuth flow expired before the callback was received.");
 
             var (accessToken, accessTokenSecret) = await OmniTumblrOAuthHelper.GetAccessTokenAsync(
                 flow.ConsumerKey!, flow.ConsumerSecret!,
                 flow.RequestToken!.Key, flow.RequestToken.Secret,
                 verifier);
 
-            await service.ServiceLog($"[OmniTumblr] OAuth flow {flowId} completed for blog '{blogName}'. Access token acquired.");
+            await service.ServiceLog($"[OmniTumblr] OAuth callback received for flow {flowId}, blog '{flow.BlogName}'.");
 
+            var account = await AddAccountAsync(flow.BlogName!, flow.ConsumerKey!, flow.ConsumerSecret!, accessToken, accessTokenSecret);
+            completedCallbackFlows[flowId] = account;
+            return account;
+        }
+
+        /// <summary>
+        /// Returns null if the flow is still pending, or the created account if the callback has been received.
+        /// Removes the entry after the first successful read.
+        /// </summary>
+        public OmniTumblrAccount? GetFlowStatus(string flowId)
+        {
+            if (completedCallbackFlows.TryRemove(flowId, out var account))
+                return account;
+            return null;
+        }
+
+        /// <summary>
+        /// Manual fallback: complete using a flowId + verifier (e.g., if the callback URL redirect is unavailable).
+        /// </summary>
+        public async Task<OmniTumblrAccount> CompleteOAuthFlowAsync(string flowId, string verifier, string blogName)
+        {
+            if (!pendingFlows.TryRemove(flowId, out var flow))
+                throw new InvalidOperationException("OAuth flow not found or expired. Please start a new authorization.");
+
+            if (flow.RequestToken != null)
+                requestTokenIndex.TryRemove(flow.RequestToken.Key, out _);
+
+            var (accessToken, accessTokenSecret) = await OmniTumblrOAuthHelper.GetAccessTokenAsync(
+                flow.ConsumerKey!, flow.ConsumerSecret!,
+                flow.RequestToken!.Key, flow.RequestToken.Secret,
+                verifier);
+
+            await service.ServiceLog($"[OmniTumblr] OAuth flow {flowId} manually completed for blog '{blogName}'.");
             return await AddAccountAsync(blogName, flow.ConsumerKey!, flow.ConsumerSecret!, accessToken, accessTokenSecret);
         }
 

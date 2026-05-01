@@ -57,14 +57,15 @@ namespace Omnipotent.Services.OmniTumblr
                     var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
                     string consumerKey    = body.consumerKey;
                     string consumerSecret = body.consumerSecret;
+                    string blogName       = body.blogName;
 
-                    if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret))
+                    if (string.IsNullOrWhiteSpace(consumerKey) || string.IsNullOrWhiteSpace(consumerSecret) || string.IsNullOrWhiteSpace(blogName))
                     {
-                        await req.ReturnResponse("consumerKey and consumerSecret are required.", code: HttpStatusCode.BadRequest);
+                        await req.ReturnResponse("consumerKey, consumerSecret, and blogName are required.", code: HttpStatusCode.BadRequest);
                         return;
                     }
 
-                    var (flowId, authUrl) = await service.AccountManager.BeginOAuthFlowAsync(consumerKey, consumerSecret);
+                    var (flowId, authUrl) = await service.AccountManager.BeginOAuthFlowAsync(consumerKey, consumerSecret, blogName);
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { flowId, authorizationUrl = authUrl }));
                 }
                 catch (Exception ex)
@@ -72,6 +73,78 @@ namespace Omnipotent.Services.OmniTumblr
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Admin);
+
+            // GET /omnitumblr/oauth/callback — Tumblr redirects here after the user authorizes.
+            // Query params: oauth_token (request token), oauth_verifier
+            await service.CreateAPIRoute("/omnitumblr/oauth/callback", async (req) =>
+            {
+                try
+                {
+                    var requestToken = req.userParameters.Get("oauth_token");
+                    var verifier     = req.userParameters.Get("oauth_verifier");
+
+                    if (string.IsNullOrWhiteSpace(requestToken) || string.IsNullOrWhiteSpace(verifier))
+                    {
+                        await req.ReturnResponse("<html><body style='font-family:sans-serif;background:#111;color:#f00;padding:40px'>" +
+                            "<h2>Authorization failed</h2><p>Missing oauth_token or oauth_verifier parameters.</p></body></html>",
+                            contentType: "text/html", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = await service.AccountManager.CompleteOAuthCallbackAsync(requestToken, verifier);
+
+                    await req.ReturnResponse(
+                        $"<html><body style='font-family:sans-serif;background:#111;color:#e0e0e0;padding:40px;text-align:center'>" +
+                        $"<h2 style='color:#4caf50'>✓ Authorization Successful</h2>" +
+                        $"<p>Blog <strong>{HtmlEncode(account.BlogName)}</strong> has been connected to OmniTumblr.</p>" +
+                        $"<p>You can close this tab and return to the dashboard.</p>" +
+                        $"</body></html>",
+                        contentType: "text/html");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        $"<html><body style='font-family:sans-serif;background:#111;color:#f00;padding:40px'>" +
+                        $"<h2>Authorization Error</h2><p>{HtmlEncode(ex.Message)}</p>" +
+                        $"<p>Please close this tab and try again from the dashboard.</p></body></html>",
+                        contentType: "text/html", code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // GET /omnitumblr/oauth/callback-status?flowId=X — poll to check if callback was received
+            await service.CreateAPIRoute("/omnitumblr/oauth/callback-status", async (req) =>
+            {
+                try
+                {
+                    var flowId = req.userParameters.Get("flowId");
+                    if (string.IsNullOrWhiteSpace(flowId))
+                    {
+                        await req.ReturnResponse("flowId is required.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var account = service.AccountManager.GetFlowStatus(flowId);
+                    if (account == null)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { completed = false }));
+                        return;
+                    }
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        completed = true,
+                        account.AccountId,
+                        account.BlogName,
+                        ConnectionStatus = account.ConnectionStatus.ToString(),
+                        account.FollowerCount,
+                        account.PostCount
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Admin);
 
             // POST /omnitumblr/oauth/complete — Step 3: exchange request token + verifier for access token and create account
             await service.CreateAPIRoute("/omnitumblr/oauth/complete", async (req) =>
@@ -853,5 +926,8 @@ namespace Omnipotent.Services.OmniTumblr
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
         }
+
+        private static string HtmlEncode(string? s)
+            => (s ?? "").Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
     }
 }
