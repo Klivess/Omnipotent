@@ -81,6 +81,7 @@ namespace Omnipotent.Services.KliveLLM
             LLamaBinariesDownloadPath = await GetStringOmniSetting("CustomLLamaBinariesDownloadLink", "https://github.com/Klivess/Omnipotent/raw/refs/heads/master/OldCPULLamaBinaries.zip", false, true);
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
+            await EnsureRemoteProviderSettingsExistAsync();
             client = new HttpClient();
 
             await EnsureLlamaBinariesAvailableAsync();
@@ -96,7 +97,9 @@ namespace Omnipotent.Services.KliveLLM
 
         private async void KliveLLM_OnOmniSettingsChanged(object? sender, OmniSettingsChangedEventArgs e)
         {
-            if (e.Setting.Name == "UseHuggingFaceProvider" && e.IsNewSetting)
+            bool valueChanged = string.Equals(e.PreviousValue, e.Setting.Value, StringComparison.Ordinal) == false;
+
+            if (e.Setting.Name == "UseHuggingFaceProvider" && valueChanged)
             {
                 if(e.Setting.Value == "false")
                 {
@@ -109,12 +112,20 @@ namespace Omnipotent.Services.KliveLLM
                     ServiceLog("Switched to remote LLM provider. Local model resources have been released.");
                 }
             }
-            if(e.Setting.Name == "LocalLLMGGUFDownloadURL" && e.IsNewSetting && await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
+            if(e.Setting.Name == "LocalLLMGGUFDownloadURL" && valueChanged && await GetBoolOmniSetting("UseHuggingFaceProvider", true) == false)
             {
                 ServiceLog("Local LLM model URL updated. Setting up local model...");
                 await SetupLocalLLM();
                 ServiceLog("Local LLM model URL updated. Model resources have been re-initialized with the new model.");
             }
+        }
+
+        private async Task EnsureRemoteProviderSettingsExistAsync()
+        {
+            await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", new[] { "HuggingFace", "OpenRouter" }, false, false);
+            await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, false);
+            await GetStringOmniSetting("OpenRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
+            await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
         }
         private async Task SetupLocalLLM()
         {

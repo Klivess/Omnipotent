@@ -25,6 +25,9 @@ namespace Omnipotent.Service_Manager
         public string ParentServiceName { get; set; }
         public string ParentServiceId { get; set; }
         public List<string> DropdownOptions { get; set; } = new();
+
+        [JsonIgnore]
+        public bool WasUsedThisSession { get; set; }
     }
 
     public class OmniSettingsChangedEventArgs : EventArgs
@@ -232,6 +235,8 @@ namespace Omnipotent.Service_Manager
                 isNewOrModified = true;
             }
 
+            MarkSettingUsedThisSession(setting);
+
             if (string.IsNullOrEmpty(setting.Value))
             {
                 var populatedMatch = settings.Values.FirstOrDefault(x =>
@@ -253,6 +258,7 @@ namespace Omnipotent.Service_Manager
                 await Task.Delay(2000);
                 if (settings.TryGetValue(ComposeKey(setting.ParentServiceId, setting.Name), out var recheck) && !string.IsNullOrEmpty(recheck.Value))
                 {
+                    MarkSettingUsedThisSession(recheck);
                     return recheck;
                 }
 
@@ -438,6 +444,8 @@ namespace Omnipotent.Service_Manager
                     }
                 }
 
+                MarkSettingUsedThisSession(s);
+
                 s.Type = type;
                 s.DropdownOptions = type == OmniSettingType.Dropdown ? normalizedDropdownOptions : new List<string>();
 
@@ -481,6 +489,51 @@ namespace Omnipotent.Service_Manager
 
         public Task<bool> SetDropdownOmniSetting(string name, string value, IEnumerable<string> dropdownOptions, string parentServiceId = null, string parentServiceName = null) =>
             SetOmniSetting(name, value, parentServiceId, parentServiceName, OmniSettingType.Dropdown, dropdownOptions: dropdownOptions);
+
+        public OmniSetting? FindExistingSetting(string name, string parentServiceId = null)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return null;
+            }
+
+            name = NormalizeSettingName(name);
+            string? normalizedParentServiceId = string.IsNullOrWhiteSpace(parentServiceId) ? null : NormalizeParentServiceId(parentServiceId);
+
+            if (normalizedParentServiceId != null && settings.TryGetValue(ComposeKey(normalizedParentServiceId, name), out var exactSetting))
+            {
+                return exactSetting;
+            }
+
+            return settings.Values.FirstOrDefault(setting =>
+                NormalizeSettingName(setting.Name).Equals(name, StringComparison.OrdinalIgnoreCase)
+                && (normalizedParentServiceId == null || NormalizeParentServiceId(setting.ParentServiceId) == normalizedParentServiceId));
+        }
+
+        public async Task<bool> DeleteOmniSetting(string name, string parentServiceId = null)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return false;
+            }
+
+            OmniSetting? existingSetting = FindExistingSetting(name, parentServiceId);
+            if (existingSetting == null)
+            {
+                return false;
+            }
+
+            string resolvedKey = ComposeKey(existingSetting.ParentServiceId, existingSetting.Name);
+            bool removed = settings.TryRemove(resolvedKey, out _);
+            if (!removed)
+            {
+                return false;
+            }
+
+            pendingFulfillmentPromptIds.TryRemove(resolvedKey, out _);
+            await SaveSettings();
+            return true;
+        }
 
 
         // --- Utilities & Routes ---
@@ -538,6 +591,11 @@ namespace Omnipotent.Service_Manager
             return matchedValue ?? dropdownOptions[0];
         }
 
+        private static void MarkSettingUsedThisSession(OmniSetting setting)
+        {
+            setting.WasUsedThisSession = true;
+        }
+
         private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
 
         private void RaiseSettingsChanged(OmniSetting setting, string previousValue, bool isNewSetting)
@@ -574,6 +632,7 @@ namespace Omnipotent.Service_Manager
                         s.Sensitive,
                         s.ParentServiceId,
                         s.ParentServiceName,
+                        s.WasUsedThisSession,
                         s.DropdownOptions,
                         Value = (s.Sensitive && !revealSensitive) ? MaskSensitive(s.Value) : s.Value
                     }).ToList();
@@ -615,6 +674,7 @@ namespace Omnipotent.Service_Manager
                         s.Sensitive,
                         s.ParentServiceId,
                         s.ParentServiceName,
+                        s.WasUsedThisSession,
                         s.DropdownOptions,
                         Value = s.Sensitive ? MaskSensitive(s.Value) : s.Value
                     }), "application/json");

@@ -20,6 +20,90 @@ namespace Omnipotent.Services.OmniTumblr
         // Completed callback flows awaiting the frontend to acknowledge
         private readonly ConcurrentDictionary<string, OmniTumblrAccount> completedCallbackFlows = new();
 
+        private sealed class PersistedOmniTumblrAccount
+        {
+            public string AccountId { get; set; } = RandomGeneration.GenerateRandomLengthOfNumbers(8);
+            public string BlogName { get; set; } = string.Empty;
+            public string ConsumerKey { get; set; } = string.Empty;
+            public string ConsumerSecret { get; set; } = string.Empty;
+            public string? OAuthToken { get; set; }
+            public string? OAuthTokenSecret { get; set; }
+            public bool IsActive { get; set; } = true;
+            public bool IsPaused { get; set; }
+            public DateTime AddedDate { get; set; } = DateTime.UtcNow;
+            public DateTime? LastPostTime { get; set; }
+            public List<string> Tags { get; set; } = new();
+            public string Notes { get; set; } = string.Empty;
+            public long FollowerCount { get; set; }
+            public long PostCount { get; set; }
+            public long LikesCount { get; set; }
+            public string AvatarUrl { get; set; } = string.Empty;
+            public string Description { get; set; } = string.Empty;
+            public string Title { get; set; } = string.Empty;
+            public string Url { get; set; } = string.Empty;
+            public OmniTumblrConnectionStatus ConnectionStatus { get; set; } = OmniTumblrConnectionStatus.Disconnected;
+            public string ConnectionErrorMessage { get; set; } = string.Empty;
+            public OmniTumblrAccountContentConfig ContentConfig { get; set; } = new();
+
+            public static PersistedOmniTumblrAccount FromAccount(OmniTumblrAccount account)
+            {
+                return new PersistedOmniTumblrAccount
+                {
+                    AccountId = account.AccountId,
+                    BlogName = account.BlogName,
+                    ConsumerKey = account.ConsumerKey,
+                    ConsumerSecret = account.ConsumerSecret,
+                    OAuthToken = account.OAuthToken,
+                    OAuthTokenSecret = account.OAuthTokenSecret,
+                    IsActive = account.IsActive,
+                    IsPaused = account.IsPaused,
+                    AddedDate = account.AddedDate,
+                    LastPostTime = account.LastPostTime,
+                    Tags = account.Tags ?? new List<string>(),
+                    Notes = account.Notes,
+                    FollowerCount = account.FollowerCount,
+                    PostCount = account.PostCount,
+                    LikesCount = account.LikesCount,
+                    AvatarUrl = account.AvatarUrl,
+                    Description = account.Description,
+                    Title = account.Title,
+                    Url = account.Url,
+                    ConnectionStatus = account.ConnectionStatus,
+                    ConnectionErrorMessage = account.ConnectionErrorMessage,
+                    ContentConfig = account.ContentConfig ?? new OmniTumblrAccountContentConfig(),
+                };
+            }
+
+            public OmniTumblrAccount ToAccount()
+            {
+                return new OmniTumblrAccount
+                {
+                    AccountId = AccountId,
+                    BlogName = BlogName,
+                    ConsumerKey = ConsumerKey,
+                    ConsumerSecret = ConsumerSecret,
+                    OAuthToken = OAuthToken,
+                    OAuthTokenSecret = OAuthTokenSecret,
+                    IsActive = IsActive,
+                    IsPaused = IsPaused,
+                    AddedDate = AddedDate,
+                    LastPostTime = LastPostTime,
+                    Tags = Tags ?? new List<string>(),
+                    Notes = Notes,
+                    FollowerCount = FollowerCount,
+                    PostCount = PostCount,
+                    LikesCount = LikesCount,
+                    AvatarUrl = AvatarUrl,
+                    Description = Description,
+                    Title = Title,
+                    Url = Url,
+                    ConnectionStatus = ConnectionStatus,
+                    ConnectionErrorMessage = ConnectionErrorMessage,
+                    ContentConfig = ContentConfig ?? new OmniTumblrAccountContentConfig(),
+                };
+            }
+        }
+
         private class PendingOAuthFlow
         {
             public string? FlowId { get; set; }
@@ -198,7 +282,6 @@ namespace Omnipotent.Services.OmniTumblr
             apiInstances[account.AccountId] = client;
 
             await SaveAccountToDisk(account);
-            await SaveCredentialsToSettings(account);
 
             await service.ServiceLog($"[OmniTumblr] Added account '{blogName}' (ID: {account.AccountId}).");
 
@@ -220,6 +303,8 @@ namespace Omnipotent.Services.OmniTumblr
 
             var accountFile = Path.Combine(OmniPaths.GlobalPaths.OmniTumblrAccountsDirectory, $"{account.BlogName}.json");
             if (File.Exists(accountFile)) File.Delete(accountFile);
+
+            await DeleteLegacyCredentialSettingsAsync(account.BlogName);
 
             await service.ServiceLog($"[OmniTumblr] Removed account '{account.BlogName}' (ID: {accountId}).");
             return true;
@@ -340,14 +425,23 @@ namespace Omnipotent.Services.OmniTumblr
                 try
                 {
                     var json = await File.ReadAllTextAsync(file);
-                    var account = JsonConvert.DeserializeObject<OmniTumblrAccount>(json);
+                    var persistedAccount = JsonConvert.DeserializeObject<PersistedOmniTumblrAccount>(json);
+                    var account = persistedAccount?.ToAccount();
                     if (account != null && !string.IsNullOrEmpty(account.AccountId))
                     {
-                        // Credentials are stored in OmniSettings (sensitive), not in JSON
-                        account.ConsumerKey = await service.GetStringOmniSetting($"OmniTumblr_ConsumerKey_{account.BlogName}", sensitive: true);
-                        account.ConsumerSecret = await service.GetStringOmniSetting($"OmniTumblr_ConsumerSecret_{account.BlogName}", sensitive: true);
-                        account.OAuthToken = await service.GetStringOmniSetting($"OmniTumblr_OAuthToken_{account.BlogName}", sensitive: true);
-                        account.OAuthTokenSecret = await service.GetStringOmniSetting($"OmniTumblr_OAuthTokenSecret_{account.BlogName}", sensitive: true);
+                        bool migrated = false;
+
+                        migrated |= await PopulateFromLegacySettingIfMissingAsync(account, $"OmniTumblr_ConsumerKey_{account.BlogName}", value => account.ConsumerKey = value);
+                        migrated |= await PopulateFromLegacySettingIfMissingAsync(account, $"OmniTumblr_ConsumerSecret_{account.BlogName}", value => account.ConsumerSecret = value);
+                        migrated |= await PopulateFromLegacySettingIfMissingAsync(account, $"OmniTumblr_OAuthToken_{account.BlogName}", value => account.OAuthToken = value);
+                        migrated |= await PopulateFromLegacySettingIfMissingAsync(account, $"OmniTumblr_OAuthTokenSecret_{account.BlogName}", value => account.OAuthTokenSecret = value);
+
+                        if (migrated)
+                        {
+                            await SaveAccountToDisk(account);
+                            await DeleteLegacyCredentialSettingsAsync(account.BlogName);
+                            await service.ServiceLog($"[OmniTumblr] Migrated legacy credential settings for '{account.BlogName}' into the account file.");
+                        }
 
                         accounts[account.AccountId] = account;
                     }
@@ -369,7 +463,7 @@ namespace Omnipotent.Services.OmniTumblr
                     if (string.IsNullOrEmpty(account.ConsumerKey))
                     {
                         account.ConnectionStatus = OmniTumblrConnectionStatus.Disconnected;
-                        account.ConnectionErrorMessage = "Missing Consumer Key in settings.";
+                        account.ConnectionErrorMessage = "Missing Consumer Key in account file.";
                         await SaveAccountToDisk(account);
                         continue;
                     }
@@ -393,7 +487,8 @@ namespace Omnipotent.Services.OmniTumblr
             try
             {
                 var filePath = Path.Combine(OmniPaths.GlobalPaths.OmniTumblrAccountsDirectory, $"{account.BlogName}.json");
-                var json = JsonConvert.SerializeObject(account, Formatting.Indented);
+                var persistedAccount = PersistedOmniTumblrAccount.FromAccount(account);
+                var json = JsonConvert.SerializeObject(persistedAccount, Formatting.Indented);
                 await File.WriteAllTextAsync(filePath, json);
             }
             catch (Exception ex)
@@ -402,15 +497,26 @@ namespace Omnipotent.Services.OmniTumblr
             }
         }
 
-        private async Task SaveCredentialsToSettings(OmniTumblrAccount account)
+        private async Task<bool> PopulateFromLegacySettingIfMissingAsync(OmniTumblrAccount account, string settingName, Action<string> applyValue)
         {
             var settingsManager = await service.GetOmniGlobalSettingsManager();
-            await settingsManager.SetStringOmniSetting($"OmniTumblr_ConsumerKey_{account.BlogName}", account.ConsumerKey);
-            await settingsManager.SetStringOmniSetting($"OmniTumblr_ConsumerSecret_{account.BlogName}", account.ConsumerSecret);
-            if (account.OAuthToken != null)
-                await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthToken_{account.BlogName}", account.OAuthToken);
-            if (account.OAuthTokenSecret != null)
-                await settingsManager.SetStringOmniSetting($"OmniTumblr_OAuthTokenSecret_{account.BlogName}", account.OAuthTokenSecret);
+            string? legacyValue = settingsManager.FindExistingSetting(settingName)?.Value;
+            if (string.IsNullOrWhiteSpace(legacyValue))
+            {
+                return false;
+            }
+
+            applyValue(legacyValue);
+            return true;
+        }
+
+        private async Task DeleteLegacyCredentialSettingsAsync(string blogName)
+        {
+            var settingsManager = await service.GetOmniGlobalSettingsManager();
+            await settingsManager.DeleteOmniSetting($"OmniTumblr_ConsumerKey_{blogName}");
+            await settingsManager.DeleteOmniSetting($"OmniTumblr_ConsumerSecret_{blogName}");
+            await settingsManager.DeleteOmniSetting($"OmniTumblr_OAuthToken_{blogName}");
+            await settingsManager.DeleteOmniSetting($"OmniTumblr_OAuthTokenSecret_{blogName}");
         }
     }
 }

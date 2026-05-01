@@ -24,6 +24,90 @@ namespace Omnipotent.Services.OmniGram
         private string[] proxyPool = Array.Empty<string>();
         private int proxyIndex = 0;
 
+        private sealed class PersistedOmniGramAccount
+        {
+            public string AccountId { get; set; } = RandomGeneration.GenerateRandomLengthOfNumbers(8);
+            public string Username { get; set; } = string.Empty;
+            public string Password { get; set; } = string.Empty;
+            public string ProxyAddress { get; set; } = string.Empty;
+            public bool IsActive { get; set; } = true;
+            public bool IsPaused { get; set; }
+            public DateTime AddedDate { get; set; } = DateTime.UtcNow;
+            public DateTime? LastLoginTime { get; set; }
+            public DateTime? LastPostTime { get; set; }
+            public DateTime? LastLoginAttemptTime { get; set; }
+            public List<string> Tags { get; set; } = new();
+            public string Notes { get; set; } = string.Empty;
+            public int FollowerCount { get; set; }
+            public int FollowingCount { get; set; }
+            public int MediaCount { get; set; }
+            public string ProfilePicUrl { get; set; } = string.Empty;
+            public string Biography { get; set; } = string.Empty;
+            public OmniGramLoginStatus LoginStatus { get; set; } = OmniGramLoginStatus.LoggedOut;
+            public int LoginRetryCount { get; set; }
+            public string LoginErrorMessage { get; set; } = string.Empty;
+            public string DeviceData { get; set; } = string.Empty;
+            public OmniGramAccountContentConfig ContentConfig { get; set; } = new();
+
+            public static PersistedOmniGramAccount FromAccount(OmniGramAccount account)
+            {
+                return new PersistedOmniGramAccount
+                {
+                    AccountId = account.AccountId,
+                    Username = account.Username,
+                    Password = account.Password,
+                    ProxyAddress = account.ProxyAddress,
+                    IsActive = account.IsActive,
+                    IsPaused = account.IsPaused,
+                    AddedDate = account.AddedDate,
+                    LastLoginTime = account.LastLoginTime,
+                    LastPostTime = account.LastPostTime,
+                    LastLoginAttemptTime = account.LastLoginAttemptTime,
+                    Tags = account.Tags ?? new List<string>(),
+                    Notes = account.Notes,
+                    FollowerCount = account.FollowerCount,
+                    FollowingCount = account.FollowingCount,
+                    MediaCount = account.MediaCount,
+                    ProfilePicUrl = account.ProfilePicUrl,
+                    Biography = account.Biography,
+                    LoginStatus = account.LoginStatus,
+                    LoginRetryCount = account.LoginRetryCount,
+                    LoginErrorMessage = account.LoginErrorMessage,
+                    DeviceData = account.DeviceData,
+                    ContentConfig = account.ContentConfig ?? new OmniGramAccountContentConfig(),
+                };
+            }
+
+            public OmniGramAccount ToAccount()
+            {
+                return new OmniGramAccount
+                {
+                    AccountId = AccountId,
+                    Username = Username,
+                    Password = Password,
+                    ProxyAddress = ProxyAddress,
+                    IsActive = IsActive,
+                    IsPaused = IsPaused,
+                    AddedDate = AddedDate,
+                    LastLoginTime = LastLoginTime,
+                    LastPostTime = LastPostTime,
+                    LastLoginAttemptTime = LastLoginAttemptTime,
+                    Tags = Tags ?? new List<string>(),
+                    Notes = Notes,
+                    FollowerCount = FollowerCount,
+                    FollowingCount = FollowingCount,
+                    MediaCount = MediaCount,
+                    ProfilePicUrl = ProfilePicUrl,
+                    Biography = Biography,
+                    LoginStatus = LoginStatus,
+                    LoginRetryCount = LoginRetryCount,
+                    LoginErrorMessage = LoginErrorMessage,
+                    DeviceData = DeviceData,
+                    ContentConfig = ContentConfig ?? new OmniGramAccountContentConfig(),
+                };
+            }
+        }
+
         public OmniGramAccountManager(OmniGram service)
         {
             this.service = service;
@@ -128,6 +212,8 @@ namespace Omnipotent.Services.OmniGram
             var sessionFile = Path.Combine(OmniPaths.GlobalPaths.OmniGramSessionsDirectory, $"{account.Username}.session");
             if (File.Exists(sessionFile)) File.Delete(sessionFile);
 
+            await DeleteLegacyPasswordSettingAsync(account.Username);
+
             await service.ServiceLog($"[OmniGram] Removed account {account.Username} (ID: {accountId}).");
             return true;
         }
@@ -200,12 +286,21 @@ namespace Omnipotent.Services.OmniGram
                 try
                 {
                     var json = await File.ReadAllTextAsync(file);
-                    var account = JsonConvert.DeserializeObject<OmniGramAccount>(json);
+                    var persistedAccount = JsonConvert.DeserializeObject<PersistedOmniGramAccount>(json);
+                    var account = persistedAccount?.ToAccount();
                     if (account != null && !string.IsNullOrEmpty(account.AccountId))
                     {
-                        // Password is loaded from OmniSettings (sensitive), not from the JSON file
-                        account.Password = await service.GetStringOmniSetting(
-                            $"OmniGram_AccountPassword_{account.Username}", sensitive: true);
+                        if (string.IsNullOrWhiteSpace(account.Password))
+                        {
+                            string? legacyPassword = await GetLegacySettingValueAsync($"OmniGram_AccountPassword_{account.Username}");
+                            if (string.IsNullOrWhiteSpace(legacyPassword) == false)
+                            {
+                                account.Password = legacyPassword;
+                                await SaveAccountToDisk(account);
+                                await DeleteLegacyPasswordSettingAsync(account.Username);
+                                await service.ServiceLog($"[OmniGram] Migrated legacy password setting for {account.Username} into the account file.");
+                            }
+                        }
 
                         accounts[account.AccountId] = account;
                     }
@@ -378,13 +473,26 @@ namespace Omnipotent.Services.OmniGram
             try
             {
                 var accountFile = Path.Combine(OmniPaths.GlobalPaths.OmniGramAccountsDirectory, $"{account.Username}.json");
-                var json = JsonConvert.SerializeObject(account, Formatting.Indented);
+                var persistedAccount = PersistedOmniGramAccount.FromAccount(account);
+                var json = JsonConvert.SerializeObject(persistedAccount, Formatting.Indented);
                 await File.WriteAllTextAsync(accountFile, json);
             }
             catch (Exception ex)
             {
                 await service.ServiceLogError(ex, $"[OmniGram] Failed to save account {account.Username}");
             }
+        }
+
+        private async Task<string?> GetLegacySettingValueAsync(string settingName)
+        {
+            var settingsManager = await service.GetOmniGlobalSettingsManager();
+            return settingsManager.FindExistingSetting(settingName)?.Value;
+        }
+
+        private async Task DeleteLegacyPasswordSettingAsync(string username)
+        {
+            var settingsManager = await service.GetOmniGlobalSettingsManager();
+            await settingsManager.DeleteOmniSetting($"OmniGram_AccountPassword_{username}");
         }
 
         public async Task SaveAllAccountsToDisk()
