@@ -9,6 +9,12 @@ namespace Omnipotent.Services.OmniTumblr
         public OmniTumblrMediaManager MediaManager { get; private set; }
         public OmniTumblrAnalyticsTracker AnalyticsTracker { get; private set; }
 
+        /// <summary>
+        /// The callback URL registered in the Tumblr app. Must match exactly.
+        /// Configurable via OmniSetting 'OmniTumblr_OAuthCallbackUrl'.
+        /// </summary>
+        public string OAuthCallbackUrl { get; private set; } = "https://klive.dev/omnitumblr/oauth/callback";
+
         public OmniTumblr()
         {
             name = "OmniTumblr";
@@ -18,6 +24,7 @@ namespace Omnipotent.Services.OmniTumblr
         protected override async void ServiceMain()
         {
             var enabled = await GetBoolOmniSetting("OmniTumblr_Enabled", defaultValue: true);
+            OAuthCallbackUrl = await GetStringOmniSetting("OmniTumblr_OAuthCallbackUrl", defaultValue: "https://klive.dev/omnitumblr/oauth/callback");
             if (!enabled)
             {
                 await ServiceLog("[OmniTumblr] Service is disabled via OmniSettings. Exiting.");

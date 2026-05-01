@@ -66,7 +66,7 @@ namespace Omnipotent.Services.OmniTumblr
                     }
 
                     var (flowId, authUrl) = await service.AccountManager.BeginOAuthFlowAsync(consumerKey, consumerSecret, blogName);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { flowId, authorizationUrl = authUrl }));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { flowId, authorizationUrl = authUrl, callbackUrl = service.OAuthCallbackUrl }));
                 }
                 catch (Exception ex)
                 {
@@ -110,6 +110,12 @@ namespace Omnipotent.Services.OmniTumblr
                         contentType: "text/html", code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
+
+            // GET /omnitumblr/oauth/callback-url — returns the configured OAuth callback URL
+            await service.CreateAPIRoute("/omnitumblr/oauth/callback-url", async (req) =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { callbackUrl = service.OAuthCallbackUrl }));
+            }, HttpMethod.Get, KMPermissions.Admin);
 
             // GET /omnitumblr/oauth/callback-status?flowId=X — poll to check if callback was received
             await service.CreateAPIRoute("/omnitumblr/oauth/callback-status", async (req) =>

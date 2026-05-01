@@ -21,10 +21,10 @@ namespace Omnipotent.Services.OmniTumblr
 
         /// <summary>Requests a temporary OAuth request token from Tumblr using the consumer credentials.</summary>
         public static async Task<(string RequestToken, string RequestTokenSecret)> GetRequestTokenAsync(
-            string consumerKey, string consumerSecret)
+            string consumerKey, string consumerSecret, string callbackUrl)
         {
             var oauthParams = BuildBaseParams(consumerKey);
-            oauthParams["oauth_callback"] = CallbackUrl;
+            oauthParams["oauth_callback"] = callbackUrl;
 
             var signature = ComputeSignature(HttpMethod.Post.Method, RequestTokenUrl, oauthParams, consumerSecret, "");
             oauthParams["oauth_signature"] = signature;

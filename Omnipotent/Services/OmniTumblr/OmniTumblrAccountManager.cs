@@ -82,7 +82,7 @@ namespace Omnipotent.Services.OmniTumblr
         /// </summary>
         public async Task<(string FlowId, string AuthorizationUrl)> BeginOAuthFlowAsync(string consumerKey, string consumerSecret, string blogName)
         {
-            var (requestToken, requestTokenSecret) = await OmniTumblrOAuthHelper.GetRequestTokenAsync(consumerKey, consumerSecret);
+            var (requestToken, requestTokenSecret) = await OmniTumblrOAuthHelper.GetRequestTokenAsync(consumerKey, consumerSecret, service.OAuthCallbackUrl);
 
             var flowId = Guid.NewGuid().ToString("N");
             var flow = new PendingOAuthFlow
