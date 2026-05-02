@@ -16,7 +16,7 @@ namespace Omnipotent.Services.KliveCloud
             this.parent = parent;
         }
 
-        private static bool TryParseSharePermissionMode(string rawMode, out KliveCloud.SharePermissionMode mode)
+        private static bool TryParseSharePermissionMode(string? rawMode, out KliveCloud.SharePermissionMode mode)
         {
             mode = KliveCloud.SharePermissionMode.ReadOnly;
             if (string.IsNullOrWhiteSpace(rawMode))
@@ -48,7 +48,7 @@ namespace Omnipotent.Services.KliveCloud
 
         private async Task<(KliveCloud.ShareLink Link, CloudItem Root)?> ResolveShareScope(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req)
         {
-            string shareCode = req.userParameters.Get("code");
+            string? shareCode = req.userParameters.Get("code");
             if (string.IsNullOrEmpty(shareCode))
             {
                 await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
@@ -79,7 +79,7 @@ namespace Omnipotent.Services.KliveCloud
             return (link, root);
         }
 
-        private CloudItem ResolveSharedFileTarget(KliveCloud.ShareLink link, CloudItem root, string requestedItemID)
+        private CloudItem? ResolveSharedFileTarget(KliveCloud.ShareLink link, CloudItem root, string? requestedItemID)
         {
             if (root.ItemType == CloudItemType.File)
             {
@@ -112,7 +112,7 @@ namespace Omnipotent.Services.KliveCloud
             var fileInfo = new FileInfo(filePath);
             long fileLength = fileInfo.Length;
             string mimeType = parent.GetVideoMimeType(item);
-            string rangeHeader = req.req.Headers["Range"];
+            string? rangeHeader = req.req.Headers["Range"];
 
             if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
             {
@@ -278,8 +278,8 @@ namespace Omnipotent.Services.KliveCloud
             {
                 try
                 {
-                    string name = req.userParameters.Get("name");
-                    string parentFolderID = req.userParameters.Get("parentFolderID");
+                    string name = req.userParameters.Get("name") ?? string.Empty;
+                    string parentFolderID = req.userParameters.Get("parentFolderID") ?? string.Empty;
                     string permLevelStr = req.userParameters.Get("permissionLevel");
 
                     if (string.IsNullOrEmpty(name))
@@ -315,8 +315,8 @@ namespace Omnipotent.Services.KliveCloud
             {
                 try
                 {
-                    string fileName = req.userParameters.Get("fileName");
-                    string parentFolderID = req.userParameters.Get("parentFolderID");
+                    string fileName = req.userParameters.Get("fileName") ?? string.Empty;
+                    string parentFolderID = req.userParameters.Get("parentFolderID") ?? string.Empty;
                     string permLevelStr = req.userParameters.Get("permissionLevel");
 
                     if (string.IsNullOrEmpty(fileName))
@@ -678,6 +678,67 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Post, KMPermissions.Guest);
 
+            await parent.CreateAPIRoute("/KliveCloud/UpdateShareLinkPermission", async (req) =>
+            {
+                try
+                {
+                    string shareCode = req.userParameters.Get("code") ?? string.Empty;
+                    string permissionModeStr = req.userParameters.Get("permissionMode") ?? string.Empty;
+                    var user = req.user;
+                    if (user == null)
+                    {
+                        await req.ReturnResponse("AccessDenied", code: HttpStatusCode.Unauthorized);
+                        return;
+                    }
+
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.CreatedByUserID != user.UserID && user.KlivesManagementRank < KMPermissions.Admin)
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    if (!TryParseSharePermissionMode(permissionModeStr, out var permissionMode))
+                    {
+                        await req.ReturnResponse("InvalidSharePermissionMode", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(link.ItemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("SharedItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (item.ItemType != CloudItemType.Folder && permissionMode != KliveCloud.SharePermissionMode.ReadOnly)
+                    {
+                        await req.ReturnResponse("WritableShareLinksRequireFolder", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    await parent.UpdateShareLinkPermission(shareCode, permissionMode);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        ShareCode = link.ShareCode,
+                        ItemID = link.ItemID,
+                        SharePermissionMode = link.PermissionMode.ToString(),
+                        CanWrite = parent.CanWriteThroughShareLink(link),
+                        CanDelete = parent.CanDeleteThroughShareLink(link)
+                    }), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
             // List all share links created by the current user (Admins and Klives see all)
             await parent.CreateAPIRoute("/KliveCloud/ListShareLinks", async (req) =>
             {
@@ -772,6 +833,9 @@ namespace Omnipotent.Services.KliveCloud
                     {
                         effectiveItem.ItemID,
                         effectiveItem.Name,
+                        effectiveItem.RelativePath,
+                        effectiveItem.ParentFolderID,
+                        effectiveItem.CreatedByUserID,
                         ItemType = effectiveItem.ItemType.ToString(),
                         effectiveItem.FileSizeBytes,
                         effectiveItem.CreatedDate,
@@ -872,6 +936,53 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
 
+            await parent.CreateAPIRoute("/KliveCloud/GetSharedPreview", async (req) =>
+            {
+                try
+                {
+                    var scope = await ResolveShareScope(req);
+                    if (scope == null) return;
+
+                    var (link, root) = scope.Value;
+                    var item = ResolveSharedFileTarget(link, root, req.userParameters.Get("itemID"));
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("SharedFileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (!parent.IsPreviewable(item))
+                    {
+                        await req.ReturnResponse("ItemNotPreviewable", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    int maxWidth = 320;
+                    int maxHeight = 320;
+                    string? widthStr = req.userParameters.Get("maxWidth");
+                    string? heightStr = req.userParameters.Get("maxHeight");
+                    if (!string.IsNullOrEmpty(widthStr) && int.TryParse(widthStr, out int parsedWidth))
+                        maxWidth = Math.Clamp(parsedWidth, 16, 1920);
+                    if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out int parsedHeight))
+                        maxHeight = Math.Clamp(parsedHeight, 16, 1920);
+
+                    byte[] thumbnailData = await parent.GeneratePreview(item, maxWidth, maxHeight);
+                    if (thumbnailData == null)
+                    {
+                        await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
+                        return;
+                    }
+
+                    NameValueCollection previewHeaders = new();
+                    previewHeaders.Add("Cache-Control", "public, max-age=3600");
+                    await req.ReturnBinaryResponse(thumbnailData, "image/jpeg", HttpStatusCode.OK, previewHeaders);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
+
             await parent.CreateAPIRoute("/KliveCloud/CreateSharedFolder", async (req) =>
             {
                 try
@@ -886,8 +997,14 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    string name = req.userParameters.Get("name");
-                    string parentFolderID = req.userParameters.Get("parentFolderID");
+                    string name = req.userParameters.Get("name") ?? string.Empty;
+                    string parentFolderID = req.userParameters.Get("parentFolderID") ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        await req.ReturnResponse("FolderNameRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
                     if (string.IsNullOrWhiteSpace(parentFolderID))
                     {
                         parentFolderID = root.ItemID;
@@ -923,8 +1040,14 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    string fileName = req.userParameters.Get("fileName");
-                    string parentFolderID = req.userParameters.Get("parentFolderID");
+                    string fileName = req.userParameters.Get("fileName") ?? string.Empty;
+                    string parentFolderID = req.userParameters.Get("parentFolderID") ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(fileName))
+                    {
+                        await req.ReturnResponse("FileNameRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
                     if (string.IsNullOrWhiteSpace(parentFolderID))
                     {
                         parentFolderID = root.ItemID;

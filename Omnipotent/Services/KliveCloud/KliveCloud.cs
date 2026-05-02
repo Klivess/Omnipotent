@@ -2,6 +2,7 @@ using FFMpegCore;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using System.Runtime.Serialization;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.KliveCloud.CloudItem;
 
@@ -79,6 +80,19 @@ namespace Omnipotent.Services.KliveCloud
             public DateTime CreatedDate;
             public DateTime? ExpirationDate;
             public SharePermissionMode PermissionMode = SharePermissionMode.ReadOnly;
+
+            [JsonProperty("SharePermissionMode", NullValueHandling = NullValueHandling.Ignore)]
+            public SharePermissionMode? LegacySharePermissionMode { get; set; }
+
+            [OnDeserialized]
+            internal void OnDeserialized(StreamingContext context)
+            {
+                if (LegacySharePermissionMode.HasValue)
+                {
+                    PermissionMode = LegacySharePermissionMode.Value;
+                    LegacySharePermissionMode = null;
+                }
+            }
         }
 
         public enum SharePermissionMode
@@ -136,6 +150,18 @@ namespace Omnipotent.Services.KliveCloud
             await SaveShareLinks();
             ServiceLog($"Share link created for item {itemID} by user {createdByUserID}.");
             return link;
+        }
+
+        public async Task<bool> UpdateShareLinkPermission(string shareCode, SharePermissionMode permissionMode)
+        {
+            var link = GetShareLinkByCode(shareCode);
+            if (link == null) return false;
+
+            link.PermissionMode = permissionMode;
+            link.LegacySharePermissionMode = null;
+            await SaveShareLinks();
+            ServiceLog($"Share link {shareCode} permission updated to {permissionMode}.");
+            return true;
         }
 
         public bool CanWriteThroughShareLink(ShareLink link)
