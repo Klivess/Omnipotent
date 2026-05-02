@@ -18,9 +18,12 @@ namespace Omnipotent.Services.OmniUpdater
         private const string GitHubOwner = "Klivess";
         private const string GitHubRepo = "Omnipotent";
         private const string Branch = "master";
-        private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(2);
+        private const string PollIntervalSettingName = "OmniUpdaterPollIntervalSeconds";
+        private const int DefaultPollIntervalSeconds = 15;
+        private const int MinimumPollIntervalSeconds = 5;
+        private const int MaximumPollIntervalSeconds = 3600;
 
-        private string stateFilePath;
+        private string stateFilePath = string.Empty;
         private string lastSeenSha = string.Empty;
         private string? lastEtag;
 
@@ -75,13 +78,34 @@ namespace Omnipotent.Services.OmniUpdater
                         await ServiceLogError(ex, "OmniUpdater poll iteration failed");
                     }
 
-                    try { await Task.Delay(PollInterval, cancellationToken.Token); }
+                    TimeSpan pollInterval = await GetPollInterval();
+                    try { await Task.Delay(pollInterval, cancellationToken.Token); }
                     catch (OperationCanceledException) { break; }
                 }
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "OmniUpdater service crashed");
+            }
+        }
+
+        private async Task<TimeSpan> GetPollInterval()
+        {
+            try
+            {
+                int configuredSeconds = await GetIntOmniSetting(PollIntervalSettingName, DefaultPollIntervalSeconds);
+                int clampedSeconds = Math.Clamp(configuredSeconds, MinimumPollIntervalSeconds, MaximumPollIntervalSeconds);
+                if (configuredSeconds != clampedSeconds)
+                {
+                    await ServiceLogError($"{PollIntervalSettingName}={configuredSeconds} is outside the allowed range ({MinimumPollIntervalSeconds}-{MaximumPollIntervalSeconds}); using {clampedSeconds} seconds.", false);
+                }
+
+                return TimeSpan.FromSeconds(clampedSeconds);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"Failed to load {PollIntervalSettingName}; using {DefaultPollIntervalSeconds} seconds.", false);
+                return TimeSpan.FromSeconds(DefaultPollIntervalSeconds);
             }
         }
 

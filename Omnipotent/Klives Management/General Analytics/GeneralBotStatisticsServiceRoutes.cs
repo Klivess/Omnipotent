@@ -1,6 +1,5 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Service_Manager;
-using System.Diagnostics;
 
 namespace Omnipotent.Klives_Management.General_Analytics
 {
@@ -186,24 +185,20 @@ namespace Omnipotent.Klives_Management.General_Analytics
             {
                 try
                 {
-                    string repoRoot = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
-                    string scriptPath = Path.Combine(repoRoot, "SyncAndStartOmnipotent.bat");
-                    if (!File.Exists(scriptPath))
+                    string scriptPath;
+                    try
                     {
-                        await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = $"Update script not found at {scriptPath}" }), code: System.Net.HttpStatusCode.InternalServerError);
+                        scriptPath = ExistentialBotUtilities.GetUpdateBotScriptPath();
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = false, Error = "Update script SyncAndStartOmnipotent.bat could not be found." }), code: System.Net.HttpStatusCode.InternalServerError);
                         return;
                     }
 
                     g.ServiceLog($"Bot update requested by {req.user.Name}. Launching update script...");
 
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = "cmd.exe",
-                        Arguments = $"/c \"{scriptPath}\"",
-                        WorkingDirectory = repoRoot,
-                        UseShellExecute = true,
-                        CreateNoWindow = false
-                    });
+                    ExistentialBotUtilities.LaunchUpdateBotProcess(scriptPath);
 
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Success = true, Message = "Update script launched. The bot will restart shortly." }));
                 }

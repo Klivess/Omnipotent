@@ -10,32 +10,47 @@ namespace Omnipotent.Service_Manager
             Environment.Exit(-1);
         }
 
-        public static void UpdateBot()
+        public static string GetUpdateBotScriptPath()
         {
-            //iteratively search backwards for full path of SyncAndStartOmnipotent.bat
             string currentPath = AppDomain.CurrentDomain.BaseDirectory;
-            bool found = false;
-            while (found == false)
+            while (true)
             {
                 string updateFilePath = Path.Combine(currentPath, "SyncAndStartOmnipotent.bat");
                 if (File.Exists(updateFilePath))
                 {
-                    Process.Start(updateFilePath);
-                    break;
+                    return updateFilePath;
                 }
-                else
+
+                var parentDirectory = Directory.GetParent(currentPath);
+                if (parentDirectory != null)
                 {
-                    var parentDirectory = Directory.GetParent(currentPath);
-                    if (parentDirectory != null)
-                    {
-                        currentPath = parentDirectory.FullName;
-                    }
-                    else
-                    {
-                        throw new FileNotFoundException("SyncAndStartOmnipotent.bat not found in any parent directories.");
-                    }
+                    currentPath = parentDirectory.FullName;
+                    continue;
                 }
+
+                throw new FileNotFoundException("SyncAndStartOmnipotent.bat not found in any parent directories.");
             }
+        }
+
+        public static Process? LaunchUpdateBotProcess(string? scriptPath = null)
+        {
+            scriptPath ??= GetUpdateBotScriptPath();
+            string repoRoot = Path.GetDirectoryName(scriptPath)
+                ?? throw new DirectoryNotFoundException($"Could not determine working directory for update script: {scriptPath}");
+
+            return Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"{scriptPath}\"",
+                WorkingDirectory = repoRoot,
+                UseShellExecute = true,
+                CreateNoWindow = false
+            });
+        }
+
+        public static void UpdateBot()
+        {
+            LaunchUpdateBotProcess();
         }
 
         public static void QuitBot()
