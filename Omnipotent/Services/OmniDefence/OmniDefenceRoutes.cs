@@ -182,22 +182,13 @@ namespace Omnipotent.Services.OmniDefence
             // Unblock
             await parent.CreateAPIRoute("/omnidefence/ip/unblock", async req =>
             {
-                var body = ParseJsonBody(req);
-                string ip = (body["ip"] as string ?? "").Trim();
-                if (string.IsNullOrEmpty(ip)) { await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest); return; }
-                var rec = parent.Tracker.GetOrCreate(ip);
-                lock (rec) { rec.Status = nameof(IpThreatTracker.IpStatus.Normal); rec.LastBlockReason = null; }
-                await parent.Tracker.PersistAsync(rec);
-                await parent.RecordIpEventAsync(new IpEventRow
-                {
-                    UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    Ip = ip,
-                    Kind = "Unblock",
-                    ActorProfileId = req.user?.UserID,
-                    ActorProfileName = req.user?.Name,
-                    Detail = null
-                });
-                await req.ReturnResponse("{\"ok\":true}", "application/json");
+                await ResetIpToNormalAsync(parent, req, "Unblock");
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+
+            // Untrap / release hostile statuses (Blocked / Tarpit / Honeypot)
+            await parent.CreateAPIRoute("/omnidefence/ip/untrap", async req =>
+            {
+                await ResetIpToNormalAsync(parent, req, "Untrap");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
             // Set status (Watch / Tarpit / Honeypot / Normal / Blocked)
@@ -218,7 +209,11 @@ namespace Omnipotent.Services.OmniDefence
                     return;
                 }
                 var rec = parent.Tracker.GetOrCreate(ip);
-                lock (rec) { rec.Status = parsed.ToString(); }
+                lock (rec)
+                {
+                    rec.Status = parsed.ToString();
+                    if (parsed != IpThreatTracker.IpStatus.Blocked) rec.LastBlockReason = null;
+                }
                 await parent.Tracker.PersistAsync(rec);
                 await parent.RecordIpEventAsync(new IpEventRow
                 {
@@ -511,6 +506,36 @@ namespace Omnipotent.Services.OmniDefence
                 return dict ?? new();
             }
             catch { return new(); }
+        }
+
+        private static async Task ResetIpToNormalAsync(OmniDefence parent, KliveAPI.KliveAPI.UserRequest req, string eventKind)
+        {
+            var body = ParseJsonBody(req);
+            string ip = (body["ip"] as string ?? "").Trim();
+            string? detail = body["reason"] as string ?? body["detail"] as string;
+            if (string.IsNullOrEmpty(ip))
+            {
+                await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var rec = parent.Tracker.GetOrCreate(ip);
+            lock (rec)
+            {
+                rec.Status = nameof(IpThreatTracker.IpStatus.Normal);
+                rec.LastBlockReason = null;
+            }
+            await parent.Tracker.PersistAsync(rec);
+            await parent.RecordIpEventAsync(new IpEventRow
+            {
+                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                Ip = ip,
+                Kind = eventKind,
+                ActorProfileId = req.user?.UserID,
+                ActorProfileName = req.user?.Name,
+                Detail = detail
+            });
+            await req.ReturnResponse("{\"ok\":true}", "application/json");
         }
 
         private static string ToCsv(List<Dictionary<string, object?>> rows)
