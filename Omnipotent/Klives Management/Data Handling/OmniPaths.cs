@@ -143,6 +143,9 @@ namespace Omnipotent.Data_Handling
             public static string KliveAgentScriptLogsDirectory = $"{KliveAgentDirectory}/ScriptLogs";
             public static string KliveAgentIndexDirectory = $"{KliveAgentDirectory}/Index";
 
+            //OmniUpdater
+            public static string OmniUpdaterDirectory = $"{SavedDataDirectory}/OmniUpdater";
+
         };
 
         public static string GetPath(string path)

@@ -81,6 +81,7 @@ namespace Omnipotent
                 }
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniUpdater.OmniUpdater());
 
                 testTask();
 

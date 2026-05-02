@@ -142,11 +142,12 @@ namespace Omnipotent.Service_Manager
 
                 Thread ramAndCpuCounters = new(UpdateCPUandRAMCounters);
                 ramAndCpuCounters.Start();
-                _ = SetupUptimeTrackingAsync();
+                await SetupUptimeTrackingAsync();
+                await ServiceLog("OmniServiceMonitor uptime and terminal routes registered.");
             }
             catch (Exception ex)
             {
-                ServiceLogError(ex, "Error in ServiceMain.");
+                await ServiceLogError(ex, "Error in ServiceMain.");
             }
         }
 

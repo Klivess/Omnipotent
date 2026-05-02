@@ -62,7 +62,8 @@ namespace Omnipotent.Service_Manager
             {
                 Directory.CreateDirectory(settingsDirectory);
                 await LoadSavedSettings();
-                CreateRoutes();
+                await CreateRoutesAsync();
+                await ServiceLog("OmniGlobalSettings routes registered.");
             }
             catch (Exception ex)
             {
@@ -628,7 +629,7 @@ namespace Omnipotent.Service_Manager
             return new string('*', v.Length - 4) + v.Substring(v.Length - 4);
         }
 
-        private async void CreateRoutes()
+        private async Task CreateRoutesAsync()
         {
             await CreateAPIRoute("/OmniGlobalSettings/List", async (req) =>
             {

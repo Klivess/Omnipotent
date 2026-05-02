@@ -590,17 +590,32 @@ namespace Omnipotent.Services.KliveCloud
             return Path.Combine(embedsDir, $"{itemID}_discord.mp4");
         }
 
+        private Task RemuxDiscordOptimizedMp4(string sourcePath, string cachePath)
+        {
+            return FFMpegArguments
+                .FromFileInput(sourcePath)
+                .OutputToFile(cachePath, true, options => options
+                    .WithCustomArgument("-map 0:v:0 -map 0:a? -c copy -movflags +faststart")
+                    .ForceFormat("mp4"))
+                .ProcessAsynchronously();
+        }
+
+        private Task TranscodeDiscordOptimizedMp4(string sourcePath, string cachePath)
+        {
+            return FFMpegArguments
+                .FromFileInput(sourcePath)
+                .OutputToFile(cachePath, true, options => options
+                    .WithCustomArgument("-map 0:v:0 -map 0:a? -vf \"scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2\" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart")
+                    .ForceFormat("mp4"))
+                .ProcessAsynchronously();
+        }
+
         public async Task<string?> GetDiscordCompatibleVideoPath(CloudItem item)
         {
             string sourcePath = GetFullItemPath(item);
             if (!File.Exists(sourcePath)) return null;
 
             string sourceExtension = Path.GetExtension(item.Name);
-            if (string.Equals(sourceExtension, ".mp4", StringComparison.OrdinalIgnoreCase))
-            {
-                return sourcePath;
-            }
-
             string cachePath = GetVideoEmbedCachePath(item.ItemID);
 
             // Fast path: cache exists and is up-to-date - avoid acquiring transcode lock
@@ -620,12 +635,27 @@ namespace Omnipotent.Services.KliveCloud
                     return cachePath;
                 }
 
-                await FFMpegArguments
-                    .FromFileInput(sourcePath)
-                    .OutputToFile(cachePath, true, options => options
-                        .WithCustomArgument("-map 0:v:0 -map 0:a? -vf \"scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2\" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart")
-                        .ForceFormat("mp4"))
-                    .ProcessAsynchronously();
+                if (string.Equals(sourceExtension, ".mp4", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        await RemuxDiscordOptimizedMp4(sourcePath, cachePath);
+                    }
+                    catch (Exception ex)
+                    {
+                        ServiceLogError(ex, $"Failed to remux Discord MP4 for {sourcePath}; retrying with full transcode");
+                        if (File.Exists(cachePath))
+                        {
+                            File.Delete(cachePath);
+                        }
+
+                        await TranscodeDiscordOptimizedMp4(sourcePath, cachePath);
+                    }
+                }
+                else
+                {
+                    await TranscodeDiscordOptimizedMp4(sourcePath, cachePath);
+                }
 
                 return File.Exists(cachePath) ? cachePath : null;
             }
