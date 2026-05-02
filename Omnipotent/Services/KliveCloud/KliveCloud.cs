@@ -129,15 +129,18 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(shareLinksFilePath, json);
         }
 
-        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly)
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly, bool reuseExisting = true)
         {
-            var existingLink = await GetReusableShareLink(itemID);
-            if (existingLink != null)
+            if (reuseExisting)
             {
-                existingLink.ExpirationDate = expirationDate;
-                existingLink.PermissionMode = permissionMode;
-                await SaveShareLinks();
-                return existingLink;
+                var existingLink = await GetReusableShareLink(itemID);
+                if (existingLink != null)
+                {
+                    existingLink.ExpirationDate = expirationDate;
+                    existingLink.PermissionMode = permissionMode;
+                    await SaveShareLinks();
+                    return existingLink;
+                }
             }
 
             var link = new ShareLink

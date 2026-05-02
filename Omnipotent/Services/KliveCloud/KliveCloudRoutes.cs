@@ -117,13 +117,35 @@ namespace Omnipotent.Services.KliveCloud
             var fileInfo = new FileInfo(filePath);
             long fileLength = fileInfo.Length;
             string? rangeHeader = req.req.Headers["Range"];
+            bool isHeadRequest = string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase);
 
             if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
             {
                 string rangeValue = rangeHeader.Substring("bytes=".Length);
                 string[] parts = rangeValue.Split('-');
-                long start = long.Parse(parts[0]);
-                long end = parts.Length > 1 && !string.IsNullOrEmpty(parts[1]) ? long.Parse(parts[1]) : fileLength - 1;
+
+                if (parts.Length != 2)
+                {
+                    NameValueCollection rangeErrHeaders = new();
+                    rangeErrHeaders.Add("Accept-Ranges", "bytes");
+                    rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
+                    await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
+                    return;
+                }
+
+                long start;
+                long end;
+                if (string.IsNullOrEmpty(parts[0]) && long.TryParse(parts[1], out long suffixLength))
+                {
+                    suffixLength = Math.Min(suffixLength, fileLength);
+                    start = fileLength - suffixLength;
+                    end = fileLength - 1;
+                }
+                else
+                {
+                    start = long.TryParse(parts[0], out long parsedStart) ? parsedStart : -1;
+                    end = !string.IsNullOrEmpty(parts[1]) && long.TryParse(parts[1], out long parsedEnd) ? parsedEnd : fileLength - 1;
+                }
 
                 if (start >= fileLength || end >= fileLength || start > end)
                 {
@@ -140,6 +162,11 @@ namespace Omnipotent.Services.KliveCloud
                 rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
 
                 using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
+                if (isHeadRequest)
+                {
+                    return;
+                }
+
                 using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
                 fs.Seek(start, SeekOrigin.Begin);
                 byte[] buffer = new byte[262144];
@@ -159,6 +186,11 @@ namespace Omnipotent.Services.KliveCloud
                 fullHeaders.Add("Accept-Ranges", "bytes");
 
                 using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
+                if (isHeadRequest)
+                {
+                    return;
+                }
+
                 using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
                 byte[] buffer = new byte[262144];
                 int bytesRead;
@@ -627,17 +659,21 @@ namespace Omnipotent.Services.KliveCloud
                         expirationDate = DateTime.Now.AddHours(hours);
                     }
 
-                    var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate, permissionMode);
-
-                    // Pre-warm Discord-compatible MP4 cache so embed URL responds instantly before Discord's scraper times out.
-                    if (item.ItemType == CloudItemType.File && parent.IsVideo(item))
+                    bool isVideoShare = item.ItemType == CloudItemType.File && parent.IsVideo(item);
+                    bool embedVideoReady = false;
+                    if (isVideoShare)
                     {
-                        _ = Task.Run(async () =>
+                        string? compatibleVideoPath = await parent.GetDiscordCompatibleVideoPath(item);
+                        if (string.IsNullOrEmpty(compatibleVideoPath))
                         {
-                            try { await parent.GetDiscordCompatibleVideoPath(item); }
-                            catch (Exception ex) { await parent.ServiceLogError(ex, "Failed to pre-warm Discord embed transcode for share link"); }
-                        });
+                            await req.ReturnResponse("VideoEmbedGenerationFailed", code: HttpStatusCode.InternalServerError);
+                            return;
+                        }
+
+                        embedVideoReady = true;
                     }
+
+                    var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate, permissionMode, reuseExisting: !isVideoShare);
 
                     string downloadUrl = $"https://{KliveAPI.KliveAPI.domainName}:{KliveAPI.KliveAPI.apiPORT}/KliveCloud/DownloadShared?code={shareLink.ShareCode}";
 
@@ -651,6 +687,7 @@ namespace Omnipotent.Services.KliveCloud
                         CreatedDate = shareLink.CreatedDate,
                         ExpirationDate = shareLink.ExpirationDate,
                         SharePermissionMode = shareLink.PermissionMode.ToString(),
+                        EmbedVideoReady = embedVideoReady,
                         CanWrite = parent.CanWriteThroughShareLink(shareLink),
                         CanDelete = parent.CanDeleteThroughShareLink(shareLink)
                     };

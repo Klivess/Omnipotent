@@ -458,6 +458,14 @@ namespace Omnipotent.Services.KliveAPI
             return normalizedMethod == "POST" || normalizedMethod == "PUT" || normalizedMethod == "PATCH";
         }
 
+        private static bool IsRequestMethodAllowed(string requestMethod, string routeMethod)
+        {
+            string normalizedRequestMethod = NormalizeMethod(requestMethod);
+            string normalizedRouteMethod = NormalizeMethod(routeMethod);
+            return normalizedRequestMethod == normalizedRouteMethod
+                || (normalizedRequestMethod == "HEAD" && normalizedRouteMethod == "GET");
+        }
+
         private static bool ShouldResolveUser(HttpListenerRequest req, KMPermissions requiredPermission)
         {
             return requiredPermission != KMPermissions.Anybody || !string.IsNullOrWhiteSpace(req.Headers["Authorization"]);
@@ -577,7 +585,7 @@ namespace Omnipotent.Services.KliveAPI
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
                     matchedRoute = true;
-                    if (NormalizeMethod(req.HttpMethod) != routeData.normalizedMethod)
+                    if (!IsRequestMethodAllowed(req.HttpMethod, routeData.normalizedMethod))
                     {
                         await DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
                         return;
