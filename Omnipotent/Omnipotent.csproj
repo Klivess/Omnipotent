@@ -39,6 +39,7 @@
 		<PackageReference Include="Microsoft.Extensions.AI" Version="10.4.1" />
 		<PackageReference Include="Microsoft.Extensions.AI.Abstractions" Version="10.4.1" />
 		<PackageReference Include="Microsoft.Extensions.AI.Evaluation" Version="10.4.0" />
+		<PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
 		<PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="9.0.4" />
 		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.5" />
 		<PackageReference Include="Microsoft.ML" Version="5.0.0" />

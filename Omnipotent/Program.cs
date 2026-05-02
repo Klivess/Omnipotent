@@ -51,6 +51,7 @@ namespace Omnipotent
                 //Create services
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.SeleniumManager.SeleniumManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniDefence.OmniDefence());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGlobalSettingsManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
 

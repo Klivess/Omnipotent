@@ -27,6 +27,8 @@ using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Crypto;
 using Microsoft.PowerShell.Commands;
+using OmniDefenceService = Omnipotent.Services.OmniDefence.OmniDefence;
+using Omnipotent.Services.OmniDefence;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -519,6 +521,18 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        private OmniDefenceService? _defenceCache;
+        private OmniDefenceService? TryGetDefence()
+        {
+            if (_defenceCache != null && _defenceCache.IsServiceActive()) return _defenceCache;
+            try
+            {
+                _defenceCache = GetActiveServices().OfType<OmniDefenceService>().FirstOrDefault();
+                return _defenceCache;
+            }
+            catch { return null; }
+        }
+
         private async Task ProcessRequestAsync(HttpListenerContext context)
         {
             Stopwatch requestStopwatch = Stopwatch.StartNew();
@@ -527,6 +541,20 @@ namespace Omnipotent.Services.KliveAPI
             string statsRoute = context?.Request?.Url?.AbsolutePath ?? context?.Request?.RawUrl ?? "/";
             string statsMethod = NormalizeMethod(context?.Request?.HttpMethod ?? string.Empty);
 
+            // OmniDefence telemetry locals (captured into finally)
+            string defenceIp = "";
+            string? defenceUserAgent = null;
+            string? defenceQueryString = null;
+            string? defenceBodyHash = null;
+            long defenceBodyLength = 0;
+            int defencePermRequired = 0;
+            string? defenceProfileId = null;
+            string? defenceProfileName = null;
+            string? defenceDenyReason = null;
+            RequestOutcome defenceOutcome = RequestOutcome.Success;
+            bool defenceSkipRecord = false;
+            bool defencePreBlocked = false;
+
             try
             {
                 HttpListenerRequest req = context.Request;
@@ -534,6 +562,9 @@ namespace Omnipotent.Services.KliveAPI
                 string route = NormalizeRoute(req.Url?.AbsolutePath ?? req.RawUrl);
                 statsRoute = route;
                 statsMethod = NormalizeMethod(req.HttpMethod);
+                defenceIp = OmniDefenceService.ExtractClientIp(req);
+                defenceUserAgent = req.UserAgent;
+                defenceQueryString = query;
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
                     ? new NameValueCollection()
                     : HttpUtility.ParseQueryString(query);
@@ -551,14 +582,48 @@ namespace Omnipotent.Services.KliveAPI
                 if (NormalizeMethod(request.req.HttpMethod) == "OPTIONS")
                 {
                     shouldRecordStatistics = false;
+                    defenceSkipRecord = true;
                     await request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
                     return;
+                }
+
+                // ---- OmniDefence pre-dispatch gate ----
+                var defence = TryGetDefence();
+                if (defence != null && !string.IsNullOrEmpty(defenceIp))
+                {
+                    var decision = defence.EvaluateRequestGate(defenceIp, route);
+                    if (decision == IpThreatTracker.GateDecision.Block)
+                    {
+                        defencePreBlocked = true;
+                        defenceOutcome = RequestOutcome.PreBlocked;
+                        defenceDenyReason = "IPBlocked";
+                        context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
+                        context.Response.Close();
+                        return;
+                    }
+                    else if (decision == IpThreatTracker.GateDecision.Tarpit)
+                    {
+                        try { await Task.Delay(TimeSpan.FromSeconds(15) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 5000)), cancellationToken.Token); } catch { }
+                        defenceDenyReason = "Tarpit";
+                        defenceOutcome = RequestOutcome.PreBlocked;
+                        context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
+                        context.Response.Close();
+                        return;
+                    }
+                    else if (decision == IpThreatTracker.GateDecision.Honeypot)
+                    {
+                        defenceDenyReason = "Honeypot";
+                        string junk = defence.GenerateHoneypotResponse(defenceIp);
+                        await request.ReturnResponse(junk, "application/json");
+                        return;
+                    }
                 }
 
                 // --- WebSocket upgrade handling ---
                 if (req.IsWebSocketRequest && WebSocketRouteLookup.TryGetValue(route, out WebSocketRouteInfo wsRouteData))
                 {
                     shouldRecordStatistics = false;
+                    defenceSkipRecord = true;
                     if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
                     {
                         request.user = await ResolveRequestUserAsync(req);
@@ -581,8 +646,11 @@ namespace Omnipotent.Services.KliveAPI
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
                     matchedRoute = true;
+                    defencePermRequired = (int)routeData.authenticationLevelRequired;
                     if (!IsRequestMethodAllowed(req.HttpMethod, routeData.normalizedMethod))
                     {
+                        defenceOutcome = RequestOutcome.IncorrectMethod;
+                        defenceDenyReason = "IncorrectHTTPMethod";
                         await DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
                         return;
                     }
@@ -595,13 +663,20 @@ namespace Omnipotent.Services.KliveAPI
                     if (CanRequestCarryBody(req.HttpMethod))
                     {
                         (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req);
+                        defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
+                        defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
                     }
 
                     bool isUserNull = request.user == null;
                     if (isUserNull != true)
                     {
+                        defenceProfileId = request.user.UserID;
+                        defenceProfileName = request.user.Name;
+
                         if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                         {
+                            defenceOutcome = RequestOutcome.InsufficientClearance;
+                            defenceDenyReason = "ProfileDisabled";
                             await DenyRequest(request, DeniedRequestReason.ProfileDisabled);
                             return;
                         }
@@ -619,6 +694,22 @@ namespace Omnipotent.Services.KliveAPI
                         }
 
                         _ = ServiceLog($"{request.user.Name} requested route {route} without sufficient permission.");
+                        defenceOutcome = RequestOutcome.InsufficientClearance;
+                        defenceDenyReason = "TooLowClearance";
+                        if (defence != null)
+                        {
+                            _ = defence.RecordAuthEventAsync(new AuthEventRow
+                            {
+                                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                                Ip = defenceIp,
+                                Type = "InsufficientClearance",
+                                ProfileId = request.user.UserID,
+                                ProfileName = request.user.Name,
+                                Route = route,
+                                UserAgent = defenceUserAgent,
+                                Detail = "Required " + routeData.authenticationLevelRequired
+                            });
+                        }
                         await DenyRequest(request, DeniedRequestReason.TooLowClearance);
                     }
                     else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
@@ -628,18 +719,38 @@ namespace Omnipotent.Services.KliveAPI
                     else
                     {
                         _ = ServiceLog($"Authenticated route {route} was requested without valid credentials.");
-                        _ = ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", $"An unauthenticated request was made to route {route} which requires permission level {routeData.authenticationLevelRequired.ToString()}. This means someone is trying to access a protected route without providing valid credentials. Be on the lookout for suspicious activity!");
+                        defenceOutcome = RequestOutcome.UnauthRoute;
+                        defenceDenyReason = "NoProfile";
+                        if (defence != null)
+                        {
+                            _ = defence.RecordAuthEventAsync(new AuthEventRow
+                            {
+                                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                                Ip = defenceIp,
+                                Type = string.IsNullOrWhiteSpace(req.Headers["Authorization"]) ? "UnauthRoute" : "InvalidPassword",
+                                Route = route,
+                                UserAgent = defenceUserAgent,
+                                Detail = "Required " + routeData.authenticationLevelRequired
+                            });
+                            if (!string.IsNullOrWhiteSpace(req.Headers["Authorization"]))
+                            {
+                                defenceOutcome = RequestOutcome.InvalidPassword;
+                                defenceDenyReason = "InvalidPassword";
+                            }
+                        }
                         await DenyRequest(request, DeniedRequestReason.NoProfile);
                     }
                 }
                 else
                 {
+                    defenceOutcome = RequestOutcome.NotFound;
                     await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
             }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
+                defenceOutcome = RequestOutcome.ServerError;
                 try
                 {
                     if (context?.Response != null && context.Response.OutputStream.CanWrite)
@@ -668,6 +779,48 @@ namespace Omnipotent.Services.KliveAPI
                     requestStopwatch.Stop();
                     int statusCode = context?.Response?.StatusCode > 0 ? context.Response.StatusCode : (int)HttpStatusCode.InternalServerError;
                     apiStatistics.RecordRequest(statsRoute, statsMethod, statusCode, requestStopwatch.Elapsed, matchedRoute);
+                }
+
+                // Record everything to OmniDefence
+                if (!defenceSkipRecord)
+                {
+                    var defence = TryGetDefence();
+                    if (defence != null)
+                    {
+                        try
+                        {
+                            int statusCode = context?.Response?.StatusCode > 0 ? context.Response.StatusCode : (int)HttpStatusCode.InternalServerError;
+                            // Map status code to outcome when not already set
+                            if (defenceOutcome == RequestOutcome.Success && statusCode >= 400)
+                            {
+                                defenceOutcome = statusCode == 401 ? RequestOutcome.UnauthRoute
+                                                : statusCode == 403 ? RequestOutcome.InsufficientClearance
+                                                : statusCode == 404 ? RequestOutcome.NotFound
+                                                : statusCode >= 500 ? RequestOutcome.ServerError
+                                                : RequestOutcome.UnauthRoute;
+                            }
+                            var row = new RequestRow
+                            {
+                                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                                Ip = defenceIp,
+                                Method = statsMethod,
+                                Route = statsRoute,
+                                Query = string.IsNullOrEmpty(defenceQueryString) ? null : defenceQueryString,
+                                StatusCode = statusCode,
+                                DurationMs = requestStopwatch.Elapsed.TotalMilliseconds,
+                                ProfileId = defenceProfileId,
+                                ProfileName = defenceProfileName,
+                                PermRequired = defencePermRequired,
+                                MatchedRoute = matchedRoute,
+                                BodyHash = defenceBodyHash,
+                                BodyLength = defenceBodyLength,
+                                UserAgent = defenceUserAgent,
+                                DenyReason = defenceDenyReason
+                            };
+                            _ = defence.RecordRequestAsync(row, defenceOutcome);
+                        }
+                        catch { }
+                    }
                 }
             }
         }

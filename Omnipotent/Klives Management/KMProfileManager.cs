@@ -25,6 +25,18 @@ namespace Omnipotent.Profiles
             name = "Klives Management Profile Manager";
             threadAnteriority = ThreadAnteriority.Standard;
         }
+
+        // Lightweight audit hook into OmniDefence. Errors are swallowed so a missing
+        // OmniDefence service never breaks profile operations.
+        private async Task AuditAction(KMProfile? actor, string category, string action, object? detail = null)
+        {
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.OmniDefence.OmniDefence>(
+                    "RecordProfileAction", actor, category, action, detail, (string?)null);
+            }
+            catch { }
+        }
         protected override async void ServiceMain()
         {
             await LoadAllProfiles();
@@ -273,6 +285,7 @@ namespace Omnipotent.Profiles
                     string serialized = JsonConvert.SerializeObject(profile);
                     await request.ReturnResponse(serialized, "application/json");
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"A new profile has been created with the name {name} and the rank {rank} by {request.user.Name}.");
+                    await AuditAction(request.user, "Profile", "CreateProfile", new { profile.UserID, profile.Name, rank = rank.ToString() });
                 }
                 catch (Exception ex)
                 {
@@ -302,6 +315,7 @@ namespace Omnipotent.Profiles
                                 }
                             }
                             catch (Exception e) { }
+                            await AuditAction(profile, "Auth", "Login");
                             await request.ReturnResponse("true", "application/json");
                         }
                         else
@@ -386,6 +400,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just disabled {profile.Name}'s KMProfile.");
+                    await AuditAction(request.user, "Profile", "ChangeCanLogin", new { profile.UserID, profile.Name, canLogin = profile.CanLogin });
                 }
                 catch (Exception ex)
                 {
@@ -421,6 +436,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {originalName}'s KMProfile username to {profile.Name}.");
+                    await AuditAction(request.user, "Profile", "ChangeProfileName", new { profile.UserID, oldName = originalName, newName = profile.Name });
                 }
                 catch (Exception ex)
                 {
@@ -455,6 +471,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile password.");
+                    await AuditAction(request.user, "Permission", "ChangeProfilePassword", new { profile.UserID, profile.Name });
                 }
                 catch (Exception ex)
                 {
@@ -490,6 +507,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile rank from {originalRank.ToString()} to {rank.ToString()}. Ominous!!");
+                    await AuditAction(request.user, "Permission", "ChangeProfileRank", new { profile.UserID, profile.Name, oldRank = originalRank.ToString(), newRank = rank.ToString() });
                 }
                 catch (Exception ex)
                 {
@@ -518,6 +536,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
                     }
                     await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just deleted {profile.Name}'s KMProfile.");
+                    await AuditAction(request.user, "Profile", "DeleteProfile", new { profile.UserID, profile.Name });
                 }
                 catch (Exception ex)
                 {

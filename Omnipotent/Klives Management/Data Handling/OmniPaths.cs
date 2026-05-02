@@ -146,6 +146,10 @@ namespace Omnipotent.Data_Handling
             //OmniUpdater
             public static string OmniUpdaterDirectory = $"{SavedDataDirectory}/OmniUpdater";
 
+            //OmniDefence
+            public static string OmniDefenceDirectory = $"{SavedDataDirectory}/OmniDefence";
+            public static string OmniDefenceDatabaseFile = $"{OmniDefenceDirectory}/omnidefence.db";
+
         };
 
         public static string GetPath(string path)
