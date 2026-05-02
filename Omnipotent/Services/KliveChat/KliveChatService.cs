@@ -126,7 +126,10 @@ namespace Omnipotent.Services.KliveChat
                     Name = userName,
                     Socket = socket,
                     UserId = resolvedUser?.UserID,
-                    Rank = resolvedUser?.KlivesManagementRank ?? KMPermissions.Anybody
+                    Rank = resolvedUser?.KlivesManagementRank ?? KMPermissions.Anybody,
+                    GuestIdentity = string.IsNullOrWhiteSpace(queryParams["guestIdentity"])
+                        ? $"{context.Request.RemoteEndPoint?.Address}|{context.Request.UserAgent}"
+                        : queryParams["guestIdentity"]
                 };
 
                 await room.AddClient(client, this);

@@ -71,13 +71,6 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(metadataFilePath, json);
         }
 
-        public enum SharePermissionMode
-        {
-            ReadOnly = 0,
-            Write = 1,
-            WriteDelete = 2
-        }
-
         public class ShareLink
         {
             public string ShareCode;
@@ -85,7 +78,6 @@ namespace Omnipotent.Services.KliveCloud
             public string CreatedByUserID;
             public DateTime CreatedDate;
             public DateTime? ExpirationDate;
-            public SharePermissionMode PermissionMode = SharePermissionMode.ReadOnly;
         }
 
         private async Task LoadShareLinks()
@@ -112,19 +104,8 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(shareLinksFilePath, json);
         }
 
-        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly)
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate)
         {
-            var item = GetItemByID(itemID);
-            if (item == null)
-            {
-                throw new Exception("Item not found.");
-            }
-
-            if (item.ItemType != CloudItemType.Folder)
-            {
-                permissionMode = SharePermissionMode.ReadOnly;
-            }
-
             var existingLink = await GetReusableShareLink(itemID);
             if (existingLink != null)
             {
@@ -137,8 +118,7 @@ namespace Omnipotent.Services.KliveCloud
                 ItemID = itemID,
                 CreatedByUserID = createdByUserID,
                 CreatedDate = DateTime.Now,
-                ExpirationDate = expirationDate,
-                PermissionMode = permissionMode
+                ExpirationDate = expirationDate
             };
             ShareLinks.Add(link);
             await SaveShareLinks();
@@ -177,36 +157,6 @@ namespace Omnipotent.Services.KliveCloud
             ShareLinks.Remove(link);
             await SaveShareLinks();
             return true;
-        }
-
-        public bool CanWriteThroughShareLink(ShareLink link, CloudItem sharedItem)
-        {
-            return sharedItem.ItemType == CloudItemType.Folder && link.PermissionMode >= SharePermissionMode.Write;
-        }
-
-        public bool CanDeleteThroughShareLink(ShareLink link, CloudItem sharedItem)
-        {
-            return sharedItem.ItemType == CloudItemType.Folder && link.PermissionMode >= SharePermissionMode.WriteDelete;
-        }
-
-        public bool IsItemWithinSharedScope(CloudItem sharedItem, CloudItem targetItem, bool includeSharedItem = true)
-        {
-            if (sharedItem == null || targetItem == null)
-            {
-                return false;
-            }
-
-            if (string.Equals(sharedItem.ItemID, targetItem.ItemID, StringComparison.OrdinalIgnoreCase))
-            {
-                return includeSharedItem;
-            }
-
-            if (sharedItem.ItemType != CloudItemType.Folder)
-            {
-                return false;
-            }
-
-            return IsDescendantOfFolder(sharedItem.ItemID, targetItem);
         }
 
         private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
@@ -442,11 +392,6 @@ namespace Omnipotent.Services.KliveCloud
 
         public async Task<bool> DeleteItem(string itemID, KMProfile user)
         {
-            return await DeleteItem(itemID, user?.Name ?? "Unknown user");
-        }
-
-        public async Task<bool> DeleteItem(string itemID, string deletedByLabel)
-        {
             var item = GetItemByID(itemID);
             if (item == null) return false;
 
@@ -455,7 +400,7 @@ namespace Omnipotent.Services.KliveCloud
                 var children = CloudItems.Where(k => k.ParentFolderID == itemID).ToList();
                 foreach (var child in children)
                 {
-                    await DeleteItem(child.ItemID, deletedByLabel);
+                    await DeleteItem(child.ItemID, user);
                 }
 
                 string fullPath = GetFullItemPath(item);
@@ -471,7 +416,7 @@ namespace Omnipotent.Services.KliveCloud
 
             CloudItems.Remove(item);
             await SaveMetadata();
-            ServiceLog($"Item '{item.Name}' deleted by {deletedByLabel}.");
+            ServiceLog($"Item '{item.Name}' deleted by user {user.Name}.");
             return true;
         }
 

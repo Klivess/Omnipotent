@@ -7,6 +7,9 @@ using Omnipotent.Klives_Management;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
 using System.Net;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
 using System.Xml.Linq;
 using static System.Runtime.InteropServices.JavaScript.JSType;
 
@@ -131,6 +134,23 @@ namespace Omnipotent.Profiles
             }
         }
 
+        private static async Task SendSessionWatchStateAsync(WebSocket socket, string state)
+        {
+            if (socket == null || socket.State != WebSocketState.Open)
+            {
+                return;
+            }
+
+            string payload = JsonConvert.SerializeObject(new
+            {
+                type = "session-state",
+                state
+            });
+
+            byte[] buffer = Encoding.UTF8.GetBytes(payload);
+            await socket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+
         public enum KMPermissions
         {
             Anybody = 0,
@@ -169,6 +189,74 @@ namespace Omnipotent.Profiles
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Anybody);
+
+            await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>(
+                "CreateWebSocketRoute",
+                "/KMProfiles/SessionWatch",
+                (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
+                {
+                    KMProfile resolvedProfile = user;
+                    string? authorization = queryParams["authorization"];
+
+                    if (resolvedProfile == null && !string.IsNullOrWhiteSpace(authorization))
+                    {
+                        resolvedProfile = await GetProfileByPassword(authorization);
+                    }
+
+                    if (resolvedProfile == null)
+                    {
+                        await SendSessionWatchStateAsync(socket, "ProfileNotFound");
+                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Profile not found", CancellationToken.None);
+                        return;
+                    }
+
+                    string watchedUserId = resolvedProfile.UserID;
+                    string watchedPassword = resolvedProfile.Password;
+                    await SendSessionWatchStateAsync(socket, "SessionActive");
+
+                    try
+                    {
+                        while (socket.State == WebSocketState.Open)
+                        {
+                            var liveProfile = Profiles.FirstOrDefault(profile => profile.UserID == watchedUserId);
+                            string? invalidationReason = null;
+                            string closeReason = "Session invalidated";
+
+                            if (liveProfile == null)
+                            {
+                                invalidationReason = "ProfileNotFound";
+                                closeReason = "Profile not found";
+                            }
+                            else if (!liveProfile.CanLogin)
+                            {
+                                invalidationReason = "ProfileDisabled";
+                                closeReason = "Profile disabled";
+                            }
+                            else if (!string.Equals(liveProfile.Password, watchedPassword, StringComparison.Ordinal))
+                            {
+                                invalidationReason = "PasswordChanged";
+                                closeReason = "Password changed";
+                            }
+
+                            if (invalidationReason != null)
+                            {
+                                await SendSessionWatchStateAsync(socket, invalidationReason);
+                                if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
+                                {
+                                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, closeReason, CancellationToken.None);
+                                }
+                                return;
+                            }
+
+                            await Task.Delay(1000);
+                        }
+                    }
+                    catch (WebSocketException)
+                    {
+                    }
+                }),
+                KMPermissions.Anybody);
+
             await CreateAPIRoute("/KMProfiles/CreateProfile", async (request) =>
             {
                 try

@@ -298,7 +298,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private static string BuildPendingApiResponseText()
         {
-            return "I’m on it. I’m inspecting the request and running any needed scripts now. I’ll send the finished answer as soon as execution completes.";
+            return "I'm on it. I'm checking the code and running any needed scripts now. I'll send the finished answer as soon as execution completes.";
         }
 
         private async Task<string> HandleDiscordDM(string message, string channelId)

@@ -132,7 +132,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- Multiple script blocks in the same reply share state — locals persist between blocks.");
             sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
             sb.AppendLine("- Prefer one narrow lookup over broad searching. Find the target type/service first, then inspect it.");
-            sb.AppendLine("- Scripts are disposable scratchpads: keep them compact, avoid boilerplate, and do not add comments unless a line would otherwise be ambiguous.");
+            sb.AppendLine("- Scripts are disposable scratchpads: keep them compact, skip boilerplate, and do not add comments unless a line would otherwise be ambiguous.");
             sb.AppendLine("- Do not narrate obvious steps in comments. Prefer concise, directly executable code.");
             sb.AppendLine("- Await methods that return Task or Task<T>. Sync methods should not be awaited.");
             sb.AppendLine("- If a script fails, read the error and change your approach — never retry the same failing code.");

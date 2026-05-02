@@ -611,6 +611,43 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly object ProjectClassIndexLock = new();
         private static List<ProjectClassInfo>? projectClassIndexCache;
 
+        private static bool IsPromptNoiseLine(string line)
+        {
+            var trimmed = line.Trim();
+            if (string.IsNullOrEmpty(trimmed)) return true;
+            return trimmed.StartsWith("///", StringComparison.Ordinal)
+                || trimmed.StartsWith("//", StringComparison.Ordinal)
+                || trimmed.StartsWith("/*", StringComparison.Ordinal)
+                || trimmed.StartsWith("*", StringComparison.Ordinal)
+                || trimmed.StartsWith("*/", StringComparison.Ordinal);
+        }
+
+        private static List<(int LineNumber, string Text)> GetPromptFriendlyLines(string[] lines, int startLine, int endLine, int maxLines)
+        {
+            var result = new List<(int LineNumber, string Text)>();
+            for (int i = startLine - 1; i < endLine && result.Count < maxLines; i++)
+            {
+                if (IsPromptNoiseLine(lines[i]))
+                {
+                    continue;
+                }
+
+                result.Add((i + 1, lines[i]));
+            }
+
+            if (result.Count > 0)
+            {
+                return result;
+            }
+
+            for (int i = startLine - 1; i < endLine && result.Count < maxLines; i++)
+            {
+                result.Add((i + 1, lines[i]));
+            }
+
+            return result;
+        }
+
         private string? ResolvePath(string relativePath)
         {
             var full = Path.GetFullPath(Path.Combine(CodebaseRoot, relativePath));
@@ -661,14 +698,17 @@ namespace Omnipotent.Services.KliveAgent
             var totalLines = lines.Length;
             startLine = Math.Max(1, startLine);
             var endLine = Math.Min(totalLines, startLine + maxLines - 1);
+            var visibleLines = GetPromptFriendlyLines(lines, startLine, endLine, maxLines);
+            var visibleStartLine = visibleLines.Count > 0 ? visibleLines[0].LineNumber : startLine;
+            var visibleEndLine = visibleLines.Count > 0 ? visibleLines[^1].LineNumber : endLine;
 
             var sb = new StringBuilder();
-            sb.AppendLine($"File: {relativePath} (lines {startLine}-{endLine} of {totalLines})");
-            for (int i = startLine - 1; i < endLine; i++)
-                sb.AppendLine($"{i + 1,5} | {lines[i]}");
+            sb.AppendLine($"File: {relativePath} (lines {visibleStartLine}-{visibleEndLine} of {totalLines})");
+            foreach (var (lineNumber, text) in visibleLines)
+                sb.AppendLine($"{lineNumber,5} | {text}");
 
-            if (endLine < totalLines)
-                sb.AppendLine($"... {totalLines - endLine} more lines. Use ReadFile(\"{relativePath}\", startLine: {endLine + 1}) to continue.");
+            if (visibleEndLine < totalLines)
+                sb.AppendLine($"... {totalLines - visibleEndLine} more lines. Use ReadFile(\"{relativePath}\", startLine: {visibleEndLine + 1}) to continue.");
 
             return sb.ToString();
         }

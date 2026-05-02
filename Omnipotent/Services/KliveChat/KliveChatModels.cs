@@ -50,9 +50,11 @@ namespace Omnipotent.Services.KliveChat
         [JsonIgnore]
         public SemaphoreSlim SendLock { get; } = new SemaphoreSlim(1, 1);
         [JsonIgnore]
+        public string? GuestIdentity { get; set; }
+        [JsonIgnore]
         public string IdentityKey => !string.IsNullOrWhiteSpace(UserId)
             ? $"profile:{UserId}"
-            : $"guest:{(Name ?? "Guest").Trim().ToLowerInvariant()}";
+            : $"guest:{(string.IsNullOrWhiteSpace(GuestIdentity) ? (Name ?? "Guest").Trim().ToLowerInvariant() : GuestIdentity.Trim().ToLowerInvariant())}";
         [JsonIgnore]
         public bool CanModerate => Rank >= KMPermissions.Associate;
     }

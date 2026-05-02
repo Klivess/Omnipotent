@@ -748,6 +748,35 @@ namespace Omnipotent.Service_Manager
                     await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+
+            await CreateAPIRoute("/OmniGlobalSettings/Delete", async (req) =>
+            {
+                try
+                {
+                    var obj = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string name = obj?.name;
+                    string parentId = obj?.parentServiceId;
+
+                    if (string.IsNullOrWhiteSpace(name))
+                    {
+                        await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    bool deleted = await DeleteOmniSetting(name, parentId);
+                    if (!deleted)
+                    {
+                        await req.ReturnResponse("NotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    await req.ReturnResponse("Deleted", code: HttpStatusCode.OK);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
         }
     }
 }

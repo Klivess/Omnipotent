@@ -16,186 +16,6 @@ namespace Omnipotent.Services.KliveCloud
             this.parent = parent;
         }
 
-        private bool TryParseSharePermissionMode(string rawValue, out KliveCloud.SharePermissionMode permissionMode)
-        {
-            permissionMode = KliveCloud.SharePermissionMode.ReadOnly;
-
-            if (string.IsNullOrWhiteSpace(rawValue))
-            {
-                return true;
-            }
-
-            if (int.TryParse(rawValue, out int numericValue) && Enum.IsDefined(typeof(KliveCloud.SharePermissionMode), numericValue))
-            {
-                permissionMode = (KliveCloud.SharePermissionMode)numericValue;
-                return true;
-            }
-
-            return Enum.TryParse(rawValue, true, out permissionMode);
-        }
-
-        private async Task<(KliveCloud.ShareLink Link, CloudItem SharedItem)?> ResolveShareScope(global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string shareCode)
-        {
-            if (string.IsNullOrWhiteSpace(shareCode))
-            {
-                await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
-                return null;
-            }
-
-            var link = parent.GetShareLinkByCode(shareCode);
-            if (link == null)
-            {
-                await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
-                return null;
-            }
-
-            if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
-            {
-                await parent.DeleteShareLink(shareCode);
-                await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
-                return null;
-            }
-
-            var sharedItem = parent.GetItemByID(link.ItemID);
-            if (sharedItem == null)
-            {
-                await req.ReturnResponse("SharedItemNotFound", code: HttpStatusCode.NotFound);
-                return null;
-            }
-
-            return (link, sharedItem);
-        }
-
-        private async Task<CloudItem?> ResolveSharedTargetFolder(global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, CloudItem sharedItem, string requestedFolderID)
-        {
-            if (sharedItem.ItemType != CloudItemType.Folder)
-            {
-                await req.ReturnResponse("SharedLinkIsNotAFolder", code: HttpStatusCode.BadRequest);
-                return null;
-            }
-
-            if (string.IsNullOrWhiteSpace(requestedFolderID))
-            {
-                return sharedItem;
-            }
-
-            var targetFolder = parent.GetItemByID(requestedFolderID);
-            if (targetFolder == null || targetFolder.ItemType != CloudItemType.Folder || !parent.IsItemWithinSharedScope(sharedItem, targetFolder))
-            {
-                await req.ReturnResponse("SharedFolderTargetNotFound", code: HttpStatusCode.NotFound);
-                return null;
-            }
-
-            return targetFolder;
-        }
-
-        private async Task<CloudItem?> ResolveSharedFileTarget(global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, CloudItem sharedItem, string requestedItemID)
-        {
-            if (sharedItem.ItemType == CloudItemType.File)
-            {
-                return sharedItem;
-            }
-
-            if (string.IsNullOrWhiteSpace(requestedItemID))
-            {
-                await req.ReturnResponse("SharedFolderRequiresItemID", code: HttpStatusCode.BadRequest);
-                return null;
-            }
-
-            var requestedItem = parent.GetItemByID(requestedItemID);
-            if (requestedItem == null || requestedItem.ItemType != CloudItemType.File || !parent.IsItemWithinSharedScope(sharedItem, requestedItem, includeSharedItem: false))
-            {
-                await req.ReturnResponse("SharedFileNotFound", code: HttpStatusCode.NotFound);
-                return null;
-            }
-
-            return requestedItem;
-        }
-
-        private async Task<CloudItem?> ResolveSharedDeleteTarget(global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, CloudItem sharedItem, string itemID)
-        {
-            if (string.IsNullOrWhiteSpace(itemID))
-            {
-                await req.ReturnResponse("ItemIDRequired", code: HttpStatusCode.BadRequest);
-                return null;
-            }
-
-            var targetItem = parent.GetItemByID(itemID);
-            if (targetItem == null || !parent.IsItemWithinSharedScope(sharedItem, targetItem, includeSharedItem: false))
-            {
-                await req.ReturnResponse("SharedItemNotFound", code: HttpStatusCode.NotFound);
-                return null;
-            }
-
-            return targetItem;
-        }
-
-        private async Task StreamVideoFile(global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, CloudItem item)
-        {
-            string filePath = parent.GetFullItemPath(item);
-            if (!File.Exists(filePath))
-            {
-                await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
-                return;
-            }
-
-            var fileInfo = new FileInfo(filePath);
-            long fileLength = fileInfo.Length;
-            string mimeType = parent.GetVideoMimeType(item);
-
-            string rangeHeader = req.req.Headers["Range"];
-
-            if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
-            {
-                string rangeValue = rangeHeader.Substring("bytes=".Length);
-                string[] parts = rangeValue.Split('-');
-                long start = long.Parse(parts[0]);
-                long end = !string.IsNullOrEmpty(parts[1]) ? long.Parse(parts[1]) : fileLength - 1;
-
-                if (start >= fileLength || end >= fileLength || start > end)
-                {
-                    NameValueCollection rangeErrHeaders = new();
-                    rangeErrHeaders.Add("Accept-Ranges", "bytes");
-                    rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
-                    await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
-                    return;
-                }
-
-                long contentLength = end - start + 1;
-                NameValueCollection rangeHeaders = new();
-                rangeHeaders.Add("Accept-Ranges", "bytes");
-                rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
-
-                using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                fs.Seek(start, SeekOrigin.Begin);
-                byte[] buffer = new byte[65536];
-                long remaining = contentLength;
-                while (remaining > 0)
-                {
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int bytesRead = await fs.ReadAsync(buffer, 0, toRead);
-                    if (bytesRead == 0) break;
-                    await output.WriteAsync(buffer, 0, bytesRead);
-                    remaining -= bytesRead;
-                }
-            }
-            else
-            {
-                NameValueCollection fullHeaders = new();
-                fullHeaders.Add("Accept-Ranges", "bytes");
-
-                using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                byte[] buffer = new byte[65536];
-                int bytesRead;
-                while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                {
-                    await output.WriteAsync(buffer, 0, bytesRead);
-                }
-            }
-        }
-
         public async void CreateRoutes()
         {
             // List items at root or in a specific folder
@@ -641,18 +461,7 @@ namespace Omnipotent.Services.KliveCloud
                         expirationDate = DateTime.Now.AddHours(hours);
                     }
 
-                    KliveCloud.SharePermissionMode sharePermissionMode = KliveCloud.SharePermissionMode.ReadOnly;
-                    if (item.ItemType == CloudItemType.Folder)
-                    {
-                        string sharePermissionModeStr = req.userParameters.Get("sharePermissionMode");
-                        if (!TryParseSharePermissionMode(sharePermissionModeStr, out sharePermissionMode))
-                        {
-                            await req.ReturnResponse("InvalidSharePermissionMode", code: HttpStatusCode.BadRequest);
-                            return;
-                        }
-                    }
-
-                    var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate, sharePermissionMode);
+                    var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate);
 
                     string downloadUrl = $"https://{KliveAPI.KliveAPI.domainName}:{KliveAPI.KliveAPI.apiPORT}/KliveCloud/DownloadShared?code={shareLink.ShareCode}";
 
@@ -664,10 +473,7 @@ namespace Omnipotent.Services.KliveCloud
                         ItemType = item.ItemType,
                         DownloadURL = downloadUrl,
                         CreatedDate = shareLink.CreatedDate,
-                        ExpirationDate = shareLink.ExpirationDate,
-                        SharePermissionMode = shareLink.PermissionMode,
-                        CanWrite = parent.CanWriteThroughShareLink(shareLink, item),
-                        CanDelete = parent.CanDeleteThroughShareLink(shareLink, item)
+                        ExpirationDate = shareLink.ExpirationDate
                     };
 
                     string json = JsonConvert.SerializeObject(result);
@@ -731,149 +537,61 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            await parent.CreateAPIRoute("/KliveCloud/CreateSharedFolder", async (req) =>
-            {
-                try
-                {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
-                    {
-                        return;
-                    }
-
-                    var (link, sharedItem) = shareScope.Value;
-                    if (!parent.CanWriteThroughShareLink(link, sharedItem))
-                    {
-                        await req.ReturnResponse("SharedLinkDoesNotAllowWrite", code: HttpStatusCode.Forbidden);
-                        return;
-                    }
-
-                    string name = req.userParameters.Get("name");
-                    if (string.IsNullOrWhiteSpace(name))
-                    {
-                        await req.ReturnResponse("FolderNameRequired", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    var targetFolder = await ResolveSharedTargetFolder(req, sharedItem, req.userParameters.Get("parentFolderID"));
-                    if (targetFolder == null)
-                    {
-                        return;
-                    }
-
-                    var folder = await parent.CreateFolder(
-                        name,
-                        targetFolder.ItemID,
-                        $"share:{link.ShareCode}",
-                        parent.GetEffectiveMinimumPermission(targetFolder));
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(parent.CloneWithEffectivePermission(folder)), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Anybody);
-
-            await parent.CreateAPIRoute("/KliveCloud/UploadShared", async (req) =>
-            {
-                try
-                {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
-                    {
-                        return;
-                    }
-
-                    var (link, sharedItem) = shareScope.Value;
-                    if (!parent.CanWriteThroughShareLink(link, sharedItem))
-                    {
-                        await req.ReturnResponse("SharedLinkDoesNotAllowWrite", code: HttpStatusCode.Forbidden);
-                        return;
-                    }
-
-                    string fileName = req.userParameters.Get("fileName");
-                    if (string.IsNullOrWhiteSpace(fileName))
-                    {
-                        await req.ReturnResponse("FileNameRequired", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    byte[] fileData = req.userMessageBytes;
-                    if (fileData == null || fileData.Length == 0)
-                    {
-                        await req.ReturnResponse("EmptyFileBody", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    var targetFolder = await ResolveSharedTargetFolder(req, sharedItem, req.userParameters.Get("parentFolderID"));
-                    if (targetFolder == null)
-                    {
-                        return;
-                    }
-
-                    var file = await parent.UploadFile(
-                        fileName,
-                        fileData,
-                        targetFolder.ItemID,
-                        $"share:{link.ShareCode}",
-                        parent.GetEffectiveMinimumPermission(targetFolder));
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(parent.CloneWithEffectivePermission(file)), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Anybody);
-
-            await parent.CreateAPIRoute("/KliveCloud/DeleteSharedItem", async (req) =>
-            {
-                try
-                {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
-                    {
-                        return;
-                    }
-
-                    var (link, sharedItem) = shareScope.Value;
-                    if (!parent.CanDeleteThroughShareLink(link, sharedItem))
-                    {
-                        await req.ReturnResponse("SharedLinkDoesNotAllowDelete", code: HttpStatusCode.Forbidden);
-                        return;
-                    }
-
-                    var targetItem = await ResolveSharedDeleteTarget(req, sharedItem, req.userParameters.Get("itemID"));
-                    if (targetItem == null)
-                    {
-                        return;
-                    }
-
-                    bool success = await parent.DeleteItem(targetItem.ItemID, $"shared link {link.ShareCode}");
-                    await req.ReturnResponse(success ? "ItemDeleted" : "DeleteFailed", code: success ? HttpStatusCode.OK : HttpStatusCode.InternalServerError);
-                }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Anybody);
-
             // Download a file via share link (no authentication required)
             await parent.CreateAPIRoute("/KliveCloud/DownloadShared", async (req) =>
             {
                 try
                 {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
+                    string shareCode = req.userParameters.Get("code");
+                    if (string.IsNullOrEmpty(shareCode))
                     {
+                        await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
                         return;
                     }
 
-                    var (_, sharedItem) = shareScope.Value;
-                    var item = await ResolveSharedFileTarget(req, sharedItem, req.userParameters.Get("itemID"));
-                    if (item == null)
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
                     {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
+                    {
+                        await parent.DeleteShareLink(shareCode);
+                        await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
+                        return;
+                    }
+
+                    var sharedItem = parent.GetItemByID(link.ItemID);
+                    if (sharedItem == null)
+                    {
+                        await req.ReturnResponse("FileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var item = sharedItem;
+                    if (sharedItem.ItemType == CloudItemType.Folder)
+                    {
+                        string requestedItemID = req.userParameters.Get("itemID");
+                        if (string.IsNullOrEmpty(requestedItemID))
+                        {
+                            await req.ReturnResponse("SharedFolderRequiresItemID", code: HttpStatusCode.BadRequest);
+                            return;
+                        }
+
+                        var requestedItem = parent.GetItemByID(requestedItemID);
+                        if (requestedItem == null || requestedItem.ItemType != CloudItemType.File || !parent.IsDescendantOfFolder(sharedItem.ItemID, requestedItem))
+                        {
+                            await req.ReturnResponse("SharedFileNotFound", code: HttpStatusCode.NotFound);
+                            return;
+                        }
+
+                        item = requestedItem;
+                    }
+                    else if (item.ItemType != CloudItemType.File)
+                    {
+                        await req.ReturnResponse("FileNotFound", code: HttpStatusCode.NotFound);
                         return;
                     }
 
@@ -899,13 +617,33 @@ namespace Omnipotent.Services.KliveCloud
             {
                 try
                 {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
+                    string shareCode = req.userParameters.Get("code");
+                    if (string.IsNullOrEmpty(shareCode))
                     {
+                        await req.ReturnResponse("ShareCodeRequired", code: HttpStatusCode.BadRequest);
                         return;
                     }
 
-                    var (link, item) = shareScope.Value;
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await req.ReturnResponse("ShareLinkNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
+                    {
+                        await parent.DeleteShareLink(shareCode);
+                        await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(link.ItemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("FileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
 
                     var effectiveItem = parent.CloneWithEffectivePermission(item);
                     var result = new
@@ -919,11 +657,7 @@ namespace Omnipotent.Services.KliveCloud
                         effectiveItem.MinimumPermissionLevel,
                         IsImage = parent.IsImage(item),
                         IsVideo = parent.IsVideo(item),
-                        VideoMimeType = parent.IsVideo(item) ? parent.GetVideoMimeType(item) : null,
                         ShareCode = link.ShareCode,
-                        SharePermissionMode = link.PermissionMode,
-                        CanWrite = parent.CanWriteThroughShareLink(link, item),
-                        CanDelete = parent.CanDeleteThroughShareLink(link, item),
                         ExpirationDate = link.ExpirationDate,
                         Children = item.ItemType == CloudItemType.Folder
                             ? parent.GetFolderDescendantsForShare(item.ItemID)
@@ -962,44 +696,74 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    await StreamVideoFile(req, item);
+                    string filePath = parent.GetFullItemPath(item);
+                    if (!File.Exists(filePath))
+                    {
+                        await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    var fileInfo = new FileInfo(filePath);
+                    long fileLength = fileInfo.Length;
+                    string mimeType = parent.GetVideoMimeType(item);
+
+                    string rangeHeader = req.req.Headers["Range"];
+
+                    if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
+                    {
+                        string rangeValue = rangeHeader.Substring("bytes=".Length);
+                        string[] parts = rangeValue.Split('-');
+                        long start = long.Parse(parts[0]);
+                        long end = !string.IsNullOrEmpty(parts[1]) ? long.Parse(parts[1]) : fileLength - 1;
+
+                        if (start >= fileLength || end >= fileLength || start > end)
+                        {
+                            NameValueCollection rangeErrHeaders = new();
+                            rangeErrHeaders.Add("Accept-Ranges", "bytes");
+                            rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
+                            await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
+                            return;
+                        }
+
+                        long contentLength = end - start + 1;
+                        NameValueCollection rangeHeaders = new();
+                        rangeHeaders.Add("Accept-Ranges", "bytes");
+                        rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
+
+                        using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
+                        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        fs.Seek(start, SeekOrigin.Begin);
+                        byte[] buffer = new byte[65536];
+                        long remaining = contentLength;
+                        while (remaining > 0)
+                        {
+                            int toRead = (int)Math.Min(buffer.Length, remaining);
+                            int bytesRead = await fs.ReadAsync(buffer, 0, toRead);
+                            if (bytesRead == 0) break;
+                            await output.WriteAsync(buffer, 0, bytesRead);
+                            remaining -= bytesRead;
+                        }
+                    }
+                    else
+                    {
+                        NameValueCollection fullHeaders = new();
+                        fullHeaders.Add("Accept-Ranges", "bytes");
+
+                        using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
+                        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                        byte[] buffer = new byte[65536];
+                        int bytesRead;
+                        while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                        {
+                            await output.WriteAsync(buffer, 0, bytesRead);
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Guest);
-
-            await parent.CreateAPIRoute("/KliveCloud/StreamSharedVideo", async (req) =>
-            {
-                try
-                {
-                    var shareScope = await ResolveShareScope(req, req.userParameters.Get("code"));
-                    if (!shareScope.HasValue)
-                    {
-                        return;
-                    }
-
-                    var (_, sharedItem) = shareScope.Value;
-                    var item = await ResolveSharedFileTarget(req, sharedItem, req.userParameters.Get("itemID"));
-                    if (item == null)
-                    {
-                        return;
-                    }
-
-                    if (!parent.IsVideo(item))
-                    {
-                        await req.ReturnResponse("ItemIsNotAVideo", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    await StreamVideoFile(req, item);
-                }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Anybody);
         }
 
         private List<CloudItem> GetDescendants(string folderID, KMPermissions userPerm)
