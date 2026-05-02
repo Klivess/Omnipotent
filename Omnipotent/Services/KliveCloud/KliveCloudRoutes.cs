@@ -140,9 +140,9 @@ namespace Omnipotent.Services.KliveCloud
                 rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
 
                 using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
                 fs.Seek(start, SeekOrigin.Begin);
-                byte[] buffer = new byte[65536];
+                byte[] buffer = new byte[262144];
                 long remaining = contentLength;
                 while (remaining > 0)
                 {
@@ -159,8 +159,8 @@ namespace Omnipotent.Services.KliveCloud
                 fullHeaders.Add("Accept-Ranges", "bytes");
 
                 using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-                byte[] buffer = new byte[65536];
+                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                byte[] buffer = new byte[262144];
                 int bytesRead;
                 while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
                 {
@@ -629,6 +629,16 @@ namespace Omnipotent.Services.KliveCloud
 
                     var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate, permissionMode);
 
+                    // Pre-warm Discord-compatible MP4 cache so embed URL responds instantly before Discord's scraper times out.
+                    if (item.ItemType == CloudItemType.File && parent.IsVideo(item))
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try { await parent.GetDiscordCompatibleVideoPath(item); }
+                            catch (Exception ex) { await parent.ServiceLogError(ex, "Failed to pre-warm Discord embed transcode for share link"); }
+                        });
+                    }
+
                     string downloadUrl = $"https://{KliveAPI.KliveAPI.domainName}:{KliveAPI.KliveAPI.apiPORT}/KliveCloud/DownloadShared?code={shareLink.ShareCode}";
 
                     var result = new
@@ -828,6 +838,16 @@ namespace Omnipotent.Services.KliveCloud
                     if (scope == null) return;
 
                     var (link, item) = scope.Value;
+
+                    // Pre-warm Discord-compatible MP4 cache (covers existing share links re-shared into Discord).
+                    if (item.ItemType == CloudItemType.File && parent.IsVideo(item))
+                    {
+                        _ = Task.Run(async () =>
+                        {
+                            try { await parent.GetDiscordCompatibleVideoPath(item); }
+                            catch (Exception ex) { await parent.ServiceLogError(ex, "Failed to pre-warm Discord embed transcode on shared item info"); }
+                        });
+                    }
 
                     var effectiveItem = parent.CloneWithEffectivePermission(item);
                     var descendants = item.ItemType == CloudItemType.Folder

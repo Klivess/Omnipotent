@@ -602,6 +602,14 @@ namespace Omnipotent.Services.KliveCloud
             }
 
             string cachePath = GetVideoEmbedCachePath(item.ItemID);
+
+            // Fast path: cache exists and is up-to-date - avoid acquiring transcode lock
+            // so concurrent Range requests during playback don't serialize behind each other.
+            if (File.Exists(cachePath) && File.GetLastWriteTimeUtc(cachePath) >= File.GetLastWriteTimeUtc(sourcePath))
+            {
+                return cachePath;
+            }
+
             var transcodeLock = videoEmbedTranscodeLocks.GetOrAdd(item.ItemID, _ => new SemaphoreSlim(1, 1));
             await transcodeLock.WaitAsync();
             try
