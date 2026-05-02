@@ -78,6 +78,14 @@ namespace Omnipotent.Services.KliveCloud
             public string CreatedByUserID;
             public DateTime CreatedDate;
             public DateTime? ExpirationDate;
+            public SharePermissionMode PermissionMode = SharePermissionMode.ReadOnly;
+        }
+
+        public enum SharePermissionMode
+        {
+            ReadOnly,
+            Write,
+            WriteDelete
         }
 
         private async Task LoadShareLinks()
@@ -104,11 +112,14 @@ namespace Omnipotent.Services.KliveCloud
             await GetDataHandler().WriteToFile(shareLinksFilePath, json);
         }
 
-        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate)
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly)
         {
             var existingLink = await GetReusableShareLink(itemID);
             if (existingLink != null)
             {
+                existingLink.ExpirationDate = expirationDate;
+                existingLink.PermissionMode = permissionMode;
+                await SaveShareLinks();
                 return existingLink;
             }
 
@@ -118,12 +129,34 @@ namespace Omnipotent.Services.KliveCloud
                 ItemID = itemID,
                 CreatedByUserID = createdByUserID,
                 CreatedDate = DateTime.Now,
-                ExpirationDate = expirationDate
+                ExpirationDate = expirationDate,
+                PermissionMode = permissionMode
             };
             ShareLinks.Add(link);
             await SaveShareLinks();
             ServiceLog($"Share link created for item {itemID} by user {createdByUserID}.");
             return link;
+        }
+
+        public bool CanWriteThroughShareLink(ShareLink link)
+        {
+            return link.PermissionMode == SharePermissionMode.Write || link.PermissionMode == SharePermissionMode.WriteDelete;
+        }
+
+        public bool CanDeleteThroughShareLink(ShareLink link)
+        {
+            return link.PermissionMode == SharePermissionMode.WriteDelete;
+        }
+
+        public bool IsItemWithinSharedScope(ShareLink link, CloudItem item)
+        {
+            if (string.Equals(link.ItemID, item.ItemID, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            var sharedRoot = GetItemByID(link.ItemID);
+            return sharedRoot != null && sharedRoot.ItemType == CloudItemType.Folder && IsDescendantOfFolder(sharedRoot.ItemID, item);
         }
 
         public ShareLink GetShareLinkByCode(string shareCode)
@@ -392,6 +425,16 @@ namespace Omnipotent.Services.KliveCloud
 
         public async Task<bool> DeleteItem(string itemID, KMProfile user)
         {
+            return await DeleteItemInternal(itemID, user?.Name ?? user?.UserID ?? "Unknown user");
+        }
+
+        public async Task<bool> DeleteItem(string itemID, string deletedByLabel)
+        {
+            return await DeleteItemInternal(itemID, deletedByLabel);
+        }
+
+        private async Task<bool> DeleteItemInternal(string itemID, string deletedByLabel)
+        {
             var item = GetItemByID(itemID);
             if (item == null) return false;
 
@@ -400,7 +443,7 @@ namespace Omnipotent.Services.KliveCloud
                 var children = CloudItems.Where(k => k.ParentFolderID == itemID).ToList();
                 foreach (var child in children)
                 {
-                    await DeleteItem(child.ItemID, user);
+                    await DeleteItemInternal(child.ItemID, deletedByLabel);
                 }
 
                 string fullPath = GetFullItemPath(item);
@@ -416,7 +459,7 @@ namespace Omnipotent.Services.KliveCloud
 
             CloudItems.Remove(item);
             await SaveMetadata();
-            ServiceLog($"Item '{item.Name}' deleted by user {user.Name}.");
+            ServiceLog($"Item '{item.Name}' deleted by {deletedByLabel}.");
             return true;
         }
 
