@@ -103,6 +103,11 @@ namespace Omnipotent.Services.KliveCloud
         private async Task StreamVideoFile(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, CloudItem item)
         {
             string filePath = parent.GetFullItemPath(item);
+            await StreamVideoPath(req, filePath, parent.GetVideoMimeType(item));
+        }
+
+        private async Task StreamVideoPath(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string filePath, string mimeType)
+        {
             if (!File.Exists(filePath))
             {
                 await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
@@ -111,7 +116,6 @@ namespace Omnipotent.Services.KliveCloud
 
             var fileInfo = new FileInfo(filePath);
             long fileLength = fileInfo.Length;
-            string mimeType = parent.GetVideoMimeType(item);
             string? rangeHeader = req.req.Headers["Range"];
 
             if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
@@ -929,6 +933,42 @@ namespace Omnipotent.Services.KliveCloud
                     }
 
                     await StreamVideoFile(req, item);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Anybody);
+
+            await parent.CreateAPIRoute("/KliveCloud/StreamSharedVideoEmbed", async (req) =>
+            {
+                try
+                {
+                    var scope = await ResolveShareScope(req);
+                    if (scope == null) return;
+
+                    var (link, root) = scope.Value;
+                    var item = ResolveSharedFileTarget(link, root, req.userParameters.Get("itemID"));
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("SharedFileNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (!parent.IsVideo(item))
+                    {
+                        await req.ReturnResponse("ItemIsNotAVideo", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    string? compatibleVideoPath = await parent.GetDiscordCompatibleVideoPath(item);
+                    if (string.IsNullOrEmpty(compatibleVideoPath))
+                    {
+                        await req.ReturnResponse("VideoEmbedGenerationFailed", code: HttpStatusCode.InternalServerError);
+                        return;
+                    }
+
+                    await StreamVideoPath(req, compatibleVideoPath, "video/mp4");
                 }
                 catch (Exception ex)
                 {

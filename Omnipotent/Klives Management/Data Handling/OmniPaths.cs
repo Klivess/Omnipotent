@@ -96,6 +96,7 @@ namespace Omnipotent.Data_Handling
             public static string KliveCloudStorageDirectory = $"{KliveCloudDirectory}/Cloud";
             public static string KliveCloudMetadataDirectory = $"{KliveCloudDirectory}/Metadata";
             public static string KliveCloudThumbnailsDirectory = $"{KliveCloudDirectory}/Thumbnails";
+            public static string KliveCloudVideoEmbedsDirectory = $"{KliveCloudDirectory}/VideoEmbeds";
 
             //KlivesWorkoutManager
             public static string KlivesWorkoutManagerDirectory = $"{SavedDataDirectory}/KlivesWorkoutManager";

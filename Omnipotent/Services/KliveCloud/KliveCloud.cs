@@ -2,6 +2,7 @@ using FFMpegCore;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using System.Collections.Concurrent;
 using System.Runtime.Serialization;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.KliveCloud.CloudItem;
@@ -15,6 +16,7 @@ namespace Omnipotent.Services.KliveCloud
         private KliveCloudRoutes routes;
         private string metadataFilePath;
         private string shareLinksFilePath;
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> videoEmbedTranscodeLocks = new();
 
         public KliveCloud()
         {
@@ -30,6 +32,7 @@ namespace Omnipotent.Services.KliveCloud
             Directory.CreateDirectory(storagePath);
             Directory.CreateDirectory(metadataPath);
             Directory.CreateDirectory(thumbnailsPath);
+            Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudVideoEmbedsDirectory));
             metadataFilePath = Path.Combine(metadataPath, "cloud_metadata.json");
             shareLinksFilePath = Path.Combine(metadataPath, "share_links.json");
 
@@ -523,7 +526,8 @@ namespace Omnipotent.Services.KliveCloud
 
         private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
-            ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp"
+            ".mp4", ".mkv", ".avi", ".mov", ".qt", ".wmv", ".flv", ".webm", ".m4v", ".mpg", ".mpeg", ".3gp", ".3g2",
+            ".ogv", ".ogg", ".ts", ".mts", ".m2ts", ".vob", ".asf", ".divx", ".mxf"
         };
 
         private static readonly Dictionary<string, string> VideoMimeTypes = new(StringComparer.OrdinalIgnoreCase)
@@ -532,13 +536,24 @@ namespace Omnipotent.Services.KliveCloud
             { ".mkv", "video/x-matroska" },
             { ".avi", "video/x-msvideo" },
             { ".mov", "video/quicktime" },
+            { ".qt", "video/quicktime" },
             { ".wmv", "video/x-ms-wmv" },
             { ".flv", "video/x-flv" },
             { ".webm", "video/webm" },
             { ".m4v", "video/x-m4v" },
             { ".mpg", "video/mpeg" },
             { ".mpeg", "video/mpeg" },
-            { ".3gp", "video/3gpp" }
+            { ".3gp", "video/3gpp" },
+            { ".3g2", "video/3gpp2" },
+            { ".ogv", "video/ogg" },
+            { ".ogg", "video/ogg" },
+            { ".ts", "video/mp2t" },
+            { ".mts", "video/mp2t" },
+            { ".m2ts", "video/mp2t" },
+            { ".vob", "video/dvd" },
+            { ".asf", "video/x-ms-asf" },
+            { ".divx", "video/divx" },
+            { ".mxf", "application/mxf" }
         };
 
         public string GetVideoMimeType(CloudItem item)
@@ -566,6 +581,55 @@ namespace Omnipotent.Services.KliveCloud
         {
             string thumbnailsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudThumbnailsDirectory);
             return Path.Combine(thumbnailsDir, $"{itemID}_{width}x{height}.jpg");
+        }
+
+        private string GetVideoEmbedCachePath(string itemID)
+        {
+            string embedsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudVideoEmbedsDirectory);
+            Directory.CreateDirectory(embedsDir);
+            return Path.Combine(embedsDir, $"{itemID}_discord.mp4");
+        }
+
+        public async Task<string?> GetDiscordCompatibleVideoPath(CloudItem item)
+        {
+            string sourcePath = GetFullItemPath(item);
+            if (!File.Exists(sourcePath)) return null;
+
+            string sourceExtension = Path.GetExtension(item.Name);
+            if (string.Equals(sourceExtension, ".mp4", StringComparison.OrdinalIgnoreCase))
+            {
+                return sourcePath;
+            }
+
+            string cachePath = GetVideoEmbedCachePath(item.ItemID);
+            var transcodeLock = videoEmbedTranscodeLocks.GetOrAdd(item.ItemID, _ => new SemaphoreSlim(1, 1));
+            await transcodeLock.WaitAsync();
+            try
+            {
+                var sourceWriteTime = File.GetLastWriteTimeUtc(sourcePath);
+                if (File.Exists(cachePath) && File.GetLastWriteTimeUtc(cachePath) >= sourceWriteTime)
+                {
+                    return cachePath;
+                }
+
+                await FFMpegArguments
+                    .FromFileInput(sourcePath)
+                    .OutputToFile(cachePath, true, options => options
+                        .WithCustomArgument("-map 0:v:0 -map 0:a? -vf \"scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2\" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 128k -movflags +faststart")
+                        .ForceFormat("mp4"))
+                    .ProcessAsynchronously();
+
+                return File.Exists(cachePath) ? cachePath : null;
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Failed to generate Discord-compatible MP4 for {sourcePath}");
+                return null;
+            }
+            finally
+            {
+                transcodeLock.Release();
+            }
         }
 
         public async Task<byte[]> GeneratePreview(CloudItem item, int maxWidth, int maxHeight)
