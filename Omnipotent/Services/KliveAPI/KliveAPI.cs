@@ -205,10 +205,6 @@ namespace Omnipotent.Services.KliveAPI
                 apiStatistics = new KliveApiStatisticsStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPIStatisticsFile));
                 await apiStatistics.InitializeAsync();
 
-                //Create API listener
-                ControllerLookup = new(StringComparer.OrdinalIgnoreCase);
-                WebSocketRouteLookup = new(StringComparer.OrdinalIgnoreCase);
-
                 listener = new();
                 //listener.Prefixes.Add($"https://+:{apiPORT}/");
                 listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
