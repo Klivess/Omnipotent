@@ -372,6 +372,31 @@ namespace Omnipotent.Profiles
                     await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Associate);
+            await CreateAPIRoute("/KMProfiles/GetCurrentProfile", async (request) =>
+            {
+                try
+                {
+                    if (request.user == null)
+                    {
+                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
+                        return;
+                    }
+
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        request.user.UserID,
+                        request.user.Name,
+                        request.user.CreationDate,
+                        request.user.KlivesManagementRank,
+                        request.user.DiscordID,
+                        request.user.CanLogin
+                    }), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Guest);
             await CreateAPIRoute("/KMProfiles/ChangeCanLogin", async (request) =>
             {
                 try

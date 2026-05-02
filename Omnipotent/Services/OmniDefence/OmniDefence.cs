@@ -7,6 +7,8 @@ using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Http;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -23,10 +25,13 @@ namespace Omnipotent.Services.OmniDefence
         private OmniDefenceStore store = null!;
         private IpThreatTracker tracker = null!;
         private OmniDefenceScanner scanner = new();
+        private static readonly HttpClient GeoIpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
 
         // Discord notification dedupe state (separate from DB so it survives intra-request scenarios fast)
         private readonly ConcurrentDictionary<string, byte> recentlyScannedIps = new();
         private readonly ConcurrentDictionary<string, DateTime> lastScanByIp = new();
+        private readonly ConcurrentDictionary<string, byte> geoLookupsInFlight = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, DateTime> geoLookupCooldown = new(StringComparer.OrdinalIgnoreCase);
 
         // Cached set of routes registered as honeypots (route -> response kind)
         private readonly ConcurrentDictionary<string, string> honeypotRoutes = new(StringComparer.OrdinalIgnoreCase);
@@ -51,6 +56,7 @@ namespace Omnipotent.Services.OmniDefence
 
                 tracker = new IpThreatTracker(store);
                 await tracker.LoadAsync();
+                await BackfillProfileAssociationsAsync();
 
                 foreach (var hp in await store.ListHoneypotRoutesAsync())
                 {
@@ -88,10 +94,13 @@ namespace Omnipotent.Services.OmniDefence
         public IpThreatTracker.GateDecision EvaluateRequestGate(string ip, string route)
         {
             if (string.IsNullOrEmpty(ip)) return IpThreatTracker.GateDecision.Allow;
+            if (tracker.IsLinkedToKlives(ip)) return IpThreatTracker.GateDecision.Allow;
             // Honeypot routes always honeypot regardless of IP status.
             if (honeypotRoutes.ContainsKey(route)) return IpThreatTracker.GateDecision.Honeypot;
             return tracker.Evaluate(ip);
         }
+
+        public bool IsLinkedToKlives(string ip) => tracker.IsLinkedToKlives(ip);
 
         public bool IsHoneypotRoute(string route) => honeypotRoutes.ContainsKey(route);
 
@@ -105,8 +114,10 @@ namespace Omnipotent.Services.OmniDefence
             {
                 if (!string.IsNullOrEmpty(row.Ip))
                 {
+                    tracker.LinkProfile(tracker.GetOrCreate(row.Ip!), row.ProfileId, row.ProfileName, row.ProfileRank, row.UtcTimestamp);
                     var rec = tracker.RecordOutcome(row.Ip!, outcome);
-                    _ = MaybeAlertAsync(rec, row);
+                    _ = EnrichIpRecordAsync(rec);
+                    if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId)) _ = MaybeAlertAsync(rec, row);
                 }
                 await store.InsertRequestAsync(row);
             }
@@ -145,6 +156,133 @@ namespace Omnipotent.Services.OmniDefence
         {
             try { await store.InsertIpEventAsync(row); }
             catch (Exception ex) { await ServiceLogError(ex, "OmniDefence RecordIpEventAsync failed."); }
+        }
+
+        private async Task BackfillProfileAssociationsAsync()
+        {
+            try
+            {
+                var rows = await store.QueryAsync(@"
+                    SELECT r.ip, r.profile_id, r.profile_name, r.profile_rank, r.utc_ts
+                    FROM requests r
+                    INNER JOIN (
+                        SELECT ip, MAX(utc_ts) AS last_profile_seen
+                        FROM requests
+                        WHERE ip IS NOT NULL AND ip <> '' AND profile_id IS NOT NULL AND profile_id <> ''
+                        GROUP BY ip
+                    ) latest ON latest.ip = r.ip AND latest.last_profile_seen = r.utc_ts
+                    WHERE r.profile_id IS NOT NULL AND r.profile_id <> ''",
+                    new());
+
+                foreach (var row in rows)
+                {
+                    string? ip = row.TryGetValue("ip", out var rawIp) ? rawIp as string : null;
+                    string? profileId = row.TryGetValue("profile_id", out var rawProfileId) ? rawProfileId as string : null;
+                    if (string.IsNullOrWhiteSpace(ip) || string.IsNullOrWhiteSpace(profileId)) continue;
+
+                    string? profileName = row.TryGetValue("profile_name", out var rawProfileName) ? rawProfileName as string : null;
+                    int? profileRank = row.TryGetValue("profile_rank", out var rawProfileRank) && rawProfileRank != null ? Convert.ToInt32(rawProfileRank) : null;
+                    long seenUtc = row.TryGetValue("utc_ts", out var rawSeen) && rawSeen != null ? Convert.ToInt64(rawSeen) : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                    tracker.LinkProfile(tracker.GetOrCreate(ip), profileId, profileName, profileRank, seenUtc);
+                }
+
+                await tracker.PersistAllDirtyAsync();
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "OmniDefence profile association backfill failed.");
+            }
+        }
+
+        private async Task EnrichIpRecordAsync(IpRecord rec)
+        {
+            if (rec == null || string.IsNullOrWhiteSpace(rec.Ip)) return;
+            lock (rec)
+            {
+                if (!string.IsNullOrWhiteSpace(rec.Country) || !string.IsNullOrWhiteSpace(rec.Asn)) return;
+            }
+
+            if (!geoLookupsInFlight.TryAdd(rec.Ip, 0)) return;
+            try
+            {
+                if (geoLookupCooldown.TryGetValue(rec.Ip, out var lastFail) && DateTime.UtcNow - lastFail < TimeSpan.FromHours(6)) return;
+
+                if (!IPAddress.TryParse(rec.Ip, out var address) || IsPrivateOrLocalAddress(address))
+                {
+                    lock (rec)
+                    {
+                        rec.Country = "Private";
+                        rec.Asn = "Local";
+                    }
+                    await tracker.PersistAsync(rec);
+                    return;
+                }
+
+                string url = $"http://ip-api.com/json/{rec.Ip}?fields=status,country,countryCode,as,query,message";
+                string json = await GeoIpClient.GetStringAsync(url);
+                var result = JsonConvert.DeserializeObject<GeoIpResponse>(json);
+                if (result?.Status == "success")
+                {
+                    lock (rec)
+                    {
+                        rec.Country = string.IsNullOrWhiteSpace(result.CountryCode) ? result.Country : result.CountryCode;
+                        rec.Asn = result.Asn;
+                    }
+                    await tracker.PersistAsync(rec);
+                    await RecordIpEventAsync(new IpEventRow
+                    {
+                        UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                        Ip = rec.Ip,
+                        Kind = "GeoIP",
+                        Detail = JsonConvert.SerializeObject(new { result.Country, result.CountryCode, result.Asn })
+                    });
+                }
+                else
+                {
+                    geoLookupCooldown[rec.Ip] = DateTime.UtcNow;
+                }
+            }
+            catch
+            {
+                geoLookupCooldown[rec.Ip] = DateTime.UtcNow;
+            }
+            finally
+            {
+                geoLookupsInFlight.TryRemove(rec.Ip, out _);
+            }
+        }
+
+        private static bool IsPrivateOrLocalAddress(IPAddress address)
+        {
+            if (IPAddress.IsLoopback(address)) return true;
+            if (address.AddressFamily == AddressFamily.InterNetwork)
+            {
+                byte[] b = address.GetAddressBytes();
+                return b[0] == 10
+                    || (b[0] == 172 && b[1] >= 16 && b[1] <= 31)
+                    || (b[0] == 192 && b[1] == 168)
+                    || (b[0] == 169 && b[1] == 254);
+            }
+            if (address.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                return address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.ToString().StartsWith("fc", StringComparison.OrdinalIgnoreCase) || address.ToString().StartsWith("fd", StringComparison.OrdinalIgnoreCase);
+            }
+            return false;
+        }
+
+        private sealed class GeoIpResponse
+        {
+            [JsonProperty("status")]
+            public string? Status { get; set; }
+
+            [JsonProperty("country")]
+            public string? Country { get; set; }
+
+            [JsonProperty("countryCode")]
+            public string? CountryCode { get; set; }
+
+            [JsonProperty("as")]
+            public string? Asn { get; set; }
         }
 
         // ------------------------------------------------------------------

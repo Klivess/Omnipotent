@@ -12,6 +12,9 @@ namespace Omnipotent.Services.OmniDefence
     /// </summary>
     internal static class OmniDefenceRoutes
     {
+        private const string DerivedRequestOriginSql = "COALESCE(NULLIF(request_origin, ''), CASE WHEN client_page IS NOT NULL AND client_page <> '' THEN CASE WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'WebsiteProfile' ELSE 'WebsiteNoProfile' END WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'DirectApiProfile' ELSE 'DirectApi' END)";
+        private const string RequestSelectSql = "SELECT id, utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, " + DerivedRequestOriginSql + " AS request_origin, client_page FROM requests";
+
         public static async Task RegisterAsync(OmniDefence parent)
         {
             // Overview
@@ -24,12 +27,24 @@ namespace Omnipotent.Services.OmniDefence
                 long reqs24h = await parent.Store.ScalarLongAsync(
                     "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t",
                     new() { ["$t"] = day });
+                long totalRequests = await parent.Store.ScalarLongAsync(
+                    "SELECT COUNT(*) FROM requests",
+                    new());
                 long reqs7d = await parent.Store.ScalarLongAsync(
                     "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t",
                     new() { ["$t"] = week });
-                long unauth24h = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM auth_events WHERE utc_ts >= $t AND type IN ('UnauthRoute','InsufficientClearance','InvalidPassword')",
+                long denied24h = await parent.Store.ScalarLongAsync(
+                    "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t AND (deny_reason IS NOT NULL OR status_code >= 400)",
                     new() { ["$t"] = day });
+                long totalDenied = await parent.Store.ScalarLongAsync(
+                    "SELECT COUNT(*) FROM requests WHERE deny_reason IS NOT NULL OR status_code >= 400",
+                    new());
+                long unauth24h = await parent.Store.ScalarLongAsync(
+                    "SELECT COUNT(*) FROM auth_events WHERE utc_ts >= $t AND type IN ('UnauthRoute','InsufficientClearance','InvalidPassword','WebsiteNoProfile','WebsiteInvalidProfile')",
+                    new() { ["$t"] = day });
+                long totalAuthEvents = await parent.Store.ScalarLongAsync(
+                    "SELECT COUNT(*) FROM auth_events",
+                    new());
 
                 int blocked = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Blocked));
                 int watched = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Watch));
@@ -37,26 +52,45 @@ namespace Omnipotent.Services.OmniDefence
                 int tarpit = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Tarpit));
 
                 var topAttackers = parent.Tracker.All()
+                    .Where(r => string.IsNullOrWhiteSpace(r.AssociatedProfileId))
                     .OrderByDescending(r => r.ThreatScore)
                     .Take(10)
-                    .Select(r => new { ip = r.Ip, score = r.ThreatScore, status = r.Status, unauth = r.UnauthAttempts, country = r.Country });
+                    .Select(r => new { ip = r.Ip, score = r.ThreatScore, status = r.Status, unauth = r.UnauthAttempts, country = r.Country, attacker = true });
+
+                var topThreat = parent.Tracker.All()
+                    .Where(r => string.IsNullOrWhiteSpace(r.AssociatedProfileId))
+                    .OrderByDescending(r => r.ThreatScore)
+                    .Select(r => new { ip = r.Ip, score = r.ThreatScore, status = r.Status, unauth = r.UnauthAttempts, country = r.Country, asn = r.Asn, attacker = true })
+                    .FirstOrDefault();
 
                 var topRoutes = await parent.Store.QueryAsync(
                     "SELECT route, COUNT(*) AS hits FROM requests WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC LIMIT 10",
                     new() { ["$t"] = day });
 
+                var originBreakdown = await parent.Store.QueryAsync(
+                    $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
+                    new() { ["$t"] = day });
+
                 var resp = new
                 {
                     requests24h = reqs24h,
+                    totalRequests,
                     requests7d = reqs7d,
+                    denied24h,
+                    totalDenied,
+                    authFailures24h = unauth24h,
                     unauth24h,
+                    totalAuthEvents,
                     blockedIps = blocked,
                     watchedIps = watched,
                     honeypotIps = honey,
                     tarpitIps = tarpit,
                     totalIps = parent.Tracker.All().Count(),
+                    knownIps = parent.Tracker.All().Count(),
+                    topThreat,
                     topAttackers,
-                    topRoutes
+                    topRoutes,
+                    originBreakdown
                 };
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(resp), "application/json");
@@ -91,11 +125,11 @@ namespace Omnipotent.Services.OmniDefence
             {
                 string? status = req.userParameters.Get("status");
                 double minScore = double.TryParse(req.userParameters.Get("minScore"), out var ms) ? ms : 0;
-                string? query = req.userParameters.Get("query");
+                string? query = req.userParameters.Get("query") ?? req.userParameters.Get("q");
                 int limit = int.TryParse(req.userParameters.Get("limit"), out var l) ? Math.Clamp(l, 1, 1000) : 200;
                 int offset = int.TryParse(req.userParameters.Get("offset"), out var o) ? Math.Max(0, o) : 0;
 
-                var rows = await parent.Store.ListIpRecordsAsync(status, minScore, query, limit, offset);
+                var rows = FilterIpRecords(parent.Tracker.All(), status, minScore, query, limit, offset);
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
@@ -108,9 +142,9 @@ namespace Omnipotent.Services.OmniDefence
                     await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest);
                     return;
                 }
-                var record = await parent.Store.GetIpRecordAsync(ip);
+                var record = parent.Tracker.Get(ip) ?? await parent.Store.GetIpRecordAsync(ip);
                 var recentReqs = await parent.Store.QueryAsync(
-                    "SELECT * FROM requests WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
+                    RequestSelectSql + " WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
                     new() { ["$ip"] = ip });
                 var events = await parent.Store.QueryAsync(
                     "SELECT * FROM ip_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
@@ -128,6 +162,7 @@ namespace Omnipotent.Services.OmniDefence
                 string ip = (body["ip"] as string ?? "").Trim();
                 string reason = body["reason"] as string ?? "Manual block";
                 if (string.IsNullOrEmpty(ip)) { await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest); return; }
+                if (parent.IsLinkedToKlives(ip)) { await req.ReturnResponse("Refusing to block a Klives-linked IP", "text/plain", null, HttpStatusCode.Conflict); return; }
                 var rec = parent.Tracker.GetOrCreate(ip);
                 lock (rec) { rec.Status = nameof(IpThreatTracker.IpStatus.Blocked); rec.LastBlockReason = reason; }
                 await parent.Tracker.PersistAsync(rec);
@@ -171,9 +206,15 @@ namespace Omnipotent.Services.OmniDefence
                 var body = ParseJsonBody(req);
                 string ip = (body["ip"] as string ?? "").Trim();
                 string status = body["status"] as string ?? "";
+                if (string.IsNullOrEmpty(ip)) { await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest); return; }
                 if (!Enum.TryParse<IpThreatTracker.IpStatus>(status, true, out var parsed))
                 {
                     await req.ReturnResponse("Invalid status", "text/plain", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+                if ((parsed == IpThreatTracker.IpStatus.Blocked || parsed == IpThreatTracker.IpStatus.Tarpit || parsed == IpThreatTracker.IpStatus.Honeypot) && parent.IsLinkedToKlives(ip))
+                {
+                    await req.ReturnResponse("Refusing to apply hostile status to a Klives-linked IP", "text/plain", null, HttpStatusCode.Conflict);
                     return;
                 }
                 var rec = parent.Tracker.GetOrCreate(ip);
@@ -195,7 +236,7 @@ namespace Omnipotent.Services.OmniDefence
             {
                 var body = ParseJsonBody(req);
                 string ip = (body["ip"] as string ?? "").Trim();
-                string? note = body["note"] as string;
+                string? note = body["note"] as string ?? body["notes"] as string;
                 if (string.IsNullOrEmpty(ip)) { await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest); return; }
                 parent.Tracker.SetNotes(ip, note);
                 var rec = parent.Tracker.GetOrCreate(ip);
@@ -233,7 +274,26 @@ namespace Omnipotent.Services.OmniDefence
             // Honeypot routes management
             await parent.CreateAPIRoute("/omnidefence/honeypot-routes", async req =>
             {
-                var rows = await parent.Store.ListHoneypotRoutesAsync();
+                var storedRoutes = await parent.Store.ListHoneypotRoutesAsync();
+                var rows = new List<object>();
+                foreach (var row in storedRoutes)
+                {
+                    long hits = await parent.Store.ScalarLongAsync(
+                        "SELECT COUNT(*) FROM requests WHERE route=$route AND deny_reason='Honeypot'",
+                        new() { ["$route"] = row.Route });
+                    long lastHit = await parent.Store.ScalarLongAsync(
+                        "SELECT COALESCE(MAX(utc_ts), 0) FROM requests WHERE route=$route AND deny_reason='Honeypot'",
+                        new() { ["$route"] = row.Route });
+                    rows.Add(new
+                    {
+                        route = row.Route,
+                        createdUtc = row.CreatedUtc,
+                        responseKind = row.ResponseKind,
+                        note = row.Note,
+                        hits,
+                        lastHit
+                    });
+                }
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
@@ -317,7 +377,7 @@ namespace Omnipotent.Services.OmniDefence
             // Export
             await parent.CreateAPIRoute("/omnidefence/export", async req =>
             {
-                string table = (req.userParameters.Get("table") ?? "requests").ToLowerInvariant();
+                string table = (req.userParameters.Get("table") ?? req.userParameters.Get("kind") ?? "requests").ToLowerInvariant();
                 string format = (req.userParameters.Get("format") ?? "json").ToLowerInvariant();
                 if (!new[] { "requests", "auth_events", "profile_actions", "ip_records", "ip_events" }.Contains(table))
                 {
@@ -338,15 +398,41 @@ namespace Omnipotent.Services.OmniDefence
 
         // -------- Query builders --------
 
+        private static List<IpRecord> FilterIpRecords(IEnumerable<IpRecord> records, string? status, double minScore, string? query, int limit, int offset)
+        {
+            var filtered = records.Where(r => r.ThreatScore >= minScore);
+            if (!string.IsNullOrWhiteSpace(status)) filtered = filtered.Where(r => string.Equals(r.Status, status, StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(query))
+            {
+                filtered = filtered.Where(r =>
+                    Contains(r.Ip, query) ||
+                    Contains(r.Country, query) ||
+                    Contains(r.Asn, query) ||
+                    Contains(r.Notes, query) ||
+                    Contains(r.AssociatedProfileId, query) ||
+                    Contains(r.AssociatedProfileName, query));
+            }
+
+            return filtered
+                .OrderByDescending(r => r.ThreatScore)
+                .ThenByDescending(r => r.LastSeen)
+                .Skip(offset)
+                .Take(limit)
+                .ToList();
+        }
+
+        private static bool Contains(string? source, string query) => source?.Contains(query, StringComparison.OrdinalIgnoreCase) == true;
+
         private static (string sql, Dictionary<string, object?> p) BuildRequestsQuery(KliveAPI.KliveAPI.UserRequest req)
         {
-            var sb = new StringBuilder("SELECT * FROM requests WHERE 1=1");
+            var sb = new StringBuilder(RequestSelectSql + " WHERE 1=1");
             var p = new Dictionary<string, object?>();
             string? ip = req.userParameters.Get("ip");
             string? profile = req.userParameters.Get("profile");
             string? route = req.userParameters.Get("route");
             string? statusCode = req.userParameters.Get("status");
             string? method = req.userParameters.Get("method");
+            string? origin = req.userParameters.Get("origin");
             string? from = req.userParameters.Get("from");
             string? to = req.userParameters.Get("to");
             string? denyOnly = req.userParameters.Get("denyOnly");
@@ -356,8 +442,15 @@ namespace Omnipotent.Services.OmniDefence
             if (!string.IsNullOrWhiteSpace(ip)) { sb.Append(" AND ip LIKE $ip"); p["$ip"] = "%" + ip + "%"; }
             if (!string.IsNullOrWhiteSpace(profile)) { sb.Append(" AND (profile_id=$pid OR profile_name LIKE $pname)"); p["$pid"] = profile; p["$pname"] = "%" + profile + "%"; }
             if (!string.IsNullOrWhiteSpace(route)) { sb.Append(" AND route LIKE $route"); p["$route"] = "%" + route + "%"; }
-            if (!string.IsNullOrWhiteSpace(statusCode) && int.TryParse(statusCode, out var sc)) { sb.Append(" AND status_code=$sc"); p["$sc"] = sc; }
+            if (!string.IsNullOrWhiteSpace(statusCode) && statusCode.EndsWith("xx", StringComparison.OrdinalIgnoreCase) && int.TryParse(statusCode[..1], out var statusHundreds))
+            {
+                sb.Append(" AND status_code >= $scFrom AND status_code < $scTo");
+                p["$scFrom"] = statusHundreds * 100;
+                p["$scTo"] = (statusHundreds + 1) * 100;
+            }
+            else if (!string.IsNullOrWhiteSpace(statusCode) && int.TryParse(statusCode, out var sc)) { sb.Append(" AND status_code=$sc"); p["$sc"] = sc; }
             if (!string.IsNullOrWhiteSpace(method)) { sb.Append(" AND method=$method"); p["$method"] = method.ToUpperInvariant(); }
+            if (!string.IsNullOrWhiteSpace(origin)) { sb.Append(" AND ").Append(DerivedRequestOriginSql).Append("=$origin"); p["$origin"] = origin; }
             if (!string.IsNullOrWhiteSpace(from) && long.TryParse(from, out var f)) { sb.Append(" AND utc_ts >= $f"); p["$f"] = f; }
             if (!string.IsNullOrWhiteSpace(to) && long.TryParse(to, out var t)) { sb.Append(" AND utc_ts <= $t"); p["$t"] = t; }
             if (denyOnly == "1" || string.Equals(denyOnly, "true", StringComparison.OrdinalIgnoreCase)) sb.Append(" AND deny_reason IS NOT NULL");

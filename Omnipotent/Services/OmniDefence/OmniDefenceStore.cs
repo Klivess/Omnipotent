@@ -53,12 +53,15 @@ namespace Omnipotent.Services.OmniDefence
                     duration_ms REAL,
                     profile_id TEXT,
                     profile_name TEXT,
+                    profile_rank INTEGER,
                     perm_required INTEGER,
                     matched_route INTEGER,
                     body_hash TEXT,
                     body_length INTEGER,
                     user_agent TEXT,
-                    deny_reason TEXT
+                    deny_reason TEXT,
+                    request_origin TEXT,
+                    client_page TEXT
                 );",
                 "CREATE INDEX IF NOT EXISTS ix_requests_ts ON requests(utc_ts);",
                 "CREATE INDEX IF NOT EXISTS ix_requests_ip ON requests(ip);",
@@ -107,6 +110,10 @@ namespace Omnipotent.Services.OmniDefence
                     country TEXT,
                     asn TEXT,
                     notes TEXT,
+                    associated_profile_id TEXT,
+                    associated_profile_name TEXT,
+                    associated_profile_rank INTEGER,
+                    associated_profile_last_seen_utc INTEGER,
                     first_alerted_utc INTEGER,
                     last_alerted_utc INTEGER,
                     escalation_level INTEGER DEFAULT 0,
@@ -142,6 +149,32 @@ namespace Omnipotent.Services.OmniDefence
                 cmd.CommandText = stmt;
                 await cmd.ExecuteNonQueryAsync();
             }
+
+            await EnsureColumnAsync("requests", "request_origin", "TEXT");
+            await EnsureColumnAsync("requests", "client_page", "TEXT");
+            await EnsureColumnAsync("requests", "profile_rank", "INTEGER");
+            await EnsureColumnAsync("ip_records", "associated_profile_id", "TEXT");
+            await EnsureColumnAsync("ip_records", "associated_profile_name", "TEXT");
+            await EnsureColumnAsync("ip_records", "associated_profile_rank", "INTEGER");
+            await EnsureColumnAsync("ip_records", "associated_profile_last_seen_utc", "INTEGER");
+        }
+
+        private async Task EnsureColumnAsync(string table, string column, string type)
+        {
+            using var check = Connection.CreateCommand();
+            check.CommandText = $"PRAGMA table_info({table})";
+            using var rdr = await check.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                if (string.Equals(rdr["name"] as string, column, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+            }
+
+            using var alter = Connection.CreateCommand();
+            alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {type}";
+            await alter.ExecuteNonQueryAsync();
         }
 
         public SqliteConnection Connection => sharedConnection ?? throw new InvalidOperationException("OmniDefenceStore not initialized.");
@@ -178,8 +211,8 @@ namespace Omnipotent.Services.OmniDefence
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO requests
-                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason)
-                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$perm,$matched,$bh,$blen,$ua,$deny)";
+                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page)
+                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page)";
             cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);
             cmd.Parameters.AddWithValue("$ip", (object?)row.Ip ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$method", (object?)row.Method ?? DBNull.Value);
@@ -189,12 +222,15 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$dur", row.DurationMs);
             cmd.Parameters.AddWithValue("$pid", (object?)row.ProfileId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$pname", (object?)row.ProfileName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$prank", (object?)row.ProfileRank ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$perm", row.PermRequired);
             cmd.Parameters.AddWithValue("$matched", row.MatchedRoute ? 1 : 0);
             cmd.Parameters.AddWithValue("$bh", (object?)row.BodyHash ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$blen", row.BodyLength);
             cmd.Parameters.AddWithValue("$ua", (object?)row.UserAgent ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$deny", (object?)row.DenyReason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$origin", (object?)row.RequestOrigin ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$page", (object?)row.ClientPage ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync();
         });
 
@@ -251,8 +287,8 @@ namespace Omnipotent.Services.OmniDefence
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO ip_records
-                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, notes, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
-                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$nt,$fa,$la,$el,$lbr,$lsc)
+                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
+                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
                 ON CONFLICT(ip) DO UPDATE SET
                     last_seen=excluded.last_seen,
                     total_requests=excluded.total_requests,
@@ -264,6 +300,10 @@ namespace Omnipotent.Services.OmniDefence
                     country=COALESCE(excluded.country, ip_records.country),
                     asn=COALESCE(excluded.asn, ip_records.asn),
                     notes=excluded.notes,
+                    associated_profile_id=COALESCE(excluded.associated_profile_id, ip_records.associated_profile_id),
+                    associated_profile_name=COALESCE(excluded.associated_profile_name, ip_records.associated_profile_name),
+                    associated_profile_rank=COALESCE(excluded.associated_profile_rank, ip_records.associated_profile_rank),
+                    associated_profile_last_seen_utc=COALESCE(excluded.associated_profile_last_seen_utc, ip_records.associated_profile_last_seen_utc),
                     first_alerted_utc=COALESCE(excluded.first_alerted_utc, ip_records.first_alerted_utc),
                     last_alerted_utc=excluded.last_alerted_utc,
                     escalation_level=excluded.escalation_level,
@@ -281,6 +321,10 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$co", (object?)rec.Country ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$asn", (object?)rec.Asn ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$nt", (object?)rec.Notes ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$apid", (object?)rec.AssociatedProfileId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$apname", (object?)rec.AssociatedProfileName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$aprank", (object?)rec.AssociatedProfileRank ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$aplast", (object?)rec.AssociatedProfileLastSeenUtc ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$fa", (object?)rec.FirstAlertedUtc ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$la", (object?)rec.LastAlertedUtc ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$el", rec.EscalationLevel);
@@ -312,7 +356,7 @@ namespace Omnipotent.Services.OmniDefence
             }
             if (!string.IsNullOrWhiteSpace(query))
             {
-                sb.Append(" AND (ip LIKE $q OR country LIKE $q OR notes LIKE $q)");
+                sb.Append(" AND (ip LIKE $q OR country LIKE $q OR notes LIKE $q OR associated_profile_name LIKE $q OR associated_profile_id LIKE $q)");
                 cmd.Parameters.AddWithValue("$q", "%" + query + "%");
             }
             sb.Append(" ORDER BY threat_score DESC, last_seen DESC LIMIT $lim OFFSET $off");
@@ -431,6 +475,10 @@ namespace Omnipotent.Services.OmniDefence
                 Country = rdr["country"] as string,
                 Asn = rdr["asn"] as string,
                 Notes = rdr["notes"] as string,
+                AssociatedProfileId = rdr["associated_profile_id"] as string,
+                AssociatedProfileName = rdr["associated_profile_name"] as string,
+                AssociatedProfileRank = rdr["associated_profile_rank"] is DBNull ? null : Convert.ToInt32(rdr["associated_profile_rank"]),
+                AssociatedProfileLastSeenUtc = rdr["associated_profile_last_seen_utc"] is DBNull ? null : Convert.ToInt64(rdr["associated_profile_last_seen_utc"]),
                 FirstAlertedUtc = rdr["first_alerted_utc"] is DBNull ? null : Convert.ToInt64(rdr["first_alerted_utc"]),
                 LastAlertedUtc = rdr["last_alerted_utc"] is DBNull ? null : Convert.ToInt64(rdr["last_alerted_utc"]),
                 EscalationLevel = Convert.ToInt32(rdr["escalation_level"] ?? 0),
@@ -451,12 +499,15 @@ namespace Omnipotent.Services.OmniDefence
         public double DurationMs;
         public string? ProfileId;
         public string? ProfileName;
+        public int? ProfileRank;
         public int PermRequired;
         public bool MatchedRoute;
         public string? BodyHash;
         public long BodyLength;
         public string? UserAgent;
         public string? DenyReason;
+        public string? RequestOrigin;
+        public string? ClientPage;
     }
 
     public class AuthEventRow
@@ -506,6 +557,10 @@ namespace Omnipotent.Services.OmniDefence
         public string? Country;
         public string? Asn;
         public string? Notes;
+        public string? AssociatedProfileId;
+        public string? AssociatedProfileName;
+        public int? AssociatedProfileRank;
+        public long? AssociatedProfileLastSeenUtc;
         public long? FirstAlertedUtc;
         public long? LastAlertedUtc;
         public int EscalationLevel;

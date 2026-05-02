@@ -469,6 +469,20 @@ namespace Omnipotent.Services.KliveAPI
             return requiredPermission != KMPermissions.Anybody || !string.IsNullOrWhiteSpace(req.Headers["Authorization"]);
         }
 
+        private static bool IsWebsiteClientRequest(HttpListenerRequest req)
+        {
+            string client = req.Headers["X-Klive-Client"] ?? string.Empty;
+            if (string.Equals(client, "website", StringComparison.OrdinalIgnoreCase)) return true;
+            if (!string.IsNullOrWhiteSpace(req.Headers["X-Klive-Page"])) return true;
+
+            string origin = req.Headers["Origin"] ?? string.Empty;
+            string referer = req.Headers["Referer"] ?? string.Empty;
+            return !string.IsNullOrWhiteSpace(origin)
+                || !string.IsNullOrWhiteSpace(referer)
+                || origin.Contains(domainName, StringComparison.OrdinalIgnoreCase)
+                || referer.Contains(domainName, StringComparison.OrdinalIgnoreCase);
+        }
+
         private async Task<KMProfileManager.KMProfile?> ResolveRequestUserAsync(HttpListenerRequest req)
         {
             string password = req.Headers["Authorization"];
@@ -550,10 +564,13 @@ namespace Omnipotent.Services.KliveAPI
             int defencePermRequired = 0;
             string? defenceProfileId = null;
             string? defenceProfileName = null;
+            int? defenceProfileRank = null;
             string? defenceDenyReason = null;
+            string defenceRequestOrigin = "DirectApi";
+            string? defenceClientPage = null;
+            bool defenceFromWebsite = false;
             RequestOutcome defenceOutcome = RequestOutcome.Success;
             bool defenceSkipRecord = false;
-            bool defencePreBlocked = false;
 
             try
             {
@@ -565,6 +582,10 @@ namespace Omnipotent.Services.KliveAPI
                 defenceIp = OmniDefenceService.ExtractClientIp(req);
                 defenceUserAgent = req.UserAgent;
                 defenceQueryString = query;
+                defenceFromWebsite = IsWebsiteClientRequest(req);
+                defenceClientPage = req.Headers["X-Klive-Page"] ?? req.Headers["Referer"];
+                string defenceAuthHeader = req.Headers["Authorization"] ?? string.Empty;
+                defenceRequestOrigin = defenceFromWebsite ? (string.IsNullOrWhiteSpace(defenceAuthHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile") : "DirectApi";
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
                     ? new NameValueCollection()
                     : HttpUtility.ParseQueryString(query);
@@ -587,14 +608,27 @@ namespace Omnipotent.Services.KliveAPI
                     return;
                 }
 
+                KMProfileManager.KMProfile? preResolvedUser = null;
+                if (!string.IsNullOrWhiteSpace(defenceAuthHeader))
+                {
+                    preResolvedUser = await ResolveRequestUserAsync(req);
+                    if (preResolvedUser != null)
+                    {
+                        defenceProfileId = preResolvedUser.UserID;
+                        defenceProfileName = preResolvedUser.Name;
+                        defenceProfileRank = (int)preResolvedUser.KlivesManagementRank;
+                        defenceRequestOrigin = defenceFromWebsite ? "WebsiteProfile" : "DirectApiProfile";
+                    }
+                }
+                bool skipDefenceGateForKlives = preResolvedUser != null && preResolvedUser.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives;
+
                 // ---- OmniDefence pre-dispatch gate ----
                 var defence = TryGetDefence();
-                if (defence != null && !string.IsNullOrEmpty(defenceIp))
+                if (defence != null && !string.IsNullOrEmpty(defenceIp) && !skipDefenceGateForKlives)
                 {
                     var decision = defence.EvaluateRequestGate(defenceIp, route);
                     if (decision == IpThreatTracker.GateDecision.Block)
                     {
-                        defencePreBlocked = true;
                         defenceOutcome = RequestOutcome.PreBlocked;
                         defenceDenyReason = "IPBlocked";
                         context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
@@ -626,7 +660,7 @@ namespace Omnipotent.Services.KliveAPI
                     defenceSkipRecord = true;
                     if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
                     {
-                        request.user = await ResolveRequestUserAsync(req);
+                        request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
                     }
 
                     if (wsRouteData.authenticationLevelRequired == KMPermissions.Anybody
@@ -657,7 +691,22 @@ namespace Omnipotent.Services.KliveAPI
 
                     if (ShouldResolveUser(req, routeData.authenticationLevelRequired))
                     {
-                        request.user = await ResolveRequestUserAsync(req);
+                        request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
+                    }
+
+                    if (defenceFromWebsite)
+                    {
+                        defenceRequestOrigin = request.user != null
+                            ? "WebsiteProfile"
+                            : routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody
+                                ? "WebsitePublicNoProfile"
+                                : string.IsNullOrWhiteSpace(req.Headers["Authorization"])
+                                    ? "WebsiteNoProfile"
+                                    : "WebsiteInvalidProfile";
+                    }
+                    else
+                    {
+                        defenceRequestOrigin = request.user != null ? "DirectApiProfile" : "DirectApi";
                     }
 
                     if (CanRequestCarryBody(req.HttpMethod))
@@ -672,6 +721,7 @@ namespace Omnipotent.Services.KliveAPI
                     {
                         defenceProfileId = request.user.UserID;
                         defenceProfileName = request.user.Name;
+                        defenceProfileRank = (int)request.user.KlivesManagementRank;
 
                         if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
                         {
@@ -719,26 +769,40 @@ namespace Omnipotent.Services.KliveAPI
                     else
                     {
                         _ = ServiceLog($"Authenticated route {route} was requested without valid credentials.");
-                        defenceOutcome = RequestOutcome.UnauthRoute;
-                        defenceDenyReason = "NoProfile";
+                        bool isWebsiteNoProfile = defenceFromWebsite;
+                        string authHeader = req.Headers["Authorization"] ?? string.Empty;
+                        defenceOutcome = isWebsiteNoProfile ? RequestOutcome.WebsiteNoProfile : RequestOutcome.UnauthRoute;
+                        defenceDenyReason = isWebsiteNoProfile
+                            ? (string.IsNullOrWhiteSpace(authHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile")
+                            : "NoProfile";
                         if (defence != null)
                         {
                             _ = defence.RecordAuthEventAsync(new AuthEventRow
                             {
                                 UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                                 Ip = defenceIp,
-                                Type = string.IsNullOrWhiteSpace(req.Headers["Authorization"]) ? "UnauthRoute" : "InvalidPassword",
+                                Type = isWebsiteNoProfile
+                                    ? defenceDenyReason
+                                    : string.IsNullOrWhiteSpace(authHeader) ? "UnauthRoute" : "InvalidPassword",
                                 Route = route,
                                 UserAgent = defenceUserAgent,
-                                Detail = "Required " + routeData.authenticationLevelRequired
+                                Detail = "Required " + routeData.authenticationLevelRequired + (string.IsNullOrWhiteSpace(defenceClientPage) ? "" : "; Page " + defenceClientPage)
                             });
-                            if (!string.IsNullOrWhiteSpace(req.Headers["Authorization"]))
+                            if (!isWebsiteNoProfile && !string.IsNullOrWhiteSpace(authHeader))
                             {
                                 defenceOutcome = RequestOutcome.InvalidPassword;
                                 defenceDenyReason = "InvalidPassword";
                             }
                         }
-                        await DenyRequest(request, DeniedRequestReason.NoProfile);
+                        if (isWebsiteNoProfile)
+                        {
+                            try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
+                            await DenyRequest(request, DeniedRequestReason.NoProfile, HttpStatusCode.Forbidden);
+                        }
+                        else
+                        {
+                            await DenyRequest(request, DeniedRequestReason.NoProfile);
+                        }
                     }
                 }
                 else
@@ -810,12 +874,15 @@ namespace Omnipotent.Services.KliveAPI
                                 DurationMs = requestStopwatch.Elapsed.TotalMilliseconds,
                                 ProfileId = defenceProfileId,
                                 ProfileName = defenceProfileName,
+                                ProfileRank = defenceProfileRank,
                                 PermRequired = defencePermRequired,
                                 MatchedRoute = matchedRoute,
                                 BodyHash = defenceBodyHash,
                                 BodyLength = defenceBodyLength,
                                 UserAgent = defenceUserAgent,
-                                DenyReason = defenceDenyReason
+                                DenyReason = defenceDenyReason,
+                                RequestOrigin = defenceRequestOrigin,
+                                ClientPage = defenceClientPage
                             };
                             _ = defence.RecordRequestAsync(row, defenceOutcome);
                         }
@@ -832,12 +899,12 @@ namespace Omnipotent.Services.KliveAPI
             IncorrectHTTPMethod = 3,
             ProfileDisabled = 4
         }
-        private async Task DenyRequest(UserRequest request, DeniedRequestReason reason)
+        private async Task DenyRequest(UserRequest request, DeniedRequestReason reason, HttpStatusCode code = HttpStatusCode.Unauthorized)
         {
             NameValueCollection headers = new();
             headers.Add("RequestDeniedReason", reason.ToString());
             headers.Add("RequestDeniedCode", ((int)reason).ToString());
-            await request.ReturnResponse("Access Denied: " + reason, "text/plain", headers, HttpStatusCode.Unauthorized);
+            await request.ReturnResponse("Access Denied: " + reason, "text/plain", headers, code);
         }
     }
 }

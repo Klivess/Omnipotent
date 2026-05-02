@@ -111,6 +111,11 @@ namespace Omnipotent.Services.OmniDefence
                         rec.DenyCount++;
                         rec.ThreatScore += 10;
                         break;
+                    case RequestOutcome.WebsiteNoProfile:
+                        rec.UnauthAttempts++;
+                        rec.DenyCount++;
+                        rec.ThreatScore += 15;
+                        break;
                     case RequestOutcome.IncorrectMethod:
                         rec.DenyCount++;
                         rec.ThreatScore += 1;
@@ -129,7 +134,7 @@ namespace Omnipotent.Services.OmniDefence
                 rec.ThreatScore = Math.Clamp(rec.ThreatScore, 0, 1000);
 
                 // Auto-escalation of status (only escalate, never auto-downgrade away from manual states)
-                if (rec.Status != nameof(IpStatus.Blocked) && rec.Status != nameof(IpStatus.Honeypot))
+                if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId) && rec.Status != nameof(IpStatus.Blocked) && rec.Status != nameof(IpStatus.Honeypot))
                 {
                     if (rec.ThreatScore >= AutoBlockScore)
                     {
@@ -171,6 +176,28 @@ namespace Omnipotent.Services.OmniDefence
             var rec = GetOrCreate(ip);
             lock (rec) { rec.Notes = notes; }
         }
+
+        public void LinkProfile(IpRecord rec, string? profileId, string? profileName, int? profileRank, long seenUtc)
+        {
+            if (rec == null || string.IsNullOrWhiteSpace(profileId)) return;
+
+            lock (rec)
+            {
+                if (rec.AssociatedProfileLastSeenUtc.HasValue && rec.AssociatedProfileLastSeenUtc.Value > seenUtc) return;
+
+                rec.AssociatedProfileId = profileId;
+                rec.AssociatedProfileName = profileName;
+                rec.AssociatedProfileRank = profileRank;
+                rec.AssociatedProfileLastSeenUtc = seenUtc;
+            }
+        }
+
+        public bool IsLinkedToKlives(string ip)
+        {
+            if (string.IsNullOrWhiteSpace(ip)) return false;
+            var rec = Get(ip);
+            return rec?.AssociatedProfileRank >= 5;
+        }
     }
 
     public enum RequestOutcome
@@ -179,6 +206,7 @@ namespace Omnipotent.Services.OmniDefence
         UnauthRoute,
         InsufficientClearance,
         InvalidPassword,
+        WebsiteNoProfile,
         IncorrectMethod,
         NotFound,
         ServerError,
