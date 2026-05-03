@@ -109,6 +109,12 @@ namespace Omnipotent.Services.OmniDefence
                     status TEXT DEFAULT 'Normal',
                     country TEXT,
                     asn TEXT,
+                    city TEXT,
+                    region TEXT,
+                    isp TEXT,
+                    org TEXT,
+                    latitude REAL,
+                    longitude REAL,
                     notes TEXT,
                     associated_profile_id TEXT,
                     associated_profile_name TEXT,
@@ -140,6 +146,17 @@ namespace Omnipotent.Services.OmniDefence
                     created_utc INTEGER,
                     response_kind TEXT,
                     note TEXT
+                );",
+
+                @"CREATE TABLE IF NOT EXISTS blocked_regions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lat_min REAL NOT NULL,
+                    lat_max REAL NOT NULL,
+                    lon_min REAL NOT NULL,
+                    lon_max REAL NOT NULL,
+                    reason TEXT,
+                    created_utc INTEGER NOT NULL,
+                    created_by TEXT
                 );"
             };
 
@@ -153,6 +170,12 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("requests", "request_origin", "TEXT");
             await EnsureColumnAsync("requests", "client_page", "TEXT");
             await EnsureColumnAsync("requests", "profile_rank", "INTEGER");
+            await EnsureColumnAsync("ip_records", "latitude", "REAL");
+            await EnsureColumnAsync("ip_records", "longitude", "REAL");
+            await EnsureColumnAsync("ip_records", "city", "TEXT");
+            await EnsureColumnAsync("ip_records", "region", "TEXT");
+            await EnsureColumnAsync("ip_records", "isp", "TEXT");
+            await EnsureColumnAsync("ip_records", "org", "TEXT");
             await EnsureColumnAsync("ip_records", "associated_profile_id", "TEXT");
             await EnsureColumnAsync("ip_records", "associated_profile_name", "TEXT");
             await EnsureColumnAsync("ip_records", "associated_profile_rank", "INTEGER");
@@ -287,8 +310,8 @@ namespace Omnipotent.Services.OmniDefence
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO ip_records
-                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
-                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
+                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, city, region, isp, org, latitude, longitude, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
+                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$city,$region,$isp,$org,$lat,$lon,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
                 ON CONFLICT(ip) DO UPDATE SET
                     last_seen=excluded.last_seen,
                     total_requests=excluded.total_requests,
@@ -299,6 +322,12 @@ namespace Omnipotent.Services.OmniDefence
                     status=excluded.status,
                     country=COALESCE(excluded.country, ip_records.country),
                     asn=COALESCE(excluded.asn, ip_records.asn),
+                    city=COALESCE(excluded.city, ip_records.city),
+                    region=COALESCE(excluded.region, ip_records.region),
+                    isp=COALESCE(excluded.isp, ip_records.isp),
+                    org=COALESCE(excluded.org, ip_records.org),
+                    latitude=COALESCE(excluded.latitude, ip_records.latitude),
+                    longitude=COALESCE(excluded.longitude, ip_records.longitude),
                     notes=excluded.notes,
                     associated_profile_id=COALESCE(excluded.associated_profile_id, ip_records.associated_profile_id),
                     associated_profile_name=COALESCE(excluded.associated_profile_name, ip_records.associated_profile_name),
@@ -320,6 +349,12 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$st", rec.Status);
             cmd.Parameters.AddWithValue("$co", (object?)rec.Country ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$asn", (object?)rec.Asn ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$city", (object?)rec.City ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$region", (object?)rec.Region ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$isp", (object?)rec.Isp ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$org", (object?)rec.Org ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$lat", (object?)rec.Latitude ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$lon", (object?)rec.Longitude ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$nt", (object?)rec.Notes ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$apid", (object?)rec.AssociatedProfileId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$apname", (object?)rec.AssociatedProfileName ?? DBNull.Value);
@@ -356,7 +391,7 @@ namespace Omnipotent.Services.OmniDefence
             }
             if (!string.IsNullOrWhiteSpace(query))
             {
-                sb.Append(" AND (ip LIKE $q OR country LIKE $q OR notes LIKE $q OR associated_profile_name LIKE $q OR associated_profile_id LIKE $q)");
+                sb.Append(" AND (ip LIKE $q OR country LIKE $q OR city LIKE $q OR region LIKE $q OR asn LIKE $q OR isp LIKE $q OR org LIKE $q OR notes LIKE $q OR associated_profile_name LIKE $q OR associated_profile_id LIKE $q)");
                 cmd.Parameters.AddWithValue("$q", "%" + query + "%");
             }
             sb.Append(" ORDER BY threat_score DESC, last_seen DESC LIMIT $lim OFFSET $off");
@@ -459,6 +494,55 @@ namespace Omnipotent.Services.OmniDefence
             await cmd.ExecuteNonQueryAsync();
         });
 
+        // ---------- Blocked regions ----------
+        public Task<List<BlockedRegionRow>> ListBlockedRegionsAsync() => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT id, lat_min, lat_max, lon_min, lon_max, reason, created_utc, created_by FROM blocked_regions ORDER BY id DESC";
+            using var rdr = await cmd.ExecuteReaderAsync();
+            var list = new List<BlockedRegionRow>();
+            while (await rdr.ReadAsync())
+            {
+                list.Add(new BlockedRegionRow
+                {
+                    Id = rdr.GetInt64(0),
+                    LatMin = rdr.GetDouble(1),
+                    LatMax = rdr.GetDouble(2),
+                    LonMin = rdr.GetDouble(3),
+                    LonMax = rdr.GetDouble(4),
+                    Reason = rdr.IsDBNull(5) ? null : rdr.GetString(5),
+                    CreatedUtc = rdr.IsDBNull(6) ? 0 : rdr.GetInt64(6),
+                    CreatedBy = rdr.IsDBNull(7) ? null : rdr.GetString(7)
+                });
+            }
+            return list;
+        });
+
+        public Task<long> InsertBlockedRegionAsync(BlockedRegionRow row) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO blocked_regions (lat_min, lat_max, lon_min, lon_max, reason, created_utc, created_by)
+                VALUES ($lmin,$lmax,$omin,$omax,$reason,$ts,$by);
+                SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$lmin", row.LatMin);
+            cmd.Parameters.AddWithValue("$lmax", row.LatMax);
+            cmd.Parameters.AddWithValue("$omin", row.LonMin);
+            cmd.Parameters.AddWithValue("$omax", row.LonMax);
+            cmd.Parameters.AddWithValue("$reason", (object?)row.Reason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$ts", row.CreatedUtc);
+            cmd.Parameters.AddWithValue("$by", (object?)row.CreatedBy ?? DBNull.Value);
+            var res = await cmd.ExecuteScalarAsync();
+            return res == null || res is DBNull ? 0L : Convert.ToInt64(res);
+        });
+
+        public Task DeleteBlockedRegionAsync(long id) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM blocked_regions WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", id);
+            await cmd.ExecuteNonQueryAsync();
+        });
+
         private static IpRecord ReadIpRecord(SqliteDataReader rdr)
         {
             return new IpRecord
@@ -474,6 +558,12 @@ namespace Omnipotent.Services.OmniDefence
                 Status = rdr["status"] as string ?? "Normal",
                 Country = rdr["country"] as string,
                 Asn = rdr["asn"] as string,
+                City = rdr["city"] as string,
+                Region = rdr["region"] as string,
+                Isp = rdr["isp"] as string,
+                Org = rdr["org"] as string,
+                Latitude = rdr["latitude"] is DBNull ? null : Convert.ToDouble(rdr["latitude"]),
+                Longitude = rdr["longitude"] is DBNull ? null : Convert.ToDouble(rdr["longitude"]),
                 Notes = rdr["notes"] as string,
                 AssociatedProfileId = rdr["associated_profile_id"] as string,
                 AssociatedProfileName = rdr["associated_profile_name"] as string,
@@ -556,6 +646,12 @@ namespace Omnipotent.Services.OmniDefence
         public string Status = "Normal"; // Normal, Watch, Blocked, Tarpit, Honeypot
         public string? Country;
         public string? Asn;
+        public string? City;
+        public string? Region;
+        public string? Isp;
+        public string? Org;
+        public double? Latitude;
+        public double? Longitude;
         public string? Notes;
         public string? AssociatedProfileId;
         public string? AssociatedProfileName;
@@ -574,5 +670,17 @@ namespace Omnipotent.Services.OmniDefence
         public long CreatedUtc;
         public string ResponseKind = "JunkJson";
         public string? Note;
+    }
+
+    public class BlockedRegionRow
+    {
+        public long Id;
+        public double LatMin;
+        public double LatMax;
+        public double LonMin;
+        public double LonMax;
+        public string? Reason;
+        public long CreatedUtc;
+        public string? CreatedBy;
     }
 }

@@ -36,6 +36,9 @@ namespace Omnipotent.Services.OmniDefence
         // Cached set of routes registered as honeypots (route -> response kind)
         private readonly ConcurrentDictionary<string, string> honeypotRoutes = new(StringComparer.OrdinalIgnoreCase);
 
+        // Cached set of blocked geographic regions (id -> row).
+        private readonly ConcurrentDictionary<long, BlockedRegionRow> blockedRegions = new();
+
         public OmniDefence()
         {
             name = "OmniDefence";
@@ -63,7 +66,12 @@ namespace Omnipotent.Services.OmniDefence
                     honeypotRoutes[hp.Route] = hp.ResponseKind;
                 }
 
-                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes.");
+                foreach (var region in await store.ListBlockedRegionsAsync())
+                {
+                    blockedRegions[region.Id] = region;
+                }
+
+                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
 
                 // Periodic flush so threat scores survive restarts.
                 _ = PeriodicFlushLoop();
@@ -199,7 +207,9 @@ namespace Omnipotent.Services.OmniDefence
             if (rec == null || string.IsNullOrWhiteSpace(rec.Ip)) return;
             lock (rec)
             {
-                if (!string.IsNullOrWhiteSpace(rec.Country) || !string.IsNullOrWhiteSpace(rec.Asn)) return;
+                bool hasDetailedGeo = (!string.IsNullOrWhiteSpace(rec.City) || !string.IsNullOrWhiteSpace(rec.Region) || !string.IsNullOrWhiteSpace(rec.Isp) || !string.IsNullOrWhiteSpace(rec.Org)) && rec.Latitude.HasValue && rec.Longitude.HasValue;
+                bool isKnownPrivate = string.Equals(rec.Country, "Private", StringComparison.OrdinalIgnoreCase) && string.Equals(rec.Asn, "Local", StringComparison.OrdinalIgnoreCase);
+                if (hasDetailedGeo || isKnownPrivate) return;
             }
 
             if (!geoLookupsInFlight.TryAdd(rec.Ip, 0)) return;
@@ -213,12 +223,18 @@ namespace Omnipotent.Services.OmniDefence
                     {
                         rec.Country = "Private";
                         rec.Asn = "Local";
+                        rec.City = null;
+                        rec.Region = null;
+                        rec.Isp = null;
+                        rec.Org = null;
+                        rec.Latitude = null;
+                        rec.Longitude = null;
                     }
                     await tracker.PersistAsync(rec);
                     return;
                 }
 
-                string url = $"http://ip-api.com/json/{rec.Ip}?fields=status,country,countryCode,as,query,message";
+                string url = $"http://ip-api.com/json/{rec.Ip}?fields=status,country,countryCode,regionName,city,zip,isp,org,as,lat,lon,timezone,query,message";
                 string json = await GeoIpClient.GetStringAsync(url);
                 var result = JsonConvert.DeserializeObject<GeoIpResponse>(json);
                 if (result?.Status == "success")
@@ -227,6 +243,12 @@ namespace Omnipotent.Services.OmniDefence
                     {
                         rec.Country = string.IsNullOrWhiteSpace(result.CountryCode) ? result.Country : result.CountryCode;
                         rec.Asn = result.Asn;
+                        rec.City = result.City;
+                        rec.Region = result.RegionName;
+                        rec.Isp = result.Isp;
+                        rec.Org = result.Org;
+                        rec.Latitude = result.Latitude;
+                        rec.Longitude = result.Longitude;
                     }
                     await tracker.PersistAsync(rec);
                     await RecordIpEventAsync(new IpEventRow
@@ -234,8 +256,9 @@ namespace Omnipotent.Services.OmniDefence
                         UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                         Ip = rec.Ip,
                         Kind = "GeoIP",
-                        Detail = JsonConvert.SerializeObject(new { result.Country, result.CountryCode, result.Asn })
+                        Detail = JsonConvert.SerializeObject(new { result.Country, result.CountryCode, result.RegionName, result.City, result.Zip, result.Isp, result.Org, result.Asn, result.Latitude, result.Longitude, result.Timezone })
                     });
+                    await EnforceBlockedRegionsAsync(rec);
                 }
                 else
                 {
@@ -281,8 +304,32 @@ namespace Omnipotent.Services.OmniDefence
             [JsonProperty("countryCode")]
             public string? CountryCode { get; set; }
 
+            [JsonProperty("regionName")]
+            public string? RegionName { get; set; }
+
+            [JsonProperty("city")]
+            public string? City { get; set; }
+
+            [JsonProperty("zip")]
+            public string? Zip { get; set; }
+
+            [JsonProperty("isp")]
+            public string? Isp { get; set; }
+
+            [JsonProperty("org")]
+            public string? Org { get; set; }
+
+            [JsonProperty("timezone")]
+            public string? Timezone { get; set; }
+
             [JsonProperty("as")]
             public string? Asn { get; set; }
+
+            [JsonProperty("lat")]
+            public double? Latitude { get; set; }
+
+            [JsonProperty("lon")]
+            public double? Longitude { get; set; }
         }
 
         // ------------------------------------------------------------------
@@ -408,6 +455,59 @@ namespace Omnipotent.Services.OmniDefence
 
         public IReadOnlyDictionary<string, string> HoneypotRouteSnapshot() =>
             new Dictionary<string, string>(honeypotRoutes, StringComparer.OrdinalIgnoreCase);
+
+        // ------------------------------------------------------------------
+        //  Blocked region helpers
+        // ------------------------------------------------------------------
+
+        public IReadOnlyCollection<BlockedRegionRow> BlockedRegionsSnapshot() => blockedRegions.Values.ToList();
+
+        public void RegisterBlockedRegion(BlockedRegionRow row)
+        {
+            if (row == null || row.Id <= 0) return;
+            blockedRegions[row.Id] = row;
+        }
+
+        public void UnregisterBlockedRegion(long id)
+        {
+            blockedRegions.TryRemove(id, out _);
+        }
+
+        public bool IsLatLonInBlockedRegion(double latitude, double longitude, out BlockedRegionRow? region)
+        {
+            foreach (var r in blockedRegions.Values)
+            {
+                if (latitude >= r.LatMin && latitude <= r.LatMax && longitude >= r.LonMin && longitude <= r.LonMax)
+                {
+                    region = r;
+                    return true;
+                }
+            }
+            region = null;
+            return false;
+        }
+
+        private async Task EnforceBlockedRegionsAsync(IpRecord rec)
+        {
+            if (rec == null || !rec.Latitude.HasValue || !rec.Longitude.HasValue) return;
+            if (IsLinkedToKlives(rec.Ip)) return;
+            if (string.Equals(rec.Status, nameof(IpThreatTracker.IpStatus.Blocked), StringComparison.OrdinalIgnoreCase)) return;
+            if (!IsLatLonInBlockedRegion(rec.Latitude.Value, rec.Longitude.Value, out var region) || region == null) return;
+            string reason = $"Region block #{region.Id}: {region.Reason}";
+            lock (rec)
+            {
+                rec.Status = nameof(IpThreatTracker.IpStatus.Blocked);
+                rec.LastBlockReason = reason;
+            }
+            await tracker.PersistAsync(rec);
+            await RecordIpEventAsync(new IpEventRow
+            {
+                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                Ip = rec.Ip,
+                Kind = "RegionBlock",
+                Detail = reason
+            });
+        }
 
         // ------------------------------------------------------------------
         //  Convenience helpers

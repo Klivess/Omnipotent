@@ -133,6 +133,15 @@ namespace Omnipotent.Services.OmniDefence
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
+            // Tactical map data
+            await parent.CreateAPIRoute("/omnidefence/ip-map", async req =>
+            {
+                var rows = parent.Tracker.All()
+                    .OrderByDescending(r => r.LastSeen)
+                    .ToList();
+                await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+
             // IP detail
             await parent.CreateAPIRoute("/omnidefence/ip", async req =>
             {
@@ -264,6 +273,64 @@ namespace Omnipotent.Services.OmniDefence
                     Detail = JsonConvert.SerializeObject(new { open = result.OpenPorts, probed = result.ProbedPorts, durationMs = result.Duration.TotalMilliseconds, error = result.Error })
                 });
                 await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+
+            // Blocked regions list
+            await parent.CreateAPIRoute("/omnidefence/regions", async req =>
+            {
+                var rows = await parent.Store.ListBlockedRegionsAsync();
+                await req.ReturnResponse(JsonConvert.SerializeObject(rows.Select(r => new
+                {
+                    id = r.Id,
+                    latMin = r.LatMin,
+                    latMax = r.LatMax,
+                    lonMin = r.LonMin,
+                    lonMax = r.LonMax,
+                    reason = r.Reason,
+                    createdUtc = r.CreatedUtc,
+                    createdBy = r.CreatedBy
+                })), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+
+            // Add a blocked region
+            await parent.CreateAPIRoute("/omnidefence/regions/add", async req =>
+            {
+                var body = ParseJsonBody(req);
+                double latMin = Convert.ToDouble(body.GetValueOrDefault("latMin") ?? body.GetValueOrDefault("lat_min") ?? 0);
+                double latMax = Convert.ToDouble(body.GetValueOrDefault("latMax") ?? body.GetValueOrDefault("lat_max") ?? 0);
+                double lonMin = Convert.ToDouble(body.GetValueOrDefault("lonMin") ?? body.GetValueOrDefault("lon_min") ?? 0);
+                double lonMax = Convert.ToDouble(body.GetValueOrDefault("lonMax") ?? body.GetValueOrDefault("lon_max") ?? 0);
+                string? reason = body.GetValueOrDefault("reason") as string;
+                if (latMin >= latMax || lonMin >= lonMax)
+                {
+                    await req.ReturnResponse("Invalid bounds", "text/plain", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+                var row = new BlockedRegionRow
+                {
+                    LatMin = latMin,
+                    LatMax = latMax,
+                    LonMin = lonMin,
+                    LonMax = lonMax,
+                    Reason = string.IsNullOrWhiteSpace(reason) ? "Region block" : reason,
+                    CreatedUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    CreatedBy = req.user?.Name
+                };
+                long id = await parent.Store.InsertBlockedRegionAsync(row);
+                row.Id = id;
+                parent.RegisterBlockedRegion(row);
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, id }), "application/json");
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+
+            // Remove a blocked region
+            await parent.CreateAPIRoute("/omnidefence/regions/remove", async req =>
+            {
+                var body = ParseJsonBody(req);
+                long id = Convert.ToInt64(body.GetValueOrDefault("id") ?? 0);
+                if (id <= 0) { await req.ReturnResponse("Missing id", "text/plain", null, HttpStatusCode.BadRequest); return; }
+                await parent.Store.DeleteBlockedRegionAsync(id);
+                parent.UnregisterBlockedRegion(id);
+                await req.ReturnResponse("{\"ok\":true}", "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
             // Honeypot routes management
