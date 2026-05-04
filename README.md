@@ -1,6 +1,6 @@
 <h1 align="center" id="title">Omnipotent</h1>
 
-<p align="center" id="description">Omnipotent is an "orchestrator" platform which allows me to implement many different automation services (or bots) into Omnipotent, and have them communicate with other services and utilities like the KliveAPI for access through the Klives Management Dashboard, and for me to be able to access and configure all of my automated services through one dashboard. It also serves as the backend to my website Klives Management.</p>
+<p align="center" id="description">Omnipotent is a centralized orchestration platform that brings together multiple automation services and bots under one roof. Services can communicate with each other and with external utilities like the KliveAPI, providing unified access and configuration through the Klives Management Dashboard. It also powers the Klives Management website as its core backend.</p>
 
 <figure style="margin: 1.5rem auto; padding: 0; display: inline-block; text-align: center;">
     <figcaption style="margin-top: 0.5rem; font-size: 0.9rem; color: #555; font-style: italic;">Picture of the Klives Management Dashboard</figcaption>
