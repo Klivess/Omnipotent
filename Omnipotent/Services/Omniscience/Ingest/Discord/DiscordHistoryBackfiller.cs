@@ -50,12 +50,17 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
             catch (Exception ex) { _ = service.ServiceLogError(ex, "Backfill DM enumeration failed"); }
 
             // ── Guilds ──
+            // Per user policy: DMs first (above), then guilds ordered ascending by
+            // approximate_member_count so smaller communities ingest before huge ones.
             try
             {
                 var guilds = await rest.GetGuildsAsync(ct) as JArray;
                 if (guilds != null)
                 {
-                    foreach (var g in guilds.OfType<JObject>())
+                    var ordered = guilds.OfType<JObject>()
+                        .OrderBy(g => g.Value<int?>("approximate_member_count") ?? int.MaxValue)
+                        .ToList();
+                    foreach (var g in ordered)
                     {
                         ct.ThrowIfCancellationRequested();
                         string gid = g.Value<string>("id") ?? "";

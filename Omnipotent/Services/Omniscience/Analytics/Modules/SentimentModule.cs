@@ -12,13 +12,13 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class SentimentModule : IPersonAnalyticModule
     {
         public string Name => "sentiment";
-        public int Version => 1;
+        public int Version => 2;
 
-        private static readonly Dictionary<string, double> Lex = new(StringComparer.OrdinalIgnoreCase)
+        public static readonly IReadOnlyDictionary<string, double> Lex = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
         {
             // positive
             {"love",2},{"loved",2},{"loving",2},{"awesome",2},{"great",1.5},{"good",1},{"nice",1},{"happy",1.5},
-            {"amazing",2},{"perfect",1.5},{"thanks",1},{"thank",1},{"lol",0.6},{"lmao",0.6},{"haha",0.6},{"haha",0.6},
+            {"amazing",2},{"perfect",1.5},{"thanks",1},{"thank",1},{"lol",0.6},{"lmao",0.6},{"haha",0.6},{"hehe",0.6},
             {"cool",1},{"yay",1.2},{"win",1},{"wins",1},{"won",1},{"best",1.5},
             // negative
             {"hate",-2},{"hated",-2},{"hating",-2},{"shit",-1.2},{"fuck",-1.2},{"fucked",-1.5},{"fucking",-0.5},
@@ -26,6 +26,10 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
             {"worst",-1.8},{"annoying",-1.2},{"crap",-1},{"ugh",-1},{"stupid",-1.2},{"idiot",-1.5}
         };
         private static readonly Regex Word = new(@"[a-zA-Z]+", RegexOptions.Compiled);
+        public static IEnumerable<string> Tokenise(string s)
+        {
+            foreach (Match m in Word.Matches(s ?? "")) yield return m.Value;
+        }
 
         public Task<JObject> ComputeAsync(string personId, OmniscienceDb db, CancellationToken ct)
         {
@@ -36,6 +40,9 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
             int pos = 0, neg = 0, neu = 0;
             // monthly trend
             var monthly = new Dictionary<string, (double sum, int n)>();
+            // Track top examples for richer dossier output.
+            var topPos = new List<(double score, string text)>();
+            var topNeg = new List<(double score, string text)>();
             foreach (var m in msgs)
             {
                 if (string.IsNullOrWhiteSpace(m.Content)) continue;
@@ -53,6 +60,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 string key = m.SentAt.ToString("yyyy-MM");
                 if (!monthly.TryGetValue(key, out var cur)) cur = (0, 0);
                 monthly[key] = (cur.sum + norm, cur.n + 1);
+
+                if (m.Content.Length is > 0 and < 280)
+                {
+                    if (norm > 0.5) topPos.Add((norm, m.Content));
+                    else if (norm < -0.5) topNeg.Add((norm, m.Content));
+                }
             }
             double avg = scored > 0 ? total / scored : 0;
             var trend = monthly.OrderBy(k => k.Key).Select(k => new JObject(
@@ -65,7 +78,13 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("positive_count", pos),
                 new JProperty("negative_count", neg),
                 new JProperty("neutral_count", neu),
-                new JProperty("monthly_trend", new JArray(trend))
+                new JProperty("monthly_trend", new JArray(trend)),
+                new JProperty("top_positive_examples", new JArray(
+                    topPos.OrderByDescending(t => t.score).Take(5).Select(t => new JObject(
+                        new JProperty("score", t.score), new JProperty("text", t.text))))),
+                new JProperty("top_negative_examples", new JArray(
+                    topNeg.OrderBy(t => t.score).Take(5).Select(t => new JObject(
+                        new JProperty("score", t.score), new JProperty("text", t.text)))))
             );
             return Task.FromResult(payload);
         }

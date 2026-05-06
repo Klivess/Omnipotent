@@ -32,6 +32,14 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
                 RawJson = m.ToString(Newtonsoft.Json.Formatting.None),
             };
 
+            // Per-guild nickname for the author lives on `member.nick` in MESSAGE_CREATE
+            // gateway payloads. Treat it as an alt-name when present.
+            string? nick = (m["member"] as JObject)?.Value<string>("nick");
+            if (!string.IsNullOrWhiteSpace(nick))
+            {
+                msg.Author.AltNames.Add((nick.Trim(), guildName != null ? "discord_nick:" + guildName : "discord_nick"));
+            }
+
             // Mentions \u2192 participants
             if (m["mentions"] is JArray mentions)
             {
@@ -76,6 +84,11 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
                 DisplayName = globalName ?? username,
                 AvatarUrl = avatarUrl,
                 Bio = u.Value<string>("bio"),
+                // If global_name differs from username, record both so users can be
+                // searched by either. Username is already stored as the canonical handle.
+                AltNames = (!string.IsNullOrWhiteSpace(globalName) && !string.Equals(globalName, username, StringComparison.OrdinalIgnoreCase))
+                    ? new List<(string, string)> { (globalName!, "discord_global_name") }
+                    : new List<(string, string)>(),
             };
         }
 

@@ -84,8 +84,8 @@ namespace Omnipotent.Services.Omniscience.Profiling
             var trimmed = new List<string>();
             if (samples.Count > 0)
             {
-                int stride = Math.Max(1, samples.Count / 80);
-                for (int i = 0; i < samples.Count && trimmed.Count < 80; i += stride)
+                int stride = Math.Max(1, samples.Count / 200);
+                for (int i = 0; i < samples.Count && trimmed.Count < 200; i += stride)
                     trimmed.Add(samples[i]);
             }
 
@@ -135,14 +135,30 @@ namespace Omnipotent.Services.Omniscience.Profiling
                 }
             }
 
-            // 7. Persist (history-preserving: one row per generation).
+            // 7. Second LLM pass: biographical inferences (location, school, employment\u2026).
+            //    Failure here must not block the personality dossier from being persisted.
+            string? biographical = null;
+            try
+            {
+                string bioPrompt = ProfilePromptBuilder.BuildBiographical(displayName, handlesJoined, statsBundle, trimmed);
+                var bioResp = await llm.QueryLLM(bioPrompt, sessionId: null, maxTokensOverride: 1536,
+                    systemPrompt: ProfilePromptBuilder.BiographicalSystemPrompt, useFreeModel: true);
+                if (bioResp.Success && !string.IsNullOrWhiteSpace(bioResp.Response))
+                    biographical = bioResp.Response.Trim();
+            }
+            catch (Exception ex)
+            {
+                _ = service.ServiceLogError(ex, "Biographical dossier generation failed (non-fatal).");
+            }
+
+            // 8. Persist (history-preserving: one row per generation).
             await db.WriteLock.WaitAsync(ct);
             try
             {
                 using var conn = db.Open();
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = @"INSERT INTO personality_profiles(profile_id, person_id, generated_at, model_used, prompt_hash, profile_markdown, traits_json)
-                    VALUES($id,$p,$t,$m,$h,$n,$tj)";
+                cmd.CommandText = @"INSERT INTO personality_profiles(profile_id, person_id, generated_at, model_used, prompt_hash, profile_markdown, traits_json, biographical_markdown)
+                    VALUES($id,$p,$t,$m,$h,$n,$tj,$bio)";
                 cmd.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N"));
                 cmd.Parameters.AddWithValue("$p", personId);
                 cmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
@@ -150,6 +166,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
                 cmd.Parameters.AddWithValue("$h", $"pt={resp.PromptTokens};ct={resp.CompletionTokens}");
                 cmd.Parameters.AddWithValue("$n", narrative);
                 cmd.Parameters.AddWithValue("$tj", traitsJson);
+                cmd.Parameters.AddWithValue("$bio", (object?)biographical ?? DBNull.Value);
                 cmd.ExecuteNonQuery();
             }
             finally { db.WriteLock.Release(); }

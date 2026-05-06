@@ -42,6 +42,12 @@ namespace Omnipotent.Services.Omniscience.Domain
         public string? DisplayName { get; set; }
         public string? AvatarUrl { get; set; }
         public string? Bio { get; set; }
+        /// <summary>
+        /// Additional names this identity is known by \u2014 e.g. per-guild nicknames,
+        /// the global_name when it diverges from the username. Persisted into
+        /// <c>identity_alt_names</c> for richer search and dossier hints.
+        /// </summary>
+        public List<(string Name, string Source)> AltNames { get; set; } = new();
     }
 
     public class HarvestedAttachment

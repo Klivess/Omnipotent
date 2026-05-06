@@ -139,6 +139,7 @@ namespace Omnipotent.Services.Omniscience.Ingest
                     upd.Parameters.AddWithValue("$ls", new DateTimeOffset(now).ToUnixTimeMilliseconds());
                     upd.Parameters.AddWithValue("$id", idid);
                     upd.ExecuteNonQuery();
+                    UpsertAltNames(conn, tx, idid, ident, now);
                     return idid;
                 }
             }
@@ -175,7 +176,32 @@ namespace Omnipotent.Services.Omniscience.Ingest
                 iCmd.Parameters.AddWithValue("$ts", ts);
                 iCmd.ExecuteNonQuery();
             }
+            UpsertAltNames(conn, tx, identityId, ident, now);
             return identityId;
+        }
+
+        // Insert any per-identity alt-names (per-guild nicknames, divergent global names, etc.)
+        // \u2014 idempotent via the (identity_id, alt_name) UNIQUE constraint.
+        private static void UpsertAltNames(SqliteConnection conn, SqliteTransaction tx, string identityId, HarvestedIdentity ident, DateTime now)
+        {
+            if (ident.AltNames == null || ident.AltNames.Count == 0) return;
+            long ts = new DateTimeOffset(now).ToUnixTimeMilliseconds();
+            foreach (var (name, source) in ident.AltNames)
+            {
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"INSERT INTO identity_alt_names(identity_id, alt_name, source, first_seen, last_seen)
+                    VALUES($id,$n,$s,$ts,$ts)
+                    ON CONFLICT(identity_id, alt_name) DO UPDATE SET
+                        last_seen=excluded.last_seen,
+                        source=COALESCE(identity_alt_names.source, excluded.source)";
+                cmd.Parameters.AddWithValue("$id", identityId);
+                cmd.Parameters.AddWithValue("$n", name.Trim());
+                cmd.Parameters.AddWithValue("$s", (object?)source ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$ts", ts);
+                try { cmd.ExecuteNonQuery(); } catch { /* best-effort: schema may be older */ }
+            }
         }
 
         private string UpsertConversation(SqliteConnection conn, SqliteTransaction tx, HarvestedMessage msg, DateTime now)

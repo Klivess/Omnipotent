@@ -75,7 +75,7 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
         // ── High level helpers ──
 
         public Task<JToken> GetSelfAsync(CancellationToken ct) => GetAsync("/users/@me", ct);
-        public Task<JToken> GetGuildsAsync(CancellationToken ct) => GetAsync("/users/@me/guilds", ct);
+        public Task<JToken> GetGuildsAsync(CancellationToken ct) => GetAsync("/users/@me/guilds?with_counts=true", ct);
         public Task<JToken> GetDmChannelsAsync(CancellationToken ct) => GetAsync("/users/@me/channels", ct);
         public Task<JToken> GetGuildChannelsAsync(string guildId, CancellationToken ct) => GetAsync($"/guilds/{guildId}/channels", ct);
         public Task<JToken> GetUserAsync(string userId, CancellationToken ct) => GetAsync($"/users/{userId}", ct);

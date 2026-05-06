@@ -71,8 +71,43 @@ namespace Omnipotent.Services.Omniscience
                 }
             }
 
+            if (currentVersion < 2)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = SchemaV2;
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "PRAGMA user_version = 2;";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
             tx.Commit();
         }
+
+        // ── Migration: v2 (biographical dossier + identity alt-names) ──
+        // Existing databases will not have these columns/tables; ALTER and CREATE IF NOT EXISTS
+        // both succeed regardless of fresh-vs-upgrade because v1 ran first.
+        private const string SchemaV2 = @"
+ALTER TABLE personality_profiles ADD COLUMN biographical_markdown TEXT;
+
+CREATE TABLE IF NOT EXISTS identity_alt_names (
+    alt_name_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_id TEXT NOT NULL,
+    alt_name TEXT NOT NULL,
+    source TEXT,
+    first_seen INTEGER,
+    last_seen INTEGER,
+    UNIQUE(identity_id, alt_name)
+);
+CREATE INDEX IF NOT EXISTS idx_alt_name ON identity_alt_names(alt_name);
+CREATE INDEX IF NOT EXISTS idx_alt_identity ON identity_alt_names(identity_id);
+";
 
         // ── Migration: v1 (initial schema) ──
         private const string SchemaV1 = @"

@@ -37,6 +37,8 @@ namespace Omnipotent.Services.Omniscience.Analytics
                 new HumorModule(),
                 new LanguageDetectionModule(),
                 new InterestInferenceModule(),
+                new MentionAffinityModule(),
+                new TimezoneInferenceModule(),
             };
         }
 

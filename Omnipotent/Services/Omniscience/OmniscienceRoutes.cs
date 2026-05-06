@@ -137,6 +137,7 @@ namespace Omnipotent.Services.Omniscience
                 {
                     string? search = req.userParameters?["search"];
                     string? platform = req.userParameters?["platform"];
+                    string? relatedTo = req.userParameters?["relatedTo"];
                     int.TryParse(req.userParameters?["limit"] ?? "100", out int limit);
                     if (limit <= 0 || limit > 500) limit = 100;
                     int.TryParse(req.userParameters?["offset"] ?? "0", out int offset);
@@ -148,13 +149,33 @@ namespace Omnipotent.Services.Omniscience
                     var where = new List<string> { "p.merged_into_person_id IS NULL" };
                     if (!string.IsNullOrWhiteSpace(search))
                     {
-                        where.Add("(p.display_name LIKE $s OR EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND (pi.platform_username LIKE $s OR pi.display_name LIKE $s)))");
+                        // Search across: person display_name, identity username/display_name,
+                        // alt-names (nicknames + global-name aliases), and the social_graph
+                        // analytic payload so users can be located by their relationships.
+                        where.Add(@"(
+                            p.display_name LIKE $s
+                            OR EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND (pi.platform_username LIKE $s OR pi.display_name LIKE $s))
+                            OR EXISTS (SELECT 1 FROM identity_alt_names an JOIN platform_identities pi ON pi.identity_id=an.identity_id WHERE pi.person_id=p.person_id AND an.alt_name LIKE $s)
+                            OR EXISTS (SELECT 1 FROM person_statistics ps WHERE ps.person_id=p.person_id AND ps.module_name IN ('social_graph','mention_affinity') AND ps.payload_json LIKE $s)
+                        )");
                         cmd.Parameters.AddWithValue("$s", "%" + search + "%");
                     }
                     if (!string.IsNullOrWhiteSpace(platform))
                     {
                         where.Add("EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND pi.platform=$pl)");
                         cmd.Parameters.AddWithValue("$pl", platform);
+                    }
+                    if (!string.IsNullOrWhiteSpace(relatedTo))
+                    {
+                        // Find people whose ID appears in the target's social_graph or
+                        // mention_affinity payload, OR vice-versa. Substring match on the
+                        // person_id key keeps the SQL simple and fast.
+                        where.Add(@"EXISTS (
+                            SELECT 1 FROM person_statistics ps
+                            WHERE ps.person_id=$rel
+                              AND ps.module_name IN ('social_graph','mention_affinity')
+                              AND ps.payload_json LIKE '%' || p.person_id || '%')");
+                        cmd.Parameters.AddWithValue("$rel", relatedTo);
                     }
                     cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
                             (SELECT COUNT(*) FROM messages m JOIN platform_identities pi ON pi.identity_id=m.author_identity_id WHERE pi.person_id=p.person_id) AS msg_count,
@@ -532,7 +553,7 @@ namespace Omnipotent.Services.Omniscience
                 // latest profile
                 using (var cmd4 = conn.CreateCommand())
                 {
-                    cmd4.CommandText = @"SELECT generated_at, model_used, profile_markdown, traits_json FROM personality_profiles
+                    cmd4.CommandText = @"SELECT generated_at, model_used, profile_markdown, traits_json, biographical_markdown FROM personality_profiles
                         WHERE person_id=$p ORDER BY generated_at DESC LIMIT 1";
                     cmd4.Parameters.AddWithValue("$p", personId);
                     using var pr = cmd4.ExecuteReader();
@@ -544,13 +565,39 @@ namespace Omnipotent.Services.Omniscience
                             new JProperty("generated_at", pr.GetInt64(0)),
                             new JProperty("model", pr.IsDBNull(1) ? null : pr.GetString(1)),
                             new JProperty("narrative_markdown", pr.IsDBNull(2) ? "" : pr.GetString(2)),
-                            new JProperty("traits", traits)
+                            new JProperty("traits", traits),
+                            new JProperty("biographical_markdown", pr.IsDBNull(4) ? null : pr.GetString(4))
                         );
                     }
                     else
                     {
                         personObj["personality_profile"] = null;
                     }
+                }
+
+                // alt-names (nicknames, divergent global names) for the dossier
+                using (var cmdAn = conn.CreateCommand())
+                {
+                    cmdAn.CommandText = @"SELECT DISTINCT an.alt_name, an.source
+                        FROM identity_alt_names an
+                        JOIN platform_identities pi ON pi.identity_id = an.identity_id
+                        WHERE pi.person_id=$p OR pi.person_id IN (SELECT person_id FROM persons WHERE merged_into_person_id=$p)
+                        ORDER BY an.last_seen DESC LIMIT 30";
+                    cmdAn.Parameters.AddWithValue("$p", personId);
+                    var arr = new JArray();
+                    try
+                    {
+                        using var ar = cmdAn.ExecuteReader();
+                        while (ar.Read())
+                        {
+                            arr.Add(new JObject(
+                                new JProperty("alt_name", ar.GetString(0)),
+                                new JProperty("source", ar.IsDBNull(1) ? null : ar.GetString(1))
+                            ));
+                        }
+                    }
+                    catch { /* table may not exist on very old databases */ }
+                    personObj["alt_names"] = arr;
                 }
 
                 // message volume
