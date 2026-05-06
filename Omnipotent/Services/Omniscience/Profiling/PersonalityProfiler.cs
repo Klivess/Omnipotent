@@ -27,6 +27,8 @@ namespace Omnipotent.Services.Omniscience.Profiling
 
         public async Task<bool> GenerateForPersonAsync(string personId, CancellationToken ct)
         {
+            int messageLimit = Math.Clamp(await service.GetIntOmniSetting("OmniscienceProfilerLLMMessageLimit", 200), 20, 500);
+
             // 1. Pull display name + handles.
             string displayName, handlesJoined;
             using (var conn = db.Open())
@@ -80,12 +82,12 @@ namespace Omnipotent.Services.Omniscience.Profiling
                 using var r = cmd.ExecuteReader();
                 while (r.Read()) samples.Add(r.GetString(0));
             }
-            // Stride to ~80 messages.
+            // Stride to the configured number of messages.
             var trimmed = new List<string>();
             if (samples.Count > 0)
             {
-                int stride = Math.Max(1, samples.Count / 200);
-                for (int i = 0; i < samples.Count && trimmed.Count < 200; i += stride)
+                int stride = Math.Max(1, samples.Count / messageLimit);
+                for (int i = 0; i < samples.Count && trimmed.Count < messageLimit; i += stride)
                     trimmed.Add(samples[i]);
             }
 
@@ -168,6 +170,14 @@ namespace Omnipotent.Services.Omniscience.Profiling
                 cmd.Parameters.AddWithValue("$tj", traitsJson);
                 cmd.Parameters.AddWithValue("$bio", (object?)biographical ?? DBNull.Value);
                 cmd.ExecuteNonQuery();
+
+                using var targetCmd = conn.CreateCommand();
+                targetCmd.CommandText = @"UPDATE person_profile_targets
+                    SET last_profiled_at=$t, last_profile_status='ok', updated_at=$t
+                    WHERE person_id=$p";
+                targetCmd.Parameters.AddWithValue("$p", personId);
+                targetCmd.Parameters.AddWithValue("$t", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                try { targetCmd.ExecuteNonQuery(); } catch { }
             }
             finally { db.WriteLock.Release(); }
             return true;

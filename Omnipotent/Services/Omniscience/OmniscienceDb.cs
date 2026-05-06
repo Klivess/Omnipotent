@@ -87,8 +87,38 @@ namespace Omnipotent.Services.Omniscience
                 }
             }
 
+            if (currentVersion < 3)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = SchemaV3;
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "PRAGMA user_version = 3;";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
             tx.Commit();
         }
+
+        // ── Migration: v3 (explicit profile target allow-list) ──
+        private const string SchemaV3 = @"
+CREATE TABLE IF NOT EXISTS person_profile_targets (
+    person_id TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    added_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_profiled_at INTEGER,
+    last_profile_status TEXT,
+    notes TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_profile_targets_enabled ON person_profile_targets(enabled, updated_at DESC);
+";
 
         // ── Migration: v2 (biographical dossier + identity alt-names) ──
         // Existing databases will not have these columns/tables; ALTER and CREATE IF NOT EXISTS

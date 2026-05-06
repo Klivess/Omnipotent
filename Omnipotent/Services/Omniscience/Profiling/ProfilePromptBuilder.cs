@@ -19,8 +19,16 @@ namespace Omnipotent.Services.Omniscience.Profiling
 @"You are an analyst constructing a personality dossier from the messaging history of a single person.
 You are given (1) computed analytic statistics, (2) a sample of their actual messages, (3) social-graph context.
 Produce TWO sections separated by the line '---TRAITS_JSON---':
-- Section 1: a concise but rich markdown narrative covering communication style, vocabulary, humour,
-  emotional tone, conflict tendencies, recurring topics/interests, social positioning, and noteworthy patterns.
+- Section 1: a structured markdown dossier. Use exactly these headings, in this order:
+    ## Communication Style
+    ## Vocabulary & Phrases
+    ## Emotional Tone
+    ## Humour
+    ## Conflict Tendencies
+    ## Recurring Interests
+    ## Social Positioning
+    ## Noteworthy Patterns
+    Under each heading, write 2-4 concise bullets. Avoid a single wall of prose.
 - Section 2: a single valid JSON object with keys: communication_style (string), tone (string),
   humour (string), conflict_tendency (string), top_interests (array of strings), big_five_estimate
   (object with openness, conscientiousness, extraversion, agreeableness, neuroticism each 0-1),

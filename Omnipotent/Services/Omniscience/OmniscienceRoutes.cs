@@ -177,10 +177,11 @@ namespace Omnipotent.Services.Omniscience
                               AND ps.payload_json LIKE '%' || p.person_id || '%')");
                         cmd.Parameters.AddWithValue("$rel", relatedTo);
                     }
-                    cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
+                        cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
                             (SELECT COUNT(*) FROM messages m JOIN platform_identities pi ON pi.identity_id=m.author_identity_id WHERE pi.person_id=p.person_id) AS msg_count,
                             (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles,
-                            (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json
+                            (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json,
+                            EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1) AS profile_targeted
                         FROM persons p
                         WHERE {string.Join(" AND ", where)}
                         ORDER BY msg_count DESC
@@ -198,7 +199,8 @@ namespace Omnipotent.Services.Omniscience
                             new JProperty("updated_at", r.GetInt64(3)),
                             new JProperty("message_count", r.GetInt32(4)),
                             new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5)),
-                            new JProperty("identities", idents)
+                            new JProperty("identities", idents),
+                            new JProperty("profile_targeted", r.GetInt32(7) != 0)
                         ));
                     }
                     await req.ReturnResponse(new JArray(rows).ToString(Formatting.None));
@@ -280,9 +282,40 @@ namespace Omnipotent.Services.Omniscience
                         await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    await service.Analytics.RunForPersonAsync(personId, CancellationToken.None);
-                    bool ok = await service.Profiler.GenerateForPersonAsync(personId, CancellationToken.None);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { ok }));
+                    var started = await service.Scheduler.StartPersonRecomputeAsync(personId, CancellationToken.None);
+                    if (!started.Accepted)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = false, accepted = false, run_id = started.RunId, message = started.Message }), code: HttpStatusCode.Conflict);
+                        return;
+                    }
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, accepted = true, run_id = started.RunId, message = started.Message }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await service.CreateAPIRoute("/omniscience/persons/profile-targets", async req =>
+            {
+                try
+                {
+                    await req.ReturnResponse(service.Scheduler.GetProfileTargetsJson().ToString(Formatting.None));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await service.CreateAPIRoute("/omniscience/persons/profile-targets/set", async req =>
+            {
+                try
+                {
+                    string personId = req.userParameters?["personId"] ?? "";
+                    if (string.IsNullOrWhiteSpace(personId))
+                    {
+                        await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    bool enabled = !string.Equals(req.userParameters?["enabled"], "false", StringComparison.OrdinalIgnoreCase)
+                        && req.userParameters?["enabled"] != "0";
+                    await service.Scheduler.SetProfileTargetAsync(personId, enabled, CancellationToken.None);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, person_id = personId, enabled }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
@@ -459,14 +492,7 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    var s = service.Scheduler;
-                    var obj = new JObject(
-                        new JProperty("running", s.IsRunning),
-                        new JProperty("last_run_started_at", s.LastRunStartedAt?.ToString("o")),
-                        new JProperty("last_run_finished_at", s.LastRunFinishedAt?.ToString("o")),
-                        new JProperty("last_run_status", s.LastRunStatus)
-                    );
-                    await req.ReturnResponse(obj.ToString(Formatting.None));
+                    await req.ReturnResponse(service.Scheduler.BuildStatusJson().ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -528,6 +554,7 @@ namespace Omnipotent.Services.Omniscience
                     }
                 }
                 personObj["identities"] = idents;
+                personObj["profile_targeted"] = service.Scheduler.IsProfileTarget(personId);
 
                 // analytics bundle
                 var analytics = new JObject();
