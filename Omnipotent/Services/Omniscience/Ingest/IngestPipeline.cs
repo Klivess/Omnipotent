@@ -194,9 +194,23 @@ namespace Omnipotent.Services.Omniscience.Ingest
                     string cid = (string)existing;
                     using var upd = conn.CreateCommand();
                     upd.Transaction = tx;
-                    upd.CommandText = "UPDATE conversations SET last_seen=$ls WHERE conversation_id=$id";
+                    // COALESCE keeps the first non-null we ever learned for title/guild_name/kind so live
+                    // events (which often lack them) don't blank fields populated by the backfiller.
+                    upd.CommandText = @"UPDATE conversations
+                        SET last_seen=$ls,
+                            title      = COALESCE(title, $t),
+                            guild_name = COALESCE(guild_name, $gn),
+                            guild_id   = COALESCE(guild_id, $g),
+                            kind       = CASE WHEN kind='guild_channel' AND $k IN ('dm','group_dm') THEN $k
+                                              WHEN kind IS NULL OR kind='' THEN $k
+                                              ELSE kind END
+                        WHERE conversation_id=$id";
                     upd.Parameters.AddWithValue("$ls", ms);
                     upd.Parameters.AddWithValue("$id", cid);
+                    upd.Parameters.AddWithValue("$t", (object?)msg.ChannelTitle ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("$gn", (object?)msg.GuildName ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("$g", (object?)msg.GuildId ?? DBNull.Value);
+                    upd.Parameters.AddWithValue("$k", msg.ConversationKind ?? "");
                     upd.ExecuteNonQuery();
                     return cid;
                 }

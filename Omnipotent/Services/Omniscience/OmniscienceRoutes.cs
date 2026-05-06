@@ -64,7 +64,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JArray(rows).ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/sources/add", async req =>
             {
@@ -93,7 +93,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, self_id = selfId, self_username = selfName }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/sources/remove", async req =>
             {
@@ -109,7 +109,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/sources/backfill", async req =>
             {
@@ -125,7 +125,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
         }
 
         // ── Persons ──
@@ -158,7 +158,8 @@ namespace Omnipotent.Services.Omniscience
                     }
                     cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
                             (SELECT COUNT(*) FROM messages m JOIN platform_identities pi ON pi.identity_id=m.author_identity_id WHERE pi.person_id=p.person_id) AS msg_count,
-                            (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles
+                            (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles,
+                            (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json
                         FROM persons p
                         WHERE {string.Join(" AND ", where)}
                         ORDER BY msg_count DESC
@@ -166,19 +167,23 @@ namespace Omnipotent.Services.Omniscience
                     using var r = cmd.ExecuteReader();
                     while (r.Read())
                     {
+                        JArray idents;
+                        try { idents = string.IsNullOrEmpty(r.IsDBNull(6) ? null : r.GetString(6)) ? new JArray() : JArray.Parse(r.GetString(6)); }
+                        catch { idents = new JArray(); }
                         rows.Add(new JObject(
                             new JProperty("person_id", r.GetString(0)),
                             new JProperty("display_name", r.IsDBNull(1) ? "" : r.GetString(1)),
                             new JProperty("created_at", r.GetInt64(2)),
                             new JProperty("updated_at", r.GetInt64(3)),
                             new JProperty("message_count", r.GetInt32(4)),
-                            new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5))
+                            new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5)),
+                            new JProperty("identities", idents)
                         ));
                     }
                     await req.ReturnResponse(new JArray(rows).ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/persons/get", async req =>
             {
@@ -199,7 +204,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(dossier.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/persons/messages", async req =>
             {
@@ -242,7 +247,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(arr.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/persons/recompute", async req =>
             {
@@ -259,7 +264,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/persons/merge", async req =>
             {
@@ -306,7 +311,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
         }
 
         // ── Conversations ──
@@ -349,7 +354,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(arr.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/conversations/messages", async req =>
             {
@@ -393,7 +398,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(arr.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         // ── Stats ──
@@ -423,7 +428,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(obj.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         // ── Schedule control ──
@@ -443,7 +448,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(obj.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Manager);
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/schedule/run-now", async req =>
             {
@@ -454,7 +459,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Manager);
+            }, HttpMethod.Post, KMPermissions.Klives);
         }
 
         // ── helpers ──

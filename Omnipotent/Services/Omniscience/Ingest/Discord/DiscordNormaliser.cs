@@ -21,7 +21,8 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
                 SentAt = ParseTimestamp(m.Value<string>("timestamp")) ?? DateTime.UtcNow,
                 EditedAt = ParseTimestamp(m.Value<string>("edited_timestamp")),
                 Content = m.Value<string>("content"),
-                ReplyToPlatformMessageId = m["referenced_message"]?.Value<string>("id") ?? m["message_reference"]?.Value<string>("message_id"),
+                ReplyToPlatformMessageId = (m["referenced_message"] as JObject)?.Value<string>("id")
+                    ?? (m["message_reference"] as JObject)?.Value<string>("message_id"),
                 ConversationKind = conversationKind,
                 GuildId = guildId,
                 GuildName = guildName,

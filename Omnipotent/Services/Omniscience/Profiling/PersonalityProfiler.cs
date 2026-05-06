@@ -108,7 +108,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             KliveLLM.KliveLLM.KliveLLMResponse resp;
             try
             {
-                resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 2048, systemPrompt: ProfilePromptBuilder.SystemPrompt);
+                resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 2048, systemPrompt: ProfilePromptBuilder.SystemPrompt, useFreeModel: true);
             }
             catch (Exception ex)
             {

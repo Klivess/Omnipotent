@@ -113,6 +113,30 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
             }
 
             string conversationId = DiscordNormaliser.Platform + ":" + channelId;
+
+            // Stamp title / guild_name on the conversation row immediately, even if it was already
+            // ingested before this code path knew about names. We only fill nulls, never overwrite.
+            await db.WriteLock.WaitAsync(ct);
+            try
+            {
+                using var conn = db.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"UPDATE conversations
+                    SET title = COALESCE(title, $t),
+                        guild_name = COALESCE(guild_name, $gn),
+                        guild_id = COALESCE(guild_id, $g),
+                        kind = CASE WHEN kind IS NULL OR kind='' OR (kind='guild_channel' AND $k IN ('dm','group_dm')) THEN $k ELSE kind END
+                    WHERE conversation_id=$id";
+                cmd.Parameters.AddWithValue("$id", conversationId);
+                cmd.Parameters.AddWithValue("$t", (object?)title ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$gn", (object?)guildName ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$g", (object?)guildId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$k", convKind);
+                cmd.ExecuteNonQuery();
+            }
+            catch { /* best-effort metadata stamp */ }
+            finally { db.WriteLock.Release(); }
+
             (string? earliest, bool fully) = ReadCursor(conversationId);
 
             string? cursor = earliest;

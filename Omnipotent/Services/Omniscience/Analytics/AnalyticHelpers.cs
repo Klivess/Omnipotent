@@ -37,12 +37,16 @@ namespace Omnipotent.Services.Omniscience.Analytics
             var list = new List<AnalyticMessage>();
             if (ids.Count == 0) return list;
 
-            string inClause = string.Join(",", ids.ConvertAll(_ => "?"));
+            // Microsoft.Data.Sqlite requires named parameters; positional '?' bindings
+            // are not supported and raise "Must add values for the following parameters".
+            var paramNames = new List<string>(ids.Count);
+            for (int i = 0; i < ids.Count; i++) paramNames.Add("$i" + i);
+            string inClause = string.Join(",", paramNames);
             using var cmd = conn.CreateCommand();
             cmd.CommandText = $@"SELECT message_id, conversation_id, author_identity_id, sent_at, content
                 FROM messages WHERE author_identity_id IN ({inClause})
                 ORDER BY sent_at ASC" + (limit.HasValue ? $" LIMIT {limit.Value}" : "");
-            foreach (var i in ids) cmd.Parameters.AddWithValue("?", i);
+            for (int i = 0; i < ids.Count; i++) cmd.Parameters.AddWithValue(paramNames[i], ids[i]);
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {

@@ -32,6 +32,7 @@ namespace Omnipotent.Services.KliveLLM
     {
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
         private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
+        private const string DefaultFreeOpenRouterModel = "openrouter/free";
         private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter" };
 
         private string huggingFaceToken = "";
@@ -174,6 +175,7 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, false);
             await GetStringOmniSetting("OpenRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
+            await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
         }
 
         private async Task SetupLocalLLM()
@@ -291,8 +293,19 @@ namespace Omnipotent.Services.KliveLLM
             string prompt,
             string? sessionId = null,
             int? maxTokensOverride = null,
-            string? systemPrompt = null)
+            string? systemPrompt = null,
+            bool useFreeModel = false)
         {
+            if (useFreeModel)
+            {
+                return await QueryRemoteLLMAsync(
+                    prompt,
+                    sessionId,
+                    maxTokensOverride,
+                    systemPrompt,
+                    forceFreeModel: true);
+            }
+
             if (await GetActiveProviderAsync() != LLMProvider.Local)
             {
                 var hfResponse = await QueryRemoteLLMAsync(
@@ -310,7 +323,7 @@ namespace Omnipotent.Services.KliveLLM
                 maxTokensOverride);
         }
 
-        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -343,7 +356,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
-            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel);
             {
                 var content = response.choices[0].message.content;
                 session.chatHistory.AddMessage(AuthorRole.Assistant, content);
@@ -362,8 +375,27 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        private async Task<RemoteLLMProviderConfiguration> GetRemoteProviderConfigurationAsync()
+        private async Task<RemoteLLMProviderConfiguration> GetRemoteProviderConfigurationAsync(bool forceFreeModel = false)
         {
+            // Free-model fast path: always use OpenRouter with the FreeOpenRouterModelID setting,
+            // regardless of the user's configured RemoteLLMProvider. Token still comes from
+            // OpenRouterLLMToken because OpenRouter requires authentication for every request.
+            if (forceFreeModel)
+            {
+                string freeToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
+                string freeModel = await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, true);
+                if (string.IsNullOrWhiteSpace(freeToken))
+                {
+                    throw new InvalidOperationException("OpenRouterLLMToken is missing (required to use the free OpenRouter model).");
+                }
+                return new RemoteLLMProviderConfiguration(
+                    LLMProvider.OpenRouter,
+                    "OpenRouter (free)",
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    freeToken,
+                    freeModel);
+            }
+
             string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", ProviderOptions, false, true);
 
             if (string.Equals(configuredProvider, "OpenRouter", StringComparison.OrdinalIgnoreCase))
@@ -405,9 +437,9 @@ namespace Omnipotent.Services.KliveLLM
                 huggingFaceModel);
         }
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false)
         {
-            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync();
+            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
