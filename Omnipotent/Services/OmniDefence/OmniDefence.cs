@@ -38,6 +38,7 @@ namespace Omnipotent.Services.OmniDefence
 
         // Cached set of blocked geographic regions (id -> row).
         private readonly ConcurrentDictionary<long, BlockedRegionRow> blockedRegions = new();
+        private volatile BlockedRegionRow[] blockedRegionSnapshot = Array.Empty<BlockedRegionRow>();
 
         public OmniDefence()
         {
@@ -70,6 +71,7 @@ namespace Omnipotent.Services.OmniDefence
                 {
                     blockedRegions[region.Id] = region;
                 }
+                RefreshBlockedRegionSnapshot();
 
                 await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
 
@@ -105,7 +107,17 @@ namespace Omnipotent.Services.OmniDefence
             if (tracker.IsLinkedToKlives(ip)) return IpThreatTracker.GateDecision.Allow;
             // Honeypot routes always honeypot regardless of IP status.
             if (honeypotRoutes.ContainsKey(route)) return IpThreatTracker.GateDecision.Honeypot;
-            return tracker.Evaluate(ip);
+            var decision = tracker.Evaluate(ip);
+            if (decision != IpThreatTracker.GateDecision.Allow) return decision;
+
+            var rec = tracker.Get(ip);
+            if (TryApplyBlockedRegion(rec, out string regionReason))
+            {
+                _ = PersistRegionBlockAsync(rec!, regionReason);
+                return IpThreatTracker.GateDecision.Block;
+            }
+
+            return IpThreatTracker.GateDecision.Allow;
         }
 
         public bool IsLinkedToKlives(string ip) => tracker.IsLinkedToKlives(ip);
@@ -209,7 +221,11 @@ namespace Omnipotent.Services.OmniDefence
             {
                 bool hasDetailedGeo = (!string.IsNullOrWhiteSpace(rec.City) || !string.IsNullOrWhiteSpace(rec.Region) || !string.IsNullOrWhiteSpace(rec.Isp) || !string.IsNullOrWhiteSpace(rec.Org)) && rec.Latitude.HasValue && rec.Longitude.HasValue;
                 bool isKnownPrivate = string.Equals(rec.Country, "Private", StringComparison.OrdinalIgnoreCase) && string.Equals(rec.Asn, "Local", StringComparison.OrdinalIgnoreCase);
-                if (hasDetailedGeo || isKnownPrivate) return;
+                if (hasDetailedGeo || isKnownPrivate)
+                {
+                    if (hasDetailedGeo) _ = EnforceBlockedRegionsAsync(rec);
+                    return;
+                }
             }
 
             if (!geoLookupsInFlight.TryAdd(rec.Ip, 0)) return;
@@ -460,22 +476,29 @@ namespace Omnipotent.Services.OmniDefence
         //  Blocked region helpers
         // ------------------------------------------------------------------
 
-        public IReadOnlyCollection<BlockedRegionRow> BlockedRegionsSnapshot() => blockedRegions.Values.ToList();
+        public IReadOnlyCollection<BlockedRegionRow> BlockedRegionsSnapshot() => blockedRegionSnapshot.ToList();
 
         public void RegisterBlockedRegion(BlockedRegionRow row)
         {
             if (row == null || row.Id <= 0) return;
             blockedRegions[row.Id] = row;
+            RefreshBlockedRegionSnapshot();
         }
 
         public void UnregisterBlockedRegion(long id)
         {
             blockedRegions.TryRemove(id, out _);
+            RefreshBlockedRegionSnapshot();
+        }
+
+        private void RefreshBlockedRegionSnapshot()
+        {
+            blockedRegionSnapshot = blockedRegions.Values.ToArray();
         }
 
         public bool IsLatLonInBlockedRegion(double latitude, double longitude, out BlockedRegionRow? region)
         {
-            foreach (var r in blockedRegions.Values)
+            foreach (var r in blockedRegionSnapshot)
             {
                 if (latitude >= r.LatMin && latitude <= r.LatMax && longitude >= r.LonMin && longitude <= r.LonMax)
                 {
@@ -487,26 +510,118 @@ namespace Omnipotent.Services.OmniDefence
             return false;
         }
 
-        private async Task EnforceBlockedRegionsAsync(IpRecord rec)
+        private static bool IsLatLonInRegion(double latitude, double longitude, BlockedRegionRow region)
         {
-            if (rec == null || !rec.Latitude.HasValue || !rec.Longitude.HasValue) return;
-            if (IsLinkedToKlives(rec.Ip)) return;
-            if (string.Equals(rec.Status, nameof(IpThreatTracker.IpStatus.Blocked), StringComparison.OrdinalIgnoreCase)) return;
-            if (!IsLatLonInBlockedRegion(rec.Latitude.Value, rec.Longitude.Value, out var region) || region == null) return;
-            string reason = $"Region block #{region.Id}: {region.Reason}";
+            return latitude >= region.LatMin && latitude <= region.LatMax && longitude >= region.LonMin && longitude <= region.LonMax;
+        }
+
+        private static string BuildRegionBlockReason(BlockedRegionRow region)
+        {
+            return $"Region block #{region.Id}: {(string.IsNullOrWhiteSpace(region.Reason) ? "Region block" : region.Reason)}";
+        }
+
+        private bool TryApplyBlockedRegion(IpRecord? rec, out string reason)
+        {
+            reason = string.Empty;
+            if (rec == null || !rec.Latitude.HasValue || !rec.Longitude.HasValue) return false;
+            if (IsLinkedToKlives(rec.Ip)) return false;
+            if (!IsLatLonInBlockedRegion(rec.Latitude.Value, rec.Longitude.Value, out var region) || region == null) return false;
+            return TryApplyBlockedRegion(rec, region, out reason);
+        }
+
+        private bool TryApplyBlockedRegion(IpRecord rec, BlockedRegionRow region, out string reason)
+        {
+            reason = string.Empty;
+            if (rec == null || !rec.Latitude.HasValue || !rec.Longitude.HasValue) return false;
+            if (IsLinkedToKlives(rec.Ip)) return false;
+            if (!IsLatLonInRegion(rec.Latitude.Value, rec.Longitude.Value, region)) return false;
+            reason = BuildRegionBlockReason(region);
             lock (rec)
             {
+                if (string.Equals(rec.Status, nameof(IpThreatTracker.IpStatus.Blocked), StringComparison.OrdinalIgnoreCase)) return false;
                 rec.Status = nameof(IpThreatTracker.IpStatus.Blocked);
                 rec.LastBlockReason = reason;
             }
-            await tracker.PersistAsync(rec);
-            await RecordIpEventAsync(new IpEventRow
+            return true;
+        }
+
+        private async Task PersistRegionBlockAsync(IpRecord rec, string reason, string? actorProfileId = null, string? actorProfileName = null)
+        {
+            try
             {
-                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                Ip = rec.Ip,
-                Kind = "RegionBlock",
-                Detail = reason
-            });
+                await tracker.PersistAsync(rec);
+                await RecordIpEventAsync(new IpEventRow
+                {
+                    UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Ip = rec.Ip,
+                    Kind = "RegionBlock",
+                    ActorProfileId = actorProfileId,
+                    ActorProfileName = actorProfileName,
+                    Detail = reason
+                });
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "OmniDefence region block persistence failed.");
+            }
+        }
+
+        public async Task<int> ApplyBlockedRegionToKnownIpsAsync(BlockedRegionRow region, string? actorProfileId, string? actorProfileName)
+        {
+            int blocked = 0;
+            foreach (var rec in tracker.All())
+            {
+                if (TryApplyBlockedRegion(rec, region, out string reason))
+                {
+                    blocked++;
+                    await PersistRegionBlockAsync(rec, reason, actorProfileId, actorProfileName);
+                }
+            }
+            return blocked;
+        }
+
+        public async Task<int> UnblockIpsInRegionAsync(BlockedRegionRow region, string? actorProfileId, string? actorProfileName)
+        {
+            int unblocked = 0;
+            foreach (var rec in tracker.All())
+            {
+                if (rec == null || !rec.Latitude.HasValue || !rec.Longitude.HasValue) continue;
+                if (!IsLatLonInRegion(rec.Latitude.Value, rec.Longitude.Value, region)) continue;
+
+                bool reset = false;
+                lock (rec)
+                {
+                    if (string.Equals(rec.Status, nameof(IpThreatTracker.IpStatus.Blocked), StringComparison.OrdinalIgnoreCase)
+                        && !IsLatLonInBlockedRegion(rec.Latitude.Value, rec.Longitude.Value, out _))
+                    {
+                        rec.Status = nameof(IpThreatTracker.IpStatus.Normal);
+                        rec.LastBlockReason = null;
+                        reset = true;
+                    }
+                }
+
+                if (!reset) continue;
+                unblocked++;
+                await tracker.PersistAsync(rec);
+                await RecordIpEventAsync(new IpEventRow
+                {
+                    UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Ip = rec.Ip,
+                    Kind = "RegionUnblock",
+                    ActorProfileId = actorProfileId,
+                    ActorProfileName = actorProfileName,
+                    Detail = $"Removed region block #{region.Id}"
+                });
+            }
+            return unblocked;
+        }
+
+        private async Task EnforceBlockedRegionsAsync(IpRecord rec)
+        {
+            if (TryApplyBlockedRegion(rec, out string reason))
+            {
+                await PersistRegionBlockAsync(rec, reason);
+            }
         }
 
         // ------------------------------------------------------------------

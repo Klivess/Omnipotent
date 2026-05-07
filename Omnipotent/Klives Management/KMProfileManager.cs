@@ -19,6 +19,9 @@ namespace Omnipotent.Profiles
     {
         private const string profileFileExtension = ".kmp";
         public List<KMProfile> Profiles;
+        private readonly object profileIndexLock = new();
+        private Dictionary<string, KMProfile> profilesByPassword = new(StringComparer.Ordinal);
+        private Dictionary<string, KMProfile> profilesById = new(StringComparer.Ordinal);
 
         public KMProfileManager()
         {
@@ -55,7 +58,7 @@ namespace Omnipotent.Profiles
 
         public bool CheckIfProfileExists(string password)
         {
-            return Profiles.Any(k => k.Password == password);
+            return GetProfileByPasswordFast(password) != null;
         }
         public class KMProfile
         {
@@ -84,6 +87,7 @@ namespace Omnipotent.Profiles
             profile.CanLogin = true;
             await SaveProfileAsync(profile);
             Profiles.Add(profile);
+            AddOrUpdateProfileIndex(profile);
             ServiceLog($"Created new KM Profile '{profile.Name}, with permissions {rank.ToString()}.'");
             return profile;
         }
@@ -104,7 +108,62 @@ namespace Omnipotent.Profiles
                 await SaveProfileAsync(profile);
             }
             Profiles = Profiles.OrderBy(k => k.UserID).ToList();
+            RebuildProfileIndexes();
         }
+
+        private void RebuildProfileIndexes()
+        {
+            lock (profileIndexLock)
+            {
+                profilesByPassword = new Dictionary<string, KMProfile>(StringComparer.Ordinal);
+                profilesById = new Dictionary<string, KMProfile>(StringComparer.Ordinal);
+                foreach (var profile in Profiles ?? new List<KMProfile>())
+                {
+                    if (profile == null) continue;
+                    if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword[profile.Password] = profile;
+                    if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById[profile.UserID] = profile;
+                }
+            }
+        }
+
+        private void AddOrUpdateProfileIndex(KMProfile profile)
+        {
+            if (profile == null) return;
+            lock (profileIndexLock)
+            {
+                if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword[profile.Password] = profile;
+                if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById[profile.UserID] = profile;
+            }
+        }
+
+        private void RemoveProfileFromIndex(KMProfile profile)
+        {
+            if (profile == null) return;
+            lock (profileIndexLock)
+            {
+                if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword.Remove(profile.Password);
+                if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById.Remove(profile.UserID);
+            }
+        }
+
+        public KMProfile GetProfileByPasswordFast(string password)
+        {
+            if (string.IsNullOrWhiteSpace(password)) return null;
+            lock (profileIndexLock)
+            {
+                return profilesByPassword.TryGetValue(password, out var profile) ? profile : null;
+            }
+        }
+
+        public KMProfile GetProfileByIDFast(string id)
+        {
+            if (string.IsNullOrWhiteSpace(id)) return null;
+            lock (profileIndexLock)
+            {
+                return profilesById.TryGetValue(id, out var profile) ? profile : null;
+            }
+        }
+
         private async Task LoadAllProfiles()
         {
             Profiles = new();
@@ -114,36 +173,37 @@ namespace Omnipotent.Profiles
                 try
                 {
                     string data = await GetDataHandler().ReadDataFromFile(file);
-                    Profiles.Add(JsonConvert.DeserializeObject<KMProfile>(data));
+                    var profile = JsonConvert.DeserializeObject<KMProfile>(data);
+                    if (profile != null) Profiles.Add(profile);
                 }
                 catch (Exception ex) { }
             }
+            RebuildProfileIndexes();
             ServiceLog($"Loaded {Profiles.Count} Klives Management Profiles into memory.");
         }
 
-        public async Task<KMProfile> GetProfileByPassword(string password)
+        public Task<KMProfile> GetProfileByPassword(string password)
         {
-            var results = Profiles.Where(k => k.Password == password);
-            if (results.Any())
-            {
-                return results.First();
-            }
-            else
-            {
-                return null;
-            }
+            return Task.FromResult(GetProfileByPasswordFast(password));
         }
-        public async Task<KMProfile> GetProfileByID(string id)
+
+        public Task<KMProfile> GetProfileByID(string id)
         {
-            var results = Profiles.Where(k => k.UserID == id);
-            if (results.Any())
+            return Task.FromResult(GetProfileByIDFast(id));
+        }
+
+        private static KMProfile CreateProfileResponseCopy(KMProfile profile, bool includePassword)
+        {
+            return new KMProfile
             {
-                return results.First();
-            }
-            else
-            {
-                return null;
-            }
+                UserID = profile.UserID,
+                Name = profile.Name,
+                CreationDate = profile.CreationDate,
+                KlivesManagementRank = profile.KlivesManagementRank,
+                Password = includePassword ? profile.Password : "***",
+                DiscordID = profile.DiscordID,
+                CanLogin = profile.CanLogin
+            };
         }
 
         private static async Task SendSessionWatchStateAsync(WebSocket socket, string state)
@@ -341,13 +401,7 @@ namespace Omnipotent.Profiles
                         await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
                         return;
                     }
-                    string password = profile.Password;
-                    if (request.user.KlivesManagementRank != KMPermissions.Klives)
-                    {
-                        profile.Password = "***";
-                    }
-                    await request.ReturnResponse(JsonConvert.SerializeObject(profile), "application/json");
-                    profile.Password = password;
+                    await request.ReturnResponse(JsonConvert.SerializeObject(CreateProfileResponseCopy(profile, request.user.KlivesManagementRank == KMPermissions.Klives)), "application/json");
                 }
                 catch (Exception ex)
                 {
@@ -358,12 +412,8 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
-                    List<KMProfile> kMProfiles = new(Profiles);
-                    foreach (var item in kMProfiles)
-                    {
-                        if (request.user.KlivesManagementRank != KMPermissions.Klives)
-                            item.Password = "***";
-                    }
+                    bool includePassword = request.user.KlivesManagementRank == KMPermissions.Klives;
+                    List<KMProfile> kMProfiles = Profiles.Select(profile => CreateProfileResponseCopy(profile, includePassword)).ToList();
                     string serialized = JsonConvert.SerializeObject(kMProfiles);
                     await request.ReturnResponse(serialized, "application/json");
                 }
@@ -553,6 +603,7 @@ namespace Omnipotent.Profiles
                     if (request.user.KlivesManagementRank == KMPermissions.Klives)
                     {
                         Profiles.Remove(profile);
+                        RemoveProfileFromIndex(profile);
                         GetDataHandler().DeleteFile(profile.CreateProfilePath());
                         await request.ReturnResponse("ProfileDeleted", code: HttpStatusCode.OK);
                     }

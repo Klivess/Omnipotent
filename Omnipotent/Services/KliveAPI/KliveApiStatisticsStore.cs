@@ -6,9 +6,9 @@ namespace Omnipotent.Services.KliveAPI
     public class KliveApiStatisticsStore
     {
         private readonly object _lifetimeLock = new();
-        private readonly object _saveScheduleLock = new();
         private readonly string persistencePath;
-        private CancellationTokenSource? pendingSaveTokenSource;
+        private int saveScheduled;
+        private int saveDirty;
 
         private readonly ConcurrentDictionary<string, ApiDailyBucket> _days = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, ApiRouteBucket> _routes = new(StringComparer.OrdinalIgnoreCase);
@@ -189,24 +189,32 @@ namespace Omnipotent.Services.KliveAPI
 
         private void QueueSave()
         {
-            lock (_saveScheduleLock)
+            Volatile.Write(ref saveDirty, 1);
+            if (Interlocked.CompareExchange(ref saveScheduled, 1, 0) == 0)
             {
-                pendingSaveTokenSource?.Cancel();
-                pendingSaveTokenSource?.Dispose();
-                pendingSaveTokenSource = new CancellationTokenSource();
-                _ = SaveAfterDelayAsync(pendingSaveTokenSource.Token);
+                _ = SaveWhenQuietAsync();
             }
         }
 
-        private async Task SaveAfterDelayAsync(CancellationToken cancellationToken)
+        private async Task SaveWhenQuietAsync()
         {
             try
             {
-                await Task.Delay(750, cancellationToken);
-                await PersistAsync();
+                while (true)
+                {
+                    await Task.Delay(750);
+                    Interlocked.Exchange(ref saveDirty, 0);
+                    await PersistAsync();
+                    if (Volatile.Read(ref saveDirty) == 0) break;
+                }
             }
-            catch (OperationCanceledException)
+            finally
             {
+                Volatile.Write(ref saveScheduled, 0);
+                if (Volatile.Read(ref saveDirty) != 0 && Interlocked.CompareExchange(ref saveScheduled, 1, 0) == 0)
+                {
+                    _ = SaveWhenQuietAsync();
+                }
             }
         }
 

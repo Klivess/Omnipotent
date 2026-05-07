@@ -278,7 +278,7 @@ namespace Omnipotent.Services.OmniDefence
             // Blocked regions list
             await parent.CreateAPIRoute("/omnidefence/regions", async req =>
             {
-                var rows = await parent.Store.ListBlockedRegionsAsync();
+                var rows = parent.BlockedRegionsSnapshot().OrderByDescending(r => r.Id).ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows.Select(r => new
                 {
                     id = r.Id,
@@ -319,7 +319,8 @@ namespace Omnipotent.Services.OmniDefence
                 long id = await parent.Store.InsertBlockedRegionAsync(row);
                 row.Id = id;
                 parent.RegisterBlockedRegion(row);
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, id }), "application/json");
+                int blockedCount = await parent.ApplyBlockedRegionToKnownIpsAsync(row, req.user?.UserID, req.user?.Name);
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, id, blockedCount }), "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
             // Remove a blocked region
@@ -328,9 +329,14 @@ namespace Omnipotent.Services.OmniDefence
                 var body = ParseJsonBody(req);
                 long id = Convert.ToInt64(body.GetValueOrDefault("id") ?? 0);
                 if (id <= 0) { await req.ReturnResponse("Missing id", "text/plain", null, HttpStatusCode.BadRequest); return; }
+                bool unblockIpsInRegion = ReadBoolean(body, "unblockIpsInRegion", "unblockIpsInBox", "unblockIps");
+                var region = parent.BlockedRegionsSnapshot().FirstOrDefault(r => r.Id == id);
                 await parent.Store.DeleteBlockedRegionAsync(id);
                 parent.UnregisterBlockedRegion(id);
-                await req.ReturnResponse("{\"ok\":true}", "application/json");
+                int unblockedCount = unblockIpsInRegion && region != null
+                    ? await parent.UnblockIpsInRegionAsync(region, req.user?.UserID, req.user?.Name)
+                    : 0;
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, unblockedCount }), "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
             // Honeypot routes management
@@ -573,6 +579,19 @@ namespace Omnipotent.Services.OmniDefence
                 return dict ?? new();
             }
             catch { return new(); }
+        }
+
+        private static bool ReadBoolean(Dictionary<string, object?> body, params string[] keys)
+        {
+            foreach (string key in keys)
+            {
+                if (!body.TryGetValue(key, out object? value) || value == null) continue;
+                if (value is bool boolValue) return boolValue;
+                string text = value.ToString()?.Trim() ?? string.Empty;
+                if (bool.TryParse(text, out bool parsed)) return parsed;
+                if (long.TryParse(text, out long numeric)) return numeric != 0;
+            }
+            return false;
         }
 
         private static async Task ResetIpToNormalAsync(OmniDefence parent, KliveAPI.KliveAPI.UserRequest req, string eventKind)

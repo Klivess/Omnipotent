@@ -91,7 +91,7 @@ namespace Omnipotent.Service_Manager
             }
             //Add task to tasks and save.
             tasks.Add(task);
-            SaveTaskToFile(task);
+            QueueSaveTaskToFile(task);
             //Log task creation
             ServiceLog($"New task made: {task.taskName} - '{task.reason}'");
         }
@@ -103,10 +103,37 @@ namespace Omnipotent.Service_Manager
             return Path.Combine(directoryPath, fileName);
         }
 
-        private async void SaveTaskToFile(ScheduledTask task)
+        private void QueueSaveTaskToFile(ScheduledTask task)
         {
-            string path = FormFilePathWithTask(task);
-            await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(task));
+            _ = SaveTaskToFileAsync(task);
+        }
+
+        private async Task SaveTaskToFileAsync(ScheduledTask task)
+        {
+            try
+            {
+                string directoryPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.TimeManagementTasksDirectory);
+                await GetDataHandler().CreateDirectory(directoryPath);
+
+                string path = FormFilePathWithTask(task);
+                await GetDataHandler().WriteToFile(path, JsonConvert.SerializeObject(task));
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Couldn't save task file for '{task.taskName}'.");
+            }
+        }
+
+        private async Task DeleteTaskFileAsync(ScheduledTask task)
+        {
+            try
+            {
+                await GetDataHandler().DeleteFile(FormFilePathWithTask(task));
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Couldn't delete task file.");
+            }
         }
 
         public async Task<List<ScheduledTask>> GetAllUpcomingTasksFromDisk()
@@ -114,6 +141,7 @@ namespace Omnipotent.Service_Manager
             List<ScheduledTask> tasks = new List<ScheduledTask>();
             //Filter only files that are taskfiles
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.TimeManagementTasksDirectory);
+            Directory.CreateDirectory(path);
             string[] files = Directory.GetFiles(path);
             foreach (var item in files.Where(k => k.EndsWith(TaskFileExtension)))
             {
@@ -173,18 +201,7 @@ namespace Omnipotent.Service_Manager
                             }
                             //Remove task from list, and delete file.
                             tasks.Remove(item);
-                            string filePath = FormFilePathWithTask(item);
-                            if (File.Exists(filePath))
-                            {
-                                try
-                                {
-                                    File.Delete(filePath);
-                                }
-                                catch (Exception ex)
-                                {
-                                    ServiceLogError(ex, "Couldn't delete task file.");
-                                }
-                            }
+                            await DeleteTaskFileAsync(item);
                         });
                         thread.Start();
                     }
@@ -229,18 +246,7 @@ namespace Omnipotent.Service_Manager
                     }
                     //Remove task from list, and delete file.
                     tasks.Remove(task);
-                    string filePath = FormFilePathWithTask(task);
-                    if (File.Exists(filePath))
-                    {
-                        try
-                        {
-                            File.Delete(filePath);
-                        }
-                        catch (Exception ex)
-                        {
-                            ServiceLogError(ex, "Couldn't delete task file.");
-                        }
-                    }
+                    await DeleteTaskFileAsync(task);
                 }
             });
             thread.Start();

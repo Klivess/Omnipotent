@@ -291,22 +291,49 @@ namespace Omnipotent.Services.KliveAPI
 
         private async void StartWatchdog()
         {
+            // Ensure the omnisetting exists with its default value so it is discoverable
+            // from the omnisettings UI as soon as KliveAPI starts.
+            try { await GetBoolOmniSetting("KliveAPIWatchdogEnabled", defaultValue: true); }
+            catch { /* settings manager may not yet be ready; ignore */ }
+
             using System.Net.Http.HttpClient client = new System.Net.Http.HttpClient();
             client.Timeout = TimeSpan.FromSeconds(10);
             await Task.Delay(15000); // Give the API time to initialize
 
+            int consecutiveFailures = 0;
+            const int FailureThresholdBeforeRestart = 3;
+
             while (ContinueListenLoop)
             {
+                bool watchdogEnabled = true;
+                try { watchdogEnabled = await GetBoolOmniSetting("KliveAPIWatchdogEnabled", defaultValue: true); }
+                catch { /* if the settings manager fails, fall back to enabled */ }
+
+                if (!watchdogEnabled)
+                {
+                    consecutiveFailures = 0;
+                    try { await Task.Delay(30000, cancellationToken.Token); }
+                    catch (TaskCanceledException) { return; }
+                    catch (ObjectDisposedException) { return; }
+                    continue;
+                }
+
                 try
                 {
                     var response = await client.GetAsync($"http://127.0.0.1:{apiHTTPPORT}/ping");
                     response.EnsureSuccessStatusCode();
+                    consecutiveFailures = 0;
                 }
                 catch (Exception ex)
                 {
-                    if (ContinueListenLoop)
+                    if (!ContinueListenLoop) return;
+
+                    consecutiveFailures++;
+                    await ServiceLogError(ex, $"Watchdog ping failed ({consecutiveFailures}/{FailureThresholdBeforeRestart}). API may be busy.");
+
+                    if (consecutiveFailures >= FailureThresholdBeforeRestart)
                     {
-                        await ServiceLogError(ex, "Watchdog detected API is unresponsive. Restarting API service...");
+                        await ServiceLogError(ex, "Watchdog detected API is unresponsive across multiple consecutive checks. Restarting API service...");
                         _ = RestartService();
                         return;
                     }
