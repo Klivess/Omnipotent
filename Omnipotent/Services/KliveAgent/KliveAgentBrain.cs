@@ -147,6 +147,9 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- For 'in the last N minutes' filters on errors, call GetRecentErrors(50) once and filter the formatted timestamps yourself. Do NOT call it repeatedly with shrinking limits.");
             sb.AppendLine("- To find FILES by filename (e.g. 'every .cs file containing X in the name'), use FindFiles(\"*Pattern*.cs\", \"subfolder\") — it returns the file list directly. Do NOT use SearchCode for filename queries; SearchCode searches CONTENT, not filenames.");
             sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
+            sb.AppendLine("- For MULTI-STEP tasks (output of step 1 feeds step 2 feeds step 3), chain everything in ONE script block using local variables. Log each intermediate value so you can see the chain. Example: `var errs = GetRecentErrors(50); var top = ParseTopService(errs); var files = FindFiles($\"*{top}*.cs\", \"Omnipotent/Services\"); Log($\"top={top} files={files.Count}\");`. Do NOT split a 3-step pipeline into 3 separate scripts — the locals from script 1 are GONE in script 2 unless you re-fetch.");
+            sb.AppendLine("- EMPTY-PREMISE RULE: if the data needed to answer is empty (zero errors, zero matches, no memories with that tag), the EMPTY STATE IS THE ANSWER. Report it directly. Do NOT save a vacuous self-improvement memory, propose imaginary fixes, or fabricate work — 'no errors today' is a complete answer.");
+            sb.AppendLine("- If you don't know what fields a returned object has, call GetTypeSchema on its type OR just `Log(System.Text.Json.JsonSerializer.Serialize(obj))` to see the shape. Do NOT guess field names — discover them first, ONCE.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
@@ -181,6 +184,20 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("foreach (var m in await RecallMemoriesByTag(\"preferences\")) Log($\"{m.Id.Substring(0,8)} {m.Content}\");");
             sb.AppendLine("// Get today's run-time stats (no codebase search needed):");
             sb.AppendLine("var st = GetAgentStats(); Log(System.Text.Json.JsonSerializer.Serialize(st));");
+            sb.AppendLine("// Discover an unknown object's shape (when you don't remember the field names):");
+            sb.AppendLine("var info = GetService(\"Omniscience\"); Log(System.Text.Json.JsonSerializer.Serialize(info, new System.Text.Json.JsonSerializerOptions{WriteIndented=true,MaxDepth=3}));");
+            sb.AppendLine("// MULTI-STEP PIPELINE in ONE script (output of step N → input of step N+1, with logs at each gate):");
+            sb.AppendLine("var errs = GetRecentErrors(50);");
+            sb.AppendLine("if (errs.Count == 0) { Log(\"no errors today\"); return; } // empty-premise short-circuit");
+            sb.AppendLine("var groups = errs.Select(e => System.Text.RegularExpressions.Regex.Match(e, @\"Omnipotent\\.Services\\.([\\w\\.]+)\").Groups[1].Value)");
+            sb.AppendLine("    .Where(s => !string.IsNullOrEmpty(s)).GroupBy(s => s).OrderByDescending(g => g.Count()).ToList();");
+            sb.AppendLine("var topSvc = groups.First().Key; Log($\"step1 topSvc={topSvc} count={groups.First().Count()}\");");
+            sb.AppendLine("var files = FindFiles($\"*{topSvc.Split('.').Last()}*.cs\", \"Omnipotent/Services\");");
+            sb.AppendLine("Log($\"step2 files={files.Count} first={files.FirstOrDefault()}\");");
+            sb.AppendLine("if (files.Count > 0) { var src = ReadFile(files[0]); var n = System.Text.RegularExpressions.Regex.Matches(src, @\"\\bcatch\\b\").Count; Log($\"step3 catches={n}\"); }");
+            sb.AppendLine("// CHAINED MEMORY SAVE (later step references id from earlier step in SAME block):");
+            sb.AppendLine("var anchorId = await SaveMemory(\"anchor content\", new[]{\"anchor\"});");
+            sb.AppendLine("var refId = await SaveMemory($\"references {anchorId}\", new[]{\"reference\"}); Log($\"anchor={anchorId} ref={refId}\");");
             sb.AppendLine();
 
             sb.AppendLine("[Memory Discipline]");
