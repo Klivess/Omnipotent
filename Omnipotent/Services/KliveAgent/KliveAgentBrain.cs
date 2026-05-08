@@ -42,6 +42,7 @@ namespace Omnipotent.Services.KliveAgent
             new("GetObjectTypeInfo", "Inspect a live object's members before calling or reading them."),
             new("ExecuteServiceMethod", "Call a known service method directly when you already know the exact service type and method name."),
             new("CallObjectMethod", "Invoke a method on a live object after inspecting it. Await Task-returning methods."),
+            new("GetRecentErrors", "Pull recent Error-level entries from OmniLogging directly. Prefer this over reflecting into the logger."),
             new("Log", "Write short structured observations back to the loop.")
         ];
 
@@ -144,6 +145,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("var mem = GetObjectMember(GetService(\"KliveAgent\"), \"Memory\");");
             sb.AppendLine("// Get all KliveAgent memories:");
             sb.AppendLine("var all = await CallObjectMethod(GetObjectMember(GetService(\"KliveAgent\"), \"Memory\"), \"GetAllMemoriesAsync\"); Log(((System.Collections.ICollection)all).Count.ToString());");
+            sb.AppendLine("// List all running services with name + uptime (ListServices() already filters to active):");
+            sb.AppendLine("foreach (var s in ListServices()) Log($\"{s.TypeName}/{s.Name} up={s.Uptime}\");");
+            sb.AppendLine("// Recent errors from OmniLogging — overallMessages is the source of truth, type==Error means error:");
+            sb.AppendLine("var recent = GetRecentErrors(10); foreach (var line in recent) Log(line);");
             sb.AppendLine();
 
             sb.AppendLine("[Memory Discipline]");
@@ -260,6 +265,7 @@ namespace Omnipotent.Services.KliveAgent
                 var errorFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 bool stuckForceFinal = false;
+                bool finalFormatRetryUsed = false;
 
                 // ── Agentic Loop: Think → Script → Observe → repeat ──
                 // No iteration cap. The loop ends when the LLM produces a final text-only
@@ -315,6 +321,18 @@ namespace Omnipotent.Services.KliveAgent
                         var finalText = string.Join("\n", segments
                             .Where(s => !s.IsScript)
                             .Select(s => s.Content)).Trim();
+
+                        // Guard: model sometimes emits C# code as plain text (unbalanced ``` fence,
+                        // or naked tool calls like "ReadFile(...)") thinking it's a final answer.
+                        // Re-prompt once to force a real final reply or a properly-fenced script.
+                        if (!finalFormatRetryUsed && !stuckForceFinal && LooksLikeUnexecutedScript(finalText))
+                        {
+                            finalFormatRetryUsed = true;
+                            currentPrompt = "[Format error] Your last reply contained C# code as plain text but no executable {{{ ... }}} or ```csharp fenced block, so nothing ran. "
+                                + "You must EITHER (a) re-emit the code wrapped in {{{ ... }}} so it actually runs, OR (b) write the real final text-only answer with NO code, NO fences, NO tool names. "
+                                + "Pick one. Do not stall.";
+                            continue;
+                        }
 
                         llm.ResetSession(llmSessionId);
 
@@ -710,6 +728,44 @@ namespace Omnipotent.Services.KliveAgent
             }
             var trimmed = sb.ToString().Trim();
             return trimmed.Length <= 240 ? trimmed : trimmed[..240];
+        }
+
+        /// <summary>
+        /// Heuristic: does this "final answer" text actually look like it's secretly C# code
+        /// (or a half-broken code fence) that the agent meant to execute but didn't wrap?
+        /// We trip on: unbalanced ``` fence count, or several lines that look like tool
+        /// calls / variable declarations / awaited Tasks.
+        /// </summary>
+        private static bool LooksLikeUnexecutedScript(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+
+            // Unbalanced triple-backtick → there's a fence opener or closer dangling.
+            int fenceCount = 0;
+            for (int i = 0; i + 2 < text.Length; i++)
+            {
+                if (text[i] == '`' && text[i + 1] == '`' && text[i + 2] == '`')
+                {
+                    fenceCount++;
+                    i += 2;
+                }
+            }
+            if ((fenceCount & 1) == 1) return true;
+
+            // Count lines that look like raw C# tool calls / declarations.
+            var lines = text.Split('\n');
+            int codeyLines = 0;
+            foreach (var raw in lines)
+            {
+                var line = raw.TrimStart();
+                if (line.Length == 0) continue;
+                if (line.StartsWith("//")) { codeyLines++; continue; }
+                if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|ReadFile|WriteFile|SaveMemory|RecallMemories|DeleteMemory|GetRecentErrors|SaveShortcut|GetShortcuts)\b"))
+                    codeyLines++;
+                if (line.EndsWith(";") && Regex.IsMatch(line, @"[A-Za-z_]\w*\s*\("))
+                    codeyLines++;
+            }
+            return codeyLines >= 3;
         }
     }
 

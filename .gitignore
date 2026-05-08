@@ -405,3 +405,4 @@ FodyWeavers.xsd
 /.github/copilot-instructions.md
 agent_test_results_utf8.txt
 agent_test_results.txt
+agent_benchmark.ps1

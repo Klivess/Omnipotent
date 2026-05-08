@@ -594,6 +594,43 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Background Tasks ──
 
+        /// <summary>
+        /// Get the most recent error log entries from OmniLogging, newest last. Returns formatted lines:
+        /// "yyyy-MM-dd HH:mm:ss [ServiceName] message". Use this BEFORE reaching for reflection on logger internals.
+        /// </summary>
+        public List<string> GetRecentErrors(int limit = 20)
+        {
+            var result = new List<string>();
+            var services = agentService.GetActiveServices();
+            var logger = services.FirstOrDefault(s => s.GetType().Name == "OmniLogging" || s.GetName() == "OmniLogging");
+            if (logger == null) return result;
+
+            var queueField = logger.GetType().GetField("overallMessages",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            if (queueField == null) return result;
+            var queue = queueField.GetValue(logger) as System.Collections.IEnumerable;
+            if (queue == null) return result;
+
+            var snapshot = new List<object>();
+            foreach (var item in queue) snapshot.Add(item);
+
+            foreach (var entry in snapshot)
+            {
+                var t = entry.GetType();
+                var typeVal = t.GetField("type")?.GetValue(entry)?.ToString();
+                if (typeVal != "Error") continue;
+                var when = t.GetField("TimeOfLog")?.GetValue(entry) as DateTime? ?? DateTime.MinValue;
+                var svc = t.GetField("serviceName")?.GetValue(entry)?.ToString() ?? "?";
+                var msg = t.GetField("message")?.GetValue(entry)?.ToString() ?? "";
+                if (msg.Length > 240) msg = msg.Substring(0, 240) + "…";
+                result.Add($"{when:yyyy-MM-dd HH:mm:ss} [{svc}] {msg}");
+            }
+
+            if (limit > 0 && result.Count > limit)
+                result = result.GetRange(result.Count - limit, limit);
+            return result;
+        }
+
         /// <summary>Spawn a long-running background task with its own script.</summary>
         public string SpawnBackgroundTask(string description, string code)
         {
