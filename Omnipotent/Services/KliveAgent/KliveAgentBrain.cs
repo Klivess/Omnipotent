@@ -82,7 +82,7 @@ namespace Omnipotent.Services.KliveAgent
             new("DeleteMemory", "Forget a memory by its id (or short-id prefix shown in prompts). Use this to curate noise/duplicates/outdated beliefs."),
             new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task. Returns the saved memory id (string)."),
             new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow."),
-            new("GetAgentStats", "Return today's KliveAgent run-time stats: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, plus fullSummary with today and dailyHistory buckets.")
+            new("GetAgentStats", "Return today's KliveAgent run-time stats. Top-level: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, todayUtcDate, fullSummary. fullSummary contains nested objects: lifetime{messages,promptTokens,completionTokens,totalTokens,iterations,scripts,scriptFailures,scriptSuccessRatePct,...}, today{messages,promptTokens,completionTokens,totalTokens,scripts,scriptFailures,scriptFailureRatePct,...} (today is null on a fresh day before any activity), and dailyHistory[] with the same per-day shape. Access nested values via JSON serialization or GetObjectMember chains.")
         ];
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
@@ -147,7 +147,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- For 'in the last N minutes' filters on errors, call GetRecentErrors(50) once and filter the formatted timestamps yourself. Do NOT call it repeatedly with shrinking limits.");
             sb.AppendLine("- To find FILES by filename (e.g. 'every .cs file containing X in the name'), use FindFiles(\"*Pattern*.cs\", \"subfolder\") — it returns the file list directly. Do NOT use SearchCode for filename queries; SearchCode searches CONTENT, not filenames.");
             sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
-            sb.AppendLine("- For MULTI-STEP tasks (output of step 1 feeds step 2 feeds step 3), chain everything in ONE script block using local variables. Log each intermediate value so you can see the chain. Example: `var errs = GetRecentErrors(50); var top = ParseTopService(errs); var files = FindFiles($\"*{top}*.cs\", \"Omnipotent/Services\"); Log($\"top={top} files={files.Count}\");`. Do NOT split a 3-step pipeline into 3 separate scripts — the locals from script 1 are GONE in script 2 unless you re-fetch.");
+            sb.AppendLine("- For MULTI-STEP tasks (output of step 1 feeds step 2 feeds step 3), chain everything in ONE script block using local variables and `Log` each intermediate so you can see the chain. Use ONLY real APIs from this guide — do NOT invent helper functions like `ParseTopService` or `Aggregate`; if you need parsing, write the regex / LINQ inline. The full pipeline template appears below in [Common Patterns]. Do NOT split a pipeline into separate scripts — locals from script 1 are GONE in script 2.");
             sb.AppendLine("- EMPTY-PREMISE RULE: if the data needed to answer is empty (zero errors, zero matches, no memories with that tag), the EMPTY STATE IS THE ANSWER. Report it directly. Do NOT save a vacuous self-improvement memory, propose imaginary fixes, or fabricate work — 'no errors today' is a complete answer.");
             sb.AppendLine("- If you don't know what fields a returned object has, call GetTypeSchema on its type OR just `Log(System.Text.Json.JsonSerializer.Serialize(obj))` to see the shape. Do NOT guess field names — discover them first, ONCE.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
@@ -853,6 +853,8 @@ namespace Omnipotent.Services.KliveAgent
                 return true;
 
             // Unbalanced triple-backtick → there's a fence opener or closer dangling.
+            // Only flag when there are 3+ fences (so a single literal "```" inside an answer
+            // explaining markdown fences doesn't trip the heuristic).
             int fenceCount = 0;
             for (int i = 0; i + 2 < text.Length; i++)
             {
@@ -862,15 +864,23 @@ namespace Omnipotent.Services.KliveAgent
                     i += 2;
                 }
             }
-            if ((fenceCount & 1) == 1) return true;
+            if (fenceCount >= 3 && (fenceCount & 1) == 1) return true;
 
             // Count lines that look like raw C# tool calls / declarations.
+            // Skip lines that are clearly prose (start with bullet markers, numbers, common English words),
+            // or quoted (inside backticks). Only a leading bare identifier in caller position counts.
             var lines = text.Split('\n');
             int codeyLines = 0;
             foreach (var raw in lines)
             {
                 var line = raw.TrimStart();
                 if (line.Length == 0) continue;
+                // Bullets / numbered list items / blockquotes / table cells are prose, not code.
+                if (line.StartsWith("- ") || line.StartsWith("* ") || line.StartsWith("> ")
+                    || line.StartsWith("|") || Regex.IsMatch(line, @"^\d+[\.\)]\s"))
+                    continue;
+                // Lines that begin with a backtick are inline-code in markdown — prose-ish.
+                if (line.StartsWith("`")) continue;
                 if (line.StartsWith("//")) { codeyLines++; continue; }
                 if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|SearchCode|SearchCodeRegex|SearchCodeHybrid|ReadFile|WriteFile|FindFiles|ListDirectory|SaveMemory|RecallMemories|RecallMemoriesByTag|DeleteMemory|GetRecentErrors|GetAgentStats|SaveShortcut|GetShortcuts)\b"))
                     codeyLines++;
