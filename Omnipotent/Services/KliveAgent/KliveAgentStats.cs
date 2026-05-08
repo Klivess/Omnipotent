@@ -303,7 +303,10 @@ namespace Omnipotent.Services.KliveAgent
                     promptTokens = today.PromptTokens,
                     completionTokens = today.CompletionTokens,
                     totalTokens = today.PromptTokens + today.CompletionTokens,
+                    iterations = today.Iterations,
                     scripts = today.Scripts,
+                    scriptFailures = today.ScriptFailures,
+                    scriptFailureRatePct = today.Scripts > 0 ? Math.Round((double)today.ScriptFailures / today.Scripts * 100.0, 1) : 0.0,
                     capabilityCalls = today.CapabilityCalls,
                     capabilityFailures = today.CapabilityFailures,
                     capabilityConfirmationBlocks = today.CapabilityConfirmationBlocks

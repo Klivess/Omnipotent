@@ -76,10 +76,12 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly PromptToolDescriptor[] MemoryTools =
         [
             new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags must be a string array, e.g. new[] { \"klive\", \"identity\" }. Returns the saved memory id (string) — log it if the user asked you to confirm."),
-            new("RecallMemories", "Search saved memories for prior facts."),
+            new("RecallMemories", "Search saved memories by free-text query (matches both content and tags as text)."),
+            new("RecallMemoriesByTag", "Return memories whose Tags collection contains the given tag exactly (case-insensitive). Prefer over RecallMemories when filtering by a known tag."),
             new("DeleteMemory", "Forget a memory by its id (or short-id prefix shown in prompts). Use this to curate noise/duplicates/outdated beliefs."),
             new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task. Returns the saved memory id (string)."),
-            new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow.")
+            new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow."),
+            new("GetAgentStats", "Return today's KliveAgent run-time stats: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, plus fullSummary with today and dailyHistory buckets.")
         ];
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
@@ -135,7 +137,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
-            sb.AppendLine("- To find a function/symbol in the codebase, ALWAYS use SearchCode(\"Name\", \"Omnipotent/Services/...\") or SearchCodeHybrid first. Never read whole files looking for a symbol — page-read after you have a line number.");
+            sb.AppendLine("- When the user names a specific file (e.g. 'Read X.cs and ...'), call ReadFile(path) directly. Use SearchCode/SearchCodeHybrid only when the file or location is unknown.");
+            sb.AppendLine("- SearchCode(text, subfolder) accepts a single .cs file path as the second arg, not just a directory — pass the full file path when you want to search inside ONE file.");
+            sb.AppendLine("- If the SAME tool errors twice with the SAME message, STOP retrying it. Switch tools (e.g. SearchCode → ReadFile, or RecallMemories → RecallMemoriesByTag) or accept the answer and finalize.");
+            sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStats() — do NOT search the codebase or claim 'no metric exists'.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
@@ -154,8 +159,16 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("var recent = GetRecentErrors(10); foreach (var line in recent) Log(line);");
             sb.AppendLine("// Save TWO (or more) memories in ONE block and capture the returned ids:");
             sb.AppendLine("var idA = await SaveMemory(\"fact A\", new[]{\"tag\"}); var idB = await SaveMemory(\"fact B\", new[]{\"tag\"}); Log($\"a={idA} b={idB}\");");
-            sb.AppendLine("// Find a symbol in code (do this BEFORE reading a whole file):");
-            sb.AppendLine("Log(SearchCode(\"Bm25Score\", \"Omnipotent/Services/KliveAgent\")); // returns file:line matches; then ReadFile(path, startLine: <line>-3, maxLines: 30) to inspect.");
+            sb.AppendLine("// Find a symbol when location is UNKNOWN (search codebase, then read the file at the line):");
+            sb.AppendLine("Log(SearchCode(\"Bm25Score\", \"Omnipotent/Services/KliveAgent\")); // returns file:line matches");
+            sb.AppendLine("// Search inside ONE known file (subfolder = file path):");
+            sb.AppendLine("Log(SearchCode(\"BM25\", \"Omnipotent/Services/KliveAgent/KliveAgentMemory.cs\"));");
+            sb.AppendLine("// Read a known file directly (user named it):");
+            sb.AppendLine("Log(ReadFile(\"Omnipotent/Services/KliveAgent/KliveAgentBrain.cs\", startLine: 1, maxLines: 250));");
+            sb.AppendLine("// Filter memories by exact tag (instead of full-text search):");
+            sb.AppendLine("foreach (var m in await RecallMemoriesByTag(\"preferences\")) Log($\"{m.Id.Substring(0,8)} {m.Content}\");");
+            sb.AppendLine("// Get today's run-time stats (no codebase search needed):");
+            sb.AppendLine("var st = GetAgentStats(); Log(System.Text.Json.JsonSerializer.Serialize(st));");
             sb.AppendLine();
 
             sb.AppendLine("[Memory Discipline]");
@@ -796,7 +809,7 @@ namespace Omnipotent.Services.KliveAgent
                 var line = raw.TrimStart();
                 if (line.Length == 0) continue;
                 if (line.StartsWith("//")) { codeyLines++; continue; }
-                if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|ReadFile|WriteFile|SaveMemory|RecallMemories|DeleteMemory|GetRecentErrors|SaveShortcut|GetShortcuts)\b"))
+                if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|SearchCode|SearchCodeRegex|SearchCodeHybrid|ReadFile|WriteFile|SaveMemory|RecallMemories|RecallMemoriesByTag|DeleteMemory|GetRecentErrors|GetAgentStats|SaveShortcut|GetShortcuts)\b"))
                     codeyLines++;
                 if (line.EndsWith(";") && Regex.IsMatch(line, @"[A-Za-z_]\w*\s*\("))
                     codeyLines++;

@@ -579,10 +579,39 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString();
         }
 
-        /// <summary>Search persistent memories.</summary>
+        /// <summary>Search persistent memories. Searches both content and tags as text — passing a tag name works.</summary>
         public async Task<List<AgentMemoryEntry>> RecallMemories(string query, int maxResults = 10)
         {
             return await agentService.Memory.RecallMemoriesAsync(query, maxResults);
+        }
+
+        /// <summary>Return all memories whose Tags collection contains the given tag (case-insensitive). Use this for exact tag filtering instead of RecallMemories.</summary>
+        public async Task<List<AgentMemoryEntry>> RecallMemoriesByTag(string tag)
+        {
+            if (string.IsNullOrWhiteSpace(tag)) return new List<AgentMemoryEntry>();
+            var all = await agentService.Memory.GetAllMemoriesAsync();
+            return all.Where(m => m.Tags != null && m.Tags.Any(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase))).ToList();
+        }
+
+        /// <summary>Return today's KliveAgent run-time stats (script counts, failure rate, token totals). Sourced directly from KliveAgentStats.</summary>
+        public object GetAgentStats()
+        {
+            var s = agentService.Stats;
+            if (s == null) return new { error = "Stats not initialised yet." };
+            var todayKey = DateTime.UtcNow.ToString("yyyy-MM-dd");
+            long lifetimeScripts = s.TotalScriptsRun;
+            long lifetimeFailures = s.TotalScriptFailures;
+            double lifetimeRate = lifetimeScripts > 0 ? Math.Round((double)lifetimeFailures / lifetimeScripts * 100.0, 1) : 0.0;
+            // Today bucket lives inside KliveAgentStats; surface via the public summary.
+            var summary = s.GetSummary();
+            return new
+            {
+                todayUtcDate = todayKey,
+                lifetimeScriptsRun = lifetimeScripts,
+                lifetimeScriptFailures = lifetimeFailures,
+                lifetimeScriptFailureRatePct = lifetimeRate,
+                fullSummary = summary
+            };
         }
 
         /// <summary>Forget a memory by its id (or short-id prefix as shown in prompts, e.g. "a3f1b2c4").
@@ -769,12 +798,26 @@ namespace Omnipotent.Services.KliveAgent
         {
             if (string.IsNullOrWhiteSpace(searchText)) return "Search text cannot be empty.";
 
-            var dir = ResolvePath(subfolder);
-            if (dir == null || !Directory.Exists(dir)) return $"Directory not found: {subfolder}";
+            var resolved = ResolvePath(subfolder);
+            if (resolved == null) return $"Path not found: {subfolder}";
+
+            IEnumerable<string> filesToScan;
+            if (File.Exists(resolved))
+            {
+                filesToScan = new[] { resolved };
+            }
+            else if (Directory.Exists(resolved))
+            {
+                filesToScan = Directory.EnumerateFiles(resolved, "*.cs", SearchOption.AllDirectories);
+            }
+            else
+            {
+                return $"Path not found: {subfolder}";
+            }
 
             var results = new List<string>();
 
-            foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
+            foreach (var file in filesToScan)
             {
                 if (results.Count >= maxResults) break;
 
@@ -958,18 +1001,35 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString().TrimEnd();
         }
 
-        /// <summary>Regex-based search across .cs source files.</summary>
+        /// <summary>Regex-based search across .cs source files. subfolder may be a directory or a single .cs file path.</summary>
         public string SearchCodeRegex(string pattern, string subfolder = "", int maxResults = 30)
         {
             var root = ResolveCodebaseRoot();
-            var searchDir = string.IsNullOrEmpty(subfolder)
-                ? root
-                : Path.Combine(root, subfolder.Replace('/', Path.DirectorySeparatorChar));
-            if (!Directory.Exists(searchDir)) return $"Directory not found: {searchDir}";
+            IEnumerable<string> filesToScan;
+            if (string.IsNullOrEmpty(subfolder))
+            {
+                filesToScan = Directory.EnumerateFiles(root, "*.cs", SearchOption.AllDirectories);
+            }
+            else
+            {
+                var resolved = Path.Combine(root, subfolder.Replace('/', Path.DirectorySeparatorChar));
+                if (File.Exists(resolved))
+                {
+                    filesToScan = new[] { resolved };
+                }
+                else if (Directory.Exists(resolved))
+                {
+                    filesToScan = Directory.EnumerateFiles(resolved, "*.cs", SearchOption.AllDirectories);
+                }
+                else
+                {
+                    return $"Path not found: {subfolder}";
+                }
+            }
 
             var sb = new StringBuilder();
             int count = 0;
-            foreach (var file in Directory.EnumerateFiles(searchDir, "*.cs", SearchOption.AllDirectories))
+            foreach (var file in filesToScan)
             {
                 if (file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") ||
                     file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")) continue;
