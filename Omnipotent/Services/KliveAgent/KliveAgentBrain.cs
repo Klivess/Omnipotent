@@ -54,6 +54,7 @@ namespace Omnipotent.Services.KliveAgent
             new("ReadFile", "Read the source directly with line pagination."),
             new("GetFileSymbols", "List the symbols declared in one file."),
             new("ListDirectory", "Browse a directory relative to the codebase root."),
+            new("FindFiles", "Find files by FILENAME pattern (e.g. '*Routes*.cs', 'KliveBot*'). Use this for filename-only queries — much cheaper than SearchCode."),
             new("GetRepoMap", "Refresh the live repo map if you need broader structure."),
             new("SearchCode", "Use plain-text search only when a narrower type lookup did not find the target."),
             new("SearchCodeRegex", "Use regex search for signature-shaped lookups.")
@@ -144,6 +145,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- If the SAME tool errors twice with the SAME message, STOP retrying it. Switch tools (e.g. SearchCode → ReadFile, or RecallMemories → RecallMemoriesByTag) or accept the answer and finalize.");
             sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStats() — do NOT search the codebase or claim 'no metric exists'.");
             sb.AppendLine("- For 'in the last N minutes' filters on errors, call GetRecentErrors(50) once and filter the formatted timestamps yourself. Do NOT call it repeatedly with shrinking limits.");
+            sb.AppendLine("- To find FILES by filename (e.g. 'every .cs file containing X in the name'), use FindFiles(\"*Pattern*.cs\", \"subfolder\") — it returns the file list directly. Do NOT use SearchCode for filename queries; SearchCode searches CONTENT, not filenames.");
+            sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
@@ -168,6 +171,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("Log(SearchCode(\"BM25\", \"Omnipotent/Services/KliveAgent/KliveAgentMemory.cs\"));");
             sb.AppendLine("// List private static METHODS in a file (NOT fields — the negative lookahead skips `private static readonly`):");
             sb.AppendLine("Log(SearchCodeRegex(@\"^\\s*private\\s+static\\s+(?!readonly)[\\w<>?,\\s\\[\\]]+\\s+\\w+\\s*\\(\", \"Omnipotent/Services/KliveAgent/KliveAgentBrain.cs\"));");
+            sb.AppendLine("// Find every .cs FILE matching a name pattern under a subfolder (filename-only, no content scan):");
+            sb.AppendLine("Log(FindFiles(\"*Routes*.cs\", \"Omnipotent/Services\"));");
+            sb.AppendLine("// Count + list PUBLIC INSTANCE methods of a class (GetTypeSchema returns only public methods):");
+            sb.AppendLine("var sch = GetTypeSchema(\"ScriptGlobals\"); var inst = sch.Methods.Where(m => !m.IsStatic).ToList(); Log($\"{inst.Count} pub instance methods. First 3: {string.Join(\\\", \\\", inst.Take(3).Select(m => m.Name))}\");");
             sb.AppendLine("// Read a known file directly (user named it):");
             sb.AppendLine("Log(ReadFile(\"Omnipotent/Services/KliveAgent/KliveAgentBrain.cs\", startLine: 1, maxLines: 250));");
             sb.AppendLine("// Filter memories by exact tag (instead of full-text search):");
@@ -839,7 +846,7 @@ namespace Omnipotent.Services.KliveAgent
                 var line = raw.TrimStart();
                 if (line.Length == 0) continue;
                 if (line.StartsWith("//")) { codeyLines++; continue; }
-                if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|SearchCode|SearchCodeRegex|SearchCodeHybrid|ReadFile|WriteFile|SaveMemory|RecallMemories|RecallMemoriesByTag|DeleteMemory|GetRecentErrors|GetAgentStats|SaveShortcut|GetShortcuts)\b"))
+                if (Regex.IsMatch(line, @"^(var|await|foreach|for|if|return|using|Log|GetService|GetServiceMember|GetTypeSchema|GetTypeInfo|GetObjectMember|CallObjectMethod|ExecuteServiceMethod|ListServices|SearchSymbols|SearchCode|SearchCodeRegex|SearchCodeHybrid|ReadFile|WriteFile|FindFiles|ListDirectory|SaveMemory|RecallMemories|RecallMemoriesByTag|DeleteMemory|GetRecentErrors|GetAgentStats|SaveShortcut|GetShortcuts)\b"))
                     codeyLines++;
                 if (line.EndsWith(";") && Regex.IsMatch(line, @"[A-Za-z_]\w*\s*\("))
                     codeyLines++;
