@@ -74,6 +74,20 @@ namespace Omnipotent.Services.KliveAgent
                 Memory = new KliveAgentMemory(this);
                 await Memory.InitializeAsync();
 
+                // One-shot cleanup of legacy auto-saved "completed task" changelog memories.
+                // The previous brain auto-recorded every successful turn, which polluted prompts.
+                // Real memories (durable facts about reality) are preserved.
+                try
+                {
+                    var pruned = await Memory.PruneAutoCompletedTaskMemoriesAsync();
+                    if (pruned > 0)
+                        await ServiceLog($"[KliveAgent] Pruned {pruned} legacy auto-completed-task memor{(pruned == 1 ? "y" : "ies")}.");
+                }
+                catch (Exception pruneEx)
+                {
+                    await ServiceLogError(pruneEx, "[KliveAgent] Memory prune failed (non-fatal).");
+                }
+
                 BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
                 await BackgroundTasks.InitializeAsync();
 

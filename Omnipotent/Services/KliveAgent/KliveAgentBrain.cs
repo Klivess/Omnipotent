@@ -74,8 +74,9 @@ namespace Omnipotent.Services.KliveAgent
 
         private static readonly PromptToolDescriptor[] MemoryTools =
         [
-            new("SaveMemory", "Persist a durable note. Tags must be a string array, for example new[] { \"service\", \"workflow\" }."),
-            new("RecallMemories", "Search saved memories for prior discoveries or IDs."),
+            new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags must be a string array, e.g. new[] { \"klive\", \"identity\" }."),
+            new("RecallMemories", "Search saved memories for prior facts."),
+            new("DeleteMemory", "Forget a memory by its id (or short-id prefix shown in prompts). Use this to curate noise/duplicates/outdated beliefs."),
             new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task."),
             new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow.")
         ];
@@ -98,13 +99,10 @@ namespace Omnipotent.Services.KliveAgent
             // Extract PascalCase seed words from the user message for repo map personalisation
             var seeds = KliveAgentRepoMap.ExtractSeedsFromText(userMessage);
 
-            // Build token-budgeted, task-personalised repo map
+            // Build token-budgeted, task-personalised repo map (only when the task has code signals).
             var repoMap = string.Empty;
             try
             {
-                // Only inject the repo map when the task has code-exploration signals (PascalCase
-                // type/service names found in the message). For plain action requests like
-                // "send me a Discord message" there are no seeds and the map adds pure token waste.
                 if (agentService.RepoMap != null && seeds.Count > 0)
                     repoMap = agentService.RepoMap.GetRepoMap(KliveAgentContextBudget.RepoMapBudget, seeds);
             }
@@ -116,8 +114,8 @@ namespace Omnipotent.Services.KliveAgent
             {
                 memoriesSection = await memory.FormatMemoriesForPrompt(
                     userMessage,
-                    maxMemories: 6,
-                    maxShortcuts: 4,
+                    maxMemories: 4,
+                    maxShortcuts: 3,
                     maxTokens: KliveAgentContextBudget.MemoryBudget);
             }
             catch { }
@@ -127,29 +125,35 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine(personality);
             sb.AppendLine();
 
-            sb.AppendLine("[Script Execution Rules]");
-            sb.AppendLine("- Write C# inside {{{ }}} to inspect the codebase or take action.");
-            sb.AppendLine("- Multiple script blocks in the same reply share state — locals persist between blocks.");
-            sb.AppendLine("- ALWAYS discover before acting: use GetTypeSchema / ExploreClassCode / GetMethodDocumentation before calling unfamiliar APIs.");
-            sb.AppendLine("- Prefer one narrow lookup over broad searching. Find the target type/service first, then inspect it.");
-            sb.AppendLine("- Scripts are disposable scratchpads: keep them compact, skip boilerplate, and do not add comments unless a line would otherwise be ambiguous.");
-            sb.AppendLine("- Do not narrate obvious steps in comments. Prefer concise, directly executable code.");
-            sb.AppendLine("- Await methods that return Task or Task<T>. Sync methods should not be awaited.");
-            sb.AppendLine("- If a script fails, read the error and change your approach — never retry the same failing code.");
-            sb.AppendLine("- When you have completed the task, give a final text-only answer with no script blocks.");
-            sb.AppendLine("- On your FIRST reply to a new task: write 1-3 sentences describing your plan before any script.");
-            sb.AppendLine("- Code fences (```csharp or ```) are also recognised as script blocks — use {{{ }}} by default.");
+            sb.AppendLine("[Rules]");
+            sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
+            sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
+            sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, CallObjectMethod, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
+            sb.AppendLine("- GetService(name) returns object. To call a method on it: CallObjectMethod(svc, \"Method\", args) — it auto-awaits Tasks for you.");
+            sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
+            sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
+            sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy.");
             sb.AppendLine();
-            sb.AppendLine("[Background Tasks]");
-            sb.AppendLine("- SpawnBackgroundTask() runs in a SEPARATE isolated scope — it cannot read or set variables in your current session.");
-            sb.AppendLine("- Background tasks communicate results ONLY via SaveMemory() / Log(). They cannot return values to your session directly.");
-            sb.AppendLine("- Do NOT assume a variable set inside SpawnBackgroundTask() is accessible in your outer script — it will not be.");
+
+            sb.AppendLine("[Common Patterns]");
+            sb.AppendLine("// Call any service method (sync or async) — works for object returned by GetService:");
+            sb.AppendLine("var svc = GetService(\"KliveBotDiscord\"); var r = await CallObjectMethod(svc, \"SendMessageToKlives\", \"hello\");");
+            sb.AppendLine("// Inspect a service's API before guessing:");
+            sb.AppendLine("var schema = GetTypeSchema(\"KliveBotDiscord\"); foreach (var m in schema.Methods) Log(m.Name);");
+            sb.AppendLine("// Read a property/field on a live object:");
+            sb.AppendLine("var mem = GetObjectMember(GetService(\"KliveAgent\"), \"Memory\");");
+            sb.AppendLine("// Get all KliveAgent memories:");
+            sb.AppendLine("var all = await CallObjectMethod(GetObjectMember(GetService(\"KliveAgent\"), \"Memory\"), \"GetAllMemoriesAsync\"); Log(((System.Collections.ICollection)all).Count.ToString());");
             sb.AppendLine();
-            sb.AppendLine("[CRITICAL - No Pretending]");
-            sb.AppendLine("- If the task requires taking ANY action (sending a message, creating data, calling a service, modifying state), you MUST run a script that actually performs it.");
-            sb.AppendLine("- NEVER describe an action as done, complete, or successful unless a script in THIS session already executed it and returned OK.");
-            sb.AppendLine("- A text-only final answer is valid ONLY for: (1) purely conversational/informational replies that require zero system calls, OR (2) confirming completion after your scripts already ran.");
-            sb.AppendLine("- Saying 'All set!' or 'Done!' without a preceding script is a hallucination. Do not do it.");
+
+            sb.AppendLine("[Memory Discipline]");
+            sb.AppendLine("Memory is your long-term knowledge of reality across conversations. Treat it like human memory.");
+            sb.AppendLine("DO save (call SaveMemory): durable facts about Klive, about yourself, about how Omnipotent actually works,");
+            sb.AppendLine("non-obvious recipes for using a service, things Klive explicitly tells you to remember.");
+            sb.AppendLine("DO NOT save: a record that you just answered a question, summaries of what you did this turn,");
+            sb.AppendLine("greetings, jokes, transient state, or anything already obvious from the conversation.");
+            sb.AppendLine("If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief,");
+            sb.AppendLine("a duplicate), call DeleteMemory(id) to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
             sb.AppendLine();
 
             sb.Append(BuildToolGuide(userMessage));
@@ -159,11 +163,6 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine();
                 sb.Append(repoMap);
             }
-            else
-            {
-                sb.AppendLine();
-                sb.AppendLine("[Repo Map] Not pre-loaded (no specific type/service names found in this task). Call GetRepoMap() or FindDefinition() inside a script if you need codebase context.");
-            }
 
             if (!string.IsNullOrWhiteSpace(memoriesSection))
             {
@@ -171,9 +170,11 @@ namespace Omnipotent.Services.KliveAgent
                 sb.Append(memoriesSection);
             }
 
-            return KliveAgentContextBudget.TruncateToTokens(
-                sb.ToString(),
-                KliveAgentContextBudget.TotalSystemPromptBudget);
+            // No hard truncation here: the system prompt is composed of bounded, deliberate
+            // sections (slim personality + short rule block + tool names + budgeted repo map
+            // + budgeted memories). A blanket truncate would silently cut tools or memories,
+            // which is a capability loss. If a section is too big, lower its own budget.
+            return sb.ToString();
         }
         public static List<ResponseSegment> ParseLLMResponse(string response)
         {
@@ -213,7 +214,12 @@ namespace Omnipotent.Services.KliveAgent
 
             return segments;
         }
-        private const int MaxAgentIterations = 25;
+        // No hard iteration cap. The loop self-terminates when the LLM produces a no-script
+        // reply (final answer) or when the stuck-detector trips on truly looping behaviour
+        // (same error 3x or same script body run twice). This lets KliveAgent run arbitrarily
+        // long, complex tasks without an artificial ceiling on its cognition.
+        private const int StuckErrorThreshold = 3;
+        private const int StuckScriptRepeatThreshold = 2;
 
         public async Task<AgentChatResponse> ProcessMessageAsync(
             string userMessage,
@@ -251,9 +257,16 @@ namespace Omnipotent.Services.KliveAgent
                 // Subsequent iterations only send observations — the session retains the system message.
                 var currentPrompt = BuildUserPrompt(conversation, userMessage, senderName);
                 string? firstIterationSystemPrompt = systemPrompt;
+                var errorFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
+                var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
+                bool stuckForceFinal = false;
 
-                // â”€â”€ Agentic Loop: Think â†’ Script â†’ Observe â†’ repeat â”€â”€
-                for (int iteration = 0; iteration < MaxAgentIterations; iteration++)
+                // ── Agentic Loop: Think → Script → Observe → repeat ──
+                // No iteration cap. The loop ends when the LLM produces a final text-only
+                // answer, or when the stuck-detector trips (same error 3x, or same script
+                // body re-run). This lets the agent take as many steps as a complex task
+                // genuinely requires without an artificial ceiling on its cognition.
+                for (int iteration = 0; ; iteration++)
                 {
                     iterationsDone = iteration + 1;
 
@@ -312,15 +325,12 @@ namespace Omnipotent.Services.KliveAgent
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
 
-                        // Auto-save a codebase-pattern memory when non-trivial scripts succeeded
-                        if (allScriptsExecuted.Count > 0 && allScriptsExecuted.Any(s => s.Success))
-                        {
-                            _ = memory.SaveMemoryAsync(
-                                $"Completed: \"{TruncateForMemory(userMessage, 120)}\" -- {TruncateForMemory(finalText, 200)}",
-                                tags: new[] { "auto", "completed-task" },
-                                source: "agent",
-                                importance: 2);
-                        }
+                        // NOTE: We deliberately do NOT auto-save "task completed" summaries here.
+                        // Memory is for durable facts about reality (who Klives is, how a service
+                        // actually behaves, things the user has told the agent about itself or its
+                        // world) — NOT a per-turn changelog. Saving every completed task created
+                        // prompt bloat with information the conversation history already carries.
+                        // The agent decides what's worth remembering by calling SaveMemory() itself.
 
                         return new AgentChatResponse
                         {
@@ -334,9 +344,12 @@ namespace Omnipotent.Services.KliveAgent
                         };
                     }
 
-                    // Execute scripts â†’ collect structured observations
+                    // Execute scripts → collect structured observations
                     var observationSb = new StringBuilder();
                     observationSb.AppendLine("[Script Observations]");
+
+                    int scriptCountThisIter = 0;
+                    int errorCountThisIter = 0;
 
                     foreach (var segment in segments)
                     {
@@ -345,6 +358,18 @@ namespace Omnipotent.Services.KliveAgent
                             if (!string.IsNullOrWhiteSpace(segment.Content))
                                 observationSb.AppendLine($"[Agent thought] {segment.Content.Trim()}");
                             continue;
+                        }
+
+                        scriptCountThisIter++;
+
+                        // Track repeated script bodies (a key stuck-loop signal).
+                        var scriptKey = NormaliseForFingerprint(segment.Content ?? string.Empty);
+                        if (!string.IsNullOrEmpty(scriptKey))
+                        {
+                            scriptFrequency.TryGetValue(scriptKey, out var prev);
+                            scriptFrequency[scriptKey] = prev + 1;
+                            if (scriptFrequency[scriptKey] >= StuckScriptRepeatThreshold)
+                                stuckForceFinal = true;
                         }
 
                         var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
@@ -362,34 +387,58 @@ namespace Omnipotent.Services.KliveAgent
                         }
                         else
                         {
+                            errorCountThisIter++;
+                            var errMsg = result.ErrorMessage ?? "Unknown error.";
+                            var errKey = NormaliseForFingerprint(errMsg);
+                            if (!string.IsNullOrEmpty(errKey))
+                            {
+                                errorFrequency.TryGetValue(errKey, out var prev);
+                                errorFrequency[errKey] = prev + 1;
+                                if (errorFrequency[errKey] >= StuckErrorThreshold)
+                                    stuckForceFinal = true;
+                            }
+
                             observationSb.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
-                            observationSb.AppendLine(result.ErrorMessage ?? "Unknown error.");
+                            observationSb.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, 300));
                         }
 
                         observationSb.AppendLine();
                     }
 
-                    // Feed observations back as the next prompt turn
-                    currentPrompt = observationSb.ToString().TrimEnd()
-                        + "\n\nEarlier script state is preserved. If you have what you need, give the final answer now (no scripts). "
-                        + "Otherwise write your next script(s).";
+                    // Soft nudge once the task has gone deep — informational, not a stop.
+                    if (iteration + 1 == 12 && !stuckForceFinal)
+                    {
+                        observationSb.AppendLine();
+                        observationSb.AppendLine("[Nudge] You've taken 12 steps on this. If you're making real progress, keep going. " +
+                            "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.");
+                    }
+
+                    // Feed observations back as the next prompt turn. System prompt + prior turns
+                    // already live in the LLM session — do not re-inject them.
+                    if (stuckForceFinal)
+                    {
+                        currentPrompt = observationSb.ToString().TrimEnd()
+                            + "\n\n[Stuck-loop detected] You repeated a script or hit the same error 3+ times. "
+                            + "STOP scripting. Reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you.";
+                    }
+                    else
+                    {
+                        currentPrompt = observationSb.ToString().TrimEnd()
+                            + "\n\nIf you have what you need, give the final answer now (no scripts). "
+                            + "Otherwise write your next script — prefer ONE composite block over several tiny ones.";
+                    }
                 }
 
-                // Hit iteration cap
+                // Loop is unbounded; this point is unreachable in practice (the loop only
+                // exits via the no-script final-answer return above). Kept here so the
+                // catch-all exception path below stays valid C#.
                 llm.ResetSession(llmSessionId);
-                conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
-                conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = "[Reached maximum reasoning steps]" });
-                conversation.LastUpdated = DateTime.UtcNow;
-
-                agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
-                    allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
-
                 return new AgentChatResponse
                 {
                     ConversationId = conversation.ConversationId,
-                    Response = "I hit my maximum number of reasoning steps. Here is what I managed to complete so far.",
+                    Response = "[Internal] Agent loop exited unexpectedly.",
                     ScriptsExecuted = allScriptsExecuted,
-                    Success = true,
+                    Success = false,
                     PromptTokens = totalPromptTokens,
                     CompletionTokens = totalCompletionTokens,
                     Iterations = iterationsDone
@@ -500,54 +549,28 @@ namespace Omnipotent.Services.KliveAgent
         {
             var sb = new StringBuilder();
 
-            sb.AppendLine("[Runtime Workflow]");
-            sb.AppendLine("1. Tools are the public methods on ScriptGlobals.");
-            sb.AppendLine("2. Narrow the task to one target type, service, or method before doing anything else.");
-            sb.AppendLine("3. Inspect exact signatures before calling unfamiliar APIs.");
-            sb.AppendLine("4. Act with the smallest script that can prove progress, then stop when you have the answer.");
-            sb.AppendLine();
+            sb.AppendLine("[Tools] (public methods on ScriptGlobals — call by name)");
 
-            AppendToolSection(sb, "Starter Tools", StarterTools);
+            AppendToolNames(sb, "Core", StarterTools);
 
             if (ShouldIncludeDiscoveryTools(userMessage))
-            {
-                sb.AppendLine();
-                AppendToolSection(sb, "Codebase Tools", DiscoveryTools);
-            }
+                AppendToolNames(sb, "Codebase", DiscoveryTools);
 
             if (ShouldIncludeAdvancedRuntimeTools(userMessage))
-            {
-                sb.AppendLine();
-                AppendToolSection(sb, "Advanced Runtime Tools", AdvancedRuntimeTools);
-            }
+                AppendToolNames(sb, "Runtime", AdvancedRuntimeTools);
 
             if (ShouldIncludeMemoryTools(userMessage))
-            {
-                sb.AppendLine();
-                AppendToolSection(sb, "Memory Tools", MemoryTools);
-            }
+                AppendToolNames(sb, "Memory", MemoryTools);
 
-            sb.AppendLine();
-            sb.AppendLine("[Tool Self-Discovery]");
-            sb.AppendLine("If a needed tool is not listed above, inspect ScriptGlobals itself before using it:");
-            sb.AppendLine("  GetTypeSchema(\"ScriptGlobals\")");
-            sb.AppendLine("  GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\")");
-            sb.AppendLine("  ExploreClassCode(\"ScriptGlobals\")");
+            sb.AppendLine("If a tool you need isn't listed, run: GetTypeSchema(\"ScriptGlobals\") to see every tool, or GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\") for one signature.");
 
             return sb.ToString().TrimEnd();
         }
 
-        private static void AppendToolSection(StringBuilder sb, string title, IEnumerable<PromptToolDescriptor> tools)
+        private static void AppendToolNames(StringBuilder sb, string title, IEnumerable<PromptToolDescriptor> tools)
         {
-            sb.AppendLine($"[{title}]");
-            foreach (var tool in tools)
-            {
-                var signature = FormatToolSignature(tool.MethodName);
-                if (string.IsNullOrWhiteSpace(signature))
-                    continue;
-
-                sb.AppendLine($"  {signature} -- {tool.Description}");
-            }
+            sb.Append(title).Append(": ");
+            sb.AppendLine(string.Join("; ", tools.Select(t => $"{t.MethodName} — {t.Description}")));
         }
 
         private static string? FormatToolSignature(string methodName)
@@ -660,6 +683,33 @@ namespace Omnipotent.Services.KliveAgent
             if (string.IsNullOrEmpty(s)) return "";
             s = s.Replace('\n', ' ').Replace('\r', ' ');
             return s.Length <= max ? s : s[..max] + "…";
+        }
+
+        /// <summary>
+        /// Reduces a script body or error string to a stable fingerprint for stuck-loop
+        /// detection: trims, collapses whitespace, strips most punctuation, lowercases,
+        /// and truncates. Two scripts that differ only in formatting will hash to the
+        /// same key, two genuinely different scripts will not.
+        /// </summary>
+        private static string NormaliseForFingerprint(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+            var sb = new StringBuilder(s.Length);
+            bool lastSpace = false;
+            foreach (var ch in s)
+            {
+                if (char.IsWhiteSpace(ch))
+                {
+                    if (!lastSpace) { sb.Append(' '); lastSpace = true; }
+                }
+                else
+                {
+                    sb.Append(char.ToLowerInvariant(ch));
+                    lastSpace = false;
+                }
+            }
+            var trimmed = sb.ToString().Trim();
+            return trimmed.Length <= 240 ? trimmed : trimmed[..240];
         }
     }
 

@@ -10,20 +10,30 @@ namespace Omnipotent.Services.KliveAgent
     public class KliveAgentContextBudget
     {
         // ── Budget constants ──
+        //
+        // These are *compression* budgets, not capability caps. They only apply to content
+        // that is regenerable on demand (the agent can call GetRepoMap, RecallMemories,
+        // or re-run a script with different parameters to fetch more). They do NOT cap how
+        // many iterations the agent may take or how complex a task may be.
 
-        /// <summary>Max tokens reserved for the repo map in every system prompt.</summary>
-        public const int RepoMapBudget = 2000;
+        /// <summary>Soft cap on the repo-map slice injected into the system prompt.
+        /// Agent can always call GetRepoMap(maxTokens: ...) inside a script for more.</summary>
+        public const int RepoMapBudget = 800;
 
-        /// <summary>Max tokens reserved for memory entries in every system prompt.</summary>
-        public const int MemoryBudget = 1000;
+        /// <summary>Soft cap on memories surfaced into the system prompt up-front.
+        /// Agent can always call RecallMemories(query) for deeper retrieval.</summary>
+        public const int MemoryBudget = 600;
 
-        /// <summary>Max tokens reserved for conversation history selection.</summary>
-        public const int HistoryBudget = 3000;
+        /// <summary>Soft cap on conversation history selected into the per-turn prompt.
+        /// Higher = more conversational persistence at the cost of input tokens.</summary>
+        public const int HistoryBudget = 4000;
 
-        /// <summary>Max tokens to surface from a single script execution output before truncating.</summary>
-        public const int ScriptOutputBudget = 2000;
+        /// <summary>Per-script output truncation. Output is regenerable: if a single script
+        /// dumps more than this, the agent should narrow its query, not be given the full blob.</summary>
+        public const int ScriptOutputBudget = 800;
 
-        /// <summary>Hard cap on the total system prompt (personality + repo map + memories + tools).</summary>
+        /// <summary>Legacy constant. No longer applied as a hard truncation — kept for API
+        /// stability in case external callers reference it.</summary>
         public const int TotalSystemPromptBudget = 8000;
 
         /// <summary>Chars-per-token ratio used for estimation.</summary>

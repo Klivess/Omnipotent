@@ -582,6 +582,16 @@ namespace Omnipotent.Services.KliveAgent
             return await agentService.Memory.RecallMemoriesAsync(query, maxResults);
         }
 
+        /// <summary>Forget a memory by its id (or short-id prefix as shown in prompts, e.g. "a3f1b2c4").
+        /// Returns true if a memory was removed. Use this to curate memory: prune outdated beliefs,
+        /// duplicates, and noise so future prompts stay clean.</summary>
+        public async Task<bool> DeleteMemory(string idOrShortId)
+        {
+            var resolved = await agentService.Memory.ResolveIdAsync(idOrShortId);
+            if (resolved == null) return false;
+            return await agentService.Memory.DeleteMemoryAsync(resolved);
+        }
+
         // ── Background Tasks ──
 
         /// <summary>Spawn a long-running background task with its own script.</summary>

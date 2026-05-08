@@ -403,3 +403,5 @@ FodyWeavers.xsd
 /Omnipotent/Services/KliveCloud/KliveCloud_API_Documentation.md
 /Omnipotent/Services/OmniTrader/Strategies/FlowSignalTraderStrategy/main.py
 /.github/copilot-instructions.md
+agent_test_results_utf8.txt
+agent_test_results.txt
