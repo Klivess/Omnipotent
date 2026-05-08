@@ -547,10 +547,11 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Memory ──
 
-        /// <summary>Save a persistent memory entry so you can recall it in future conversations.</summary>
-        public async Task SaveMemory(string content, string[]? tags = null, int importance = 1)
+        /// <summary>Save a persistent memory entry so you can recall it in future conversations. Returns the memory id.</summary>
+        public async Task<string> SaveMemory(string content, string[]? tags = null, int importance = 1)
         {
-            await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", importance, "general");
+            var entry = await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", importance, "general");
+            return entry?.Id ?? string.Empty;
         }
 
         /// <summary>
@@ -559,10 +560,12 @@ namespace Omnipotent.Services.KliveAgent
         /// to a guild by name). Shortcuts are shown at the top of every prompt so you can skip re-discovery.
         /// title: short label, e.g. "Send Discord message to guild by name"
         /// content: the exact script steps to follow next time (concise, step-by-step).
+        /// Returns the memory id of the saved shortcut.
         /// </summary>
-        public async Task SaveShortcut(string title, string content, string[]? tags = null)
+        public async Task<string> SaveShortcut(string title, string content, string[]? tags = null)
         {
-            await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", 5, "shortcut", title);
+            var entry = await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", 5, "shortcut", title);
+            return entry?.Id ?? string.Empty;
         }
 
         /// <summary>List all saved shortcuts.</summary>

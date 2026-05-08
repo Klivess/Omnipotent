@@ -75,10 +75,10 @@ namespace Omnipotent.Services.KliveAgent
 
         private static readonly PromptToolDescriptor[] MemoryTools =
         [
-            new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags must be a string array, e.g. new[] { \"klive\", \"identity\" }."),
+            new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags must be a string array, e.g. new[] { \"klive\", \"identity\" }. Returns the saved memory id (string) — log it if the user asked you to confirm."),
             new("RecallMemories", "Search saved memories for prior facts."),
             new("DeleteMemory", "Forget a memory by its id (or short-id prefix shown in prompts). Use this to curate noise/duplicates/outdated beliefs."),
-            new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task."),
+            new("SaveShortcut", "Store a reusable recipe immediately after solving a non-obvious task. Returns the saved memory id (string)."),
             new("GetShortcuts", "Review saved shortcuts before rediscovering a workflow.")
         ];
 
@@ -134,7 +134,9 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- GetService(name) returns object. To call a method on it: CallObjectMethod(svc, \"Method\", args) — it auto-awaits Tasks for you.");
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
-            sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy.");
+            sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
+            sb.AppendLine("- To find a function/symbol in the codebase, ALWAYS use SearchCode(\"Name\", \"Omnipotent/Services/...\") or SearchCodeHybrid first. Never read whole files looking for a symbol — page-read after you have a line number.");
+            sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
             sb.AppendLine("[Common Patterns]");
@@ -150,6 +152,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("foreach (var s in ListServices()) Log($\"{s.TypeName}/{s.Name} up={s.Uptime}\");");
             sb.AppendLine("// Recent errors from OmniLogging — overallMessages is the source of truth, type==Error means error:");
             sb.AppendLine("var recent = GetRecentErrors(10); foreach (var line in recent) Log(line);");
+            sb.AppendLine("// Save TWO (or more) memories in ONE block and capture the returned ids:");
+            sb.AppendLine("var idA = await SaveMemory(\"fact A\", new[]{\"tag\"}); var idB = await SaveMemory(\"fact B\", new[]{\"tag\"}); Log($\"a={idA} b={idB}\");");
+            sb.AppendLine("// Find a symbol in code (do this BEFORE reading a whole file):");
+            sb.AppendLine("Log(SearchCode(\"Bm25Score\", \"Omnipotent/Services/KliveAgent\")); // returns file:line matches; then ReadFile(path, startLine: <line>-3, maxLines: 30) to inspect.");
             sb.AppendLine();
 
             sb.AppendLine("[Memory Discipline]");
@@ -341,9 +347,9 @@ namespace Omnipotent.Services.KliveAgent
                         if (!finalFormatRetryUsed && !stuckForceFinal && LooksLikeUnexecutedScript(finalText))
                         {
                             finalFormatRetryUsed = true;
-                            currentPrompt = "[Format error] Your last reply contained C# code as plain text but no executable {{{ ... }}} or ```csharp fenced block, so nothing ran. "
-                                + "You must EITHER (a) re-emit the code wrapped in {{{ ... }}} so it actually runs, OR (b) write the real final text-only answer with NO code, NO fences, NO tool names. "
-                                + "Pick one. Do not stall.";
+                            currentPrompt = "[Format error] Your last reply was not a real final answer. Either it (a) contained C# code as plain text instead of an executable {{{ ... }}} block, (b) was a stub like 'Let me get X' or 'I'll now Y' that promises to act but contains no answer, or (c) was an XML/JSON tool envelope. "
+                                + "Pick ONE: actually run the script wrapped in {{{ ... }}} so it executes, OR write the real text-only final answer with NO code, NO fences, NO tool names, NO 'Let me X'. "
+                                + "Do not stall. Do not promise. Either act or answer.";
                             continue;
                         }
 
@@ -759,6 +765,15 @@ namespace Omnipotent.Services.KliveAgent
 
             // XML/JSON tool-call envelope (Claude/OpenAI style) — always wrong here.
             if (Regex.IsMatch(text, @"<\s*(function|tool_use|tool_call|parameters|invoke)\b", RegexOptions.IgnoreCase))
+                return true;
+
+            // Stub final: a short reply that promises to do something next ("Let me get/find/check X")
+            // instead of containing the actual answer. The LLM mistook a script preamble for a final reply.
+            var trimmed = text.Trim();
+            if (trimmed.Length <= 400
+                && Regex.IsMatch(trimmed,
+                    @"\b(let me (get|find|check|call|fetch|look|see|grab|pull|inspect|query|search)|i'?ll (now|first|just|go) (get|find|check|call|fetch|look|see|grab|pull|inspect|query|search|run|try)|going to (get|find|check|call|fetch|look|see|grab|pull|inspect|query|search|run|try))\b",
+                    RegexOptions.IgnoreCase))
                 return true;
 
             // Unbalanced triple-backtick → there's a fence opener or closer dangling.

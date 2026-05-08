@@ -10,7 +10,7 @@ namespace Omnipotent.Tests.KliveAgent
             var guide = KliveAgentBrain.BuildToolGuide("remember this service workflow");
 
             Assert.Contains("GetMethodDocumentation(string typeName, string methodName) -> string", guide);
-            Assert.Contains("SaveMemory(string content, string[] tags = null, int importance = 1) -> Task", guide);
+            Assert.Contains("SaveMemory(string content, string[] tags = null, int importance = 1) -> Task<string>", guide);
             Assert.DoesNotContain("SaveMemory(content, tags?, importance?)", guide);
         }
 
