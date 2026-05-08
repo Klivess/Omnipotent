@@ -239,7 +239,27 @@ namespace Omnipotent.Services.KliveAgent
             {
                 var text = response.Substring(lastIndex).Trim();
                 if (!string.IsNullOrEmpty(text))
-                    segments.Add(new ResponseSegment { IsScript = false, Content = text });
+                {
+                    // Tolerant fallback: the LLM sometimes drops one closing brace and emits
+                    // "{{{ ...code... }}" instead of "{{{ ...code... }}}". Recover the script.
+                    var openIdx = text.IndexOf("{{{", StringComparison.Ordinal);
+                    if (openIdx >= 0 && !text.AsSpan(openIdx).Contains("}}}".AsSpan(), StringComparison.Ordinal))
+                    {
+                        var prefix = text.Substring(0, openIdx).Trim();
+                        if (!string.IsNullOrEmpty(prefix))
+                            segments.Add(new ResponseSegment { IsScript = false, Content = prefix });
+                        var inner = text.Substring(openIdx + 3).TrimEnd();
+                        // Strip up to two trailing close-braces if present (handles "}}" / "}" tails).
+                        if (inner.EndsWith("}}")) inner = inner.Substring(0, inner.Length - 2).TrimEnd();
+                        else if (inner.EndsWith("}")) inner = inner.Substring(0, inner.Length - 1).TrimEnd();
+                        if (!string.IsNullOrEmpty(inner))
+                            segments.Add(new ResponseSegment { IsScript = true, Content = inner });
+                    }
+                    else
+                    {
+                        segments.Add(new ResponseSegment { IsScript = false, Content = text });
+                    }
+                }
             }
 
             return segments;
@@ -780,6 +800,11 @@ namespace Omnipotent.Services.KliveAgent
         private static bool LooksLikeUnexecutedScript(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return false;
+
+            // Stray opening triple-brace anywhere in a final reply means the LLM tried to emit
+            // a script but mismatched the closer (e.g. "{{{ ... }}" instead of "{{{ ... }}}").
+            if (text.Contains("{{{", StringComparison.Ordinal))
+                return true;
 
             // XML/JSON tool-call envelope (Claude/OpenAI style) — always wrong here.
             if (Regex.IsMatch(text, @"<\s*(function|tool_use|tool_call|parameters|invoke)\b", RegexOptions.IgnoreCase))
