@@ -137,10 +137,13 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
+            sb.AppendLine("- NEVER invent identifiers. Method names, line numbers, file contents, and field values you put in your final answer MUST come verbatim from a tool output you actually received this turn. If the tool returned nothing useful, say 'I couldn't find that' — do NOT confabulate plausible-sounding C# names.");
+            sb.AppendLine("- To list private static METHODS in a file (not fields), use SearchCodeRegex with a method-signature pattern: `SearchCodeRegex(@\"^\\s*private\\s+static\\s+(?!readonly)[\\w<>?,\\s\\[\\]]+\\s+\\w+\\s*\\(\", \"path/to/File.cs\")`. The `(?!readonly)` excludes field declarations.");
             sb.AppendLine("- When the user names a specific file (e.g. 'Read X.cs and ...'), call ReadFile(path) directly. Use SearchCode/SearchCodeHybrid only when the file or location is unknown.");
             sb.AppendLine("- SearchCode(text, subfolder) accepts a single .cs file path as the second arg, not just a directory — pass the full file path when you want to search inside ONE file.");
             sb.AppendLine("- If the SAME tool errors twice with the SAME message, STOP retrying it. Switch tools (e.g. SearchCode → ReadFile, or RecallMemories → RecallMemoriesByTag) or accept the answer and finalize.");
             sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStats() — do NOT search the codebase or claim 'no metric exists'.");
+            sb.AppendLine("- For 'in the last N minutes' filters on errors, call GetRecentErrors(50) once and filter the formatted timestamps yourself. Do NOT call it repeatedly with shrinking limits.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
@@ -163,6 +166,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("Log(SearchCode(\"Bm25Score\", \"Omnipotent/Services/KliveAgent\")); // returns file:line matches");
             sb.AppendLine("// Search inside ONE known file (subfolder = file path):");
             sb.AppendLine("Log(SearchCode(\"BM25\", \"Omnipotent/Services/KliveAgent/KliveAgentMemory.cs\"));");
+            sb.AppendLine("// List private static METHODS in a file (NOT fields — the negative lookahead skips `private static readonly`):");
+            sb.AppendLine("Log(SearchCodeRegex(@\"^\\s*private\\s+static\\s+(?!readonly)[\\w<>?,\\s\\[\\]]+\\s+\\w+\\s*\\(\", \"Omnipotent/Services/KliveAgent/KliveAgentBrain.cs\"));");
             sb.AppendLine("// Read a known file directly (user named it):");
             sb.AppendLine("Log(ReadFile(\"Omnipotent/Services/KliveAgent/KliveAgentBrain.cs\", startLine: 1, maxLines: 250));");
             sb.AppendLine("// Filter memories by exact tag (instead of full-text search):");
