@@ -128,6 +128,7 @@ namespace Omnipotent.Services.KliveAgent
 
             sb.AppendLine("[Rules]");
             sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
+            sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, CallObjectMethod, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
             sb.AppendLine("- GetService(name) returns object. To call a method on it: CallObjectMethod(svc, \"Method\", args) — it auto-awaits Tasks for you.");
@@ -266,6 +267,8 @@ namespace Omnipotent.Services.KliveAgent
                 var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 bool stuckForceFinal = false;
                 bool finalFormatRetryUsed = false;
+                int consecutiveFailedScripts = 0;
+                int consecutiveNoOpResponses = 0;
 
                 // ── Agentic Loop: Think → Script → Observe → repeat ──
                 // No iteration cap. The loop ends when the LLM produces a final text-only
@@ -314,6 +317,16 @@ namespace Omnipotent.Services.KliveAgent
 
                     var segments = ParseLLMResponse(llmResponse.Response ?? "");
                     var hasScripts = segments.Any(s => s.IsScript);
+
+                    // Detect Anthropic/OpenAI-style tool-call XML or JSON in the raw output — the
+                    // model thinks it's calling a tool but the parser will never see it. After 2
+                    // such turns in a row, stop the loop.
+                    bool looksLikeXmlToolCall = !hasScripts
+                        && Regex.IsMatch(llmResponse.Response ?? string.Empty,
+                            @"<\s*(function|tool_use|tool_call|parameters|invoke)\b", RegexOptions.IgnoreCase);
+                    if (looksLikeXmlToolCall) consecutiveNoOpResponses++;
+                    else consecutiveNoOpResponses = 0;
+                    if (consecutiveNoOpResponses >= 2) stuckForceFinal = true;
 
                     // No scripts â†’ this is the final answer
                     if (!hasScripts)
@@ -418,7 +431,11 @@ namespace Omnipotent.Services.KliveAgent
 
                             observationSb.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
                             observationSb.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, 300));
+                            consecutiveFailedScripts++;
+                            if (consecutiveFailedScripts >= 5) stuckForceFinal = true;
                         }
+
+                        if (result.Success) consecutiveFailedScripts = 0;
 
                         observationSb.AppendLine();
                     }
@@ -739,6 +756,10 @@ namespace Omnipotent.Services.KliveAgent
         private static bool LooksLikeUnexecutedScript(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return false;
+
+            // XML/JSON tool-call envelope (Claude/OpenAI style) — always wrong here.
+            if (Regex.IsMatch(text, @"<\s*(function|tool_use|tool_call|parameters|invoke)\b", RegexOptions.IgnoreCase))
+                return true;
 
             // Unbalanced triple-backtick → there's a fence opener or closer dangling.
             int fenceCount = 0;
