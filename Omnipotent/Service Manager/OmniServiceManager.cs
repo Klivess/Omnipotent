@@ -62,9 +62,20 @@ namespace Omnipotent.Service_Manager
             //Create prerequisite items
             var manager = new OmniStartupManager();
             CreateAndStartNewMonitoredOmniService(manager);
-            //Tight loop
-            //---TODO--: replace this
-            while (manager.IsServiceActive()) { Task.Delay(100); }
+            // Wait for the startup manager to finish its prerequisite work.
+            // Bound the wait so a stuck startup manager can't freeze the whole app on boot.
+            var startupWait = Stopwatch.StartNew();
+            var startupTimeout = TimeSpan.FromSeconds(30);
+            while (manager.IsServiceActive() && startupWait.Elapsed < startupTimeout)
+            {
+                Task.Delay(100).Wait();
+            }
+            if (manager.IsServiceActive())
+            {
+                logger.LogError("Omni Service Manager",
+                    "OmniStartupManager did not terminate within 30s; continuing boot anyway to avoid frozen startup.",
+                    true);
+            }
             //Initialising time manager
             timeManager = new();
             timeManager.ReplaceDataManager(this);

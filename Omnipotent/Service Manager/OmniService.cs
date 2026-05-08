@@ -298,9 +298,13 @@ namespace Omnipotent.Service_Manager
                     }
                 });
                 serviceThread.Name = "OmniServiceThread_" + name;
-                serviceThread.Start();
+                // Set ServiceActive = true BEFORE starting the thread.
+                // Otherwise a fast-completing ServiceMain (e.g. OmniStartupManager) can call
+                // TerminateService() (which sets ServiceActive = false) before this line runs,
+                // and we'd then overwrite it back to true permanently, hanging startup.
                 ServiceActive = true;
                 serviceThread.Priority = (ThreadPriority)(threadAnteriority + 1);
+                serviceThread.Start();
                 ServiceLog("Started service.");
             }
         }
