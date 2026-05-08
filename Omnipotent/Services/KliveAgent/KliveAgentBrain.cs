@@ -499,6 +499,15 @@ namespace Omnipotent.Services.KliveAgent
                             "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.");
                     }
 
+                    // Hard safety cap: prevent runaway loops that never produce a final answer.
+                    // After 30 iterations, force the final-answer path. Real questions that
+                    // need >30 scripted steps should be split by the user; the agent should
+                    // not hang an API request indefinitely (exposed as a Tier-5 hang bug).
+                    if (iteration + 1 >= 30 && !stuckForceFinal)
+                    {
+                        stuckForceFinal = true;
+                    }
+
                     // Feed observations back as the next prompt turn. System prompt + prior turns
                     // already live in the LLM session — do not re-inject them.
                     if (stuckForceFinal)

@@ -85,7 +85,7 @@ namespace Omnipotent.Services.KliveLLM
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             await EnsureProviderSettingsExistAsync();
-            client = new HttpClient();
+            client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 
             await EnsureLlamaBinariesAvailableAsync();
             NativeLibraryConfig.All.WithLibrary(LLamaDLLFile, LLamaMTMDFile);
