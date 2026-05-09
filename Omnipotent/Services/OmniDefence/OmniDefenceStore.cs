@@ -21,12 +21,16 @@ namespace Omnipotent.Services.OmniDefence
         public OmniDefenceStore(string dbPath)
         {
             this.dbPath = dbPath;
+            // Single shared connection serialised via writeLock; SqliteCacheMode.Shared
+            // would needlessly add SQLite's process-global shared-cache mutex on top of
+            // that, which historically contributed to thread-pool starvation when several
+            // request finalisers wrote here concurrently with Omniscience reads.
             connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = dbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
-                Pooling = true
+                Pooling = true,
+                DefaultTimeout = 30,
             }.ToString();
         }
 

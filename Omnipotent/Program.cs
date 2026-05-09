@@ -43,6 +43,15 @@ namespace Omnipotent
     {
         public static void Main(string[] args)
         {
+            // Pre-warm the thread pool so a burst of API requests that block on synchronous
+            // SQLite I/O (Omniscience routes are the worst offender) cannot starve workers
+            // long enough to wedge KliveAPI's listener continuations. The default minimum is
+            // ProcessorCount, and the runtime only grows the pool by ~1 thread every 500ms,
+            // so on an 8-core box a 6-call burst from the Omniscience dashboard could pin
+            // every worker for the duration of the slowest query while /ping queued behind
+            // them. Raising the floor to 128 eliminates that window without affecting steady
+            // state cost (idle threads are cheap and trim themselves over time).
+            ThreadPool.SetMinThreads(128, 128);
             OmniLogging.LogStatusStatic("Main Thread", $"Omnipotent last updated {File.GetLastWriteTime(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Omnipotent.exe")).Humanize()}");
             OmniServiceManager omniServiceManager = new OmniServiceManager();
             try
