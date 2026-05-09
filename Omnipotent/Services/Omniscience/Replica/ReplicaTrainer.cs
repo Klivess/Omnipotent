@@ -77,14 +77,17 @@ namespace Omnipotent.Services.Omniscience.Replica
             try
             {
                 // Resolve display name & handles up front; needed by every stage.
+                await UpdateStage(jobId, "loading_person", 1, "Loading person + identities", ct);
                 var person = await LoadPersonAsync(personId, ct);
                 if (person == null)
                     throw new InvalidOperationException($"Person {personId} does not exist.");
 
                 // Pull every message authored by this person (across all merged identities).
+                await UpdateStage(jobId, "loading_messages", 2, "Loading messages from corpus", ct);
                 var allMessages = await LoadPersonMessagesAsync(personId, ct);
                 if (allMessages.Count == 0)
                     throw new InvalidOperationException("This person has no captured messages to train on.");
+                await UpdateStage(jobId, "loading_messages", 3, $"Loaded {allMessages.Count:N0} messages", ct);
 
                 var dossier = new ReplicaDossier
                 {
