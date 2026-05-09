@@ -21,12 +21,21 @@ namespace Omnipotent.Services.Omniscience
         {
             Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniscienceDirectory));
             DbPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniscienceDbFile);
+            // NOTE: do NOT set Cache=Shared here.
+            // Microsoft.Data.Sqlite's shared-cache mode funnels every connection in the
+            // process through a single underlying SQLite connection / mutex. Combined
+            // with the connection pool and several concurrent readers (the Omniscience
+            // dashboard fires 6+ parallel queries on page load) plus the IngestPipeline
+            // writer, that mutex serialises everything and routinely deadlocks the
+            // thread pool, which then wedges the rest of KliveAPI. Default (private)
+            // cache + WAL gives us proper concurrent readers + one writer without that
+            // global bottleneck.
             ConnectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
                 Pooling = true,
+                DefaultTimeout = 30, // seconds; gives SQLite room to wait for a busy lock instead of throwing immediately
             }.ToString();
         }
 
@@ -36,7 +45,11 @@ namespace Omnipotent.Services.Omniscience
             conn.Open();
             using (var pragma = conn.CreateCommand())
             {
-                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;";
+                // journal_mode=WAL is persistent on disk and is enforced once during
+                // Migrate(); no need to re-apply per connection. The remaining pragmas
+                // are per-connection. busy_timeout makes any transient lock contention
+                // wait politely instead of bubbling up as SQLITE_BUSY.
+                pragma.CommandText = "PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY; PRAGMA busy_timeout=5000;";
                 pragma.ExecuteNonQuery();
             }
             return conn;
@@ -45,6 +58,16 @@ namespace Omnipotent.Services.Omniscience
         public void Migrate()
         {
             using var conn = Open();
+
+            // journal_mode=WAL is a persistent, file-level setting. It must be applied
+            // outside any transaction (SQLite refuses to change journal mode mid-tx).
+            // Doing it once here means readers no longer pay the cost on every Open().
+            using (var walCmd = conn.CreateCommand())
+            {
+                walCmd.CommandText = "PRAGMA journal_mode=WAL;";
+                walCmd.ExecuteNonQuery();
+            }
+
             using var tx = conn.BeginTransaction();
 
             int currentVersion;
