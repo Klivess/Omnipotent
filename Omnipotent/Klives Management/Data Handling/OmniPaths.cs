@@ -30,6 +30,8 @@ namespace Omnipotent.Data_Handling
             public static string OmniscienceDbFile = $"{OmniscienceDirectory}/omniscience.db";
             public static string OmniscienceAttachmentsDirectory = $"{OmniscienceDirectory}/Attachments";
             public static string OmniscienceAvatarsDirectory = $"{OmniscienceDirectory}/Avatars";
+            public static string OmniscienceReplicasDirectory = $"{OmniscienceDirectory}/Replicas";
+            public static string OmniscienceReplicaModelsDirectory = $"{OmniscienceReplicasDirectory}/_models";
 
             //Klives Management Profiles
             public static string KlivesManagementInfoDirectory = $"{SavedDataDirectory}/KlivesManagement";

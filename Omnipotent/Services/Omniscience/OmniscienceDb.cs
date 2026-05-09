@@ -126,8 +126,110 @@ namespace Omnipotent.Services.Omniscience
                 }
             }
 
+            if (currentVersion < 4)
+            {
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = SchemaV4;
+                    cmd.ExecuteNonQuery();
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.Transaction = tx;
+                    cmd.CommandText = "PRAGMA user_version = 4;";
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
             tx.Commit();
         }
+
+        // ── Migration: v4 (Replica system: per-person LLM-driven chat agent) ──
+        // The Replica feature lets the user chat with an LLM that mimics a specific
+        // person, trained from their message history. We persist:
+        //   - replicas:                   the trained persona dossier + status
+        //   - replica_message_embeddings: vector index over the person's messages
+        //   - replica_chats:              ChatGPT-style multi-conversation per replica
+        //   - replica_chat_messages:      individual user/assistant turns
+        //   - replica_training_jobs:      live training progress for the UI
+        //   - replica_notifications:      server-side toast queue for the website
+        private const string SchemaV4 = @"
+CREATE TABLE IF NOT EXISTS replicas (
+    person_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,                  -- 'none' | 'training' | 'ready' | 'failed' | 'stale'
+    version INTEGER NOT NULL DEFAULT 0,    -- bumped each successful retrain
+    built_at INTEGER,
+    model_used TEXT,
+    messages_embedded INTEGER NOT NULL DEFAULT 0,
+    prompt_token_estimate INTEGER NOT NULL DEFAULT 0,
+    dossier_json TEXT,                     -- structured ReplicaDossier (voice rules, opinions, reflexes, etc.)
+    stylistic_exemplars_json TEXT,         -- top-30 always-on (stimulus, reply) pairs
+    last_error TEXT,
+    last_status_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replicas_status ON replicas(status, last_status_at DESC);
+
+-- Vector index over the person's messages. embedding is a packed float[384] (MiniLM-L6 dim).
+-- Brute-force cosine in C# at query time; fine at expected per-person scale (10k-100k msgs).
+CREATE TABLE IF NOT EXISTS replica_message_embeddings (
+    person_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    embedded_at INTEGER NOT NULL,
+    PRIMARY KEY(person_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_replica_emb_person ON replica_message_embeddings(person_id);
+
+CREATE TABLE IF NOT EXISTS replica_chats (
+    chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id TEXT NOT NULL,
+    title TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    archived INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_replica_chats_person ON replica_chats(person_id, archived, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS replica_chat_messages (
+    message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    role TEXT NOT NULL,                    -- 'user' | 'assistant' | 'system'
+    content TEXT NOT NULL,
+    sent_at INTEGER NOT NULL,
+    prompt_token_count INTEGER,
+    completion_token_count INTEGER,
+    latency_ms INTEGER,
+    used_self_critique INTEGER NOT NULL DEFAULT 0,
+    model_used TEXT,
+    FOREIGN KEY(chat_id) REFERENCES replica_chats(chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_replica_chat_msgs ON replica_chat_messages(chat_id, sent_at);
+
+CREATE TABLE IF NOT EXISTS replica_training_jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    person_id TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    status TEXT NOT NULL,                  -- 'queued' | 'running' | 'ok' | 'failed' | 'cancelled'
+    stage TEXT,                            -- e.g. 'voice', 'opinions', 'reflexes', 'stylometric', 'relational', 'forbidden', 'embedding'
+    progress_pct INTEGER NOT NULL DEFAULT 0,
+    log_json TEXT,                         -- accumulated [{at, stage, msg}] entries
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_replica_jobs_person ON replica_training_jobs(person_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_replica_jobs_status ON replica_training_jobs(status, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS replica_notifications (
+    notif_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,                    -- 'replica_ready' | 'replica_failed'
+    person_id TEXT,
+    payload_json TEXT,
+    created_at INTEGER NOT NULL,
+    dismissed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_replica_notif_undismissed ON replica_notifications(dismissed, created_at DESC);
+";
 
         // ── Migration: v3 (explicit profile target allow-list) ──
         private const string SchemaV3 = @"

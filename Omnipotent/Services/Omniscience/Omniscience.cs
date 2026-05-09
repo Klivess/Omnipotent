@@ -3,6 +3,7 @@ using Omnipotent.Services.Omniscience.Analytics;
 using Omnipotent.Services.Omniscience.Ingest;
 using Omnipotent.Services.Omniscience.Ingest.Discord;
 using Omnipotent.Services.Omniscience.Profiling;
+using Omnipotent.Services.Omniscience.Replica;
 using Omnipotent.Services.Omniscience.Scheduling;
 using System;
 using System.IO;
@@ -26,6 +27,8 @@ namespace Omnipotent.Services.Omniscience
         public AnalyticsEngine Analytics { get; private set; } = null!;
         public PersonalityProfiler Profiler { get; private set; } = null!;
         public OmniscienceScheduler Scheduler { get; private set; } = null!;
+        public ReplicaTrainer ReplicaTrainer { get; private set; } = null!;
+        public ReplicaChatOrchestrator ReplicaChat { get; private set; } = null!;
 
         public HttpClient Http { get; private set; } = null!;
 
@@ -53,10 +56,14 @@ namespace Omnipotent.Services.Omniscience
             Analytics = new AnalyticsEngine(this, Db);
             Profiler = new PersonalityProfiler(this, Db);
             Scheduler = new OmniscienceScheduler(this, Analytics, Profiler);
+            ReplicaTrainer = new ReplicaTrainer(this, Db, Http);
+            ReplicaChat = new ReplicaChatOrchestrator(this, Db, Http);
 
             // Routes first so the UI is responsive even before sources load.
             var routes = new OmniscienceRoutes(this);
             await routes.RegisterRoutes();
+            var replicaRoutes = new ReplicaRoutes(this);
+            await replicaRoutes.RegisterRoutes();
             await ServiceLog("[Omniscience] API routes registered.");
 
             // Start Discord ingest (will start gateways for every saved source).
