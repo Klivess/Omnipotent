@@ -3,6 +3,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
@@ -32,11 +33,83 @@ namespace Omnipotent.Services.Omniscience
         // held) until a slot frees.
         private static readonly SemaphoreSlim ReadGate = new(initialCount: 3, maxCount: 3);
 
+        // ── Per-route TTL response cache ──
+        // The Omniscience DB grows into the millions of rows. The dashboard routes do
+        // unavoidable full-table aggregates (COUNT(*) FROM messages, GROUP BY
+        // conversation_id, etc.) which SQLite has no shortcut for: every call is an
+        // O(n) scan that competes with the IngestPipeline writer for disk I/O. Even
+        // gated to 3-in-flight, the dashboard re-running the same scans on every page
+        // load is what was still stalling KliveAPI. We cache the raw response payload
+        // per (route, query-string) for a short TTL so back-to-back loads, the
+        // built-in poll loops, and the parallel burst from refreshAll() collapse onto
+        // a single underlying query. Cached hits return synchronously without taking
+        // a ReadGate slot or a worker thread at all.
+        //
+        // Single-flight: when the cache is cold we deduplicate concurrent requesters
+        // for the same key onto a single Task, so the parallel burst issues exactly
+        // one DB scan per route instead of N.
+        private sealed class CacheEntry
+        {
+            public string? Payload;
+            public long ExpiresAtTicks;
+            public Task<string>? InFlight;
+        }
+        private static readonly ConcurrentDictionary<string, CacheEntry> ResponseCache = new();
+
+        private static async Task<string> GetOrComputeAsync(string cacheKey, TimeSpan ttl, Func<string> buildPayload)
+        {
+            long nowTicks = DateTime.UtcNow.Ticks;
+            if (ResponseCache.TryGetValue(cacheKey, out var hit) && hit.Payload != null && hit.ExpiresAtTicks > nowTicks)
+            {
+                return hit.Payload;
+            }
+
+            // Reserve / claim the in-flight slot under a per-entry lock to dedupe.
+            var entry = ResponseCache.GetOrAdd(cacheKey, _ => new CacheEntry());
+            Task<string> task;
+            lock (entry)
+            {
+                if (entry.Payload != null && entry.ExpiresAtTicks > DateTime.UtcNow.Ticks)
+                {
+                    return entry.Payload;
+                }
+                if (entry.InFlight != null)
+                {
+                    task = entry.InFlight;
+                }
+                else
+                {
+                    task = Task.Run(async () =>
+                    {
+                        await ReadGate.WaitAsync();
+                        try
+                        {
+                            string payload = buildPayload();
+                            lock (entry)
+                            {
+                                entry.Payload = payload;
+                                entry.ExpiresAtTicks = DateTime.UtcNow.Add(ttl).Ticks;
+                                entry.InFlight = null;
+                            }
+                            return payload;
+                        }
+                        catch
+                        {
+                            lock (entry) { entry.InFlight = null; }
+                            throw;
+                        }
+                        finally { ReadGate.Release(); }
+                    });
+                    entry.InFlight = task;
+                }
+            }
+            return await task;
+        }
+
         // Helper: gate a synchronous-DB route body, run the blocking work on a dedicated
         // worker thread (Task.Run), then write the response on the original async path.
-        // Using Task.Run here is intentional: it isolates the synchronous SQLite call from
-        // the listener's continuation thread, so an unexpectedly slow query no longer
-        // blocks ProcessRequestAsync's await machinery.
+        // Use this for routes where caching is not appropriate (per-id detail lookups);
+        // use GetOrComputeAsync for list/aggregate routes that re-run the same query.
         private static async Task GatedRead(UserRequest req, Func<string> buildPayload)
         {
             await ReadGate.WaitAsync();
@@ -46,6 +119,12 @@ namespace Omnipotent.Services.Omniscience
                 await req.ReturnResponse(payload);
             }
             finally { ReadGate.Release(); }
+        }
+
+        private static async Task CachedRead(UserRequest req, string cacheKey, TimeSpan ttl, Func<string> buildPayload)
+        {
+            string payload = await GetOrComputeAsync(cacheKey, ttl, buildPayload);
+            await req.ReturnResponse(payload);
         }
 
         public OmniscienceRoutes(Omniscience service) { this.service = service; }
@@ -66,28 +145,31 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    var rows = new List<JObject>();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT source_id, platform, label, status, last_status_message, self_username, self_platform_user_id,
-                                               added_at, last_full_sync_at, last_event_at FROM harvest_sources ORDER BY added_at DESC";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
+                    await CachedRead(req, "sources", TimeSpan.FromSeconds(15), () =>
                     {
-                        rows.Add(new JObject(
-                            new JProperty("source_id", r.GetString(0)),
-                            new JProperty("platform", r.GetString(1)),
-                            new JProperty("label", r.IsDBNull(2) ? null : r.GetString(2)),
-                            new JProperty("status", r.GetString(3)),
-                            new JProperty("last_status_message", r.IsDBNull(4) ? null : r.GetString(4)),
-                            new JProperty("self_username", r.IsDBNull(5) ? null : r.GetString(5)),
-                            new JProperty("self_platform_user_id", r.IsDBNull(6) ? null : r.GetString(6)),
-                            new JProperty("added_at", r.GetInt64(7)),
-                            new JProperty("last_full_sync_at", r.IsDBNull(8) ? (long?)null : r.GetInt64(8)),
-                            new JProperty("last_event_at", r.IsDBNull(9) ? (long?)null : r.GetInt64(9))
-                        ));
-                    }
-                    await req.ReturnResponse(new JArray(rows).ToString(Formatting.None));
+                        var rows = new List<JObject>();
+                        using var conn = service.Db.Open();
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = @"SELECT source_id, platform, label, status, last_status_message, self_username, self_platform_user_id,
+                                               added_at, last_full_sync_at, last_event_at FROM harvest_sources ORDER BY added_at DESC";
+                        using var r = cmd.ExecuteReader();
+                        while (r.Read())
+                        {
+                            rows.Add(new JObject(
+                                new JProperty("source_id", r.GetString(0)),
+                                new JProperty("platform", r.GetString(1)),
+                                new JProperty("label", r.IsDBNull(2) ? null : r.GetString(2)),
+                                new JProperty("status", r.GetString(3)),
+                                new JProperty("last_status_message", r.IsDBNull(4) ? null : r.GetString(4)),
+                                new JProperty("self_username", r.IsDBNull(5) ? null : r.GetString(5)),
+                                new JProperty("self_platform_user_id", r.IsDBNull(6) ? null : r.GetString(6)),
+                                new JProperty("added_at", r.GetInt64(7)),
+                                new JProperty("last_full_sync_at", r.IsDBNull(8) ? (long?)null : r.GetInt64(8)),
+                                new JProperty("last_event_at", r.IsDBNull(9) ? (long?)null : r.GetInt64(9))
+                            ));
+                        }
+                        return new JArray(rows).ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -169,7 +251,8 @@ namespace Omnipotent.Services.Omniscience
                     int.TryParse(req.userParameters?["offset"] ?? "0", out int offset);
                     if (offset < 0) offset = 0;
 
-                    await GatedRead(req, () =>
+                    string cacheKey = $"persons|s={search}|p={platform}|r={relatedTo}|l={limit}|o={offset}";
+                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45), () =>
                     {
                         var rows = new List<JObject>();
                         using var conn = service.Db.Open();
@@ -340,7 +423,8 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    await req.ReturnResponse(service.Scheduler.GetProfileTargetsJson().ToString(Formatting.None));
+                    await CachedRead(req, "profile-targets", TimeSpan.FromSeconds(30), () =>
+                        service.Scheduler.GetProfileTargetsJson().ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -423,7 +507,8 @@ namespace Omnipotent.Services.Omniscience
                     string? platform = req.userParameters?["platform"];
                     string? kind = req.userParameters?["kind"];
 
-                    await GatedRead(req, () =>
+                    string cacheKey = $"conversations|p={platform}|k={kind}|l={limit}";
+                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45), () =>
                     {
                         using var conn = service.Db.Open();
                         using var cmd = conn.CreateCommand();
@@ -519,24 +604,32 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    using var conn = service.Db.Open();
-                    long Scalar(string sql)
+                    // SQLite has no fast row-count metadata; each COUNT(*) here scans the
+                    // full table. With millions of messages a single overview call took
+                    // long enough to wedge KliveAPI when several tabs/refresh cycles
+                    // overlapped. Cache the entire payload — staleness up to ~60s on a
+                    // bot-internal dashboard is fine.
+                    await CachedRead(req, "stats/overview", TimeSpan.FromSeconds(60), () =>
                     {
-                        using var c = conn.CreateCommand();
-                        c.CommandText = sql;
-                        var v = c.ExecuteScalar();
-                        return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
-                    }
-                    var obj = new JObject(
-                        new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
-                        new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
-                        new JProperty("conversations", Scalar("SELECT COUNT(*) FROM conversations")),
-                        new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
-                        new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
-                        new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
-                        new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles"))
-                    );
-                    await req.ReturnResponse(obj.ToString(Formatting.None));
+                        using var conn = service.Db.Open();
+                        long Scalar(string sql)
+                        {
+                            using var c = conn.CreateCommand();
+                            c.CommandText = sql;
+                            var v = c.ExecuteScalar();
+                            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+                        }
+                        var obj = new JObject(
+                            new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
+                            new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
+                            new JProperty("conversations", Scalar("SELECT COUNT(*) FROM conversations")),
+                            new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
+                            new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
+                            new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
+                            new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles"))
+                        );
+                        return obj.ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
