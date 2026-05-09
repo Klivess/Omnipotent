@@ -136,6 +136,44 @@ namespace Omnipotent.Services.Omniscience
             await RegisterConversationRoutes();
             await RegisterStatRoutes();
             await RegisterScheduleRoutes();
+            StartCacheWarmer();
+        }
+
+        // ── Cache warmer ──
+        // Without this, the FIRST dashboard load after bot startup (or after the
+        // TTL has expired with no traffic in between) still has to wait for the
+        // full O(n) scans on the messages table. With millions of rows that easily
+        // exceeds the website's 8s AbortController timeout, so the browser cancels
+        // the request before the response can return — exactly what was happening
+        // in the network tab. We pro-actively rebuild the dashboard's default cache
+        // keys in the background so a real user request always hits a warm entry.
+        private void StartCacheWarmer()
+        {
+            _ = Task.Run(async () =>
+            {
+                // Tiny initial delay so we don't fight the rest of service start-up.
+                try { await Task.Delay(TimeSpan.FromSeconds(2)); } catch { }
+                while (true)
+                {
+                    try { await WarmDashboardOnce(); }
+                    catch { /* swallow — next tick will retry */ }
+                    // Refresh interval slightly under the shortest TTL we warm (sources=15s)
+                    // so the cache is always pre-populated before it can expire.
+                    try { await Task.Delay(TimeSpan.FromSeconds(10)); } catch { break; }
+                }
+            });
+        }
+
+        private async Task WarmDashboardOnce()
+        {
+            // Default dashboard keys must mirror the keys constructed in the routes.
+            await GetOrComputeAsync("sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
+            await GetOrComputeAsync("stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
+            await GetOrComputeAsync("profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
+            await GetOrComputeAsync("persons|s=|p=|r=|l=200|o=0", TimeSpan.FromSeconds(45),
+                () => BuildPersonsPayload(null, null, null, 200, 0));
+            await GetOrComputeAsync("conversations|p=|k=|l=200", TimeSpan.FromSeconds(45),
+                () => BuildConversationsPayload(null, null, 200));
         }
 
         // ── Sources ──
@@ -145,31 +183,7 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    await CachedRead(req, "sources", TimeSpan.FromSeconds(15), () =>
-                    {
-                        var rows = new List<JObject>();
-                        using var conn = service.Db.Open();
-                        using var cmd = conn.CreateCommand();
-                        cmd.CommandText = @"SELECT source_id, platform, label, status, last_status_message, self_username, self_platform_user_id,
-                                               added_at, last_full_sync_at, last_event_at FROM harvest_sources ORDER BY added_at DESC";
-                        using var r = cmd.ExecuteReader();
-                        while (r.Read())
-                        {
-                            rows.Add(new JObject(
-                                new JProperty("source_id", r.GetString(0)),
-                                new JProperty("platform", r.GetString(1)),
-                                new JProperty("label", r.IsDBNull(2) ? null : r.GetString(2)),
-                                new JProperty("status", r.GetString(3)),
-                                new JProperty("last_status_message", r.IsDBNull(4) ? null : r.GetString(4)),
-                                new JProperty("self_username", r.IsDBNull(5) ? null : r.GetString(5)),
-                                new JProperty("self_platform_user_id", r.IsDBNull(6) ? null : r.GetString(6)),
-                                new JProperty("added_at", r.GetInt64(7)),
-                                new JProperty("last_full_sync_at", r.IsDBNull(8) ? (long?)null : r.GetInt64(8)),
-                                new JProperty("last_event_at", r.IsDBNull(9) ? (long?)null : r.GetInt64(9))
-                            ));
-                        }
-                        return new JArray(rows).ToString(Formatting.None);
-                    });
+                    await CachedRead(req, "sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -252,82 +266,8 @@ namespace Omnipotent.Services.Omniscience
                     if (offset < 0) offset = 0;
 
                     string cacheKey = $"persons|s={search}|p={platform}|r={relatedTo}|l={limit}|o={offset}";
-                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45), () =>
-                    {
-                        var rows = new List<JObject>();
-                        using var conn = service.Db.Open();
-                        using var cmd = conn.CreateCommand();
-                        var where = new List<string> { "p.merged_into_person_id IS NULL" };
-                        if (!string.IsNullOrWhiteSpace(search))
-                        {
-                            // Search across: person display_name, identity username/display_name,
-                            // alt-names (nicknames + global-name aliases), and the social_graph
-                            // analytic payload so users can be located by their relationships.
-                            where.Add(@"(
-                            p.display_name LIKE $s
-                            OR EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND (pi.platform_username LIKE $s OR pi.display_name LIKE $s))
-                            OR EXISTS (SELECT 1 FROM identity_alt_names an JOIN platform_identities pi ON pi.identity_id=an.identity_id WHERE pi.person_id=p.person_id AND an.alt_name LIKE $s)
-                            OR EXISTS (SELECT 1 FROM person_statistics ps WHERE ps.person_id=p.person_id AND ps.module_name IN ('social_graph','mention_affinity') AND ps.payload_json LIKE $s)
-                        )");
-                            cmd.Parameters.AddWithValue("$s", "%" + search + "%");
-                        }
-                        if (!string.IsNullOrWhiteSpace(platform))
-                        {
-                            where.Add("EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND pi.platform=$pl)");
-                            cmd.Parameters.AddWithValue("$pl", platform);
-                        }
-                        if (!string.IsNullOrWhiteSpace(relatedTo))
-                        {
-                            // Find people whose ID appears in the target's social_graph or
-                            // mention_affinity payload, OR vice-versa. Substring match on the
-                            // person_id key keeps the SQL simple and fast.
-                            where.Add(@"EXISTS (
-                            SELECT 1 FROM person_statistics ps
-                            WHERE ps.person_id=$rel
-                              AND ps.module_name IN ('social_graph','mention_affinity')
-                              AND ps.payload_json LIKE '%' || p.person_id || '%')");
-                            cmd.Parameters.AddWithValue("$rel", relatedTo);
-                        }
-                        // PERF: msg_count was previously a correlated subquery evaluated for
-                        // EVERY person row before the ORDER BY/LIMIT could prune anything.
-                        // On a large database that was the single biggest reason this route
-                        // could pin a worker thread for many seconds and wedge KliveAPI when
-                        // the dashboard fired its parallel-load burst. Computing msg_count
-                        // once via a grouped derived table lets SQLite use the existing
-                        // idx_msg_author_time + idx_identity_person indexes a single time.
-                        cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
-                            COALESCE(mc.msg_count, 0) AS msg_count,
-                            (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles,
-                            (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json,
-                            EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1) AS profile_targeted
-                        FROM persons p
-                        LEFT JOIN (
-                            SELECT pi.person_id, COUNT(*) AS msg_count
-                            FROM messages m JOIN platform_identities pi ON pi.identity_id = m.author_identity_id
-                            GROUP BY pi.person_id
-                        ) mc ON mc.person_id = p.person_id
-                        WHERE {string.Join(" AND ", where)}
-                        ORDER BY msg_count DESC
-                        LIMIT {limit} OFFSET {offset}";
-                        using var r = cmd.ExecuteReader();
-                        while (r.Read())
-                        {
-                            JArray idents;
-                            try { idents = string.IsNullOrEmpty(r.IsDBNull(6) ? null : r.GetString(6)) ? new JArray() : JArray.Parse(r.GetString(6)); }
-                            catch { idents = new JArray(); }
-                            rows.Add(new JObject(
-                                new JProperty("person_id", r.GetString(0)),
-                                new JProperty("display_name", r.IsDBNull(1) ? "" : r.GetString(1)),
-                                new JProperty("created_at", r.GetInt64(2)),
-                                new JProperty("updated_at", r.GetInt64(3)),
-                                new JProperty("message_count", r.GetInt64(4)),
-                                new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5)),
-                                new JProperty("identities", idents),
-                                new JProperty("profile_targeted", r.GetInt32(7) != 0)
-                            ));
-                        }
-                        return new JArray(rows).ToString(Formatting.None);
-                    });
+                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45),
+                        () => BuildPersonsPayload(search, platform, relatedTo, limit, offset));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -423,8 +363,7 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    await CachedRead(req, "profile-targets", TimeSpan.FromSeconds(30), () =>
-                        service.Scheduler.GetProfileTargetsJson().ToString(Formatting.None));
+                    await CachedRead(req, "profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -508,43 +447,8 @@ namespace Omnipotent.Services.Omniscience
                     string? kind = req.userParameters?["kind"];
 
                     string cacheKey = $"conversations|p={platform}|k={kind}|l={limit}";
-                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45), () =>
-                    {
-                        using var conn = service.Db.Open();
-                        using var cmd = conn.CreateCommand();
-                        var where = new List<string>();
-                        if (!string.IsNullOrWhiteSpace(platform)) { where.Add("c.platform=$pl"); cmd.Parameters.AddWithValue("$pl", platform); }
-                        if (!string.IsNullOrWhiteSpace(kind)) { where.Add("c.kind=$k"); cmd.Parameters.AddWithValue("$k", kind); }
-                        string whereSql = where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where);
-                        // PERF: same fix as /persons — compute msg_count once via a derived
-                        // table instead of a correlated subquery per conversation row.
-                        cmd.CommandText = $@"SELECT c.conversation_id, c.platform, c.kind, c.guild_name, c.title, c.first_seen, c.last_seen,
-                                COALESCE(mc.msg_count, 0) AS msg_count
-                            FROM conversations c
-                            LEFT JOIN (
-                                SELECT conversation_id, COUNT(*) AS msg_count
-                                FROM messages
-                                GROUP BY conversation_id
-                            ) mc ON mc.conversation_id = c.conversation_id
-                            {whereSql}
-                            ORDER BY msg_count DESC LIMIT {limit}";
-                        using var r = cmd.ExecuteReader();
-                        var arr = new JArray();
-                        while (r.Read())
-                        {
-                            arr.Add(new JObject(
-                                new JProperty("conversation_id", r.GetString(0)),
-                                new JProperty("platform", r.GetString(1)),
-                                new JProperty("kind", r.GetString(2)),
-                                new JProperty("guild_name", r.IsDBNull(3) ? null : r.GetString(3)),
-                                new JProperty("title", r.IsDBNull(4) ? null : r.GetString(4)),
-                                new JProperty("first_seen", r.IsDBNull(5) ? (long?)null : r.GetInt64(5)),
-                                new JProperty("last_seen", r.IsDBNull(6) ? (long?)null : r.GetInt64(6)),
-                                new JProperty("message_count", r.GetInt64(7))
-                            ));
-                        }
-                        return arr.ToString(Formatting.None);
-                    });
+                    await CachedRead(req, cacheKey, TimeSpan.FromSeconds(45),
+                        () => BuildConversationsPayload(platform, kind, limit));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -609,27 +513,7 @@ namespace Omnipotent.Services.Omniscience
                     // long enough to wedge KliveAPI when several tabs/refresh cycles
                     // overlapped. Cache the entire payload — staleness up to ~60s on a
                     // bot-internal dashboard is fine.
-                    await CachedRead(req, "stats/overview", TimeSpan.FromSeconds(60), () =>
-                    {
-                        using var conn = service.Db.Open();
-                        long Scalar(string sql)
-                        {
-                            using var c = conn.CreateCommand();
-                            c.CommandText = sql;
-                            var v = c.ExecuteScalar();
-                            return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
-                        }
-                        var obj = new JObject(
-                            new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
-                            new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
-                            new JProperty("conversations", Scalar("SELECT COUNT(*) FROM conversations")),
-                            new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
-                            new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
-                            new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
-                            new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles"))
-                        );
-                        return obj.ToString(Formatting.None);
-                    });
+                    await CachedRead(req, "stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -657,6 +541,164 @@ namespace Omnipotent.Services.Omniscience
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
+        }
+
+        // ── cached payload builders ──
+        // These build the raw JSON string for the matching cached route. They are
+        // shared between the route handler (via CachedRead) and the background
+        // cache warmer (StartCacheWarmer) so the dashboard never sees a cold cache.
+
+        private string BuildSourcesPayload()
+        {
+            var rows = new List<JObject>();
+            using var conn = service.Db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT source_id, platform, label, status, last_status_message, self_username, self_platform_user_id,
+                                       added_at, last_full_sync_at, last_event_at FROM harvest_sources ORDER BY added_at DESC";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                rows.Add(new JObject(
+                    new JProperty("source_id", r.GetString(0)),
+                    new JProperty("platform", r.GetString(1)),
+                    new JProperty("label", r.IsDBNull(2) ? null : r.GetString(2)),
+                    new JProperty("status", r.GetString(3)),
+                    new JProperty("last_status_message", r.IsDBNull(4) ? null : r.GetString(4)),
+                    new JProperty("self_username", r.IsDBNull(5) ? null : r.GetString(5)),
+                    new JProperty("self_platform_user_id", r.IsDBNull(6) ? null : r.GetString(6)),
+                    new JProperty("added_at", r.GetInt64(7)),
+                    new JProperty("last_full_sync_at", r.IsDBNull(8) ? (long?)null : r.GetInt64(8)),
+                    new JProperty("last_event_at", r.IsDBNull(9) ? (long?)null : r.GetInt64(9))
+                ));
+            }
+            return new JArray(rows).ToString(Formatting.None);
+        }
+
+        private string BuildOverviewPayload()
+        {
+            using var conn = service.Db.Open();
+            long Scalar(string sql)
+            {
+                using var c = conn.CreateCommand();
+                c.CommandText = sql;
+                var v = c.ExecuteScalar();
+                return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
+            }
+            var obj = new JObject(
+                new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
+                new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
+                new JProperty("conversations", Scalar("SELECT COUNT(*) FROM conversations")),
+                new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
+                new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
+                new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
+                new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles"))
+            );
+            return obj.ToString(Formatting.None);
+        }
+
+        private string BuildProfileTargetsPayload()
+        {
+            return service.Scheduler.GetProfileTargetsJson().ToString(Formatting.None);
+        }
+
+        private string BuildPersonsPayload(string? search, string? platform, string? relatedTo, int limit, int offset)
+        {
+            var rows = new List<JObject>();
+            using var conn = service.Db.Open();
+            using var cmd = conn.CreateCommand();
+            var where = new List<string> { "p.merged_into_person_id IS NULL" };
+            if (!string.IsNullOrWhiteSpace(search))
+            {
+                where.Add(@"(
+                    p.display_name LIKE $s
+                    OR EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND (pi.platform_username LIKE $s OR pi.display_name LIKE $s))
+                    OR EXISTS (SELECT 1 FROM identity_alt_names an JOIN platform_identities pi ON pi.identity_id=an.identity_id WHERE pi.person_id=p.person_id AND an.alt_name LIKE $s)
+                    OR EXISTS (SELECT 1 FROM person_statistics ps WHERE ps.person_id=p.person_id AND ps.module_name IN ('social_graph','mention_affinity') AND ps.payload_json LIKE $s)
+                )");
+                cmd.Parameters.AddWithValue("$s", "%" + search + "%");
+            }
+            if (!string.IsNullOrWhiteSpace(platform))
+            {
+                where.Add("EXISTS (SELECT 1 FROM platform_identities pi WHERE pi.person_id=p.person_id AND pi.platform=$pl)");
+                cmd.Parameters.AddWithValue("$pl", platform);
+            }
+            if (!string.IsNullOrWhiteSpace(relatedTo))
+            {
+                where.Add(@"EXISTS (
+                    SELECT 1 FROM person_statistics ps
+                    WHERE ps.person_id=$rel
+                      AND ps.module_name IN ('social_graph','mention_affinity')
+                      AND ps.payload_json LIKE '%' || p.person_id || '%')");
+                cmd.Parameters.AddWithValue("$rel", relatedTo);
+            }
+            cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
+                    COALESCE(mc.msg_count, 0) AS msg_count,
+                    (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles,
+                    (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json,
+                    EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1) AS profile_targeted
+                FROM persons p
+                LEFT JOIN (
+                    SELECT pi.person_id, COUNT(*) AS msg_count
+                    FROM messages m JOIN platform_identities pi ON pi.identity_id = m.author_identity_id
+                    GROUP BY pi.person_id
+                ) mc ON mc.person_id = p.person_id
+                WHERE {string.Join(" AND ", where)}
+                ORDER BY msg_count DESC
+                LIMIT {limit} OFFSET {offset}";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                JArray idents;
+                try { idents = string.IsNullOrEmpty(r.IsDBNull(6) ? null : r.GetString(6)) ? new JArray() : JArray.Parse(r.GetString(6)); }
+                catch { idents = new JArray(); }
+                rows.Add(new JObject(
+                    new JProperty("person_id", r.GetString(0)),
+                    new JProperty("display_name", r.IsDBNull(1) ? "" : r.GetString(1)),
+                    new JProperty("created_at", r.GetInt64(2)),
+                    new JProperty("updated_at", r.GetInt64(3)),
+                    new JProperty("message_count", r.GetInt64(4)),
+                    new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5)),
+                    new JProperty("identities", idents),
+                    new JProperty("profile_targeted", r.GetInt32(7) != 0)
+                ));
+            }
+            return new JArray(rows).ToString(Formatting.None);
+        }
+
+        private string BuildConversationsPayload(string? platform, string? kind, int limit)
+        {
+            using var conn = service.Db.Open();
+            using var cmd = conn.CreateCommand();
+            var where = new List<string>();
+            if (!string.IsNullOrWhiteSpace(platform)) { where.Add("c.platform=$pl"); cmd.Parameters.AddWithValue("$pl", platform); }
+            if (!string.IsNullOrWhiteSpace(kind)) { where.Add("c.kind=$k"); cmd.Parameters.AddWithValue("$k", kind); }
+            string whereSql = where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where);
+            cmd.CommandText = $@"SELECT c.conversation_id, c.platform, c.kind, c.guild_name, c.title, c.first_seen, c.last_seen,
+                    COALESCE(mc.msg_count, 0) AS msg_count
+                FROM conversations c
+                LEFT JOIN (
+                    SELECT conversation_id, COUNT(*) AS msg_count
+                    FROM messages
+                    GROUP BY conversation_id
+                ) mc ON mc.conversation_id = c.conversation_id
+                {whereSql}
+                ORDER BY msg_count DESC LIMIT {limit}";
+            using var r = cmd.ExecuteReader();
+            var arr = new JArray();
+            while (r.Read())
+            {
+                arr.Add(new JObject(
+                    new JProperty("conversation_id", r.GetString(0)),
+                    new JProperty("platform", r.GetString(1)),
+                    new JProperty("kind", r.GetString(2)),
+                    new JProperty("guild_name", r.IsDBNull(3) ? null : r.GetString(3)),
+                    new JProperty("title", r.IsDBNull(4) ? null : r.GetString(4)),
+                    new JProperty("first_seen", r.IsDBNull(5) ? (long?)null : r.GetInt64(5)),
+                    new JProperty("last_seen", r.IsDBNull(6) ? (long?)null : r.GetInt64(6)),
+                    new JProperty("message_count", r.GetInt64(7))
+                ));
+            }
+            return arr.ToString(Formatting.None);
         }
 
         // ── helpers ──
