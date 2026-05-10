@@ -86,6 +86,13 @@ namespace Omnipotent.Services.Stratum
                 ctx.Cancellation.ThrowIfCancellationRequested();
                 subtaskIdx++;
                 var slot = blueprint.Slots.FirstOrDefault(s => string.Equals(s.SubtaskTitle, subtask.Title, StringComparison.OrdinalIgnoreCase));
+                if (slot != null && slot.Virtual)
+                {
+                    ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — virtual / integration-only, no CAD generated.");
+                    if (!string.IsNullOrWhiteSpace(slot.Reasoning))
+                        ctx.EmitThought($"Skipping virtual subtask: {slot.Reasoning}");
+                    continue;
+                }
                 if (alreadyApproved.TryGetValue(subtask.Title, out var reused))
                 {
                     ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — reusing previously approved part.");
@@ -160,6 +167,29 @@ namespace Omnipotent.Services.Stratum
                 if (!result.Success)
                     throw new Exception($"CadQuery script failed after {MaxScriptRepairs + 1} attempts:\n{Tail(result.Stderr, 1000)}");
 
+                // 2a. Parse the part's actual bounding box from the export footer's STRATUM_BBOX line.
+                //     If it busts the slot's bounding box by >20% on any axis, treat as a soft
+                //     failure and re-prompt — the LLM probably picked the wrong principal axis or
+                //     made the part too big.
+                var measured = ParseBBoxLine(result.Stdout);
+                if (slot != null && measured != null && slot.BoundingBoxMm != null && slot.BoundingBoxMm.Length >= 3)
+                {
+                    double tol = 1.20;  // 20% slack
+                    double sx = slot.BoundingBoxMm[0], sy = slot.BoundingBoxMm[1], sz = slot.BoundingBoxMm[2];
+                    double mx = measured.Value.dx, my = measured.Value.dy, mz = measured.Value.dz;
+                    bool oversize = mx > sx * tol || my > sy * tol || mz > sz * tol;
+                    if (oversize && iter < MaxIterationsPerSubtask - 1)
+                    {
+                        ctx.EmitThought($"Part bounding box {mx:0.#}×{my:0.#}×{mz:0.#} mm exceeds slot {sx:0.#}×{sy:0.#}×{sz:0.#} mm by more than 20%. Re-prompting (likely wrong principalAxis or oversized geometry).");
+                        previousReject = $"Your produced part has bounding box {mx:0.#}×{my:0.#}×{mz:0.#} mm but the slot allows at most {sx:0.#}×{sy:0.#}×{sz:0.#} mm. Either the principal axis was wrong (the longest dimension must be along the slot's `principalAxis`, which is the FIRST entry of `boundingBoxMm`) or the part is too big. Re-design with correct local orientation and dimensions.";
+                        continue;
+                    }
+                    if (oversize)
+                    {
+                        ctx.EmitThought($"WARNING: Part bbox still exceeds slot after retries — proceeding anyway. {mx:0.#}×{my:0.#}×{mz:0.#} mm vs {sx:0.#}×{sy:0.#}×{sz:0.#} mm.");
+                    }
+                }
+
                 // 3. Locate STEP + GLB outputs.
                 var stepFile = result.ProducedFiles.FirstOrDefault(f => f.Extension.Equals(".step", StringComparison.OrdinalIgnoreCase) || f.Extension.Equals(".stp", StringComparison.OrdinalIgnoreCase));
                 var glbFile = result.ProducedFiles.FirstOrDefault(f => f.Extension.Equals(".glb", StringComparison.OrdinalIgnoreCase) || f.Extension.Equals(".gltf", StringComparison.OrdinalIgnoreCase));
@@ -174,9 +204,16 @@ namespace Omnipotent.Services.Stratum
                 if (stepFile != null)
                 {
                     var bytes = File.ReadAllBytes(stepFile.FullName);
+                    var meta = new Dictionary<string, string>
+                    {
+                        ["subtask"] = subtask.Title,
+                        ["iteration"] = (iter + 1).ToString(),
+                        ["runID"] = ctx.Run.RunID,
+                    };
+                    if (slot != null) meta["principalAxis"] = slot.PrincipalAxis;
+                    if (measured != null) meta["measuredBBoxMm"] = $"{measured.Value.dx:0.###},{measured.Value.dy:0.###},{measured.Value.dz:0.###}";
                     var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
-                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes,
-                        new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes, meta);
                     producedArtifactIDs.Add(art.ArtifactID);
                     approvedStepArtifactID = art.ArtifactID;
                     approvedStepFileName = art.FileName;
@@ -309,6 +346,11 @@ namespace Omnipotent.Services.Stratum
             public string Reasoning { get; set; } = "";
             public int Quantity { get; set; } = 1;
             public List<double[]>? Instances { get; set; }  // optional per-copy positions for replicated parts
+            // Local axis along which the part's primary length extends from its localOrigin.
+            // "+X" | "-X" | "+Y" | "-Y" | "+Z" | "-Z". Defaults to "+X" for back-compat.
+            public string PrincipalAxis { get; set; } = "+X";
+            // Non-physical / integration-only subtasks: skipped by design AND composer.
+            public bool Virtual { get; set; } = false;
         }
 
         private sealed class MechanicalMatingInterface
@@ -368,6 +410,55 @@ namespace Omnipotent.Services.Stratum
                 if (missing.Count > 0)
                 {
                     previousReject = "The blueprint is missing slots for: " + string.Join(", ", missing) + ". Every planner subtask must appear in `slots[]`.";
+                    ctx.EmitThought(previousReject);
+                    continue;
+                }
+
+                // Validate: instances[] must match quantity when quantity > 1.
+                var quantityProblems = new List<string>();
+                foreach (var s in bp.Slots)
+                {
+                    if (s.Virtual) continue;
+                    if (s.Quantity > 1)
+                    {
+                        if (s.Instances == null || s.Instances.Count != s.Quantity)
+                            quantityProblems.Add($"`{s.SubtaskTitle}` has quantity={s.Quantity} but `instances[]` has {s.Instances?.Count ?? 0} entries — must equal quantity, each as [x,y,z,rx,ry,rz].");
+                    }
+                }
+                if (quantityProblems.Count > 0)
+                {
+                    previousReject = string.Join(" ", quantityProblems);
+                    ctx.EmitThought(previousReject);
+                    continue;
+                }
+
+                // Validate: principalAxis must be present and one of +/- X/Y/Z for non-virtual slots.
+                var axisProblems = new List<string>();
+                var allowedAxes = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+                foreach (var s in bp.Slots)
+                {
+                    if (s.Virtual) continue;
+                    if (string.IsNullOrWhiteSpace(s.PrincipalAxis) || !allowedAxes.Contains(s.PrincipalAxis.Trim()))
+                        axisProblems.Add($"`{s.SubtaskTitle}` is missing a valid `principalAxis` (must be one of +X, -X, +Y, -Y, +Z, -Z).");
+                }
+                if (axisProblems.Count > 0)
+                {
+                    previousReject = string.Join(" ", axisProblems);
+                    ctx.EmitThought(previousReject);
+                    continue;
+                }
+
+                // Heuristic: catch virtual subtasks the planner forgot to mark (final-integration, etc.).
+                var virtualHeuristic = new System.Text.RegularExpressions.Regex("finali[sz]e|integrat|verify|inspect|assembl(y|e) cad", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var unmarkedVirtual = bp.Slots
+                    .Where(s => !s.Virtual
+                        && (virtualHeuristic.IsMatch(s.SubtaskTitle)
+                            || (s.BoundingBoxMm != null && s.BoundingBoxMm.Length >= 3 && s.BoundingBoxMm[0] <= 5 && s.BoundingBoxMm[1] <= 5 && s.BoundingBoxMm[2] <= 5)))
+                    .Select(s => s.SubtaskTitle).ToList();
+                if (unmarkedVirtual.Count > 0)
+                {
+                    previousReject = "These slots look like non-physical / integration tasks but are not marked virtual: " + string.Join(", ", unmarkedVirtual)
+                        + ". Set `virtual: true` on slots that don't correspond to a real machined/printed part (e.g. final assembly verification).";
                     ctx.EmitThought(previousReject);
                     continue;
                 }
@@ -473,6 +564,13 @@ namespace Omnipotent.Services.Stratum
                     ctx.EmitThought($"Cumulative preview build failed (exit {result.ExitCode}). STDERR tail: {Tail(result.Stderr, 400)}");
                     return;
                 }
+                // Surface composer diagnostics (per-part world bbox + pairwise overlaps).
+                foreach (var line in (result.Stdout ?? "").Split('\n'))
+                {
+                    string l = line.TrimEnd('\r');
+                    if (l.StartsWith("STRATUM_PART_BBOX:") || l.StartsWith("STRATUM_OVERLAP:"))
+                        ctx.EmitThought("compose: " + l.Substring(l.IndexOf(':') + 1).Trim());
+                }
                 var glb = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly_progress.glb", StringComparison.OrdinalIgnoreCase));
                 var step = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly_progress.step", StringComparison.OrdinalIgnoreCase));
                 if (glb != null)
@@ -500,14 +598,19 @@ namespace Omnipotent.Services.Stratum
 
         private static string BuildCompositionScript(List<(string staged, ApprovedPart part)> entries, MechanicalBlueprint blueprint)
         {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string F(double v) => v.ToString("0.######", inv);
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("import cadquery as cq");
             sb.AppendLine("asm = cq.Assembly()");
+            sb.AppendLine("_part_world_bboxes = []  # (name, dx, dy, dz, cx, cy, cz)");
             int idx = 0;
             foreach (var (staged, part) in entries)
             {
                 idx++;
                 var slot = part.Slot ?? blueprint.Slots.FirstOrDefault(s => string.Equals(s.SubtaskTitle, part.Subtask.Title, StringComparison.OrdinalIgnoreCase));
+                if (slot != null && slot.Virtual) continue;
+
                 double px = 0, py = 0, pz = 0, rx = 0, ry = 0, rz = 0;
                 if (slot != null)
                 {
@@ -517,7 +620,9 @@ namespace Omnipotent.Services.Stratum
                 string safeName = SafeFileName(part.Subtask.Title).Replace(' ', '_');
                 sb.AppendLine($"shape_{idx} = cq.importers.importStep(r'{staged}')");
 
-                var instances = (slot?.Instances != null && slot.Instances.Count > 0) ? slot.Instances : new List<double[]> { new[] { px, py, pz } };
+                var instances = (slot?.Instances != null && slot.Instances.Count > 0)
+                    ? slot.Instances
+                    : new List<double[]> { new[] { px, py, pz, rx, ry, rz } };
                 int instIdx = 0;
                 foreach (var inst in instances)
                 {
@@ -528,20 +633,43 @@ namespace Omnipotent.Services.Stratum
                     double irx = inst.Length > 3 ? inst[3] : rx;
                     double iry = inst.Length > 4 ? inst[4] : ry;
                     double irz = inst.Length > 5 ? inst[5] : rz;
-                    sb.AppendLine($"asm.add(shape_{idx}, name='{safeName}_{instIdx}',");
-                    sb.AppendLine($"        loc=cq.Location(cq.Vector({ix.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {iy.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {iz.ToString(System.Globalization.CultureInfo.InvariantCulture)}),");
-                    sb.AppendLine($"                        cq.Vector(0, 0, 1), {irz.ToString(System.Globalization.CultureInfo.InvariantCulture)}))");
-                    if (Math.Abs(irx) > 1e-6)
-                    {
-                        sb.AppendLine($"# X rotation {irx} deg requested — applied separately below");
-                    }
-                    if (Math.Abs(iry) > 1e-6)
-                    {
-                        sb.AppendLine($"# Y rotation {iry} deg requested — applied separately below");
-                    }
+
+                    // Apply local Euler XYZ rotations to the shape itself, then place it at world position.
+                    // CadQuery `.rotate(axisStart, axisEnd, angleDeg)` rotates the underlying geometry.
+                    string varName = $"placed_{idx}_{instIdx}";
+                    sb.AppendLine($"{varName} = shape_{idx}");
+                    if (Math.Abs(irx) > 1e-9)
+                        sb.AppendLine($"{varName} = {varName}.rotate((0, 0, 0), (1, 0, 0), {F(irx)})");
+                    if (Math.Abs(iry) > 1e-9)
+                        sb.AppendLine($"{varName} = {varName}.rotate((0, 0, 0), (0, 1, 0), {F(iry)})");
+                    if (Math.Abs(irz) > 1e-9)
+                        sb.AppendLine($"{varName} = {varName}.rotate((0, 0, 0), (0, 0, 1), {F(irz)})");
+                    sb.AppendLine($"asm.add({varName}, name='{safeName}_{instIdx}',");
+                    sb.AppendLine($"        loc=cq.Location(cq.Vector({F(ix)}, {F(iy)}, {F(iz)})))");
+
+                    // Compute world bbox of this instance for diagnostics.
+                    sb.AppendLine($"try:");
+                    sb.AppendLine($"    _placed_world_{idx}_{instIdx} = {varName}.translate(({F(ix)}, {F(iy)}, {F(iz)}))");
+                    sb.AppendLine($"    _bb = _placed_world_{idx}_{instIdx}.val().BoundingBox() if hasattr(_placed_world_{idx}_{instIdx}, 'val') else _placed_world_{idx}_{instIdx}.BoundingBox()");
+                    sb.AppendLine($"    _part_world_bboxes.append(('{safeName}_{instIdx}', _bb.xmax-_bb.xmin, _bb.ymax-_bb.ymin, _bb.zmax-_bb.zmin, (_bb.xmax+_bb.xmin)/2, (_bb.ymax+_bb.ymin)/2, (_bb.zmax+_bb.zmin)/2, _bb.xmin, _bb.xmax, _bb.ymin, _bb.ymax, _bb.zmin, _bb.zmax))");
+                    sb.AppendLine($"except Exception as _e:");
+                    sb.AppendLine($"    print(f'STRATUM_PART_BBOX_FAILED:{safeName}_{instIdx}: {{_e}}')");
                 }
             }
             sb.AppendLine("result = asm");
+            sb.AppendLine();
+            sb.AppendLine("# Diagnostics: print each part's world bbox and pairwise overlaps so the host can surface them.");
+            sb.AppendLine("for _row in _part_world_bboxes:");
+            sb.AppendLine("    _n,_dx,_dy,_dz,_cx,_cy,_cz,_x0,_x1,_y0,_y1,_z0,_z1 = _row");
+            sb.AppendLine("    print(f'STRATUM_PART_BBOX:{_n}:size={_dx:.1f}x{_dy:.1f}x{_dz:.1f} centre=({_cx:.1f},{_cy:.1f},{_cz:.1f})')");
+            sb.AppendLine("for _i in range(len(_part_world_bboxes)):");
+            sb.AppendLine("    for _j in range(_i+1, len(_part_world_bboxes)):");
+            sb.AppendLine("        _a = _part_world_bboxes[_i]; _b = _part_world_bboxes[_j]");
+            sb.AppendLine("        _ox = max(0, min(_a[8], _b[8]) - max(_a[7], _b[7]))");
+            sb.AppendLine("        _oy = max(0, min(_a[10], _b[10]) - max(_a[9], _b[9]))");
+            sb.AppendLine("        _oz = max(0, min(_a[12], _b[12]) - max(_a[11], _b[11]))");
+            sb.AppendLine("        if _ox > 0.5 and _oy > 0.5 and _oz > 0.5:");
+            sb.AppendLine("            print(f'STRATUM_OVERLAP:{_a[0]} <> {_b[0]}: {_ox:.1f}x{_oy:.1f}x{_oz:.1f} mm')");
             sb.AppendLine();
             sb.AppendLine("try:");
             sb.AppendLine("    result.save('assembly_progress.step', 'STEP')");
@@ -571,10 +699,12 @@ OUTPUT FORMAT: respond with a SINGLE ```json fenced code block, nothing else. No
       ""subtaskTitle"": string,            // MUST match a planner subtask title verbatim
       ""worldPosition"": [x, y, z],        // millimetres, world frame
       ""worldRotationDeg"": [rx, ry, rz],  // Euler XYZ degrees
-      ""boundingBoxMm"": [dx, dy, dz],     // maximum extents the part is permitted to occupy
+      ""boundingBoxMm"": [dx, dy, dz],     // maximum extents the part is permitted to occupy. dx is along principalAxis, dy & dz are the other two local axes.
       ""localOrigin"": string,             // where the part's own (0,0,0) is anchored, e.g. ""bottom-centre of mounting flange""
+      ""principalAxis"": ""+X""|""-X""|""+Y""|""-Y""|""+Z""|""-Z"", // local axis along which the part's primary length extends from localOrigin. REQUIRED for non-virtual slots.
+      ""virtual"": boolean,                // true for non-physical subtasks (finalise/integrate/verify); they are skipped at the CAD layer. Default false.
       ""quantity"": integer,               // 1 unless the subtask describes multiple copies (legs/wheels)
-      ""instances"": [[x,y,z,rx,ry,rz], …],// optional: explicit per-copy poses when quantity>1
+      ""instances"": [[x,y,z,rx,ry,rz], …],// REQUIRED when quantity>1: exactly `quantity` entries, each is the world pose of one copy
       ""matingInterfaces"": [
         { ""matesWith"": string,           // subtaskTitle of the neighbour
           ""kind"": ""bolt-pattern""|""shaft""|""snap-fit""|""press-fit""|""slot"",
@@ -590,10 +720,14 @@ OUTPUT FORMAT: respond with a SINGLE ```json fenced code block, nothing else. No
 Hard rules:
 - Every planner subtask MUST appear exactly once in `slots`.
 - Pick a single world origin and stick to it; describe it in `originConvention`.
-- Choose part sizes and positions so neighbouring parts do not interpenetrate and mating interfaces line up.
+- Choose part sizes and positions so neighbouring parts do not interpenetrate and mating interfaces line up. Axis-aligned bounding boxes of distinct slots must NOT overlap given their world positions.
 - Mating interfaces must be reciprocated: if A bolts to B, B must list a matching interface mating with A.
 - Units are millimetres. Angles are degrees.
-- All numeric fields must be numbers, not strings.";
+- All numeric fields must be numbers, not strings.
+- EVERY non-virtual slot MUST declare `principalAxis` (one of +X, -X, +Y, -Y, +Z, -Z). This is the LOCAL axis along which the part's primary length extends from `localOrigin`. The downstream design agent models the part along this axis; the composer applies your `worldRotationDeg` on top to point it where it needs to go. Hexapod legs with `principalAxis: ""+X""` are modelled extending laterally along local +X; the composer rotates each instance to its world heading.
+- If `quantity > 1`, you MUST emit `instances` with EXACTLY that many `[x, y, z, rx, ry, rz]` entries — one world pose per copy. Do NOT rely on the composer to auto-mirror.
+- Mark non-physical / integration-only subtasks (final-assembly checks, integration, verification) with `virtual: true` and a `boundingBoxMm` of `[1, 1, 1]`. These are skipped at the CAD layer.
+- WORKED EXAMPLE — a hexapod leg slot: `principalAxis: ""+X""`, `localOrigin: ""coxa rotation axis at body mounting face""`, `boundingBoxMm: [230, 80, 80]` (230 mm along +X, 80 mm in Y and Z), `quantity: 6`, `instances` lists 6 explicit world poses (three per side of the body, with rotations of ±90° about Z so each leg points outward).";
 
         private static string BuildBlueprintPrompt(StratumPlannerOutput plan, string? focus, string previousReject, string lastJson)
         {
@@ -733,9 +867,10 @@ Hard rules:
 ASSEMBLY CONTEXT (CRITICAL):
 - You are designing ONE part of a larger assembly that has ALREADY been planned. The user-provided prompt will include the full assembly blueprint and your part's slot in it.
 - Model the part with its LOCAL origin at the location described by `localOrigin` in your slot (e.g. ""bottom-centre of mounting flange"" means the part's (0,0,0) should be at the centre of the bottom mounting flange).
-- Stay inside the slot's `boundingBoxMm` — do NOT exceed those extents.
+- Stay inside the slot's `boundingBoxMm` — do NOT exceed those extents on any axis. The host MEASURES the produced bounding box and will reject + re-prompt you if it exceeds the slot by more than 20%.
+- The slot specifies a `principalAxis` (one of +X, -X, +Y, -Y, +Z, -Z). Your part's primary length MUST extend along this LOCAL axis from the localOrigin. The first dimension of `boundingBoxMm` is the length along that axis. Example: a 230×80×80 mm leg with `principalAxis: +X` extends 230 mm along local +X, occupying ≤ 80 mm in local Y and Z.
 - IMPLEMENT every mating interface listed in the slot's `matingInterfaces` (bolt patterns, shafts, snap-fits, etc.) at the described location with the described spec. These are HOW your part connects to its neighbours; they are NOT optional.
-- Do NOT apply the world transform yourself; the host's composer applies world position/rotation when assembling.";
+- Do NOT apply the world transform yourself; the host's composer applies world position and rotation when assembling.";
 
         private static string BuildScriptPrompt(
             StratumPlannerOutput plan, MechanicalBlueprint blueprint, StratumPlannerSubtask subtask, MechanicalBlueprintSlot? slot, string? focus, string previousReject, string lastScript)
@@ -765,6 +900,10 @@ ASSEMBLY CONTEXT (CRITICAL):
                 sb.AppendLine();
                 sb.AppendLine("YOUR SLOT IN THE ASSEMBLY (you MUST conform to this):");
                 sb.AppendLine(JsonConvert.SerializeObject(slot, Formatting.Indented));
+                string firstDim = (slot.BoundingBoxMm != null && slot.BoundingBoxMm.Length > 0)
+                    ? slot.BoundingBoxMm[0].ToString("0.#") : "?";
+                sb.AppendLine();
+                sb.AppendLine($"PRINCIPAL AXIS: {slot.PrincipalAxis} — your part MUST extend along this LOCAL axis from `localOrigin`. The first entry of `boundingBoxMm` ({firstDim} mm) is the length along this axis.");
             }
             if (!string.IsNullOrWhiteSpace(focus))
             {
@@ -784,7 +923,7 @@ ASSEMBLY CONTEXT (CRITICAL):
                 sb.AppendLine("```");
             }
             sb.AppendLine();
-            sb.AppendLine("Output the CadQuery script now. Remember: model in the LOCAL frame, stay inside the bounding box, implement every listed mating interface.");
+            sb.AppendLine("Output the CadQuery script now. Remember: model in the LOCAL frame, extend along the principalAxis, stay inside the bounding box, implement every listed mating interface.");
             return sb.ToString();
         }
 
@@ -807,7 +946,8 @@ ASSEMBLY CONTEXT (CRITICAL):
         }
 
         // Append the canonical export footer (STEP + GLB via cq.Assembly) — we control this so
-        // the LLM never has to fight the file system.
+        // the LLM never has to fight the file system. Also prints a bounding-box probe line so
+        // the host can verify the produced part fits its blueprint slot.
         private static string InjectExportFooter(string script)
         {
             const string footer = @"
@@ -820,6 +960,17 @@ except NameError:
     raise RuntimeError(""Stratum: script must define a variable named 'result'"")
 
 _assembly = _result if isinstance(_result, _cq_export.Assembly) else _cq_export.Assembly().add(_result, name='part')
+
+# Bounding-box probe (host parses this line for the slot guard).
+try:
+    _bb = _assembly.toCompound().BoundingBox()
+    _dx = _bb.xmax - _bb.xmin
+    _dy = _bb.ymax - _bb.ymin
+    _dz = _bb.zmax - _bb.zmin
+    print(f'STRATUM_BBOX:{_dx:.3f},{_dy:.3f},{_dz:.3f}')
+    print(f'STRATUM_BBOX_RANGE:{_bb.xmin:.3f},{_bb.xmax:.3f},{_bb.ymin:.3f},{_bb.ymax:.3f},{_bb.zmin:.3f},{_bb.zmax:.3f}')
+except Exception as _e_bb:
+    print(f'STRATUM_BBOX_FAILED:{_e_bb}')
 
 # STEP (canonical CAD)
 try:
@@ -848,6 +999,27 @@ except Exception as _e:
             if (string.IsNullOrEmpty(s)) return "";
             if (s.Length <= max) return s;
             return "…" + s.Substring(s.Length - max);
+        }
+
+        // Parses the STRATUM_BBOX:dx,dy,dz line emitted by the export footer. Returns null if absent.
+        private static (double dx, double dy, double dz)? ParseBBoxLine(string? stdout)
+        {
+            if (string.IsNullOrEmpty(stdout)) return null;
+            foreach (var raw in stdout.Split('\n'))
+            {
+                string line = raw.TrimEnd('\r').Trim();
+                if (!line.StartsWith("STRATUM_BBOX:", StringComparison.Ordinal)) continue;
+                string payload = line.Substring("STRATUM_BBOX:".Length);
+                var parts = payload.Split(',');
+                if (parts.Length < 3) continue;
+                if (double.TryParse(parts[0], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dx)
+                    && double.TryParse(parts[1], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dy)
+                    && double.TryParse(parts[2], System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var dz))
+                {
+                    return (dx, dy, dz);
+                }
+            }
+            return null;
         }
     }
 }
