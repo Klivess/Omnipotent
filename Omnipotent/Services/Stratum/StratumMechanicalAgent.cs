@@ -56,12 +56,28 @@ namespace Omnipotent.Services.Stratum
             // 3. Optional user-prompt focus: if the user supplied a prompt with this run,
             //    we treat it as an instruction to focus on a specific subtask or behaviour.
             string? focus = string.IsNullOrWhiteSpace(ctx.Run.UserPrompt) ? null : ctx.Run.UserPrompt;
+            string sessionId = $"stratum-mechanical-{ctx.Run.RunID}";
 
-            // 4. Iterate subtasks. Each subtask is its own LLM-driven design loop.
+            // 4. Assembly Blueprint phase — BEFORE designing any part, ask the LLM to plan the
+            //    full mechanical layout: per-part bounding box, world placement (position +
+            //    rotation), local origin convention, and the mating interfaces each part must
+            //    expose to its neighbours, with reasoning for every decision. This is gated
+            //    for user approval so the user can see the assembly strategy up front and
+            //    every subsequent part is designed against a fixed contract.
+            var blueprint = await BuildAssemblyBlueprintAsync(ctx, llm, sessionId, plan, focus);
+            if (blueprint == null)
+            {
+                ctx.EmitThought("Assembly blueprint was not produced — aborting mechanical run.");
+                return;
+            }
+
+            // 5. Iterate subtasks. Each subtask is designed against its blueprint slot AND the
+            //    full blueprint context so it can mate to its neighbours. Approved parts get
+            //    appended to a running assembly and a cumulative progress GLB is emitted after
+            //    every approval so the user can watch the device come together.
             //    If a previous Mechanical run on this project already produced an approved
             //    STEP for a given subtask, reuse it instead of re-designing — this lets the
             //    user pick up after a crash / restart / cancel without losing all their work.
-            string sessionId = $"stratum-mechanical-{ctx.Run.RunID}";
             int subtaskIdx = 0;
             var approvedParts = new List<ApprovedPart>();
             var alreadyApproved = FindApprovedStepsByPriorRuns(ctx);
@@ -69,29 +85,29 @@ namespace Omnipotent.Services.Stratum
             {
                 ctx.Cancellation.ThrowIfCancellationRequested();
                 subtaskIdx++;
+                var slot = blueprint.Slots.FirstOrDefault(s => string.Equals(s.SubtaskTitle, subtask.Title, StringComparison.OrdinalIgnoreCase));
                 if (alreadyApproved.TryGetValue(subtask.Title, out var reused))
                 {
                     ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — reusing previously approved part.");
                     approvedParts.Add(new ApprovedPart
                     {
                         Subtask = subtask,
+                        Slot = slot,
                         StepArtifactID = reused.ArtifactID,
                         StepFileName = reused.FileName,
                     });
+                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx);
                     continue;
                 }
                 ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: {subtask.Title}");
-                var partResult = await DesignSubtaskAsync(ctx, llm, sessionId, plan, subtask, subtaskIdx, focus);
-                if (partResult != null) approvedParts.Add(partResult);
-            }
-
-            // 5. Final assembly pass — combine the approved parts into one positioned model so the
-            //    user can actually see how the device fits together. Skipped if there is only a
-            //    single approved part (assembly would be identical to the part itself).
-            if (approvedParts.Count >= 2)
-            {
-                ctx.EmitStatus("Composing final mechanical assembly…");
-                await AssembleAsync(ctx, llm, sessionId, plan, approvedParts, focus);
+                if (slot != null && !string.IsNullOrWhiteSpace(slot.Reasoning))
+                    ctx.EmitThought($"Assembly plan for '{subtask.Title}': {slot.Reasoning}");
+                var partResult = await DesignSubtaskAsync(ctx, llm, sessionId, plan, blueprint, subtask, slot, subtaskIdx, focus);
+                if (partResult != null)
+                {
+                    approvedParts.Add(partResult);
+                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx);
+                }
             }
 
             ctx.EmitStatus("All mechanical subtasks completed.");
@@ -103,7 +119,9 @@ namespace Omnipotent.Services.Stratum
             KliveLLM.KliveLLM llm,
             string sessionId,
             StratumPlannerOutput plan,
+            MechanicalBlueprint blueprint,
             StratumPlannerSubtask subtask,
+            MechanicalBlueprintSlot? slot,
             int subtaskIdx,
             string? focus)
         {
@@ -117,7 +135,7 @@ namespace Omnipotent.Services.Stratum
                 ctx.EmitStatus($"Subtask '{subtask.Title}' — design iteration {iter + 1}");
 
                 // 1. Ask the LLM for a CadQuery script.
-                string userPrompt = BuildScriptPrompt(plan, subtask, focus, previousReject, lastScript);
+                string userPrompt = BuildScriptPrompt(plan, blueprint, subtask, slot, focus, previousReject, lastScript);
                 string? systemPrompt = iter == 0 ? BuildSystemPrompt() : null;
 
                 ctx.EmitThought("Generating CadQuery script…");
@@ -213,6 +231,7 @@ namespace Omnipotent.Services.Stratum
                         return new ApprovedPart
                         {
                             Subtask = subtask,
+                            Slot = slot,
                             StepArtifactID = approvedStepArtifactID,
                             StepFileName = approvedStepFileName,
                         };
@@ -264,226 +283,375 @@ namespace Omnipotent.Services.Stratum
         private sealed class ApprovedPart
         {
             public StratumPlannerSubtask Subtask { get; set; } = new();
+            public MechanicalBlueprintSlot? Slot { get; set; }
             public string StepArtifactID { get; set; } = "";
             public string StepFileName { get; set; } = "";
         }
 
-        // ── final assembly composition ──
-        private async Task AssembleAsync(
-            StratumAgentContext ctx,
-            KliveLLM.KliveLLM llm,
-            string sessionId,
-            StratumPlannerOutput plan,
-            List<ApprovedPart> parts,
-            string? focus)
+        // ─────────── Mechanical Blueprint (assembly plan) ───────────
+
+        private sealed class MechanicalBlueprint
         {
-            string asmSession = $"{sessionId}-assembly";
+            public string DeviceConcept { get; set; } = "";
+            public string OriginConvention { get; set; } = "";
+            public string AssemblyStrategy { get; set; } = "";
+            public List<MechanicalBlueprintSlot> Slots { get; set; } = new();
+        }
 
-            // Stage every approved STEP file into a fresh work directory so the script can
-            // reference them by stable, predictable relative paths (part_000.step, part_001.step…).
-            string workDir = Path.GetFullPath(Path.Combine(OmniPaths.GlobalPaths.StratumWorkDirectory, ctx.Run.RunID, $"asm_{Guid.NewGuid():N}"));
-            Directory.CreateDirectory(workDir);
+        private sealed class MechanicalBlueprintSlot
+        {
+            public string SubtaskTitle { get; set; } = "";
+            public double[] WorldPosition { get; set; } = new double[] { 0, 0, 0 };
+            public double[] WorldRotationDeg { get; set; } = new double[] { 0, 0, 0 };
+            public double[] BoundingBoxMm { get; set; } = new double[] { 50, 50, 50 };
+            public string LocalOrigin { get; set; } = "geometric centre";
+            public List<MechanicalMatingInterface> MatingInterfaces { get; set; } = new();
+            public string Reasoning { get; set; } = "";
+            public int Quantity { get; set; } = 1;
+            public List<double[]>? Instances { get; set; }  // optional per-copy positions for replicated parts
+        }
 
-            var partRefs = new List<object>();
-            for (int i = 0; i < parts.Count; i++)
+        private sealed class MechanicalMatingInterface
+        {
+            public string MatesWith { get; set; } = "";   // subtask title of neighbour
+            public string Kind { get; set; } = "";        // "bolt-pattern" | "shaft" | "snap-fit" | "press-fit" | "slot"
+            public string LocationOnPart { get; set; } = ""; // e.g. "top face, centred"
+            public string Spec { get; set; } = "";        // e.g. "4x M3 on 20mm bolt circle"
+        }
+
+        private async Task<MechanicalBlueprint?> BuildAssemblyBlueprintAsync(
+            StratumAgentContext ctx, KliveLLM.KliveLLM llm, string sessionId, StratumPlannerOutput plan, string? focus)
+        {
+            // Skip the blueprint phase if a previous Mechanical run on this project has already
+            // produced an approved blueprint — reuse it so the user doesn't have to re-approve.
+            var existing = LoadLatestBlueprint(ctx);
+            if (existing != null)
             {
-                var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, parts[i].StepArtifactID);
-                if (resolved == null || !File.Exists(resolved.Value.blobPath))
-                {
-                    ctx.EmitThought($"Skipping assembly — part '{parts[i].Subtask.Title}' STEP missing on disk.");
-                    return;
-                }
-                string stagedName = $"part_{i:D3}.step";
-                File.Copy(resolved.Value.blobPath, Path.Combine(workDir, stagedName), overwrite: true);
-                partRefs.Add(new
-                {
-                    index = i,
-                    stagedFile = stagedName,
-                    title = parts[i].Subtask.Title,
-                    description = parts[i].Subtask.Description,
-                    dependsOn = parts[i].Subtask.DependsOn ?? new List<string>(),
-                });
+                ctx.EmitThought("Reusing previously approved assembly blueprint.");
+                return existing;
             }
 
+            string bpSession = $"{sessionId}-blueprint";
             string previousReject = "";
-            string lastScript = "";
+            string lastJson = "";
 
             for (int iter = 0; iter < MaxIterationsPerSubtask; iter++)
             {
                 ctx.Cancellation.ThrowIfCancellationRequested();
-                ctx.EmitStatus($"Assembly composition — iteration {iter + 1}");
+                ctx.EmitStatus($"Planning assembly blueprint — iteration {iter + 1}");
+                ctx.EmitThought("Asking LLM to plan the full assembly layout BEFORE designing any part…");
 
-                string userPrompt = BuildAssemblyPrompt(plan, partRefs, focus, previousReject, lastScript);
-                string? systemPrompt = iter == 0 ? BuildAssemblySystemPrompt() : null;
-
-                ctx.EmitThought("Generating assembly script…");
-                var resp = await llm.QueryLLM(userPrompt, asmSession, systemPrompt: systemPrompt);
+                string userPrompt = BuildBlueprintPrompt(plan, focus, previousReject, lastJson);
+                string? sys = iter == 0 ? BuildBlueprintSystemPrompt() : null;
+                var resp = await llm.QueryLLM(userPrompt, bpSession, systemPrompt: sys);
                 if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
                 {
-                    ctx.EmitThought($"Assembly LLM call failed: {resp.ErrorMessage}");
-                    return;
+                    ctx.EmitThought($"Blueprint LLM call failed: {resp.ErrorMessage}");
+                    return null;
                 }
-                string script = ExtractPythonCode(resp.Response);
-                if (string.IsNullOrWhiteSpace(script))
+                string json = ExtractJson(resp.Response);
+                if (string.IsNullOrWhiteSpace(json))
                 {
-                    ctx.EmitThought("Assembly LLM did not return a Python script. Skipping assembly.");
-                    return;
+                    ctx.EmitThought("LLM did not return a JSON blueprint. Retrying.");
+                    continue;
                 }
-                script = InjectAssemblyExportFooter(script);
-                lastScript = script;
+                lastJson = json;
+                MechanicalBlueprint? bp;
+                try { bp = JsonConvert.DeserializeObject<MechanicalBlueprint>(json); }
+                catch (Exception ex) { ctx.EmitThought($"Blueprint JSON parse failed: {ex.Message}. Retrying."); continue; }
+                if (bp == null) continue;
 
-                // Execute the assembly script directly in the staged workDir so importStep('part_000.step') resolves.
-                ctx.EmitThought($"Executing assembly script (attempt {iter + 1})…");
-                var result = await pythonRunner.RunScriptAsync(script, workDir, ScriptTimeout, _ => { }, ctx.Cancellation);
-
-                if (!result.Success)
+                // Validate: every planner subtask must have a slot.
+                var missing = plan.MechanicalSubtasks!
+                    .Where(t => !bp.Slots.Any(s => string.Equals(s.SubtaskTitle, t.Title, StringComparison.OrdinalIgnoreCase)))
+                    .Select(t => t.Title).ToList();
+                if (missing.Count > 0)
                 {
-                    if (iter < MaxIterationsPerSubtask - 1)
-                    {
-                        ctx.EmitThought($"Assembly script failed (exit {result.ExitCode}). Asking LLM to repair.");
-                        var repair = await llm.QueryLLM(
-                            "The assembly script failed. STDERR (truncated):\n" + Tail(result.Stderr, 1500)
-                            + "\n\nOutput ONLY a corrected complete script in a single ```python block.",
-                            asmSession);
-                        string repaired = ExtractPythonCode(repair.Response);
-                        if (!string.IsNullOrWhiteSpace(repaired)) lastScript = InjectAssemblyExportFooter(repaired);
-                        previousReject = "";
-                        continue;
-                    }
-                    ctx.EmitThought($"Assembly failed after retries: {Tail(result.Stderr, 600)}");
-                    return;
+                    previousReject = "The blueprint is missing slots for: " + string.Join(", ", missing) + ". Every planner subtask must appear in `slots[]`.";
+                    ctx.EmitThought(previousReject);
+                    continue;
                 }
 
-                var asmStep = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly.step", StringComparison.OrdinalIgnoreCase));
-                var asmGlb = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly.glb", StringComparison.OrdinalIgnoreCase));
-                if (asmStep == null && asmGlb == null)
+                // Emit reasoning so the user can see the plan in the event stream.
+                ctx.EmitThought($"Assembly strategy: {bp.AssemblyStrategy}");
+                foreach (var s in bp.Slots)
                 {
-                    ctx.EmitThought("Assembly script ran but emitted no assembly.step or assembly.glb. Skipping.");
-                    return;
+                    string pos = $"({s.WorldPosition?[0]:0.#}, {s.WorldPosition?[1]:0.#}, {s.WorldPosition?[2]:0.#}) mm";
+                    string size = $"{s.BoundingBoxMm?[0]:0.#}×{s.BoundingBoxMm?[1]:0.#}×{s.BoundingBoxMm?[2]:0.#} mm";
+                    ctx.EmitThought($"  • {s.SubtaskTitle} @ {pos}, size ≤ {size}  — {Tail(s.Reasoning, 200)}");
                 }
 
-                var producedArtifactIDs = new List<string>();
-                string baseName = "assembly_v" + (iter + 1);
-                if (asmStep != null)
-                {
-                    var bytes = File.ReadAllBytes(asmStep.FullName);
-                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
-                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes,
-                        new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
-                    producedArtifactIDs.Add(art.ArtifactID);
-                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
-                }
-                if (asmGlb != null)
-                {
-                    var bytes = File.ReadAllBytes(asmGlb.FullName);
-                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
-                        StratumArtifactKind.MeshGlb, $"{baseName}.glb", "model/gltf-binary", bytes,
-                        new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
-                    producedArtifactIDs.Add(art.ArtifactID);
-                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
-                }
-                var scriptArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
-                    StratumArtifactKind.CadQueryScript, $"{baseName}.cq.py", "text/x-python",
-                    System.Text.Encoding.UTF8.GetBytes(lastScript),
-                    new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
-                producedArtifactIDs.Add(scriptArt.ArtifactID);
-                ctx.EmitArtifact(scriptArt.ArtifactID, scriptArt.FileName, scriptArt.Kind.ToString());
+                var blueprintBytes = System.Text.Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(bp, Formatting.Indented));
+                var bpArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                    StratumArtifactKind.Document, $"mechanical_blueprint_v{iter + 1}.json", "application/json", blueprintBytes,
+                    new Dictionary<string, string> { ["role"] = "mechanical-blueprint", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                ctx.EmitArtifact(bpArt.ArtifactID, bpArt.FileName, bpArt.Kind.ToString());
 
-                var proposal = new
-                {
-                    role = "assembly",
-                    iteration = iter + 1,
-                    parts = partRefs,
-                    files = new { step = asmStep?.Name, glb = asmGlb?.Name, script = $"{baseName}.cq.py" },
-                };
                 var resolution = await ctx.OpenGateAndWait(
-                    title: $"Approve mechanical assembly (v{iter + 1})",
-                    description: "The Mechanical Agent has positioned every approved part into a single combined model. Inspect the assembly GLB and confirm the layout — reject with a comment to adjust spacing/orientation.",
-                    rationale: "Combined assembly of: " + string.Join(", ", parts.Select(p => p.Subtask.Title)),
-                    proposalObject: proposal,
-                    proposalArtifactIDs: producedArtifactIDs);
+                    title: $"Approve assembly blueprint (v{iter + 1})",
+                    description: "The Mechanical Agent has produced an upfront assembly plan: where each part sits, how big it can be, and how it mates to its neighbours. Approve to lock the layout in (subsequent part design will be constrained by this plan); reject with a comment to revise.",
+                    rationale: bp.AssemblyStrategy,
+                    proposalObject: bp,
+                    proposalArtifactIDs: new[] { bpArt.ArtifactID });
 
                 if (resolution.Decision == StratumGateDecision.Approve)
                 {
-                    ctx.EmitStatus("Mechanical assembly approved.");
-                    return;
+                    ctx.EmitStatus("Assembly blueprint approved.");
+                    return bp;
                 }
                 previousReject = resolution.Comment ?? "";
-                ctx.EmitThought($"Assembly rejected. Refining: {Tail(previousReject, 200)}");
+                ctx.EmitThought($"Blueprint rejected. Revising: {Tail(previousReject, 200)}");
             }
-            ctx.EmitThought("Assembly did not converge within iteration budget.");
+            return null;
         }
 
-        private static string BuildAssemblySystemPrompt() =>
-@"You are the Mechanical Assembly composer in Stratum.
-Each input part is a STEP file already on disk in the working directory. Your job is to import them all and place them in 3D space relative to each other so that the device looks correctly assembled.
+        private static MechanicalBlueprint? LoadLatestBlueprint(StratumAgentContext ctx)
+        {
+            var project = ctx.Parent.Storage.GetProject(ctx.Run.ProjectID);
+            if (project == null) return null;
+            // Walk approved gates newest-first looking for a blueprint artifact.
+            var artById = new Dictionary<string, StratumArtifact>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rev in project.Revisions)
+                foreach (var a in rev.Artifacts) artById[a.ArtifactID] = a;
+            var gates = ctx.RunStore.ListGatesForProject(ctx.Run.ProjectID)
+                .Where(g => g.Status == StratumGateStatus.Approved)
+                .OrderByDescending(g => g.ResolvedAt ?? g.OpenedAt);
+            foreach (var g in gates)
+            {
+                foreach (var aid in g.ProposalArtifactIDs)
+                {
+                    if (!artById.TryGetValue(aid, out var art)) continue;
+                    if (art.Kind != StratumArtifactKind.Document) continue;
+                    if (!art.Metadata.TryGetValue("role", out var role) || role != "mechanical-blueprint") continue;
+                    var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, art.ArtifactID);
+                    if (resolved == null || !File.Exists(resolved.Value.blobPath)) continue;
+                    try { return JsonConvert.DeserializeObject<MechanicalBlueprint>(File.ReadAllText(resolved.Value.blobPath)); }
+                    catch { continue; }
+                }
+            }
+            return null;
+        }
+
+        // ─────────── Incremental assembly composition ───────────
+
+        /// <summary>
+        /// After every approved part, deterministically rebuild the assembly using the blueprint's
+        /// per-part placements and emit a fresh GLB so the user can see the device come together.
+        /// This is a code-driven composition — we don't ask the LLM where things go, we use the
+        /// already-approved blueprint. No HITL gate here; the cumulative progress GLB is just a
+        /// preview artifact.
+        /// </summary>
+        private async Task ComposeProgressAsync(
+            StratumAgentContext ctx,
+            StratumPlannerOutput plan,
+            MechanicalBlueprint blueprint,
+            List<ApprovedPart> approvedSoFar,
+            int subtaskIdx)
+        {
+            if (approvedSoFar.Count == 0) return;
+            try
+            {
+                string workDir = Path.GetFullPath(Path.Combine(OmniPaths.GlobalPaths.StratumWorkDirectory, ctx.Run.RunID, $"asm_progress_{subtaskIdx:D2}_{Guid.NewGuid():N}"));
+                Directory.CreateDirectory(workDir);
+
+                var entries = new List<(string staged, ApprovedPart part)>();
+                for (int i = 0; i < approvedSoFar.Count; i++)
+                {
+                    var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, approvedSoFar[i].StepArtifactID);
+                    if (resolved == null || !File.Exists(resolved.Value.blobPath)) continue;
+                    string staged = $"part_{i:D3}.step";
+                    File.Copy(resolved.Value.blobPath, Path.Combine(workDir, staged), overwrite: true);
+                    entries.Add((staged, approvedSoFar[i]));
+                }
+                if (entries.Count == 0) return;
+
+                string script = BuildCompositionScript(entries, blueprint);
+                ctx.EmitThought($"Updating cumulative assembly preview ({approvedSoFar.Count}/{plan.MechanicalSubtasks!.Count} parts)…");
+                var result = await pythonRunner.RunScriptAsync(script, workDir, ScriptTimeout, _ => { }, ctx.Cancellation);
+                if (!result.Success)
+                {
+                    ctx.EmitThought($"Cumulative preview build failed (exit {result.ExitCode}). STDERR tail: {Tail(result.Stderr, 400)}");
+                    return;
+                }
+                var glb = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly_progress.glb", StringComparison.OrdinalIgnoreCase));
+                var step = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly_progress.step", StringComparison.OrdinalIgnoreCase));
+                if (glb != null)
+                {
+                    var bytes = File.ReadAllBytes(glb.FullName);
+                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                        StratumArtifactKind.MeshGlb, $"assembly_progress_after_{subtaskIdx:D2}.glb", "model/gltf-binary", bytes,
+                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID });
+                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
+                }
+                if (step != null)
+                {
+                    var bytes = File.ReadAllBytes(step.FullName);
+                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                        StratumArtifactKind.StepCad, $"assembly_progress_after_{subtaskIdx:D2}.step", "model/step", bytes,
+                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID });
+                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
+                }
+            }
+            catch (Exception ex)
+            {
+                ctx.EmitThought($"Cumulative preview build threw: {ex.Message}");
+            }
+        }
+
+        private static string BuildCompositionScript(List<(string staged, ApprovedPart part)> entries, MechanicalBlueprint blueprint)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("import cadquery as cq");
+            sb.AppendLine("asm = cq.Assembly()");
+            int idx = 0;
+            foreach (var (staged, part) in entries)
+            {
+                idx++;
+                var slot = part.Slot ?? blueprint.Slots.FirstOrDefault(s => string.Equals(s.SubtaskTitle, part.Subtask.Title, StringComparison.OrdinalIgnoreCase));
+                double px = 0, py = 0, pz = 0, rx = 0, ry = 0, rz = 0;
+                if (slot != null)
+                {
+                    if (slot.WorldPosition != null && slot.WorldPosition.Length >= 3) { px = slot.WorldPosition[0]; py = slot.WorldPosition[1]; pz = slot.WorldPosition[2]; }
+                    if (slot.WorldRotationDeg != null && slot.WorldRotationDeg.Length >= 3) { rx = slot.WorldRotationDeg[0]; ry = slot.WorldRotationDeg[1]; rz = slot.WorldRotationDeg[2]; }
+                }
+                string safeName = SafeFileName(part.Subtask.Title).Replace(' ', '_');
+                sb.AppendLine($"shape_{idx} = cq.importers.importStep(r'{staged}')");
+
+                var instances = (slot?.Instances != null && slot.Instances.Count > 0) ? slot.Instances : new List<double[]> { new[] { px, py, pz } };
+                int instIdx = 0;
+                foreach (var inst in instances)
+                {
+                    instIdx++;
+                    double ix = inst.Length > 0 ? inst[0] : px;
+                    double iy = inst.Length > 1 ? inst[1] : py;
+                    double iz = inst.Length > 2 ? inst[2] : pz;
+                    double irx = inst.Length > 3 ? inst[3] : rx;
+                    double iry = inst.Length > 4 ? inst[4] : ry;
+                    double irz = inst.Length > 5 ? inst[5] : rz;
+                    sb.AppendLine($"asm.add(shape_{idx}, name='{safeName}_{instIdx}',");
+                    sb.AppendLine($"        loc=cq.Location(cq.Vector({ix.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {iy.ToString(System.Globalization.CultureInfo.InvariantCulture)}, {iz.ToString(System.Globalization.CultureInfo.InvariantCulture)}),");
+                    sb.AppendLine($"                        cq.Vector(0, 0, 1), {irz.ToString(System.Globalization.CultureInfo.InvariantCulture)}))");
+                    if (Math.Abs(irx) > 1e-6)
+                    {
+                        sb.AppendLine($"# X rotation {irx} deg requested — applied separately below");
+                    }
+                    if (Math.Abs(iry) > 1e-6)
+                    {
+                        sb.AppendLine($"# Y rotation {iry} deg requested — applied separately below");
+                    }
+                }
+            }
+            sb.AppendLine("result = asm");
+            sb.AppendLine();
+            sb.AppendLine("try:");
+            sb.AppendLine("    result.save('assembly_progress.step', 'STEP')");
+            sb.AppendLine("except Exception as e:");
+            sb.AppendLine("    print(f'STEP export failed: {e}')");
+            sb.AppendLine("try:");
+            sb.AppendLine("    result.save('assembly_progress.glb', 'GLTF')");
+            sb.AppendLine("except Exception as e:");
+            sb.AppendLine("    print(f'GLB export failed: {e}')");
+            return sb.ToString();
+        }
+
+        // ─────────── Prompt builders ───────────
+
+        private static string BuildBlueprintSystemPrompt() =>
+@"You are the Mechanical Assembly Planner inside Stratum.
+Before any 3D model is generated, your job is to lay out the WHOLE assembly in advance: where every part sits in world space, how big it is allowed to be, what shared origin everyone uses, and how each part mates to its neighbours. This plan is a contract — subsequent CAD generation will be constrained by it.
+
+OUTPUT FORMAT: respond with a SINGLE ```json fenced code block, nothing else. No prose. The JSON MUST match this schema exactly:
+
+{
+  ""deviceConcept"": string,
+  ""originConvention"": string,           // e.g. ""World origin at chassis geometric centre; +Z up; +X forward.""
+  ""assemblyStrategy"": string,            // concise reasoning paragraph: how the parts come together, mounting order, key constraints
+  ""slots"": [
+    {
+      ""subtaskTitle"": string,            // MUST match a planner subtask title verbatim
+      ""worldPosition"": [x, y, z],        // millimetres, world frame
+      ""worldRotationDeg"": [rx, ry, rz],  // Euler XYZ degrees
+      ""boundingBoxMm"": [dx, dy, dz],     // maximum extents the part is permitted to occupy
+      ""localOrigin"": string,             // where the part's own (0,0,0) is anchored, e.g. ""bottom-centre of mounting flange""
+      ""quantity"": integer,               // 1 unless the subtask describes multiple copies (legs/wheels)
+      ""instances"": [[x,y,z,rx,ry,rz], …],// optional: explicit per-copy poses when quantity>1
+      ""matingInterfaces"": [
+        { ""matesWith"": string,           // subtaskTitle of the neighbour
+          ""kind"": ""bolt-pattern""|""shaft""|""snap-fit""|""press-fit""|""slot"",
+          ""locationOnPart"": string,      // e.g. ""top face, centred""
+          ""spec"": string                  // e.g. ""4× M3 on 20 mm bolt circle, through-holes""
+        }
+      ],
+      ""reasoning"": string                // WHY this part lives here at this size with these interfaces
+    }
+  ]
+}
 
 Hard rules:
-- Output a single Python script in one ```python fenced block. NO prose.
-- Import: `import cadquery as cq`.
-- Build a `cq.Assembly` and assign it to a variable named exactly `result`.
-- For each part, use `cq.importers.importStep('part_000.step')` (etc.) — paths are relative to CWD.
-- Use `assembly.add(shape, name=..., loc=cq.Location(cq.Vector(x_mm, y_mm, z_mm), (ax, ay, az), angle_deg))` to place each part. Choose translations and rotations so the device makes mechanical sense given the device concept and part descriptions.
-- Use millimetres throughout. Place at most one copy of each named part unless the description explicitly says ""6 legs"", ""4 wheels"", etc. — in which case duplicate the imported shape with different transforms.
-- Do NOT call file I/O or write export code. The host appends the export footer.
-- The script must run in under 60 seconds.";
+- Every planner subtask MUST appear exactly once in `slots`.
+- Pick a single world origin and stick to it; describe it in `originConvention`.
+- Choose part sizes and positions so neighbouring parts do not interpenetrate and mating interfaces line up.
+- Mating interfaces must be reciprocated: if A bolts to B, B must list a matching interface mating with A.
+- Units are millimetres. Angles are degrees.
+- All numeric fields must be numbers, not strings.";
 
-        private static string BuildAssemblyPrompt(
-            StratumPlannerOutput plan, List<object> partRefs, string? focus, string previousReject, string lastScript)
+        private static string BuildBlueprintPrompt(StratumPlannerOutput plan, string? focus, string previousReject, string lastJson)
         {
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("DEVICE CONCEPT:");
             sb.AppendLine(plan.DeviceConcept);
             sb.AppendLine();
-            sb.AppendLine("APPROVED PARTS (each is a STEP file already in CWD):");
-            sb.AppendLine(JsonConvert.SerializeObject(partRefs, Formatting.Indented));
+            sb.AppendLine("MECHANICAL SUBTASKS TO LAY OUT (verbatim titles must appear in `slots[].subtaskTitle`):");
+            foreach (var t in plan.MechanicalSubtasks ?? new List<StratumPlannerSubtask>())
+            {
+                sb.AppendLine($"- {t.Title}: {t.Description}");
+                if (t.DependsOn != null && t.DependsOn.Count > 0)
+                    sb.AppendLine($"    (depends on: {string.Join(", ", t.DependsOn)})");
+            }
             if (!string.IsNullOrWhiteSpace(focus))
             {
                 sb.AppendLine();
-                sb.AppendLine("USER FOCUS:");
+                sb.AppendLine("USER FOCUS / EXTRA INSTRUCTIONS:");
                 sb.AppendLine(focus);
             }
             if (!string.IsNullOrWhiteSpace(previousReject))
             {
                 sb.AppendLine();
-                sb.AppendLine("USER FEEDBACK ON PREVIOUS ASSEMBLY (must be addressed):");
+                sb.AppendLine("USER / VALIDATOR FEEDBACK ON PREVIOUS BLUEPRINT (must be addressed):");
                 sb.AppendLine(previousReject);
-                sb.AppendLine();
-                sb.AppendLine("PREVIOUS SCRIPT:");
-                sb.AppendLine("```python");
-                sb.AppendLine(Tail(lastScript, 4000));
-                sb.AppendLine("```");
+                if (!string.IsNullOrWhiteSpace(lastJson))
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("PREVIOUS BLUEPRINT (for reference, refine it):");
+                    sb.AppendLine("```json");
+                    sb.AppendLine(Tail(lastJson, 4000));
+                    sb.AppendLine("```");
+                }
             }
             sb.AppendLine();
-            sb.AppendLine("Output the assembly script now.");
+            sb.AppendLine("Produce the full assembly blueprint JSON now.");
             return sb.ToString();
         }
 
-        private static string InjectAssemblyExportFooter(string script)
+        // Extracts the first ```json fenced block, or falls back to the raw text if it parses as JSON.
+        private static string ExtractJson(string raw)
         {
-            const string footer = @"
-
-# ─── Stratum auto-injected assembly export footer ───
-import cadquery as _cq_export
-try:
-    _result = result
-except NameError:
-    raise RuntimeError(""Stratum: assembly script must define a variable named 'result'"")
-
-if not isinstance(_result, _cq_export.Assembly):
-    _result = _cq_export.Assembly().add(_result, name='assembly_root')
-
-try:
-    _result.save('assembly.step', 'STEP')
-except Exception as _e_step:
-    print(f'STEP export failed: {_e_step}')
-
-try:
-    _result.save('assembly.glb', 'GLTF')
-except Exception as _e_glb:
-    print(f'GLB export failed: {_e_glb}')
-";
-            return script.TrimEnd() + footer;
+            if (string.IsNullOrWhiteSpace(raw)) return "";
+            int fence = raw.IndexOf("```", StringComparison.Ordinal);
+            if (fence >= 0)
+            {
+                int afterTag = raw.IndexOf('\n', fence);
+                if (afterTag > 0)
+                {
+                    int closeFence = raw.IndexOf("```", afterTag + 1, StringComparison.Ordinal);
+                    string inside = closeFence < 0 ? raw.Substring(afterTag + 1) : raw.Substring(afterTag + 1, closeFence - afterTag - 1);
+                    return inside.Trim();
+                }
+            }
+            // No fences: assume the LLM emitted bare JSON.
+            string trimmed = raw.Trim();
+            if (trimmed.StartsWith("{") && trimmed.EndsWith("}")) return trimmed;
+            return "";
         }
 
 
@@ -560,20 +728,44 @@ Hard rules:
 - Keep dimensions in millimetres. Use named parameters at the top of the script (e.g. `LENGTH = 80`).
 - Prefer assemblies (`cq.Assembly`) when the part has multiple bodies.
 - The host will append export code that writes STEP and GLB files. Do NOT write export calls yourself.
-- The script must run to completion in under 90 seconds on a normal CPU. Avoid extremely high-resolution fillets/lofts.";
+- The script must run to completion in under 90 seconds on a normal CPU. Avoid extremely high-resolution fillets/lofts.
+
+ASSEMBLY CONTEXT (CRITICAL):
+- You are designing ONE part of a larger assembly that has ALREADY been planned. The user-provided prompt will include the full assembly blueprint and your part's slot in it.
+- Model the part with its LOCAL origin at the location described by `localOrigin` in your slot (e.g. ""bottom-centre of mounting flange"" means the part's (0,0,0) should be at the centre of the bottom mounting flange).
+- Stay inside the slot's `boundingBoxMm` — do NOT exceed those extents.
+- IMPLEMENT every mating interface listed in the slot's `matingInterfaces` (bolt patterns, shafts, snap-fits, etc.) at the described location with the described spec. These are HOW your part connects to its neighbours; they are NOT optional.
+- Do NOT apply the world transform yourself; the host's composer applies world position/rotation when assembling.";
 
         private static string BuildScriptPrompt(
-            StratumPlannerOutput plan, StratumPlannerSubtask subtask, string? focus, string previousReject, string lastScript)
+            StratumPlannerOutput plan, MechanicalBlueprint blueprint, StratumPlannerSubtask subtask, MechanicalBlueprintSlot? slot, string? focus, string previousReject, string lastScript)
         {
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("DEVICE CONCEPT:");
             sb.AppendLine(plan.DeviceConcept);
             sb.AppendLine();
-            sb.AppendLine("CURRENT SUBTASK:");
+            sb.AppendLine("FULL ASSEMBLY BLUEPRINT (already approved — every part is designed against this contract):");
+            sb.AppendLine($"  Origin convention: {blueprint.OriginConvention}");
+            sb.AppendLine($"  Strategy: {blueprint.AssemblyStrategy}");
+            sb.AppendLine("  Slots:");
+            foreach (var s in blueprint.Slots)
+            {
+                string pos = $"({s.WorldPosition?[0]:0.#}, {s.WorldPosition?[1]:0.#}, {s.WorldPosition?[2]:0.#})";
+                string size = $"{s.BoundingBoxMm?[0]:0.#}×{s.BoundingBoxMm?[1]:0.#}×{s.BoundingBoxMm?[2]:0.#}";
+                sb.AppendLine($"    - {s.SubtaskTitle}: world {pos} mm, max {size} mm, origin = {s.LocalOrigin}, quantity {s.Quantity}");
+            }
+            sb.AppendLine();
+            sb.AppendLine("YOUR CURRENT SUBTASK:");
             sb.AppendLine($"Title: {subtask.Title}");
             sb.AppendLine($"Description: {subtask.Description}");
             if (subtask.DependsOn != null && subtask.DependsOn.Count > 0)
                 sb.AppendLine($"Depends on: {string.Join(", ", subtask.DependsOn)}");
+            if (slot != null)
+            {
+                sb.AppendLine();
+                sb.AppendLine("YOUR SLOT IN THE ASSEMBLY (you MUST conform to this):");
+                sb.AppendLine(JsonConvert.SerializeObject(slot, Formatting.Indented));
+            }
             if (!string.IsNullOrWhiteSpace(focus))
             {
                 sb.AppendLine();
@@ -592,7 +784,7 @@ Hard rules:
                 sb.AppendLine("```");
             }
             sb.AppendLine();
-            sb.AppendLine("Output the CadQuery script now.");
+            sb.AppendLine("Output the CadQuery script now. Remember: model in the LOCAL frame, stay inside the bounding box, implement every listed mating interface.");
             return sb.ToString();
         }
 
