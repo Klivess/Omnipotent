@@ -225,6 +225,11 @@ namespace Omnipotent.Services.Stratum
             if (!IsBootstrapped && !File.Exists(venvPython))
                 throw new InvalidOperationException("Python runner is not bootstrapped. Call EnsureBootstrappedAsync first.");
 
+            // Callers sometimes pass a project-relative path (e.g. "SavedData/Stratum/Work/...").
+            // We must hand Python an absolute script path AND an absolute working directory,
+            // otherwise Python resolves the relative script path against the CWD it just got
+            // assigned, producing a doubled path like "...\sub_xxx\SavedData\Stratum\...\sub_xxx\script.py".
+            workDir = Path.GetFullPath(workDir);
             Directory.CreateDirectory(workDir);
             string scriptPath = Path.Combine(workDir, "script.py");
             File.WriteAllText(scriptPath, scriptCode);
