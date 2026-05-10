@@ -198,5 +198,23 @@ namespace Omnipotent.Services.Stratum
             try { return JsonConvert.DeserializeObject<StratumApprovalGate>(File.ReadAllText(path)); }
             catch (Exception ex) { log($"Failed to load gate {gateID}: {ex.Message}"); return null; }
         }
+
+        /// <summary>Enumerate every persisted gate for a project. Used to detect already-approved work when resuming.</summary>
+        public List<StratumApprovalGate> ListGatesForProject(string projectID)
+        {
+            var list = new List<StratumApprovalGate>();
+            string dir = GatesDir(projectID);
+            if (!Directory.Exists(dir)) return list;
+            foreach (var f in Directory.EnumerateFiles(dir, "*.json"))
+            {
+                try
+                {
+                    var g = JsonConvert.DeserializeObject<StratumApprovalGate>(File.ReadAllText(f));
+                    if (g != null) list.Add(g);
+                }
+                catch (Exception ex) { log($"Failed to load gate file {f}: {ex.Message}"); }
+            }
+            return list;
+        }
     }
 }

@@ -58,13 +58,28 @@ namespace Omnipotent.Services.Stratum
             string? focus = string.IsNullOrWhiteSpace(ctx.Run.UserPrompt) ? null : ctx.Run.UserPrompt;
 
             // 4. Iterate subtasks. Each subtask is its own LLM-driven design loop.
+            //    If a previous Mechanical run on this project already produced an approved
+            //    STEP for a given subtask, reuse it instead of re-designing — this lets the
+            //    user pick up after a crash / restart / cancel without losing all their work.
             string sessionId = $"stratum-mechanical-{ctx.Run.RunID}";
             int subtaskIdx = 0;
             var approvedParts = new List<ApprovedPart>();
+            var alreadyApproved = FindApprovedStepsByPriorRuns(ctx);
             foreach (var subtask in plan.MechanicalSubtasks)
             {
                 ctx.Cancellation.ThrowIfCancellationRequested();
                 subtaskIdx++;
+                if (alreadyApproved.TryGetValue(subtask.Title, out var reused))
+                {
+                    ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — reusing previously approved part.");
+                    approvedParts.Add(new ApprovedPart
+                    {
+                        Subtask = subtask,
+                        StepArtifactID = reused.ArtifactID,
+                        StepFileName = reused.FileName,
+                    });
+                    continue;
+                }
                 ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: {subtask.Title}");
                 var partResult = await DesignSubtaskAsync(ctx, llm, sessionId, plan, subtask, subtaskIdx, focus);
                 if (partResult != null) approvedParts.Add(partResult);
@@ -497,6 +512,40 @@ except Exception as _e_glb:
                 catch { return null; }
             }
             return null;
+        }
+
+        /// <summary>
+        /// Walks every approved gate in this project and finds StepCad artifacts whose
+        /// metadata `subtask` matches a planner subtask title. The most recent approved
+        /// step wins. Used so a new Mechanical run can pick up where a crashed/interrupted
+        /// one left off, skipping subtasks the user has already approved.
+        /// </summary>
+        private static Dictionary<string, StratumArtifact> FindApprovedStepsByPriorRuns(StratumAgentContext ctx)
+        {
+            var result = new Dictionary<string, StratumArtifact>(StringComparer.OrdinalIgnoreCase);
+            var project = ctx.Parent.Storage.GetProject(ctx.Run.ProjectID);
+            if (project == null) return result;
+
+            // Build a quick artifact index by ID.
+            var artById = new Dictionary<string, StratumArtifact>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rev in project.Revisions)
+                foreach (var a in rev.Artifacts) artById[a.ArtifactID] = a;
+
+            var gates = ctx.RunStore.ListGatesForProject(ctx.Run.ProjectID)
+                .Where(g => g.Status == StratumGateStatus.Approved)
+                .OrderBy(g => g.ResolvedAt ?? g.OpenedAt);
+            foreach (var gate in gates)
+            {
+                foreach (var artID in gate.ProposalArtifactIDs)
+                {
+                    if (!artById.TryGetValue(artID, out var art)) continue;
+                    if (art.Kind != StratumArtifactKind.StepCad) continue;
+                    if (!art.Metadata.TryGetValue("subtask", out var subtaskTitle) || string.IsNullOrWhiteSpace(subtaskTitle)) continue;
+                    // Most-recent approval wins (OrderBy ascending → later overwrites earlier).
+                    result[subtaskTitle] = art;
+                }
+            }
+            return result;
         }
 
         private static string BuildSystemPrompt() =>
