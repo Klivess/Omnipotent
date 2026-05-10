@@ -60,19 +60,30 @@ namespace Omnipotent.Services.Stratum
             // 4. Iterate subtasks. Each subtask is its own LLM-driven design loop.
             string sessionId = $"stratum-mechanical-{ctx.Run.RunID}";
             int subtaskIdx = 0;
+            var approvedParts = new List<ApprovedPart>();
             foreach (var subtask in plan.MechanicalSubtasks)
             {
                 ctx.Cancellation.ThrowIfCancellationRequested();
                 subtaskIdx++;
                 ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: {subtask.Title}");
-                await DesignSubtaskAsync(ctx, llm, sessionId, plan, subtask, subtaskIdx, focus);
+                var partResult = await DesignSubtaskAsync(ctx, llm, sessionId, plan, subtask, subtaskIdx, focus);
+                if (partResult != null) approvedParts.Add(partResult);
+            }
+
+            // 5. Final assembly pass — combine the approved parts into one positioned model so the
+            //    user can actually see how the device fits together. Skipped if there is only a
+            //    single approved part (assembly would be identical to the part itself).
+            if (approvedParts.Count >= 2)
+            {
+                ctx.EmitStatus("Composing final mechanical assembly…");
+                await AssembleAsync(ctx, llm, sessionId, plan, approvedParts, focus);
             }
 
             ctx.EmitStatus("All mechanical subtasks completed.");
         }
 
         // ── per-subtask iterative loop ──
-        private async Task DesignSubtaskAsync(
+        private async Task<ApprovedPart?> DesignSubtaskAsync(
             StratumAgentContext ctx,
             KliveLLM.KliveLLM llm,
             string sessionId,
@@ -124,6 +135,8 @@ namespace Omnipotent.Services.Stratum
 
                 var producedArtifactIDs = new List<string>();
                 string baseName = SafeFileName($"{subtask.Title.Replace(' ', '_')}_v{iter + 1}");
+                string? approvedStepArtifactID = null;
+                string? approvedStepFileName = null;
 
                 if (stepFile != null)
                 {
@@ -132,6 +145,8 @@ namespace Omnipotent.Services.Stratum
                         StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes,
                         new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
                     producedArtifactIDs.Add(art.ArtifactID);
+                    approvedStepArtifactID = art.ArtifactID;
+                    approvedStepFileName = art.FileName;
                     ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
                 }
                 if (glbFile != null)
@@ -178,7 +193,16 @@ namespace Omnipotent.Services.Stratum
                 if (resolution.Decision == StratumGateDecision.Approve)
                 {
                     ctx.EmitStatus($"Subtask '{subtask.Title}' approved.");
-                    return;
+                    if (approvedStepArtifactID != null && approvedStepFileName != null)
+                    {
+                        return new ApprovedPart
+                        {
+                            Subtask = subtask,
+                            StepArtifactID = approvedStepArtifactID,
+                            StepFileName = approvedStepFileName,
+                        };
+                    }
+                    return null;
                 }
                 previousReject = resolution.Comment ?? "";
                 ctx.EmitThought($"Rejected. Refining based on user feedback: {Tail(previousReject, 200)}");
@@ -221,6 +245,232 @@ namespace Omnipotent.Services.Stratum
         }
 
         // ── helpers ──
+
+        private sealed class ApprovedPart
+        {
+            public StratumPlannerSubtask Subtask { get; set; } = new();
+            public string StepArtifactID { get; set; } = "";
+            public string StepFileName { get; set; } = "";
+        }
+
+        // ── final assembly composition ──
+        private async Task AssembleAsync(
+            StratumAgentContext ctx,
+            KliveLLM.KliveLLM llm,
+            string sessionId,
+            StratumPlannerOutput plan,
+            List<ApprovedPart> parts,
+            string? focus)
+        {
+            string asmSession = $"{sessionId}-assembly";
+
+            // Stage every approved STEP file into a fresh work directory so the script can
+            // reference them by stable, predictable relative paths (part_000.step, part_001.step…).
+            string workDir = Path.GetFullPath(Path.Combine(OmniPaths.GlobalPaths.StratumWorkDirectory, ctx.Run.RunID, $"asm_{Guid.NewGuid():N}"));
+            Directory.CreateDirectory(workDir);
+
+            var partRefs = new List<object>();
+            for (int i = 0; i < parts.Count; i++)
+            {
+                var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, parts[i].StepArtifactID);
+                if (resolved == null || !File.Exists(resolved.Value.blobPath))
+                {
+                    ctx.EmitThought($"Skipping assembly — part '{parts[i].Subtask.Title}' STEP missing on disk.");
+                    return;
+                }
+                string stagedName = $"part_{i:D3}.step";
+                File.Copy(resolved.Value.blobPath, Path.Combine(workDir, stagedName), overwrite: true);
+                partRefs.Add(new
+                {
+                    index = i,
+                    stagedFile = stagedName,
+                    title = parts[i].Subtask.Title,
+                    description = parts[i].Subtask.Description,
+                    dependsOn = parts[i].Subtask.DependsOn ?? new List<string>(),
+                });
+            }
+
+            string previousReject = "";
+            string lastScript = "";
+
+            for (int iter = 0; iter < MaxIterationsPerSubtask; iter++)
+            {
+                ctx.Cancellation.ThrowIfCancellationRequested();
+                ctx.EmitStatus($"Assembly composition — iteration {iter + 1}");
+
+                string userPrompt = BuildAssemblyPrompt(plan, partRefs, focus, previousReject, lastScript);
+                string? systemPrompt = iter == 0 ? BuildAssemblySystemPrompt() : null;
+
+                ctx.EmitThought("Generating assembly script…");
+                var resp = await llm.QueryLLM(userPrompt, asmSession, systemPrompt: systemPrompt);
+                if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
+                {
+                    ctx.EmitThought($"Assembly LLM call failed: {resp.ErrorMessage}");
+                    return;
+                }
+                string script = ExtractPythonCode(resp.Response);
+                if (string.IsNullOrWhiteSpace(script))
+                {
+                    ctx.EmitThought("Assembly LLM did not return a Python script. Skipping assembly.");
+                    return;
+                }
+                script = InjectAssemblyExportFooter(script);
+                lastScript = script;
+
+                // Execute the assembly script directly in the staged workDir so importStep('part_000.step') resolves.
+                ctx.EmitThought($"Executing assembly script (attempt {iter + 1})…");
+                var result = await pythonRunner.RunScriptAsync(script, workDir, ScriptTimeout, _ => { }, ctx.Cancellation);
+
+                if (!result.Success)
+                {
+                    if (iter < MaxIterationsPerSubtask - 1)
+                    {
+                        ctx.EmitThought($"Assembly script failed (exit {result.ExitCode}). Asking LLM to repair.");
+                        var repair = await llm.QueryLLM(
+                            "The assembly script failed. STDERR (truncated):\n" + Tail(result.Stderr, 1500)
+                            + "\n\nOutput ONLY a corrected complete script in a single ```python block.",
+                            asmSession);
+                        string repaired = ExtractPythonCode(repair.Response);
+                        if (!string.IsNullOrWhiteSpace(repaired)) lastScript = InjectAssemblyExportFooter(repaired);
+                        previousReject = "";
+                        continue;
+                    }
+                    ctx.EmitThought($"Assembly failed after retries: {Tail(result.Stderr, 600)}");
+                    return;
+                }
+
+                var asmStep = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly.step", StringComparison.OrdinalIgnoreCase));
+                var asmGlb = result.ProducedFiles.FirstOrDefault(f => f.Name.Equals("assembly.glb", StringComparison.OrdinalIgnoreCase));
+                if (asmStep == null && asmGlb == null)
+                {
+                    ctx.EmitThought("Assembly script ran but emitted no assembly.step or assembly.glb. Skipping.");
+                    return;
+                }
+
+                var producedArtifactIDs = new List<string>();
+                string baseName = "assembly_v" + (iter + 1);
+                if (asmStep != null)
+                {
+                    var bytes = File.ReadAllBytes(asmStep.FullName);
+                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes,
+                        new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    producedArtifactIDs.Add(art.ArtifactID);
+                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
+                }
+                if (asmGlb != null)
+                {
+                    var bytes = File.ReadAllBytes(asmGlb.FullName);
+                    var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                        StratumArtifactKind.MeshGlb, $"{baseName}.glb", "model/gltf-binary", bytes,
+                        new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    producedArtifactIDs.Add(art.ArtifactID);
+                    ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
+                }
+                var scriptArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                    StratumArtifactKind.CadQueryScript, $"{baseName}.cq.py", "text/x-python",
+                    System.Text.Encoding.UTF8.GetBytes(lastScript),
+                    new Dictionary<string, string> { ["role"] = "assembly", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                producedArtifactIDs.Add(scriptArt.ArtifactID);
+                ctx.EmitArtifact(scriptArt.ArtifactID, scriptArt.FileName, scriptArt.Kind.ToString());
+
+                var proposal = new
+                {
+                    role = "assembly",
+                    iteration = iter + 1,
+                    parts = partRefs,
+                    files = new { step = asmStep?.Name, glb = asmGlb?.Name, script = $"{baseName}.cq.py" },
+                };
+                var resolution = await ctx.OpenGateAndWait(
+                    title: $"Approve mechanical assembly (v{iter + 1})",
+                    description: "The Mechanical Agent has positioned every approved part into a single combined model. Inspect the assembly GLB and confirm the layout — reject with a comment to adjust spacing/orientation.",
+                    rationale: "Combined assembly of: " + string.Join(", ", parts.Select(p => p.Subtask.Title)),
+                    proposalObject: proposal,
+                    proposalArtifactIDs: producedArtifactIDs);
+
+                if (resolution.Decision == StratumGateDecision.Approve)
+                {
+                    ctx.EmitStatus("Mechanical assembly approved.");
+                    return;
+                }
+                previousReject = resolution.Comment ?? "";
+                ctx.EmitThought($"Assembly rejected. Refining: {Tail(previousReject, 200)}");
+            }
+            ctx.EmitThought("Assembly did not converge within iteration budget.");
+        }
+
+        private static string BuildAssemblySystemPrompt() =>
+@"You are the Mechanical Assembly composer in Stratum.
+Each input part is a STEP file already on disk in the working directory. Your job is to import them all and place them in 3D space relative to each other so that the device looks correctly assembled.
+
+Hard rules:
+- Output a single Python script in one ```python fenced block. NO prose.
+- Import: `import cadquery as cq`.
+- Build a `cq.Assembly` and assign it to a variable named exactly `result`.
+- For each part, use `cq.importers.importStep('part_000.step')` (etc.) — paths are relative to CWD.
+- Use `assembly.add(shape, name=..., loc=cq.Location(cq.Vector(x_mm, y_mm, z_mm), (ax, ay, az), angle_deg))` to place each part. Choose translations and rotations so the device makes mechanical sense given the device concept and part descriptions.
+- Use millimetres throughout. Place at most one copy of each named part unless the description explicitly says ""6 legs"", ""4 wheels"", etc. — in which case duplicate the imported shape with different transforms.
+- Do NOT call file I/O or write export code. The host appends the export footer.
+- The script must run in under 60 seconds.";
+
+        private static string BuildAssemblyPrompt(
+            StratumPlannerOutput plan, List<object> partRefs, string? focus, string previousReject, string lastScript)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("DEVICE CONCEPT:");
+            sb.AppendLine(plan.DeviceConcept);
+            sb.AppendLine();
+            sb.AppendLine("APPROVED PARTS (each is a STEP file already in CWD):");
+            sb.AppendLine(JsonConvert.SerializeObject(partRefs, Formatting.Indented));
+            if (!string.IsNullOrWhiteSpace(focus))
+            {
+                sb.AppendLine();
+                sb.AppendLine("USER FOCUS:");
+                sb.AppendLine(focus);
+            }
+            if (!string.IsNullOrWhiteSpace(previousReject))
+            {
+                sb.AppendLine();
+                sb.AppendLine("USER FEEDBACK ON PREVIOUS ASSEMBLY (must be addressed):");
+                sb.AppendLine(previousReject);
+                sb.AppendLine();
+                sb.AppendLine("PREVIOUS SCRIPT:");
+                sb.AppendLine("```python");
+                sb.AppendLine(Tail(lastScript, 4000));
+                sb.AppendLine("```");
+            }
+            sb.AppendLine();
+            sb.AppendLine("Output the assembly script now.");
+            return sb.ToString();
+        }
+
+        private static string InjectAssemblyExportFooter(string script)
+        {
+            const string footer = @"
+
+# ─── Stratum auto-injected assembly export footer ───
+import cadquery as _cq_export
+try:
+    _result = result
+except NameError:
+    raise RuntimeError(""Stratum: assembly script must define a variable named 'result'"")
+
+if not isinstance(_result, _cq_export.Assembly):
+    _result = _cq_export.Assembly().add(_result, name='assembly_root')
+
+try:
+    _result.save('assembly.step', 'STEP')
+except Exception as _e_step:
+    print(f'STEP export failed: {_e_step}')
+
+try:
+    _result.save('assembly.glb', 'GLTF')
+except Exception as _e_glb:
+    print(f'GLB export failed: {_e_glb}')
+";
+            return script.TrimEnd() + footer;
+        }
+
 
         private static StratumPlannerOutput? LoadLatestPlan(StratumAgentContext ctx)
         {
