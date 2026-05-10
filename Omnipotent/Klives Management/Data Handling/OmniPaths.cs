@@ -147,6 +147,17 @@ namespace Omnipotent.Data_Handling
             public static string OmniDefenceDirectory = $"{SavedDataDirectory}/OmniDefence";
             public static string OmniDefenceDatabaseFile = $"{OmniDefenceDirectory}/omnidefence.db";
 
+            //Stratum (agentic CAD platform)
+            public static string StratumDirectory = $"{SavedDataDirectory}/Stratum";
+            public static string StratumProjectsDirectory = $"{StratumDirectory}/Projects";
+            public static string StratumArtifactsDirectory = $"{StratumDirectory}/Artifacts";
+            public static string StratumAttachmentsDirectory = $"{StratumDirectory}/Attachments";
+            public static string StratumMetadataFile = $"{StratumDirectory}/stratum_index.json";
+            public static string StratumWorkDirectory = $"{StratumDirectory}/Work";
+            public static string StratumPythonDirectory = $"{StratumDirectory}/Python";
+            public static string StratumToolsDirectory = $"{StratumDirectory}/Tools";
+            public static string StratumRunsDirectory = $"{StratumDirectory}/Runs";
+
         };
 
         public static string GetPath(string path)
