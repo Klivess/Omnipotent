@@ -89,8 +89,57 @@ namespace Omnipotent.Services.Stratum
                 if (instExit != 0) throw new Exception($"pip install failed: {instErr}");
 
                 progress("Verifying CadQuery import…");
-                var (vExit, vOut, vErr) = await RunAsync(venvPython, new[] { "-c", "import cadquery; print(cadquery.__version__)" }, null, TimeSpan.FromMinutes(1), null, ct);
-                if (vExit != 0) throw new Exception($"CadQuery import failed: {vErr}");
+                var (vExit, vOut, vErr) = await RunAsync(
+                    venvPython,
+                    new[] { "-c", "import sys, cadquery; print('cq', cadquery.__version__); print('py', sys.version)" },
+                    null, TimeSpan.FromMinutes(1),
+                    line => progress($"verify: {line}"),
+                    line => progress($"verify[stderr]: {line}"),
+                    ct);
+
+                // Auto-remediation: cadquery-ocp wheels for Python 3.9 are built against the
+                // numpy 1.x C ABI. If pip's solver pulled numpy 2.x anyway (because the user's
+                // requirements.txt was stale, or a transitive constraint relaxed it), downgrade
+                // numpy in-place and retry the import once before giving up.
+                if (vExit != 0)
+                {
+                    progress("Import failed — checking installed numpy version…");
+                    var (npExit, npOut, _) = await RunAsync(
+                        venvPython,
+                        new[] { "-c", "import numpy; print(numpy.__version__)" },
+                        null, TimeSpan.FromSeconds(30), null, null, ct);
+                    string npVer = (npOut ?? "").Trim();
+                    if (npExit == 0 && npVer.StartsWith("2."))
+                    {
+                        progress($"Detected numpy {npVer} (incompatible with cadquery-ocp 7.7.x on Python 3.9). Downgrading to numpy<2…");
+                        var (fixExit, _, fixErr) = await RunAsync(
+                            venvPython,
+                            new[] { "-m", "pip", "install", "--upgrade", "--force-reinstall", "numpy<2" },
+                            null, TimeSpan.FromMinutes(5),
+                            line => progress($"pip: {line}"),
+                            line => progress($"pip[stderr]: {line}"),
+                            ct);
+                        if (fixExit != 0) throw new Exception($"numpy downgrade failed: {fixErr}");
+
+                        progress("Retrying CadQuery import…");
+                        (vExit, vOut, vErr) = await RunAsync(
+                            venvPython,
+                            new[] { "-c", "import sys, cadquery; print('cq', cadquery.__version__); print('py', sys.version)" },
+                            null, TimeSpan.FromMinutes(1),
+                            line => progress($"verify: {line}"),
+                            line => progress($"verify[stderr]: {line}"),
+                            ct);
+                    }
+                }
+
+                if (vExit != 0)
+                {
+                    string detail = (vErr?.Trim().Length > 0 ? vErr : vOut)?.Trim() ?? "(no output)";
+                    throw new Exception(
+                        $"CadQuery import failed (exit {vExit}). The venv installed but Python could not load cadquery/cadquery-ocp.\n" +
+                        $"Most common causes on Windows: (1) Python 3.9 mixed with numpy 2.x (try Python 3.11/3.12), (2) missing VC++ runtime, (3) cadquery-ocp wheel/Python ABI mismatch.\n" +
+                        $"Diagnostics:\n{detail}");
+                }
                 progress($"CadQuery {vOut.Trim()} ready.");
                 bootstrapped = true;
             }
@@ -315,10 +364,12 @@ namespace Omnipotent.Services.Stratum
 
         private static string BuildRequirements() =>
             // CadQuery wheel ships with OCP (OpenCascade) and trame deps. Pin minor versions.
+            // Numpy is pinned <2 because CadQuery 2.5.x + cadquery-ocp 7.7.x have ABI
+            // incompatibilities with numpy 2.x on Python 3.9 (DLL load / import failure).
             string.Join("\n", new[]
             {
                 "cadquery>=2.4,<3.0",
-                "numpy>=1.24",
+                "numpy>=1.24,<2.0",
                 // Newer cadquery uses cadquery-ocp; let pip resolve it.
             }) + "\n";
 
@@ -335,8 +386,13 @@ namespace Omnipotent.Services.Stratum
             return (p.ExitCode, stdoutTask.GetAwaiter().GetResult(), stderrTask.GetAwaiter().GetResult());
         }
 
-        private static async Task<(int exit, string stdout, string stderr)> RunAsync(
+        private static Task<(int exit, string stdout, string stderr)> RunAsync(
             string exe, string[] args, string? workDir, TimeSpan timeout, Action<string>? onStdoutLine, CancellationToken ct)
+            => RunAsync(exe, args, workDir, timeout, onStdoutLine, null, ct);
+
+        private static async Task<(int exit, string stdout, string stderr)> RunAsync(
+            string exe, string[] args, string? workDir, TimeSpan timeout,
+            Action<string>? onStdoutLine, Action<string>? onStderrLine, CancellationToken ct)
         {
             using var p = StartProcess(exe, args, workDir);
             var stdoutSb = new System.Text.StringBuilder();
@@ -354,6 +410,7 @@ namespace Omnipotent.Services.Stratum
             {
                 if (e.Data == null) { stderrDone.TrySetResult(true); return; }
                 stderrSb.AppendLine(e.Data);
+                try { onStderrLine?.Invoke(e.Data); } catch { }
             };
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();

@@ -8,8 +8,13 @@ namespace Omnipotent.Services.Stratum
     /// </summary>
     internal static class ProcessRunner
     {
-        public static async Task<(int exit, string stdout, string stderr)> RunAsync(
+        public static Task<(int exit, string stdout, string stderr)> RunAsync(
             string exe, string[] args, string? workDir, TimeSpan timeout, Action<string>? onStdoutLine, CancellationToken ct)
+            => RunAsync(exe, args, workDir, timeout, onStdoutLine, null, ct);
+
+        public static async Task<(int exit, string stdout, string stderr)> RunAsync(
+            string exe, string[] args, string? workDir, TimeSpan timeout,
+            Action<string>? onStdoutLine, Action<string>? onStderrLine, CancellationToken ct)
         {
             var psi = new ProcessStartInfo
             {
@@ -38,6 +43,7 @@ namespace Omnipotent.Services.Stratum
             {
                 if (e.Data == null) { stderrDone.TrySetResult(true); return; }
                 stderrSb.AppendLine(e.Data);
+                try { onStderrLine?.Invoke(e.Data); } catch { }
             };
             p.BeginOutputReadLine();
             p.BeginErrorReadLine();
