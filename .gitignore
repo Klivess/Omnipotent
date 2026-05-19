@@ -6,6 +6,8 @@
 #Klive Files
 SyncAndStartOmnipotent.bat
 serverBuild/
+.claude/
+*.lscache
 
 # User-specific files
 *.rsuser
@@ -407,3 +409,4 @@ agent_test_results_utf8.txt
 agent_test_results.txt
 agent_benchmark.ps1
 agent_benchmark_tier2.ps1
+Omnipotent.Tests/Omnipotent.Tests.csproj.lscache

@@ -104,6 +104,35 @@ namespace Omnipotent.Services.OmniDefence
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
+            // Single request detail (full body, headers, query, etc.)
+            await parent.CreateAPIRoute("/omnidefence/request", async req =>
+            {
+                string? rawId = req.userParameters.Get("id");
+                if (string.IsNullOrWhiteSpace(rawId) || !long.TryParse(rawId, out long id) || id <= 0)
+                {
+                    await req.ReturnResponse("Missing or invalid id", "text/plain", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+                var row = await parent.Store.GetRequestByIdAsync(id);
+                if (row == null)
+                {
+                    await req.ReturnResponse("Request not found", "text/plain", null, HttpStatusCode.NotFound);
+                    return;
+                }
+                // Decode headers_json so the client receives a parsed object alongside the raw JSON.
+                Dictionary<string, string>? headers = null;
+                if (row.TryGetValue("headers_json", out var hdrsRaw) && hdrsRaw is string hdrsStr && !string.IsNullOrWhiteSpace(hdrsStr))
+                {
+                    try { headers = JsonConvert.DeserializeObject<Dictionary<string, string>>(hdrsStr); }
+                    catch { headers = null; }
+                }
+                var resp = new Dictionary<string, object?>(row)
+                {
+                    ["headers"] = headers
+                };
+                await req.ReturnResponse(JsonConvert.SerializeObject(resp), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+
             // Auth events
             await parent.CreateAPIRoute("/omnidefence/auth-events", async req =>
             {

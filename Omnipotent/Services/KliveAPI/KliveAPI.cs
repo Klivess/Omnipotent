@@ -521,6 +521,46 @@ namespace Omnipotent.Services.KliveAPI
             return await profileManager.GetProfileByPassword(password);
         }
 
+        private static readonly HashSet<string> SensitiveHeaderNames = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "Authorization", "Cookie", "Set-Cookie", "Proxy-Authorization"
+        };
+
+        private static string? CaptureHeadersJson(HttpListenerRequest req)
+        {
+            try
+            {
+                if (req?.Headers == null || req.Headers.Count == 0) return null;
+                var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string key in req.Headers.AllKeys)
+                {
+                    if (string.IsNullOrEmpty(key)) continue;
+                    string raw = req.Headers[key] ?? string.Empty;
+                    if (SensitiveHeaderNames.Contains(key))
+                    {
+                        dict[key] = string.IsNullOrEmpty(raw) ? "[empty]" : "[REDACTED:" + raw.Length + "]";
+                    }
+                    else
+                    {
+                        if (raw.Length > 4096) raw = raw.Substring(0, 4096) + "...[truncated]";
+                        dict[key] = raw;
+                    }
+                }
+                string json = JsonConvert.SerializeObject(dict);
+                if (json.Length > 32768) json = json.Substring(0, 32768);
+                return json;
+            }
+            catch { return null; }
+        }
+
+        private static (string? text, bool truncated) TruncateBodyForStorage(byte[]? bodyBytes, string? bodyText, int maxBytes)
+        {
+            if (bodyBytes == null || bodyBytes.Length == 0) return (null, false);
+            if (bodyBytes.Length <= maxBytes) return (bodyText ?? string.Empty, false);
+            string truncated = Encoding.UTF8.GetString(bodyBytes, 0, maxBytes);
+            return (truncated, true);
+        }
+
         private async Task<(byte[] BodyBytes, string BodyText)> ReadRequestBodyAsync(HttpListenerRequest req)
         {
             if (!req.HasEntityBody || !CanRequestCarryBody(req.HttpMethod))
@@ -598,6 +638,10 @@ namespace Omnipotent.Services.KliveAPI
             bool defenceFromWebsite = false;
             RequestOutcome defenceOutcome = RequestOutcome.Success;
             bool defenceSkipRecord = false;
+            string? defenceBodyText = null;
+            bool defenceBodyTruncated = false;
+            string? defenceHeadersJson = null;
+            const int MaxStoredBodyBytes = 65536; // 64KB cap for stored body text
 
             try
             {
@@ -611,6 +655,7 @@ namespace Omnipotent.Services.KliveAPI
                 defenceQueryString = query;
                 defenceFromWebsite = IsWebsiteClientRequest(req);
                 defenceClientPage = req.Headers["X-Klive-Page"] ?? req.Headers["Referer"];
+                defenceHeadersJson = CaptureHeadersJson(req);
                 string defenceAuthHeader = req.Headers["Authorization"] ?? string.Empty;
                 defenceRequestOrigin = defenceFromWebsite ? (string.IsNullOrWhiteSpace(defenceAuthHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile") : "DirectApi";
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
@@ -741,6 +786,7 @@ namespace Omnipotent.Services.KliveAPI
                         (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req);
                         defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
                         defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
+                        (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(request.userMessageBytes, request.userMessageContent, MaxStoredBodyBytes);
                     }
 
                     bool isUserNull = request.user == null;
@@ -835,6 +881,17 @@ namespace Omnipotent.Services.KliveAPI
                 else
                 {
                     defenceOutcome = RequestOutcome.NotFound;
+                    if (CanRequestCarryBody(req.HttpMethod))
+                    {
+                        try
+                        {
+                            var (bodyBytes, bodyText) = await ReadRequestBodyAsync(req);
+                            defenceBodyLength = bodyBytes?.LongLength ?? 0;
+                            defenceBodyHash = OmniDefenceService.HashBody(bodyBytes ?? Array.Empty<byte>());
+                            (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(bodyBytes, bodyText, MaxStoredBodyBytes);
+                        }
+                        catch { }
+                    }
                     await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
             }
@@ -909,7 +966,10 @@ namespace Omnipotent.Services.KliveAPI
                                 UserAgent = defenceUserAgent,
                                 DenyReason = defenceDenyReason,
                                 RequestOrigin = defenceRequestOrigin,
-                                ClientPage = defenceClientPage
+                                ClientPage = defenceClientPage,
+                                BodyText = defenceBodyText,
+                                BodyTruncated = defenceBodyTruncated,
+                                HeadersJson = defenceHeadersJson
                             };
                             _ = defence.RecordRequestAsync(row, defenceOutcome);
                         }

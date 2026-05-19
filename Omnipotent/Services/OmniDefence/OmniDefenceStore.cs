@@ -174,6 +174,9 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("requests", "request_origin", "TEXT");
             await EnsureColumnAsync("requests", "client_page", "TEXT");
             await EnsureColumnAsync("requests", "profile_rank", "INTEGER");
+            await EnsureColumnAsync("requests", "body_text", "TEXT");
+            await EnsureColumnAsync("requests", "body_truncated", "INTEGER");
+            await EnsureColumnAsync("requests", "headers_json", "TEXT");
             await EnsureColumnAsync("ip_records", "latitude", "REAL");
             await EnsureColumnAsync("ip_records", "longitude", "REAL");
             await EnsureColumnAsync("ip_records", "city", "TEXT");
@@ -238,8 +241,8 @@ namespace Omnipotent.Services.OmniDefence
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"INSERT INTO requests
-                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page)
-                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page)";
+                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page, body_text, body_truncated, headers_json)
+                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page,$btext,$btrunc,$hdrs)";
             cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);
             cmd.Parameters.AddWithValue("$ip", (object?)row.Ip ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$method", (object?)row.Method ?? DBNull.Value);
@@ -258,7 +261,26 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$deny", (object?)row.DenyReason ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$origin", (object?)row.RequestOrigin ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$page", (object?)row.ClientPage ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$btext", (object?)row.BodyText ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$btrunc", row.BodyTruncated ? 1 : 0);
+            cmd.Parameters.AddWithValue("$hdrs", (object?)row.HeadersJson ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync();
+        });
+
+        public Task<Dictionary<string, object?>?> GetRequestByIdAsync(long id) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT * FROM requests WHERE id=$id";
+            cmd.Parameters.AddWithValue("$id", id);
+            using var rdr = await cmd.ExecuteReaderAsync();
+            if (!await rdr.ReadAsync()) return null;
+            var row = new Dictionary<string, object?>(rdr.FieldCount);
+            for (int i = 0; i < rdr.FieldCount; i++)
+            {
+                var v = rdr.GetValue(i);
+                row[rdr.GetName(i)] = v is DBNull ? null : v;
+            }
+            return row;
         });
 
         public Task InsertAuthEventAsync(AuthEventRow row) => WithLockAsync(async conn =>
@@ -602,6 +624,9 @@ namespace Omnipotent.Services.OmniDefence
         public string? DenyReason;
         public string? RequestOrigin;
         public string? ClientPage;
+        public string? BodyText;
+        public bool BodyTruncated;
+        public string? HeadersJson;
     }
 
     public class AuthEventRow
