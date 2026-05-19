@@ -14,7 +14,7 @@ The project spans financial automation, passive intelligence gathering, social m
 
 ## Dashboard
 
-![Klives Management Dashboard](https://github.com/user-attachments/assets/339f961b-7522-4264-9b8e-2c9dfe9d9a45)
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/89f66e02-b109-4b29-91f0-2652c61c916b" />
 
 ---
 
@@ -39,14 +39,10 @@ The project spans financial automation, passive intelligence gathering, social m
 | OmniTrader | Simulator | Backtesting and strategy deployment engine for live exchange trading. Simulation mode with full analytics. Live deployment planned. |
 | OmniTube Bot | Planned | Full YouTube content automation — production, upload scheduling, and channel strategy optimisation. |
 
-![CS2 Arbitrage Page](https://github.com/user-attachments/assets/22e4b7e8-6a2c-494e-85fb-740b83a714a6)
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/8c1bbbbc-2be5-4c4e-8c01-4c90c7efc411" />
 
 **OmniDefence** — Real-time API security telemetry with threat profiling, IP reputation scoring, honeypots, and response tooling.
-
-- 109,000+ requests processed in 24h, 8,100+ denied
-- 304 tracked IP addresses, 283 flagged as attackers
-- Live world map of request origins with box-select blocking
-- Auth failure monitoring and tarpit support
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/d2f8c6ac-0f42-49ad-869a-8b8f1c8ae8ba" />
 
 ---
 
@@ -63,10 +59,8 @@ The project spans financial automation, passive intelligence gathering, social m
 **KliveTools** — General-purpose utilities.
 
 **Stratum** — Agentic mechatronics design studio. Each hardware project lives here with revision history, attachments, and AI-assisted design workflows.
+<img width="1919" height="1079" alt="image" src="https://github.com/user-attachments/assets/a169ed29-6ce9-4954-832d-db2f1857507d" />
 
-![KliveTech Page](https://github.com/user-attachments/assets/c9e7c080-f4d1-4cc4-b757-ec7626f1c5da)
-
-![Meme Scraper Page](https://github.com/user-attachments/assets/7cef03f0-c681-4fa4-b4ca-6e2068b33163)
 
 ---
 
@@ -84,16 +78,11 @@ The project spans financial automation, passive intelligence gathering, social m
 
 ## Architecture
 
-Omnipotent is a monolithic C# / .NET backend exposing a REST API. The solution is structured as four projects:
+Omnipotent is a monolithic C# / .NET backend exposing a REST API.
 
-| Project | Purpose |
-|---|---|
-| `Omnipotent` | Core service — all modules, API controllers, and bot logic |
-| `KliveLink` | Shared library for inter-service communication |
-| `Omnipotent.Tests` | Automated test suite |
-| `OmnipotentProcessMonitor` | Watchdog process that keeps the bot alive and handles restarts |
+The frontend is a separate React application served at [klive.uk](https://klive.uk), which connects to the Omnipotent API.
 
-The frontend is a separate React application served at [klive.uk](https://klive.uk), which connects to the Omnipotent API. Hardware clients use the [KliveTech-Ecosystem](https://github.com/Klivess/KliveTech-Ecosystem) C++ Arduino library to register themselves with the platform and receive commands.
+Hardware clients use the [KliveTech-Ecosystem](https://github.com/Klivess/KliveTech-Ecosystem) C++ Arduino library to register themselves with the platform and receive commands.
 
 A custom CA (`KMCA`) signs internal certificates for secure API communication.
 
