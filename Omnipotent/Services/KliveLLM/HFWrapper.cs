@@ -22,6 +22,9 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("max_tokens", NullValueHandling = NullValueHandling.Ignore)]
             public int? max_tokens;
 
+            [JsonProperty("service_tier", NullValueHandling = NullValueHandling.Ignore)]
+            public string service_tier;
+
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {
                 List<HFMessage> hFMessages = new();

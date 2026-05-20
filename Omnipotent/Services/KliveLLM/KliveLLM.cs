@@ -34,6 +34,7 @@ namespace Omnipotent.Services.KliveLLM
         private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
         private const string DefaultFreeOpenRouterModel = "openrouter/free";
         private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter" };
+        private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
 
         private string huggingFaceToken = "";
         private HttpClient client;
@@ -57,13 +58,14 @@ namespace Omnipotent.Services.KliveLLM
 
         private sealed class RemoteLLMProviderConfiguration
         {
-            public RemoteLLMProviderConfiguration(LLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model)
+            public RemoteLLMProviderConfiguration(LLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model, string? serviceTier = null)
             {
                 Provider = provider;
                 DisplayName = displayName;
                 ChatCompletionsEndpoint = chatCompletionsEndpoint;
                 ApiKey = apiKey;
                 Model = model;
+                ServiceTier = serviceTier;
             }
 
             public LLMProvider Provider { get; }
@@ -71,6 +73,7 @@ namespace Omnipotent.Services.KliveLLM
             public string ChatCompletionsEndpoint { get; }
             public string ApiKey { get; }
             public string Model { get; }
+            public string? ServiceTier { get; }
         }
 
         public KliveLLM()
@@ -176,6 +179,7 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("OpenRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
+            await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
         }
 
         private async Task SetupLocalLLM()
@@ -388,12 +392,14 @@ namespace Omnipotent.Services.KliveLLM
                 {
                     throw new InvalidOperationException("OpenRouterLLMToken is missing (required to use the free OpenRouter model).");
                 }
+                string freeServiceTier = await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
                 return new RemoteLLMProviderConfiguration(
                     LLMProvider.OpenRouter,
                     "OpenRouter (free)",
                     "https://openrouter.ai/api/v1/chat/completions",
                     freeToken,
-                    freeModel);
+                    freeModel,
+                    freeServiceTier);
             }
 
             string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", ProviderOptions, false, true);
@@ -408,12 +414,14 @@ namespace Omnipotent.Services.KliveLLM
                     throw new InvalidOperationException("OpenRouterLLMToken is missing.");
                 }
 
+                string openRouterServiceTier = await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
                 return new RemoteLLMProviderConfiguration(
                     LLMProvider.OpenRouter,
                     "OpenRouter",
                     "https://openrouter.ai/api/v1/chat/completions",
                     openRouterToken,
-                    openRouterModel);
+                    openRouterModel,
+                    openRouterServiceTier);
             }
 
             if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
@@ -447,6 +455,12 @@ namespace Omnipotent.Services.KliveLLM
                 stream = false,
                 max_tokens = maxTokensOverride,
             };
+            if (remoteProvider.Provider == LLMProvider.OpenRouter
+                && !string.IsNullOrWhiteSpace(remoteProvider.ServiceTier)
+                && !string.Equals(remoteProvider.ServiceTier, "default", StringComparison.OrdinalIgnoreCase))
+            {
+                payload.service_tier = remoteProvider.ServiceTier;
+            }
             payload.BuildMessagesFromChatHistory(messages);
 
             using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
