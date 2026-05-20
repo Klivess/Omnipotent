@@ -1262,6 +1262,65 @@ namespace Omnipotent.Services.KliveCloud
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Anybody);
+
+            await parent.CreateAPIRoute("/KliveCloud/MoveSharedItem", async (req) =>
+            {
+                try
+                {
+                    var scope = await ResolveShareScope(req);
+                    if (scope == null) return;
+
+                    var (link, root) = scope.Value;
+                    if (root.ItemType != CloudItemType.Folder || !parent.CanWriteThroughShareLink(link))
+                    {
+                        await req.ReturnResponse("SharedFolderWriteNotAllowed", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    string itemID = req.userParameters.Get("itemID") ?? string.Empty;
+                    string newParentFolderID = req.userParameters.Get("newParentFolderID") ?? string.Empty;
+
+                    if (string.IsNullOrEmpty(itemID))
+                    {
+                        await req.ReturnResponse("ItemIDRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null || string.Equals(item.ItemID, root.ItemID, StringComparison.OrdinalIgnoreCase) || !parent.IsItemWithinSharedScope(link, item))
+                    {
+                        await req.ReturnResponse("SharedItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    if (string.IsNullOrEmpty(newParentFolderID))
+                    {
+                        await req.ReturnResponse("NewParentFolderRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var newParent = parent.GetItemByID(newParentFolderID);
+                    if (newParent == null || newParent.ItemType != CloudItemType.Folder || !parent.IsItemWithinSharedScope(link, newParent))
+                    {
+                        await req.ReturnResponse("NewParentFolderNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    bool success = await parent.MoveItem(itemID, newParentFolderID, $"shared:{link.ShareCode}");
+                    if (success)
+                    {
+                        await req.ReturnResponse("ItemMoved", code: HttpStatusCode.OK);
+                    }
+                    else
+                    {
+                        await req.ReturnResponse("MoveFailed", code: HttpStatusCode.InternalServerError);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Anybody);
         }
 
         private List<CloudItem> GetDescendants(string folderID, KMPermissions userPerm)
