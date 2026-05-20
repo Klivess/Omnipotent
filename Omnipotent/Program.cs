@@ -1,4 +1,4 @@
-﻿global using static Omnipotent.Logging.OmniLogging;
+global using static Omnipotent.Logging.OmniLogging;
 global using static Omnipotent.Services.KliveAPI.KliveAPI;
 using DSharpPlus.Entities;
 using Humanizer;
@@ -36,6 +36,7 @@ using System.Text.RegularExpressions;
 using static System.Net.Mime.MediaTypeNames;
 using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.KliveMultiTool;
+using Omnipotent.Services.PortForwardManager;
 
 namespace Omnipotent
 {
@@ -92,6 +93,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Stratum.Stratum());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new PortForwardManager());
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniUpdater.OmniUpdater());
 
                 testTask();
