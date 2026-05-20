@@ -505,6 +505,66 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Post, KMPermissions.Guest);
 
+            // Move a file or folder to a new parent folder
+            await parent.CreateAPIRoute("/KliveCloud/MoveItem", async (req) =>
+            {
+                try
+                {
+                    string itemID = req.userParameters.Get("itemID") ?? string.Empty;
+                    string newParentFolderID = req.userParameters.Get("newParentFolderID") ?? string.Empty;
+
+                    if (string.IsNullOrEmpty(itemID))
+                    {
+                        await req.ReturnResponse("ItemIDRequired", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(itemID);
+                    if (item == null)
+                    {
+                        await req.ReturnResponse("ItemNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    // Check permissions
+                    KMPermissions userPerm = req.user.KlivesManagementRank;
+                    if (!parent.CanAccessItem(item, userPerm))
+                    {
+                        await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+
+                    if (!string.IsNullOrEmpty(newParentFolderID))
+                    {
+                        var newParent = parent.GetItemByID(newParentFolderID);
+                        if (newParent == null || newParent.ItemType != CloudItemType.Folder)
+                        {
+                            await req.ReturnResponse("NewParentFolderNotFound", code: HttpStatusCode.NotFound);
+                            return;
+                        }
+                        if (!parent.CanAccessItem(newParent, userPerm))
+                        {
+                            await req.ReturnResponse("InsufficientPermission", code: HttpStatusCode.Forbidden);
+                            return;
+                        }
+                    }
+
+                    bool success = await parent.MoveItem(itemID, newParentFolderID, req.user.UserID);
+                    if (success)
+                    {
+                        await req.ReturnResponse("ItemMoved", code: HttpStatusCode.OK);
+                    }
+                    else
+                    {
+                        await req.ReturnResponse("MoveFailed", code: HttpStatusCode.InternalServerError);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
             // Get drive capacity info for the drive the application is running on
             await parent.CreateAPIRoute("/KliveCloud/GetDriveInfo", async (req) =>
             {

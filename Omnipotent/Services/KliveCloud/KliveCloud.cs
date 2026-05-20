@@ -505,6 +505,107 @@ namespace Omnipotent.Services.KliveCloud
             return CloneWithEffectivePermission(item);
         }
 
+        public async Task<bool> MoveItem(string itemID, string newParentFolderID, string userID)
+        {
+            var item = GetItemByID(itemID);
+            if (item == null) return false;
+
+            newParentFolderID = newParentFolderID ?? "";
+
+            // Cannot move an item into itself
+            if (string.Equals(itemID, newParentFolderID, StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("Cannot move a folder into itself.");
+
+            // Cannot move a folder into one of its descendants
+            if (item.ItemType == CloudItemType.Folder && !string.IsNullOrEmpty(newParentFolderID))
+            {
+                var targetFolder = GetItemByID(newParentFolderID);
+                if (targetFolder != null && IsDescendantOfFolder(itemID, targetFolder))
+                {
+                    throw new ArgumentException("Cannot move a folder into one of its descendants.");
+                }
+            }
+
+            string oldRelativePath = item.RelativePath;
+            string newRelativePath;
+            if (string.IsNullOrEmpty(newParentFolderID))
+            {
+                newRelativePath = item.Name;
+            }
+            else
+            {
+                var newParent = GetItemByID(newParentFolderID);
+                if (newParent == null || newParent.ItemType != CloudItemType.Folder)
+                    throw new Exception("New parent folder not found.");
+                newRelativePath = Path.Combine(newParent.RelativePath, item.Name);
+            }
+
+            string basePath = GetStorageBasePath();
+            string oldFullPath = Path.GetFullPath(Path.Combine(basePath, oldRelativePath));
+            string newFullPath = Path.GetFullPath(Path.Combine(basePath, newRelativePath));
+
+            if (!oldFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && oldFullPath != basePath)
+                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+            if (!newFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && newFullPath != basePath)
+                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+
+            // Check if the destination path already exists
+            if (item.ItemType == CloudItemType.Folder)
+            {
+                if (Directory.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("A folder with this name already exists in the destination.");
+            }
+            else
+            {
+                if (File.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("A file with this name already exists in the destination.");
+            }
+
+            // Perform physical move on disk
+            if (item.ItemType == CloudItemType.Folder)
+            {
+                if (Directory.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Directory.Move(oldFullPath, newFullPath);
+                }
+            }
+            else
+            {
+                if (File.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    string destDir = Path.GetDirectoryName(newFullPath);
+                    if (!Directory.Exists(destDir))
+                        Directory.CreateDirectory(destDir);
+                    File.Move(oldFullPath, newFullPath);
+                }
+            }
+
+            // Update item metadata
+            item.ParentFolderID = newParentFolderID;
+            item.RelativePath = newRelativePath;
+            item.ModifiedDate = DateTime.Now;
+
+            // If it is a folder, update all descendant relative paths
+            if (item.ItemType == CloudItemType.Folder)
+            {
+                var descendants = CloudItems.Where(k => IsDescendantOfFolder(itemID, k)).ToList();
+                foreach (var descendant in descendants)
+                {
+                    // Find the subpath from the old folder root
+                    string relativeSubPath = descendant.RelativePath.Substring(oldRelativePath.Length);
+                    if (relativeSubPath.StartsWith(Path.DirectorySeparatorChar.ToString()) || relativeSubPath.StartsWith("/"))
+                    {
+                        relativeSubPath = relativeSubPath.Substring(1);
+                    }
+                    descendant.RelativePath = Path.Combine(newRelativePath, relativeSubPath);
+                }
+            }
+
+            await SaveMetadata();
+            ServiceLog($"Item '{item.Name}' moved to parent '{newParentFolderID}' by user {userID}.");
+            return true;
+        }
+
         public async Task<byte[]> DownloadFile(string itemID)
         {
             var item = GetItemByID(itemID);
