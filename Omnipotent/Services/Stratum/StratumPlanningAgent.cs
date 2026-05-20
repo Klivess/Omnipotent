@@ -79,7 +79,10 @@ namespace Omnipotent.Services.Stratum
                             StratumArtifactKind.Document,
                             $"plan_v{iter + 1}.json",
                             "application/json",
-                            bytes);
+                            bytes,
+                            metadata: null,
+                            role: StratumArtifactRoles.Plan,
+                            subtaskTitle: null);
                         ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
                     }
                     catch (Exception ex)

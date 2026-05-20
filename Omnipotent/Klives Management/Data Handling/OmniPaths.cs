@@ -157,6 +157,7 @@ namespace Omnipotent.Data_Handling
             public static string StratumPythonDirectory = $"{StratumDirectory}/Python";
             public static string StratumToolsDirectory = $"{StratumDirectory}/Tools";
             public static string StratumRunsDirectory = $"{StratumDirectory}/Runs";
+            public static string StratumConversationsDirectory = $"{StratumDirectory}/Conversations";
 
         };
 

@@ -107,6 +107,13 @@ namespace Omnipotent.Services.Stratum
         public string? CurrentGateID { get; set; }
         /// <summary>How many planner iterations the agent has done so far (refinement loop counter).</summary>
         public int Iteration { get; set; } = 0;
+
+        /// <summary>
+        /// When non-empty, the agent must only (re)design the listed subtasks; everything else is
+        /// reused from prior approved artifacts. Set by chat-spawned amendment runs so unrelated
+        /// parts aren't re-generated. Subtask titles match <c>StratumPlannerSubtask.Title</c>.
+        /// </summary>
+        public List<string> RestrictToSubtasks { get; set; } = new();
     }
 
     /// <summary>

@@ -156,6 +156,26 @@ namespace Omnipotent.Services.Stratum
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Guest);
 
+            // Bulk download: zip every artifact in the project according to the requested scope.
+            // Query: projectID, include=current|all|printables (default current).
+            await parent.CreateAPIRoute("/stratum/projects/download-bundle", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var user, out var project)) return;
+                    string includeStr = req.userParameters?.Get("include") ?? "current";
+                    StratumStorage.BundleScope scope = includeStr.ToLowerInvariant() switch
+                    {
+                        "all" => StratumStorage.BundleScope.All,
+                        "printables" => StratumStorage.BundleScope.Printables,
+                        _ => StratumStorage.BundleScope.Current,
+                    };
+                    byte[] zip = parent.Storage.BuildProjectBundleZip(project.ProjectID, scope);
+                    await req.ReturnBinaryResponse(zip, "application/zip");
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
             // ── Attachments ──
             await parent.CreateAPIRoute("/stratum/attachments/upload", async req =>
             {
@@ -515,6 +535,78 @@ namespace Omnipotent.Services.Stratum
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Guest);
+
+            // ── Mechanical Engineer chat ──
+            // List recent messages since a given sequence. Defaults to since=0 (full history).
+            await parent.CreateAPIRoute("/stratum/chat/messages", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var user, out var project)) return;
+                    string agentRole = req.userParameters?.Get("agentRole") ?? StratumAgentRoles.MechanicalEngineer;
+                    long since = 0;
+                    long.TryParse(req.userParameters?.Get("since") ?? "0", out since);
+                    var conversation = parent.Storage.GetOrCreateConversation(project.ProjectID, agentRole);
+                    var msgs = parent.Storage.ListChatMessagesSince(project.ProjectID, agentRole, since);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        conversationID = conversation.ConversationID,
+                        nextSequence = conversation.NextSequence,
+                        messages = msgs,
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Guest);
+
+            // Send a message to the mechanical engineer. Body: { text: string }.
+            await parent.CreateAPIRoute("/stratum/chat/send", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var user, out var project)) return;
+                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
+                    string text = ((string?)body?.text ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var chat = new StratumMechanicalEngineerChat(parent);
+                    var (userMsg, agentMsg) = await chat.SendUserMessageAsync(project, user.UserID, text, CancellationToken.None);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { userMessage = userMsg, agentMessage = agentMsg }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Guest);
+
+            // Approve a proposal message → patch the blueprint + spawn a focused amendment run.
+            // Query: messageID.
+            await parent.CreateAPIRoute("/stratum/chat/approve-proposal", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var user, out var project)) return;
+                    string messageID = req.userParameters?.Get("messageID") ?? "";
+                    if (string.IsNullOrWhiteSpace(messageID))
+                    {
+                        await req.ReturnResponse("messageID required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    string? denyReason = parent.AgentManager.CheckAndRecordStart(user.UserID);
+                    if (denyReason != null)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { error = denyReason }), code: HttpStatusCode.TooManyRequests);
+                        return;
+                    }
+                    var chat = new StratumMechanicalEngineerChat(parent);
+                    var run = await chat.ApproveProposalAsync(project, user.UserID, messageID, CancellationToken.None);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, runID = run?.RunID }));
+                }
+                catch (InvalidOperationException ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Guest);
         }
 
         // ── Helpers ──

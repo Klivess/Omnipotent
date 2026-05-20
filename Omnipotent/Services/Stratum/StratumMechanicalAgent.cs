@@ -58,18 +58,32 @@ namespace Omnipotent.Services.Stratum
             string? focus = string.IsNullOrWhiteSpace(ctx.Run.UserPrompt) ? null : ctx.Run.UserPrompt;
             string sessionId = $"stratum-mechanical-{ctx.Run.RunID}";
 
+            // 3a. Load the latest approved electronics spatial layout, if one exists. It drives
+            //     per-slot integration features (bosses, screw holes, connector cutouts) on the
+            //     mechanical parts that host each electronics module.
+            var electronicsLayout = LoadLatestElectronicsLayout(ctx);
+            if (electronicsLayout != null)
+                ctx.EmitThought($"Loaded electronics layout: {electronicsLayout.Placements.Count} module placement(s) across {electronicsLayout.Placements.Select(p => p.HostingPart).Distinct(StringComparer.OrdinalIgnoreCase).Count()} host part(s).");
+
             // 4. Assembly Blueprint phase — BEFORE designing any part, ask the LLM to plan the
             //    full mechanical layout: per-part bounding box, world placement (position +
             //    rotation), local origin convention, and the mating interfaces each part must
             //    expose to its neighbours, with reasoning for every decision. This is gated
             //    for user approval so the user can see the assembly strategy up front and
             //    every subsequent part is designed against a fixed contract.
-            var blueprint = await BuildAssemblyBlueprintAsync(ctx, llm, sessionId, plan, focus);
+            var blueprint = await BuildAssemblyBlueprintAsync(ctx, llm, sessionId, plan, focus, electronicsLayout);
             if (blueprint == null)
             {
                 ctx.EmitThought("Assembly blueprint was not produced — aborting mechanical run.");
                 return;
             }
+
+            // 4a. Attach integration features (bosses / cutouts / reservations) for each electronics
+            //     module assigned to a host part. Done after blueprint approval so the user only
+            //     approves the blueprint geometry once; the features are deterministically derived
+            //     from the approved layout + blueprint.
+            if (electronicsLayout != null)
+                AttachIntegrationFeatures(blueprint, electronicsLayout, ctx);
 
             // 5. Iterate subtasks. Each subtask is designed against its blueprint slot AND the
             //    full blueprint context so it can mate to its neighbours. Approved parts get
@@ -78,6 +92,14 @@ namespace Omnipotent.Services.Stratum
             //    If a previous Mechanical run on this project already produced an approved
             //    STEP for a given subtask, reuse it instead of re-designing — this lets the
             //    user pick up after a crash / restart / cancel without losing all their work.
+            //
+            //    Chat-spawned amendment runs may set RestrictToSubtasks to a single-part subset;
+            //    when present, every other subtask is forced to reuse its prior approved STEP
+            //    even if the LLM "would" have re-designed it. This is what makes the
+            //    "propose → amend on approval" flow surgical.
+            var restrictSet = (ctx.Run.RestrictToSubtasks ?? new List<string>())
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             int subtaskIdx = 0;
             var approvedParts = new List<ApprovedPart>();
             var alreadyApproved = FindApprovedStepsByPriorRuns(ctx);
@@ -93,7 +115,32 @@ namespace Omnipotent.Services.Stratum
                         ctx.EmitThought($"Skipping virtual subtask: {slot.Reasoning}");
                     continue;
                 }
-                if (alreadyApproved.TryGetValue(subtask.Title, out var reused))
+
+                bool isAmendmentTarget = restrictSet.Count > 0 && restrictSet.Contains(subtask.Title);
+                bool inRestrictMode = restrictSet.Count > 0;
+
+                // In restrict mode every non-target subtask MUST reuse its prior approved STEP
+                // (otherwise the user would suddenly see unrelated parts re-designed for no reason).
+                if (inRestrictMode && !isAmendmentTarget)
+                {
+                    if (alreadyApproved.TryGetValue(subtask.Title, out var reusedR))
+                    {
+                        ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — reusing prior approved part (amendment run, not a target).");
+                        approvedParts.Add(new ApprovedPart
+                        {
+                            Subtask = subtask, Slot = slot,
+                            StepArtifactID = reusedR.ArtifactID, StepFileName = reusedR.FileName,
+                        });
+                        await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx, electronicsLayout);
+                    }
+                    else
+                    {
+                        ctx.EmitThought($"Amendment run skipping '{subtask.Title}': no prior approved STEP to reuse.");
+                    }
+                    continue;
+                }
+
+                if (alreadyApproved.TryGetValue(subtask.Title, out var reused) && !isAmendmentTarget)
                 {
                     ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: '{subtask.Title}' — reusing previously approved part.");
                     approvedParts.Add(new ApprovedPart
@@ -103,7 +150,7 @@ namespace Omnipotent.Services.Stratum
                         StepArtifactID = reused.ArtifactID,
                         StepFileName = reused.FileName,
                     });
-                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx);
+                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx, electronicsLayout);
                     continue;
                 }
                 ctx.EmitStatus($"Mechanical subtask {subtaskIdx}/{plan.MechanicalSubtasks.Count}: {subtask.Title}");
@@ -113,7 +160,7 @@ namespace Omnipotent.Services.Stratum
                 if (partResult != null)
                 {
                     approvedParts.Add(partResult);
-                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx);
+                    await ComposeProgressAsync(ctx, plan, blueprint, approvedParts, subtaskIdx, electronicsLayout);
                 }
             }
 
@@ -174,7 +221,10 @@ namespace Omnipotent.Services.Stratum
                 var measured = ParseBBoxLine(result.Stdout);
                 if (slot != null && measured != null && slot.BoundingBoxMm != null && slot.BoundingBoxMm.Length >= 3)
                 {
-                    double tol = 1.20;  // 20% slack
+                    // Slots with integration features can legitimately push past the bounding box
+                    // because bosses and external connectors extrude beyond the part envelope.
+                    bool hasIntegration = slot.IntegrationFeatures != null && slot.IntegrationFeatures.Count > 0;
+                    double tol = hasIntegration ? 1.30 : 1.20;
                     double sx = slot.BoundingBoxMm[0], sy = slot.BoundingBoxMm[1], sz = slot.BoundingBoxMm[2];
                     double mx = measured.Value.dx, my = measured.Value.dy, mz = measured.Value.dz;
                     bool oversize = mx > sx * tol || my > sy * tol || mz > sz * tol;
@@ -213,7 +263,8 @@ namespace Omnipotent.Services.Stratum
                     if (slot != null) meta["principalAxis"] = slot.PrincipalAxis;
                     if (measured != null) meta["measuredBBoxMm"] = $"{measured.Value.dx:0.###},{measured.Value.dy:0.###},{measured.Value.dz:0.###}";
                     var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
-                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes, meta);
+                        StratumArtifactKind.StepCad, $"{baseName}.step", "model/step", bytes, meta,
+                        role: StratumArtifactRoles.Part, subtaskTitle: subtask.Title);
                     producedArtifactIDs.Add(art.ArtifactID);
                     approvedStepArtifactID = art.ArtifactID;
                     approvedStepFileName = art.FileName;
@@ -225,7 +276,8 @@ namespace Omnipotent.Services.Stratum
                     string ct2 = glbFile.Extension.Equals(".glb", StringComparison.OrdinalIgnoreCase) ? "model/gltf-binary" : "model/gltf+json";
                     var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                         StratumArtifactKind.MeshGlb, $"{baseName}{glbFile.Extension.ToLowerInvariant()}", ct2, bytes,
-                        new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                        new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                        role: StratumArtifactRoles.Part, subtaskTitle: subtask.Title);
                     producedArtifactIDs.Add(art.ArtifactID);
                     ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
                 }
@@ -234,7 +286,8 @@ namespace Omnipotent.Services.Stratum
                 var scriptBytes = System.Text.Encoding.UTF8.GetBytes(script);
                 var scriptArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                     StratumArtifactKind.CadQueryScript, $"{baseName}.cq.py", "text/x-python", scriptBytes,
-                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.Script, subtaskTitle: subtask.Title);
                 producedArtifactIDs.Add(scriptArt.ArtifactID);
                 ctx.EmitArtifact(scriptArt.ArtifactID, scriptArt.FileName, scriptArt.Kind.ToString());
 
@@ -351,6 +404,9 @@ namespace Omnipotent.Services.Stratum
             public string PrincipalAxis { get; set; } = "+X";
             // Non-physical / integration-only subtasks: skipped by design AND composer.
             public bool Virtual { get; set; } = false;
+            // Electronics integration: bosses, holes, cutouts this part MUST implement for the
+            // electronics modules the layout assigned to it. Populated by AttachIntegrationFeatures.
+            public List<MechanicalIntegrationFeature> IntegrationFeatures { get; set; } = new();
         }
 
         private sealed class MechanicalMatingInterface
@@ -361,8 +417,22 @@ namespace Omnipotent.Services.Stratum
             public string Spec { get; set; } = "";        // e.g. "4x M3 on 20mm bolt circle"
         }
 
+        /// <summary>
+        /// One mounting/cutout feature a mechanical part must implement to host an electronics module.
+        /// Coordinates are in the host part's LOCAL frame (same frame the per-part CadQuery script writes in).
+        /// </summary>
+        private sealed class MechanicalIntegrationFeature
+        {
+            public string FeatureKind { get; set; } = "";        // "boss" | "thru-hole" | "wall-cutout" | "reservation" | "snap-clip"
+            public double[] LocalPositionMm { get; set; } = new double[] { 0, 0, 0 };
+            public double[] LocalRotationDeg { get; set; } = new double[] { 0, 0, 0 };
+            public double[] SizeMm { get; set; } = new double[] { 0, 0, 0 };  // dx, dy, dz (or diameter, length, _ for holes/bosses)
+            public string ForModuleInstanceId { get; set; } = "";
+            public string Spec { get; set; } = "";                // human-readable spec, e.g. "M3 thread, 4mm tall, brass-insert ready"
+        }
+
         private async Task<MechanicalBlueprint?> BuildAssemblyBlueprintAsync(
-            StratumAgentContext ctx, KliveLLM.KliveLLM llm, string sessionId, StratumPlannerOutput plan, string? focus)
+            StratumAgentContext ctx, KliveLLM.KliveLLM llm, string sessionId, StratumPlannerOutput plan, string? focus, StratumElectronicsLayout? electronicsLayout)
         {
             // Skip the blueprint phase if a previous Mechanical run on this project has already
             // produced an approved blueprint — reuse it so the user doesn't have to re-approve.
@@ -383,7 +453,7 @@ namespace Omnipotent.Services.Stratum
                 ctx.EmitStatus($"Planning assembly blueprint — iteration {iter + 1}");
                 ctx.EmitThought("Asking LLM to plan the full assembly layout BEFORE designing any part…");
 
-                string userPrompt = BuildBlueprintPrompt(plan, focus, previousReject, lastJson);
+                string userPrompt = BuildBlueprintPrompt(plan, focus, previousReject, lastJson, electronicsLayout);
                 string? sys = iter == 0 ? BuildBlueprintSystemPrompt() : null;
                 var resp = await llm.QueryLLM(userPrompt, bpSession, systemPrompt: sys);
                 if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
@@ -475,7 +545,8 @@ namespace Omnipotent.Services.Stratum
                 var blueprintBytes = System.Text.Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(bp, Formatting.Indented));
                 var bpArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                     StratumArtifactKind.Document, $"mechanical_blueprint_v{iter + 1}.json", "application/json", blueprintBytes,
-                    new Dictionary<string, string> { ["role"] = "mechanical-blueprint", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    new Dictionary<string, string> { ["role"] = "mechanical-blueprint", ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.Blueprint, subtaskTitle: null);
                 ctx.EmitArtifact(bpArt.ArtifactID, bpArt.FileName, bpArt.Kind.ToString());
 
                 var resolution = await ctx.OpenGateAndWait(
@@ -494,6 +565,166 @@ namespace Omnipotent.Services.Stratum
                 ctx.EmitThought($"Blueprint rejected. Revising: {Tail(previousReject, 200)}");
             }
             return null;
+        }
+
+        private static StratumElectronicsLayout? LoadLatestElectronicsLayout(StratumAgentContext ctx)
+        {
+            var project = ctx.Parent.Storage.GetProject(ctx.Run.ProjectID);
+            if (project == null) return null;
+            var artById = new Dictionary<string, StratumArtifact>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rev in project.Revisions)
+                foreach (var a in rev.Artifacts) artById[a.ArtifactID] = a;
+            var gates = ctx.RunStore.ListGatesForProject(ctx.Run.ProjectID)
+                .Where(g => g.Status == StratumGateStatus.Approved)
+                .OrderByDescending(g => g.ResolvedAt ?? g.OpenedAt);
+            foreach (var g in gates)
+            {
+                foreach (var aid in g.ProposalArtifactIDs)
+                {
+                    if (!artById.TryGetValue(aid, out var art)) continue;
+                    if (art.Kind != StratumArtifactKind.Document) continue;
+                    bool match = string.Equals(art.Role, StratumArtifactRoles.ElectronicsLayout, StringComparison.OrdinalIgnoreCase)
+                                 || (art.Metadata.TryGetValue("role", out var roleHint)
+                                     && string.Equals(roleHint, StratumArtifactRoles.ElectronicsLayout, StringComparison.OrdinalIgnoreCase));
+                    if (!match) continue;
+                    var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, art.ArtifactID);
+                    if (resolved == null || !File.Exists(resolved.Value.blobPath)) continue;
+                    try { return JsonConvert.DeserializeObject<StratumElectronicsLayout>(File.ReadAllText(resolved.Value.blobPath)); }
+                    catch { continue; }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// For each module placement in the approved electronics layout, derive the bosses,
+        /// thru-holes, and wall-cutouts the hosting mechanical part must implement, transforming
+        /// the placement from world space into the host part's local frame. Pure deterministic
+        /// code — no LLM call. Mutates the blueprint slots in place.
+        /// </summary>
+        private static void AttachIntegrationFeatures(MechanicalBlueprint blueprint, StratumElectronicsLayout layout, StratumAgentContext ctx)
+        {
+            foreach (var placement in layout.Placements)
+            {
+                var slot = blueprint.Slots.FirstOrDefault(s => string.Equals(s.SubtaskTitle, placement.HostingPart, StringComparison.OrdinalIgnoreCase));
+                if (slot == null)
+                {
+                    ctx.EmitThought($"Electronics layout assigns '{placement.InstanceId}' to host '{placement.HostingPart}', but no matching mechanical slot exists. Skipping integration features for this module.");
+                    continue;
+                }
+                if (slot.Virtual)
+                {
+                    ctx.EmitThought($"Electronics layout assigns '{placement.InstanceId}' to host '{slot.SubtaskTitle}' which is marked virtual. Skipping integration features.");
+                    continue;
+                }
+
+                // World → host-part-local frame: subtract slot world position, then undo slot rotation.
+                var localOffset = SubtractVec3(placement.WorldPositionMm, slot.WorldPosition);
+                var localRotInverse = InvertEulerXyzDeg(slot.WorldRotationDeg);
+                var localPos = RotateVec3EulerXyzDeg(localOffset, localRotInverse);
+
+                var localRotDeg = SubtractVec3(placement.WorldRotationDeg, slot.WorldRotationDeg);
+                var f = placement.Footprint;
+
+                // 1. Reservation: a "do-not-fill" volume the size of the module's footprint, centred at localPos.
+                slot.IntegrationFeatures.Add(new MechanicalIntegrationFeature
+                {
+                    FeatureKind = "reservation",
+                    LocalPositionMm = (double[])localPos.Clone(),
+                    LocalRotationDeg = (double[])localRotDeg.Clone(),
+                    SizeMm = new[] { f.DxMm, f.DyMm, f.DzMm },
+                    ForModuleInstanceId = placement.InstanceId,
+                    Spec = $"Reserve volume for {placement.ModuleId} ({placement.InstanceId}). Do NOT fill this region; ribs/walls must route around it.",
+                });
+
+                // 2. Bosses + thru-holes for every mount hole in the footprint.
+                if (string.Equals(f.MountStrategy, "screw-bosses", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var hole in f.MountHolesMm)
+                    {
+                        if (hole == null || hole.Length < 3) continue;
+                        double hx = hole[0], hy = hole[1], holeDia = hole[2];
+                        // Hole position in module-local frame → rotate by placement rotation → translate by placement world pos → into host-local.
+                        var moduleLocalHole = new[] { hx, hy, 0.0 };
+                        var worldHole = RotateVec3EulerXyzDeg(moduleLocalHole, placement.WorldRotationDeg);
+                        worldHole[0] += placement.WorldPositionMm[0];
+                        worldHole[1] += placement.WorldPositionMm[1];
+                        worldHole[2] += placement.WorldPositionMm[2];
+                        var localHole = RotateVec3EulerXyzDeg(SubtractVec3(worldHole, slot.WorldPosition), localRotInverse);
+
+                        double bossOuter = Math.Max(holeDia + 4.0, 6.0);   // ~2 mm wall
+                        double bossHeight = 5.0;
+                        slot.IntegrationFeatures.Add(new MechanicalIntegrationFeature
+                        {
+                            FeatureKind = "boss",
+                            LocalPositionMm = (double[])localHole.Clone(),
+                            LocalRotationDeg = (double[])localRotDeg.Clone(),
+                            SizeMm = new[] { bossOuter, bossHeight, holeDia },
+                            ForModuleInstanceId = placement.InstanceId,
+                            Spec = $"Mounting boss for {placement.InstanceId}: cylinder Ø{bossOuter:0.#} mm × {bossHeight:0.#} mm tall, centred thru-hole Ø{holeDia:0.#} mm (M{Math.Round(holeDia - 0.2)} clearance). Boss top face must contact the module PCB.",
+                        });
+                    }
+                }
+
+                // 3. Wall cutouts for every connector that needs external access.
+                foreach (var conn in f.Connectors ?? new List<ConnectorAccess>())
+                {
+                    var moduleLocalConn = new[] { conn.LocalPositionMm[0], conn.LocalPositionMm[1], conn.LocalPositionMm.Length > 2 ? conn.LocalPositionMm[2] : 0.0 };
+                    var worldConn = RotateVec3EulerXyzDeg(moduleLocalConn, placement.WorldRotationDeg);
+                    worldConn[0] += placement.WorldPositionMm[0];
+                    worldConn[1] += placement.WorldPositionMm[1];
+                    worldConn[2] += placement.WorldPositionMm[2];
+                    var localConn = RotateVec3EulerXyzDeg(SubtractVec3(worldConn, slot.WorldPosition), localRotInverse);
+
+                    double cdx = conn.CutoutSizeMm.Length > 0 ? conn.CutoutSizeMm[0] : 8.0;
+                    double cdy = conn.CutoutSizeMm.Length > 1 ? conn.CutoutSizeMm[1] : 8.0;
+                    slot.IntegrationFeatures.Add(new MechanicalIntegrationFeature
+                    {
+                        FeatureKind = "wall-cutout",
+                        LocalPositionMm = (double[])localConn.Clone(),
+                        LocalRotationDeg = (double[])localRotDeg.Clone(),
+                        SizeMm = new[] { cdx + 1.0, cdy + 1.0, 0.0 },  // 0.5 mm clearance each side
+                        ForModuleInstanceId = placement.InstanceId,
+                        Spec = $"Through-wall cutout for {conn.Kind} on {placement.InstanceId}, oriented along (world) {conn.Direction}. Aperture {cdx + 1:0.#} × {cdy + 1:0.#} mm; subtract through the nearest exterior wall.",
+                    });
+                }
+            }
+
+            // Diagnostics — log how many features each slot picked up.
+            foreach (var s in blueprint.Slots)
+            {
+                if (s.IntegrationFeatures.Count == 0) continue;
+                int bosses = s.IntegrationFeatures.Count(f => f.FeatureKind == "boss");
+                int cuts = s.IntegrationFeatures.Count(f => f.FeatureKind == "wall-cutout");
+                int res = s.IntegrationFeatures.Count(f => f.FeatureKind == "reservation");
+                ctx.EmitThought($"Integration features for '{s.SubtaskTitle}': {bosses} boss(es), {cuts} cutout(s), {res} reservation(s).");
+            }
+        }
+
+        private static double[] SubtractVec3(double[] a, double[] b)
+        {
+            double ax = a.Length > 0 ? a[0] : 0, ay = a.Length > 1 ? a[1] : 0, az = a.Length > 2 ? a[2] : 0;
+            double bx = b.Length > 0 ? b[0] : 0, by = b.Length > 1 ? b[1] : 0, bz = b.Length > 2 ? b[2] : 0;
+            return new[] { ax - bx, ay - by, az - bz };
+        }
+        private static double[] InvertEulerXyzDeg(double[] e) => new[] { -(e.Length > 0 ? e[0] : 0), -(e.Length > 1 ? e[1] : 0), -(e.Length > 2 ? e[2] : 0) };
+        private static double[] RotateVec3EulerXyzDeg(double[] v, double[] rotDeg)
+        {
+            // Apply intrinsic XYZ rotations: rotate about X, then Y, then Z.
+            double x = v.Length > 0 ? v[0] : 0, y = v.Length > 1 ? v[1] : 0, z = v.Length > 2 ? v[2] : 0;
+            double rx = (rotDeg.Length > 0 ? rotDeg[0] : 0) * Math.PI / 180.0;
+            double ry = (rotDeg.Length > 1 ? rotDeg[1] : 0) * Math.PI / 180.0;
+            double rz = (rotDeg.Length > 2 ? rotDeg[2] : 0) * Math.PI / 180.0;
+            // Rx
+            double cx = Math.Cos(rx), sx = Math.Sin(rx);
+            (y, z) = (cx * y - sx * z, sx * y + cx * z);
+            // Ry
+            double cy_ = Math.Cos(ry), sy_ = Math.Sin(ry);
+            (x, z) = (cy_ * x + sy_ * z, -sy_ * x + cy_ * z);
+            // Rz
+            double cz = Math.Cos(rz), sz = Math.Sin(rz);
+            (x, y) = (cz * x - sz * y, sz * x + cz * y);
+            return new[] { x, y, z };
         }
 
         private static MechanicalBlueprint? LoadLatestBlueprint(StratumAgentContext ctx)
@@ -537,7 +768,8 @@ namespace Omnipotent.Services.Stratum
             StratumPlannerOutput plan,
             MechanicalBlueprint blueprint,
             List<ApprovedPart> approvedSoFar,
-            int subtaskIdx)
+            int subtaskIdx,
+            StratumElectronicsLayout? electronicsLayout)
         {
             if (approvedSoFar.Count == 0) return;
             try
@@ -556,7 +788,7 @@ namespace Omnipotent.Services.Stratum
                 }
                 if (entries.Count == 0) return;
 
-                string script = BuildCompositionScript(entries, blueprint);
+                string script = BuildCompositionScript(entries, blueprint, electronicsLayout);
                 ctx.EmitThought($"Updating cumulative assembly preview ({approvedSoFar.Count}/{plan.MechanicalSubtasks!.Count} parts)…");
                 var result = await pythonRunner.RunScriptAsync(script, workDir, ScriptTimeout, _ => { }, ctx.Cancellation);
                 if (!result.Success)
@@ -578,7 +810,8 @@ namespace Omnipotent.Services.Stratum
                     var bytes = File.ReadAllBytes(glb.FullName);
                     var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                         StratumArtifactKind.MeshGlb, $"assembly_progress_after_{subtaskIdx:D2}.glb", "model/gltf-binary", bytes,
-                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID });
+                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID },
+                        role: StratumArtifactRoles.AssemblySnapshot, subtaskTitle: null);
                     ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
                 }
                 if (step != null)
@@ -586,7 +819,8 @@ namespace Omnipotent.Services.Stratum
                     var bytes = File.ReadAllBytes(step.FullName);
                     var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                         StratumArtifactKind.StepCad, $"assembly_progress_after_{subtaskIdx:D2}.step", "model/step", bytes,
-                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID });
+                        new Dictionary<string, string> { ["role"] = "assembly-progress", ["partsSoFar"] = approvedSoFar.Count.ToString(), ["runID"] = ctx.Run.RunID },
+                        role: StratumArtifactRoles.AssemblySnapshot, subtaskTitle: null);
                     ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
                 }
             }
@@ -596,7 +830,7 @@ namespace Omnipotent.Services.Stratum
             }
         }
 
-        private static string BuildCompositionScript(List<(string staged, ApprovedPart part)> entries, MechanicalBlueprint blueprint)
+        private static string BuildCompositionScript(List<(string staged, ApprovedPart part)> entries, MechanicalBlueprint blueprint, StratumElectronicsLayout? electronicsLayout)
         {
             var inv = System.Globalization.CultureInfo.InvariantCulture;
             string F(double v) => v.ToString("0.######", inv);
@@ -656,6 +890,37 @@ namespace Omnipotent.Services.Stratum
                     sb.AppendLine($"    print(f'STRATUM_PART_BBOX_FAILED:{safeName}_{instIdx}: {{_e}}')");
                 }
             }
+            // Electronics overlay: emit a translucent labeled box at each module's world pose.
+            // Naming prefix `_electronics_` lets the frontend toggle their visibility independently.
+            // These boxes are excluded from the printables bundle by the download endpoint.
+            if (electronicsLayout != null && electronicsLayout.Placements.Count > 0)
+            {
+                int eidx = 0;
+                foreach (var p in electronicsLayout.Placements)
+                {
+                    eidx++;
+                    var f = p.Footprint;
+                    if (f == null || f.DxMm <= 0 || f.DyMm <= 0 || f.DzMm <= 0) continue;
+                    double ex = p.WorldPositionMm.Length > 0 ? p.WorldPositionMm[0] : 0;
+                    double ey = p.WorldPositionMm.Length > 1 ? p.WorldPositionMm[1] : 0;
+                    double ez = p.WorldPositionMm.Length > 2 ? p.WorldPositionMm[2] : 0;
+                    double erx = p.WorldRotationDeg.Length > 0 ? p.WorldRotationDeg[0] : 0;
+                    double ery = p.WorldRotationDeg.Length > 1 ? p.WorldRotationDeg[1] : 0;
+                    double erz = p.WorldRotationDeg.Length > 2 ? p.WorldRotationDeg[2] : 0;
+                    string safeInst = SafeFileName(p.InstanceId).Replace(' ', '_');
+                    string boxVar = $"_ebox_{eidx}";
+                    sb.AppendLine($"{boxVar} = cq.Workplane('XY').box({F(f.DxMm)}, {F(f.DyMm)}, {F(f.DzMm)})");
+                    if (Math.Abs(erx) > 1e-9)
+                        sb.AppendLine($"{boxVar} = {boxVar}.rotate((0, 0, 0), (1, 0, 0), {F(erx)})");
+                    if (Math.Abs(ery) > 1e-9)
+                        sb.AppendLine($"{boxVar} = {boxVar}.rotate((0, 0, 0), (0, 1, 0), {F(ery)})");
+                    if (Math.Abs(erz) > 1e-9)
+                        sb.AppendLine($"{boxVar} = {boxVar}.rotate((0, 0, 0), (0, 0, 1), {F(erz)})");
+                    sb.AppendLine($"asm.add({boxVar}, name='_electronics_{safeInst}',");
+                    sb.AppendLine($"        loc=cq.Location(cq.Vector({F(ex)}, {F(ey)}, {F(ez)})))");
+                }
+            }
+
             sb.AppendLine("result = asm");
             sb.AppendLine();
             sb.AppendLine("# Diagnostics: print each part's world bbox and pairwise overlaps so the host can surface them.");
@@ -729,7 +994,7 @@ Hard rules:
 - Mark non-physical / integration-only subtasks (final-assembly checks, integration, verification) with `virtual: true` and a `boundingBoxMm` of `[1, 1, 1]`. These are skipped at the CAD layer.
 - WORKED EXAMPLE — a hexapod leg slot: `principalAxis: ""+X""`, `localOrigin: ""coxa rotation axis at body mounting face""`, `boundingBoxMm: [230, 80, 80]` (230 mm along +X, 80 mm in Y and Z), `quantity: 6`, `instances` lists 6 explicit world poses (three per side of the body, with rotations of ±90° about Z so each leg points outward).";
 
-        private static string BuildBlueprintPrompt(StratumPlannerOutput plan, string? focus, string previousReject, string lastJson)
+        private static string BuildBlueprintPrompt(StratumPlannerOutput plan, string? focus, string previousReject, string lastJson, StratumElectronicsLayout? electronicsLayout)
         {
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("DEVICE CONCEPT:");
@@ -742,6 +1007,32 @@ Hard rules:
                 if (t.DependsOn != null && t.DependsOn.Count > 0)
                     sb.AppendLine($"    (depends on: {string.Join(", ", t.DependsOn)})");
             }
+
+            if (electronicsLayout != null && electronicsLayout.Placements.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("ELECTRONICS PLACEMENT (already approved — each part listed below is responsible for HOSTING the assigned modules; size its bounding box accordingly so the modules + their bosses fit, and pick a worldPosition compatible with the module's worldPosition):");
+                var grouped = electronicsLayout.Placements
+                    .GroupBy(p => p.HostingPart, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(g => g.Key);
+                foreach (var g in grouped)
+                {
+                    sb.AppendLine($"- Hosting part: {g.Key}");
+                    foreach (var p in g)
+                    {
+                        string size = $"{p.Footprint.DxMm:0.#}×{p.Footprint.DyMm:0.#}×{p.Footprint.DzMm:0.#} mm";
+                        string pos = $"world ({p.WorldPositionMm[0]:0.#}, {p.WorldPositionMm[1]:0.#}, {p.WorldPositionMm[2]:0.#}) mm";
+                        string mount = p.Footprint.MountStrategy;
+                        string conns = p.Footprint.Connectors.Count > 0
+                            ? " — needs wall access: " + string.Join(", ", p.Footprint.Connectors.Select(c => $"{c.Kind} on {c.Direction}"))
+                            : "";
+                        sb.AppendLine($"    • {p.InstanceId} ({p.ModuleId}): {size} @ {pos}, mount: {mount}{conns}");
+                    }
+                }
+                sb.AppendLine();
+                sb.AppendLine("Make sure each hosting part's `boundingBoxMm` is large enough to contain its assigned modules (their bounding boxes + ~3 mm clearance + boss height ~5 mm), and that its `worldPosition` is consistent with the placements above. The Mechanical Agent will add the actual bosses, screw holes, and connector cutouts in a deterministic post-step — you only need to RESERVE space and place the part appropriately.");
+            }
+
             if (!string.IsNullOrWhiteSpace(focus))
             {
                 sb.AppendLine();
@@ -870,6 +1161,11 @@ ASSEMBLY CONTEXT (CRITICAL):
 - Stay inside the slot's `boundingBoxMm` — do NOT exceed those extents on any axis. The host MEASURES the produced bounding box and will reject + re-prompt you if it exceeds the slot by more than 20%.
 - The slot specifies a `principalAxis` (one of +X, -X, +Y, -Y, +Z, -Z). Your part's primary length MUST extend along this LOCAL axis from the localOrigin. The first dimension of `boundingBoxMm` is the length along that axis. Example: a 230×80×80 mm leg with `principalAxis: +X` extends 230 mm along local +X, occupying ≤ 80 mm in local Y and Z.
 - IMPLEMENT every mating interface listed in the slot's `matingInterfaces` (bolt patterns, shafts, snap-fits, etc.) at the described location with the described spec. These are HOW your part connects to its neighbours; they are NOT optional.
+- IMPLEMENT every entry in the slot's `integrationFeatures` (mounting bosses, thru-holes, wall cutouts, reservations) for the electronics modules this part hosts:
+    • boss: add a solid cylinder of the listed outer diameter and height at the listed local position; subtract a centred thru-hole of the listed diameter all the way through it.
+    • thru-hole: subtract a Boolean cylinder of the listed diameter, all the way through the wall, at the listed local position.
+    • wall-cutout: Boolean-subtract a rectangular hole of the listed dx × dy size at the listed local position, all the way through the nearest exterior wall.
+    • reservation: ensure your geometry does NOT fill the listed volume (route walls/ribs around it).
 - Do NOT apply the world transform yourself; the host's composer applies world position and rotation when assembling.";
 
         private static string BuildScriptPrompt(
@@ -904,6 +1200,24 @@ ASSEMBLY CONTEXT (CRITICAL):
                     ? slot.BoundingBoxMm[0].ToString("0.#") : "?";
                 sb.AppendLine();
                 sb.AppendLine($"PRINCIPAL AXIS: {slot.PrincipalAxis} — your part MUST extend along this LOCAL axis from `localOrigin`. The first entry of `boundingBoxMm` ({firstDim} mm) is the length along this axis.");
+
+                if (slot.IntegrationFeatures != null && slot.IntegrationFeatures.Count > 0)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("INTEGRATION FEATURES — you MUST implement each of these in CadQuery as part of your geometry. Coordinates are in YOUR local frame. The host has computed these deterministically from the approved electronics layout; treat them as a hard contract:");
+                    foreach (var f in slot.IntegrationFeatures)
+                    {
+                        string pos = $"({f.LocalPositionMm[0]:0.##}, {f.LocalPositionMm[1]:0.##}, {f.LocalPositionMm[2]:0.##})";
+                        string size = $"{f.SizeMm[0]:0.##} × {f.SizeMm[1]:0.##} × {f.SizeMm[2]:0.##}";
+                        sb.AppendLine($"  • [{f.FeatureKind}] for {f.ForModuleInstanceId} @ {pos} mm, size {size} mm — {f.Spec}");
+                    }
+                    sb.AppendLine();
+                    sb.AppendLine("Implementation guidance:");
+                    sb.AppendLine("  - For each `boss`, union a Workplane().box / cylinder of the listed dimensions at the listed local position with your main body, then `.faces().workplane().hole(diameter)` through it. SizeMm = [bossOuterDia, bossHeight, holeDia].");
+                    sb.AppendLine("  - For each `wall-cutout`, Boolean-subtract a box at the listed local position from your main body. SizeMm = [dx, dy, ignored_dz] — choose a cut depth that goes all the way through the wall (at least 2× the wall thickness).");
+                    sb.AppendLine("  - For each `reservation`, ensure your geometry does NOT fill that box. You may route walls/ribs around it but the interior must remain empty.");
+                    sb.AppendLine("  - Integration features may extend your part's bounding box by up to ~10 mm beyond the slot — that is expected and tolerated by the host.");
+                }
             }
             if (!string.IsNullOrWhiteSpace(focus))
             {

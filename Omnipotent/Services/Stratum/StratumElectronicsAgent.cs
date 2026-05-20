@@ -67,7 +67,269 @@ namespace Omnipotent.Services.Stratum
                 await DesignSubtaskAsync(ctx, llm, sessionId, plan, subtask, idx);
             }
 
-            ctx.EmitStatus("Electronics design completed.");
+            // ── Spatial layout phase ──
+            // Now that the schematics are approved, run a separate LLM step that places every
+            // module instance in 3D space and assigns each one to a hosting mechanical subtask.
+            // The Mechanical Agent reads this artifact next to design real bosses + cutouts.
+            await BuildLayoutAsync(ctx, llm, sessionId, plan);
+
+            ctx.EmitStatus("Electronics design + layout completed.");
+        }
+
+        // ── Spatial layout (post-design) ──
+        private async Task BuildLayoutAsync(
+            StratumAgentContext ctx, KliveLLM.KliveLLM llm, string sessionId, StratumPlannerOutput plan)
+        {
+            // Aggregate every approved electronics design on this project.
+            var aggregated = LoadAggregatedApprovedDesigns(ctx);
+            if (aggregated.Modules.Count == 0)
+            {
+                ctx.EmitThought("No approved electronics modules — skipping spatial layout phase.");
+                return;
+            }
+
+            // Mechanical subtask titles double as the only valid hostingPart values.
+            var hostingParts = (plan.MechanicalSubtasks ?? new List<StratumPlannerSubtask>())
+                .Select(t => t.Title).Where(t => !string.IsNullOrWhiteSpace(t)).ToList();
+            if (hostingParts.Count == 0)
+            {
+                ctx.EmitThought("Plan has no mechanical subtasks — cannot assign hosting parts. Layout phase skipped.");
+                return;
+            }
+
+            string layoutSession = $"{sessionId}-layout";
+            string previousReject = "";
+            string lastJson = "";
+
+            for (int iter = 0; iter < MaxIterationsPerSubtask; iter++)
+            {
+                ctx.Cancellation.ThrowIfCancellationRequested();
+                ctx.EmitStatus($"Planning electronics spatial layout — iteration {iter + 1}");
+
+                string userPrompt = BuildLayoutPrompt(plan, aggregated, hostingParts, previousReject, lastJson);
+                string? systemPrompt = iter == 0 ? BuildLayoutSystemPrompt() : null;
+
+                ctx.EmitThought("Asking LLM to place every module in 3D and assign a hosting part…");
+                var resp = await llm.QueryLLM(userPrompt, layoutSession, systemPrompt: systemPrompt);
+                if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
+                {
+                    previousReject = $"LLM call failed: {resp.ErrorMessage}";
+                    continue;
+                }
+
+                string json = ExtractJsonObject(resp.Response);
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    previousReject = "Response did not contain a JSON object.";
+                    continue;
+                }
+                lastJson = json;
+
+                StratumElectronicsLayout? layout;
+                try { layout = JsonConvert.DeserializeObject<StratumElectronicsLayout>(json); }
+                catch (Exception ex) { previousReject = $"JSON parse failed: {ex.Message}"; continue; }
+                if (layout == null || layout.Placements == null)
+                {
+                    previousReject = "Layout JSON deserialised to null or has no placements.";
+                    continue;
+                }
+
+                // Backfill footprints from the catalog and validate.
+                var errors = new List<string>();
+                foreach (var p in layout.Placements)
+                {
+                    var mod = StratumModuleLibrary.Find(p.ModuleId);
+                    if (mod?.Footprint != null)
+                    {
+                        // Always overwrite the LLM's footprint with the library's authoritative copy.
+                        p.Footprint = new ModuleFootprint
+                        {
+                            DxMm = mod.Footprint.DxMm,
+                            DyMm = mod.Footprint.DyMm,
+                            DzMm = mod.Footprint.DzMm,
+                            MountStrategy = mod.Footprint.MountStrategy,
+                            MountHolesMm = mod.Footprint.MountHolesMm.Select(h => (double[])h.Clone()).ToList(),
+                            Connectors = mod.Footprint.Connectors.Select(c => new ConnectorAccess
+                            {
+                                Kind = c.Kind,
+                                LocalPositionMm = (double[])c.LocalPositionMm.Clone(),
+                                Direction = c.Direction,
+                                CutoutSizeMm = (double[])c.CutoutSizeMm.Clone(),
+                            }).ToList(),
+                        };
+                    }
+                    if (!hostingParts.Any(h => string.Equals(h, p.HostingPart, StringComparison.OrdinalIgnoreCase)))
+                        errors.Add($"Placement '{p.InstanceId}' has hostingPart '{p.HostingPart}' which is not a mechanical subtask title. Allowed: {string.Join(", ", hostingParts)}.");
+                }
+                // Every instance must be placed.
+                var placedIds = new HashSet<string>(layout.Placements.Select(p => p.InstanceId), StringComparer.OrdinalIgnoreCase);
+                var missing = aggregated.Modules.Where(m => !placedIds.Contains(m.InstanceId)).Select(m => m.InstanceId).ToList();
+                if (missing.Count > 0)
+                    errors.Add($"Missing placements for instances: {string.Join(", ", missing)}.");
+
+                if (errors.Count > 0)
+                {
+                    previousReject = string.Join(" ", errors.Take(8));
+                    ctx.EmitThought($"Layout invalid: {previousReject}");
+                    continue;
+                }
+
+                // Emit reasoning into the event stream.
+                ctx.EmitThought($"Layout origin convention: {layout.OriginConvention}");
+                foreach (var p in layout.Placements)
+                {
+                    string pos = $"({p.WorldPositionMm[0]:0.#}, {p.WorldPositionMm[1]:0.#}, {p.WorldPositionMm[2]:0.#}) mm";
+                    ctx.EmitThought($"  • {p.InstanceId} ({p.ModuleId}) → {p.HostingPart} @ {pos}");
+                }
+
+                var layoutBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(layout, Formatting.Indented));
+                var art = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
+                    StratumArtifactKind.Document, $"electronics_layout_v{iter + 1}.json", "application/json", layoutBytes,
+                    new Dictionary<string, string> { ["role"] = StratumArtifactRoles.ElectronicsLayout, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.ElectronicsLayout,
+                    subtaskTitle: null);
+                ctx.EmitArtifact(art.ArtifactID, art.FileName, art.Kind.ToString());
+
+                var resolution = await ctx.OpenGateAndWait(
+                    title: $"Approve electronics spatial layout (v{iter + 1})",
+                    description: "The Electronics Agent has placed every module in 3D space and assigned each one to a mechanical part that will host it. The Mechanical Agent will use this to generate real mounting bosses, screw holes, and connector cutouts. Approve to lock the layout in or reject with a comment to revise.",
+                    rationale: layout.OriginConvention,
+                    proposalObject: layout,
+                    proposalArtifactIDs: new[] { art.ArtifactID });
+
+                if (resolution.Decision == StratumGateDecision.Approve)
+                {
+                    ctx.EmitStatus("Electronics layout approved.");
+                    return;
+                }
+                previousReject = resolution.Comment ?? "";
+                ctx.EmitThought($"Layout rejected. Revising: {Tail(previousReject, 200)}");
+            }
+
+            throw new Exception($"Electronics layout did not converge within {MaxIterationsPerSubtask} iterations.");
+        }
+
+        private static StratumElectronicsDesign LoadAggregatedApprovedDesigns(StratumAgentContext ctx)
+        {
+            // Walk approved gates and union all electronics-design (schematic) artifacts.
+            var agg = new StratumElectronicsDesign();
+            var seenInstances = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var project = ctx.Parent.Storage.GetProject(ctx.Run.ProjectID);
+            if (project == null) return agg;
+
+            var artById = new Dictionary<string, StratumArtifact>(StringComparer.OrdinalIgnoreCase);
+            foreach (var rev in project.Revisions)
+                foreach (var a in rev.Artifacts) artById[a.ArtifactID] = a;
+
+            var gates = ctx.RunStore.ListGatesForProject(ctx.Run.ProjectID)
+                .Where(g => g.Status == StratumGateStatus.Approved)
+                .OrderBy(g => g.ResolvedAt ?? g.OpenedAt);
+            foreach (var gate in gates)
+            {
+                foreach (var artID in gate.ProposalArtifactIDs)
+                {
+                    if (!artById.TryGetValue(artID, out var art)) continue;
+                    if (art.Kind != StratumArtifactKind.Schematic) continue;
+                    var resolved = ctx.Parent.Storage.ResolveArtifact(ctx.Run.ProjectID, art.ArtifactID);
+                    if (resolved == null || !File.Exists(resolved.Value.blobPath)) continue;
+                    StratumElectronicsDesign? design;
+                    try { design = JsonConvert.DeserializeObject<StratumElectronicsDesign>(File.ReadAllText(resolved.Value.blobPath)); }
+                    catch { continue; }
+                    if (design == null) continue;
+                    foreach (var m in design.Modules ?? new List<ElectronicsModuleInstance>())
+                    {
+                        if (!seenInstances.Add(m.InstanceId)) continue;
+                        agg.Modules.Add(m);
+                    }
+                    if (design.Wires != null) agg.Wires.AddRange(design.Wires);
+                }
+            }
+            return agg;
+        }
+
+        private static string BuildLayoutSystemPrompt() =>
+@"You are the Electronics Layout Planner inside Stratum.
+After the wiring design has been approved, you place every electronics module in 3D space inside the device's enclosure and assign each module to a mechanical part that will host it.
+
+OUTPUT FORMAT: respond with a SINGLE ```json fenced code block, nothing else. No prose. The JSON MUST match this schema exactly:
+
+{
+  ""OriginConvention"": string,                     // e.g. ""World origin at chassis geometric centre; +Z up; +X forward.""
+  ""Placements"": [
+    {
+      ""InstanceId"": string,                       // MUST match a declared electronics module instance verbatim
+      ""ModuleId"": string,                         // FK into the catalog
+      ""Role"": string,                             // human-readable role
+      ""WorldPositionMm"": [x, y, z],               // millimetres
+      ""WorldRotationDeg"": [rx, ry, rz],           // Euler XYZ degrees
+      ""HostingPart"": string,                      // MUST match a mechanical subtask title verbatim
+      ""Reasoning"": string                         // why here
+    }
+  ],
+  ""Assumptions"": [ string, ... ],
+  ""OpenQuestions"": [ string, ... ]
+}
+
+Hard rules:
+- Every module instance MUST appear exactly once in `Placements`.
+- `HostingPart` MUST be one of the mechanical subtask titles supplied in the prompt — copy them verbatim.
+- Place modules so their bounding boxes (DxMm × DyMm × DzMm at their world pose) do not overlap each other.
+- Modules with connectors that need external access (USB, screw-terminal, jst-xh, antenna, led-indicator, shaft) should sit on a mechanical part with at least one outer face — explain this in `Reasoning`.
+- Modules that are wired together should be physically close when reasonable, to minimise harness length — explain this in `Reasoning` when relevant.
+- All numeric fields must be numbers, not strings. Units are millimetres / degrees.";
+
+        private static string BuildLayoutPrompt(
+            StratumPlannerOutput plan,
+            StratumElectronicsDesign aggregated,
+            List<string> hostingParts,
+            string previousReject,
+            string lastJson)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("DEVICE CONCEPT:");
+            sb.AppendLine(plan.DeviceConcept);
+            sb.AppendLine();
+            sb.AppendLine("MECHANICAL SUBTASKS (verbatim titles — `HostingPart` MUST be one of these):");
+            foreach (var t in plan.MechanicalSubtasks ?? new List<StratumPlannerSubtask>())
+                sb.AppendLine($"- {t.Title}: {t.Description}");
+            sb.AppendLine();
+            sb.AppendLine("ELECTRONICS MODULES TO PLACE (every InstanceId MUST appear in Placements):");
+            foreach (var m in aggregated.Modules)
+            {
+                var spec = StratumModuleLibrary.Find(m.ModuleId);
+                var f = spec?.Footprint;
+                string size = f != null ? $"{f.DxMm:0.#}×{f.DyMm:0.#}×{f.DzMm:0.#} mm" : "size unknown";
+                string mount = f != null ? f.MountStrategy : "unknown";
+                string connectors = f != null && f.Connectors.Count > 0
+                    ? "; needs access: " + string.Join(", ", f.Connectors.Select(c => $"{c.Kind} on {c.Direction}"))
+                    : "";
+                sb.AppendLine($"- {m.InstanceId} ({m.ModuleId}, {m.Role}): {size}, mount: {mount}{connectors}");
+            }
+            sb.AppendLine();
+            sb.AppendLine("WIRING (informational — keep wired-together instances physically close where possible):");
+            foreach (var w in aggregated.Wires.Take(40))
+                sb.AppendLine($"  {w.FromInstance}.{w.FromPin} → {w.ToInstance}.{w.ToPin}  ({w.Signal})");
+            if (aggregated.Wires.Count > 40)
+                sb.AppendLine($"  … {aggregated.Wires.Count - 40} more wires omitted");
+
+            if (!string.IsNullOrWhiteSpace(previousReject))
+            {
+                sb.AppendLine();
+                sb.AppendLine("USER / VALIDATOR FEEDBACK ON PREVIOUS LAYOUT (must be addressed):");
+                sb.AppendLine(previousReject);
+                if (!string.IsNullOrWhiteSpace(lastJson))
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("PREVIOUS LAYOUT (for reference, refine it):");
+                    sb.AppendLine("```json");
+                    sb.AppendLine(Tail(lastJson, 3500));
+                    sb.AppendLine("```");
+                }
+            }
+
+            sb.AppendLine();
+            sb.AppendLine("Produce the layout JSON now.");
+            return sb.ToString();
         }
 
         private async Task DesignSubtaskAsync(
@@ -110,21 +372,24 @@ namespace Omnipotent.Services.Stratum
                 var schematicArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                     StratumArtifactKind.Schematic, $"{baseName}.schematic.json", "application/json",
                     Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(design, Formatting.Indented)),
-                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.ElectronicsSchematic, subtaskTitle: subtask.Title);
                 producedArtifactIDs.Add(schematicArt.ArtifactID);
                 ctx.EmitArtifact(schematicArt.ArtifactID, schematicArt.FileName, schematicArt.Kind.ToString());
 
                 var wiringArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                     StratumArtifactKind.WiringDiagram, $"{baseName}.wiring.json", "application/json",
                     Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(BuildWiringGraph(design), Formatting.Indented)),
-                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.Wiring, subtaskTitle: subtask.Title);
                 producedArtifactIDs.Add(wiringArt.ArtifactID);
                 ctx.EmitArtifact(wiringArt.ArtifactID, wiringArt.FileName, wiringArt.Kind.ToString());
 
                 var bomArt = ctx.Parent.Storage.AddArtifact(ctx.Run.ProjectID, ctx.Run.TargetRevisionID,
                     StratumArtifactKind.Bom, $"{baseName}.bom.json", "application/json",
                     Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(bom, Formatting.Indented)),
-                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID });
+                    new Dictionary<string, string> { ["subtask"] = subtask.Title, ["iteration"] = (iter + 1).ToString(), ["runID"] = ctx.Run.RunID },
+                    role: StratumArtifactRoles.Bom, subtaskTitle: subtask.Title);
                 producedArtifactIDs.Add(bomArt.ArtifactID);
                 ctx.EmitArtifact(bomArt.ArtifactID, bomArt.FileName, bomArt.Kind.ToString());
 
