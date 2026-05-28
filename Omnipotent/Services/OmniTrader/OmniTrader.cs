@@ -1,475 +1,113 @@
-﻿using Newtonsoft.Json;
-using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.OmniTrader.Api;
 using Omnipotent.Services.OmniTrader.Backtesting;
-using Omnipotent.Services.OmniTrader.Data;
-using Omnipotent.Services.OmniTrader.Strategies.FlowSignalTraderStrategy;
-using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-using System.Net;
+using Omnipotent.Services.OmniTrader.Contracts;
+using Omnipotent.Services.OmniTrader.Execution;
+using Omnipotent.Services.OmniTrader.MarketData;
+using Omnipotent.Services.OmniTrader.Persistence;
+using Omnipotent.Services.OmniTrader.Sessions;
+using Omnipotent.Services.OmniTrader.Strategy;
 using System.Reflection;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace Omnipotent.Services.OmniTrader
 {
-    public class OmniTrader : OmniService
+    public sealed class OmniTrader : OmniService
     {
-        public OmniTraderFinanceData data = null!;
-        public OmniTraderSimulator simulator = null!;
+        public OmniTraderDb Db { get; private set; } = null!;
+        public DeploymentRepository DeploymentRepo { get; private set; } = null!;
+        public OrderRepository OrderRepo { get; private set; } = null!;
+        public FillRepository FillRepo { get; private set; } = null!;
+        public EquityRepository EquityRepo { get; private set; } = null!;
+        public BacktestJobRepository BacktestJobRepo { get; private set; } = null!;
+        public CandleCacheRepository CandleCacheRepo { get; private set; } = null!;
+        public KrakenNonceStore NonceStore { get; private set; } = null!;
+        public MarketDataRouter MarketData { get; private set; } = null!;
+        public StrategyRegistry StrategyRegistry { get; private set; } = null!;
+        public SessionManager SessionManager { get; private set; } = null!;
+        public BacktestJobQueue BacktestQueue { get; private set; } = null!;
 
-        private readonly Dictionary<Guid, string> deploymentStrategyNames = new();
+        private OmniTraderRoutes routes = null!;
+        private KrakenOrderRouter? krakenRouter;
+
+        public bool IsKrakenConfigured => krakenRouter != null;
+        public string GetDbPath() => Db?.DbPath ?? "(uninitialised)";
 
         public OmniTrader()
         {
             name = "OmniTrader";
-            threadAnteriority = ThreadAnteriority.Critical;
+            threadAnteriority = ThreadAnteriority.Standard;
         }
 
         protected override async void ServiceMain()
         {
-            data = new OmniTraderFinanceData(this);
-            simulator = new OmniTraderSimulator(this);
-
-            _ = InitialiseRoutesAndAutoRedeploy();
-
-
-            FlowSignalTraderStrategy engine = new();
-            await engine.Initialise(this);
-            var guid = await simulator.Deploy(engine, "BTCUSDT", OmniTraderFinanceData.TimeInterval.OneMinute);
-            while (true)
-            {
-                var strategy = await simulator.GetPersistedStrategySnapshot("FlowSignalTraderStrategy");
-
-                if (strategy is not null)
-                {
-                    await ServiceLog(
-                        $"[FlowSignalTraderStrategy] FinalEquity={strategy.FinalEquity}, " +
-                        $"Trades={strategy.TotalTrades}, " +
-                        $"PnL%={strategy.TotalPnLPercent}, " +
-                        $"WinRate={strategy.WinRate}, " +
-                        $"Fees={strategy.TotalFeesPaid}");
-                }
-
-                await Task.Delay(1000);
-            }
-        }
-
-        private async Task InitialiseRoutesAndAutoRedeploy()
-        {
             try
             {
-                await CreateRoutes();
-                await RestorePersistedDeployments();
+                Db = new OmniTraderDb();
+                await Db.InitialiseAsync();
+
+                DeploymentRepo = new DeploymentRepository(Db);
+                OrderRepo = new OrderRepository(Db);
+                FillRepo = new FillRepository(Db);
+                EquityRepo = new EquityRepository(Db);
+                BacktestJobRepo = new BacktestJobRepository(Db);
+                CandleCacheRepo = new CandleCacheRepository(Db);
+                NonceStore = new KrakenNonceStore(Db);
+                await NonceStore.InitialiseAsync();
+
+                MarketData = new MarketDataRouter(CandleCacheRepo);
+
+                StrategyRegistry = new StrategyRegistry();
+                StrategyRegistry.DiscoverFrom(Assembly.GetExecutingAssembly());
+
+                await BacktestJobRepo.MarkOrphansFailedAsync("interrupted by restart");
+
+                await TryInitKrakenAsync();
+
+                SessionManager = new SessionManager(
+                    MarketData, StrategyRegistry,
+                    DeploymentRepo, OrderRepo, FillRepo, EquityRepo,
+                    () => krakenRouter,
+                    m => _ = ServiceLog(m),
+                    (m, e) => _ = (e == null ? ServiceLogError(m) : ServiceLogError(e, m)));
+
+                BacktestQueue = new BacktestJobQueue(BacktestJobRepo, MarketData, StrategyRegistry,
+                    m => _ = ServiceLog(m),
+                    (m, e) => _ = (e == null ? ServiceLogError(m) : ServiceLogError(e, m)));
+                BacktestQueue.Start();
+                await BacktestQueue.RestoreQueuedAsync();
+
+                routes = new OmniTraderRoutes(this);
+                await routes.RegisterAsync();
+
+                await SessionManager.RecoverAsync();
+
+                await ServiceLog($"OmniTrader started. DB={Db.DbPath}. Strategies={StrategyRegistry.All.Count}. Kraken={(IsKrakenConfigured ? "configured" : "not configured")}.");
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "Failed to initialise OmniTrader routes and auto-redeploy.");
+                await ServiceLogError(ex, "OmniTrader startup failed");
             }
         }
 
-        public async Task<Guid> StartStrategyDeployment(
-            OmniTraderStrategy strategy,
-            string symbol,
-            OmniTraderFinanceData.TimeInterval interval,
-            BacktestSettings? settings = null,
-            CancellationToken cancellationToken = default)
+        private async Task TryInitKrakenAsync()
         {
-            Guid deploymentId = await simulator.Deploy(strategy, symbol, interval, settings, cancellationToken);
-            lock (deploymentStrategyNames)
+            try
             {
-                deploymentStrategyNames[deploymentId] = strategy.Name;
-            }
-            return deploymentId;
-        }
-
-        public async Task<bool> StopStrategyDeployment(Guid deploymentId)
-        {
-            bool removed = await simulator.Undeploy(deploymentId);
-            if (removed)
-            {
-                lock (deploymentStrategyNames)
+                string apiKey = await GetStringOmniSetting("OmniTrader.Kraken.ApiKey", sensitive: true);
+                string apiSecret = await GetStringOmniSetting("OmniTrader.Kraken.ApiSecret", sensitive: true);
+                if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(apiSecret))
                 {
-                    deploymentStrategyNames.Remove(deploymentId);
-                }
-            }
-            return removed;
-        }
-
-        public Task StopAllStrategyDeployments()
-        {
-            lock (deploymentStrategyNames)
-            {
-                deploymentStrategyNames.Clear();
-            }
-            return simulator.UndeployAll();
-        }
-
-        public IReadOnlyCollection<Guid> GetActiveDeploymentIds()
-        {
-            return simulator.GetDeploymentIds();
-        }
-
-        public OmniBacktestResult GetAnalyticsForDeployment(Guid deploymentId)
-        {
-            return simulator.GetSnapshot(deploymentId);
-        }
-
-        public Dictionary<Guid, OmniBacktestResult> GetAnalyticsForAllDeployments()
-        {
-            return simulator.GetAllSnapshots();
-        }
-
-        public Dictionary<Guid, OmniBacktestResult> GetAllStrategyAnalyticsSummary()
-        {
-            return simulator.GetAllSnapshotSummaries();
-        }
-
-        public Task<OmniBacktestResult> GetPersistedStrategyAnalytics(string strategyName)
-        {
-            return simulator.GetPersistedStrategySnapshot(strategyName);
-        }
-
-        public Task<Dictionary<string, OmniBacktestResult>> GetAllPersistedStrategyAnalytics()
-        {
-            return simulator.GetAllPersistedStrategySnapshots();
-        }
-
-        public async Task WriteBacktestResultToDesktop(OmniBacktestResult result)
-        {
-            string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            string filePath = Path.Combine(desktopPath, $"BacktestResult_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
-            await File.WriteAllTextAsync(filePath, result.ToString());
-        }
-
-        private async Task RestorePersistedDeployments()
-        {
-            var deploymentsToRestore = await simulator.GetPersistedActiveDeployments();
-            foreach (var registration in deploymentsToRestore)
-            {
-                try
-                {
-                    OmniTraderStrategy strategy = CreateStrategyInstance(registration.StrategyName);
-                    await StartStrategyDeployment(strategy, registration.Symbol, registration.Interval, registration.Settings);
-                    await ServiceLog($"Auto-redeployed strategy '{registration.StrategyName}' on {registration.Symbol} {registration.Interval}.");
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, $"Failed to auto-redeploy strategy '{registration.StrategyName}'.");
-                }
-            }
-        }
-
-        private static Dictionary<string, Type> GetStrategyTypeMap()
-        {
-            var map = new Dictionary<string, Type>(StringComparer.OrdinalIgnoreCase);
-            var strategyTypes = Assembly.GetExecutingAssembly()
-                .GetTypes()
-                .Where(t => !t.IsAbstract
-                            && typeof(OmniTraderStrategy).IsAssignableFrom(t)
-                            && t.GetConstructor(Type.EmptyTypes) != null);
-
-            foreach (var type in strategyTypes)
-            {
-                var strategy = (OmniTraderStrategy)Activator.CreateInstance(type)!;
-                if (!string.IsNullOrWhiteSpace(strategy.Name))
-                    map[strategy.Name] = type;
-
-                map[type.Name] = type;
-            }
-
-            return map;
-        }
-
-        private static OmniTraderStrategy CreateStrategyInstance(string strategyName)
-        {
-            var strategyMap = GetStrategyTypeMap();
-            if (!strategyMap.TryGetValue(strategyName, out var strategyType))
-                throw new InvalidOperationException($"Strategy '{strategyName}' could not be found.");
-
-            return (OmniTraderStrategy)Activator.CreateInstance(strategyType)!;
-        }
-
-        private async Task CreateRoutes()
-        {
-
-            await CreateAPIRoute("/api/omnitrader/status", async (req) =>
-            {
-                var summary = new
-                {
-                    Service = "OmniTrader",
-                    DeployedCount = GetActiveDeploymentIds().Count,
-                    ActiveDeploymentIds = GetActiveDeploymentIds(),
-                    Uptime = GetServiceUptime().ToString(),
-                    ManagerUptime = GetManagerUptime().ToString()
-                };
-                await req.ReturnResponse(JsonConvert.SerializeObject(summary));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/strategies", async (req) =>
-            {
-                var map = GetStrategyTypeMap();
-                var available = map
-                    .GroupBy(k => k.Value)
-                    .Select(g =>
-                    {
-                        var strategy = (OmniTraderStrategy)Activator.CreateInstance(g.Key)!;
-                        return new
-                        {
-                            StrategyName = strategy.Name,
-                            ClassName = g.Key.Name,
-                            strategy.Description
-                        };
-                    })
-                    .Where(x => !string.IsNullOrWhiteSpace(x.StrategyName))
-                    .OrderBy(x => x.StrategyName)
-                    .ToList();
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(available));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/simulator/deployments", async (req) =>
-            {
-                var analytics = GetAllStrategyAnalyticsSummary();
-                var deployed = analytics.Select(k => new
-                {
-                    DeploymentId = k.Key,
-                    StrategyName = GetTrackedStrategyName(k.Key),
-                    k.Value.FinalEquity,
-                    k.Value.TotalTrades,
-                    k.Value.TotalPnLPercent,
-                    k.Value.WinRate,
-                    k.Value.TotalFeesPaid
-                }).ToList();
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(deployed));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/simulator/active", async (req) =>
-            {
-                try
-                {
-                    var registrations = (await simulator.GetPersistedActiveDeployments(1500)).ToList();
-                    await req.ReturnResponse(JsonConvert.SerializeObject(registrations));
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Failed to read active persistent simulator deployments.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(Array.Empty<object>()), code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/analytics/live", async (req) =>
-            {
-                try
-                {
-                    var analytics = GetAllStrategyAnalyticsSummary();
-                    await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Failed to read live OmniTrader analytics.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new Dictionary<string, OmniBacktestResult>()), code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/analytics/live/deployment", async (req) =>
-            {
-                if (!Guid.TryParse(req.userParameters.Get("deploymentId"), out var deploymentId))
-                {
-                    await req.ReturnResponse("Invalid or missing deploymentId", code: HttpStatusCode.BadRequest);
+                    await ServiceLog("Kraken credentials missing — live trading disabled.");
                     return;
                 }
-
-                var result = GetAnalyticsForDeployment(deploymentId);
-                await req.ReturnResponse(JsonConvert.SerializeObject(result));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/analytics/persisted", async (req) =>
-            {
-                var analytics = await GetAllPersistedStrategyAnalytics();
-                await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/analytics/persisted/strategy", async (req) =>
-            {
-                try
-                {
-                    string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                    if (string.IsNullOrWhiteSpace(strategyName))
-                    {
-                        await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
-                    var analytics = await simulator.GetPersistedStrategySnapshot(strategyName, includeTrades);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(analytics));
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Failed to read persisted analytics by strategy.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Error = ex.Message
-                    }), code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/analytics/insight", async (req) =>
-            {
-                try
-                {
-                    string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                    if (string.IsNullOrWhiteSpace(strategyName))
-                    {
-                        await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    bool includeTrades = bool.TryParse(req.userParameters.Get("includeTrades"), out var parsed) && parsed;
-                    var insight = await simulator.GetStrategyInsight(strategyName, includeTrades);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(insight));
-                }
-                catch (Exception ex)
-                {
-                    await ServiceLogError(ex, "Failed to read strategy insight.");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        Error = ex.Message
-                    }), code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/backtest", async (req) =>
-            {
-                string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(strategyName))
-                {
-                    await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                    return;
-                }
-
-                string coin = req.userParameters.Get("coin") ?? "BTC";
-                string currency = req.userParameters.Get("currency") ?? "USD";
-                int candleCount = ParseInt(req.userParameters.Get("candles"), 500);
-                var interval = ParseInterval(req.userParameters.Get("interval"), OmniTraderFinanceData.TimeInterval.OneHour);
-
-                var settings = new BacktestSettings
-                {
-                    InitialQuoteBalance = ParseDecimal(req.userParameters.Get("initialQuote"), 10_000m),
-                    InitialBaseBalance = ParseDecimal(req.userParameters.Get("initialBase"), 0m),
-                    FeeFraction = ParseDecimal(req.userParameters.Get("feeFraction"), 0.001m),
-                    SlippageFraction = ParseDecimal(req.userParameters.Get("slippageFraction"), 0.0005m)
-                };
-
-                OmniTraderStrategy strategy = CreateStrategyInstance(strategyName);
-                await strategy.PrepareForSession(this, TradeSessionType.Backtester);
-                var result = await simulator.RunBacktestAndPersist(strategy, coin, currency, interval, candleCount, settings);
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
-                {
-                    strategyName,
-                    coin,
-                    currency,
-                    interval,
-                    candleCount,
-                    result
-                }));
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Guest);
-
-            await CreateAPIRoute("/api/omnitrader/simulator/deploy", async (req) =>
-            {
-                string strategyName = req.userParameters.Get("strategyName") ?? string.Empty;
-                if (string.IsNullOrWhiteSpace(strategyName))
-                {
-                    await req.ReturnResponse("Missing strategyName", code: HttpStatusCode.BadRequest);
-                    return;
-                }
-
-                string symbol = req.userParameters.Get("symbol") ?? "BTCUSDT";
-                var interval = ParseInterval(req.userParameters.Get("interval"), OmniTraderFinanceData.TimeInterval.OneMinute);
-
-                var settings = new BacktestSettings
-                {
-                    InitialQuoteBalance = ParseDecimal(req.userParameters.Get("initialQuote"), 10_000m),
-                    InitialBaseBalance = ParseDecimal(req.userParameters.Get("initialBase"), 0m),
-                    FeeFraction = ParseDecimal(req.userParameters.Get("feeFraction"), 0.001m),
-                    SlippageFraction = ParseDecimal(req.userParameters.Get("slippageFraction"), 0.0005m)
-                };
-
-                OmniTraderStrategy strategy = CreateStrategyInstance(strategyName);
-                Guid deploymentId = await StartStrategyDeployment(strategy, symbol, interval, settings);
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
-                {
-                    Message = "Strategy deployed",
-                    DeploymentId = deploymentId,
-                    StrategyName = strategyName,
-                    Symbol = symbol,
-                    Interval = interval
-                }));
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-
-            await CreateAPIRoute("/api/omnitrader/simulator/undeploy", async (req) =>
-            {
-                if (!Guid.TryParse(req.userParameters.Get("deploymentId"), out var deploymentId))
-                {
-                    await req.ReturnResponse("Invalid or missing deploymentId", code: HttpStatusCode.BadRequest);
-                    return;
-                }
-
-                bool result = await StopStrategyDeployment(deploymentId);
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
-                {
-                    Message = result ? "Strategy undeployed" : "Deployment not found",
-                    DeploymentId = deploymentId,
-                    Success = result
-                }), code: result ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-
-            await CreateAPIRoute("/api/omnitrader/simulator/undeploy-all", async (req) =>
-            {
-                await StopAllStrategyDeployments();
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
-                {
-                    Message = "All strategies undeployed"
-                }));
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-        }
-
-        private string GetTrackedStrategyName(Guid deploymentId)
-        {
-            lock (deploymentStrategyNames)
-            {
-                return deploymentStrategyNames.TryGetValue(deploymentId, out var name) ? name : "Unknown";
+                krakenRouter = new KrakenOrderRouter(apiKey, apiSecret, NonceStore);
+                await ServiceLog("Kraken order router initialised.");
             }
-        }
-
-        private static int ParseInt(string? value, int defaultValue)
-        {
-            return int.TryParse(value, out var parsed) ? parsed : defaultValue;
-        }
-
-        private static decimal ParseDecimal(string? value, decimal defaultValue)
-        {
-            return decimal.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : defaultValue;
-        }
-
-        private static OmniTraderFinanceData.TimeInterval ParseInterval(string? raw, OmniTraderFinanceData.TimeInterval fallback)
-        {
-            if (string.IsNullOrWhiteSpace(raw))
-                return fallback;
-
-            if (Enum.TryParse<OmniTraderFinanceData.TimeInterval>(raw, true, out var byName))
-                return byName;
-
-            if (int.TryParse(raw, out var byValue) && Enum.IsDefined(typeof(OmniTraderFinanceData.TimeInterval), byValue))
-                return (OmniTraderFinanceData.TimeInterval)byValue;
-
-            return fallback;
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to initialise Kraken order router");
+                krakenRouter = null;
+            }
         }
     }
 }

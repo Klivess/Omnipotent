@@ -106,18 +106,21 @@ namespace Omnipotent.Services.KliveBot_Discord
                             message = await SendMessageToKlives(embed);
                         }
 
-                        // Try KliveAgent first if it's active
+                        // Try KliveAgent first if it's active — but ONLY for Klives. KliveAgent can
+                        // read and control every Omnipotent service via C# scripts, so it is gated to
+                        // the owner. Everyone else falls through to the plain KliveLLM chatbot below.
                         bool handledByAgent = false;
                         try
                         {
                             var agentServices = await GetServicesByType<Omnipotent.Services.KliveAgent.KliveAgent>();
-                            if (agentServices != null && agentServices.Length > 0 && agentServices[0].IsServiceActive())
+                            if (args.Author.Id == OmniPaths.KlivesDiscordAccountID
+                                && agentServices != null && agentServices.Length > 0 && agentServices[0].IsServiceActive())
                             {
                                 var agent = (Omnipotent.Services.KliveAgent.KliveAgent)agentServices[0];
                                 if (agent.DiscordDMHandler != null)
                                 {
                                     Stopwatch stopwatch = Stopwatch.StartNew();
-                                    string agentResponse = await agent.DiscordDMHandler(args.Message.Content, args.Channel.Id.ToString());
+                                    string agentResponse = await agent.DiscordDMHandler(args.Message.Content, args.Channel.Id.ToString(), args.Author.Id);
                                     stopwatch.Stop();
                                     await args.Message.RespondAsync(agentResponse + "\n\nProcessing Time: " + stopwatch.Elapsed.Humanize());
                                     handledByAgent = true;

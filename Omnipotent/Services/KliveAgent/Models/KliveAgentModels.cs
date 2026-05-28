@@ -208,8 +208,16 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("timestamp")]
         public DateTime Timestamp { get; set; } = DateTime.UtcNow;
 
+        /// <summary>Legacy single-script slot. Kept for back-compat deserialization of older
+        /// conversation files; new turns populate <see cref="ScriptResults"/> instead.</summary>
         [JsonProperty("scriptResult")]
         public AgentScriptResult ScriptResult { get; set; }
+
+        /// <summary>Every script the agent wrote+ran while producing this turn (in order), with
+        /// their outputs/errors. Lets the agent see its own prior code+outputs on later turns and
+        /// lets the UI replay them when a past conversation is reloaded.</summary>
+        [JsonProperty("scriptResults")]
+        public List<AgentScriptResult> ScriptResults { get; set; }
 
         [JsonProperty("senderName")]
         public string SenderName { get; set; }

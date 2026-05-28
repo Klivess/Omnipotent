@@ -445,6 +445,12 @@ namespace Omnipotent.Services.KliveLLM
                 huggingFaceModel);
         }
 
+        // Bounded retry policy for the remote LLM call. Only transient failures (timeouts,
+        // 408/429, 5xx, empty payloads, network resets) are retried; 4xx auth/validation errors
+        // fail fast. Without this, a single blip from the provider aborts the whole agent loop.
+        private const int RemoteInferenceMaxAttempts = 3;
+        private const int RemoteInferenceBaseDelayMs = 800;
+
         private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
@@ -463,34 +469,101 @@ namespace Omnipotent.Services.KliveLLM
             }
             payload.BuildMessagesFromChatHistory(messages);
 
-            using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
-            {
-                Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json")
-            };
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+            // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
+            // fresh request per attempt from this cached body.
+            string payloadJson = JsonConvert.SerializeObject(payload);
 
-            if (remoteProvider.Provider == LLMProvider.OpenRouter)
+            Exception lastError = null;
+            for (int attempt = 1; attempt <= RemoteInferenceMaxAttempts; attempt++)
             {
-                request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
-                request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
+                HttpResponseMessage response;
+                string responseContent;
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
+                    {
+                        Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
+                    };
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+
+                    if (remoteProvider.Provider == LLMProvider.OpenRouter)
+                    {
+                        request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
+                        request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
+                    }
+
+                    response = await client.SendAsync(request);
+                    responseContent = await response.Content.ReadAsStringAsync();
+                }
+                catch (Exception ex) when (IsTransientNetworkError(ex))
+                {
+                    // Connection reset / timeout / DNS blip — retry with backoff.
+                    lastError = ex;
+                    if (attempt >= RemoteInferenceMaxAttempts) throw;
+                    try { await ServiceLog($"Remote LLM network error (attempt {attempt}/{RemoteInferenceMaxAttempts}): {ex.Message}. Retrying."); } catch { }
+                    await DelayBeforeRetryAsync(attempt, null);
+                    continue;
+                }
+
+                using (response)
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        int status = (int)response.StatusCode;
+                        bool transient = status == 408 || status == 429 || status >= 500;
+                        var httpEx = new HttpRequestException(
+                            $"{remoteProvider.DisplayName} request failed with status {status} ({response.ReasonPhrase}). Body: {responseContent}");
+
+                        if (transient && attempt < RemoteInferenceMaxAttempts)
+                        {
+                            lastError = httpEx;
+                            try { await ServiceLog($"Remote LLM transient {status} (attempt {attempt}/{RemoteInferenceMaxAttempts}). Retrying."); } catch { }
+                            await DelayBeforeRetryAsync(attempt, response);
+                            continue;
+                        }
+                        throw httpEx; // non-transient (4xx) or out of attempts
+                    }
+
+                    var hfResponse = JsonConvert.DeserializeObject<HFWrapper.HFLLMInferenceResponse>(responseContent);
+
+                    if (hfResponse?.choices == null || hfResponse.choices.Count == 0)
+                    {
+                        var emptyEx = new InvalidOperationException($"{remoteProvider.DisplayName} returned an empty completion payload.");
+                        if (attempt < RemoteInferenceMaxAttempts)
+                        {
+                            lastError = emptyEx;
+                            await DelayBeforeRetryAsync(attempt, null);
+                            continue;
+                        }
+                        throw emptyEx;
+                    }
+
+                    return hfResponse;
+                }
             }
 
-            var response = await client.SendAsync(request);
-            string responseContent = await response.Content.ReadAsStringAsync();
+            throw lastError ?? new InvalidOperationException("Remote inference failed for an unknown reason.");
+        }
 
-            if (!response.IsSuccessStatusCode)
+        private static bool IsTransientNetworkError(Exception ex)
+            => ex is HttpRequestException
+            || ex is TaskCanceledException        // HttpClient timeout surfaces as this (no cancellation token in use)
+            || ex is System.IO.IOException
+            || ex is System.Net.Sockets.SocketException;
+
+        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response)
+        {
+            TimeSpan delay;
+            if (response?.Headers?.RetryAfter?.Delta is TimeSpan retryAfter && retryAfter > TimeSpan.Zero)
             {
-                throw new HttpRequestException($"{remoteProvider.DisplayName} request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {responseContent}");
+                delay = retryAfter; // honour provider's Retry-After (common on 429)
             }
-
-            var hfResponse = JsonConvert.DeserializeObject<HFWrapper.HFLLMInferenceResponse>(responseContent);
-
-            if (hfResponse?.choices == null || hfResponse.choices.Count == 0)
+            else
             {
-                throw new InvalidOperationException($"{remoteProvider.DisplayName} returned an empty completion payload.");
+                double ms = RemoteInferenceBaseDelayMs * Math.Pow(2, attempt - 1);
+                delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
-
-            return hfResponse;
+            await Task.Delay(delay);
         }
         private async Task EnsureModelDownloadedAsync()
         {

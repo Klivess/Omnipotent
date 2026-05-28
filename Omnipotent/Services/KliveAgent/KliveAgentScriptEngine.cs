@@ -551,6 +551,7 @@ namespace Omnipotent.Services.KliveAgent
         public async Task<string> SaveMemory(string content, string[]? tags = null, int importance = 1)
         {
             var entry = await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", importance, "general");
+            agentService.Stats?.RecordMemoryActivity(saves: 1, recalls: 0);
             return entry?.Id ?? string.Empty;
         }
 
@@ -565,6 +566,7 @@ namespace Omnipotent.Services.KliveAgent
         public async Task<string> SaveShortcut(string title, string content, string[]? tags = null)
         {
             var entry = await agentService.Memory.SaveMemoryAsync(content, tags ?? Array.Empty<string>(), "agent", 5, "shortcut", title);
+            agentService.Stats?.RecordMemoryActivity(saves: 1, recalls: 0);
             return entry?.Id ?? string.Empty;
         }
 
@@ -582,6 +584,7 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Search persistent memories. Searches both content and tags as text — passing a tag name works.</summary>
         public async Task<List<AgentMemoryEntry>> RecallMemories(string query, int maxResults = 10)
         {
+            agentService.Stats?.RecordMemoryActivity(saves: 0, recalls: 1);
             return await agentService.Memory.RecallMemoriesAsync(query, maxResults);
         }
 
@@ -589,6 +592,7 @@ namespace Omnipotent.Services.KliveAgent
         public async Task<List<AgentMemoryEntry>> RecallMemoriesByTag(string tag)
         {
             if (string.IsNullOrWhiteSpace(tag)) return new List<AgentMemoryEntry>();
+            agentService.Stats?.RecordMemoryActivity(saves: 0, recalls: 1);
             var all = await agentService.Memory.GetAllMemoriesAsync();
             return all.Where(m => m.Tags != null && m.Tags.Any(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase))).ToList();
         }

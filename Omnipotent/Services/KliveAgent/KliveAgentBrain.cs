@@ -133,6 +133,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
             sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
+            sb.AppendLine("- TALK WHILE YOU WORK: when a request needs data-gathering scripts, OPEN with a one-line conversational acknowledgement in plain prose BEFORE the {{{ script }}} (e.g. \"On it, pulling that now.\"). The user sees your prose immediately while the script runs. Keep it to one short line — don't narrate every step.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, CallObjectMethod, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
             sb.AppendLine("- GetService(name) returns object. To call a method on it: CallObjectMethod(svc, \"Method\", args) — it auto-awaits Tasks for you.");
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
@@ -295,13 +296,23 @@ namespace Omnipotent.Services.KliveAgent
         private const int StuckErrorThreshold = 3;
         private const int StuckScriptRepeatThreshold = 2;
 
+        /// <summary>How many of the most recent agent turns replay their scripts+outputs into the
+        /// conversation history. Recent turns are where "what did I just run / what did it return"
+        /// matters most; older turns stay text-only to keep prompt cost bounded.</summary>
+        private const int HistoryScriptRecentTurns = 3;
+
         public async Task<AgentChatResponse> ProcessMessageAsync(
             string userMessage,
             AgentConversation conversation,
-            string? senderName = null)
+            string? senderName = null,
+            Action<string>? onProgress = null)
         {
             try
             {
+                var turnStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                // Accumulates the agent's conversational prose across iterations so the user can be
+                // shown it "talking" (via onProgress) while its scripts are still running.
+                var progressText = new StringBuilder();
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation);
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
 
@@ -370,7 +381,8 @@ namespace Omnipotent.Services.KliveAgent
                     if (llmResponse == null || !llmResponse.Success)
                     {
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
-                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
+                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
                         return new AgentChatResponse
                         {
                             ConversationId = conversation.ConversationId,
@@ -385,6 +397,27 @@ namespace Omnipotent.Services.KliveAgent
 
                     var segments = ParseLLMResponse(llmResponse.Response ?? "");
                     var hasScripts = segments.Any(s => s.IsScript);
+
+                    // Talk while working: push the agent's conversational prose to the live progress
+                    // channel the moment we see it, before the scripts in this turn execute. The user
+                    // reads "On it — pulling that now…" while the data-gathering runs in the background.
+                    if (hasScripts && onProgress != null)
+                    {
+                        var thought = string.Join("\n", segments.Where(s => !s.IsScript)
+                            .Select(s => s.Content)).Trim();
+                        if (thought.Length > 0)
+                        {
+                            if (progressText.Length > 0) progressText.AppendLine().AppendLine();
+                            progressText.Append(thought);
+                        }
+                        int pendingScriptCount = segments.Count(s => s.IsScript);
+                        var shown = progressText.Length > 0 ? progressText.ToString() : "On it — working on that now.";
+                        try
+                        {
+                            onProgress($"{shown}\n\n_…running {pendingScriptCount} script{(pendingScriptCount == 1 ? "" : "s")} (step {iteration + 1})_");
+                        }
+                        catch { /* progress is best-effort */ }
+                    }
 
                     // Detect Anthropic/OpenAI-style tool-call XML or JSON in the raw output — the
                     // model thinks it's calling a tool but the parser will never see it. After 2
@@ -418,11 +451,21 @@ namespace Omnipotent.Services.KliveAgent
                         llm.ResetSession(llmSessionId);
 
                         conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
-                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.Agent, Content = finalText });
+                        conversation.Messages.Add(new AgentMessage
+                        {
+                            Role = AgentMessageRole.Agent,
+                            Content = finalText,
+                            // Persist the code KliveAgent wrote+ran this turn (and its outputs) so it
+                            // can see its own prior actions on later turns and the UI can replay them.
+                            ScriptResults = allScriptsExecuted.Count > 0
+                                ? new List<AgentScriptResult>(allScriptsExecuted)
+                                : null
+                        });
                         conversation.LastUpdated = DateTime.UtcNow;
 
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
-                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success));
+                            allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
+                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
 
                         // NOTE: We deliberately do NOT auto-save "task completed" summaries here.
                         // Memory is for durable facts about reality (who Klives is, how a service
@@ -598,11 +641,38 @@ namespace Omnipotent.Services.KliveAgent
 
                 if (historyMessages.Count > 0)
                 {
+                    // Compaction: turns that fall before the retained window are summarised into a
+                    // short synopsis rather than silently dropped, so the earlier thread survives.
+                    var earlierSummary = BuildEarlierSummary(conversation.Messages, historyMessages,
+                        KliveAgentContextBudget.HistorySummaryBudget);
+                    if (!string.IsNullOrWhiteSpace(earlierSummary))
+                    {
+                        sb.AppendLine("[Earlier Conversation Summary]");
+                        sb.AppendLine(earlierSummary);
+                        sb.AppendLine();
+                    }
+
                     sb.AppendLine("[Conversation History]");
+
+                    // Only the most recent agent turns replay their scripts+outputs (higher fidelity
+                    // where it matters; older turns stay text-only to bound prompt cost).
+                    var scriptCarryingTurns = historyMessages
+                        .Where(m => m.Role == AgentMessageRole.Agent
+                            && m.ScriptResults != null && m.ScriptResults.Count > 0)
+                        .TakeLast(HistoryScriptRecentTurns)
+                        .ToHashSet();
+
                     foreach (var msg in historyMessages)
                     {
                         var role = msg.Role == AgentMessageRole.User ? "User" : "KliveAgent";
                         sb.AppendLine($"{role}: {msg.Content}");
+
+                        if (scriptCarryingTurns.Contains(msg))
+                        {
+                            var scripts = FormatHistoryScripts(msg, KliveAgentContextBudget.HistoryScriptBudget);
+                            if (!string.IsNullOrWhiteSpace(scripts))
+                                sb.AppendLine(scripts);
+                        }
                     }
                     sb.AppendLine();
                 }
@@ -655,6 +725,86 @@ namespace Omnipotent.Services.KliveAgent
                     ? new[] { x.user, x.agent }
                     : new[] { x.user })
                 .ToList();
+        }
+
+        /// <summary>
+        /// Builds a compacted, token-budgeted synopsis of the conversation turns that fall *before*
+        /// the retained history window. Keeps the earlier thread alive without paying full token cost.
+        /// </summary>
+        private static string BuildEarlierSummary(List<AgentMessage> allMessages, List<AgentMessage> retained, int budget)
+        {
+            if (allMessages.Count == 0 || retained.Count == 0) return string.Empty;
+
+            // Index of the earliest retained message; everything before it is "earlier".
+            int firstRetainedIdx = int.MaxValue;
+            foreach (var m in retained)
+            {
+                var idx = allMessages.IndexOf(m);
+                if (idx >= 0 && idx < firstRetainedIdx) firstRetainedIdx = idx;
+            }
+            if (firstRetainedIdx is int.MaxValue or 0) return string.Empty;
+
+            // Collect earlier user→agent turn pairs as truncated one-liners (oldest first).
+            var earlierTurns = new List<string>();
+            for (int i = 0; i < firstRetainedIdx; i++)
+            {
+                if (allMessages[i].Role != AgentMessageRole.User) continue;
+                var user = allMessages[i];
+                var agent = (i + 1 < firstRetainedIdx && allMessages[i + 1].Role == AgentMessageRole.Agent)
+                    ? allMessages[i + 1] : null;
+                earlierTurns.Add($"- {TruncateForMemory(user.Content ?? string.Empty, 90)}"
+                    + (agent != null ? $" → {TruncateForMemory(agent.Content ?? string.Empty, 90)}" : string.Empty));
+            }
+            if (earlierTurns.Count == 0) return string.Empty;
+
+            var sb = new StringBuilder();
+            int used = 0;
+            for (int i = 0; i < earlierTurns.Count; i++)
+            {
+                var cost = KliveAgentContextBudget.EstimateTokens(earlierTurns[i]);
+                if (used + cost > budget)
+                {
+                    sb.AppendLine($"- (+{earlierTurns.Count - i} earlier turn(s) omitted)");
+                    break;
+                }
+                sb.AppendLine(earlierTurns[i]);
+                used += cost;
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// Renders the scripts an agent turn ran (and their outputs/errors) into a compact,
+        /// token-budgeted block for replay in the conversation history. This is what lets
+        /// KliveAgent see "the code I wrote last turn and what it returned" on a fresh turn.
+        /// </summary>
+        private static string FormatHistoryScripts(AgentMessage msg, int perTurnBudget)
+        {
+            if (msg.ScriptResults == null || msg.ScriptResults.Count == 0) return string.Empty;
+
+            // Share the per-turn budget across this turn's scripts so a single turn can't blow it.
+            var perScript = Math.Max(80, perTurnBudget / Math.Max(1, msg.ScriptResults.Count));
+
+            var sb = new StringBuilder();
+            sb.AppendLine("  [KliveAgent ran this turn]");
+            foreach (var sr in msg.ScriptResults)
+            {
+                var code = KliveAgentContextBudget.TruncateToTokens(sr.Code ?? string.Empty, perScript).Trim();
+                if (!string.IsNullOrWhiteSpace(code))
+                    sb.AppendLine($"  script: {code}");
+
+                if (sr.Success)
+                {
+                    var outp = KliveAgentContextBudget.TruncateToTokens(sr.Output ?? string.Empty, perScript).Trim();
+                    sb.AppendLine(string.IsNullOrWhiteSpace(outp) ? "  -> [OK, no output]" : $"  -> {outp}");
+                }
+                else
+                {
+                    var err = KliveAgentContextBudget.TruncateToTokens(sr.ErrorMessage ?? "Unknown error.", 100).Trim();
+                    sb.AppendLine($"  -> [ERROR] {err}");
+                }
+            }
+            return sb.ToString().TrimEnd();
         }
 
         public static string BuildToolGuide(string userMessage)

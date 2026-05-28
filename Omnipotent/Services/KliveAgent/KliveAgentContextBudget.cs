@@ -32,6 +32,16 @@ namespace Omnipotent.Services.KliveAgent
         /// dumps more than this, the agent should narrow its query, not be given the full blob.</summary>
         public const int ScriptOutputBudget = 800;
 
+        /// <summary>Per-turn cap on the replayed scripts+outputs injected under a past agent turn in
+        /// the conversation history, so the agent can see what code it previously ran and what it
+        /// returned. Only the most recent agent turns carry this (see HistoryScriptRecentTurns).</summary>
+        public const int HistoryScriptBudget = 400;
+
+        /// <summary>Budget for the compacted synopsis of turns that fall before the retained history
+        /// window. Instead of silently dropping old turns, we summarise them into this many tokens so
+        /// the agent keeps a thread of the earlier conversation.</summary>
+        public const int HistorySummaryBudget = 500;
+
         /// <summary>Legacy constant. No longer applied as a hard truncation — kept for API
         /// stability in case external callers reference it.</summary>
         public const int TotalSystemPromptBudget = 8000;

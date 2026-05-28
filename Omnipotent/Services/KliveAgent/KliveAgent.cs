@@ -31,8 +31,9 @@ namespace Omnipotent.Services.KliveAgent
         private int initializationState = InitializationStateStarting;
         private string initializationMessage = "KliveAgent is initializing.";
 
-        // Discord DM handler delegate — set by KliveBotDiscord when agent is active
-        public Func<string, string, Task<string>> DiscordDMHandler { get; private set; }
+        // Discord DM handler delegate — set by KliveBotDiscord when agent is active.
+        // Args: (messageContent, channelId, authorDiscordId). KliveAgent only serves Klives over Discord.
+        public Func<string, string, ulong, Task<string>> DiscordDMHandler { get; private set; }
 
         public KliveAgent()
         {
@@ -176,7 +177,8 @@ namespace Omnipotent.Services.KliveAgent
             string message,
             AgentSourceChannel channel,
             string conversationId = null,
-            string senderName = null)
+            string senderName = null,
+            Action<string> onProgress = null)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -212,7 +214,7 @@ namespace Omnipotent.Services.KliveAgent
             });
 
             // Process through the brain
-            var response = await brain.ProcessMessageAsync(message, conversation, senderName);
+            var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress);
 
             // Persist conversation periodically (every 5 messages)
             if (conversation.Messages.Count % 5 == 0)
@@ -266,7 +268,10 @@ namespace Omnipotent.Services.KliveAgent
             {
                 try
                 {
-                    var response = await HandleIncomingMessage(message, AgentSourceChannel.API, conversationId, senderName);
+                    // Stream the agent's prose + script activity into the pending response so the
+                    // poller shows it talking while it works.
+                    var response = await HandleIncomingMessage(message, AgentSourceChannel.API, conversationId, senderName,
+                        onProgress: text => { pendingResponse.Response = text; });
                     pendingResponse.FinalResponse = response;
                     pendingResponse.Status = response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
                     pendingResponse.ErrorMessage = response.Success ? null : response.ErrorMessage;
@@ -315,8 +320,15 @@ namespace Omnipotent.Services.KliveAgent
             return "I'm on it. I'm checking the code and running any needed scripts now. I'll send the finished answer as soon as execution completes.";
         }
 
-        private async Task<string> HandleDiscordDM(string message, string channelId)
+        private async Task<string> HandleDiscordDM(string message, string channelId, ulong authorDiscordId)
         {
+            // Defense-in-depth: KliveAgent is gated to Klives over Discord at the KliveBotDiscord
+            // boundary too, but never trust a single gate for a service this powerful.
+            if (authorDiscordId != OmniPaths.KlivesDiscordAccountID)
+            {
+                return "Nice try. KliveAgent only takes orders from Klives.";
+            }
+
             var conversationId = $"discord-{channelId}";
             var response = await HandleIncomingMessage(message, AgentSourceChannel.Discord, conversationId, "Klives");
             return response.Response;
@@ -356,7 +368,8 @@ namespace Omnipotent.Services.KliveAgent
             Stats.RecordCapability(
                 request.Capability,
                 result.Success,
-                result.RequiresConfirmation && !result.Success);
+                result.RequiresConfirmation && !result.Success,
+                result.DurationMs);
             return result;
         }
 
