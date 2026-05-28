@@ -548,6 +548,11 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("response")]
         public string Response { get; set; }
 
+        /// <summary>Scripts run so far this turn, streamed live so the UI shows code as it executes
+        /// (before the final response is ready).</summary>
+        [JsonProperty("scriptsExecuted")]
+        public List<AgentScriptResult> ScriptsExecuted { get; set; } = new();
+
         [JsonProperty("finalResponse")]
         public AgentChatResponse FinalResponse { get; set; }
 

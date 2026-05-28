@@ -305,7 +305,7 @@ namespace Omnipotent.Services.KliveAgent
             string userMessage,
             AgentConversation conversation,
             string? senderName = null,
-            Action<string>? onProgress = null)
+            Action<string, List<AgentScriptResult>>? onProgress = null)
         {
             try
             {
@@ -348,6 +348,17 @@ namespace Omnipotent.Services.KliveAgent
                 bool finalFormatRetryUsed = false;
                 int consecutiveFailedScripts = 0;
                 int consecutiveNoOpResponses = 0;
+
+                // Streams the agent's current prose + the scripts it has run so far to the live
+                // progress channel, so the UI shows it talking AND shows the code as it executes
+                // (replacing the old static "I'm on it…" placeholder).
+                void ReportProgress(string runningNote)
+                {
+                    if (onProgress == null) return;
+                    var shown = progressText.Length > 0 ? progressText.ToString() : "On it.";
+                    var body = string.IsNullOrWhiteSpace(runningNote) ? shown : $"{shown}\n\n{runningNote}";
+                    try { onProgress(body, new List<AgentScriptResult>(allScriptsExecuted)); } catch { }
+                }
 
                 // ── Agentic Loop: Think → Script → Observe → repeat ──
                 // No iteration cap. The loop ends when the LLM produces a final text-only
@@ -411,12 +422,7 @@ namespace Omnipotent.Services.KliveAgent
                             progressText.Append(thought);
                         }
                         int pendingScriptCount = segments.Count(s => s.IsScript);
-                        var shown = progressText.Length > 0 ? progressText.ToString() : "On it — working on that now.";
-                        try
-                        {
-                            onProgress($"{shown}\n\n_…running {pendingScriptCount} script{(pendingScriptCount == 1 ? "" : "s")} (step {iteration + 1})_");
-                        }
-                        catch { /* progress is best-effort */ }
+                        ReportProgress($"_…running {pendingScriptCount} script{(pendingScriptCount == 1 ? "" : "s")} (step {iteration + 1})_");
                     }
 
                     // Detect Anthropic/OpenAI-style tool-call XML or JSON in the raw output — the
@@ -516,6 +522,9 @@ namespace Omnipotent.Services.KliveAgent
 
                         var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
                         allScriptsExecuted.Add(result);
+
+                        // Stream the just-completed script (code + output) to the UI as it lands.
+                        ReportProgress($"_…ran {allScriptsExecuted.Count} script{(allScriptsExecuted.Count == 1 ? "" : "s")} so far (step {iteration + 1})_");
 
                         if (result.Success)
                         {

@@ -178,7 +178,7 @@ namespace Omnipotent.Services.KliveAgent
             AgentSourceChannel channel,
             string conversationId = null,
             string senderName = null,
-            Action<string> onProgress = null)
+            Action<string, List<AgentScriptResult>> onProgress = null)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -259,7 +259,9 @@ namespace Omnipotent.Services.KliveAgent
             var pendingResponse = new AgentPendingChatResponse
             {
                 ConversationId = conversationId,
-                Response = BuildPendingApiResponseText()
+                // No canned placeholder — the bubble fills with the agent's real prose + code as it
+                // streams in (or its final answer for a no-script reply).
+                Response = string.Empty
             };
 
             pendingApiResponses[pendingResponse.RequestId] = pendingResponse;
@@ -268,10 +270,14 @@ namespace Omnipotent.Services.KliveAgent
             {
                 try
                 {
-                    // Stream the agent's prose + script activity into the pending response so the
-                    // poller shows it talking while it works.
+                    // Stream the agent's prose + the scripts it runs into the pending response so the
+                    // poller shows it talking while it works, with code appearing as it executes.
                     var response = await HandleIncomingMessage(message, AgentSourceChannel.API, conversationId, senderName,
-                        onProgress: text => { pendingResponse.Response = text; });
+                        onProgress: (text, scripts) =>
+                        {
+                            pendingResponse.Response = text;
+                            pendingResponse.ScriptsExecuted = scripts;
+                        });
                     pendingResponse.FinalResponse = response;
                     pendingResponse.Status = response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
                     pendingResponse.ErrorMessage = response.Success ? null : response.ErrorMessage;
@@ -313,11 +319,6 @@ namespace Omnipotent.Services.KliveAgent
         {
             pendingApiResponses.TryGetValue(requestId, out var pendingResponse);
             return pendingResponse;
-        }
-
-        private static string BuildPendingApiResponseText()
-        {
-            return "I'm on it. I'm checking the code and running any needed scripts now. I'll send the finished answer as soon as execution completes.";
         }
 
         private async Task<string> HandleDiscordDM(string message, string channelId, ulong authorDiscordId)
