@@ -36,10 +36,11 @@ namespace Omnipotent.Services.KliveAgent
             new("FindProjectClass", "Jump straight to a likely project type when you already know its name."),
             new("ExploreClassCode", "Read the implementation around a target type declaration."),
             new("GetMethodDocumentation", "Inspect exact method signatures, defaults, and XML docs before calling unfamiliar APIs."),
-            new("GetTypeSchema", "Inspect exact members and parameter types for any type, including ScriptGlobals itself."),
+            new("GetTypeSchema", "Inspect a type's members. Each Methods[] entry has a ready-to-call .Signature; params expose .Type (and .ParameterType). One shot — no per-method GetMethodDocumentation needed."),
             new("ListServices", "See which OmniServices are live right now."),
             new("GetService", "Fetch a live service instance by type name or display name."),
-            new("GetObjectTypeInfo", "Inspect a live object's members before calling or reading them."),
+            new("GetObjectTypeInfo", "Quick string view of a live object's members; pass a filter, e.g. GetObjectTypeInfo(obj, \"Guild\")."),
+            new("GetObjectMembers", "STRUCTURED, filterable introspection of a live object: GetObjectMembers(obj, \"nameFilter\", \"method|property|field\"). Returns a list you LINQ over inline; each method carries a ready-to-call .Signature. Prefer this over JSON-dumping GetObjectTypeInfo."),
             new("ExecuteServiceMethod", "Call a known service method directly when you already know the exact service type and method name."),
             new("CallObjectMethod", "Invoke a method on a live object after inspecting it. Await Task-returning methods."),
             new("GetRecentErrors", "Pull recent Error-level entries from OmniLogging directly. Prefer this over reflecting into the logger."),
@@ -150,15 +151,18 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
             sb.AppendLine("- For MULTI-STEP tasks (output of step 1 feeds step 2 feeds step 3), chain everything in ONE script block using local variables and `Log` each intermediate so you can see the chain. Use ONLY real APIs from this guide — do NOT invent helper functions like `ParseTopService` or `Aggregate`; if you need parsing, write the regex / LINQ inline. The full pipeline template appears below in [Common Patterns]. Do NOT split a pipeline into separate scripts — locals from script 1 are GONE in script 2.");
             sb.AppendLine("- EMPTY-PREMISE RULE: if the data needed to answer is empty (zero errors, zero matches, no memories with that tag), the EMPTY STATE IS THE ANSWER. Report it directly. Do NOT save a vacuous self-improvement memory, propose imaginary fixes, or fabricate work — 'no errors today' is a complete answer.");
-            sb.AppendLine("- If you don't know what fields a returned object has, call GetTypeSchema on its type OR just `Log(System.Text.Json.JsonSerializer.Serialize(obj))` to see the shape. Do NOT guess field names — discover them first, ONCE.");
+            sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
+            sb.AppendLine("- DSharpPlus live objects cache STALE/empty collections (DiscordGuild.Channels, GuildContainingKlives.Channels). For authoritative data use the async accessors: var g = await CallObjectMethod(GetObjectMember(GetService(\"KliveBotDiscord\"),\"Client\"), \"GetGuildAsync\", guildId, (bool?)null); then await CallObjectMethod(g, \"GetChannelsAsync\"). The live client field is 'Client', NOT 'botClient'.");
             sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
             sb.AppendLine("[Common Patterns]");
             sb.AppendLine("// Call any service method (sync or async) — works for object returned by GetService:");
             sb.AppendLine("var svc = GetService(\"KliveBotDiscord\"); var r = await CallObjectMethod(svc, \"SendMessageToKlives\", \"hello\");");
-            sb.AppendLine("// Inspect a service's API before guessing:");
-            sb.AppendLine("var schema = GetTypeSchema(\"KliveBotDiscord\"); foreach (var m in schema.Methods) Log(m.Name);");
+            sb.AppendLine("// Inspect a service's API before guessing (each method has a ready-to-call .Signature):");
+            sb.AppendLine("var schema = GetTypeSchema(\"KliveBotDiscord\"); foreach (var m in schema.Methods) Log(m.Signature);");
+            sb.AppendLine("// Discover a live object's members cheaply (filter + kind), then call — ONE round-trip:");
+            sb.AppendLine("var client = GetObjectMember(GetService(\"KliveBotDiscord\"), \"Client\"); foreach (var m in GetObjectMembers(client, \"Guild\", \"method\")) Log(m.Signature);");
             sb.AppendLine("// Read a property/field on a live object:");
             sb.AppendLine("var mem = GetObjectMember(GetService(\"KliveAgent\"), \"Memory\");");
             sb.AppendLine("// Get all KliveAgent memories:");

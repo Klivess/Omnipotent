@@ -291,6 +291,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("returnType")]
         public string ReturnType { get; set; } = string.Empty;
 
+        /// <summary>Full, ready-to-call signature, e.g.
+        /// "SendMessageToChannel(ulong guildId, ulong channelId, DiscordMessageBuilder builder) -> Task&lt;DiscordMessage&gt;".
+        /// Reachable directly from GetTypeSchema so callers never need a per-method GetMethodDocumentation round-trip.</summary>
+        [JsonProperty("signature")]
+        public string Signature { get; set; } = string.Empty;
+
         [JsonProperty("isStatic")]
         public bool IsStatic { get; set; }
 
@@ -305,6 +311,11 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("type")]
         public string Type { get; set; } = string.Empty;
+
+        /// <summary>Alias for <see cref="Type"/>. Lets scripts that naturally reach for
+        /// <c>p.ParameterType</c> compile (a common, previously-fatal guess). Not serialized.</summary>
+        [JsonIgnore]
+        public string ParameterType => Type;
 
         [JsonProperty("hasDefaultValue")]
         public bool HasDefaultValue { get; set; }
@@ -347,6 +358,36 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("isStatic")]
         public bool IsStatic { get; set; }
+    }
+
+    /// <summary>A single member (field/property/method) of a live object, returned by
+    /// GetObjectMembers so scripts can LINQ over it inline (filter, pick, call) without
+    /// JSON-serializing-and-splitting a string blob.</summary>
+    public class AgentObjectMember
+    {
+        /// <summary>"field" | "property" | "method"</summary>
+        [JsonProperty("kind")]
+        public string Kind { get; set; } = string.Empty;
+
+        /// <summary>"public" | "private"</summary>
+        [JsonProperty("visibility")]
+        public string Visibility { get; set; } = string.Empty;
+
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        /// <summary>Field/property type, or a method's return type.</summary>
+        [JsonProperty("type")]
+        public string Type { get; set; } = string.Empty;
+
+        /// <summary>For methods: the full callable signature. Null for fields/properties.</summary>
+        [JsonProperty("signature")]
+        public string? Signature { get; set; }
+
+        [JsonProperty("isStatic")]
+        public bool IsStatic { get; set; }
+
+        public override string ToString() => Signature ?? $"{Kind} {Type} {Name}";
     }
 
     public class ServiceInfo

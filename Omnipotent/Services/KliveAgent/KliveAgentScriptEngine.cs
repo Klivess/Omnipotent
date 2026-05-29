@@ -67,13 +67,9 @@ namespace Omnipotent.Services.KliveAgent
                 .Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object))
                 .OrderBy(m => m.Name)
                 .ThenBy(m => m.GetParameters().Length)
-                .Select(m => new AgentTypeMethodSchema
+                .Select(m =>
                 {
-                    Name = m.Name,
-                    DeclaringType = m.DeclaringType?.Name ?? type.Name,
-                    ReturnType = SimplifyTypeName(m.ReturnType),
-                    IsStatic = m.IsStatic,
-                    Parameters = m.GetParameters()
+                    var parameters = m.GetParameters()
                         .Select(p => new AgentTypeParameterSchema
                         {
                             Name = p.Name ?? string.Empty,
@@ -81,7 +77,20 @@ namespace Omnipotent.Services.KliveAgent
                             HasDefaultValue = p.HasDefaultValue,
                             DefaultValue = p.HasDefaultValue ? (p.DefaultValue?.ToString() ?? "null") : null,
                         })
-                        .ToList()
+                        .ToList();
+                    var returnType = SimplifyTypeName(m.ReturnType);
+                    var renderedParams = string.Join(", ", parameters.Select(p =>
+                        $"{p.Type} {p.Name}" + (p.HasDefaultValue ? $" = {p.DefaultValue ?? "null"}" : "")));
+                    return new AgentTypeMethodSchema
+                    {
+                        Name = m.Name,
+                        DeclaringType = m.DeclaringType?.Name ?? type.Name,
+                        ReturnType = returnType,
+                        // One-shot, ready-to-call signature so callers never need GetMethodDocumentation per method.
+                        Signature = $"{m.Name}({renderedParams}) -> {returnType}",
+                        IsStatic = m.IsStatic,
+                        Parameters = parameters
+                    };
                 })
                 .ToList();
 
@@ -420,7 +429,7 @@ namespace Omnipotent.Services.KliveAgent
                 t = t.BaseType;
             }
 
-            throw new MissingMemberException($"'{memberName}' not found on service '{serviceTypeName}'. Use GetObjectTypeInfo(GetService(\"{serviceTypeName}\")) to see available members.");
+            throw new MissingMemberException($"'{memberName}' not found on service '{serviceTypeName}'.{SuggestClosest(memberName, CollectMemberNames(target.GetType()))} Use GetObjectMembers(GetService(\"{serviceTypeName}\"), \"{memberName}\") to see available members.");
         }
 
         /// <summary>Alias for GetServiceMember — kept for backward compatibility.</summary>
@@ -458,7 +467,7 @@ namespace Omnipotent.Services.KliveAgent
                 t = t.BaseType;
             }
 
-            throw new MissingMemberException($"'{memberName}' not found on '{obj.GetType().FullName}' or any base type. Use GetObjectTypeInfo(obj) to see available members.");
+            throw new MissingMemberException($"'{memberName}' not found on '{obj.GetType().FullName}' or any base type.{SuggestClosest(memberName, CollectMemberNames(obj.GetType()))} Use GetObjectMembers(obj, \"{memberName}\") or GetObjectTypeInfo(obj) to see available members.");
         }
 
         /// <summary>
@@ -475,7 +484,7 @@ namespace Omnipotent.Services.KliveAgent
             args ??= Array.Empty<object>();
             var method = ResolveMethod(obj.GetType(), methodName, DeepFlags, args);
             if (method == null)
-                throw new MissingMethodException($"Method '{methodName}' not found on '{obj.GetType().FullName}'. Use GetObjectTypeInfo(obj) to see available methods.");
+                throw new MissingMethodException($"Method '{methodName}' not found on '{obj.GetType().FullName}'.{SuggestClosestMethods(methodName, obj.GetType())} Use GetObjectMembers(obj, \"{methodName}\", \"method\") to see available methods.");
 
             var result = method.Invoke(obj, args.Length > 0 ? args : null);
             if (result is Task task)
@@ -524,6 +533,79 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// Filtered string view of an object's members — same as GetObjectTypeInfo(obj) but only lines
+        /// whose member name contains <paramref name="filter"/> (case-insensitive), optionally without the
+        /// Type/Base header. e.g. GetObjectTypeInfo(client, "Guild").
+        /// </summary>
+        public string GetObjectTypeInfo(object? obj, string filter, bool membersOnly = false)
+        {
+            if (obj == null) return "(null)";
+            var type = obj.GetType();
+            var sb = new StringBuilder();
+            if (!membersOnly)
+            {
+                sb.AppendLine($"Type: {type.FullName}");
+                if (type.BaseType != null && type.BaseType != typeof(object))
+                    sb.AppendLine($"Base: {type.BaseType.FullName}");
+            }
+            foreach (var m in GetObjectMembers(obj, filter, null))
+            {
+                if (m.Kind == "method")
+                    sb.AppendLine($"  method [{(m.Visibility == "public" ? "pub" : "prv")}] {m.Signature}");
+                else
+                    sb.AppendLine($"  {(m.Kind == "field" ? "field" : "prop ")} [{(m.Visibility == "public" ? "pub" : "prv")}] {m.Type} {m.Name}");
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// STRUCTURED, filterable introspection — the one-shot discovery primitive. Returns a list of
+        /// AgentObjectMember you can LINQ over inline (no JSON-serialize-and-split). Methods carry a full
+        /// callable .Signature. Filter by name substring and/or kind.
+        ///   filter: case-insensitive substring of the member name (null = all).
+        ///   kind:   "method" | "property" | "field" (also accepts "prop"); null = all.
+        /// Example: var send = GetObjectMembers(client, "Channel", "method").First(m => m.Name=="GetChannelAsync");
+        /// </summary>
+        public List<AgentObjectMember> GetObjectMembers(object? obj, string? filter = null, string? kind = null)
+        {
+            var result = new List<AgentObjectMember>();
+            if (obj == null) return result;
+            var type = obj.GetType();
+
+            bool WantKind(string k) => string.IsNullOrWhiteSpace(kind)
+                || kind.Equals(k, StringComparison.OrdinalIgnoreCase)
+                || (k == "property" && kind.Equals("prop", StringComparison.OrdinalIgnoreCase));
+            bool NameOk(string n) => string.IsNullOrWhiteSpace(filter)
+                || n.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (WantKind("field"))
+                foreach (var f in type.GetFields(DeepFlags)
+                    .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
+                    .OrderBy(f => f.Name))
+                    if (NameOk(f.Name))
+                        result.Add(new AgentObjectMember { Kind = "field", Visibility = f.IsPublic ? "public" : "private", Name = f.Name, Type = SimplifyTypeName(f.FieldType), IsStatic = f.IsStatic });
+
+            if (WantKind("property"))
+                foreach (var p in type.GetProperties(DeepFlags)
+                    .Where(p => p.GetIndexParameters().Length == 0)
+                    .OrderBy(p => p.Name))
+                    if (NameOk(p.Name))
+                        result.Add(new AgentObjectMember { Kind = "property", Visibility = ((p.GetMethod ?? p.SetMethod)?.IsPublic == true) ? "public" : "private", Name = p.Name, Type = SimplifyTypeName(p.PropertyType), IsStatic = (p.GetMethod ?? p.SetMethod)?.IsStatic == true });
+
+            if (WantKind("method"))
+                foreach (var m in type.GetMethods(DeepFlags)
+                    .Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object))
+                    .OrderBy(m => m.Name).ThenBy(m => m.GetParameters().Length))
+                    if (NameOk(m.Name))
+                    {
+                        var pars = string.Join(", ", m.GetParameters().Select(p => $"{SimplifyTypeName(p.ParameterType)} {p.Name}"));
+                        result.Add(new AgentObjectMember { Kind = "method", Visibility = m.IsPublic ? "public" : "private", Name = m.Name, Type = SimplifyTypeName(m.ReturnType), IsStatic = m.IsStatic, Signature = $"{m.Name}({pars}) -> {SimplifyTypeName(m.ReturnType)}" });
+                    }
+
+            return result;
         }
 
         // ── Output ──
@@ -1564,6 +1646,82 @@ namespace Omnipotent.Services.KliveAgent
             {
                 return Array.Empty<Type>();
             }
+        }
+
+        // ── "Did you mean" suggestions for not-found members/methods ──
+        // Turns a wasted "guess → wrong → retry" round-trip into a fix that lands in the same retry.
+
+        /// <summary>Up to <paramref name="max"/> candidate names closest to <paramref name="target"/>
+        /// (case-insensitive substring preferred, else Levenshtein ratio ≥ 0.5).</summary>
+        private static List<string> ClosestNames(string target, IEnumerable<string> candidates, int max = 3)
+        {
+            if (string.IsNullOrWhiteSpace(target) || candidates == null) return new List<string>();
+            var lt = target.ToLowerInvariant();
+            return candidates.Where(c => !string.IsNullOrEmpty(c)).Distinct()
+                .Select(c => new { c, score = NameSimilarity(lt, c.ToLowerInvariant()) })
+                .Where(x => x.score > 0)
+                .OrderByDescending(x => x.score)
+                .Take(max)
+                .Select(x => x.c)
+                .ToList();
+        }
+
+        private static double NameSimilarity(string a, string b)
+        {
+            if (a.Length == 0 || b.Length == 0) return 0;
+            if (a == b) return 100;
+            if (b.Contains(a) || a.Contains(b)) return 10.0 + 1.0 / (1 + Math.Abs(a.Length - b.Length));
+            int max = Math.Max(a.Length, b.Length);
+            double ratio = 1.0 - (double)Levenshtein(a, b) / max;
+            return ratio >= 0.5 ? ratio : 0; // only suggest reasonably-close names
+        }
+
+        private static int Levenshtein(string s, string t)
+        {
+            var d = new int[s.Length + 1, t.Length + 1];
+            for (int i = 0; i <= s.Length; i++) d[i, 0] = i;
+            for (int j = 0; j <= t.Length; j++) d[0, j] = j;
+            for (int i = 1; i <= s.Length; i++)
+                for (int j = 1; j <= t.Length; j++)
+                {
+                    int cost = s[i - 1] == t[j - 1] ? 0 : 1;
+                    d[i, j] = Math.Min(Math.Min(d[i - 1, j] + 1, d[i, j - 1] + 1), d[i - 1, j - 1] + cost);
+                }
+            return d[s.Length, t.Length];
+        }
+
+        /// <summary>" Did you mean: a, b?" or "" if nothing is close. For member names.</summary>
+        private static string SuggestClosest(string target, IEnumerable<string> candidates, int max = 3)
+        {
+            var c = ClosestNames(target, candidates, max);
+            return c.Count == 0 ? string.Empty : $" Did you mean: {string.Join(", ", c)}?";
+        }
+
+        /// <summary>All field + property names across the inheritance chain, for member suggestions.</summary>
+        private static IEnumerable<string> CollectMemberNames(Type type)
+        {
+            var names = new List<string>();
+            var t = type;
+            while (t != null && t != typeof(object))
+            {
+                names.AddRange(t.GetFields(DeepFlags).Where(f => !f.Name.StartsWith("<")).Select(f => f.Name));
+                names.AddRange(t.GetProperties(DeepFlags).Where(p => p.GetIndexParameters().Length == 0).Select(p => p.Name));
+                t = t.BaseType;
+            }
+            return names.Distinct();
+        }
+
+        /// <summary>" Did you mean: sig1 | sig2?" — closest methods rendered as full signatures, so the
+        /// right overload is visible in the retry the agent is already writing.</summary>
+        private static string SuggestClosestMethods(string target, Type type, int max = 3)
+        {
+            var methods = type.GetMethods(DeepFlags).Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object)).ToList();
+            var bestNames = ClosestNames(target, methods.Select(m => m.Name), max);
+            if (bestNames.Count == 0) return string.Empty;
+            var sigs = methods.Where(m => bestNames.Contains(m.Name))
+                .Select(m => $"{m.Name}({string.Join(", ", m.GetParameters().Select(p => SimplifyTypeName(p.ParameterType) + " " + p.Name))}) -> {SimplifyTypeName(m.ReturnType)}")
+                .Distinct().Take(5);
+            return $" Did you mean: {string.Join(" | ", sigs)}?";
         }
 
         private static MethodInfo? ResolveMethod(Type target, string name, BindingFlags flags, object[] args)
