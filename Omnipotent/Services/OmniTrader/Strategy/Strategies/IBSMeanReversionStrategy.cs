@@ -19,7 +19,14 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         private const decimal AtrStopMultiplier = 1.5m;
         private const decimal PositionFraction = 0.10m;
 
+        // Vertical (time) barrier — the measured reversion horizon (see EstimateMaxHoldBars).
+        private const int MaxHoldFallback = 8;   // used until the horizon is measured
+        private const int MaxHoldClampLo  = 2;
+        private const int MaxHoldClampHi  = 24;
+
         private decimal _stopPrice;
+        private int _entryBarIndex = -1;
+        private int _maxHoldBars   = -1;         // lazily measured from history, then cached
 
         public override Task OnCandleClose(OHLCCandle candle, CancellationToken ct)
         {
@@ -28,47 +35,60 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
             if (history.Count < minBars) return Task.CompletedTask;
 
             int last = history.Count - 1;
+            var histList = history as IList<OHLCCandle> ?? history.ToList();
+
+            // Measure the strategy's natural holding period once, after enough history exists.
+            if (_maxHoldBars < 0 && history.Count >= TrendEmaPeriod + 200)
+            {
+                _maxHoldBars = EstimateMaxHoldBars(histList);
+                Log($"IBS: measured reversion horizon -> max hold {_maxHoldBars} bars");
+            }
+            int maxHold = _maxHoldBars > 0 ? _maxHoldBars : MaxHoldFallback;
+
+            Task Exit(string reason)
+            {
+                _entryBarIndex = -1;
+                Log($"IBS exit ({reason}) at {candle.Close:F2}");
+                return SubmitOrder(new OrderRequest
+                {
+                    IntentId = Guid.NewGuid().ToString("N"),
+                    Side = OrderSide.Sell,
+                    Type = OrderType.Market,
+                    Symbol = Symbol,
+                    Qty = Position!.Qty
+                }, ct);
+            }
+
             bool inPosition = Position != null && Position.IsLong;
 
             if (inPosition)
             {
-                // ATR stop-loss
-                if (candle.Close <= _stopPrice)
-                {
-                    Log($"ATR stop triggered at {candle.Close:F2} (stop={_stopPrice:F2})");
-                    return SubmitOrder(new OrderRequest
-                    {
-                        IntentId = Guid.NewGuid().ToString("N"),
-                        Side = OrderSide.Sell,
-                        Type = OrderType.Market,
-                        Symbol = Symbol,
-                        Qty = Position!.Qty
-                    }, ct);
-                }
+                // ── Triple-barrier exit ────────────────────────────────────────────
+                // Lower barrier: ATR stop-loss
+                if (candle.Close <= _stopPrice) return Exit("ATR stop");
 
-                // Original exit: close > previous bar high OR close > EMA(20)
-                decimal exitEma = Indicators.EMA(history as IList<OHLCCandle> ?? history.ToList(), ExitEmaPeriod, last);
-                var prev = history[^2];
-                if (candle.Close > prev.High || candle.Close > exitEma)
-                {
-                    return SubmitOrder(new OrderRequest
-                    {
-                        IntentId = Guid.NewGuid().ToString("N"),
-                        Side = OrderSide.Sell,
-                        Type = OrderType.Market,
-                        Symbol = Symbol,
-                        Qty = Position!.Qty
-                    }, ct);
-                }
+                // Upper barrier: price reverted up to the mean (20-EMA)
+                decimal exitEma = Indicators.EMA(histList, ExitEmaPeriod, last);
+                if (candle.Close >= exitEma) return Exit("reverted to mean");
+
+                // Vertical barrier: held longer than the measured reversion horizon
+                if (_entryBarIndex >= 0 && last - _entryBarIndex >= maxHold)
+                    return Exit($"time barrier {maxHold} bars");
+
                 return Task.CompletedTask;
             }
 
+            // ── Entry ──────────────────────────────────────────────────────────────
             // Trend filter: only long when price is above the 200-EMA
-            var histList = history as IList<OHLCCandle> ?? history.ToList();
             decimal trendEma = Indicators.EMA(histList, TrendEmaPeriod, last);
             if (candle.Close <= trendEma) return Task.CompletedTask;
 
-            // Entry: smoothed IBS(2) < threshold AND original price envelope
+            // Room to revert: enter only BELOW the 20-EMA, so the upper barrier
+            // (close >= EMA20) is a genuine target rather than already satisfied.
+            decimal entryEma20 = Indicators.EMA(histList, ExitEmaPeriod, last);
+            if (candle.Close >= entryEma20) return Task.CompletedTask;
+
+            // Oversold: smoothed IBS(2) < threshold AND price envelope
             decimal smoothedIbs = Indicators.IBSSmoothed(histList, last, IBSSmoothing);
             if (smoothedIbs >= IBSThreshold) return Task.CompletedTask;
 
@@ -83,6 +103,7 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 
             decimal atr = Indicators.ATR(histList, AtrPeriod, last);
             _stopPrice = candle.Close - AtrStopMultiplier * atr;
+            _entryBarIndex = last;
 
             return SubmitOrder(new OrderRequest
             {
@@ -92,6 +113,32 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
                 Symbol = Symbol,
                 Qty = qty
             }, ct);
+        }
+
+        // Estimate the strategy's natural holding period from history (no look-ahead):
+        // after each oversold dip below the 20-EMA in an uptrend, count the bars until
+        // price closes back above its 20-EMA. The median of those is the time barrier.
+        // Model-free — deliberately avoids imposing an OU half-life on a trending series.
+        private static int EstimateMaxHoldBars(IList<OHLCCandle> h)
+        {
+            int last = h.Count - 1;
+            var durations = new List<int>();
+            for (int i = TrendEmaPeriod; i < last; i++)
+            {
+                decimal ema20  = Indicators.EMA(h, ExitEmaPeriod, i);
+                decimal ema200 = Indicators.EMA(h, TrendEmaPeriod, i);
+                decimal ibs    = Indicators.IBSSmoothed(h, i, IBSSmoothing);
+                bool entryLike = h[i].Close > ema200 && h[i].Close < ema20 && ibs < IBSThreshold;
+                if (!entryLike) continue;
+
+                for (int j = i + 1; j <= last; j++)
+                {
+                    if (h[j].Close >= Indicators.EMA(h, ExitEmaPeriod, j)) { durations.Add(j - i); break; }
+                }
+            }
+            if (durations.Count < 5) return MaxHoldFallback;
+            durations.Sort();
+            return Math.Clamp(durations[durations.Count / 2], MaxHoldClampLo, MaxHoldClampHi);
         }
 
         private static decimal HighestHigh(IReadOnlyList<OHLCCandle> history, int lookback)
