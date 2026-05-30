@@ -173,7 +173,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 StartTime = candles.Count > 0 ? candles[0].Timestamp : default,
                 EndTime = candles.Count > 0 ? candles[^1].Timestamp : default,
                 Trades = trades,
-                EquityCurve = equityCurve
+                EquityCurve = equityCurve,
+                Candles = candles.ToList()
             };
         }
     }

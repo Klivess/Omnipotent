@@ -41,6 +41,72 @@ namespace Omnipotent.Services.PortForwardManager
             await CreateAPIRoute("/admin/portforwarding/edit", HandleEditRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
         }
 
+        // Returns true if a UPnP-enabled gateway device is present on the network.
+        public async Task<bool> IsUpnpAvailable()
+        {
+            return (await DiscoverDeviceAsync()) != null;
+        }
+
+        // Returns the current port mappings on the UPnP device, or null if no device is available.
+        public async Task<List<PortMappingModel>?> GetActiveMappings()
+        {
+            var device = await DiscoverDeviceAsync();
+            if (device == null)
+            {
+                return null;
+            }
+
+            var openNatMappings = await device.GetAllMappingsAsync();
+            var mappingsList = new List<PortMappingModel>();
+            foreach (var mapping in openNatMappings)
+            {
+                var expirationStr = mapping.Expiration == DateTime.MaxValue || mapping.Lifetime == 0
+                    ? "Permanent"
+                    : mapping.Expiration.ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss UTC");
+
+                mappingsList.Add(new PortMappingModel
+                {
+                    Protocol = mapping.Protocol == Open.Nat.Protocol.Tcp ? "TCP" : "UDP",
+                    PublicPort = mapping.PublicPort,
+                    PrivatePort = mapping.PrivatePort,
+                    PrivateIp = mapping.PrivateIP?.ToString() ?? string.Empty,
+                    Description = mapping.Description ?? string.Empty,
+                    LifetimeSeconds = mapping.Lifetime,
+                    ExpirationDate = expirationStr
+                });
+            }
+            return mappingsList;
+        }
+
+        // Ensures the given public port/protocol is forwarded to the local machine.
+        // Returns true if the mapping had to be ADDED, false if it already existed or no UPnP device is available.
+        // Uses a permanent lifetime (0).
+        public async Task<bool> EnsurePortForwarded(int publicPort, int privatePort, string protocol, string description)
+        {
+            var device = await DiscoverDeviceAsync();
+            if (device == null)
+            {
+                return false;
+            }
+
+            var protocolEnum = protocol.ToUpper() == "UDP" ? Open.Nat.Protocol.Udp : Open.Nat.Protocol.Tcp;
+
+            var existingMappings = await device.GetAllMappingsAsync();
+            foreach (var mapping in existingMappings)
+            {
+                if (mapping.PublicPort == publicPort && mapping.Protocol == protocolEnum)
+                {
+                    // Already forwarded.
+                    return false;
+                }
+            }
+
+            var privateIpAddr = IPAddress.Parse(GetLocalIPAddress());
+            var newMapping = new Open.Nat.Mapping(protocolEnum, privateIpAddr, privatePort, publicPort, 0, description);
+            await device.CreatePortMapAsync(newMapping);
+            return true;
+        }
+
         private async Task<NatDevice?> DiscoverDeviceAsync()
         {
             try

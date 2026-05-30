@@ -60,5 +60,105 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             if (first == 0) return 0;
             return (last - first) / first * 100m;
         }
+
+        /// <summary>
+        /// Downside-deviation-adjusted return (annualised, √252). Only negative period
+        /// returns contribute to the denominator. Mirrors <see cref="Sharpe"/>.
+        /// </summary>
+        public static decimal Sortino(IReadOnlyList<EquityPoint> equityCurve)
+        {
+            if (equityCurve.Count < 2) return 0;
+            var returns = new List<double>(equityCurve.Count - 1);
+            for (int i = 1; i < equityCurve.Count; i++)
+            {
+                if (equityCurve[i - 1].Equity == 0) continue;
+                returns.Add((double)((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity));
+            }
+            if (returns.Count == 0) return 0;
+            double mean = returns.Average();
+            double downsideSumSq = 0;
+            int downsideCount = 0;
+            foreach (double r in returns)
+            {
+                if (r < 0) { downsideSumSq += r * r; downsideCount++; }
+            }
+            if (downsideCount == 0) return 0;
+            double downsideDev = Math.Sqrt(downsideSumSq / downsideCount);
+            return downsideDev == 0 ? 0 : (decimal)(mean / downsideDev * Math.Sqrt(252));
+        }
+
+        /// <summary>
+        /// Annualised volatility of period-over-period equity returns, as a percentage (√252 scaling).
+        /// </summary>
+        public static decimal AnnualizedVolatilityPercent(IReadOnlyList<EquityPoint> equityCurve)
+        {
+            if (equityCurve.Count < 2) return 0;
+            var returns = new List<double>(equityCurve.Count - 1);
+            for (int i = 1; i < equityCurve.Count; i++)
+            {
+                if (equityCurve[i - 1].Equity == 0) continue;
+                returns.Add((double)((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity));
+            }
+            if (returns.Count == 0) return 0;
+            double mean = returns.Average();
+            double variance = returns.Sum(r => (r - mean) * (r - mean)) / returns.Count;
+            double std = Math.Sqrt(variance);
+            return (decimal)(std * Math.Sqrt(252) * 100);
+        }
+
+        /// <summary>
+        /// Longest run, in bars and wall-clock time, from an equity peak until equity recovers to that peak.
+        /// A still-underwater curve reports the span from the last peak to the final point.
+        /// </summary>
+        public static (int bars, TimeSpan span) MaxDrawdownDuration(IReadOnlyList<EquityPoint> equityCurve)
+        {
+            if (equityCurve.Count < 2) return (0, TimeSpan.Zero);
+            decimal peak = equityCurve[0].Equity;
+            int peakIndex = 0;
+            int maxBars = 0;
+            TimeSpan maxSpan = TimeSpan.Zero;
+            for (int i = 1; i < equityCurve.Count; i++)
+            {
+                if (equityCurve[i].Equity >= peak)
+                {
+                    int bars = i - peakIndex;
+                    TimeSpan span = equityCurve[i].Ts - equityCurve[peakIndex].Ts;
+                    if (bars > maxBars) maxBars = bars;
+                    if (span > maxSpan) maxSpan = span;
+                    peak = equityCurve[i].Equity;
+                    peakIndex = i;
+                }
+            }
+            // Account for a drawdown that never recovered before the curve ended.
+            int tailBars = (equityCurve.Count - 1) - peakIndex;
+            TimeSpan tailSpan = equityCurve[^1].Ts - equityCurve[peakIndex].Ts;
+            if (tailBars > maxBars) maxBars = tailBars;
+            if (tailSpan > maxSpan) maxSpan = tailSpan;
+            return (maxBars, maxSpan);
+        }
+
+        /// <summary>
+        /// Longest streaks of consecutive winning and losing trades.
+        /// </summary>
+        public static (int wins, int losses) MaxConsecutive(IReadOnlyList<TradeRecord> trades)
+        {
+            int maxWins = 0, maxLosses = 0, runWins = 0, runLosses = 0;
+            foreach (var t in trades)
+            {
+                if (t.IsWin)
+                {
+                    runWins++;
+                    runLosses = 0;
+                    if (runWins > maxWins) maxWins = runWins;
+                }
+                else
+                {
+                    runLosses++;
+                    runWins = 0;
+                    if (runLosses > maxLosses) maxLosses = runLosses;
+                }
+            }
+            return (maxWins, maxLosses);
+        }
     }
 }

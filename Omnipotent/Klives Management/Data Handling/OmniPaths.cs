@@ -159,6 +159,10 @@ namespace Omnipotent.Data_Handling
             public static string StratumRunsDirectory = $"{StratumDirectory}/Runs";
             public static string StratumConversationsDirectory = $"{StratumDirectory}/Conversations";
 
+            //KAPI Reachability Monitor
+            public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";
+            public static string KAPIReachabilityMonitorStateFile = $"{KAPIReachabilityMonitorDirectory}/state.json";
+
         };
 
         public static string GetPath(string path)

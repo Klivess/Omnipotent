@@ -183,7 +183,13 @@ namespace Omnipotent.Services.OmniTrader.Api
                     j.QueuedUtc,
                     j.StartedUtc,
                     j.FinishedUtc,
-                    j.Error
+                    j.Error,
+                    // At-a-glance summary metrics (null until the job has a result).
+                    TotalPnLPercent = j.Result?.TotalPnLPercent,
+                    WinRate = j.Result?.WinRate,
+                    SharpeRatio = j.Result?.SharpeRatio,
+                    MaxDrawdownPercent = j.Result?.MaxDrawdownPercent,
+                    TotalTrades = j.Result?.TotalTrades
                 }).ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(dtos));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);

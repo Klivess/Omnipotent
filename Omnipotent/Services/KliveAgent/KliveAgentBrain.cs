@@ -42,7 +42,7 @@ namespace Omnipotent.Services.KliveAgent
             new("GetObjectTypeInfo", "Quick string view of a live object's members; pass a filter, e.g. GetObjectTypeInfo(obj, \"Guild\")."),
             new("GetObjectMembers", "STRUCTURED, filterable introspection of a live object: GetObjectMembers(obj, \"nameFilter\", \"method|property|field\"). Returns a list you LINQ over inline; each method carries a ready-to-call .Signature. Prefer this over JSON-dumping GetObjectTypeInfo."),
             new("ExecuteServiceMethod", "Call a known service method directly when you already know the exact service type and method name."),
-            new("CallObjectMethod", "Invoke a method on a live object after inspecting it. Await Task-returning methods."),
+            new("CallObjectMethod", "Invoke a method (or property getter) on a live object. Returns Task<object?> — ALWAYS `await` it; it auto-unwraps the called method's own Task. Never use its result without await, or you get a Task object instead of the value."),
             new("GetRecentErrors", "Pull recent Error-level entries from OmniLogging directly. Prefer this over reflecting into the logger."),
             new("Log", "Write short structured observations back to the loop.")
         ];
@@ -135,8 +135,9 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
             sb.AppendLine("- TALK WHILE YOU WORK: when a request needs data-gathering scripts, OPEN with a one-line conversational acknowledgement in plain prose BEFORE the {{{ script }}} (e.g. \"On it, pulling that now.\"). The user sees your prose immediately while the script runs. Keep it to one short line — don't narrate every step.");
-            sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, CallObjectMethod, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
-            sb.AppendLine("- GetService(name) returns object. To call a method on it: CallObjectMethod(svc, \"Method\", args) — it auto-awaits Tasks for you.");
+            sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
+            sb.AppendLine("- CallObjectMethod ALWAYS returns Task<object?> — you MUST `await` it; it auto-unwraps the called method's own Task/Task<T> (and property getters) for you. NEVER write `var x = CallObjectMethod(...)` without await, or x is a Task object, not the value (tell-tale: output shows 'System.Threading.Tasks.Task`1[...]').");
+            sb.AppendLine("- GetService(name) returns object (sync). To read/call on it: `await CallObjectMethod(GetService(\"X\"), \"Method\", args)`, or `GetObjectMember(GetService(\"X\"), \"Field\")`.");
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
@@ -350,6 +351,7 @@ namespace Omnipotent.Services.KliveAgent
                 var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 bool stuckForceFinal = false;
                 bool finalFormatRetryUsed = false;
+                int emptyFinalRetries = 0;
                 int consecutiveFailedScripts = 0;
                 int consecutiveNoOpResponses = 0;
 
@@ -445,6 +447,38 @@ namespace Omnipotent.Services.KliveAgent
                         var finalText = string.Join("\n", segments
                             .Where(s => !s.IsScript)
                             .Select(s => s.Content)).Trim();
+
+                        // Guard: the model occasionally returns an empty/whitespace completion (no text,
+                        // no script). Don't surface a blank bubble and DON'T fake a canned reply — empties
+                        // are transient, so re-ask the model (a few times) to get a REAL answer. Only if it
+                        // stubbornly returns nothing do we report it honestly as an LLM failure.
+                        if (string.IsNullOrWhiteSpace(finalText))
+                        {
+                            if (emptyFinalRetries < 3 && !stuckForceFinal)
+                            {
+                                emptyFinalRetries++;
+                                currentPrompt = "(Your last message came through completely empty — nothing was sent to the user. Answer their previous message now.)";
+                                continue;
+                            }
+
+                            // Genuinely persistent empty: surface a truthful failure (same path as any
+                            // other LLM failure), not a fabricated persona response.
+                            llm.ResetSession(llmSessionId);
+                            agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                                allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
+                                turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                            return new AgentChatResponse
+                            {
+                                ConversationId = conversation.ConversationId,
+                                Response = "Something went wrong with my brain — the model returned an empty response several times in a row.",
+                                ScriptsExecuted = allScriptsExecuted,
+                                Success = false,
+                                ErrorMessage = "LLM returned an empty completion after retries.",
+                                PromptTokens = totalPromptTokens,
+                                CompletionTokens = totalCompletionTokens,
+                                Iterations = iterationsDone
+                            };
+                        }
 
                         // Guard: model sometimes emits C# code as plain text (unbalanced ``` fence,
                         // or naked tool calls like "ReadFile(...)") thinking it's a final answer.
