@@ -46,6 +46,27 @@ namespace Omnipotent.Services.OmniTrader.Strategy
             return sum / period;
         }
 
+        public static decimal EMA(IList<OHLCCandle> candles, int period, int endIndex)
+        {
+            if (endIndex < period - 1)
+                throw new ArgumentException("Not enough candles for EMA calculation.");
+            decimal multiplier = 2m / (period + 1);
+            decimal ema = candles[endIndex - period + 1].Close;
+            for (int i = endIndex - period + 2; i <= endIndex; i++)
+                ema = (candles[i].Close - ema) * multiplier + ema;
+            return ema;
+        }
+
+        public static decimal IBSSmoothed(IList<OHLCCandle> candles, int endIndex, int smoothing = 2)
+        {
+            if (endIndex < smoothing - 1)
+                return IBS(candles[endIndex]);
+            decimal sum = 0;
+            for (int i = endIndex - smoothing + 1; i <= endIndex; i++)
+                sum += IBS(candles[i]);
+            return sum / smoothing;
+        }
+
         public static decimal IBS(OHLCCandle candle)
         {
             decimal range = candle.High - candle.Low;
