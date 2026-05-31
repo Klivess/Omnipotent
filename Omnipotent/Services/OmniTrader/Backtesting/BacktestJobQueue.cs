@@ -13,21 +13,19 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private readonly MarketDataRouter marketData;
         private readonly StrategyRegistry registry;
         private readonly UniverseRepository universeRepo;
-        private readonly MarketData.CoinGeckoUniverseProvider coingecko;
         private readonly Action<string> log;
         private readonly Action<string, Exception?> err;
         private CancellationTokenSource? cts;
         private Task? worker;
 
         public BacktestJobQueue(BacktestJobRepository jobRepo, MarketDataRouter marketData, StrategyRegistry registry,
-            UniverseRepository universeRepo, MarketData.CoinGeckoUniverseProvider coingecko,
+            UniverseRepository universeRepo,
             Action<string> log, Action<string, Exception?> err)
         {
             this.jobRepo = jobRepo;
             this.marketData = marketData;
             this.registry = registry;
             this.universeRepo = universeRepo;
-            this.coingecko = coingecko;
             this.log = log;
             this.err = err;
         }
@@ -94,7 +92,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             // Cross-sectional momentum (portfolio) jobs run the multi-asset path end-to-end.
             if (row.Config.Momentum != null)
             {
-                var runner = new MomentumBacktestRunner(universeRepo, coingecko, log);
+                var runner = new MomentumBacktestRunner(universeRepo, log);
                 var momentumResult = await runner.RunAsync(
                     row.Config,
                     onProgress: async (pct, done, total) =>
@@ -109,6 +107,10 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
 
             var descriptor = registry.Resolve(row.StrategyClass)
                 ?? throw new InvalidOperationException($"Unknown strategy {row.StrategyClass}");
+            if (descriptor.RequiresUniverse)
+                throw new InvalidOperationException(
+                    $"{descriptor.Name} is a cross-sectional (multi-asset) strategy and cannot run as a single-symbol backtest. " +
+                    "Use the momentum backtest endpoint (/api/omnitrader/backtest/momentum/create) instead.");
             var strategy = registry.CreateInstance(descriptor.ClassName);
 
             string symbol = row.Config.Coin + row.Config.Currency;

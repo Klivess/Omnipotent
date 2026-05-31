@@ -8,6 +8,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy
         public required string Description { get; init; }
         public required string ClassName { get; init; }
         public required Type Type { get; init; }
+        /// <summary>Cross-sectional/multi-asset strategy — runs only on the portfolio backtest path.</summary>
+        public bool RequiresUniverse { get; init; }
     }
 
     public sealed class StrategyRegistry
@@ -34,7 +36,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy
                     Name = name,
                     Description = description,
                     ClassName = type.Name,
-                    Type = type
+                    Type = type,
+                    RequiresUniverse = attr?.RequiresUniverse ?? false
                 };
                 byClassName[type.Name] = descriptor;
                 byName[name] = descriptor;

@@ -51,8 +51,12 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Momentum
                 survivors.Add(a);
             }
 
-            // 5. Rank by market cap and keep the top `universe_cap`.
-            survivors.Sort((x, y) => y.MarketCap.CompareTo(x.MarketCap));
+            // 5. Rank by market cap, falling back to trailing quote volume when cap is unavailable
+            //    (e.g. the Binance universe has no market cap). The spec permits ranking by volume.
+            decimal RankKey(AssetSnapshot a) => a.MarketCap > 0m
+                ? a.MarketCap
+                : TrailingAvgQuoteVolume(a.History, cfg.LiquidityLookbackDays);
+            survivors.Sort((x, y) => RankKey(y).CompareTo(RankKey(x)));
             if (survivors.Count > cfg.UniverseCap) survivors.RemoveRange(cfg.UniverseCap, survivors.Count - cfg.UniverseCap);
             return survivors;
         }

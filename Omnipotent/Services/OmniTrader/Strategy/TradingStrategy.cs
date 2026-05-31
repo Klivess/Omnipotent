@@ -54,6 +54,13 @@ namespace Omnipotent.Services.OmniTrader.Strategy
         public string Name { get; }
         public string Description { get; }
 
+        /// <summary>
+        /// True for cross-sectional / multi-asset strategies that run only on the portfolio backtest
+        /// path (they implement <see cref="TradingStrategy.OnUniverseBar"/>, not <see cref="TradingStrategy.OnCandleClose"/>).
+        /// Such strategies cannot run as a single-symbol backtest or paper/live deployment.
+        /// </summary>
+        public bool RequiresUniverse { get; init; }
+
         public TradingStrategyAttribute(string name, string description)
         {
             Name = name;

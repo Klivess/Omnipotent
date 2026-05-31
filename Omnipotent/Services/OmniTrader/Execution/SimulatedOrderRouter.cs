@@ -411,7 +411,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
             if (state.MarginEnabled)
             {
                 AccruePortfolioBorrowFee();
-                await CheckPortfolioLiquidationAsync(ts, ct);
+                await CheckPortfolioLiquidationAsync(bar, ts, ct);
             }
 
             var toCheck = state.OpenOrders.ToList();
@@ -463,16 +463,28 @@ namespace Omnipotent.Services.OmniTrader.Execution
         }
 
         /// <summary>
-        /// Force-flatten the whole book at current marks if portfolio margin level
-        /// (equity / usedMargin, usedMargin = gross / leverage) falls to the liquidation threshold.
+        /// Cross-margin liquidation: if the portfolio margin level breaches the threshold at the bar's
+        /// worst-case (each position marked at its adverse intrabar extreme — longs at the low, shorts
+        /// at the high), force-flatten the whole book at those adverse prices. For a single position
+        /// this reduces to the usual intrabar liquidation on the candle low/high.
         /// </summary>
-        private async Task CheckPortfolioLiquidationAsync(DateTime ts, CancellationToken ct)
+        private async Task CheckPortfolioLiquidationAsync(IReadOnlyDictionary<string, OHLCCandle> bar, DateTime ts, CancellationToken ct)
         {
-            decimal gross = state.GrossNotional();
-            if (gross <= 0m) return;
-            decimal usedMargin = gross / state.EffectiveLeverage;
-            if (usedMargin <= 0m) return;
-            decimal marginLevel = state.PortfolioEquity() / usedMargin;
+            decimal AdversePrice(string sym, decimal b)
+                => bar.TryGetValue(sym, out var c) ? (b > 0m ? c.Low : c.High) : state.Mark(sym);
+
+            decimal grossAdverse = 0m, equityAdverse = state.QuoteBalance;
+            foreach (var kv in state.BaseBalances)
+            {
+                if (kv.Value == 0m) continue;
+                decimal p = AdversePrice(kv.Key, kv.Value);
+                equityAdverse += kv.Value * p;
+                grossAdverse += Math.Abs(kv.Value) * p;
+            }
+            if (grossAdverse <= 0m) return;
+
+            decimal usedMargin = grossAdverse / state.EffectiveLeverage;
+            decimal marginLevel = usedMargin <= 0m ? decimal.MaxValue : equityAdverse / usedMargin;
             if (marginLevel > state.LiquidationMarginLevel) return;
 
             state.Liquidated = true;
@@ -500,7 +512,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
                     Status = OrderStatus.Pending,
                     PlacedUtc = DateTime.UtcNow
                 };
-                await FillMarketAsync(intent, req, ApplySlippage(state.Mark(symbol), side), ts);
+                await FillMarketAsync(intent, req, ApplySlippage(AdversePrice(symbol, b), side), ts);
             }
         }
 

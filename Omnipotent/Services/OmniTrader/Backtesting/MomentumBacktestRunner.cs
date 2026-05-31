@@ -16,13 +16,11 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
     public sealed class MomentumBacktestRunner
     {
         private readonly UniverseRepository universeRepo;
-        private readonly CoinGeckoUniverseProvider coingecko;
         private readonly Action<string> log;
 
-        public MomentumBacktestRunner(UniverseRepository universeRepo, CoinGeckoUniverseProvider coingecko, Action<string> log)
+        public MomentumBacktestRunner(UniverseRepository universeRepo, Action<string> log)
         {
             this.universeRepo = universeRepo;
-            this.coingecko = coingecko;
             this.log = log;
         }
 
@@ -35,17 +33,18 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             var s = config.Momentum ?? throw new InvalidOperationException("MomentumBacktestRunner requires config.Momentum.");
 
             // 1. Ensure the point-in-time universe data covers the window (cached after the first fetch).
-            await coingecko.EnsureUniverseDataAsync(universeRepo, s.FromUtc.Date, s.ToUtc.Date, s.UniverseTopN, log, ct);
+            var universe = new BinanceUniverseProvider(s.QuoteAsset);
+            await universe.EnsureUniverseDataAsync(universeRepo, s.FromUtc.Date, s.ToUtc.Date, s.UniverseTopN, log, ct);
 
             // 2. Load it and assemble the portfolio inputs.
             var window = await universeRepo.LoadWindowAsync(s.FromUtc, s.ToUtc, ct);
             if (window.Count == 0)
-                throw new InvalidOperationException($"No universe data for {s.FromUtc:yyyy-MM-dd}..{s.ToUtc:yyyy-MM-dd}. Check the CoinGecko API key and window.");
+                throw new InvalidOperationException($"No universe data for {s.FromUtc:yyyy-MM-dd}..{s.ToUtc:yyyy-MM-dd}. Check connectivity to Binance and the window.");
 
             var coins = await universeRepo.ListCoinsAsync(ct);
             var tickers = coins.ToDictionary(c => c.CoinId, c => c.Symbol, StringComparer.OrdinalIgnoreCase);
             var shortable = coins.Where(c => c.Shortable).Select(c => c.CoinId).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var input = BuildPortfolioInput(window, s.RegimeCoinId);
+            var input = BuildPortfolioInput(window, s.RegimeSymbol);
             log($"Momentum backtest: {input.Candles.Count} coins over {s.FromUtc:yyyy-MM-dd}..{s.ToUtc:yyyy-MM-dd}.");
 
             var mcfg = MomentumConfig.FromSettings(s);
@@ -55,7 +54,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             CrossSectionalMomentumStrategy MkStrat(MomentumConfig p) => new()
             {
                 Config = p,
-                RegimeSymbol = s.RegimeCoinId,
+                RegimeSymbol = s.RegimeSymbol,
                 Tickers = tickers,
                 Shortable = shortable,
             };
@@ -132,7 +131,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 var ms = new List<MarketCapPoint>(pts.Count);
                 foreach (var p in pts)
                 {
-                    // CoinGecko gives daily close only → synthesise OHLC as close; Volume = USD quote volume.
+                    // universe_daily stores the daily close; synthesise OHLC as close (the strategy is
+                    // daily-close based). Volume = USD quote volume.
                     cs.Add(new OHLCCandle(p.Date, p.Price, p.Price, p.Price, p.Price, p.VolumeUsd));
                     ms.Add(new MarketCapPoint(p.Date, p.MarketCap));
                 }

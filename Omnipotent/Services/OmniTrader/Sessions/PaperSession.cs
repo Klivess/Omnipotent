@@ -79,16 +79,42 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             strategy.Attach(context);
         }
 
+        /// <summary>How many historical candles to seed so indicator strategies have their warmup
+        /// immediately instead of waiting many days for live candles to accumulate.</summary>
+        private const int PreloadCandles = 500;
+
         public async Task StartAsync(CancellationToken externalToken = default)
         {
             if (isRunning) return;
             isRunning = true;
             cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
 
+            await PreloadHistoryAsync(cts.Token);
+
             try { await Strategy.OnStart(cts.Token); }
             catch (Exception ex) { err($"[{DeploymentId}] OnStart failed", ex); }
 
             loopTask = Task.Run(() => RunLoopAsync(cts.Token));
+        }
+
+        /// <summary>Seed CandleHistory (and the router's last mark) with recent closed candles so the
+        /// strategy can act on the next live bar rather than after hundreds of hours of streaming.</summary>
+        private async Task PreloadHistoryAsync(CancellationToken ct)
+        {
+            try
+            {
+                var hist = await marketData.GetHistoricalCandlesAsync(Config.Symbol, Config.Interval, PreloadCandles, ct);
+                foreach (var c in hist)
+                {
+                    context.CandleHistory.Add(c);
+                    lastCandleTs = c.Timestamp;
+                }
+                if (hist.Count > 0) router.UpdateLastCandle(hist[^1]);
+                if (context.CandleHistory.Count > 5000)
+                    context.CandleHistory.RemoveRange(0, context.CandleHistory.Count - 5000);
+                log($"[{DeploymentId}] preloaded {hist.Count} {Config.Interval} candles for {Config.Symbol}.");
+            }
+            catch (Exception ex) { err($"[{DeploymentId}] history preload failed", ex); }
         }
 
         public async Task StopAsync()
@@ -122,6 +148,10 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             {
                 await foreach (var candle in marketData.StreamCandlesAsync(Config.Symbol, Config.Interval, ct))
                 {
+                    // Skip any candle already covered by the preloaded history (the stream may resend
+                    // the most recent closed bar).
+                    if (lastCandleTs.HasValue && candle.Timestamp <= lastCandleTs.Value) continue;
+
                     router.UpdateLastCandle(candle);
                     context.CandleHistory.Add(candle);
                     if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);

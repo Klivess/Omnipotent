@@ -106,7 +106,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                 CREATE INDEX idx_universe_daily_date ON universe_daily(date);
 
                 CREATE TABLE coin_meta (
-                    coin_id TEXT PRIMARY KEY,    -- provider id (e.g. CoinGecko 'bitcoin')
+                    coin_id TEXT PRIMARY KEY,    -- engine key (e.g. Binance pair 'BTCUSDT')
                     symbol TEXT NOT NULL,        -- ticker (e.g. BTC)
                     name TEXT,
                     denylisted INTEGER NOT NULL DEFAULT 0,

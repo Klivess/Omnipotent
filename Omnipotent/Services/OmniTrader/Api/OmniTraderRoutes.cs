@@ -35,7 +35,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             await parent.CreateAPIRoute("/api/omnitrader/strategies", async req =>
             {
                 var items = parent.StrategyRegistry.All
-                    .Select(d => new { d.Name, d.ClassName, d.Description })
+                    .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse })
                     .OrderBy(x => x.Name)
                     .ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(items));
@@ -444,7 +444,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             return new BacktestConfig
             {
                 StrategyClass = "CrossSectionalMomentumStrategy",
-                Coin = Settings.RegimeCoinId,
+                Coin = Settings.RegimeSymbol,
                 Currency = "USD",
                 Interval = TimeInterval.OneDay,
                 CandleCount = days,

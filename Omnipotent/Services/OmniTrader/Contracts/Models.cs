@@ -171,7 +171,10 @@ namespace Omnipotent.Services.OmniTrader.Contracts
     {
         // ── Universe fetch / window ─────────────────────────────────────────────
         public int UniverseTopN { get; init; } = 100;
-        public string RegimeCoinId { get; init; } = "bitcoin";
+        /// <summary>Engine key of the regime/benchmark asset — a Binance pair, e.g. BTCUSDT.</summary>
+        public string RegimeSymbol { get; init; } = "BTCUSDT";
+        /// <summary>Binance quote asset the universe is built from (USDT by default).</summary>
+        public string QuoteAsset { get; init; } = "USDT";
         public DateTime FromUtc { get; init; } = DateTime.UtcNow.AddYears(-2);
         public DateTime ToUtc { get; init; } = DateTime.UtcNow.AddDays(-1);
 

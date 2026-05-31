@@ -16,7 +16,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         "Weekly-rebalanced cross-sectional crypto momentum. Ranks a point-in-time universe by trailing " +
         "risk-adjusted momentum, goes long the top fraction (optionally short the bottom), sizes by " +
         "inverse-vol scaled to a target portfolio vol, gated by a BTC trend regime filter and a drawdown " +
-        "killswitch. Requires portfolio-mode backtests (multi-asset universe data).")]
+        "killswitch. Requires portfolio-mode backtests (multi-asset universe data).",
+        RequiresUniverse = true)]
     public sealed class CrossSectionalMomentumStrategy : TradingStrategy
     {
         /// <summary>Strategy parameters. The backtest queue injects this from the job config before running.</summary>

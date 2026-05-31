@@ -35,6 +35,10 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private decimal quoteBalance;
         private decimal baseBalance;
         private decimal lastMarkPrice;
+        private DateTime? lastCandleTs;
+
+        /// <summary>Historical candles to seed so indicator strategies have warmup immediately.</summary>
+        private const int PreloadCandles = 500;
 
         public LiveSession(
             string deploymentId,
@@ -84,8 +88,29 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             if (isRunning) return;
             isRunning = true;
             cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
+            await PreloadHistoryAsync(cts.Token);
             try { await Strategy.OnStart(cts.Token); } catch (Exception ex) { err($"[{DeploymentId}] OnStart failed", ex); }
             loopTask = Task.Run(() => RunLoopAsync(cts.Token));
+        }
+
+        /// <summary>Seed CandleHistory with recent closed candles so the strategy can act on the next
+        /// live bar rather than after hundreds of hours of streaming.</summary>
+        private async Task PreloadHistoryAsync(CancellationToken ct)
+        {
+            try
+            {
+                var hist = await marketData.GetHistoricalCandlesAsync(Config.Symbol, Config.Interval, PreloadCandles, ct);
+                foreach (var c in hist)
+                {
+                    context.CandleHistory.Add(c);
+                    lastCandleTs = c.Timestamp;
+                    lastMarkPrice = c.Close;
+                }
+                if (context.CandleHistory.Count > 5000)
+                    context.CandleHistory.RemoveRange(0, context.CandleHistory.Count - 5000);
+                log($"[{DeploymentId}] preloaded {hist.Count} {Config.Interval} candles for {Config.Symbol}.");
+            }
+            catch (Exception ex) { err($"[{DeploymentId}] history preload failed", ex); }
         }
 
         public async Task StopAsync()
@@ -145,6 +170,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             {
                 await foreach (var candle in marketData.StreamCandlesAsync(Config.Symbol, Config.Interval, ct))
                 {
+                    if (lastCandleTs.HasValue && candle.Timestamp <= lastCandleTs.Value) continue;
+                    lastCandleTs = candle.Timestamp;
                     lastMarkPrice = candle.Close;
                     context.CandleHistory.Add(candle);
                     if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);

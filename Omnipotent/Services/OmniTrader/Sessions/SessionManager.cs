@@ -65,6 +65,10 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         {
             var descriptor = registry.Resolve(config.StrategyClass)
                 ?? throw new InvalidOperationException($"Unknown strategy {config.StrategyClass}");
+            if (descriptor.RequiresUniverse)
+                throw new InvalidOperationException(
+                    $"{descriptor.Name} is a cross-sectional (multi-asset) strategy and cannot be deployed to a " +
+                    "single-symbol paper/live session. Run it as a momentum backtest instead.");
 
             var strategy = registry.CreateInstance(descriptor.ClassName);
             string id = Guid.NewGuid().ToString("N");
