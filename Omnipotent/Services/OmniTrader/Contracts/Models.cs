@@ -39,6 +39,9 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public required decimal Qty { get; init; }
         public decimal? LimitPrice { get; init; }
         public decimal? StopPrice { get; init; }
+        /// <summary>Margin leverage for this order (1 = spot). Live sessions inject the
+        /// deployment's leverage; the simulated router uses its State.Leverage instead.</summary>
+        public decimal Leverage { get; init; } = 1m;
     }
 
     public sealed class OrderIntent
@@ -62,6 +65,9 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public required decimal Fee { get; init; }
         public required string FeeCurrency { get; init; }
         public required DateTime FilledUtc { get; init; }
+        /// <summary>Symbol the fill is for. Needed by portfolio mode to attribute fills to the right
+        /// book; the single-symbol path also sets it. May be empty for legacy/exchange fills.</summary>
+        public string Symbol { get; init; } = "";
     }
 
     public sealed class Position
@@ -76,12 +82,51 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public bool IsShort => Qty < 0;
     }
 
+    /// <summary>
+    /// A single point-in-time slice of a multi-asset universe, handed to a portfolio strategy's
+    /// <c>OnUniverseBar</c>. All series end at <see cref="T"/> — nothing here looks ahead.
+    /// <para><see cref="Histories"/> maps symbol → its daily candle history up to and including T
+    /// (for the cross-sectional momentum strategy these are daily closes synthesised as OHLC with
+    /// <c>Volume</c> = trailing USD quote volume). <see cref="MarketCaps"/> maps symbol → its USD
+    /// market cap as of T (used only for ranking/universe cap). A symbol present in the engine's
+    /// candle set but absent from <see cref="MarketCaps"/> simply has no cap datum at T.</para>
+    /// </summary>
+    public sealed class PortfolioBar
+    {
+        public required DateTime T { get; init; }
+        public required IReadOnlyDictionary<string, IReadOnlyList<OHLCCandle>> Histories { get; init; }
+        public required IReadOnlyDictionary<string, decimal> MarketCaps { get; init; }
+
+        /// <summary>Latest (as-of-T) close for a symbol, or 0 if it has no history at T.</summary>
+        public decimal Mark(string symbol)
+            => Histories.TryGetValue(symbol, out var h) && h.Count > 0 ? h[^1].Close : 0m;
+    }
+
     public sealed class RiskCaps
     {
         public decimal MaxPositionQuoteUsd { get; init; } = 100m;
         public decimal MaxDailyLossUsd { get; init; } = 50m;
         public int MaxOrdersPerHour { get; init; } = 30;
         public HashSet<string> AllowedSymbols { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Margin settings shared by deployments and backtests. Leverage = 1 means spot
+    /// (margin mode is fully disabled and behaviour is identical to the pre-margin engine).
+    /// </summary>
+    public sealed class MarginSettings
+    {
+        /// <summary>Account leverage, 1–10. 1 = spot (no borrowing, no shorts, no liquidation).</summary>
+        public decimal Leverage { get; init; } = 1m;
+        /// <summary>Liquidate when margin level (equity / posted margin) falls to this. Kraken ≈ 0.40.</summary>
+        public decimal LiquidationMarginLevel { get; init; } = 0.40m;
+        /// <summary>Annualised borrow/rollover rate charged per bar on borrowed notional.</summary>
+        public decimal BorrowAnnualRate { get; init; } = 0.20m;
+        /// <summary>Fee fraction charged when opening/increasing a leveraged position (Kraken ≈ 0.0002).</summary>
+        public decimal OpeningFeeFraction { get; init; } = 0.0002m;
+
+        public static MarginSettings Spot => new();
+        public decimal ClampedLeverage => Math.Clamp(Leverage, 1m, 10m);
     }
 
     public sealed class DeploymentConfig
@@ -94,6 +139,7 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public decimal InitialBaseBalance { get; init; } = 0m;
         public decimal FeeFraction { get; init; } = 0.001m;
         public decimal SlippageFraction { get; init; } = 0.0005m;
+        public MarginSettings Margin { get; init; } = new();
         public RiskCaps? Caps { get; init; }
     }
 
@@ -108,6 +154,56 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public decimal InitialBaseBalance { get; init; } = 0m;
         public decimal FeeFraction { get; init; } = 0.001m;
         public decimal SlippageFraction { get; init; } = 0.0005m;
+        public MarginSettings Margin { get; init; } = new();
+
+        /// <summary>When set, the job runs the multi-asset (cross-sectional momentum) portfolio path
+        /// instead of the single-symbol path. Null for ordinary single-symbol backtests.</summary>
+        public MomentumBacktestSettings? Momentum { get; init; }
+    }
+
+    /// <summary>
+    /// Settings for a cross-sectional momentum (portfolio) backtest. Carries the universe window/fetch
+    /// parameters, the strategy parameter block (mirrors <c>MomentumConfig</c> as primitives so this
+    /// layer stays free of a Strategy dependency), and the Section 11 validation knobs. The backtest
+    /// queue maps it onto the engine.
+    /// </summary>
+    public sealed class MomentumBacktestSettings
+    {
+        // ── Universe fetch / window ─────────────────────────────────────────────
+        public int UniverseTopN { get; init; } = 100;
+        public string RegimeCoinId { get; init; } = "bitcoin";
+        public DateTime FromUtc { get; init; } = DateTime.UtcNow.AddYears(-2);
+        public DateTime ToUtc { get; init; } = DateTime.UtcNow.AddDays(-1);
+
+        // ── Strategy params (defaults = the spec's starting point) ──────────────
+        public int LookbackDays { get; init; } = 30;
+        public int SkipDays { get; init; } = 1;
+        public int RebalanceDays { get; init; } = 7;
+        public int VolLookbackDays { get; init; } = 30;
+        public double TopFraction { get; init; } = 0.20;
+        public double BottomFraction { get; init; } = 0.20;
+        public int MinUniverseSize { get; init; } = 20;
+        public bool UseRiskAdjusted { get; init; } = true;
+        public string SkipAction { get; init; } = "cash";        // cash | hold
+        public double TargetPortfolioVol { get; init; } = 0.40;
+        public double MaxWeightPerAsset { get; init; } = 0.20;
+        public double MaxGrossLeverage { get; init; } = 1.0;
+        public int RegimeMaDays { get; init; } = 100;
+        public double RiskOffScalar { get; init; } = 0.0;
+        public bool KeepShortsWhenRiskOff { get; init; } = true;
+        public double DdKillswitch { get; init; } = 0.30;
+        public int UniverseCap { get; init; } = 100;
+        public double LiquidityFloorUsd { get; init; } = 5_000_000;
+        public int LiquidityLookbackDays { get; init; } = 30;
+        public double PegVolThreshold { get; init; } = 0.01;
+        public double ParticipationCap { get; init; } = 0.05;
+        public decimal AnnualFundingRate { get; init; } = 0.10m;
+
+        // ── Validation (Section 11) ─────────────────────────────────────────────
+        public bool RunValidation { get; init; } = true;
+        public int InSampleDays { get; init; } = 180;
+        public int OosDays { get; init; } = 60;
+        public int WarmupDays { get; init; } = 62;
     }
 
     public sealed class TradeRecord

@@ -89,6 +89,31 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     last_nonce INTEGER NOT NULL
                 );
+            "),
+            (2, @"
+                -- Point-in-time universe data for the cross-sectional momentum strategy.
+                -- Daily price/market-cap/volume per coin, including coins that later delisted
+                -- (their rows simply stop at their last trading date), so the universe rebuilt
+                -- as-of any past date is survivorship-free.
+                CREATE TABLE universe_daily (
+                    coin_id TEXT NOT NULL,
+                    date TEXT NOT NULL,          -- yyyy-MM-dd (UTC day)
+                    price REAL NOT NULL,
+                    market_cap REAL NOT NULL,
+                    volume_usd REAL NOT NULL,
+                    PRIMARY KEY (coin_id, date)
+                );
+                CREATE INDEX idx_universe_daily_date ON universe_daily(date);
+
+                CREATE TABLE coin_meta (
+                    coin_id TEXT PRIMARY KEY,    -- provider id (e.g. CoinGecko 'bitcoin')
+                    symbol TEXT NOT NULL,        -- ticker (e.g. BTC)
+                    name TEXT,
+                    denylisted INTEGER NOT NULL DEFAULT 0,
+                    shortable INTEGER NOT NULL DEFAULT 1,
+                    first_date TEXT,
+                    last_date TEXT
+                );
             ")
         };
     }

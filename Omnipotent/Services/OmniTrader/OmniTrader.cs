@@ -20,6 +20,7 @@ namespace Omnipotent.Services.OmniTrader
         public EquityRepository EquityRepo { get; private set; } = null!;
         public BacktestJobRepository BacktestJobRepo { get; private set; } = null!;
         public CandleCacheRepository CandleCacheRepo { get; private set; } = null!;
+        public UniverseRepository UniverseRepo { get; private set; } = null!;
         public KrakenNonceStore NonceStore { get; private set; } = null!;
         public MarketDataRouter MarketData { get; private set; } = null!;
         public StrategyRegistry StrategyRegistry { get; private set; } = null!;
@@ -51,6 +52,7 @@ namespace Omnipotent.Services.OmniTrader
                 EquityRepo = new EquityRepository(Db);
                 BacktestJobRepo = new BacktestJobRepository(Db);
                 CandleCacheRepo = new CandleCacheRepository(Db);
+                UniverseRepo = new UniverseRepository(Db);
                 NonceStore = new KrakenNonceStore(Db);
                 await NonceStore.InitialiseAsync();
 
@@ -70,7 +72,9 @@ namespace Omnipotent.Services.OmniTrader
                     m => _ = ServiceLog(m),
                     (m, e) => _ = (e == null ? ServiceLogError(m) : ServiceLogError(e, m)));
 
+                var coingecko = await BuildCoinGeckoProviderAsync();
                 BacktestQueue = new BacktestJobQueue(BacktestJobRepo, MarketData, StrategyRegistry,
+                    UniverseRepo, coingecko,
                     m => _ = ServiceLog(m),
                     (m, e) => _ = (e == null ? ServiceLogError(m) : ServiceLogError(e, m)));
                 BacktestQueue.Start();
@@ -87,6 +91,28 @@ namespace Omnipotent.Services.OmniTrader
             {
                 await ServiceLogError(ex, "OmniTrader startup failed");
             }
+        }
+
+        /// <summary>
+        /// Build the CoinGecko universe provider for momentum backtests. The API key is optional —
+        /// without one the free tier still works but is heavily rate-limited (set
+        /// OmniTrader.CoinGecko.ApiKey, and OmniTrader.CoinGecko.Pro = "true" for a paid key).
+        /// </summary>
+        private async Task<MarketData.CoinGeckoUniverseProvider> BuildCoinGeckoProviderAsync()
+        {
+            string apiKey = "";
+            bool pro = false;
+            try
+            {
+                apiKey = await GetStringOmniSetting("OmniTrader.CoinGecko.ApiKey", sensitive: true);
+                string proFlag = await GetStringOmniSetting("OmniTrader.CoinGecko.Pro");
+                pro = proFlag.Trim().Equals("true", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { /* settings absent — fall back to keyless free tier */ }
+
+            if (string.IsNullOrWhiteSpace(apiKey))
+                await ServiceLog("CoinGecko API key not configured — momentum universe fetches use the rate-limited free tier.");
+            return new MarketData.CoinGeckoUniverseProvider(string.IsNullOrWhiteSpace(apiKey) ? null : apiKey, pro);
         }
 
         private async Task TryInitKrakenAsync()

@@ -12,17 +12,22 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private readonly BacktestJobRepository jobRepo;
         private readonly MarketDataRouter marketData;
         private readonly StrategyRegistry registry;
+        private readonly UniverseRepository universeRepo;
+        private readonly MarketData.CoinGeckoUniverseProvider coingecko;
         private readonly Action<string> log;
         private readonly Action<string, Exception?> err;
         private CancellationTokenSource? cts;
         private Task? worker;
 
         public BacktestJobQueue(BacktestJobRepository jobRepo, MarketDataRouter marketData, StrategyRegistry registry,
+            UniverseRepository universeRepo, MarketData.CoinGeckoUniverseProvider coingecko,
             Action<string> log, Action<string, Exception?> err)
         {
             this.jobRepo = jobRepo;
             this.marketData = marketData;
             this.registry = registry;
+            this.universeRepo = universeRepo;
+            this.coingecko = coingecko;
             this.log = log;
             this.err = err;
         }
@@ -85,6 +90,22 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         private async Task RunSingleJobAsync(BacktestJobRow row, CancellationToken ct)
         {
             await jobRepo.StartAsync(row.Id, DateTime.UtcNow, ct);
+
+            // Cross-sectional momentum (portfolio) jobs run the multi-asset path end-to-end.
+            if (row.Config.Momentum != null)
+            {
+                var runner = new MomentumBacktestRunner(universeRepo, coingecko, log);
+                var momentumResult = await runner.RunAsync(
+                    row.Config,
+                    onProgress: async (pct, done, total) =>
+                    {
+                        try { await jobRepo.UpdateProgressAsync(row.Id, pct, done, total, ct); } catch { }
+                    },
+                    cancellationCheck: () => jobRepo.IsCancellationRequestedAsync(row.Id, ct),
+                    ct: ct);
+                await jobRepo.CompleteAsync(row.Id, BacktestJobStatus.Succeeded, momentumResult, null, DateTime.UtcNow, ct);
+                return;
+            }
 
             var descriptor = registry.Resolve(row.StrategyClass)
                 ?? throw new InvalidOperationException($"Unknown strategy {row.StrategyClass}");

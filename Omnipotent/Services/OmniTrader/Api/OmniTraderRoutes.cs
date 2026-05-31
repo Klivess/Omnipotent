@@ -103,6 +103,62 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(series));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
+            await parent.CreateAPIRoute("/api/omnitrader/deployment/chart", async req =>
+            {
+                string? id = req.userParameters.Get("id");
+                if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
+                var row = await parent.DeploymentRepo.GetAsync(id);
+                if (row == null) { await req.ReturnResponse("Not found", code: HttpStatusCode.NotFound); return; }
+
+                int limit = 300;
+                if (int.TryParse(req.userParameters.Get("limit"), out var l)) limit = Math.Clamp(l, 50, 1000);
+
+                string symbol = row.Config.Symbol;
+                var interval = row.Config.Interval;
+
+                // Candles are cache-first (the live/paper stream upserts each candle into candle_cache),
+                // so repeated polling is a fast DB read once the window is warm.
+                IReadOnlyList<OHLCCandle> candles;
+                try { candles = await parent.MarketData.GetHistoricalCandlesAsync(symbol, interval, limit); }
+                catch { candles = Array.Empty<OHLCCandle>(); }
+
+                // Markers from this deployment's fills, joined to their order for side. Walk the fills
+                // chronologically tracking net position so each is classified as an entry or an exit
+                // (opposing an open position reduces/closes it -> exit; otherwise it opens/adds -> entry).
+                var orders = await parent.OrderRepo.ListByDeploymentAsync(id, 1000);
+                var sideById = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var o in orders) sideById[o.Id] = o.Side;
+
+                var fills = await parent.FillRepo.ListByDeploymentAsync(id, 1000);
+                fills.Sort((a, b) => a.FilledUtc.CompareTo(b.FilledUtc));
+
+                var markers = new List<object>();
+                decimal pos = 0m;
+                foreach (var f in fills)
+                {
+                    if (!sideById.TryGetValue(f.OrderId, out var side)) continue;
+                    bool isBuy = string.Equals(side, "buy", StringComparison.OrdinalIgnoreCase);
+                    decimal prev = pos;
+                    pos += isBuy ? f.Qty : -f.Qty;
+                    bool opposing = prev != 0m && (isBuy ? prev < 0m : prev > 0m);
+                    markers.Add(new
+                    {
+                        Time = f.FilledUtc.ToString("o"),
+                        f.Price,
+                        Side = isBuy ? "buy" : "sell",
+                        Kind = opposing ? "exit" : "entry"
+                    });
+                }
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    Symbol = symbol,
+                    Interval = interval.ToString(),
+                    Candles = candles.Select(c => new { c.Timestamp, c.Open, c.High, c.Low, c.Close }),
+                    Markers = markers
+                }));
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+
             await parent.CreateAPIRoute("/api/omnitrader/deployment/create", async req =>
             {
                 try
@@ -234,6 +290,22 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
+            await parent.CreateAPIRoute("/api/omnitrader/backtest/momentum/create", async req =>
+            {
+                try
+                {
+                    var dto = JsonConvert.DeserializeObject<CreateMomentumBacktestDto>(req.userMessageContent ?? "")
+                        ?? throw new Exception("Invalid body");
+                    string id = await parent.BacktestQueue.EnqueueAsync(dto.ToBacktestConfig());
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { JobId = id }));
+                }
+                catch (Exception ex)
+                {
+                    await parent.ServiceLogError(ex, "momentum backtest enqueue failed");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+
             await parent.CreateAPIRoute("/api/omnitrader/backtest/cancel", async req =>
             {
                 string? id = req.userParameters.Get("id");
@@ -288,6 +360,7 @@ namespace Omnipotent.Services.OmniTrader.Api
         public decimal InitialBaseBalance { get; set; } = 0m;
         public decimal FeeFraction { get; set; } = 0.001m;
         public decimal SlippageFraction { get; set; } = 0.0005m;
+        public decimal Leverage { get; set; } = 1m;
         public decimal? MaxPositionQuoteUsd { get; set; }
         public decimal? MaxDailyLossUsd { get; set; }
         public int? MaxOrdersPerHour { get; set; }
@@ -318,6 +391,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 InitialBaseBalance = InitialBaseBalance,
                 FeeFraction = FeeFraction,
                 SlippageFraction = SlippageFraction,
+                Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
                 Caps = caps
             };
         }
@@ -334,6 +408,7 @@ namespace Omnipotent.Services.OmniTrader.Api
         public decimal InitialBaseBalance { get; set; } = 0m;
         public decimal FeeFraction { get; set; } = 0.001m;
         public decimal SlippageFraction { get; set; } = 0.0005m;
+        public decimal Leverage { get; set; } = 1m;
 
         public BacktestConfig ToBacktestConfig() => new BacktestConfig
         {
@@ -345,7 +420,40 @@ namespace Omnipotent.Services.OmniTrader.Api
             InitialQuoteBalance = InitialQuoteBalance,
             InitialBaseBalance = InitialBaseBalance,
             FeeFraction = FeeFraction,
-            SlippageFraction = SlippageFraction
+            SlippageFraction = SlippageFraction,
+            Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) }
         };
+    }
+
+    /// <summary>
+    /// Request body for a cross-sectional momentum backtest. Only the window and a few knobs are
+    /// commonly set; everything else falls back to the spec defaults in <see cref="MomentumBacktestSettings"/>.
+    /// Leverage &gt; 1 is required for a short book (BottomFraction &gt; 0) and to charge funding.
+    /// </summary>
+    public sealed class CreateMomentumBacktestDto
+    {
+        public decimal InitialQuoteBalance { get; set; } = 10_000m;
+        public decimal FeeFraction { get; set; } = 0.0007m;     // ~7 bps taker
+        public decimal SlippageFraction { get; set; } = 0.0010m;
+        public decimal Leverage { get; set; } = 1m;
+        public MomentumBacktestSettings Settings { get; set; } = new();
+
+        public BacktestConfig ToBacktestConfig()
+        {
+            int days = Math.Max(1, (int)(Settings.ToUtc - Settings.FromUtc).TotalDays);
+            return new BacktestConfig
+            {
+                StrategyClass = "CrossSectionalMomentumStrategy",
+                Coin = Settings.RegimeCoinId,
+                Currency = "USD",
+                Interval = TimeInterval.OneDay,
+                CandleCount = days,
+                InitialQuoteBalance = InitialQuoteBalance,
+                FeeFraction = FeeFraction,
+                SlippageFraction = SlippageFraction,
+                Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
+                Momentum = Settings,
+            };
+        }
     }
 }

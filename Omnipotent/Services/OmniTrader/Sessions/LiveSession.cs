@@ -70,7 +70,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             var host = new StrategyHost(deploymentId, config.Mode, config.Symbol, config.Interval,
                 SubmitOrderAsync, CancelByIntentAsync,
                 () => position, () => quoteBalance, () => baseBalance,
-                m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e));
+                m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e),
+                config.Margin.ClampedLeverage);
             context = new StrategyContext { Host = host };
             strategy.Attach(context);
         }
@@ -116,8 +117,26 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 Qty = qty
             };
             // Bypass the gate for emergency flatten.
-            var intent = await exchange.PlaceOrderAsync(DeploymentId, req, ct);
+            var intent = await exchange.PlaceOrderAsync(DeploymentId, WithLeverage(req), ct);
             try { await orderRepo.InsertAsync(intent, ct); } catch { }
+        }
+
+        // Inject the deployment's leverage so the exchange opens/closes on margin. No-op at 1x.
+        private OrderRequest WithLeverage(OrderRequest req)
+        {
+            decimal lev = Config.Margin.ClampedLeverage;
+            if (lev <= 1m) return req;
+            return new OrderRequest
+            {
+                IntentId = req.IntentId,
+                Side = req.Side,
+                Type = req.Type,
+                Symbol = req.Symbol,
+                Qty = req.Qty,
+                LimitPrice = req.LimitPrice,
+                StopPrice = req.StopPrice,
+                Leverage = lev
+            };
         }
 
         private async Task RunLoopAsync(CancellationToken ct)
@@ -212,7 +231,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 try { await orderRepo.InsertAsync(intent, ct); } catch { }
                 return intent;
             }
-            var placed = await exchange.PlaceOrderAsync(DeploymentId, req, ct);
+            var placed = await exchange.PlaceOrderAsync(DeploymentId, WithLeverage(req), ct);
             try { await orderRepo.InsertAsync(placed, ct); } catch { }
             return placed;
         }

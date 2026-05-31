@@ -61,14 +61,20 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 QuoteBalance = startingQuote ?? config.InitialQuoteBalance,
                 BaseBalance = startingBase ?? config.InitialBaseBalance,
                 FeeFraction = config.FeeFraction,
-                SlippageFraction = config.SlippageFraction
+                SlippageFraction = config.SlippageFraction,
+                Leverage = config.Margin.ClampedLeverage,
+                LiquidationMarginLevel = config.Margin.LiquidationMarginLevel,
+                BorrowAnnualRate = config.Margin.BorrowAnnualRate,
+                OpeningFeeFraction = config.Margin.OpeningFeeFraction,
+                SecondsPerBar = (int)config.Interval * 60
             };
-            router = new SimulatedOrderRouter(simState, OnFillAsync);
+            router = new SimulatedOrderRouter(simState, OnFillAsync, m => log($"[{deploymentId}] {m}"));
 
             var host = new StrategyHost(deploymentId, config.Mode, config.Symbol, config.Interval,
                 SubmitOrderAsync, CancelByIntentAsync,
                 () => simState.Position, () => simState.QuoteBalance, () => simState.BaseBalance,
-                m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e));
+                m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e),
+                config.Margin.ClampedLeverage);
             context = new StrategyContext { Host = host };
             strategy.Attach(context);
         }

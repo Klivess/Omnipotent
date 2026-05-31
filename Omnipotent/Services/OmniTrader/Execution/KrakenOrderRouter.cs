@@ -45,6 +45,10 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 { "volume", request.Qty.ToString(System.Globalization.CultureInfo.InvariantCulture) },
                 { "cl_ord_id", request.IntentId }
             };
+            // Margin order: Kraken takes integer leverage (absent = spot). The exchange rejects
+            // leverage above what the pair supports, surfaced back as a rejected intent.
+            if (request.Leverage > 1m)
+                parameters["leverage"] = ((int)Math.Round(request.Leverage)).ToString(System.Globalization.CultureInfo.InvariantCulture);
             if (request.LimitPrice.HasValue)
                 parameters["price"] = request.LimitPrice.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
             if (request.StopPrice.HasValue && (request.Type == OrderType.StopLoss))

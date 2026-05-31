@@ -31,7 +31,7 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         "Self-training Temporal Convolutional Network (pure C#, no external model file). " +
         "Predicts next-bar direction, then applies deadband + EWMA volatility scaling to size a " +
         "long/short target weight. Auto-trains on first run and caches the model. " +
-        "For spot-only exchanges set WMin = 0.")]
+        "Sizes into the deployment's leverage: spot (1x) is long-only, margin (Nx) goes ±N.")]
     public sealed class TCNSignalStrategy : TradingStrategy
     {
         // ── Spec: fixed by design ───────────────────────────────────────────────
@@ -42,11 +42,14 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         // ── [DEFAULT] tuneable — calibrate on validation, never on test ─────────
         private const double Tau           = 0.30;   // deadband threshold
         private const double SigmaStarAnn  = 0.12;   // 12% target annualised vol
-        private const double WMin          = -1.0;   // max short weight (set 0 for spot-only)
-        private const double WMax          = +1.0;   // max long weight
         private const double RebalanceBand = 0.05;   // minimum |delta weight| to reorder
         private const double LambdaEwma    = 0.94;   // RiskMetrics EWMA decay
         private const double VolFloor      = 0.02;   // 2% ann. vol floor (avoids ÷0 blow-up)
+
+        // Weight bounds, derived from the deployment's leverage in OnStart. Spot (1x) is
+        // long-only [0, 1]; margin (Nx) is symmetric long/short [-N, +N].
+        private double _wMin;
+        private double _wMax = 1.0;
 
         // ── Training ────────────────────────────────────────────────────────────
         private const int TrainMinBars    = 300;   // need at least this many bars to train
@@ -70,6 +73,12 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         public override Task OnStart(CancellationToken ct)
         {
             _mode = Ctx.Host.Mode;
+
+            // Size into the available margin: spot (1x) stays long-only [0,1]; with leverage the
+            // signal can go symmetric long/short up to ±leverage.
+            double lev = (double)Ctx.Host.Leverage;
+            _wMax = lev;
+            _wMin = lev > 1.0 ? -lev : 0.0;
 
             _periodsPerYear = Ctx.Host.Interval switch
             {
@@ -160,7 +169,7 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 
             // 3. Volatility scaling + clip
             double sigmaHat = CurrentAnnualisedVol();
-            double wTarget = Math.Clamp((SigmaStarAnn / sigmaHat) * sig, WMin, WMax);
+            double wTarget = Math.Clamp((SigmaStarAnn / sigmaHat) * sig, _wMin, _wMax);
 
             // 4. Rebalance band (turnover control)
             decimal totalEquity = QuoteBalance + BaseBalance * candle.Close;
