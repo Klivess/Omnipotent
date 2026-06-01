@@ -11,6 +11,13 @@ namespace Omnipotent.Services.OmniTrader.Strategy
             Ctx = context;
         }
 
+        /// <summary>
+        /// What this strategy trades. Single-symbol strategies return one fixed pair (typically from a
+        /// [Param] symbol property); cross-sectional strategies return a <see cref="UniverseSpec"/>.
+        /// Called after parameters are applied, before the session/backtest subscribes to market data.
+        /// </summary>
+        public virtual StrategySymbols DeclareSymbols() => StrategySymbols.Of("BTCUSDT");
+
         public virtual Task OnStart(CancellationToken ct) => Task.CompletedTask;
         public virtual Task OnCandleClose(OHLCCandle candle, CancellationToken ct) => Task.CompletedTask;
         public virtual Task OnOrderFilled(FillEvent fill, CancellationToken ct) => Task.CompletedTask;

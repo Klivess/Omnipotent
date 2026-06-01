@@ -1,3 +1,4 @@
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 using System.Reflection;
 
 namespace Omnipotent.Services.OmniTrader.Strategy
@@ -10,6 +11,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy
         public required Type Type { get; init; }
         /// <summary>Cross-sectional/multi-asset strategy — runs only on the portfolio backtest path.</summary>
         public bool RequiresUniverse { get; init; }
+        /// <summary>User-configurable parameters reflected from [Param] properties, for the dynamic UI.</summary>
+        public IReadOnlyList<ParamDescriptor> Parameters { get; init; } = Array.Empty<ParamDescriptor>();
     }
 
     public sealed class StrategyRegistry
@@ -37,7 +40,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy
                     Description = description,
                     ClassName = type.Name,
                     Type = type,
-                    RequiresUniverse = attr?.RequiresUniverse ?? false
+                    RequiresUniverse = attr?.RequiresUniverse ?? false,
+                    Parameters = StrategyParams.For(type)
                 };
                 byClassName[type.Name] = descriptor;
                 byName[name] = descriptor;

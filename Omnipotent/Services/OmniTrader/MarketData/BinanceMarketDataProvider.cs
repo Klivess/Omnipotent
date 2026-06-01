@@ -59,6 +59,17 @@ namespace Omnipotent.Services.OmniTrader.MarketData
                 .ToList();
         }
 
+        /// <summary>Latest traded price for a symbol (REST ticker) — drives the live forming candle.</summary>
+        public async Task<decimal> GetLatestPriceAsync(string symbol, CancellationToken ct = default)
+        {
+            string sym = symbol.ToUpperInvariant().Replace("/", "");
+            string url = $"https://api.binance.com/api/v3/ticker/price?symbol={sym}";
+            var resp = await httpClient.GetAsync(url, ct);
+            if (!resp.IsSuccessStatusCode) return 0m;
+            var obj = JObject.Parse(await resp.Content.ReadAsStringAsync(ct));
+            return decimal.TryParse((string?)obj["price"], NumberStyles.Any, CultureInfo.InvariantCulture, out var p) ? p : 0m;
+        }
+
         public async IAsyncEnumerable<OHLCCandle> StreamCandlesAsync(string symbol, TimeInterval interval, [EnumeratorCancellation] CancellationToken ct = default)
         {
             string sym = symbol.ToLowerInvariant().Replace("/", "");

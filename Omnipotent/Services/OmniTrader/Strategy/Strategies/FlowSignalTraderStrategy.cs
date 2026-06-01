@@ -1,4 +1,5 @@
 using Omnipotent.Services.OmniTrader.Contracts;
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
 
@@ -15,7 +16,11 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         "Trades crypto based on FlowSignal webhook signals. Posts to /api/omnitrader/signals/flowsignal trigger entries with SL/TP from the payload.")]
     public sealed class FlowSignalTraderStrategy : TradingStrategy
     {
-        private const decimal PositionFraction = 0.10m;
+        [Param("Symbol", Group = "Market", IsSymbol = true)] public string TradeSymbol { get; set; } = "BTCUSDT";
+        public override StrategySymbols DeclareSymbols() => StrategySymbols.Of(TradeSymbol);
+
+        [Param("Position Fraction", Group = "Sizing", Min = 0.01, Max = 1, Step = 0.01)]
+        public decimal PositionFraction { get; set; } = 0.10m;
 
         // Active deployments listening for signals, keyed by uppercased symbol.
         private static readonly ConcurrentDictionary<string, List<FlowSignalTraderStrategy>> SubscribersBySymbol

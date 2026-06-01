@@ -31,6 +31,15 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private bool isRunning;
         private DateTime? lastCandleTs;
 
+        // Live tick state (forming candle between closed bars) + a gate so the websocket and the REST
+        // fallback never process a closed candle concurrently.
+        private readonly SemaphoreSlim candleGate = new(1, 1);
+        private decimal lastTickPrice;
+        private OHLCCandle? formingCandle;
+
+        /// <summary>Latest live price + the in-progress (forming) candle, for the deployment chart.</summary>
+        public (decimal price, OHLCCandle? forming, DateTime? ts) GetLiveTick() => (lastTickPrice, formingCandle, lastCandleTs);
+
         public PaperSession(
             string deploymentId,
             DeploymentConfig config,
@@ -144,49 +153,122 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
         private async Task RunLoopAsync(CancellationToken ct)
         {
-            try
+            // Three concurrent feeds keep the strategy advancing and the chart ticking even if any one
+            // source stalls: the websocket (closed candles), a REST poll fallback (in case the socket is
+            // blocked), and a fast price-tick poller (the live, forming candle).
+            var tasks = new[]
             {
-                await foreach (var candle in marketData.StreamCandlesAsync(Config.Symbol, Config.Interval, ct))
-                {
-                    // Skip any candle already covered by the preloaded history (the stream may resend
-                    // the most recent closed bar).
-                    if (lastCandleTs.HasValue && candle.Timestamp <= lastCandleTs.Value) continue;
-
-                    router.UpdateLastCandle(candle);
-                    context.CandleHistory.Add(candle);
-                    if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);
-
-                    try { await router.OnCandleAsync(candle, ct); } catch (Exception ex) { err($"[{DeploymentId}] router.OnCandle failed", ex); }
-
-                    using var stratCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    stratCts.CancelAfter(TimeSpan.FromSeconds(10));
-                    try { await Strategy.OnCandleClose(candle, stratCts.Token); }
-                    catch (OperationCanceledException) { err($"[{DeploymentId}] strategy OnCandleClose timed out", null); }
-                    catch (Exception ex) { err($"[{DeploymentId}] strategy OnCandleClose failed", ex); }
-
-                    lastCandleTs = candle.Timestamp;
-                    decimal equity = simState.QuoteBalance + simState.BaseBalance * candle.Close;
-                    try
-                    {
-                        await equityRepo.InsertAsync(DeploymentId, new EquityPoint
-                        {
-                            Ts = candle.Timestamp,
-                            MarkPrice = candle.Close,
-                            QuoteBalance = simState.QuoteBalance,
-                            BaseBalance = simState.BaseBalance,
-                            Equity = equity
-                        }, ct);
-                        await deploymentRepo.UpdateEquityAsync(DeploymentId, equity, ct);
-                    }
-                    catch { }
-                }
-            }
+                Task.Run(() => WebSocketLoopAsync(ct), ct),
+                Task.Run(() => RestFallbackLoopAsync(ct), ct),
+                Task.Run(() => TickPollLoopAsync(ct), ct),
+            };
+            try { await Task.WhenAll(tasks); }
             catch (OperationCanceledException) { }
             catch (Exception ex)
             {
                 err($"[{DeploymentId}] paper session loop crashed", ex);
                 try { await deploymentRepo.UpdateStatusAsync(DeploymentId, DeploymentStatus.Errored, ex.Message); } catch { }
             }
+        }
+
+        private async Task WebSocketLoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                await foreach (var candle in marketData.StreamCandlesAsync(Config.Symbol, Config.Interval, ct))
+                    await ProcessClosedCandleAsync(candle, ct);
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { err($"[{DeploymentId}] websocket loop error", ex); }
+        }
+
+        /// <summary>Poll the latest closed candle on a cadence so the strategy advances even when the
+        /// websocket delivers nothing (firewalled/blocked) — this is the safety net for "no trades".</summary>
+        private async Task RestFallbackLoopAsync(CancellationToken ct)
+        {
+            int barSeconds = (int)Config.Interval * 60;
+            var poll = TimeSpan.FromSeconds(Math.Clamp(barSeconds / 4.0, 15, 300));
+            while (!ct.IsCancellationRequested)
+            {
+                try { await Task.Delay(poll, ct); } catch { break; }
+                try
+                {
+                    var recent = await marketData.GetHistoricalCandlesAsync(Config.Symbol, Config.Interval, 2, ct);
+                    // The last element may be the still-forming bar; use the last fully-closed one.
+                    if (recent.Count >= 2) await ProcessClosedCandleAsync(recent[^2], ct);
+                }
+                catch (Exception ex) { err($"[{DeploymentId}] REST fallback error", ex); }
+            }
+        }
+
+        /// <summary>Poll a lightweight price every few seconds to drive the live forming candle.</summary>
+        private async Task TickPollLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    decimal px = await marketData.GetLatestPriceAsync(Config.Symbol, ct);
+                    if (px > 0m)
+                    {
+                        lastTickPrice = px;
+                        var now = DateTime.UtcNow;
+                        if (formingCandle is { } f && f.Timestamp == BarStart(now))
+                            formingCandle = new OHLCCandle(f.Timestamp, f.Open, Math.Max(f.High, px), Math.Min(f.Low, px), px, f.Volume);
+                        else
+                            formingCandle = new OHLCCandle(BarStart(now), px, px, px, px, 0m);
+                    }
+                }
+                catch { /* transient */ }
+                try { await Task.Delay(TimeSpan.FromSeconds(3), ct); } catch { break; }
+            }
+        }
+
+        private DateTime BarStart(DateTime t)
+        {
+            long sec = (int)Config.Interval * 60;
+            long unix = ((DateTimeOffset)DateTime.SpecifyKind(t, DateTimeKind.Utc)).ToUnixTimeSeconds();
+            return DateTimeOffset.FromUnixTimeSeconds(unix - unix % sec).UtcDateTime;
+        }
+
+        private async Task ProcessClosedCandleAsync(OHLCCandle candle, CancellationToken ct)
+        {
+            await candleGate.WaitAsync(ct);
+            try
+            {
+                // Dedup: skip candles already processed (preload, websocket, and REST may overlap).
+                if (lastCandleTs.HasValue && candle.Timestamp <= lastCandleTs.Value) return;
+
+                router.UpdateLastCandle(candle);
+                context.CandleHistory.Add(candle);
+                if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);
+
+                try { await router.OnCandleAsync(candle, ct); } catch (Exception ex) { err($"[{DeploymentId}] router.OnCandle failed", ex); }
+
+                using var stratCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                stratCts.CancelAfter(TimeSpan.FromSeconds(10));
+                try { await Strategy.OnCandleClose(candle, stratCts.Token); }
+                catch (OperationCanceledException) { err($"[{DeploymentId}] strategy OnCandleClose timed out", null); }
+                catch (Exception ex) { err($"[{DeploymentId}] strategy OnCandleClose failed", ex); }
+
+                lastCandleTs = candle.Timestamp;
+                lastTickPrice = candle.Close;
+                decimal equity = simState.QuoteBalance + simState.BaseBalance * candle.Close;
+                try
+                {
+                    await equityRepo.InsertAsync(DeploymentId, new EquityPoint
+                    {
+                        Ts = candle.Timestamp,
+                        MarkPrice = candle.Close,
+                        QuoteBalance = simState.QuoteBalance,
+                        BaseBalance = simState.BaseBalance,
+                        Equity = equity
+                    }, ct);
+                    await deploymentRepo.UpdateEquityAsync(DeploymentId, equity, ct);
+                }
+                catch { }
+            }
+            finally { candleGate.Release(); }
         }
 
         private async Task<OrderIntent> SubmitOrderAsync(OrderRequest req, CancellationToken ct)

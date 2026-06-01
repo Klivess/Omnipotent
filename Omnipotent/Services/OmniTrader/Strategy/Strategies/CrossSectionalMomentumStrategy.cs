@@ -1,5 +1,6 @@
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Strategy.Momentum;
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 
 namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 {
@@ -23,8 +24,27 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         /// <summary>Strategy parameters. The backtest queue injects this from the job config before running.</summary>
         public MomentumConfig Config { get; set; } = new();
 
-        /// <summary>Engine key of the regime asset (e.g. the coin id for BTC). Injected by the queue.</summary>
-        public string? RegimeSymbol { get; set; }
+        /// <summary>Engine key of the regime asset (e.g. BTCUSDT). A live/paper deploy uses this param;
+        /// the backtest runner overrides it from the request's universe settings.</summary>
+        [Param("Regime Symbol", Group = "Universe", IsSymbol = true)]
+        public string RegimeSymbol { get; set; } = "BTCUSDT";
+
+        // ── Configurable parameters (views over Config), so the dynamic UI can tune a momentum deploy. ──
+        [Param("Universe Cap", Group = "Universe", Min = 10, Max = 400)] public int UniverseCap { get => Config.UniverseCap; set => Config.UniverseCap = value; }
+        [Param("Min Universe", Group = "Universe", Min = 2, Max = 100)] public int MinUniverseSize { get => Config.MinUniverseSize; set => Config.MinUniverseSize = value; }
+        [Param("Top Fraction", Group = "Selection", Min = 0.05, Max = 0.5, Step = 0.05)] public double TopFraction { get => Config.TopFraction; set => Config.TopFraction = value; }
+        [Param("Bottom Fraction", Group = "Selection", Min = 0, Max = 0.5, Step = 0.05, Help = "0 = long-only; >0 needs leverage > 1")] public double BottomFraction { get => Config.BottomFraction; set => Config.BottomFraction = value; }
+        [Param("Lookback Days", Group = "Signal", Min = 5, Max = 90)] public int LookbackDays { get => Config.LookbackDays; set => Config.LookbackDays = value; }
+        [Param("Skip Days", Group = "Signal", Min = 0, Max = 5)] public int SkipDays { get => Config.SkipDays; set => Config.SkipDays = value; }
+        [Param("Rebalance Days", Group = "Signal", Min = 1, Max = 30)] public int RebalanceDays { get => Config.RebalanceDays; set => Config.RebalanceDays = value; }
+        [Param("Vol Lookback Days", Group = "Signal", Min = 5, Max = 90)] public int VolLookbackDays { get => Config.VolLookbackDays; set => Config.VolLookbackDays = value; }
+        [Param("Target Portfolio Vol", Group = "Sizing", Min = 0.05, Max = 1.5, Step = 0.05)] public double TargetPortfolioVol { get => Config.TargetPortfolioVol; set => Config.TargetPortfolioVol = value; }
+        [Param("Max Weight / Asset", Group = "Sizing", Min = 0.02, Max = 1, Step = 0.02)] public double MaxWeightPerAsset { get => Config.MaxWeightPerAsset; set => Config.MaxWeightPerAsset = value; }
+        [Param("Max Gross Leverage", Group = "Sizing", Min = 1, Max = 3, Step = 0.5)] public double MaxGrossLeverage { get => Config.MaxGrossLeverage; set => Config.MaxGrossLeverage = value; }
+        [Param("Regime MA Days", Group = "Regime", Min = 10, Max = 250)] public int RegimeMaDays { get => Config.RegimeMaDays; set => Config.RegimeMaDays = value; }
+        [Param("Drawdown Killswitch", Group = "Risk", Min = 0.05, Max = 1, Step = 0.05)] public double DdKillswitch { get => Config.DdKillswitch; set => Config.DdKillswitch = value; }
+        [Param("Stop Loss %", Group = "Risk", Min = 0, Max = 0.9, Step = 0.05, Help = "0 = exit only at re-rank")] public double StopLossPct { get => Config.StopLossPct; set => Config.StopLossPct = value; }
+        [Param("Take Profit %", Group = "Risk", Min = 0, Max = 2, Step = 0.05)] public double TakeProfitPct { get => Config.TakeProfitPct; set => Config.TakeProfitPct = value; }
 
         /// <summary>Optional symbol → base-ticker map (for denylist matching) and shortable set. Injected by the queue.</summary>
         public IReadOnlyDictionary<string, string>? Tickers { get; set; }
@@ -32,6 +52,12 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 
         private readonly KillswitchState _killswitch = new();
         private DateTime? _lastRebalance;
+
+        public override StrategySymbols DeclareSymbols() => StrategySymbols.FromUniverse(new UniverseSpec
+        {
+            TopN = Config.UniverseCap,
+            RegimeSymbol = RegimeSymbol ?? "BTCUSDT",
+        });
 
         public override Task OnStart(CancellationToken ct)
         {
@@ -131,6 +157,17 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
             var orders = Rebalance.BuildOrders(weights, Positions, marks, barVol, Equity, cfg);
             foreach (var o in orders)
             {
+                // Attach a protective bracket to entries/increases (not to exits), so a name is held with
+                // a stop/target between rebalances instead of only being exited at the weekly re-rank.
+                decimal targetWeight = weights.TryGetValue(o.Symbol, out var w) ? w : 0m;
+                bool entering = (o.Side == OrderSide.Buy && targetWeight > 0m) || (o.Side == OrderSide.Sell && targetWeight < 0m);
+                decimal? sl = null, tp = null;
+                if (entering && (cfg.StopLossPct > 0 || cfg.TakeProfitPct > 0) && marks.TryGetValue(o.Symbol, out var px) && px > 0m)
+                {
+                    bool isLong = targetWeight > 0m;
+                    if (cfg.StopLossPct > 0) sl = isLong ? px * (1m - (decimal)cfg.StopLossPct) : px * (1m + (decimal)cfg.StopLossPct);
+                    if (cfg.TakeProfitPct > 0) tp = isLong ? px * (1m + (decimal)cfg.TakeProfitPct) : px * (1m - (decimal)cfg.TakeProfitPct);
+                }
                 await SubmitOrder(new OrderRequest
                 {
                     IntentId = Guid.NewGuid().ToString("N"),
@@ -139,6 +176,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
                     Symbol = o.Symbol,
                     Qty = o.Qty,
                     Leverage = Leverage,
+                    StopLossPrice = sl,
+                    TakeProfitPrice = tp,
                 }, ct);
             }
         }

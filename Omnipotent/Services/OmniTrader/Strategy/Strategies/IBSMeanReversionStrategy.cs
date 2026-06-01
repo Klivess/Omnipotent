@@ -1,4 +1,5 @@
 using Omnipotent.Services.OmniTrader.Contracts;
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 
 namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 {
@@ -8,16 +9,21 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         "Long only when close > EMA(200). Entry: smoothed IBS(2) < 0.1. Stop: entry - 1.5*ATR(14). Exit: close > prev high OR close > EMA(20).")]
     public sealed class IBSMeanReversionStrategy : TradingStrategy
     {
-        private const int HighLookback = 10;
-        private const int AvgRangeLookback = 25;
-        private const decimal RangeMultiplier = 2.5m;
-        private const int IBSSmoothing = 2;
-        private const decimal IBSThreshold = 0.1m;
-        private const int TrendEmaPeriod = 200;
-        private const int ExitEmaPeriod = 20;
-        private const int AtrPeriod = 14;
-        private const decimal AtrStopMultiplier = 1.5m;
-        private const decimal PositionFraction = 0.10m;
+        [Param("Symbol", Group = "Market", IsSymbol = true)] public string TradeSymbol { get; set; } = "BTCUSDT";
+        public override StrategySymbols DeclareSymbols() => StrategySymbols.Of(TradeSymbol);
+
+        [Param("High Lookback", Group = "Entry", Min = 2, Max = 50)] public int HighLookback { get; set; } = 10;
+        [Param("Avg Range Lookback", Group = "Entry", Min = 5, Max = 100)] public int AvgRangeLookback { get; set; } = 25;
+        [Param("Range Multiplier", Group = "Entry", Min = 0.5, Max = 5, Step = 0.1)] public decimal RangeMultiplier { get; set; } = 2.5m;
+        [Param("IBS Smoothing", Group = "Entry", Min = 1, Max = 10)] public int IBSSmoothing { get; set; } = 2;
+        [Param("IBS Threshold", Group = "Entry", Min = 0.01, Max = 0.5, Step = 0.01)] public decimal IBSThreshold { get; set; } = 0.1m;
+        [Param("Trend EMA Period", Group = "Trend", Min = 20, Max = 400)] public int TrendEmaPeriod { get; set; } = 200;
+        [Param("Exit EMA Period", Group = "Exit", Min = 5, Max = 100)] public int ExitEmaPeriod { get; set; } = 20;
+        [Param("ATR Period", Group = "Risk", Min = 2, Max = 50)] public int AtrPeriod { get; set; } = 14;
+        [Param("ATR Stop Multiplier", Group = "Risk", Min = 0.5, Max = 5, Step = 0.1)] public decimal AtrStopMultiplier { get; set; } = 1.5m;
+        [Param("Take Profit ATR Mult", Group = "Risk", Min = 0, Max = 10, Step = 0.5, Help = "0 = use mean-revert exit only")] public decimal TakeProfitAtrMultiplier { get; set; } = 0m;
+        [Param("Position Fraction", Group = "Sizing", Min = 0.01, Max = 1, Step = 0.01)] public decimal PositionFraction { get; set; } = 0.10m;
+        [Param("Min Hold Bars", Group = "Risk", Min = 0, Max = 50, Help = "Don't exit before this many bars after entry")] public int MinHoldBars { get; set; } = 1;
 
         // Vertical (time) barrier — the measured reversion horizon (see EstimateMaxHoldBars).
         private const int MaxHoldFallback = 8;   // used until the horizon is measured
@@ -64,8 +70,11 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
             if (inPosition)
             {
                 // ── Triple-barrier exit ────────────────────────────────────────────
-                // Lower barrier: ATR stop-loss
-                if (candle.Close <= _stopPrice) return Exit("ATR stop");
+                // Lower barrier (ATR stop) is now a protective bracket order attached at entry — it fills
+                // intrabar via the engine, so no manual close-price check here.
+
+                // Min-hold guard: don't flip straight back out the bar(s) right after entering.
+                if (_entryBarIndex >= 0 && last - _entryBarIndex < MinHoldBars) return Task.CompletedTask;
 
                 // Upper barrier: price reverted up to the mean (20-EMA)
                 decimal exitEma = Indicators.EMA(histList, ExitEmaPeriod, last);
@@ -105,13 +114,19 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
             _stopPrice = candle.Close - AtrStopMultiplier * atr;
             _entryBarIndex = last;
 
+            // Enter WITH a protective bracket: the ATR stop becomes a real stop-loss order and (optionally)
+            // a take-profit, so the position is protected intrabar instead of waiting for the next close.
+            decimal? takeProfit = TakeProfitAtrMultiplier > 0m ? candle.Close + TakeProfitAtrMultiplier * atr : (decimal?)null;
+
             return SubmitOrder(new OrderRequest
             {
                 IntentId = Guid.NewGuid().ToString("N"),
                 Side = OrderSide.Buy,
                 Type = OrderType.Market,
                 Symbol = Symbol,
-                Qty = qty
+                Qty = qty,
+                StopLossPrice = _stopPrice,
+                TakeProfitPrice = takeProfit
             }, ct);
         }
 
@@ -119,7 +134,7 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         // after each oversold dip below the 20-EMA in an uptrend, count the bars until
         // price closes back above its 20-EMA. The median of those is the time barrier.
         // Model-free — deliberately avoids imposing an OU half-life on a trending series.
-        private static int EstimateMaxHoldBars(IList<OHLCCandle> h)
+        private int EstimateMaxHoldBars(IList<OHLCCandle> h)
         {
             int last = h.Count - 1;
             var durations = new List<int>();
