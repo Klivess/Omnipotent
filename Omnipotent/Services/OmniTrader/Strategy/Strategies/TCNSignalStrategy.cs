@@ -1,5 +1,6 @@
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniTrader.Contracts;
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 
 namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
 {
@@ -39,12 +40,20 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         private const int FeatureCount  = 12;
         private const int FeatureWarmup = 34;   // deepest feature lookback (MACD signal)
 
+        [Param("Symbol", Group = "Market", IsSymbol = true)] public string TradeSymbol { get; set; } = "BTCUSDT";
+        public override StrategySymbols DeclareSymbols() => StrategySymbols.Of(TradeSymbol);
+
         // ── [DEFAULT] tuneable — calibrate on validation, never on test ─────────
-        private const double Tau           = 0.30;   // deadband threshold
-        private const double SigmaStarAnn  = 0.12;   // 12% target annualised vol
-        private const double RebalanceBand = 0.05;   // minimum |delta weight| to reorder
-        private const double LambdaEwma    = 0.94;   // RiskMetrics EWMA decay
-        private const double VolFloor      = 0.02;   // 2% ann. vol floor (avoids ÷0 blow-up)
+        [Param("Deadband (tau)", Group = "Signal", Min = 0, Max = 0.9, Step = 0.05, Help = "Suppress weak signals below this")]
+        public double Tau { get; set; } = 0.30;
+        [Param("Target Vol (ann.)", Group = "Sizing", Min = 0.02, Max = 1, Step = 0.01)]
+        public double SigmaStarAnn { get; set; } = 0.12;
+        [Param("Rebalance Band", Group = "Sizing", Min = 0, Max = 0.5, Step = 0.01, Help = "Min |Δweight| to reorder")]
+        public double RebalanceBand { get; set; } = 0.05;
+        [Param("EWMA Decay (lambda)", Group = "Sizing", Min = 0.5, Max = 0.999, Step = 0.001)]
+        public double LambdaEwma { get; set; } = 0.94;
+        [Param("Vol Floor (ann.)", Group = "Sizing", Min = 0.001, Max = 0.2, Step = 0.001)]
+        public double VolFloor { get; set; } = 0.02;
 
         // Weight bounds, derived from the deployment's leverage in OnStart. Spot (1x) is
         // long-only [0, 1]; margin (Nx) is symmetric long/short [-N, +N].

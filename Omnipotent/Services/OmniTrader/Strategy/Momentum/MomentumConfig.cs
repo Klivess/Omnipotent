@@ -49,6 +49,10 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Momentum
         public double ParticipationCap { get; set; } = 0.05;    // ≤5% of the bar's quote volume per order
         public decimal AnnualFundingRate { get; set; } = 0.10m; // perp funding on short notional (modeled via borrow rate)
 
+        // ── Protective brackets (overlay on top of the weekly re-rank; 0 = off) ──
+        public double StopLossPct { get; set; } = 0.0;          // e.g. 0.15 = exit a name if it drops 15%
+        public double TakeProfitPct { get; set; } = 0.0;        // e.g. 0.30 = bank a name up 30%
+
         /// <summary>Minimum history a name needs to produce a signal: lookback + vol window + skip.</summary>
         public int MinHistoryDays => LookbackDays + VolLookbackDays + SkipDays + 1;
 
@@ -79,6 +83,8 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Momentum
             PegVolThreshold = s.PegVolThreshold,
             ParticipationCap = s.ParticipationCap,
             AnnualFundingRate = s.AnnualFundingRate,
+            StopLossPct = s.StopLossPct,
+            TakeProfitPct = s.TakeProfitPct,
         };
     }
 

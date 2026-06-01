@@ -35,7 +35,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             await parent.CreateAPIRoute("/api/omnitrader/strategies", async req =>
             {
                 var items = parent.StrategyRegistry.All
-                    .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse })
+                    .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse, d.Parameters })
                     .OrderBy(x => x.Name)
                     .ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(items));
@@ -52,7 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Interval = d.Config.Interval.ToString(),
                     Mode = d.Mode.ToString(),
                     Status = d.Status.ToString(),
-                    Armed = parent.SessionManager.TryGetLive(d.Id, out var live) && (live?.IsArmed ?? false),
+                    Armed = parent.SessionManager.IsDeploymentArmed(d.Id),
                     d.EquityInitial,
                     d.EquityCurrent,
                     PnLPercent = d.EquityInitial == 0 ? 0 : (d.EquityCurrent - d.EquityInitial) / d.EquityInitial * 100m,
@@ -156,6 +156,30 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Interval = interval.ToString(),
                     Candles = candles.Select(c => new { c.Timestamp, c.Open, c.High, c.Low, c.Close }),
                     Markers = markers
+                }));
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+
+            await parent.CreateAPIRoute("/api/omnitrader/deployment/ticks", async req =>
+            {
+                string? id = req.userParameters.Get("id");
+                if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
+                (decimal price, OHLCCandle? forming, DateTime? ts) tick;
+                if (parent.SessionManager.TryGetPaper(id, out var paper) && paper != null) tick = paper.GetLiveTick();
+                else if (parent.SessionManager.TryGetMulti(id, out var multi) && multi != null) tick = multi.GetLiveTick();
+                else { await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = 0m, Forming = (object?)null })); return; }
+                var (price, forming, ts) = tick;
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    Price = price,
+                    LastClosed = ts,
+                    Forming = forming.HasValue ? new
+                    {
+                        forming.Value.Timestamp,
+                        forming.Value.Open,
+                        forming.Value.High,
+                        forming.Value.Low,
+                        forming.Value.Close
+                    } : null
                 }));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
@@ -290,22 +314,6 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/api/omnitrader/backtest/momentum/create", async req =>
-            {
-                try
-                {
-                    var dto = JsonConvert.DeserializeObject<CreateMomentumBacktestDto>(req.userMessageContent ?? "")
-                        ?? throw new Exception("Invalid body");
-                    string id = await parent.BacktestQueue.EnqueueAsync(dto.ToBacktestConfig());
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { JobId = id }));
-                }
-                catch (Exception ex)
-                {
-                    await parent.ServiceLogError(ex, "momentum backtest enqueue failed");
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.BadRequest);
-                }
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-
             await parent.CreateAPIRoute("/api/omnitrader/backtest/cancel", async req =>
             {
                 string? id = req.userParameters.Get("id");
@@ -365,6 +373,7 @@ namespace Omnipotent.Services.OmniTrader.Api
         public decimal? MaxDailyLossUsd { get; set; }
         public int? MaxOrdersPerHour { get; set; }
         public List<string>? AllowedSymbols { get; set; }
+        public Dictionary<string, object?>? Parameters { get; set; }
 
         public DeploymentConfig ToDeploymentConfig()
         {
@@ -392,7 +401,8 @@ namespace Omnipotent.Services.OmniTrader.Api
                 FeeFraction = FeeFraction,
                 SlippageFraction = SlippageFraction,
                 Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
-                Caps = caps
+                Caps = caps,
+                Parameters = Parameters
             };
         }
     }
@@ -409,50 +419,44 @@ namespace Omnipotent.Services.OmniTrader.Api
         public decimal FeeFraction { get; set; } = 0.001m;
         public decimal SlippageFraction { get; set; } = 0.0005m;
         public decimal Leverage { get; set; } = 1m;
-
-        public BacktestConfig ToBacktestConfig() => new BacktestConfig
-        {
-            StrategyClass = StrategyClass,
-            Coin = Coin,
-            Currency = Currency,
-            Interval = Enum.Parse<TimeInterval>(Interval, ignoreCase: true),
-            CandleCount = CandleCount,
-            InitialQuoteBalance = InitialQuoteBalance,
-            InitialBaseBalance = InitialBaseBalance,
-            FeeFraction = FeeFraction,
-            SlippageFraction = SlippageFraction,
-            Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) }
-        };
-    }
-
-    /// <summary>
-    /// Request body for a cross-sectional momentum backtest. Only the window and a few knobs are
-    /// commonly set; everything else falls back to the spec defaults in <see cref="MomentumBacktestSettings"/>.
-    /// Leverage &gt; 1 is required for a short book (BottomFraction &gt; 0) and to charge funding.
-    /// </summary>
-    public sealed class CreateMomentumBacktestDto
-    {
-        public decimal InitialQuoteBalance { get; set; } = 10_000m;
-        public decimal FeeFraction { get; set; } = 0.0007m;     // ~7 bps taker
-        public decimal SlippageFraction { get; set; } = 0.0010m;
-        public decimal Leverage { get; set; } = 1m;
-        public MomentumBacktestSettings Settings { get; set; } = new();
+        public Dictionary<string, object?>? Parameters { get; set; }
+        /// <summary>When present, this is a cross-sectional momentum (portfolio) backtest. The universe
+        /// window/params live here; Coin/Currency/Interval/CandleCount are derived from them.</summary>
+        public MomentumBacktestSettings? Momentum { get; set; }
 
         public BacktestConfig ToBacktestConfig()
         {
-            int days = Math.Max(1, (int)(Settings.ToUtc - Settings.FromUtc).TotalDays);
+            if (Momentum != null)
+            {
+                int days = Math.Max(1, (int)(Momentum.ToUtc - Momentum.FromUtc).TotalDays);
+                return new BacktestConfig
+                {
+                    StrategyClass = string.IsNullOrWhiteSpace(StrategyClass) ? "CrossSectionalMomentumStrategy" : StrategyClass,
+                    Coin = Momentum.RegimeSymbol,
+                    Currency = "USD",
+                    Interval = TimeInterval.OneDay,
+                    CandleCount = days,
+                    InitialQuoteBalance = InitialQuoteBalance,
+                    FeeFraction = FeeFraction,
+                    SlippageFraction = SlippageFraction,
+                    Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
+                    Momentum = Momentum,
+                    Parameters = Parameters,
+                };
+            }
             return new BacktestConfig
             {
-                StrategyClass = "CrossSectionalMomentumStrategy",
-                Coin = Settings.RegimeSymbol,
-                Currency = "USD",
-                Interval = TimeInterval.OneDay,
-                CandleCount = days,
+                StrategyClass = StrategyClass,
+                Coin = Coin,
+                Currency = Currency,
+                Interval = Enum.Parse<TimeInterval>(Interval, ignoreCase: true),
+                CandleCount = CandleCount,
                 InitialQuoteBalance = InitialQuoteBalance,
+                InitialBaseBalance = InitialBaseBalance,
                 FeeFraction = FeeFraction,
                 SlippageFraction = SlippageFraction,
                 Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
-                Momentum = Settings,
+                Parameters = Parameters,
             };
         }
     }

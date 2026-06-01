@@ -112,12 +112,19 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                     $"{descriptor.Name} is a cross-sectional (multi-asset) strategy and cannot run as a single-symbol backtest. " +
                     "Use the momentum backtest endpoint (/api/omnitrader/backtest/momentum/create) instead.");
             var strategy = registry.CreateInstance(descriptor.ClassName);
+            // Apply params; the symbol the strategy DECLARES drives the data fetch (the coin/currency
+            // fields are only a fallback for older requests that don't carry a TradeSymbol param).
+            var pars = new Dictionary<string, object?>(row.Config.Parameters ?? new(), StringComparer.OrdinalIgnoreCase);
+            if (!pars.ContainsKey("TradeSymbol") && !string.IsNullOrWhiteSpace(row.Config.Coin))
+                pars["TradeSymbol"] = row.Config.Coin + row.Config.Currency;
+            Strategy.Params.StrategyParams.Apply(strategy, pars);
 
-            string symbol = row.Config.Coin + row.Config.Currency;
+            string symbol = strategy.DeclareSymbols().Primary;
             var candles = await marketData.GetHistoricalCandlesAsync(symbol, row.Config.Interval, row.Config.CandleCount, ct);
 
+            var runConfig = WithSymbol(row.Config, symbol);
             var session = new BacktestSession(
-                strategy, candles, row.Config,
+                strategy, candles, runConfig,
                 onProgress: async (pct, done, total) =>
                 {
                     try { await jobRepo.UpdateProgressAsync(row.Id, pct, done, total, ct); } catch { }
@@ -128,6 +135,24 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             var result = await session.RunAsync(ct);
             await jobRepo.CompleteAsync(row.Id, BacktestJobStatus.Succeeded, result, null, DateTime.UtcNow, ct);
         }
+
+        /// <summary>Copy a config with the engine symbol set to the strategy's declared pair (Currency
+        /// folded in), so the session keys candles/host by exactly that symbol.</summary>
+        private static BacktestConfig WithSymbol(BacktestConfig c, string symbol) => new()
+        {
+            StrategyClass = c.StrategyClass,
+            Coin = symbol,
+            Currency = "",
+            Interval = c.Interval,
+            CandleCount = c.CandleCount,
+            InitialQuoteBalance = c.InitialQuoteBalance,
+            InitialBaseBalance = c.InitialBaseBalance,
+            FeeFraction = c.FeeFraction,
+            SlippageFraction = c.SlippageFraction,
+            Margin = c.Margin,
+            Momentum = c.Momentum,
+            Parameters = c.Parameters,
+        };
 
         public async ValueTask DisposeAsync()
         {

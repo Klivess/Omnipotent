@@ -54,6 +54,20 @@ namespace Omnipotent.Services.OmniTrader.Execution
             if (request.StopPrice.HasValue && (request.Type == OrderType.StopLoss))
                 parameters["price"] = request.StopPrice.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
+            // Attached conditional close (bracket). Kraken supports one close order per entry; prefer the
+            // stop-loss for downside protection, else the take-profit. (The second leg, if both are set,
+            // is placed separately by the session as an OCO partner.)
+            if (request.StopLossPrice.HasValue)
+            {
+                parameters["close[ordertype]"] = "stop-loss";
+                parameters["close[price]"] = request.StopLossPrice.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if (request.TakeProfitPrice.HasValue)
+            {
+                parameters["close[ordertype]"] = "take-profit";
+                parameters["close[price]"] = request.TakeProfitPrice.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+
             var intent = new OrderIntent
             {
                 Id = Guid.NewGuid().ToString("N"),

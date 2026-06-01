@@ -42,6 +42,12 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// <summary>Margin leverage for this order (1 = spot). Live sessions inject the
         /// deployment's leverage; the simulated router uses its State.Leverage instead.</summary>
         public decimal Leverage { get; init; } = 1m;
+
+        /// <summary>Optional protective bracket attached to an entry. When set, the engine registers a
+        /// take-profit and/or stop-loss for the resulting position (OCO — one fills, the other cancels).
+        /// Backtest/paper manage these as conditional orders; live sends Kraken conditional-close orders.</summary>
+        public decimal? TakeProfitPrice { get; init; }
+        public decimal? StopLossPrice { get; init; }
     }
 
     public sealed class OrderIntent
@@ -54,6 +60,9 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public required DateTime PlacedUtc { get; init; }
         public string? ExchangeOrderId { get; set; }
         public string? Error { get; set; }
+        /// <summary>OCO group (e.g. "bracket:BTCUSDT"); when one order in the group fills or the position
+        /// goes flat, the others are cancelled.</summary>
+        public string? OcoGroup { get; set; }
     }
 
     public sealed class FillEvent
@@ -141,6 +150,8 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public decimal SlippageFraction { get; init; } = 0.0005m;
         public MarginSettings Margin { get; init; } = new();
         public RiskCaps? Caps { get; init; }
+        /// <summary>User-chosen values for the strategy's [Param] properties (applied at session start).</summary>
+        public Dictionary<string, object?>? Parameters { get; init; }
     }
 
     public sealed class BacktestConfig
@@ -159,6 +170,9 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// <summary>When set, the job runs the multi-asset (cross-sectional momentum) portfolio path
         /// instead of the single-symbol path. Null for ordinary single-symbol backtests.</summary>
         public MomentumBacktestSettings? Momentum { get; init; }
+
+        /// <summary>User-chosen values for the strategy's [Param] properties (applied at run start).</summary>
+        public Dictionary<string, object?>? Parameters { get; init; }
     }
 
     /// <summary>
@@ -201,6 +215,8 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public double PegVolThreshold { get; init; } = 0.01;
         public double ParticipationCap { get; init; } = 0.05;
         public decimal AnnualFundingRate { get; init; } = 0.10m;
+        public double StopLossPct { get; init; } = 0.0;
+        public double TakeProfitPct { get; init; } = 0.0;
 
         // ── Validation (Section 11) ─────────────────────────────────────────────
         public bool RunValidation { get; init; } = true;

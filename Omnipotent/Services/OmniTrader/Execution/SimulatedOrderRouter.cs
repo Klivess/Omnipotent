@@ -173,6 +173,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
             foreach (var intent in toCheck)
             {
                 if (intent.Status != OrderStatus.Open && intent.Status != OrderStatus.PartiallyFilled) continue;
+                if (!state.OpenOrders.Contains(intent)) continue; // OCO sibling already cancelled this bar
                 var req = intent.Request;
                 bool triggered = req.Type switch
                 {
@@ -269,6 +270,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
 
             state.Fees += fee;
             UpdatePosition(req.Side, req.Qty, price, ts, req.Symbol);
+            SyncBrackets(req.Symbol, req);
 
             intent.Status = OrderStatus.Filled;
             var fill = new FillEvent
@@ -355,6 +357,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
 
             state.Fees += fee;
             UpdatePortfolioPosition(sym, req.Side, req.Qty, price, ts);
+            SyncBrackets(sym, req);
 
             intent.Status = OrderStatus.Filled;
             var fill = new FillEvent
@@ -369,6 +372,62 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 Symbol = req.Symbol
             };
             await onFillAsync(fill);
+        }
+
+        // ══ Bracket / OCO orders ═════════════════════════════════════════════════
+
+        /// <summary>
+        /// Maintain the protective bracket for a symbol after a fill. If the position is now flat, cancel
+        /// any open bracket (this is also how OCO works — one leg filling flattens the book and removes the
+        /// sibling). If the fill was a bracket entry (carried TP/SL), (re)register protective conditional
+        /// orders sized to the full position.
+        /// </summary>
+        private void SyncBrackets(string symbol, OrderRequest entryReq)
+        {
+            Position? pos = state.PortfolioMode
+                ? (state.Positions.TryGetValue(symbol, out var p) ? p : null)
+                : (state.Position != null && string.Equals(state.Position.Symbol, symbol, StringComparison.OrdinalIgnoreCase) ? state.Position : null);
+            string group = "bracket:" + symbol;
+
+            if (pos == null || pos.Qty == 0m)
+            {
+                state.OpenOrders.RemoveAll(o => o.OcoGroup == group);
+                return;
+            }
+            if (entryReq.StopLossPrice.HasValue || entryReq.TakeProfitPrice.HasValue)
+            {
+                state.OpenOrders.RemoveAll(o => o.OcoGroup == group);
+                decimal qty = Math.Abs(pos.Qty);
+                var closeSide = pos.Qty > 0m ? OrderSide.Sell : OrderSide.Buy;
+                if (entryReq.StopLossPrice.HasValue)
+                    AddProtective(symbol, group, OrderType.StopLoss, closeSide, qty, stop: entryReq.StopLossPrice.Value);
+                if (entryReq.TakeProfitPrice.HasValue)
+                    AddProtective(symbol, group, OrderType.TakeProfit, closeSide, qty, limit: entryReq.TakeProfitPrice.Value);
+            }
+        }
+
+        private void AddProtective(string symbol, string group, OrderType type, OrderSide side, decimal qty, decimal? stop = null, decimal? limit = null)
+        {
+            var req = new OrderRequest
+            {
+                IntentId = "oco-" + Guid.NewGuid().ToString("N"),
+                Side = side,
+                Type = type,
+                Symbol = symbol,
+                Qty = qty,
+                StopPrice = stop,
+                LimitPrice = limit,
+            };
+            state.OpenOrders.Add(new OrderIntent
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                IntentId = req.IntentId,
+                DeploymentId = "sim",
+                Request = req,
+                Status = OrderStatus.Open,
+                PlacedUtc = DateTime.UtcNow,
+                OcoGroup = group,
+            });
         }
 
         /// <summary>Per-symbol mirror of <see cref="UpdatePosition"/> for portfolio mode.</summary>
@@ -418,6 +477,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
             foreach (var intent in toCheck)
             {
                 if (intent.Status != OrderStatus.Open && intent.Status != OrderStatus.PartiallyFilled) continue;
+                if (!state.OpenOrders.Contains(intent)) continue; // OCO sibling already cancelled this bar
                 var req = intent.Request;
                 if (!bar.TryGetValue(req.Symbol, out var candle)) continue;
                 bool triggered = req.Type switch

@@ -91,6 +91,11 @@ namespace Omnipotent.Services.OmniTrader.MarketData
             log($"Binance: done. {kept}/{candidates.Count} symbols stored.");
         }
 
+        /// <summary>Resolve the current top-N tradable symbols by 24h quote volume (for live/paper universe
+        /// subscription). Includes the delisted include-list where still served.</summary>
+        public Task<List<string>> ResolveUniverseAsync(int topN, CancellationToken ct = default)
+            => FetchCandidatesAsync(topN, _ => { }, ct);
+
         private async Task<List<string>> FetchCandidatesAsync(int topN, Action<string> log, CancellationToken ct)
         {
             var ranked = new List<(string symbol, double quoteVol)>();

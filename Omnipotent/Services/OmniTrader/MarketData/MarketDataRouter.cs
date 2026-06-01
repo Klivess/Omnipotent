@@ -40,6 +40,19 @@ namespace Omnipotent.Services.OmniTrader.MarketData
             return candles;
         }
 
+        /// <summary>Latest live price for a symbol (Binance ticker), falling back to the last cached close.</summary>
+        public async Task<decimal> GetLatestPriceAsync(string symbol, CancellationToken ct = default)
+        {
+            try
+            {
+                decimal p = await binance.GetLatestPriceAsync(symbol, ct);
+                if (p > 0m) return p;
+            }
+            catch { }
+            var cached = await cache.GetLastAsync(symbol, TimeInterval.OneMinute, 1, ct);
+            return cached.Count > 0 ? cached[^1].Close : 0m;
+        }
+
         public IAsyncEnumerable<OHLCCandle> StreamCandlesAsync(string symbol, TimeInterval interval, CancellationToken ct = default)
         {
             // Multiplex per (symbol, interval).
