@@ -31,14 +31,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private bool isRunning;
         private DateTime? lastCandleTs;
 
-        // Live tick state (forming candle between closed bars) + a gate so the websocket and the REST
-        // fallback never process a closed candle concurrently.
+        // Gate so the websocket and the REST fallback never process a closed candle concurrently.
         private readonly SemaphoreSlim candleGate = new(1, 1);
-        private decimal lastTickPrice;
-        private OHLCCandle? formingCandle;
-
-        /// <summary>Latest live price + the in-progress (forming) candle, for the deployment chart.</summary>
-        public (decimal price, OHLCCandle? forming, DateTime? ts) GetLiveTick() => (lastTickPrice, formingCandle, lastCandleTs);
 
         public PaperSession(
             string deploymentId,
@@ -153,14 +147,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
         private async Task RunLoopAsync(CancellationToken ct)
         {
-            // Three concurrent feeds keep the strategy advancing and the chart ticking even if any one
-            // source stalls: the websocket (closed candles), a REST poll fallback (in case the socket is
-            // blocked), and a fast price-tick poller (the live, forming candle).
+            // Two concurrent feeds keep the strategy advancing even if one source stalls: the websocket
+            // (closed candles) and a REST poll fallback (in case the socket is blocked). The live
+            // forming candle for the chart is served generically from market data by the ticks endpoint.
             var tasks = new[]
             {
                 Task.Run(() => WebSocketLoopAsync(ct), ct),
                 Task.Run(() => RestFallbackLoopAsync(ct), ct),
-                Task.Run(() => TickPollLoopAsync(ct), ct),
             };
             try { await Task.WhenAll(tasks); }
             catch (OperationCanceledException) { }
@@ -201,36 +194,6 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             }
         }
 
-        /// <summary>Poll a lightweight price every few seconds to drive the live forming candle.</summary>
-        private async Task TickPollLoopAsync(CancellationToken ct)
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                try
-                {
-                    decimal px = await marketData.GetLatestPriceAsync(Config.Symbol, ct);
-                    if (px > 0m)
-                    {
-                        lastTickPrice = px;
-                        var now = DateTime.UtcNow;
-                        if (formingCandle is { } f && f.Timestamp == BarStart(now))
-                            formingCandle = new OHLCCandle(f.Timestamp, f.Open, Math.Max(f.High, px), Math.Min(f.Low, px), px, f.Volume);
-                        else
-                            formingCandle = new OHLCCandle(BarStart(now), px, px, px, px, 0m);
-                    }
-                }
-                catch { /* transient */ }
-                try { await Task.Delay(TimeSpan.FromSeconds(3), ct); } catch { break; }
-            }
-        }
-
-        private DateTime BarStart(DateTime t)
-        {
-            long sec = (int)Config.Interval * 60;
-            long unix = ((DateTimeOffset)DateTime.SpecifyKind(t, DateTimeKind.Utc)).ToUnixTimeSeconds();
-            return DateTimeOffset.FromUnixTimeSeconds(unix - unix % sec).UtcDateTime;
-        }
-
         private async Task ProcessClosedCandleAsync(OHLCCandle candle, CancellationToken ct)
         {
             await candleGate.WaitAsync(ct);
@@ -252,7 +215,6 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 catch (Exception ex) { err($"[{DeploymentId}] strategy OnCandleClose failed", ex); }
 
                 lastCandleTs = candle.Timestamp;
-                lastTickPrice = candle.Close;
                 decimal equity = simState.QuoteBalance + simState.BaseBalance * candle.Close;
                 try
                 {

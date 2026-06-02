@@ -130,10 +130,6 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
         private decimal Mark(string symbol) => marks.TryGetValue(symbol, out var m) ? m : 0m;
 
-        /// <summary>Live regime-asset price for the deployment chart (no forming candle for multi-asset).</summary>
-        public (decimal price, OHLCCandle? forming, DateTime? ts) GetLiveTick()
-            => (Mark(spec.RegimeSymbol), null, lastBarTs == default ? null : lastBarTs);
-
         public async Task StartAsync(CancellationToken externalToken = default)
         {
             if (isRunning) return;

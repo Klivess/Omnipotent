@@ -188,24 +188,39 @@ namespace Omnipotent.Services.OmniTrader.Api
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
-                (decimal price, OHLCCandle? forming, DateTime? ts) tick;
-                if (parent.SessionManager.TryGetPaper(id, out var paper) && paper != null) tick = paper.GetLiveTick();
-                else if (parent.SessionManager.TryGetMulti(id, out var multi) && multi != null) tick = multi.GetLiveTick();
-                else { await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = 0m, Forming = (object?)null })); return; }
-                var (price, forming, ts) = tick;
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                var row = await parent.DeploymentRepo.GetAsync(id);
+                if (row == null) { await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = 0m, Forming = (object?)null })); return; }
+
+                // The forming candle is pure market data — the live price of the deployment's chart
+                // symbol, bucketed at its interval. This works identically for paper, live and
+                // multi-asset sessions; no per-strategy session plumbing is involved.
+                string symbol = row.Config.Symbol;
+                var interval = row.Config.Interval;
+
+                decimal price = 0m;
+                try { price = await parent.MarketData.GetLatestPriceAsync(symbol); } catch { }
+
+                object? forming = null;
+                if (price > 0m)
                 {
-                    Price = price,
-                    LastClosed = ts,
-                    Forming = forming.HasValue ? new
+                    var bucket = BucketStart(DateTime.UtcNow, interval);
+                    decimal open = price, high = price, low = price;
+                    try
                     {
-                        forming.Value.Timestamp,
-                        forming.Value.Open,
-                        forming.Value.High,
-                        forming.Value.Low,
-                        forming.Value.Close
-                    } : null
-                }));
+                        // Merge with the current bucket's cached candle so the bar keeps its open/high/low.
+                        var recent = await parent.MarketData.GetHistoricalCandlesAsync(symbol, interval, 1);
+                        if (recent.Count > 0 && recent[^1].Timestamp == bucket)
+                        {
+                            open = recent[^1].Open;
+                            high = Math.Max(recent[^1].High, price);
+                            low = Math.Min(recent[^1].Low, price);
+                        }
+                    }
+                    catch { }
+                    forming = new { Timestamp = bucket, Open = open, High = high, Low = low, Close = price };
+                }
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = price, Forming = forming }));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/create", async req =>
@@ -409,6 +424,14 @@ namespace Omnipotent.Services.OmniTrader.Api
                 result = sampled;
             }
             return result;
+        }
+
+        // Floor a UTC time to the start of its interval bucket (matches Binance bar-open times).
+        private static DateTime BucketStart(DateTime utc, TimeInterval interval)
+        {
+            long sec = (int)interval * 60;
+            long unix = ((DateTimeOffset)DateTime.SpecifyKind(utc, DateTimeKind.Utc)).ToUnixTimeSeconds();
+            return DateTimeOffset.FromUnixTimeSeconds(unix - unix % sec).UtcDateTime;
         }
 
         private static DateTime? ParseUtc(string? raw)

@@ -89,29 +89,16 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         {
             await jobRepo.StartAsync(row.Id, DateTime.UtcNow, ct);
 
-            // Cross-sectional momentum (portfolio) jobs run the multi-asset path end-to-end.
-            if (row.Config.Momentum != null)
+            Func<double, int, int, Task> onProgress = async (pct, done, total) =>
             {
-                var runner = new MomentumBacktestRunner(universeRepo, log);
-                var momentumResult = await runner.RunAsync(
-                    row.Config,
-                    onProgress: async (pct, done, total) =>
-                    {
-                        try { await jobRepo.UpdateProgressAsync(row.Id, pct, done, total, ct); } catch { }
-                    },
-                    cancellationCheck: () => jobRepo.IsCancellationRequestedAsync(row.Id, ct),
-                    ct: ct);
-                await jobRepo.CompleteAsync(row.Id, BacktestJobStatus.Succeeded, momentumResult, null, DateTime.UtcNow, ct);
-                return;
-            }
+                try { await jobRepo.UpdateProgressAsync(row.Id, pct, done, total, ct); } catch { }
+            };
+            Func<Task<bool>> cancellationCheck = () => jobRepo.IsCancellationRequestedAsync(row.Id, ct);
 
             var descriptor = registry.Resolve(row.StrategyClass)
                 ?? throw new InvalidOperationException($"Unknown strategy {row.StrategyClass}");
-            if (descriptor.RequiresUniverse)
-                throw new InvalidOperationException(
-                    $"{descriptor.Name} is a cross-sectional (multi-asset) strategy and cannot run as a single-symbol backtest. " +
-                    "Use the momentum backtest endpoint (/api/omnitrader/backtest/momentum/create) instead.");
             var strategy = registry.CreateInstance(descriptor.ClassName);
+
             // Apply params; the symbol the strategy DECLARES drives the data fetch (the coin/currency
             // fields are only a fallback for older requests that don't carry a TradeSymbol param).
             var pars = new Dictionary<string, object?>(row.Config.Parameters ?? new(), StringComparer.OrdinalIgnoreCase);
@@ -119,21 +106,62 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 pars["TradeSymbol"] = row.Config.Coin + row.Config.Currency;
             Strategy.Params.StrategyParams.Apply(strategy, pars);
 
-            string symbol = strategy.DeclareSymbols().Primary;
-            var candles = await marketData.GetHistoricalCandlesAsync(symbol, row.Config.Interval, row.Config.CandleCount, ct);
+            // Single- vs multi-symbol is decided GENERICALLY by what the strategy declares — the engine
+            // has no per-strategy branches.
+            var declaration = strategy.DeclareSymbols();
+            BacktestResult result;
+            if (declaration.IsUniverse)
+            {
+                // The bespoke point-in-time + validation research suite is an explicit, optional add-on
+                // carried on the config; it does NOT drive the single/multi dispatch above.
+                if (row.Config.Momentum != null)
+                    result = await new MomentumBacktestRunner(universeRepo, log).RunAsync(row.Config, onProgress, cancellationCheck, ct);
+                else
+                    result = await RunUniverseBacktestAsync(strategy, declaration.Universe!, row.Config, onProgress, cancellationCheck, ct);
+            }
+            else
+            {
+                string symbol = declaration.Primary;
+                var candles = await marketData.GetHistoricalCandlesAsync(symbol, row.Config.Interval, row.Config.CandleCount, ct);
+                var runConfig = WithSymbol(row.Config, symbol);
+                result = await new BacktestSession(strategy, candles, runConfig, onProgress, cancellationCheck, m => log(m)).RunAsync(ct);
+            }
 
-            var runConfig = WithSymbol(row.Config, symbol);
-            var session = new BacktestSession(
-                strategy, candles, runConfig,
-                onProgress: async (pct, done, total) =>
-                {
-                    try { await jobRepo.UpdateProgressAsync(row.Id, pct, done, total, ct); } catch { }
-                },
-                cancellationCheck: () => jobRepo.IsCancellationRequestedAsync(row.Id, ct),
-                log: m => log(m));
-
-            var result = await session.RunAsync(ct);
             await jobRepo.CompleteAsync(row.Id, BacktestJobStatus.Succeeded, result, null, DateTime.UtcNow, ct);
+        }
+
+        /// <summary>
+        /// Generic multi-symbol (cross-sectional) backtest. Driven entirely by the strategy's declared
+        /// <see cref="UniverseSpec"/> — the engine has no knowledge of any specific strategy. Resolves the
+        /// universe and fetches aligned history the same way the live/paper MultiAssetSession does, then
+        /// runs the multi-asset-native <see cref="BacktestSession.RunPortfolioAsync"/>.
+        /// </summary>
+        private async Task<BacktestResult> RunUniverseBacktestAsync(
+            TradingStrategy strategy, UniverseSpec spec, BacktestConfig config,
+            Func<double, int, int, Task>? onProgress, Func<Task<bool>>? cancellationCheck, CancellationToken ct)
+        {
+            var provider = new BinanceUniverseProvider(spec.QuoteAsset);
+            var symbols = await provider.ResolveUniverseAsync(spec.TopN, ct);
+            if (!symbols.Contains(spec.RegimeSymbol, StringComparer.OrdinalIgnoreCase)) symbols.Add(spec.RegimeSymbol);
+
+            var candles = new Dictionary<string, IReadOnlyList<OHLCCandle>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var sym in symbols)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    var bars = await marketData.GetHistoricalCandlesAsync(sym, config.Interval, config.CandleCount, ct);
+                    // USD quote volume so volume/liquidity ranking sees USD (matches MultiAssetSession).
+                    if (bars.Count > 0)
+                        candles[sym] = bars.Select(b => new OHLCCandle(b.Timestamp, b.Open, b.High, b.Low, b.Close, b.Volume * b.Close)).ToList();
+                }
+                catch (Exception ex) { err($"universe backtest: fetch {sym} failed", ex); }
+            }
+            if (candles.Count == 0)
+                throw new InvalidOperationException("No universe data could be fetched for the backtest.");
+
+            var input = new PortfolioInput { Candles = candles, RegimeSymbol = spec.RegimeSymbol };
+            return await new BacktestSession(strategy, input, config, onProgress, cancellationCheck, log).RunPortfolioAsync(ct);
         }
 
         /// <summary>Copy a config with the engine symbol set to the strategy's declared pair (Currency
