@@ -508,6 +508,8 @@ namespace Omnipotent.Services.OmniTrader.Api
         /// <summary>When present, this is a cross-sectional momentum (portfolio) backtest. The universe
         /// window/params live here; Coin/Currency/Interval/CandleCount are derived from them.</summary>
         public MomentumBacktestSettings? Momentum { get; set; }
+        /// <summary>When present, run the generic post-backtest validation (universe strategies only).</summary>
+        public ValidationSettings? Validation { get; set; }
 
         public BacktestConfig ToBacktestConfig()
         {
@@ -541,6 +543,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 FeeFraction = FeeFraction,
                 SlippageFraction = SlippageFraction,
                 Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
+                Validation = Validation,
                 Parameters = Parameters,
             };
         }

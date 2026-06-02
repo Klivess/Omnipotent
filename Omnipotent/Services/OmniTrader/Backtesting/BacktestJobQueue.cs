@@ -1,7 +1,9 @@
+using Omnipotent.Services.OmniTrader.Backtesting.Validation;
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.MarketData;
 using Omnipotent.Services.OmniTrader.Persistence;
 using Omnipotent.Services.OmniTrader.Strategy;
+using Omnipotent.Services.OmniTrader.Strategy.Params;
 using System.Threading.Channels;
 
 namespace Omnipotent.Services.OmniTrader.Backtesting
@@ -161,7 +163,20 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 throw new InvalidOperationException("No universe data could be fetched for the backtest.");
 
             var input = new PortfolioInput { Candles = candles, RegimeSymbol = spec.RegimeSymbol };
-            return await new BacktestSession(strategy, input, config, onProgress, cancellationCheck, log).RunPortfolioAsync(ct);
+            var result = await new BacktestSession(strategy, input, config, onProgress, cancellationCheck, log).RunPortfolioAsync(ct);
+
+            // Optional generic post-backtest validation — strategy-agnostic; no per-strategy code.
+            if (config.Validation != null)
+            {
+                var stratType = strategy.GetType();
+                var schema = StrategyParams.For(stratType);
+                var baseParams = (IReadOnlyDictionary<string, object?>)(config.Parameters ?? new Dictionary<string, object?>());
+                result.Validation = await GenericValidation.RunAsync(
+                    input, config, baseParams, schema,
+                    p => { var s = (TradingStrategy)Activator.CreateInstance(stratType)!; StrategyParams.Apply(s, p); return s; },
+                    result, config.Validation, ct);
+            }
+            return result;
         }
 
         /// <summary>Copy a config with the engine symbol set to the strategy's declared pair (Currency

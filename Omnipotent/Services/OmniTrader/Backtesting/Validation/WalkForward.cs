@@ -11,7 +11,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
     /// </summary>
     public static class WalkForward
     {
-        public sealed record FoldResult(DateTime OosStart, DateTime OosEnd, decimal OosPnLPercent, decimal OosSharpe, MomentumConfig ChosenParams);
+        public sealed record FoldResult(DateTime OosStart, DateTime OosEnd, decimal OosPnLPercent, decimal OosSharpe, object? ChosenParams);
 
         public sealed class Result
         {
@@ -31,10 +31,10 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
         /// caller's cost config. <paramref name="inSampleDays"/>/<paramref name="oosDays"/> are window
         /// lengths in days; <paramref name="warmupDays"/> is the history each run needs before it can trade.
         /// </summary>
-        public static async Task<Result> RunAsync(
+        public static async Task<Result> RunAsync<TParam>(
             PortfolioInput input,
-            IReadOnlyList<MomentumConfig> paramGrid,
-            Func<MomentumConfig, PortfolioInput, BacktestSession> sessionFactory,
+            IReadOnlyList<TParam> paramGrid,
+            Func<TParam, PortfolioInput, BacktestSession> sessionFactory,
             decimal initialEquity,
             int inSampleDays,
             int oosDays,
@@ -62,7 +62,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
 
                 // ── In-sample sweep ────────────────────────────────────────────────
                 var inSlice = Slice(input, inStart, inEnd);
-                MomentumConfig? best = null;
+                TParam best = paramGrid[0];
                 decimal bestSharpe = decimal.MinValue;
                 foreach (var p in paramGrid)
                 {
@@ -71,7 +71,6 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
                     pooledInSampleSharpes.Add((double)r.SharpeRatio);
                     if (r.SharpeRatio > bestSharpe) { bestSharpe = r.SharpeRatio; best = p; }
                 }
-                best ??= paramGrid[0];
 
                 // ── Out-of-sample evaluation of the chosen params ──────────────────
                 var oosSlice = Slice(input, oosRunStart, oosEnd);

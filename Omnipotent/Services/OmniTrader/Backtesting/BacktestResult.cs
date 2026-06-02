@@ -5,8 +5,9 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
 {
     public sealed class BacktestResult
     {
-        /// <summary>Section 11 validation output for momentum (portfolio) backtests; null for single-symbol runs.</summary>
-        public MomentumValidationReport? Validation { get; set; }
+        /// <summary>Generic post-backtest validation output (cost sensitivity, walk-forward, deflated
+        /// Sharpe, turnover); null unless requested. The momentum runner attaches its richer subtype.</summary>
+        public ValidationReport? Validation { get; set; }
 
         public decimal InitialEquity { get; set; }
         public decimal FinalEquity { get; set; }

@@ -171,8 +171,26 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// instead of the single-symbol path. Null for ordinary single-symbol backtests.</summary>
         public MomentumBacktestSettings? Momentum { get; init; }
 
+        /// <summary>When set, a generic post-backtest validation (cost sensitivity, walk-forward sweep,
+        /// deflated Sharpe, turnover) runs after the primary universe backtest. Strategy-agnostic.</summary>
+        public ValidationSettings? Validation { get; init; }
+
         /// <summary>User-chosen values for the strategy's [Param] properties (applied at run start).</summary>
         public Dictionary<string, object?>? Parameters { get; init; }
+    }
+
+    /// <summary>
+    /// Knobs for the generic post-backtest validation. Window lengths are in BARS of the backtest's
+    /// interval (a daily backtest ⇒ days). The walk-forward sweep grid is auto-built from the strategy's
+    /// [Param] Min/Max/Step ranges and capped at <see cref="MaxGridCombos"/>.
+    /// </summary>
+    public sealed class ValidationSettings
+    {
+        public int InSampleBars { get; init; } = 180;
+        public int OosBars { get; init; } = 60;
+        public int WarmupBars { get; init; } = 30;
+        public int MaxGridCombos { get; init; } = 24;
+        public double[] CostMultipliers { get; init; } = { 1.0, 2.0, 3.0 };
     }
 
     /// <summary>
