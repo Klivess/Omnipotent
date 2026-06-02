@@ -11,9 +11,11 @@ namespace Omnipotent.Services.OmniTube
 
         public string DirectoryPath;
 
-        public OmniBrand(OmniTube parent)
+        public OmniBrand(OmniTube parent, string name, string description)
         {
             this.parent = parent;
+            Name = name;
+            Description = description;
 
             DirectoryPath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniTubeBrandsDirectory), $"{Name}Brand");
             Directory.CreateDirectory(DirectoryPath);

@@ -31,11 +31,21 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private CancellationTokenSource? cts;
         private Task? loopTask;
         private bool isRunning;
-        private Position? position;
-        private decimal quoteBalance;
-        private decimal baseBalance;
+        private readonly LiveLedger ledger;
         private decimal lastMarkPrice;
         private DateTime? lastCandleTs;
+
+        // Exchange orders awaiting/receiving fills, keyed by exchange order id. The reconciler diffs
+        // the exchange's cumulative executed qty/fee against what we've already booked.
+        private sealed class TrackedOrder
+        {
+            public required string InternalId { get; init; }
+            public required string IntentId { get; init; }
+            public required string Symbol { get; init; }
+            public decimal SeenQty { get; set; }
+            public decimal SeenFee { get; set; }
+        }
+        private readonly Dictionary<string, TrackedOrder> trackedOrders = new();
 
         /// <summary>Historical candles to seed so indicator strategies have warmup immediately.</summary>
         private const int PreloadCandles = 500;
@@ -68,12 +78,11 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             this.err = err;
 
             Risk = new RiskGate(config.Caps ?? new RiskCaps());
-            quoteBalance = startingQuote ?? config.InitialQuoteBalance;
-            baseBalance = startingBase ?? config.InitialBaseBalance;
+            ledger = new LiveLedger(startingQuote ?? config.InitialQuoteBalance, startingBase ?? config.InitialBaseBalance);
 
             var host = new StrategyHost(deploymentId, config.Mode, config.Symbol, config.Interval,
                 SubmitOrderAsync, CancelByIntentAsync,
-                () => position, () => quoteBalance, () => baseBalance,
+                () => ledger.Position, () => ledger.QuoteBalance, () => ledger.BaseBalance,
                 m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e),
                 config.Margin.ClampedLeverage);
             context = new StrategyContext { Host = host };
@@ -123,16 +132,17 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             try { await Strategy.OnStop(CancellationToken.None); } catch { }
         }
 
-        public decimal GetEquity() => quoteBalance + baseBalance * lastMarkPrice;
-        public Position? GetPosition() => position;
-        public decimal GetQuoteBalance() => quoteBalance;
-        public decimal GetBaseBalance() => baseBalance;
+        public decimal GetEquity() => ledger.QuoteBalance + ledger.BaseBalance * lastMarkPrice;
+        public Position? GetPosition() => ledger.Position;
+        public decimal GetQuoteBalance() => ledger.QuoteBalance;
+        public decimal GetBaseBalance() => ledger.BaseBalance;
 
         public async Task FlattenAsync(CancellationToken ct = default)
         {
-            if (position == null || position.Qty == 0) return;
-            var side = position.Qty > 0 ? OrderSide.Sell : OrderSide.Buy;
-            decimal qty = Math.Abs(position.Qty);
+            var pos = ledger.Position;
+            if (pos == null || pos.Qty == 0) return;
+            var side = pos.Qty > 0 ? OrderSide.Sell : OrderSide.Buy;
+            decimal qty = Math.Abs(pos.Qty);
             var req = new OrderRequest
             {
                 IntentId = "flatten-" + Guid.NewGuid().ToString("N"),
@@ -144,6 +154,62 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             // Bypass the gate for emergency flatten.
             var intent = await exchange.PlaceOrderAsync(DeploymentId, WithLeverage(req), ct);
             try { await orderRepo.InsertAsync(intent, ct); } catch { }
+            Track(intent, req.Symbol);
+        }
+
+        // Begin tracking a placed order for fill reconciliation.
+        private void Track(OrderIntent intent, string symbol)
+        {
+            if (intent.Status == OrderStatus.Rejected || string.IsNullOrEmpty(intent.ExchangeOrderId)) return;
+            trackedOrders[intent.ExchangeOrderId!] = new TrackedOrder
+            {
+                InternalId = intent.Id,
+                IntentId = intent.IntentId,
+                Symbol = symbol
+            };
+        }
+
+        // Poll the exchange and book any incremental fills into the ledger, persistence, the strategy
+        // and the RiskGate. Runs each bar on the loop thread, so no locking is needed.
+        private async Task ReconcileFillsAsync(CancellationToken ct)
+        {
+            if (trackedOrders.Count == 0) return;
+            IReadOnlyList<ExchangeFill> fills;
+            try { fills = await exchange.QueryFillsAsync(trackedOrders.Keys.ToList(), ct); }
+            catch (Exception ex) { err($"[{DeploymentId}] fill reconciliation failed", ex); return; }
+
+            foreach (var ef in fills)
+            {
+                if (!trackedOrders.TryGetValue(ef.ExchangeOrderId, out var to)) continue;
+
+                decimal incQty = ef.CumulativeQty - to.SeenQty;
+                decimal incFee = Math.Max(0m, ef.CumulativeFee - to.SeenFee);
+                if (incQty > 1e-12m)
+                {
+                    decimal realized = ledger.ApplyFill(ef.Side, incQty, ef.AvgPrice, incFee, to.Symbol, DateTime.UtcNow);
+                    to.SeenQty = ef.CumulativeQty;
+                    to.SeenFee = ef.CumulativeFee;
+
+                    var fill = new FillEvent
+                    {
+                        OrderId = to.InternalId,
+                        IntentId = to.IntentId,
+                        Qty = incQty,
+                        Price = ef.AvgPrice,
+                        Fee = incFee,
+                        FeeCurrency = "USD",
+                        FilledUtc = DateTime.UtcNow,
+                        Symbol = to.Symbol
+                    };
+                    try { await fillRepo.InsertAsync(fill, ct); } catch { }
+                    try { await orderRepo.UpdateStatusAsync(to.InternalId, ef.Closed ? OrderStatus.Filled : OrderStatus.PartiallyFilled, ct: ct); } catch { }
+                    if (realized != 0m) Risk.RecordRealizedPnL(realized);
+                    try { await Strategy.OnOrderFilled(fill, ct); } catch (Exception ex) { err($"[{DeploymentId}] OnOrderFilled failed", ex); }
+                    log($"[{DeploymentId}] live fill {ef.Side} {incQty} {to.Symbol} @ {ef.AvgPrice:F2} (realized {realized:F2})");
+                }
+
+                if (ef.Closed) trackedOrders.Remove(ef.ExchangeOrderId);
+            }
         }
 
         // Inject the deployment's leverage so the exchange opens/closes on margin. No-op at 1x.
@@ -176,11 +242,18 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     context.CandleHistory.Add(candle);
                     if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);
 
+                    // Book any fills from orders placed on previous bars before the strategy acts,
+                    // so it sees an accurate position/balance.
+                    await ReconcileFillsAsync(ct);
+
                     using var stratCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                     stratCts.CancelAfter(TimeSpan.FromSeconds(10));
                     try { await Strategy.OnCandleClose(candle, stratCts.Token); }
                     catch (OperationCanceledException) { err($"[{DeploymentId}] strategy OnCandleClose timed out", null); }
                     catch (Exception ex) { err($"[{DeploymentId}] strategy OnCandleClose failed", ex); }
+
+                    // And again after, to catch fills from orders the strategy just placed.
+                    await ReconcileFillsAsync(ct);
 
                     decimal equity = GetEquity();
                     try
@@ -189,8 +262,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                         {
                             Ts = candle.Timestamp,
                             MarkPrice = candle.Close,
-                            QuoteBalance = quoteBalance,
-                            BaseBalance = baseBalance,
+                            QuoteBalance = ledger.QuoteBalance,
+                            BaseBalance = ledger.BaseBalance,
                             Equity = equity
                         }, ct);
                         await deploymentRepo.UpdateEquityAsync(DeploymentId, equity, ct);
@@ -260,6 +333,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             }
             var placed = await exchange.PlaceOrderAsync(DeploymentId, WithLeverage(req), ct);
             try { await orderRepo.InsertAsync(placed, ct); } catch { }
+            Track(placed, req.Symbol);
             return placed;
         }
 

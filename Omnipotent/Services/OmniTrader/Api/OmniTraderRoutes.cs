@@ -103,6 +103,31 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(series));
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
+            // Total account value over time = the summed equity of all deployments of a given mode
+            // (default Live = the Kraken account), forward-filled so each deployment contributes its
+            // last-known equity from when it first came online.
+            await parent.CreateAPIRoute("/api/omnitrader/portfolio/equity", async req =>
+            {
+                string mode = req.userParameters.Get("mode") ?? "Live";
+                var all = await parent.DeploymentRepo.ListAllAsync();
+                var selected = all.Where(d => string.Equals(d.Mode.ToString(), mode, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                var serieses = new List<List<EquityPoint>>();
+                foreach (var d in selected)
+                {
+                    var s = await parent.EquityRepo.GetSeriesAsync(d.Id);
+                    if (s.Count > 0) serieses.Add(s);
+                }
+
+                var total = MergeEquity(serieses);
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    Mode = mode,
+                    Deployments = serieses.Count,
+                    Series = total.Select(p => new { Ts = p.Ts, Equity = p.Equity })
+                }));
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+
             await parent.CreateAPIRoute("/api/omnitrader/deployment/chart", async req =>
             {
                 string? id = req.userParameters.Get("id");
@@ -347,6 +372,43 @@ namespace Omnipotent.Services.OmniTrader.Api
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+        }
+
+        // Forward-fill merge of several equity series into a single total-value series. At each
+        // distinct timestamp, every series contributes its last-known equity (0 before it starts).
+        // Downsamples to keep the payload light.
+        private static List<(DateTime Ts, decimal Equity)> MergeEquity(List<List<EquityPoint>> serieses)
+        {
+            var result = new List<(DateTime, decimal)>();
+            if (serieses.Count == 0) return result;
+
+            var times = serieses.SelectMany(s => s.Select(p => p.Ts)).Distinct().OrderBy(t => t).ToList();
+            var idx = new int[serieses.Count];
+            var last = new decimal[serieses.Count];
+            var started = new bool[serieses.Count];
+
+            foreach (var t in times)
+            {
+                decimal sum = 0m;
+                for (int i = 0; i < serieses.Count; i++)
+                {
+                    var s = serieses[i];
+                    while (idx[i] < s.Count && s[idx[i]].Ts <= t) { last[i] = s[idx[i]].Equity; started[i] = true; idx[i]++; }
+                    if (started[i]) sum += last[i];
+                }
+                result.Add((t, sum));
+            }
+
+            const int maxPoints = 1500;
+            if (result.Count > maxPoints)
+            {
+                int stride = (int)Math.Ceiling(result.Count / (double)maxPoints);
+                var sampled = new List<(DateTime, decimal)>();
+                for (int i = 0; i < result.Count; i += stride) sampled.Add(result[i]);
+                if (sampled[^1].Item1 != result[^1].Item1) sampled.Add(result[^1]); // keep the latest point
+                result = sampled;
+            }
+            return result;
         }
 
         private static DateTime? ParseUtc(string? raw)

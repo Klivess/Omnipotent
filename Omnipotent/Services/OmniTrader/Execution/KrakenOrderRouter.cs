@@ -136,6 +136,58 @@ namespace Omnipotent.Services.OmniTrader.Execution
             return await SendPrivateAsync("/0/private/QueryOrders", parameters, ct);
         }
 
+        public async Task<IReadOnlyList<ExchangeFill>> QueryFillsAsync(IEnumerable<string> exchangeOrderIds, CancellationToken ct = default)
+        {
+            var ids = exchangeOrderIds.ToList();
+            if (ids.Count == 0) return Array.Empty<ExchangeFill>();
+            var response = await QueryOrdersAsync(ids, ct);
+            return response == null ? Array.Empty<ExchangeFill>() : ParseFills(response);
+        }
+
+        /// <summary>
+        /// Map a Kraken QueryOrders response into cumulative <see cref="ExchangeFill"/>s. Pure so it
+        /// can be unit-tested against canned responses. Average price is cost/vol_exec (the true
+        /// executed average); an order counts as Closed once it is closed/canceled/expired.
+        /// </summary>
+        public static IReadOnlyList<ExchangeFill> ParseFills(JObject response)
+        {
+            var list = new List<ExchangeFill>();
+            if (response["result"] is not JObject result) return list;
+
+            foreach (var prop in result.Properties())
+            {
+                if (prop.Value is not JObject o) continue;
+                decimal volExec = ParseDecimal(o["vol_exec"]);
+                decimal cost = ParseDecimal(o["cost"]);
+                decimal fee = ParseDecimal(o["fee"]);
+                string status = (string?)o["status"] ?? "";
+                var descr = o["descr"] as JObject;
+                string type = (string?)descr?["type"] ?? "buy";
+                string pair = (string?)descr?["pair"] ?? "";
+                decimal avg = volExec > 0m ? cost / volExec : ParseDecimal(o["price"]);
+                bool closed = status is "closed" or "canceled" or "expired";
+
+                list.Add(new ExchangeFill
+                {
+                    ExchangeOrderId = prop.Name,
+                    Side = string.Equals(type, "sell", StringComparison.OrdinalIgnoreCase) ? OrderSide.Sell : OrderSide.Buy,
+                    CumulativeQty = volExec,
+                    AvgPrice = avg,
+                    CumulativeFee = fee,
+                    Closed = closed,
+                    Symbol = pair
+                });
+            }
+            return list;
+        }
+
+        private static decimal ParseDecimal(JToken? token)
+        {
+            if (token == null) return 0m;
+            return decimal.TryParse((string?)token, System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0m;
+        }
+
         private async Task<JObject> SendPrivateAsync(string path, Dictionary<string, string> parameters, CancellationToken ct)
         {
             long nonce = await nonceStore.NextAsync(ct);

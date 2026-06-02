@@ -1,12 +1,10 @@
 ﻿namespace Omnipotent.Services.OmniTube.SpectacularMemes
 {
-    public class SpectacularMemesOmniBrand : OmniBrand 
+    public class SpectacularMemesOmniBrand : OmniBrand
     {
-        public string Name = "Spectacular Memes";
-        public string Description = "Uploads videos of meme unboxings and rates each meme.";
-        public SpectacularMemesOmniBrand(OmniTube parent) : base(parent)
+        public SpectacularMemesOmniBrand(OmniTube parent)
+            : base(parent, "Spectacular Memes", "Uploads videos of meme unboxings and rates each meme.")
         {
-
         }
     }
 }
