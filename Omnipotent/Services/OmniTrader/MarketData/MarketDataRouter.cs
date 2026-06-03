@@ -53,6 +53,17 @@ namespace Omnipotent.Services.OmniTrader.MarketData
             return cached.Count > 0 ? cached[^1].Close : 0m;
         }
 
+        /// <summary>Fetch candles in a date range (Binance), caching the result. Empty on failure.</summary>
+        public async Task<IReadOnlyList<OHLCCandle>> GetHistoricalCandlesRangeAsync(string symbol, TimeInterval interval, DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+        {
+            IReadOnlyList<OHLCCandle> candles;
+            try { candles = await binance.GetHistoricalCandlesRangeAsync(symbol, interval, fromUtc, toUtc, ct); }
+            catch { candles = Array.Empty<OHLCCandle>(); }
+            if (candles.Count > 0)
+                await cache.UpsertManyAsync(symbol, interval, candles, ct);
+            return candles;
+        }
+
         public IAsyncEnumerable<OHLCCandle> StreamCandlesAsync(string symbol, TimeInterval interval, CancellationToken ct = default)
         {
             // Multiplex per (symbol, interval).

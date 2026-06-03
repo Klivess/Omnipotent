@@ -124,13 +124,20 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             else
             {
                 string symbol = declaration.Primary;
-                var candles = await marketData.GetHistoricalCandlesAsync(symbol, row.Config.Interval, row.Config.CandleCount, ct);
+                var candles = await FetchCandlesAsync(symbol, row.Config, ct);
                 var runConfig = WithSymbol(row.Config, symbol);
                 result = await new BacktestSession(strategy, candles, runConfig, onProgress, cancellationCheck, m => log(m)).RunAsync(ct);
             }
 
             await jobRepo.CompleteAsync(row.Id, BacktestJobStatus.Succeeded, result, null, DateTime.UtcNow, ct);
         }
+
+        /// <summary>Fetch candles for a backtest: a [FromUtc, ToUtc] date range when set, otherwise the
+        /// most-recent CandleCount bars.</summary>
+        private Task<IReadOnlyList<OHLCCandle>> FetchCandlesAsync(string symbol, BacktestConfig config, CancellationToken ct)
+            => config.FromUtc.HasValue && config.ToUtc.HasValue
+                ? marketData.GetHistoricalCandlesRangeAsync(symbol, config.Interval, config.FromUtc.Value, config.ToUtc.Value, ct)
+                : marketData.GetHistoricalCandlesAsync(symbol, config.Interval, config.CandleCount, ct);
 
         /// <summary>
         /// Generic multi-symbol (cross-sectional) backtest. Driven entirely by the strategy's declared
@@ -152,7 +159,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 ct.ThrowIfCancellationRequested();
                 try
                 {
-                    var bars = await marketData.GetHistoricalCandlesAsync(sym, config.Interval, config.CandleCount, ct);
+                    var bars = await FetchCandlesAsync(sym, config, ct);
                     // USD quote volume so volume/liquidity ranking sees USD (matches MultiAssetSession).
                     if (bars.Count > 0)
                         candles[sym] = bars.Select(b => new OHLCCandle(b.Timestamp, b.Open, b.High, b.Low, b.Close, b.Volume * b.Close)).ToList();
@@ -188,12 +195,15 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             Currency = "",
             Interval = c.Interval,
             CandleCount = c.CandleCount,
+            FromUtc = c.FromUtc,
+            ToUtc = c.ToUtc,
             InitialQuoteBalance = c.InitialQuoteBalance,
             InitialBaseBalance = c.InitialBaseBalance,
             FeeFraction = c.FeeFraction,
             SlippageFraction = c.SlippageFraction,
             Margin = c.Margin,
             Momentum = c.Momentum,
+            Validation = c.Validation,
             Parameters = c.Parameters,
         };
 

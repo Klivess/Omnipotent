@@ -84,40 +84,19 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
             decimal qty = QuoteBalance * PositionFraction / price;
             if (qty <= 0) return;
 
-            string intentId = Guid.NewGuid().ToString("N");
+            // Enter with the signal's stop and target as a protective bracket (OCO): the engine fills
+            // whichever is reached first and cancels the other — the strategy never closes manually.
             await SubmitOrder(new OrderRequest
             {
-                IntentId = intentId,
+                IntentId = Guid.NewGuid().ToString("N"),
                 Side = side,
                 Type = OrderType.Market,
                 Symbol = Symbol,
-                Qty = qty
+                Qty = qty,
+                Leverage = Leverage,
+                StopLossPrice = signal.Stop > 0 ? (decimal)signal.Stop : null,
+                TakeProfitPrice = signal.Tp1 > 0 ? (decimal)signal.Tp1 : null,
             }, ct);
-
-            if (signal.Stop > 0)
-            {
-                await SubmitOrder(new OrderRequest
-                {
-                    IntentId = intentId + "-sl",
-                    Side = side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy,
-                    Type = OrderType.StopLoss,
-                    Symbol = Symbol,
-                    Qty = qty,
-                    StopPrice = (decimal)signal.Stop
-                }, ct);
-            }
-            if (signal.Tp1 > 0)
-            {
-                await SubmitOrder(new OrderRequest
-                {
-                    IntentId = intentId + "-tp",
-                    Side = side == OrderSide.Buy ? OrderSide.Sell : OrderSide.Buy,
-                    Type = OrderType.TakeProfit,
-                    Symbol = Symbol,
-                    Qty = qty,
-                    LimitPrice = (decimal)signal.Tp1
-                }, ct);
-            }
         }
     }
 }

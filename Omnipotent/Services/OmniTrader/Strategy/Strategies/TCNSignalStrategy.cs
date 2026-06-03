@@ -30,9 +30,9 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
     [TradingStrategy(
         "TCN Volatility Signal",
         "Self-training Temporal Convolutional Network (pure C#, no external model file). " +
-        "Predicts next-bar direction, then applies deadband + EWMA volatility scaling to size a " +
-        "long/short target weight. Auto-trains on first run and caches the model. " +
-        "Sizes into the deployment's leverage: spot (1x) is long-only, margin (Nx) goes ±N.")]
+        "On a strong (post-deadband) signal it opens a vol-targeted directional position with an ATR " +
+        "stop-loss + take-profit bracket — the engine manages the exit (OCO), no manual close. " +
+        "Auto-trains on first run and caches the model. Spot (1x) is long-only; margin (Nx) can short.")]
     public sealed class TCNSignalStrategy : TradingStrategy
     {
         // ── Spec: fixed by design ───────────────────────────────────────────────
@@ -48,12 +48,18 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         public double Tau { get; set; } = 0.30;
         [Param("Target Vol (ann.)", Group = "Sizing", Min = 0.02, Max = 1, Step = 0.01)]
         public double SigmaStarAnn { get; set; } = 0.12;
-        [Param("Rebalance Band", Group = "Sizing", Min = 0, Max = 0.5, Step = 0.01, Help = "Min |Δweight| to reorder")]
-        public double RebalanceBand { get; set; } = 0.05;
         [Param("EWMA Decay (lambda)", Group = "Sizing", Min = 0.5, Max = 0.999, Step = 0.001)]
         public double LambdaEwma { get; set; } = 0.94;
         [Param("Vol Floor (ann.)", Group = "Sizing", Min = 0.001, Max = 0.2, Step = 0.001)]
         public double VolFloor { get; set; } = 0.02;
+
+        // Protective bracket (the ONLY exit): ATR-based stop + take-profit (≈1:2 risk/reward by default).
+        [Param("ATR Period", Group = "Risk", Min = 2, Max = 50)]
+        public int AtrPeriod { get; set; } = 14;
+        [Param("Stop ATR Mult", Group = "Risk", Min = 0.5, Max = 5, Step = 0.5)]
+        public decimal StopAtrMult { get; set; } = 1.5m;
+        [Param("Take Profit ATR Mult", Group = "Risk", Min = 0.5, Max = 10, Step = 0.5)]
+        public decimal TakeProfitAtrMult { get; set; } = 3.0m;
 
         // Weight bounds, derived from the deployment's leverage in OnStart. Spot (1x) is
         // long-only [0, 1]; margin (Nx) is symmetric long/short [-N, +N].
@@ -165,54 +171,49 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Strategies
         {
             if (history.Count < SequenceLen + FeatureWarmup + 1) return Task.CompletedTask;
 
+            // In a position: the protective bracket (TP/SL) is the ONLY exit — the engine fills it
+            // intrabar. No rebalancing, no manual close.
+            if (Position != null && !Position.IsFlat) return Task.CompletedTask;
+
             var h = history as IList<OHLCCandle> ?? history.ToList();
             int last = h.Count - 1;
 
-            // 1. Calibrated probability from the network
+            // Calibrated probability → directional signal, suppressed near 0.5 by the deadband.
             float[] window = BuildRawWindow(h, last);
             double pHat = _net!.PredictUpProbability(window);
+            double sig = ApplyDeadband(2.0 * pHat - 1.0, Tau);
+            if (sig == 0.0) return Task.CompletedTask; // weak signal — stay flat
 
-            // 2. Signal transform + deadband
-            double raw = 2.0 * pHat - 1.0;
-            double sig = ApplyDeadband(raw, Tau);
+            bool goLong = sig > 0;
+            if (!goLong && _wMin >= 0) return Task.CompletedTask; // spot (1x) is long-only; shorting needs leverage
 
-            // 3. Volatility scaling + clip
+            // Vol-targeted size scaled by conviction, capped by the leverage bound.
             double sigmaHat = CurrentAnnualisedVol();
-            double wTarget = Math.Clamp((SigmaStarAnn / sigmaHat) * sig, _wMin, _wMax);
+            double bound = goLong ? _wMax : -_wMin;
+            double w = Math.Min((SigmaStarAnn / sigmaHat) * Math.Abs(sig), bound);
+            if (w <= 0) return Task.CompletedTask;
 
-            // 4. Rebalance band (turnover control)
-            decimal totalEquity = QuoteBalance + BaseBalance * candle.Close;
-            double wCurrent = totalEquity > 0
-                ? (double)((Position?.Qty ?? 0m) * candle.Close / totalEquity)
-                : 0.0;
+            decimal equity = QuoteBalance + BaseBalance * candle.Close;
+            if (equity <= 0m || candle.Close <= 0m) return Task.CompletedTask;
+            decimal qty = (decimal)w * equity / candle.Close;
+            if (qty <= 0m) return Task.CompletedTask;
 
-            if (Math.Abs(wTarget - wCurrent) < RebalanceBand)
-                return Task.CompletedTask;
+            decimal atr = Indicators.ATR(h, AtrPeriod, last);
+            if (atr <= 0m) atr = candle.Close * 0.005m;
+            decimal stop = goLong ? candle.Close - StopAtrMult * atr : candle.Close + StopAtrMult * atr;
+            decimal take = goLong ? candle.Close + TakeProfitAtrMult * atr : candle.Close - TakeProfitAtrMult * atr;
 
-            return AdjustPosition(wTarget, wCurrent, totalEquity, sigmaHat, candle, ct);
-        }
-
-        private async Task AdjustPosition(
-            double wTarget, double wCurrent, decimal totalEquity,
-            double sigmaHat, OHLCCandle candle, CancellationToken ct)
-        {
-            if (candle.Close <= 0 || totalEquity <= 0) return;
-
-            decimal targetQty  = (decimal)wTarget * totalEquity / candle.Close;
-            decimal currentQty = Position?.Qty ?? 0m;
-            decimal delta      = targetQty - currentQty;
-
-            if (Math.Abs(delta) < 1e-10m) return;
-
-            Log($"TCN w={wTarget:F3} (curr={wCurrent:F3}) sigHat={sigmaHat:F3} delta={delta:F6}");
-
-            await SubmitOrder(new OrderRequest
+            Log($"TCN {(goLong ? "long" : "short")} p={pHat:F3} w={w:F3} (TP {take:F2}, SL {stop:F2})");
+            return SubmitOrder(new OrderRequest
             {
                 IntentId = Guid.NewGuid().ToString("N"),
-                Side     = delta > 0 ? OrderSide.Buy : OrderSide.Sell,
-                Type     = OrderType.Market,
-                Symbol   = Symbol,
-                Qty      = Math.Abs(delta)
+                Side = goLong ? OrderSide.Buy : OrderSide.Sell,
+                Type = OrderType.Market,
+                Symbol = Symbol,
+                Qty = qty,
+                Leverage = Leverage,
+                StopLossPrice = stop,
+                TakeProfitPrice = take,
             }, ct);
         }
 

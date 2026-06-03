@@ -35,13 +35,13 @@ namespace Omnipotent.Tests.OmniTrader
             {
                 ["TrendEmaPeriod"] = 100L,
                 ["AtrStopMultiplier"] = 2.0,
-                ["MinHoldBars"] = 3L,
+                ["PositionFraction"] = 0.25,
                 ["NotAParam"] = 999,         // ignored
             });
 
             Assert.Equal(100, s.TrendEmaPeriod);
             Assert.Equal(2.0m, s.AtrStopMultiplier);
-            Assert.Equal(3, s.MinHoldBars);
+            Assert.Equal(0.25m, s.PositionFraction);
         }
 
         [Fact]

@@ -499,6 +499,8 @@ namespace Omnipotent.Services.OmniTrader.Api
         public string Currency { get; set; } = "USD";
         public string Interval { get; set; } = "OneHour";
         public int CandleCount { get; set; } = 500;
+        public DateTime? FromUtc { get; set; }
+        public DateTime? ToUtc { get; set; }
         public decimal InitialQuoteBalance { get; set; } = 10_000m;
         public decimal InitialBaseBalance { get; set; } = 0m;
         public decimal FeeFraction { get; set; } = 0.001m;
@@ -538,6 +540,8 @@ namespace Omnipotent.Services.OmniTrader.Api
                 Currency = Currency,
                 Interval = Enum.Parse<TimeInterval>(Interval, ignoreCase: true),
                 CandleCount = CandleCount,
+                FromUtc = FromUtc,
+                ToUtc = ToUtc,
                 InitialQuoteBalance = InitialQuoteBalance,
                 InitialBaseBalance = InitialBaseBalance,
                 FeeFraction = FeeFraction,

@@ -59,6 +59,49 @@ namespace Omnipotent.Services.OmniTrader.MarketData
                 .ToList();
         }
 
+        /// <summary>Fetch every closed candle whose open time falls in [fromUtc, toUtc], paging forward
+        /// (Binance returns ≤1000 per request). Used by date-range backtests.</summary>
+        public async Task<IReadOnlyList<OHLCCandle>> GetHistoricalCandlesRangeAsync(string symbol, TimeInterval interval, DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+        {
+            string sym = symbol.ToUpperInvariant().Replace("/", "");
+            string intv = ToBinanceInterval(interval);
+            long startMs = ((DateTimeOffset)DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+            long endMs = ((DateTimeOffset)DateTime.SpecifyKind(toUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+
+            var output = new List<OHLCCandle>();
+            long cursor = startMs;
+            int safetyLimit = 500;
+
+            while (cursor <= endMs && safetyLimit-- > 0)
+            {
+                string url = $"https://api.binance.com/api/v3/klines?symbol={sym}&interval={intv}&startTime={cursor}&endTime={endMs}&limit=1000";
+                var resp = await httpClient.GetAsync(url, ct);
+                if (!resp.IsSuccessStatusCode)
+                    throw new Exception($"Binance klines range failed: {resp.StatusCode} {await resp.Content.ReadAsStringAsync(ct)}");
+                var arr = JArray.Parse(await resp.Content.ReadAsStringAsync(ct));
+                if (arr.Count == 0) break;
+                foreach (var k in arr)
+                {
+                    output.Add(new OHLCCandle(
+                        DateTimeOffset.FromUnixTimeMilliseconds((long)k[6]!).UtcDateTime,
+                        decimal.Parse((string)k[1]!, CultureInfo.InvariantCulture),
+                        decimal.Parse((string)k[2]!, CultureInfo.InvariantCulture),
+                        decimal.Parse((string)k[3]!, CultureInfo.InvariantCulture),
+                        decimal.Parse((string)k[4]!, CultureInfo.InvariantCulture),
+                        decimal.Parse((string)k[5]!, CultureInfo.InvariantCulture)));
+                }
+                long lastOpen = (long)arr[^1]![0]!;
+                cursor = lastOpen + 1; // next page starts just after the last bar's open time
+                if (arr.Count < 1000) break;
+            }
+
+            return output
+                .GroupBy(c => c.Timestamp)
+                .Select(g => g.First())
+                .OrderBy(c => c.Timestamp)
+                .ToList();
+        }
+
         /// <summary>Latest traded price for a symbol (REST ticker) — drives the live forming candle.</summary>
         public async Task<decimal> GetLatestPriceAsync(string symbol, CancellationToken ct = default)
         {

@@ -160,7 +160,13 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public required string Coin { get; init; }
         public required string Currency { get; init; }
         public required TimeInterval Interval { get; init; }
+        /// <summary>Number of most-recent candles to fetch when <see cref="FromUtc"/>/<see cref="ToUtc"/>
+        /// are not set. When the date range IS set, it takes precedence and this is ignored.</summary>
         public required int CandleCount { get; init; }
+        /// <summary>Backtest window. When both are set, candles are fetched for [FromUtc, ToUtc] instead
+        /// of the most-recent CandleCount bars.</summary>
+        public DateTime? FromUtc { get; init; }
+        public DateTime? ToUtc { get; init; }
         public decimal InitialQuoteBalance { get; init; } = 10_000m;
         public decimal InitialBaseBalance { get; init; } = 0m;
         public decimal FeeFraction { get; init; } = 0.001m;
