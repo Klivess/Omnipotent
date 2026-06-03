@@ -77,6 +77,11 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// <summary>Symbol the fill is for. Needed by portfolio mode to attribute fills to the right
         /// book; the single-symbol path also sets it. May be empty for legacy/exchange fills.</summary>
         public string Symbol { get; init; } = "";
+
+        /// <summary>The protective bracket attached to THIS (entry) order, if any. Carried through so the
+        /// backtest can record each trade's stop/target for charting. Null on exit/conditional fills.</summary>
+        public decimal? StopLoss { get; init; }
+        public decimal? TakeProfit { get; init; }
     }
 
     public sealed class Position
@@ -258,6 +263,9 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public required decimal Qty { get; init; }
         public required bool IsShort { get; init; }
         public required decimal Fees { get; init; }
+        /// <summary>The protective bracket levels the position was opened with (if any), for charting.</summary>
+        public decimal? StopLoss { get; init; }
+        public decimal? TakeProfit { get; init; }
         public decimal RealizedPnL => IsShort
             ? (EntryPrice - ExitPrice) * Qty - Fees
             : (ExitPrice - EntryPrice) * Qty - Fees;

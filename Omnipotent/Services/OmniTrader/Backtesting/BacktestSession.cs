@@ -100,6 +100,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             public decimal EntryQty;
             public bool EntryShort;
             public decimal AccruedFees;
+            public decimal? TakeProfit;
+            public decimal? StopLoss;
         }
 
         /// <summary>
@@ -148,9 +150,13 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                         Qty = leg.EntryQty,
                         IsShort = leg.EntryShort,
                         Fees = leg.AccruedFees + fill.Fee,
+                        TakeProfit = leg.TakeProfit,
+                        StopLoss = leg.StopLoss,
                     });
                     leg.EntryPrice = null;
                     leg.AccruedFees = 0m;
+                    leg.TakeProfit = null;
+                    leg.StopLoss = null;
                 }
                 else if (leg.EntryPrice == null && !flatNow)
                 {
@@ -160,6 +166,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                     leg.EntryQty = Math.Abs(pos.Qty);
                     leg.EntryShort = pos.IsShort;
                     leg.AccruedFees = fill.Fee;
+                    leg.TakeProfit = fill.TakeProfit;
+                    leg.StopLoss = fill.StopLoss;
                 }
                 else
                 {

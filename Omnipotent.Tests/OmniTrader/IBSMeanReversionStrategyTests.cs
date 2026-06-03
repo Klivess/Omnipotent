@@ -84,6 +84,13 @@ namespace Omnipotent.Tests.OmniTrader
 
             // Not a one-bar hair-trigger: the take-profit sits at the mean, above the entry.
             Assert.True(holdsBars.Average() > 1.0, $"Average hold {holdsBars.Average():F2} bars is too short.");
+
+            // Each trade carries the bracket levels it was opened with (for the chart's TP/SL overlay).
+            Assert.All(result.Trades, t =>
+            {
+                Assert.True(t.StopLoss.HasValue && t.StopLoss.Value < t.EntryPrice, "long stop should be below entry");
+                Assert.True(t.TakeProfit.HasValue && t.TakeProfit.Value > t.EntryPrice, "long target should be above entry");
+            });
         }
     }
 }

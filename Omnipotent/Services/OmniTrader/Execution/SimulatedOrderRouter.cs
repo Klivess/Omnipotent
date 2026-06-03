@@ -282,7 +282,9 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 Fee = fee,
                 FeeCurrency = "USD",
                 FilledUtc = ts,
-                Symbol = req.Symbol
+                Symbol = req.Symbol,
+                StopLoss = req.StopLossPrice,
+                TakeProfit = req.TakeProfitPrice
             };
             await onFillAsync(fill);
         }
@@ -369,7 +371,9 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 Fee = fee,
                 FeeCurrency = "USD",
                 FilledUtc = ts,
-                Symbol = req.Symbol
+                Symbol = req.Symbol,
+                StopLoss = req.StopLossPrice,
+                TakeProfit = req.TakeProfitPrice
             };
             await onFillAsync(fill);
         }
