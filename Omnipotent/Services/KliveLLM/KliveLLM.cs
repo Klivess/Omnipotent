@@ -362,7 +362,11 @@ namespace Omnipotent.Services.KliveLLM
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
             var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel);
             {
-                var content = response.choices[0].message.content;
+                // Providers occasionally return an assistant turn with null content. Coalesce to an
+                // empty string so it neither crashes downstream parsing nor poisons the session
+                // history — a stored null re-serializes as "content": null on the next turn and is
+                // rejected by strict providers (Alibaba/Qwen) with a 400.
+                var content = response.choices[0].message.content ?? string.Empty;
                 session.chatHistory.AddMessage(AuthorRole.Assistant, content);
                 session.lastUpdated = DateTime.UtcNow;
 

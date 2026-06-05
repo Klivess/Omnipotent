@@ -30,17 +30,22 @@ namespace Omnipotent.Services.KliveLLM
                 List<HFMessage> hFMessages = new();
                 foreach(var msg in history.Messages)
                 {
+                    // Some providers (e.g. Alibaba/Qwen via OpenRouter) reject any message whose
+                    // "content" serializes to null with a 400 "content field is a required field".
+                    // Models occasionally return assistant turns with null content, so coalesce to
+                    // an empty string here to guarantee we never emit "content": null.
+                    string content = msg.Content ?? string.Empty;
                     if(msg.AuthorRole == AuthorRole.User)
                     {
-                        hFMessages.Add(new HFMessage { role = "user", content = msg.Content });
+                        hFMessages.Add(new HFMessage { role = "user", content = content });
                     }
                     else if(msg.AuthorRole == AuthorRole.Assistant)
                     {
-                        hFMessages.Add(new HFMessage { role = "assistant", content = msg.Content });
+                        hFMessages.Add(new HFMessage { role = "assistant", content = content });
                     }
                     else if(msg.AuthorRole == AuthorRole.System)
                     {
-                        hFMessages.Add(new HFMessage { role = "system", content = msg.Content });
+                        hFMessages.Add(new HFMessage { role = "system", content = content });
                     }
                 }
                 messages = hFMessages.ToArray();
