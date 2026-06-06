@@ -141,12 +141,16 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
                 sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
             }
-            sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
+            sb.AppendLine("- MEMORY-FIRST (do this constantly): before answering ANYTHING that is not fully derivable from the codebase or live services — i.e. anything about Klive, his preferences, the people/projects/plans around him, past decisions, prior conversations, or your own earlier conclusions — you MUST RecallMemories(query) (or RecallMemoriesByTag) FIRST, even if you think you already know. Recall is a cheap reflex; a guessed or forgotten answer is not. Codebase = source of truth for code; MEMORY = source of truth for everything personal/world/historical. When in any doubt, recall before you answer or before you say 'I don't know'.");
+            sb.AppendLine("- The [Memories & Shortcuts] block below is ONLY the few auto-matched memories, not your whole memory. If the question needs anything beyond what's shown there, RecallMemories / RecallMemoriesByTag to search the rest before concluding.");
+            sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can. A memory recall fits cheaply inside that same block — fold it in rather than skipping it.");
             sb.AppendLine("- TALK WHILE YOU WORK: when a request needs data-gathering scripts, OPEN with a one-line conversational acknowledgement in plain prose BEFORE the {{{ script }}} (e.g. \"On it, pulling that now.\"). The user sees your prose immediately while the script runs. Keep it to one short line — don't narrate every step.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
             sb.AppendLine("- CallObjectMethod ALWAYS returns Task<object?> — you MUST `await` it; it auto-unwraps the called method's own Task/Task<T> (and property getters) for you. NEVER write `var x = CallObjectMethod(...)` without await, or x is a Task object, not the value (tell-tale: output shows 'System.Threading.Tasks.Task`1[...]').");
             sb.AppendLine("- GetService(name) returns object (sync). To read/call on it: `await CallObjectMethod(GetService(\"X\"), \"Method\", args)`, or `GetObjectMember(GetService(\"X\"), \"Field\")`.");
-            sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code.");
+            sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code. Compile errors now show the error id, the exact line:col, the offending source line, and a caret (^) under the bad token — fix THAT line; don't blame a different call. Runtime errors show the exception type, inner-cause chain, and stack — read them.");
+            sb.AppendLine("- RETURN TYPES: FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation each return ONE formatted string — Log() it directly; NEVER `foreach` over it (iterating a string yields chars → 'cannot convert char to string'). Only ListServices, GetObjectMembers, RecallMemories/ByTag return lists you loop.");
+            sb.AppendLine("- DON'T CHASE SOURCE FILES you don't need: once GetTypeSchema/GetObjectMembers have shown you a live object's methods, just call them. Read .cs source only when you genuinely need implementation details the live API can't give you.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
             sb.AppendLine("- NEVER invent identifiers. Method names, line numbers, file contents, and field values you put in your final answer MUST come verbatim from a tool output you actually received this turn. If the tool returned nothing useful, say 'I couldn't find that' — do NOT confabulate plausible-sounding C# names.");
@@ -215,7 +219,8 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine();
 
             sb.AppendLine("[Memory Discipline]");
-            sb.AppendLine("Memory is your long-term knowledge of reality across conversations. Treat it like human memory.");
+            sb.AppendLine("Memory is your long-term knowledge of reality across conversations. Treat it like human memory — and CONSULT IT CONSTANTLY, not just when asked to 'remember'.");
+            sb.AppendLine("RECALL FIRST — the default reflex: for ANY question not purely about the codebase (anything about Klive, his preferences, the people/projects/plans around him, past decisions, or your own earlier conclusions), call RecallMemories / RecallMemoriesByTag BEFORE answering, BEFORE guessing, and BEFORE saying 'I don't know'. Assume a relevant memory may exist and go look; the worst case is one cheap empty result. Skipping recall and confabulating is the cardinal sin. If recall returns nothing, THEN say you don't have it (and consider whether the answer is worth saving once found).");
             sb.AppendLine("DO save (call SaveMemory): durable facts about Klive, about yourself, about how Omnipotent actually works,");
             sb.AppendLine("non-obvious recipes for using a service, things Klive explicitly tells you to remember.");
             sb.AppendLine("DO NOT save: a record that you just answered a question, summaries of what you did this turn,");
@@ -775,7 +780,7 @@ namespace Omnipotent.Services.KliveAgent
                             }
 
                             scriptObs.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
-                            scriptObs.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, 300));
+                            scriptObs.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, KliveAgentContextBudget.ScriptErrorBudget));
                             consecutiveFailedScripts++;
                             if (consecutiveFailedScripts >= 5) stuckForceFinal = true;
                         }
@@ -1064,8 +1069,9 @@ namespace Omnipotent.Services.KliveAgent
             if (ShouldIncludeAdvancedRuntimeTools(userMessage))
                 AppendToolNames(sb, "Runtime", AdvancedRuntimeTools);
 
-            if (ShouldIncludeMemoryTools(userMessage))
-                AppendToolNames(sb, "Memory", MemoryTools);
+            // Memory tools are ALWAYS surfaced (not keyword-gated): recall is meant to be a reflex on
+            // every turn, so the agent must always see RecallMemories / RecallMemoriesByTag / GetShortcuts.
+            AppendToolNames(sb, "Memory", MemoryTools);
 
             sb.AppendLine("If a tool you need isn't listed, run: GetTypeSchema(\"ScriptGlobals\") to see every tool, or GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\") for one signature.");
 
@@ -1168,11 +1174,6 @@ namespace Omnipotent.Services.KliveAgent
         private static bool ShouldIncludeAdvancedRuntimeTools(string userMessage)
         {
             return ContainsAny(userMessage, "service", "capability", "background", "task", "property", "field", "member", "invoke", "call", "execute");
-        }
-
-        private static bool ShouldIncludeMemoryTools(string userMessage)
-        {
-            return ContainsAny(userMessage, "memory", "memories", "remember", "recall", "shortcut");
         }
 
         private static bool ContainsAny(string userMessage, params string[] keywords)

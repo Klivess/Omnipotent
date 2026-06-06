@@ -32,6 +32,11 @@ namespace Omnipotent.Services.KliveAgent
         /// dumps more than this, the agent should narrow its query, not be given the full blob.</summary>
         public const int ScriptOutputBudget = 800;
 
+        /// <summary>Per-script ERROR truncation. Errors are deliberately given more room than output:
+        /// the rich diagnostics (error id, line:col, source line + caret, exception chain + stack) are
+        /// exactly what lets the agent self-correct instead of flailing on the same failing call.</summary>
+        public const int ScriptErrorBudget = 900;
+
         /// <summary>Per-turn cap on the replayed scripts+outputs injected under a past agent turn in
         /// the conversation history, so the agent can see what code it previously ran and what it
         /// returned. Only the most recent agent turns carry this (see HistoryScriptRecentTurns).</summary>

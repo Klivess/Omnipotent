@@ -1847,12 +1847,11 @@ namespace Omnipotent.Services.KliveAgent
                         if (errors.Count > 0)
                         {
                             stopwatch.Stop();
-                            var errorMsg = string.Join("\n", errors.Select(e => e.GetMessage()));
                             return new AgentScriptResult
                             {
                                 Code = code,
                                 Success = false,
-                                ErrorMessage = $"Compilation errors:\n{errorMsg}",
+                                ErrorMessage = FormatCompilationDiagnostics(code, errors),
                                 ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                             };
                         }
@@ -1889,12 +1888,15 @@ namespace Omnipotent.Services.KliveAgent
                     // ContinueWithAsync throws CompilationErrorException on compile failure
                     // (rather than returning diagnostics like the first-run path does).
                     stopwatch.Stop();
-                    var errorMsg = string.Join("\n", cex.Diagnostics.Select(d => d.GetMessage()));
+                    var errors = cex.Diagnostics
+                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
+                        .ToList();
+                    if (errors.Count == 0) errors = cex.Diagnostics.ToList();
                     return new AgentScriptResult
                     {
                         Code = code,
                         Success = false,
-                        ErrorMessage = $"Compilation errors:\n{errorMsg}",
+                        ErrorMessage = FormatCompilationDiagnostics(code, errors),
                         Output = globals.TakeOutput(),
                         ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                     };
@@ -1917,11 +1919,87 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         Code = code,
                         Success = false,
-                        ErrorMessage = ex.InnerException?.Message ?? ex.Message,
+                        ErrorMessage = FormatRuntimeException(ex),
                         Output = globals.TakeOutput(),
                         ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                     };
                 }
+            }
+
+            /// <summary>
+            /// Renders compiler diagnostics with the detail the agent needs to self-correct: error id,
+            /// line:col, the offending source line, and a caret underline under the exact token — plus a
+            /// targeted hint for the recurring "iterated a string-returning tool" mistake.
+            /// </summary>
+            private static string FormatCompilationDiagnostics(string code, IEnumerable<Microsoft.CodeAnalysis.Diagnostic> errors)
+            {
+                var lines = (code ?? string.Empty).Replace("\r\n", "\n").Split('\n');
+                var list = errors.ToList();
+                var sb = new StringBuilder();
+                sb.AppendLine($"Compilation failed — {list.Count} error(s); nothing ran. Fix the exact line(s) below — don't just re-run the same call:");
+
+                const int maxShown = 8;
+                foreach (var d in list.Take(maxShown))
+                {
+                    var span = d.Location.GetLineSpan();
+                    int lineNo = span.StartLinePosition.Line;    // 0-based
+                    int col = span.StartLinePosition.Character;  // 0-based
+                    sb.AppendLine($"[{d.Id}] line {lineNo + 1}:{col + 1} — {d.GetMessage()}");
+
+                    if (d.Location.IsInSource && lineNo >= 0 && lineNo < lines.Length)
+                    {
+                        var srcLine = lines[lineNo];
+                        int spanLen = Math.Max(1, d.Location.SourceSpan.Length);
+                        int caretLen = Math.Min(spanLen, Math.Max(1, srcLine.Length - col));
+                        sb.AppendLine($"  {(lineNo + 1).ToString().PadLeft(4)} | {srcLine}");
+                        sb.AppendLine($"  {new string(' ', 4)} | {new string(' ', Math.Max(0, col))}{new string('^', caretLen)}");
+                    }
+                }
+                if (list.Count > maxShown)
+                    sb.AppendLine($"  … and {list.Count - maxShown} more error(s).");
+
+                if (list.Any(d => d.GetMessage().Contains("'char' to 'string'", StringComparison.Ordinal)))
+                    sb.AppendLine("Hint: the search/read tools (FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation) each return ONE formatted string, not a list — Log() the whole string; do NOT foreach over it (iterating a string yields chars).");
+
+                return sb.ToString().TrimEnd();
+            }
+
+            /// <summary>
+            /// Renders a runtime exception with type, the full inner-exception chain, and the top stack
+            /// frames (script frames appear as "Submission#…"). Reflection invokes wrap the real error in
+            /// TargetInvocationException, so we surface its inner exception as the primary one.
+            /// </summary>
+            private static string FormatRuntimeException(Exception ex)
+            {
+                var primary = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null)
+                    ? ex.InnerException
+                    : ex;
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Runtime error: {primary.GetType().Name}: {primary.Message}");
+
+                var inner = primary.InnerException;
+                for (int depth = 0; inner != null && depth < 5; depth++)
+                {
+                    sb.AppendLine($"  → caused by {inner.GetType().Name}: {inner.Message}");
+                    inner = inner.InnerException;
+                }
+
+                if (!string.IsNullOrWhiteSpace(primary.StackTrace))
+                {
+                    var frames = primary.StackTrace.Replace("\r\n", "\n").Split('\n')
+                        .Select(f => f.Trim())
+                        .Where(f => f.Length > 0)
+                        .Take(8)
+                        .ToList();
+                    if (frames.Count > 0)
+                    {
+                        sb.AppendLine("Stack:");
+                        foreach (var f in frames) sb.AppendLine($"  {f}");
+                    }
+                }
+
+                return sb.ToString().TrimEnd();
             }
         }
     }
