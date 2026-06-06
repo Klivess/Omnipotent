@@ -7,10 +7,74 @@ namespace Omnipotent.Services.KliveLLM
 {
     public class HFWrapper
     {
-        public struct HFMessage
+        // Was a struct with only role/content. Now a class so it can also carry the OpenAI/OpenRouter
+        // tool-calling fields (tool_calls on assistant turns; tool_call_id + name on tool-result turns)
+        // and a "tool" role. Reused for both request messages and the response message.
+        public class HFMessage
         {
+            [JsonProperty("role")]
             public string role;
+
+            // OpenAI permits null content when tool_calls is present, but some providers (Alibaba/Qwen
+            // via OpenRouter) 400 on "content": null. Callers should coalesce to "" — never emit null.
+            [JsonProperty("content")]
             public string content;
+
+            // Present on an assistant turn that requested tool invocations.
+            [JsonProperty("tool_calls", NullValueHandling = NullValueHandling.Ignore)]
+            public List<HFToolCall> tool_calls;
+
+            // Present on a tool-result turn (role == "tool"): which call this answers.
+            [JsonProperty("tool_call_id", NullValueHandling = NullValueHandling.Ignore)]
+            public string tool_call_id;
+
+            // Optional function name echoed back on a tool-result turn.
+            [JsonProperty("name", NullValueHandling = NullValueHandling.Ignore)]
+            public string name;
+        }
+
+        public class HFToolCall
+        {
+            [JsonProperty("id")]
+            public string id { get; set; }
+
+            [JsonProperty("type")]
+            public string type { get; set; } = "function";
+
+            [JsonProperty("function")]
+            public HFFunctionCall function { get; set; }
+        }
+
+        public class HFFunctionCall
+        {
+            [JsonProperty("name")]
+            public string name { get; set; }
+
+            // OpenAI delivers arguments as a JSON string (not an object).
+            [JsonProperty("arguments")]
+            public string arguments { get; set; }
+        }
+
+        public class HFTool
+        {
+            [JsonProperty("type")]
+            public string type { get; set; } = "function";
+
+            [JsonProperty("function")]
+            public HFFunctionDefinition function { get; set; }
+        }
+
+        public class HFFunctionDefinition
+        {
+            [JsonProperty("name")]
+            public string name { get; set; }
+
+            [JsonProperty("description")]
+            public string description { get; set; }
+
+            // A JSON-schema object describing the function's parameters.
+            [JsonProperty("parameters")]
+            public object parameters { get; set; }
         }
 
         public struct HFLLMInferenceRequest
@@ -24,6 +88,14 @@ namespace Omnipotent.Services.KliveLLM
 
             [JsonProperty("service_tier", NullValueHandling = NullValueHandling.Ignore)]
             public string service_tier;
+
+            // Native structured tool calling. NullValueHandling.Ignore means a request with no tools
+            // serializes byte-identically to the pre-tool-calling payload.
+            [JsonProperty("tools", NullValueHandling = NullValueHandling.Ignore)]
+            public List<HFTool> tools;
+
+            [JsonProperty("tool_choice", NullValueHandling = NullValueHandling.Ignore)]
+            public object tool_choice;
 
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {
@@ -49,6 +121,28 @@ namespace Omnipotent.Services.KliveLLM
                     }
                 }
                 messages = hFMessages.ToArray();
+            }
+
+            /// <summary>
+            /// Tool-calling path: build the request straight from a structured message list (which can
+            /// include assistant-with-tool_calls and role:"tool" result turns that LLama's ChatHistory
+            /// cannot represent). Coalesces any null content to "" to satisfy strict providers.
+            /// </summary>
+            public void BuildMessagesFromList(IEnumerable<HFMessage> structuredMessages)
+            {
+                var list = new List<HFMessage>();
+                foreach (var m in structuredMessages)
+                {
+                    list.Add(new HFMessage
+                    {
+                        role = m.role,
+                        content = m.content ?? string.Empty,
+                        tool_calls = m.tool_calls,
+                        tool_call_id = m.tool_call_id,
+                        name = m.name,
+                    });
+                }
+                messages = list.ToArray();
             }
         }
 
@@ -86,6 +180,8 @@ namespace Omnipotent.Services.KliveLLM
                 [JsonProperty("index")]
                 public int index { get; set; }
 
+                // HFMessage carries tool_calls, so a finish_reason == "tool_calls" response
+                // deserializes its requested calls straight into message.tool_calls.
                 [JsonProperty("message")]
                 public HFMessage message { get; set; }
             }

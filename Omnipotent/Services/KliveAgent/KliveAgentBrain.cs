@@ -95,7 +95,7 @@ namespace Omnipotent.Services.KliveAgent
 
         // â”€â”€ Prompt Assembly â”€â”€
 
-        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation)
+        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false)
         {
             var personality = await agentService.GetStringOmniSetting(
                 "KliveAgent_Personality",
@@ -131,8 +131,16 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine();
 
             sb.AppendLine("[Rules]");
-            sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
-            sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
+            if (toolCallingMode)
+            {
+                sb.AppendLine("- To inspect or act, CALL THE execute_csharp TOOL with your C# in the 'code' argument. Locals persist across calls within the same turn.");
+                sb.AppendLine("- Do NOT wrap code in {{{ ... }}} or markdown fences, and do NOT emit XML tool-call tags. Use the native execute_csharp tool channel only. ONE call can do discovery + action + Log() together.");
+            }
+            else
+            {
+                sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
+                sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
+            }
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can.");
             sb.AppendLine("- TALK WHILE YOU WORK: when a request needs data-gathering scripts, OPEN with a one-line conversational acknowledgement in plain prose BEFORE the {{{ script }}} (e.g. \"On it, pulling that now.\"). The user sees your prose immediately while the script runs. Keep it to one short line — don't narrate every step.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
@@ -154,7 +162,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- EMPTY-PREMISE RULE: if the data needed to answer is empty (zero errors, zero matches, no memories with that tag), the EMPTY STATE IS THE ANSWER. Report it directly. Do NOT save a vacuous self-improvement memory, propose imaginary fixes, or fabricate work — 'no errors today' is a complete answer.");
             sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
             sb.AppendLine("- DSharpPlus live objects cache STALE/empty collections (DiscordGuild.Channels, GuildContainingKlives.Channels). For authoritative data use the async accessors: var g = await CallObjectMethod(GetObjectMember(GetService(\"KliveBotDiscord\"),\"Client\"), \"GetGuildAsync\", guildId, (bool?)null); then await CallObjectMethod(g, \"GetChannelsAsync\"). The live client field is 'Client', NOT 'botClient'.");
-            sb.AppendLine("- Final answer = a reply with NO script blocks. Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
+            sb.AppendLine("- Final answer = a reply that runs NO scripts (no execute_csharp call and no {{{ }}} block). Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
 
             sb.AppendLine("[Common Patterns]");
@@ -236,64 +244,182 @@ namespace Omnipotent.Services.KliveAgent
             // which is a capability loss. If a section is too big, lower its own budget.
             return sb.ToString();
         }
+        // Lines that are pure delimiter/framing noise the model sometimes leaks INTO the code buffer
+        // (a stray quote, a Python triple-quote, a YAML "---", leftover markdown fences, or a half
+        // brace-delimiter like "{'"). These caused the real "Newline in constant / Invalid expression
+        // term '{'" compile failures, so we strip them from both ends of an extracted block.
+        private static readonly Regex FramingJunkLine = new(
+            @"^\s*(?:'''|""""""|`{3,}\s*(?:csharp|cs)?|'|""|`|-{3,}|\{'|'\}|\{\{\{|\}\}\})\s*$",
+            RegexOptions.Compiled);
+
+        private static string StripCodeFraming(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return string.Empty;
+            var lines = code.Replace("\r\n", "\n").Split('\n').ToList();
+            while (lines.Count > 0 && (string.IsNullOrWhiteSpace(lines[0]) || FramingJunkLine.IsMatch(lines[0])))
+                lines.RemoveAt(0);
+            while (lines.Count > 0 && (string.IsNullOrWhiteSpace(lines[^1]) || FramingJunkLine.IsMatch(lines[^1])))
+                lines.RemoveAt(lines.Count - 1);
+            return string.Join("\n", lines).Trim();
+        }
+
+        /// <summary>
+        /// Text-protocol parser (fallback when native tool calling is unavailable). Splits a reply into
+        /// prose + executable C# blocks. Hardened vs. the original regex:
+        ///   • {{{ ... }}} is extracted brace-DEPTH aware, so a script containing "}}}" (nested closers,
+        ///     interpolation) is no longer truncated at the first "}}}".
+        ///   • Each extracted block is run through StripCodeFraming to drop leaked delimiter noise.
+        ///   • ``` fences are only treated as code when their info string is empty / csharp / cs.
+        /// </summary>
         public static List<ResponseSegment> ParseLLMResponse(string response)
         {
             var segments = new List<ResponseSegment>();
             if (string.IsNullOrEmpty(response)) return segments;
 
-            // Primary delimiter: {{{ ... }}}
-            // Fallback delimiter: ```csharp ... ``` (or plain ``` ... ```)
-            // Both are matched in a single pass by alternation so their relative order is preserved.
-            var pattern = @"\{\{\{(.*?)\}\}\}|```(?:csharp|cs)?\s*\n(.*?)```";
-            var matches = Regex.Matches(response, pattern, RegexOptions.Singleline);
+            int n = response.Length;
+            var prose = new StringBuilder();
 
-            int lastIndex = 0;
-            foreach (Match match in matches)
+            void FlushProse()
             {
-                if (match.Index > lastIndex)
-                {
-                    var text = response.Substring(lastIndex, match.Index - lastIndex).Trim();
-                    if (!string.IsNullOrEmpty(text))
-                        segments.Add(new ResponseSegment { IsScript = false, Content = text });
-                }
-
-                // Group 1 = {{{ }}} capture, Group 2 = ``` ``` capture
-                var code = (match.Groups[1].Success ? match.Groups[1].Value : match.Groups[2].Value).Trim();
-                if (!string.IsNullOrEmpty(code))
-                    segments.Add(new ResponseSegment { IsScript = true, Content = code });
-
-                lastIndex = match.Index + match.Length;
+                var t = prose.ToString().Trim();
+                if (!string.IsNullOrEmpty(t))
+                    segments.Add(new ResponseSegment { IsScript = false, Content = t });
+                prose.Clear();
             }
 
-            if (lastIndex < response.Length)
+            void AddScript(string raw)
             {
-                var text = response.Substring(lastIndex).Trim();
-                if (!string.IsNullOrEmpty(text))
+                var code = StripCodeFraming(raw);
+                if (!string.IsNullOrEmpty(code))
+                    segments.Add(new ResponseSegment { IsScript = true, Content = code });
+            }
+
+            int i = 0;
+            while (i < n)
+            {
+                // {{{ ... }}} — find the closing triple-brace at C# brace-depth 0 so embedded "}}}" survives.
+                if (i + 3 <= n && response[i] == '{' && response[i + 1] == '{' && response[i + 2] == '{')
                 {
-                    // Tolerant fallback: the LLM sometimes drops one closing brace and emits
-                    // "{{{ ...code... }}" instead of "{{{ ...code... }}}". Recover the script.
-                    var openIdx = text.IndexOf("{{{", StringComparison.Ordinal);
-                    if (openIdx >= 0 && !text.AsSpan(openIdx).Contains("}}}".AsSpan(), StringComparison.Ordinal))
+                    int codeStart = i + 3;
+                    int depth = 0;
+                    int close = -1;
+                    for (int j = codeStart; j < n; j++)
                     {
-                        var prefix = text.Substring(0, openIdx).Trim();
-                        if (!string.IsNullOrEmpty(prefix))
-                            segments.Add(new ResponseSegment { IsScript = false, Content = prefix });
-                        var inner = text.Substring(openIdx + 3).TrimEnd();
-                        // Strip up to two trailing close-braces if present (handles "}}" / "}" tails).
-                        if (inner.EndsWith("}}")) inner = inner.Substring(0, inner.Length - 2).TrimEnd();
-                        else if (inner.EndsWith("}")) inner = inner.Substring(0, inner.Length - 1).TrimEnd();
-                        if (!string.IsNullOrEmpty(inner))
-                            segments.Add(new ResponseSegment { IsScript = true, Content = inner });
+                        if (depth == 0 && j + 3 <= n && response[j] == '}' && response[j + 1] == '}' && response[j + 2] == '}')
+                        { close = j; break; }
+                        char c = response[j];
+                        if (c == '{') depth++;
+                        else if (c == '}' && depth > 0) depth--;
+                    }
+
+                    FlushProse();
+                    if (close >= 0)
+                    {
+                        AddScript(response.Substring(codeStart, close - codeStart));
+                        i = close + 3;
                     }
                     else
                     {
-                        segments.Add(new ResponseSegment { IsScript = false, Content = text });
+                        // Tolerant tail: opener with no matching "}}}" — treat the remainder as the script
+                        // (StripCodeFraming removes any dangling "}}"/"}" framing line).
+                        AddScript(response.Substring(codeStart));
+                        i = n;
                     }
+                    continue;
                 }
+
+                // ```csharp / ```cs / ``` fenced code (only these info strings count as runnable C#).
+                if (i + 3 <= n && response[i] == '`' && response[i + 1] == '`' && response[i + 2] == '`')
+                {
+                    int lineEnd = response.IndexOf('\n', i);
+                    if (lineEnd > i)
+                    {
+                        var info = response.Substring(i + 3, lineEnd - (i + 3)).Trim().ToLowerInvariant();
+                        if (info is "" or "csharp" or "cs")
+                        {
+                            int fenceStart = lineEnd + 1;
+                            int close = response.IndexOf("```", fenceStart, StringComparison.Ordinal);
+                            if (close >= 0)
+                            {
+                                FlushProse();
+                                AddScript(response.Substring(fenceStart, close - fenceStart));
+                                i = close + 3;
+                                continue;
+                            }
+                        }
+                    }
+                    // Non-C# fence or unterminated → fall through and treat as prose.
+                }
+
+                prose.Append(response[i]);
+                i++;
             }
 
+            FlushProse();
             return segments;
         }
+
+        /// <summary>
+        /// The single native tool exposed to the model: run arbitrary C# against the live service graph.
+        /// Keeps the "raw C# only" action surface — the entire ScriptGlobals API is reachable from inside
+        /// the script the model writes. Code travels as a JSON string arg, so it is immune to the
+        /// {{{ }}} framing leaks and brace-truncation that broke the text protocol.
+        /// </summary>
+        public static List<HFWrapper.HFTool> BuildToolDefinitions()
+        {
+            return new List<HFWrapper.HFTool>
+            {
+                new HFWrapper.HFTool
+                {
+                    type = "function",
+                    function = new HFWrapper.HFFunctionDefinition
+                    {
+                        name = "execute_csharp",
+                        description =
+                            "Execute a C# script in-process against Omnipotent's live service graph (Roslyn). " +
+                            "Write plain C# using the ScriptGlobals API (GetService, GetTypeSchema, GetObjectMembers, " +
+                            "CallObjectMethod, Log, SearchCode, ReadFile, SaveMemory, GetRecentErrors, etc.). " +
+                            "Locals persist across calls within the same turn. `await` any Task-returning call. " +
+                            "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
+                            "in {{{ }}} or markdown fences. One call can do discovery + action + logging together.",
+                        parameters = new
+                        {
+                            type = "object",
+                            properties = new
+                            {
+                                code = new
+                                {
+                                    type = "string",
+                                    description = "The raw C# script to compile and run."
+                                }
+                            },
+                            required = new[] { "code" }
+                        }
+                    }
+                }
+            };
+        }
+
+        /// <summary>Pull the 'code' string out of a tool_call's JSON arguments. Falls back to the raw
+        /// arguments text if it isn't the expected {"code": "..."} shape (some models send bare code).</summary>
+        private static string ExtractCodeFromToolCall(HFWrapper.HFToolCall toolCall)
+        {
+            var args = toolCall?.function?.arguments;
+            if (string.IsNullOrWhiteSpace(args)) return string.Empty;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(args);
+                if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("code", out var codeEl)
+                    && codeEl.ValueKind == System.Text.Json.JsonValueKind.String)
+                {
+                    return codeEl.GetString() ?? string.Empty;
+                }
+            }
+            catch { /* not JSON, or no 'code' field — treat the whole argument blob as code */ }
+            return args;
+        }
+
         // No hard iteration cap. The loop self-terminates when the LLM produces a no-script
         // reply (final answer) or when the stuck-detector trips on truly looping behaviour
         // (same error 3x or same script body run twice). This lets KliveAgent run arbitrarily
@@ -318,7 +444,6 @@ namespace Omnipotent.Services.KliveAgent
                 // Accumulates the agent's conversational prose across iterations so the user can be
                 // shown it "talking" (via onProgress) while its scripts are still running.
                 var progressText = new StringBuilder();
-                var systemPrompt = await BuildSystemPrompt(userMessage, conversation);
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
 
                 var llmServices = await agentService.GetServicesByType<KliveLLM.KliveLLM>();
@@ -334,6 +459,18 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
+
+                // Prefer the provider's native structured tool-calling channel: code travels as a JSON
+                // string argument, immune to the {{{ }}} framing leaks and brace-truncation that broke the
+                // text protocol. Fall back to the text protocol when the active provider is local (no tool
+                // channel) or the capability probe fails.
+                bool useToolCalling;
+                try { useToolCalling = await llm.SupportsNativeToolCallingAsync(); }
+                catch { useToolCalling = false; }
+
+                var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling);
+                var toolDefinitions = useToolCalling ? BuildToolDefinitions() : null;
+
                 llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
@@ -343,9 +480,17 @@ namespace Omnipotent.Services.KliveAgent
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
 
-                // First iteration: pass system prompt so KliveLLM sets it as the system role (not stuffed into the user turn).
-                // Subsequent iterations only send observations — the session retains the system message.
-                var currentPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+                var userPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+
+                // Tool-calling mode: seed the structured session with system + user once; later turns are
+                // appended as tool-results / user-guidance. Text mode: keep the system prompt for iter 0
+                // and feed observations back via currentPrompt.
+                if (useToolCalling)
+                {
+                    llm.StartToolSession(llmSessionId, systemPrompt);
+                    llm.AppendUserMessageToToolSession(llmSessionId, userPrompt);
+                }
+                var currentPrompt = userPrompt;
                 string? firstIterationSystemPrompt = systemPrompt;
                 var errorFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -366,6 +511,14 @@ namespace Omnipotent.Services.KliveAgent
                     try { onProgress(body, new List<AgentScriptResult>(allScriptsExecuted)); } catch { }
                 }
 
+                // Deliver a retry/guidance/observation prompt the right way for the active mode: a user-role
+                // turn in the tool session, or the next currentPrompt in the text-protocol loop.
+                void SendModelPrompt(string text)
+                {
+                    if (useToolCalling) llm.AppendUserMessageToToolSession(llmSessionId, text);
+                    else currentPrompt = text;
+                }
+
                 // ── Agentic Loop: Think → Script → Observe → repeat ──
                 // No iteration cap. The loop ends when the LLM produces a final text-only
                 // answer, or when the stuck-detector trips (same error 3x, or same script
@@ -378,11 +531,19 @@ namespace Omnipotent.Services.KliveAgent
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
-                        // Pass system prompt only on iteration 0 so it is set as the LLM session's
-                        // system role message once — not re-injected into every user turn.
-                        llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                            systemPrompt: firstIterationSystemPrompt);
-                        firstIterationSystemPrompt = null; // don't resend
+                        if (useToolCalling)
+                        {
+                            // The structured session already holds system + user + any prior tool turns.
+                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!);
+                        }
+                        else
+                        {
+                            // Pass system prompt only on iteration 0 so it is set as the LLM session's
+                            // system role message once — not re-injected into every user turn.
+                            llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
+                                systemPrompt: firstIterationSystemPrompt);
+                            firstIterationSystemPrompt = null; // don't resend
+                        }
                     }
                     catch (Exception llmEx)
                     {
@@ -412,7 +573,23 @@ namespace Omnipotent.Services.KliveAgent
                     totalPromptTokens += llmResponse.PromptTokens;
                     totalCompletionTokens += llmResponse.CompletionTokens;
 
-                    var segments = ParseLLMResponse(llmResponse.Response ?? "");
+                    // Normalize the model turn into segments (prose + scripts) regardless of channel.
+                    // Tool-calling: each tool_call becomes a script segment tagged with its ToolCallId so
+                    // its result can be routed back as a role:"tool" message. Otherwise (text mode, or a
+                    // tool-capable model that replied in prose/{{{ }}}) fall back to the text parser.
+                    List<ResponseSegment> segments;
+                    if (useToolCalling && llmResponse.ToolCalls != null && llmResponse.ToolCalls.Count > 0)
+                    {
+                        segments = new List<ResponseSegment>();
+                        if (!string.IsNullOrWhiteSpace(llmResponse.Response))
+                            segments.Add(new ResponseSegment { IsScript = false, Content = llmResponse.Response.Trim() });
+                        foreach (var tc in llmResponse.ToolCalls)
+                            segments.Add(new ResponseSegment { IsScript = true, Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id });
+                    }
+                    else
+                    {
+                        segments = ParseLLMResponse(llmResponse.Response ?? "");
+                    }
                     var hasScripts = segments.Any(s => s.IsScript);
 
                     // Talk while working: push the agent's conversational prose to the live progress
@@ -457,7 +634,7 @@ namespace Omnipotent.Services.KliveAgent
                             if (emptyFinalRetries < 3 && !stuckForceFinal)
                             {
                                 emptyFinalRetries++;
-                                currentPrompt = "(Your last message came through completely empty — nothing was sent to the user. Answer their previous message now.)";
+                                SendModelPrompt("(Your last message came through completely empty — nothing was sent to the user. Answer their previous message now.)");
                                 continue;
                             }
 
@@ -486,9 +663,11 @@ namespace Omnipotent.Services.KliveAgent
                         if (!finalFormatRetryUsed && !stuckForceFinal && LooksLikeUnexecutedScript(finalText))
                         {
                             finalFormatRetryUsed = true;
-                            currentPrompt = "[Format error] Your last reply was not a real final answer. Either it (a) contained C# code as plain text instead of an executable {{{ ... }}} block, (b) was a stub like 'Let me get X' or 'I'll now Y' that promises to act but contains no answer, or (c) was an XML/JSON tool envelope. "
-                                + "Pick ONE: actually run the script wrapped in {{{ ... }}} so it executes, OR write the real text-only final answer with NO code, NO fences, NO tool names, NO 'Let me X'. "
-                                + "Do not stall. Do not promise. Either act or answer.";
+                            SendModelPrompt("[Format error] Your last reply was not a real final answer. Either it (a) contained C# code as plain text instead of actually running it, (b) was a stub like 'Let me get X' or 'I'll now Y' that promises to act but contains no answer, or (c) was an XML/JSON tool envelope. "
+                                + (useToolCalling
+                                    ? "Pick ONE: actually run the script by CALLING the execute_csharp tool, OR write the real text-only final answer with NO code, NO tool envelopes, NO 'Let me X'. "
+                                    : "Pick ONE: actually run the script wrapped in {{{ ... }}} so it executes, OR write the real text-only final answer with NO code, NO fences, NO tool names, NO 'Let me X'. ")
+                                + "Do not stall. Do not promise. Either act or answer.");
                             continue;
                         }
 
@@ -536,6 +715,10 @@ namespace Omnipotent.Services.KliveAgent
 
                     int scriptCountThisIter = 0;
                     int errorCountThisIter = 0;
+                    // True once at least one script's result has been delivered as a role:"tool" message.
+                    // When set, the trailing guidance goes back as a plain user turn (observations are
+                    // already in the tool results); when not, observations themselves are sent back.
+                    bool anyToolResultsAppended = false;
 
                     foreach (var segment in segments)
                     {
@@ -564,15 +747,19 @@ namespace Omnipotent.Services.KliveAgent
                         // Stream the just-completed script (code + output) to the UI as it lands.
                         ReportProgress($"_…ran {allScriptsExecuted.Count} script{(allScriptsExecuted.Count == 1 ? "" : "s")} so far (step {iteration + 1})_");
 
+                        // Build this script's observation once, then route it to BOTH the aggregate
+                        // observation buffer (text-mode feedback) and — when this came from a native
+                        // tool_call — back as a role:"tool" result keyed to its id.
+                        var scriptObs = new StringBuilder();
                         if (result.Success)
                         {
                             var output = KliveAgentContextBudget.TruncateToTokens(
                                 result.Output ?? string.Empty,
                                 KliveAgentContextBudget.ScriptOutputBudget);
 
-                            observationSb.AppendLine($"[OK | {result.ExecutionTimeMs}ms]");
+                            scriptObs.AppendLine($"[OK | {result.ExecutionTimeMs}ms]");
                             if (!string.IsNullOrWhiteSpace(output))
-                                observationSb.AppendLine(output);
+                                scriptObs.AppendLine(output);
                         }
                         else
                         {
@@ -587,23 +774,33 @@ namespace Omnipotent.Services.KliveAgent
                                     stuckForceFinal = true;
                             }
 
-                            observationSb.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
-                            observationSb.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, 300));
+                            scriptObs.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
+                            scriptObs.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, 300));
                             consecutiveFailedScripts++;
                             if (consecutiveFailedScripts >= 5) stuckForceFinal = true;
                         }
 
                         if (result.Success) consecutiveFailedScripts = 0;
 
+                        var scriptObsText = scriptObs.ToString().TrimEnd();
+                        observationSb.AppendLine(scriptObsText);
                         observationSb.AppendLine();
+
+                        // Native tool_call → answer it with a role:"tool" message so the model's next turn
+                        // sees the result attached to the exact call it made.
+                        if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
+                        {
+                            llm.AppendToolResult(llmSessionId, segment.ToolCallId, "execute_csharp", scriptObsText);
+                            anyToolResultsAppended = true;
+                        }
                     }
 
                     // Soft nudge once the task has gone deep — informational, not a stop.
+                    string nudge = string.Empty;
                     if (iteration + 1 == 12 && !stuckForceFinal)
                     {
-                        observationSb.AppendLine();
-                        observationSb.AppendLine("[Nudge] You've taken 12 steps on this. If you're making real progress, keep going. " +
-                            "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.");
+                        nudge = "\n\n[Nudge] You've taken 12 steps on this. If you're making real progress, keep going. " +
+                            "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.";
                     }
 
                     // Hard safety cap: prevent runaway loops that never produce a final answer.
@@ -615,20 +812,19 @@ namespace Omnipotent.Services.KliveAgent
                         stuckForceFinal = true;
                     }
 
-                    // Feed observations back as the next prompt turn. System prompt + prior turns
-                    // already live in the LLM session — do not re-inject them.
-                    if (stuckForceFinal)
-                    {
-                        currentPrompt = observationSb.ToString().TrimEnd()
-                            + "\n\n[Stuck-loop detected] You repeated a script or hit the same error 3+ times. "
-                            + "STOP scripting. Reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you.";
-                    }
+                    // Feed the next turn. System prompt + prior turns already live in the session, so we
+                    // never re-inject them. In tool mode where results were delivered as role:"tool"
+                    // messages, send only the guidance (observations are already attached to the calls);
+                    // otherwise send the aggregate observations + guidance as a user turn.
+                    string guidance = stuckForceFinal
+                        ? "[Stuck-loop detected] You repeated a script or hit the same error 3+ times. STOP scripting. Reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you."
+                        : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.";
+                    guidance += nudge;
+
+                    if (useToolCalling && anyToolResultsAppended)
+                        SendModelPrompt(guidance);
                     else
-                    {
-                        currentPrompt = observationSb.ToString().TrimEnd()
-                            + "\n\nIf you have what you need, give the final answer now (no scripts). "
-                            + "Otherwise write your next script — prefer ONE composite block over several tiny ones.";
-                    }
+                        SendModelPrompt(observationSb.ToString().TrimEnd() + "\n\n" + guidance);
                 }
 
                 // Loop is unbounded; this point is unreachable in practice (the loop only
@@ -1092,5 +1288,9 @@ namespace Omnipotent.Services.KliveAgent
     {
         public bool IsScript { get; set; }
         public string? Content { get; set; }
+
+        // Set only when this script segment originated from a native tool_call, so its result can be
+        // routed back as a role:"tool" message keyed to this id. Null for text-protocol scripts.
+        public string? ToolCallId { get; set; }
     }
 }

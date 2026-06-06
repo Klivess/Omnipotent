@@ -327,6 +327,103 @@ namespace Omnipotent.Services.KliveLLM
                 maxTokensOverride);
         }
 
+        // ── Native structured tool calling ──
+        // The caller (KliveAgentBrain) drives a tool loop:
+        //   StartToolSession(id, systemPrompt) → AppendUserMessageToToolSession(id, msg)
+        //   → QueryToolSessionAsync(id, tools)  ⟲  (if ToolCalls: AppendToolResult ×N, query again)
+        // until QueryToolSessionAsync returns a response with no ToolCalls (final answer).
+
+        /// <summary>True when the active provider can use native structured tool calling (any remote
+        /// provider). The local LLama path has no tool channel and must use the {{{ }}} text protocol.</summary>
+        public async Task<bool> SupportsNativeToolCallingAsync()
+        {
+            return await GetActiveProviderAsync() != LLMProvider.Local;
+        }
+
+        /// <summary>Begin (or reset) a tool-calling session, seeding its structured message log with the
+        /// system prompt. Subsequent turns are appended via AppendUserMessageToToolSession / AppendToolResult.</summary>
+        public void StartToolSession(string sessionId, string? systemPrompt)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId)) throw new ArgumentException("sessionId required", nameof(sessionId));
+            lock (sessions)
+            {
+                var s = new KliveLLMSession(this, false) { sessionId = sessionId };
+                s.structuredMessages.Clear();
+                if (!string.IsNullOrWhiteSpace(systemPrompt))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "system", content = systemPrompt });
+                sessions[sessionId] = s;
+            }
+        }
+
+        /// <summary>Append a user turn to a tool-calling session.</summary>
+        public void AppendUserMessageToToolSession(string sessionId, string content)
+        {
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = content ?? string.Empty });
+            }
+        }
+
+        /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id.</summary>
+        public void AppendToolResult(string sessionId, string toolCallId, string name, string content)
+        {
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage
+                    {
+                        role = "tool",
+                        tool_call_id = toolCallId,
+                        name = name,
+                        content = content ?? string.Empty
+                    });
+            }
+        }
+
+        /// <summary>Send the session's current structured message log (plus the tool definitions) to the
+        /// remote provider. Appends the assistant response — including any requested tool_calls — back to
+        /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null)
+        {
+            KliveLLMSession session;
+            List<HFWrapper.HFMessage> snapshot;
+            lock (sessions)
+            {
+                if (!sessions.TryGetValue(sessionId, out session))
+                    return new KliveLLMResponse { Success = false, ErrorMessage = "Tool session not found. Call StartToolSession first.", SessionId = sessionId };
+                snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
+            }
+
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride);
+            var msg = response.choices[0].message;
+            var content = msg?.content ?? string.Empty;
+            var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
+
+            lock (sessions)
+            {
+                // Persist the assistant turn so the next round-trip carries the tool_calls it must answer.
+                session.structuredMessages.Add(new HFWrapper.HFMessage
+                {
+                    role = "assistant",
+                    content = content, // "" not null — strict providers reject null content
+                    tool_calls = toolCalls,
+                });
+                session.lastUpdated = DateTime.UtcNow;
+            }
+
+            return new KliveLLMResponse
+            {
+                Response = content,
+                RawResponse = content,
+                SessionId = sessionId,
+                Success = true,
+                ToolCalls = toolCalls,
+                PromptTokens = response.usage?.prompt_tokens ?? 0,
+                CompletionTokens = response.usage?.completion_tokens ?? 0,
+            };
+        }
+
         private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false)
         {
             // ensure session
@@ -465,14 +562,52 @@ namespace Omnipotent.Services.KliveLLM
                 stream = false,
                 max_tokens = maxTokensOverride,
             };
+            ApplyServiceTier(ref payload, remoteProvider);
+            payload.BuildMessagesFromChatHistory(messages);
+
+            return await SendPayloadWithRetryAsync(remoteProvider, payload);
+        }
+
+        /// <summary>
+        /// Tool-calling variant: builds the payload from a structured message list (which can include
+        /// assistant-with-tool_calls and role:"tool" turns) and attaches the tool definitions. Shares
+        /// the same provider config + retry policy as the plain text path.
+        /// </summary>
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteToolRequestAsync(
+            List<HFWrapper.HFMessage> structuredMessages,
+            List<HFWrapper.HFTool> tools,
+            int? maxTokensOverride,
+            bool forceFreeModel = false)
+        {
+            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
+
+            HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
+            {
+                model = remoteProvider.Model,
+                stream = false,
+                max_tokens = maxTokensOverride,
+                tools = tools,
+            };
+            ApplyServiceTier(ref payload, remoteProvider);
+            payload.BuildMessagesFromList(structuredMessages);
+
+            return await SendPayloadWithRetryAsync(remoteProvider, payload);
+        }
+
+        private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        {
             if (remoteProvider.Provider == LLMProvider.OpenRouter
                 && !string.IsNullOrWhiteSpace(remoteProvider.ServiceTier)
                 && !string.Equals(remoteProvider.ServiceTier, "default", StringComparison.OrdinalIgnoreCase))
             {
                 payload.service_tier = remoteProvider.ServiceTier;
             }
-            payload.BuildMessagesFromChatHistory(messages);
+        }
 
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
+            RemoteLLMProviderConfiguration remoteProvider,
+            HFWrapper.HFLLMInferenceRequest payload)
+        {
             // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
             // fresh request per attempt from this cached body.
             string payloadJson = JsonConvert.SerializeObject(payload);
@@ -709,6 +844,10 @@ namespace Omnipotent.Services.KliveLLM
             public string ErrorMessage { get; set; }
             public int PromptTokens { get; set; }
             public int CompletionTokens { get; set; }
+
+            // Native tool-calling path: populated when the model requested tool invocations
+            // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.
+            public List<HFWrapper.HFToolCall> ToolCalls { get; set; }
         }
         public void ResetSession(string? sessionId)
         {
@@ -942,6 +1081,11 @@ namespace Omnipotent.Services.KliveLLM
             public string sessionId;
             public DateTime lastUpdated;
             public ChatHistory chatHistory;
+
+            // Tool-calling path only: a structured message log that can represent assistant turns
+            // carrying tool_calls and role:"tool" result turns — neither of which LLama's ChatHistory
+            // (role+content only) can hold. The remote tool path uses this instead of chatHistory.
+            public List<HFWrapper.HFMessage> structuredMessages = new();
 
 
             //local
