@@ -23,9 +23,11 @@ namespace Omnipotent.Services.Omniscience.Replica
         private readonly Omniscience service;
         private readonly OmniscienceDb db;
         private readonly HttpClient http;
+        private readonly ReplicaStylePostProcessor stylePostProcessor;
 
         // Tunables.
         private const int RetrievedExemplarCount = 8;
+        private const int StimulusMatchedCount = 6;
         private const int RecentChatHistoryTurns = 12;
         private const int DraftMaxTokens = 600;
         private const int PolishMaxTokens = 600;
@@ -35,6 +37,7 @@ namespace Omnipotent.Services.Omniscience.Replica
             this.service = service;
             this.db = db;
             this.http = http;
+            stylePostProcessor = new ReplicaStylePostProcessor(db);
         }
 
         public class ReplicaChatResult
@@ -72,8 +75,16 @@ namespace Omnipotent.Services.Omniscience.Replica
             // Retrieve topic-matched exemplars via local embedding cosine search.
             var retrieved = await RetrieveTopicalExemplarsAsync(personId, userMessage, RetrievedExemplarCount, ct);
 
+            // Stimulus-matched retrieval: how X *actually responded* to messages like
+            // this one — the single biggest accuracy lever.
+            var stimulusMatched = await RetrieveStimulusMatchedAsync(personId, userMessage, StimulusMatchedCount, null, ct);
+
+            // Fact grounding: the replica knows the person's real established facts and
+            // deflects on what's unknown instead of inventing biography.
+            string factGrounding = LoadFactGrounding(personId);
+
             // Build the system prompt.
-            string systemPrompt = BuildSystemPrompt(dossier, stylisticExemplars, retrieved);
+            string systemPrompt = BuildSystemPrompt(dossier, stylisticExemplars, retrieved, stimulusMatched, factGrounding);
 
             // Pull recent chat history (oldest-first) so the LLM has continuity.
             var history = await LoadRecentHistoryAsync(chatId, RecentChatHistoryTurns, ct);
@@ -97,7 +108,7 @@ namespace Omnipotent.Services.Omniscience.Replica
             if (!draftResp.Success || string.IsNullOrWhiteSpace(draftResp.Response))
                 throw new InvalidOperationException("KliveLLM draft call failed: " + draftResp.ErrorMessage);
 
-            result.Draft = StripQuotedBlock(draftResp.Response.Trim());
+            result.Draft = stylePostProcessor.Apply(personId, StripQuotedBlock(draftResp.Response.Trim()));
             result.DraftPromptTokens = draftResp.PromptTokens;
             result.DraftCompletionTokens = draftResp.CompletionTokens;
             result.DraftLatencyMs = draftSw.ElapsedMilliseconds;
@@ -112,7 +123,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 polishSw.Stop();
                 if (polishResp.Success && !string.IsNullOrWhiteSpace(polishResp.Response))
                 {
-                    result.Polished = StripQuotedBlock(polishResp.Response.Trim());
+                    result.Polished = stylePostProcessor.Apply(personId, StripQuotedBlock(polishResp.Response.Trim()));
                     result.PolishPromptTokens = polishResp.PromptTokens;
                     result.PolishCompletionTokens = polishResp.CompletionTokens;
                     result.PolishLatencyMs = polishSw.ElapsedMilliseconds;
@@ -125,13 +136,48 @@ namespace Omnipotent.Services.Omniscience.Replica
             return result;
         }
 
+        /// <summary>
+        /// One-shot generation against a stimulus, with no chat persistence — used by the
+        /// fidelity benchmark. <paramref name="excludeReplyMessageId"/> keeps the real
+        /// held-out reply out of its own retrieval pool.
+        /// </summary>
+        public async Task<string?> GenerateOnceAsync(string personId, string stimulus, string? excludeReplyMessageId, CancellationToken ct)
+        {
+            var (dossierJson, stylisticJson) = await LoadReplicaAsync(personId, ct);
+            if (dossierJson == null) return null;
+            var dossier = JsonConvert.DeserializeObject<ReplicaDossier>(dossierJson);
+            if (dossier == null) return null;
+            var stylisticExemplars = JsonConvert.DeserializeObject<List<ReplicaExemplar>>(stylisticJson ?? "[]") ?? new List<ReplicaExemplar>();
+
+            var retrieved = await RetrieveTopicalExemplarsAsync(personId, stimulus, RetrievedExemplarCount, ct);
+            var stimulusMatched = await RetrieveStimulusMatchedAsync(personId, stimulus, StimulusMatchedCount, excludeReplyMessageId, ct);
+            string factGrounding = LoadFactGrounding(personId);
+            string systemPrompt = BuildSystemPrompt(dossier, stylisticExemplars, retrieved, stimulusMatched, factGrounding);
+
+            var llms = await service.GetServicesByType<KliveLLM.KliveLLM>();
+            if (llms == null || llms.Length == 0) return null;
+            var llm = (KliveLLM.KliveLLM)llms[0];
+            var resp = await llm.QueryLLM(ComposePromptWithHistory(new List<(string, string)>(), stimulus),
+                sessionId: null, maxTokensOverride: DraftMaxTokens, systemPrompt: systemPrompt, useFreeModel: true);
+            if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response)) return null;
+            return stylePostProcessor.Apply(personId, StripQuotedBlock(resp.Response.Trim()));
+        }
+
         // ── Prompt construction ──
 
-        private static string BuildSystemPrompt(ReplicaDossier dossier, List<ReplicaExemplar> stylistic, List<ReplicaExemplar> retrieved)
+        private static string BuildSystemPrompt(ReplicaDossier dossier, List<ReplicaExemplar> stylistic, List<ReplicaExemplar> retrieved,
+            List<ReplicaExemplar>? stimulusMatched = null, string? factGrounding = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine(ReplicaPromptBuilder.ChatSystemPromptTemplate.Replace("{DISPLAY_NAME}", dossier.DisplayName));
             sb.AppendLine();
+            if (!string.IsNullOrWhiteSpace(factGrounding))
+            {
+                sb.AppendLine("# Facts about your life (these are TRUE about you — never contradict them; " +
+                              "if asked something not covered here or below, deflect casually like a real person would, never invent specifics):");
+                sb.AppendLine(factGrounding);
+                sb.AppendLine();
+            }
             if (!string.IsNullOrWhiteSpace(dossier.VoiceRulebookMarkdown))
             {
                 sb.AppendLine("# Your voice rulebook (follow it):");
@@ -173,6 +219,13 @@ namespace Omnipotent.Services.Omniscience.Replica
                     sb.AppendLine($"- \"{Truncate(ex.Reply, 240)}\"");
                 sb.AppendLine();
             }
+            if (stimulusMatched is { Count: > 0 })
+            {
+                sb.AppendLine("# How you ACTUALLY responded to messages like this one (the strongest guide — mirror this register):");
+                foreach (var ex in stimulusMatched)
+                    sb.AppendLine($"- They said: \"{Truncate(ex.Stimulus ?? "", 200)}\" → You replied: \"{Truncate(ex.Reply, 280)}\"");
+                sb.AppendLine();
+            }
             if (retrieved.Count > 0)
             {
                 sb.AppendLine("# Topic-matched things you've actually said before (USE THESE for voice and content):");
@@ -192,8 +245,100 @@ namespace Omnipotent.Services.Omniscience.Replica
                 sb.AppendLine();
             }
             sb.AppendLine("Reply in their voice. Match their length, casing, punctuation and emoji habits. " +
+                          "Real chat replies are often SHORT — one word or one line is normal; don't pad. " +
+                          "If their style is rapid-fire, you may send 2-3 short messages separated by single newlines. " +
                           "Do not add a name prefix, do not wrap the reply in quotes — output the reply text only.");
             return sb.ToString();
+        }
+
+        // ── Fact grounding: established knowledge from the deduction engine ──
+        private string LoadFactGrounding(string personId)
+        {
+            var sb = new StringBuilder();
+            try
+            {
+                using var conn = db.Open();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"SELECT category, fact_text FROM person_facts
+                        WHERE person_id=$p AND status='active' AND confidence >= 0.5
+                        ORDER BY confidence DESC LIMIT 30";
+                    cmd.Parameters.AddWithValue("$p", personId);
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                        sb.AppendLine($"- [{r.GetString(0)}] {r.GetString(1)}");
+                }
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"SELECT COALESCE(p.display_name, e.canonical_name, '?'), er.rel_type
+                        FROM entity_relationships er
+                        LEFT JOIN persons p ON p.person_id = er.related_person_id
+                        LEFT JOIN entities e ON e.entity_id = er.entity_id
+                        WHERE er.owner_person_id=$p AND er.status='active' AND er.confidence >= 0.5
+                        ORDER BY er.evidence_count DESC LIMIT 12";
+                    cmd.Parameters.AddWithValue("$p", personId);
+                    using var r = cmd.ExecuteReader();
+                    bool any = false;
+                    var rels = new StringBuilder();
+                    while (r.Read())
+                    {
+                        rels.AppendLine($"- {r.GetString(0)}: {r.GetString(1)}");
+                        any = true;
+                    }
+                    if (any)
+                    {
+                        sb.AppendLine("Your relationships:");
+                        sb.Append(rels);
+                    }
+                }
+            }
+            catch { /* pre-v8 schema */ }
+            return sb.ToString();
+        }
+
+        // ── Stimulus-side retrieval: match the incoming message against stimuli the
+        //    person actually replied to, return their real replies ──
+        private async Task<List<ReplicaExemplar>> RetrieveStimulusMatchedAsync(string personId, string query, int k,
+            string? excludeReplyMessageId, CancellationToken ct)
+        {
+            var result = new List<ReplicaExemplar>();
+            try
+            {
+                var queryVec = await service.SearchIndex.EmbedQueryAsync(query, ct);
+                var now = DateTime.UtcNow;
+                var candidates = new List<(float Score, string Stimulus, string Reply, long At)>();
+                using var conn = db.Open();
+                var idents = Analytics.AnalyticHelpers.GetPersonIdentityIds(conn, personId);
+                if (idents.Count == 0) return result;
+                using var cmd = conn.CreateCommand();
+                string inC = Analytics.AnalyticHelpers.BindInClause(cmd, "i", idents);
+                cmd.CommandText = $@"SELECT e.embedding, srp.stimulus_text, srp.reply_text, COALESCE(srp.occurred_at,0), srp.reply_message_id
+                    FROM stimulus_reply_pairs srp
+                    JOIN message_embeddings e ON e.message_id = srp.stimulus_message_id
+                    WHERE srp.replier_identity_id IN ({inC})";
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    if (excludeReplyMessageId != null && !r.IsDBNull(4) && r.GetString(4) == excludeReplyMessageId) continue;
+                    var v = ReplicaEmbedder.UnpackEmbedding((byte[])r.GetValue(0));
+                    if (v.Length != queryVec.Length) continue;
+                    float cosine = ReplicaEmbedder.CosineSimilarity(queryVec, v);
+                    long at = r.GetInt64(3);
+                    // Recency-weighted: current-era replies preferred over 2019-era ones.
+                    double weight = at > 0
+                        ? Analytics.TemporalWeighting.Weight(DateTimeOffset.FromUnixTimeMilliseconds(at).UtcDateTime, now)
+                        : Analytics.TemporalWeighting.Floor;
+                    float score = (float)(cosine * (0.6 + 0.4 * weight));
+                    candidates.Add((score, r.GetString(1), r.GetString(2), at));
+                }
+                foreach (var c in candidates.OrderByDescending(c => c.Score).Take(k))
+                    result.Add(new ReplicaExemplar { Stimulus = c.Stimulus, Reply = c.Reply, SentAt = c.At, Score = c.Score });
+            }
+            catch (Exception ex)
+            {
+                _ = service.ServiceLogError(ex, "[Omniscience] Stimulus-matched retrieval failed");
+            }
+            return result;
         }
 
         private static string ComposePromptWithHistory(List<(string role, string content)> history, string newUserMessage)
@@ -279,13 +424,17 @@ namespace Omnipotent.Services.Omniscience.Replica
             await embedder.EnsureReadyAsync(ct);
             var queryVec = await embedder.EmbedAsync(query, ct);
 
-            // Brute-force cosine over the person's embedded messages.
+            // Brute-force cosine over the person's embedded messages (shared corpus index).
             var candidates = new List<(string messageId, float score)>();
             using (var conn = db.Open())
             {
+                var idents = Analytics.AnalyticHelpers.GetPersonIdentityIds(conn, personId);
+                if (idents.Count == 0) return new();
                 using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT message_id, embedding FROM replica_message_embeddings WHERE person_id=$p";
-                cmd.Parameters.AddWithValue("$p", personId);
+                string inC = Analytics.AnalyticHelpers.BindInClause(cmd, "i", idents);
+                cmd.CommandText = $@"SELECT e.message_id, e.embedding FROM message_embeddings e
+                    JOIN messages m ON m.message_id = e.message_id
+                    WHERE m.author_identity_id IN ({inC})";
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {

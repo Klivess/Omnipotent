@@ -12,7 +12,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class VocabularyModule : IPersonAnalyticModule
     {
         public string Name => "vocabulary";
-        public int Version => 2;
+        public int Version => 3;
 
         private static readonly HashSet<string> Stop = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -27,6 +27,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages,
+                AnalyticSplits.CompactWithArrays(8, "top_tokens")));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var bigrams = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var trigrams = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -86,7 +92,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                                      new JProperty("count", kv.Value),
                                      new JProperty("size", 3)));
 
-            var payload = new JObject(
+            return new JObject(
                 new JProperty("messages_analysed", nonEmpty),
                 new JProperty("total_tokens", totalTokens),
                 new JProperty("unique_tokens", counts.Count),
@@ -96,7 +102,6 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("top_tokens", new JArray(top)),
                 new JProperty("top_phrases", new JArray(topBi.Concat(topTri)))
             );
-            return Task.FromResult(payload);
         }
     }
 }

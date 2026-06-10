@@ -39,6 +39,26 @@ namespace Omnipotent.Services.Omniscience.Analytics
                 new InterestInferenceModule(),
                 new MentionAffinityModule(),
                 new TimezoneInferenceModule(),
+                new ProfanityModule(),
+                new QuestionRateModule(),
+                // These read timezone_inference output from person_statistics, so must run after it.
+                new ChronotypeModule(),
+                new SleepScheduleModule(),
+                new FacetDivergenceModule(),
+                new MoodTrajectoryModule(),
+                new LinkTaxonomyModule(),
+                new FriendshipStrengthModule(),
+                new ReactionAffinityModule(),
+                new MusicTasteModule(),
+                new GamingProfileModule(),
+                new PolitenessModule(),
+                new ResponseObligationModule(),
+                new ConversationKillerModule(),
+                new TopicEvolutionModule(),
+                new EditingBehaviourModule(),
+                new StylometryFingerprintModule(),
+                new MessageBurstModule(),
+                new SwearComfortModule(),
             };
         }
 

@@ -1,7 +1,6 @@
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -13,7 +12,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class EmojiUsageModule : IPersonAnalyticModule
     {
         public string Name => "emoji_usage";
-        public int Version => 1;
+        public int Version => 2;
 
         // <:name:id> or <a:name:id> Discord custom emoji.
         private static readonly Regex Custom = new(@"<a?:([A-Za-z0-9_]+):\d+>", RegexOptions.Compiled);
@@ -22,6 +21,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages,
+                AnalyticSplits.CompactWithArrays(5, "top_emoji")));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             var counts = new Dictionary<string, int>();
             int totalEmoji = 0, msgsWithEmoji = 0;
             foreach (var m in msgs)
@@ -52,13 +57,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
             int analysed = msgs.Count(x => !string.IsNullOrEmpty(x.Content));
             var top = counts.OrderByDescending(kv => kv.Value).Take(30).Select(kv => new JObject(
                 new JProperty("emoji", kv.Key), new JProperty("count", kv.Value)));
-            var payload = new JObject(
+            return new JObject(
                 new JProperty("total_emoji_uses", totalEmoji),
                 new JProperty("messages_with_emoji", msgsWithEmoji),
                 new JProperty("emoji_per_message", analysed == 0 ? 0 : (double)totalEmoji / analysed),
                 new JProperty("top_emoji", new JArray(top))
             );
-            return Task.FromResult(payload);
         }
     }
 }

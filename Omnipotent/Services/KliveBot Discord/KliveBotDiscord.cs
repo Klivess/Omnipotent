@@ -33,13 +33,20 @@ namespace Omnipotent.Services.KliveBot_Discord
             {
                 string tokenPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveBotDiscordTokenText);
                 string token = await GetDataHandler().ReadDataFromFile(tokenPath, true);
+                // Privileged intents (message content, members, presences) let Omniscience use
+                // KliveBot as a full sensor. They must ALSO be enabled on the bot in the Discord
+                // developer portal; if they aren't, the gateway closes with code 4014 — flip
+                // this setting to false in that case.
+                bool privilegedIntents = await GetBoolOmniSetting("KliveBotPrivilegedIntents", true);
+                if (privilegedIntents)
+                    ServiceLog("KliveBot requesting ALL intents (incl. privileged). Requires portal toggles; set KliveBotPrivilegedIntents=false if connection fails with code 4014.");
                 DiscordConfiguration connectionConfig = new DiscordConfiguration()
                 {
                     Token = token,
                     ReconnectIndefinitely = true,
                     AutoReconnect = true,
                     MinimumLogLevel = LogLevel.None,
-                    //Intents = DiscordIntents.AllUnprivileged
+                    Intents = privilegedIntents ? DiscordIntents.All : DiscordIntents.AllUnprivileged,
                 };
                 Client = new DiscordClient(connectionConfig);
                 var parent = this;

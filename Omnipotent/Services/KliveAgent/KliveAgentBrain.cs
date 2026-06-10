@@ -130,6 +130,12 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine(personality);
             sb.AppendLine();
 
+            // Memory is a FIRST-CLASS native tool in tool-calling mode (recall_memories / save_memory / …);
+            // in the text-protocol fallback it's the ScriptGlobals C# methods. Reference the right one.
+            string recallTool = toolCallingMode ? "the recall_memories tool" : "RecallMemories(query)";
+            string recallByTagTool = toolCallingMode ? "the recall_memories_by_tag tool" : "RecallMemoriesByTag";
+            string saveTool = toolCallingMode ? "the save_memory tool" : "SaveMemory";
+
             sb.AppendLine("[Rules]");
             if (toolCallingMode)
             {
@@ -141,10 +147,10 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- Write C# inside {{{ ... }}} (or ```csharp fences) to inspect/act. Locals persist across blocks in the same reply.");
                 sb.AppendLine("- DO NOT emit XML tool-call tags like <function>, <tool_use>, <parameters>, or any JSON tool envelope. They are NOT parsed. The ONLY way to invoke a tool is C# inside {{{ ... }}}.");
             }
-            sb.AppendLine("- MEMORY-FIRST (do this constantly): before answering ANYTHING that is not fully derivable from the codebase or live services — i.e. anything about Klive, his preferences, the people/projects/plans around him, past decisions, prior conversations, or your own earlier conclusions — you MUST RecallMemories(query) (or RecallMemoriesByTag) FIRST, even if you think you already know. Recall is a cheap reflex; a guessed or forgotten answer is not. Codebase = source of truth for code; MEMORY = source of truth for everything personal/world/historical. When in any doubt, recall before you answer or before you say 'I don't know'.");
-            sb.AppendLine("- The [Memories & Shortcuts] block below is ONLY the few auto-matched memories, not your whole memory. If the question needs anything beyond what's shown there, RecallMemories / RecallMemoriesByTag to search the rest before concluding.");
+            sb.AppendLine($"- MEMORY-FIRST (do this constantly): before answering ANYTHING that is not fully derivable from the codebase or live services — i.e. anything about Klive, his preferences, the people/projects/plans around him, past decisions, prior conversations, or your own earlier conclusions — you MUST call {recallTool} (or {recallByTagTool}) FIRST, even if you think you already know. Recall is a cheap reflex; a guessed or forgotten answer is not. Codebase = source of truth for code; MEMORY = source of truth for everything personal/world/historical. When in any doubt, recall before you answer or before you say 'I don't know'.");
+            sb.AppendLine($"- The [Memories & Shortcuts] block below is ONLY the few auto-matched memories, not your whole memory. If the question needs anything beyond what's shown there, call {recallTool} / {recallByTagTool} to search the rest before concluding.");
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can. A memory recall fits cheaply inside that same block — fold it in rather than skipping it.");
-            sb.AppendLine("- TALK WHILE YOU WORK: when a request needs data-gathering scripts, OPEN with a one-line conversational acknowledgement in plain prose BEFORE the {{{ script }}} (e.g. \"On it, pulling that now.\"). The user sees your prose immediately while the script runs. Keep it to one short line — don't narrate every step.");
+            sb.AppendLine("- NO FILLER ACKNOWLEDGEMENTS. Never open with throwaway placeholders like \"On it\", \"Sure\", \"Let me…\", or \"Pulling that now\". Only write prose when you have something substantive to tell the user; otherwise just run the tool/script silently — the UI already shows your work executing. Your final reply must be the actual answer, never a stalling acknowledgement.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
             sb.AppendLine("- CallObjectMethod ALWAYS returns Task<object?> — you MUST `await` it; it auto-unwraps the called method's own Task/Task<T> (and property getters) for you. NEVER write `var x = CallObjectMethod(...)` without await, or x is a Task object, not the value (tell-tale: output shows 'System.Threading.Tasks.Task`1[...]').");
             sb.AppendLine("- GetService(name) returns object (sync). To read/call on it: `await CallObjectMethod(GetService(\"X\"), \"Method\", args)`, or `GetObjectMember(GetService(\"X\"), \"Field\")`.");
@@ -220,16 +226,15 @@ namespace Omnipotent.Services.KliveAgent
 
             sb.AppendLine("[Memory Discipline]");
             sb.AppendLine("Memory is your long-term knowledge of reality across conversations. Treat it like human memory — and CONSULT IT CONSTANTLY, not just when asked to 'remember'.");
-            sb.AppendLine("RECALL FIRST — the default reflex: for ANY question not purely about the codebase (anything about Klive, his preferences, the people/projects/plans around him, past decisions, or your own earlier conclusions), call RecallMemories / RecallMemoriesByTag BEFORE answering, BEFORE guessing, and BEFORE saying 'I don't know'. Assume a relevant memory may exist and go look; the worst case is one cheap empty result. Skipping recall and confabulating is the cardinal sin. If recall returns nothing, THEN say you don't have it (and consider whether the answer is worth saving once found).");
-            sb.AppendLine("DO save (call SaveMemory): durable facts about Klive, about yourself, about how Omnipotent actually works,");
+            sb.AppendLine($"RECALL FIRST — the default reflex: for ANY question not purely about the codebase (anything about Klive, his preferences, the people/projects/plans around him, past decisions, or your own earlier conclusions), call {recallTool} / {recallByTagTool} BEFORE answering, BEFORE guessing, and BEFORE saying 'I don't know'. Assume a relevant memory may exist and go look; the worst case is one cheap empty result. Skipping recall and confabulating is the cardinal sin. If recall returns nothing, THEN say you don't have it (and consider whether the answer is worth saving once found).");
+            sb.AppendLine($"DO save (call {saveTool}): durable facts about Klive, about yourself, about how Omnipotent actually works,");
             sb.AppendLine("non-obvious recipes for using a service, things Klive explicitly tells you to remember.");
             sb.AppendLine("DO NOT save: a record that you just answered a question, summaries of what you did this turn,");
             sb.AppendLine("greetings, jokes, transient state, or anything already obvious from the conversation.");
-            sb.AppendLine("If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief,");
-            sb.AppendLine("a duplicate), call DeleteMemory(id) to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
+            sb.AppendLine($"If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief, a duplicate), {(toolCallingMode ? "call the delete_memory tool" : "call DeleteMemory(id)")} to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
             sb.AppendLine();
 
-            sb.Append(BuildToolGuide(userMessage));
+            sb.Append(BuildToolGuide(userMessage, toolCallingMode));
 
             if (!string.IsNullOrWhiteSpace(repoMap))
             {
@@ -364,45 +369,134 @@ namespace Omnipotent.Services.KliveAgent
             return segments;
         }
 
+        /// <summary>Native tool names that are memory operations (dispatched straight to KliveAgentMemory,
+        /// NOT through the Roslyn script engine). Anything not in this set is treated as execute_csharp.</summary>
+        private static readonly HashSet<string> MemoryToolNames = new(StringComparer.Ordinal)
+        {
+            "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory"
+        };
+
         /// <summary>
-        /// The single native tool exposed to the model: run arbitrary C# against the live service graph.
-        /// Keeps the "raw C# only" action surface — the entire ScriptGlobals API is reachable from inside
-        /// the script the model writes. Code travels as a JSON string arg, so it is immune to the
-        /// {{{ }}} framing leaks and brace-truncation that broke the text protocol.
+        /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
+        /// plus first-class MEMORY tools so recall/save are a direct tool call, never a hand-written script.
         /// </summary>
         public static List<HFWrapper.HFTool> BuildToolDefinitions()
         {
+            static HFWrapper.HFTool Tool(string name, string description, object parameters) => new()
+            {
+                type = "function",
+                function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
+            };
+
             return new List<HFWrapper.HFTool>
             {
-                new HFWrapper.HFTool
-                {
-                    type = "function",
-                    function = new HFWrapper.HFFunctionDefinition
-                    {
-                        name = "execute_csharp",
-                        description =
-                            "Execute a C# script in-process against Omnipotent's live service graph (Roslyn). " +
-                            "Write plain C# using the ScriptGlobals API (GetService, GetTypeSchema, GetObjectMembers, " +
-                            "CallObjectMethod, Log, SearchCode, ReadFile, SaveMemory, GetRecentErrors, etc.). " +
-                            "Locals persist across calls within the same turn. `await` any Task-returning call. " +
-                            "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
-                            "in {{{ }}} or markdown fences. One call can do discovery + action + logging together.",
-                        parameters = new
-                        {
-                            type = "object",
-                            properties = new
-                            {
-                                code = new
-                                {
-                                    type = "string",
-                                    description = "The raw C# script to compile and run."
-                                }
-                            },
-                            required = new[] { "code" }
-                        }
-                    }
-                }
+                Tool("execute_csharp",
+                    "Execute a C# script in-process against Omnipotent's live service graph (Roslyn). " +
+                    "Write plain C# using the ScriptGlobals API (GetService, GetTypeSchema, GetObjectMembers, " +
+                    "CallObjectMethod, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
+                    "Locals persist across calls within the same turn. `await` any Task-returning call. " +
+                    "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
+                    "in {{{ }}} or markdown fences. NOTE: memory has its OWN dedicated tools (recall_memories, " +
+                    "save_memory, …) — use those, not execute_csharp, for anything memory-related.",
+                    new { type = "object", properties = new { code = new { type = "string", description = "The raw C# script to compile and run." } }, required = new[] { "code" } }),
+
+                Tool("recall_memories",
+                    "Search your long-term memory for facts about Klive, his preferences/people/projects/history, " +
+                    "past decisions, or your own prior conclusions. Call this FIRST for any question not purely about the codebase.",
+                    new { type = "object", properties = new { query = new { type = "string", description = "Free-text search query." }, maxResults = new { type = "integer", description = "Max memories to return (default 10)." } }, required = new[] { "query" } }),
+
+                Tool("recall_memories_by_tag",
+                    "Return all memories tagged with an exact tag (case-insensitive). Prefer over recall_memories when filtering by a known tag.",
+                    new { type = "object", properties = new { tag = new { type = "string", description = "The exact tag to filter by." } }, required = new[] { "tag" } }),
+
+                Tool("save_memory",
+                    "Persist a durable fact about reality (about Klive, yourself, or how a service really behaves). " +
+                    "Do NOT save per-turn changelogs, greetings, or transient state.",
+                    new { type = "object", properties = new { content = new { type = "string", description = "The fact to remember." }, tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." }, importance = new { type = "integer", description = "1-5 (default 1)." } }, required = new[] { "content" } }),
+
+                Tool("save_shortcut",
+                    "Store a reusable recipe (how-to) you discovered for a non-obvious task, so you can skip rediscovery next time.",
+                    new { type = "object", properties = new { title = new { type = "string", description = "Short label." }, content = new { type = "string", description = "The step-by-step recipe." }, tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, required = new[] { "title", "content" } }),
+
+                Tool("get_shortcuts",
+                    "List all saved shortcuts (reusable recipes).",
+                    new { type = "object", properties = new { } }),
+
+                Tool("delete_memory",
+                    "Forget a memory by its id (or short-id prefix shown in recalls). Use to curate noise/duplicates/outdated beliefs.",
+                    new { type = "object", properties = new { id = new { type = "string", description = "The memory id or short-id prefix." } }, required = new[] { "id" } }),
             };
+        }
+
+        /// <summary>
+        /// Executes a native MEMORY tool call by dispatching to the live memory API (reusing ScriptGlobals so
+        /// stats/side-effects match the script path). Returns a human-readable result string for the tool result.
+        /// </summary>
+        private static async Task<string> DispatchMemoryToolAsync(ScriptGlobals globals, string toolName, string? argsJson)
+        {
+            System.Text.Json.JsonElement root = default;
+            bool hasArgs = false;
+            if (!string.IsNullOrWhiteSpace(argsJson))
+            {
+                try
+                {
+                    root = System.Text.Json.JsonDocument.Parse(argsJson).RootElement;
+                    hasArgs = root.ValueKind == System.Text.Json.JsonValueKind.Object;
+                }
+                catch { }
+            }
+
+            string? Str(string name) => hasArgs && root.TryGetProperty(name, out var e) && e.ValueKind == System.Text.Json.JsonValueKind.String ? e.GetString() : null;
+            int IntOr(string name, int def) => hasArgs && root.TryGetProperty(name, out var e) && e.TryGetInt32(out var v) ? v : def;
+            string[]? Strs(string name) => hasArgs && root.TryGetProperty(name, out var e) && e.ValueKind == System.Text.Json.JsonValueKind.Array
+                ? e.EnumerateArray().Where(x => x.ValueKind == System.Text.Json.JsonValueKind.String).Select(x => x.GetString()!).ToArray()
+                : null;
+
+            switch (toolName)
+            {
+                case "recall_memories":
+                    return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));
+                case "recall_memories_by_tag":
+                    return FormatMemoriesResult(await globals.RecallMemoriesByTag(Str("tag") ?? string.Empty));
+                case "save_memory":
+                {
+                    var content = Str("content");
+                    if (string.IsNullOrWhiteSpace(content)) return "Error: 'content' is required.";
+                    var id = await globals.SaveMemory(content, Strs("tags"), IntOr("importance", 1));
+                    return $"Saved memory {id}.";
+                }
+                case "save_shortcut":
+                {
+                    var title = Str("title"); var content = Str("content");
+                    if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(content)) return "Error: 'title' and 'content' are both required.";
+                    var id = await globals.SaveShortcut(title, content, Strs("tags"));
+                    return $"Saved shortcut {id}.";
+                }
+                case "get_shortcuts":
+                    return await globals.GetShortcuts();
+                case "delete_memory":
+                {
+                    var id = Str("id") ?? Str("idOrShortId");
+                    if (string.IsNullOrWhiteSpace(id)) return "Error: 'id' is required.";
+                    return await globals.DeleteMemory(id) ? $"Deleted memory {id}." : $"No memory matched '{id}'.";
+                }
+                default:
+                    return $"Unknown memory tool '{toolName}'.";
+            }
+        }
+
+        private static string FormatMemoriesResult(List<AgentMemoryEntry> memories)
+        {
+            if (memories == null || memories.Count == 0) return "No memories matched.";
+            var sb = new StringBuilder();
+            sb.AppendLine($"{memories.Count} memor{(memories.Count == 1 ? "y" : "ies")}:");
+            foreach (var m in memories)
+            {
+                var shortId = !string.IsNullOrEmpty(m.Id) && m.Id.Length >= 8 ? m.Id.Substring(0, 8) : m.Id;
+                var tags = m.Tags != null && m.Tags.Count > 0 ? $"  (#{string.Join(" #", m.Tags)})" : string.Empty;
+                sb.AppendLine($"[{shortId}] {m.Content}{tags}");
+            }
+            return sb.ToString().TrimEnd();
         }
 
         /// <summary>Pull the 'code' string out of a tool_call's JSON arguments. Falls back to the raw
@@ -506,13 +600,18 @@ namespace Omnipotent.Services.KliveAgent
                 int consecutiveNoOpResponses = 0;
 
                 // Streams the agent's current prose + the scripts it has run so far to the live
-                // progress channel, so the UI shows it talking AND shows the code as it executes
-                // (replacing the old static "I'm on it…" placeholder).
+                // progress channel. NEVER fabricates placeholder text: if the model hasn't actually
+                // said anything yet, we send only the live work-status note (or nothing) — no canned
+                // "On it." filler.
                 void ReportProgress(string runningNote)
                 {
                     if (onProgress == null) return;
-                    var shown = progressText.Length > 0 ? progressText.ToString() : "On it.";
-                    var body = string.IsNullOrWhiteSpace(runningNote) ? shown : $"{shown}\n\n{runningNote}";
+                    var shown = progressText.ToString();
+                    string body;
+                    if (shown.Length > 0 && !string.IsNullOrWhiteSpace(runningNote)) body = $"{shown}\n\n{runningNote}";
+                    else if (shown.Length > 0) body = shown;
+                    else if (!string.IsNullOrWhiteSpace(runningNote)) body = runningNote;
+                    else return; // nothing real to report — don't push a placeholder
                     try { onProgress(body, new List<AgentScriptResult>(allScriptsExecuted)); } catch { }
                 }
 
@@ -589,28 +688,38 @@ namespace Omnipotent.Services.KliveAgent
                         if (!string.IsNullOrWhiteSpace(llmResponse.Response))
                             segments.Add(new ResponseSegment { IsScript = false, Content = llmResponse.Response.Trim() });
                         foreach (var tc in llmResponse.ToolCalls)
-                            segments.Add(new ResponseSegment { IsScript = true, Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id });
+                        {
+                            var name = tc.function?.name ?? string.Empty;
+                            if (MemoryToolNames.Contains(name))
+                                // Memory tool: dispatched straight to the memory API, not the script engine.
+                                segments.Add(new ResponseSegment { IsScript = false, ToolName = name, Content = tc.function?.arguments ?? string.Empty, ToolCallId = tc.id });
+                            else
+                                segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_csharp", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id });
+                        }
                     }
                     else
                     {
                         segments = ParseLLMResponse(llmResponse.Response ?? "");
                     }
-                    var hasScripts = segments.Any(s => s.IsScript);
+                    // An "action" is a script OR a native (memory) tool call. Anything else is prose.
+                    bool IsAction(ResponseSegment s) => s.IsScript || s.ToolName != null;
+                    bool IsProse(ResponseSegment s) => !s.IsScript && s.ToolName == null;
+                    var hasScripts = segments.Any(IsAction);
 
                     // Talk while working: push the agent's conversational prose to the live progress
                     // channel the moment we see it, before the scripts in this turn execute. The user
                     // reads "On it — pulling that now…" while the data-gathering runs in the background.
                     if (hasScripts && onProgress != null)
                     {
-                        var thought = string.Join("\n", segments.Where(s => !s.IsScript)
+                        var thought = string.Join("\n", segments.Where(IsProse)
                             .Select(s => s.Content)).Trim();
                         if (thought.Length > 0)
                         {
                             if (progressText.Length > 0) progressText.AppendLine().AppendLine();
                             progressText.Append(thought);
                         }
-                        int pendingScriptCount = segments.Count(s => s.IsScript);
-                        ReportProgress($"_…running {pendingScriptCount} script{(pendingScriptCount == 1 ? "" : "s")} (step {iteration + 1})_");
+                        int pendingCount = segments.Count(IsAction);
+                        ReportProgress($"_…running {pendingCount} step{(pendingCount == 1 ? "" : "s")} (step {iteration + 1})_");
                     }
 
                     // Detect Anthropic/OpenAI-style tool-call XML or JSON in the raw output — the
@@ -727,10 +836,32 @@ namespace Omnipotent.Services.KliveAgent
 
                     foreach (var segment in segments)
                     {
-                        if (!segment.IsScript)
+                        // Prose (no action) — just record the agent's thought.
+                        if (IsProse(segment))
                         {
                             if (!string.IsNullOrWhiteSpace(segment.Content))
                                 observationSb.AppendLine($"[Agent thought] {segment.Content.Trim()}");
+                            continue;
+                        }
+
+                        // Native MEMORY tool call — dispatch straight to the memory API (no Roslyn).
+                        if (!segment.IsScript && segment.ToolName != null)
+                        {
+                            string memOut; bool memOk = true;
+                            try { memOut = await DispatchMemoryToolAsync(sharedGlobals, segment.ToolName, segment.Content); }
+                            catch (Exception mex) { memOk = false; memOut = $"Memory tool error: {mex.GetType().Name}: {mex.Message}"; }
+
+                            var memText = KliveAgentContextBudget.TruncateToTokens(memOut ?? string.Empty,
+                                memOk ? KliveAgentContextBudget.ScriptOutputBudget : KliveAgentContextBudget.ScriptErrorBudget);
+                            observationSb.AppendLine($"[{(memOk ? "OK" : "ERROR")} | {segment.ToolName}]");
+                            if (!string.IsNullOrWhiteSpace(memText)) observationSb.AppendLine(memText);
+                            observationSb.AppendLine();
+
+                            if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
+                            {
+                                llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName, memText);
+                                anyToolResultsAppended = true;
+                            }
                             continue;
                         }
 
@@ -1055,7 +1186,7 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString().TrimEnd();
         }
 
-        public static string BuildToolGuide(string userMessage)
+        public static string BuildToolGuide(string userMessage, bool toolCallingMode = false)
         {
             var sb = new StringBuilder();
 
@@ -1069,9 +1200,16 @@ namespace Omnipotent.Services.KliveAgent
             if (ShouldIncludeAdvancedRuntimeTools(userMessage))
                 AppendToolNames(sb, "Runtime", AdvancedRuntimeTools);
 
-            // Memory tools are ALWAYS surfaced (not keyword-gated): recall is meant to be a reflex on
-            // every turn, so the agent must always see RecallMemories / RecallMemoriesByTag / GetShortcuts.
-            AppendToolNames(sb, "Memory", MemoryTools);
+            // Memory is ALWAYS surfaced (recall is meant to be a reflex every turn). In tool-calling mode
+            // it's a set of FIRST-CLASS native tools — call them directly, never via execute_csharp. In the
+            // text-protocol fallback it's the ScriptGlobals C# methods.
+            if (toolCallingMode)
+                sb.AppendLine("Memory (NATIVE TOOLS — call these directly as tool calls, NEVER via execute_csharp): "
+                    + "recall_memories(query, maxResults?) — search memory (do this FIRST for non-code questions); "
+                    + "recall_memories_by_tag(tag); save_memory(content, tags?, importance?); "
+                    + "save_shortcut(title, content, tags?); get_shortcuts(); delete_memory(id).");
+            else
+                AppendToolNames(sb, "Memory", MemoryTools);
 
             sb.AppendLine("If a tool you need isn't listed, run: GetTypeSchema(\"ScriptGlobals\") to see every tool, or GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\") for one signature.");
 
@@ -1293,5 +1431,10 @@ namespace Omnipotent.Services.KliveAgent
         // Set only when this script segment originated from a native tool_call, so its result can be
         // routed back as a role:"tool" message keyed to this id. Null for text-protocol scripts.
         public string? ToolCallId { get; set; }
+
+        // The native tool that produced this segment: "execute_csharp" (then IsScript=true and Content is
+        // the C# code) or a memory tool name (then IsScript=false and Content is the raw JSON arguments).
+        // Null for text-protocol prose/scripts.
+        public string? ToolName { get; set; }
     }
 }

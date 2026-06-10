@@ -15,7 +15,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class LanguageDetectionModule : IPersonAnalyticModule
     {
         public string Name => "language";
-        public int Version => 2;
+        public int Version => 3;
 
         private static readonly Dictionary<string, string[]> Markers = new()
         {
@@ -32,6 +32,11 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             var counts = Markers.Keys.ToDictionary(k => k, _ => 0);
             var samplesByLang = Markers.Keys.ToDictionary(k => k, _ => new List<string>());
             int analysed = 0;
@@ -63,13 +68,13 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("share", total == 0 ? 0 : (double)kv.Value / total),
                 new JProperty("samples", new JArray(samplesByLang[kv.Key]))));
 
-            return Task.FromResult(new JObject(
+            return new JObject(
                 new JProperty("primary_language", primary),
                 new JProperty("secondary_language", secondary),
                 new JProperty("confidence", confidence),
                 new JProperty("messages_analysed", analysed),
                 new JProperty("distribution", new JArray(dist))
-            ));
+            );
         }
     }
 }

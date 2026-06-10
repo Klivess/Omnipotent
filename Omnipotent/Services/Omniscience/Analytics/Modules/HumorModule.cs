@@ -16,7 +16,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class HumorModule : IPersonAnalyticModule
     {
         public string Name => "humor";
-        public int Version => 2;
+        public int Version => 3;
 
         private static readonly (string Family, Regex Re)[] Families =
         {
@@ -33,6 +33,11 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             int total = 0, laughs = 0, multiExcl = 0, ironicQuotes = 0;
             int laughTokenTotal = 0;
             var byFamily = Families.ToDictionary(f => f.Family, _ => 0);
@@ -55,7 +60,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
             string? dominant = byFamily.Values.All(v => v == 0)
                 ? null
                 : byFamily.OrderByDescending(kv => kv.Value).First().Key;
-            return Task.FromResult(new JObject(
+            return new JObject(
                 new JProperty("messages_analysed", total),
                 new JProperty("messages_with_laughter", laughs),
                 new JProperty("laughter_token_total", laughTokenTotal),
@@ -70,7 +75,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                            .Select(s => new JObject(new JProperty("text", s.text), new JProperty("laugh_hits", s.hits))))),
                 new JProperty("humor_score", total == 0 ? 0 :
                     (laughs + 0.5 * multiExcl + 0.5 * ironicQuotes) / (double)total)
-            ));
+            );
         }
     }
 }

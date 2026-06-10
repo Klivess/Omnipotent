@@ -18,6 +18,14 @@ namespace Omnipotent.Services.Omniscience.Profiling
         public static string SystemPrompt =>
 @"You are an analyst constructing a personality dossier from the messaging history of a single person.
 You are given (1) computed analytic statistics, (2) a sample of their actual messages, (3) social-graph context.
+The message sample is recent-heavy: roughly half comes from the last 90 days. Recent messages reflect the
+person's CURRENT personality — weight them accordingly; older messages show history and drift, so call out
+clear changes over time. Analytics payloads include 'windows' (recent-period splits: last_30d/90d/365d) and
+'facets' (per-context behaviour: dm vs group_dm vs each server). People behave differently in different rooms —
+use facet differences to describe their private vs public personas instead of averaging them away.
+When an 'Established facts' section is provided (numbered F1, F2…), treat those as verified knowledge: build on
+them rather than re-deriving, and cite them inline like [F3] wherever a claim rests on one. Include a
+'## Context Personas' section describing how they differ per facet when facet data shows real divergence.
 Produce TWO sections separated by the line '---TRAITS_JSON---':
 - Section 1: a structured markdown dossier. Use exactly these headings, in this order:
     ## Communication Style
@@ -80,11 +88,17 @@ Do NOT fabricate. If a field has zero evidence, write 'no evidence'. Do not incl
             return sb.ToString();
         }
 
-        public static string Build(string personDisplayName, string personHandles, JObject statsBundle, IList<string> sampleMessages, IList<string> socialGraphSummary)
+        public static string Build(string personDisplayName, string personHandles, JObject statsBundle, IList<string> sampleMessages, IList<string> socialGraphSummary, IList<string>? establishedFacts = null)
         {
             var sb = new StringBuilder();
             sb.AppendLine($"# Person\n- Display name: {personDisplayName}\n- Known handles: {personHandles}");
             sb.AppendLine();
+            if (establishedFacts is { Count: > 0 })
+            {
+                sb.AppendLine("# Established facts (verified by the deduction engine — cite as [Fn])");
+                foreach (var f in establishedFacts) sb.AppendLine(f);
+                sb.AppendLine();
+            }
             sb.AppendLine("# Analytics");
             sb.AppendLine("```json");
             sb.AppendLine(statsBundle.ToString(Newtonsoft.Json.Formatting.Indented));
@@ -93,7 +107,7 @@ Do NOT fabricate. If a field has zero evidence, write 'no evidence'. Do not incl
             sb.AppendLine("# Social graph");
             foreach (var s in socialGraphSummary) sb.AppendLine("- " + s);
             sb.AppendLine();
-            sb.AppendLine("# Representative messages (chronological sample)");
+            sb.AppendLine("# Representative messages (chronological, recent-heavy sample)");
             int i = 1;
             foreach (var m in sampleMessages)
             {

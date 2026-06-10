@@ -118,6 +118,67 @@ namespace Omnipotent.Services.Omniscience.Scheduling
                 LastRunStatus = $"ok ({personIds.Count} targets, {analyticsOk} analytics ok, {analyticsFail} analytics failed, {profilesOk} dossiers, {profilesFail} dossier failed)";
                 FinishRun("ok");
                 _ = service.ServiceLog($"Omniscience targeted run complete. {LastRunStatus}");
+
+                // Deduction pipeline: extraction (budgeted) → graph assembly → alias
+                // resolution → detective synthesis per target → target suggestions.
+                try
+                {
+                    string summary = await service.Extraction.RunPassAsync(ct);
+                    LastRunStatus += $"; extraction: {summary}";
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Nightly extraction pass failed");
+                }
+                try
+                {
+                    string summary = await service.Graph.RunAsync(ct);
+                    LastRunStatus += $"; graph: {summary}";
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Nightly graph assembly failed");
+                }
+                try
+                {
+                    await service.Aliases.RunAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Nightly alias resolution failed");
+                }
+                int detectiveOk = 0;
+                foreach (var pid in personIds)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try { if (await service.Detective.RunForPersonAsync(pid, ct)) detectiveOk++; }
+                    catch (Exception ex) { _ = service.ServiceLogError(ex, $"Detective pass failed for {pid}"); }
+                }
+                LastRunStatus += $"; detective: {detectiveOk}/{personIds.Count}";
+                try
+                {
+                    await service.TargetSuggestions.RunAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Target suggestion engine failed");
+                }
+                try
+                {
+                    await service.IdentityLinks.RunAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Identity-link engine failed");
+                }
+                try
+                {
+                    await service.Briefing.ComposeAndSendAsync(ct);
+                }
+                catch (Exception ex)
+                {
+                    _ = service.ServiceLogError(ex, "Daily briefing failed");
+                }
                 return true;
             }
             catch (Exception ex)

@@ -23,18 +23,20 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
         private readonly OmniscienceDb db;
         private readonly IngestPipeline pipeline;
         private readonly HttpClient http;
+        private readonly DiscordEventRecorder recorder;
         private readonly ConcurrentDictionary<string, RunningSource> running = new();
         private CancellationTokenSource? lifetimeCts;
 
         public event Func<HarvestedMessage, Task>? OnNormalisedMessage;
         public event Func<HarvestedIdentity, Task>? OnIdentityObserved;
 
-        public DiscordIngester(Omniscience service, OmniscienceDb db, IngestPipeline pipeline, HttpClient http)
+        public DiscordIngester(Omniscience service, OmniscienceDb db, IngestPipeline pipeline, HttpClient http, DiscordEventRecorder recorder)
         {
             this.service = service;
             this.db = db;
             this.pipeline = pipeline;
             this.http = http;
+            this.recorder = recorder;
         }
 
         public async Task StartAsync(CancellationToken ct)
@@ -219,7 +221,6 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
                 switch (eventName)
                 {
                     case "MESSAGE_CREATE":
-                    case "MESSAGE_UPDATE":
                     {
                         string? guildId = payload.Value<string>("guild_id");
                         string? guildName = null;
@@ -230,16 +231,60 @@ namespace Omnipotent.Services.Omniscience.Ingest.Discord
                         await UpdateLastEvent(sourceId);
                         break;
                     }
+                    case "MESSAGE_UPDATE":
+                    {
+                        // Edits on stored messages become message_edits rows (self-censorship
+                        // signal); unseen messages fall through to a normal ingest.
+                        string? pmid = payload.Value<string>("id");
+                        if (string.IsNullOrEmpty(pmid)) break;
+                        string compositeId = DiscordNormaliser.Platform + ":" + pmid;
+                        if (MessageExists(compositeId))
+                        {
+                            recorder.RecordEdit(compositeId, payload.Value<string>("content"),
+                                DiscordNormaliser.ParseTimestamp(payload.Value<string>("edited_timestamp")));
+                        }
+                        else
+                        {
+                            string? guildId = payload.Value<string>("guild_id");
+                            string convKind = guildId != null ? "guild_channel" : "dm";
+                            var hm = DiscordNormaliser.MessageFromJson(payload, guildId, null, convKind, null);
+                            await pipeline.IngestAsync(hm, CancellationToken.None);
+                        }
+                        await UpdateLastEvent(sourceId);
+                        break;
+                    }
                     case "PRESENCE_UPDATE":
                     {
                         var u = payload["user"] as JObject;
                         if (u != null && OnIdentityObserved != null)
                             await OnIdentityObserved(DiscordNormaliser.IdentityFromJson(u));
+                        recorder.OnGatewayEvent(eventName, payload);
                         break;
                     }
+                    case "TYPING_START":
+                    case "MESSAGE_REACTION_ADD":
+                    case "MESSAGE_REACTION_REMOVE":
+                    case "VOICE_STATE_UPDATE":
+                    case "MESSAGE_DELETE":
+                    case "GUILD_MEMBER_UPDATE":
+                        recorder.OnGatewayEvent(eventName, payload);
+                        break;
                 }
             }
             catch (Exception ex) { _ = service.ServiceLogError(ex, $"Failed to handle {eventName}"); }
+        }
+
+        private bool MessageExists(string compositeMessageId)
+        {
+            try
+            {
+                using var conn = db.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT 1 FROM messages WHERE message_id=$id LIMIT 1";
+                cmd.Parameters.AddWithValue("$id", compositeMessageId);
+                return cmd.ExecuteScalar() != null;
+            }
+            catch { return false; }
         }
 
         private async Task UpdateSourceStatus(string sourceId, string status, string? msg)

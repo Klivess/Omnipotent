@@ -584,6 +584,9 @@ namespace Omnipotent.Services.Omniscience
                 var v = c.ExecuteScalar();
                 return v == null || v is DBNull ? 0L : Convert.ToInt64(v);
             }
+            // Deduction-era counters are wrapped in try/scalar-0 because a pre-v8 db won't
+            // have the tables (the helper returns 0 on any error via the catch below).
+            long SafeScalar(string sql) { try { return Scalar(sql); } catch { return 0L; } }
             var obj = new JObject(
                 new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
                 new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
@@ -591,7 +594,11 @@ namespace Omnipotent.Services.Omniscience
                 new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
                 new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
                 new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
-                new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles"))
+                new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles")),
+                new JProperty("tracked", SafeScalar("SELECT COUNT(*) FROM persons WHERE tier='tracked' AND merged_into_person_id IS NULL")),
+                new JProperty("facts_active", SafeScalar("SELECT COUNT(*) FROM person_facts WHERE status='active'")),
+                new JProperty("relationships", SafeScalar("SELECT COUNT(*) FROM entity_relationships WHERE status='active'")),
+                new JProperty("radar_alerts_24h", SafeScalar($"SELECT COUNT(*) FROM radar_alerts WHERE occurred_at >= {DateTimeOffset.UtcNow.AddHours(-24).ToUnixTimeMilliseconds()}"))
             );
             return obj.ToString(Formatting.None);
         }
@@ -631,11 +638,15 @@ namespace Omnipotent.Services.Omniscience
                       AND ps.payload_json LIKE '%' || p.person_id || '%')");
                 cmd.Parameters.AddWithValue("$rel", relatedTo);
             }
+            // tier + completeness (from the deduction_summary stat) power the directory's
+            // badges; COALESCE keeps it working on a pre-v5/v8 database.
             cmd.CommandText = $@"SELECT p.person_id, p.display_name, p.created_at, p.updated_at,
                     COALESCE(mc.msg_count, 0) AS msg_count,
                     (SELECT GROUP_CONCAT(platform || ':' || COALESCE(platform_username,''), '|') FROM platform_identities WHERE person_id=p.person_id) AS handles,
                     (SELECT json_group_array(json_object('platform', platform, 'username', platform_username, 'display_name', display_name)) FROM platform_identities WHERE person_id=p.person_id) AS idents_json,
-                    EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1) AS profile_targeted
+                    EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1) AS profile_targeted,
+                    COALESCE(p.tier, 'archive') AS tier,
+                    (SELECT ps.payload_json FROM person_statistics ps WHERE ps.person_id=p.person_id AND ps.module_name='deduction_summary') AS dedu
                 FROM persons p
                 LEFT JOIN (
                     SELECT pi.person_id, COUNT(*) AS msg_count
@@ -651,6 +662,11 @@ namespace Omnipotent.Services.Omniscience
                 JArray idents;
                 try { idents = string.IsNullOrEmpty(r.IsDBNull(6) ? null : r.GetString(6)) ? new JArray() : JArray.Parse(r.GetString(6)); }
                 catch { idents = new JArray(); }
+                double? completeness = null;
+                if (!r.IsDBNull(9))
+                {
+                    try { completeness = JObject.Parse(r.GetString(9)).Value<double?>("completeness_score"); } catch { }
+                }
                 rows.Add(new JObject(
                     new JProperty("person_id", r.GetString(0)),
                     new JProperty("display_name", r.IsDBNull(1) ? "" : r.GetString(1)),
@@ -659,7 +675,9 @@ namespace Omnipotent.Services.Omniscience
                     new JProperty("message_count", r.GetInt64(4)),
                     new JProperty("handles", r.IsDBNull(5) ? "" : r.GetString(5)),
                     new JProperty("identities", idents),
-                    new JProperty("profile_targeted", r.GetInt32(7) != 0)
+                    new JProperty("profile_targeted", r.GetInt32(7) != 0),
+                    new JProperty("tier", r.IsDBNull(8) ? "archive" : r.GetString(8)),
+                    new JProperty("completeness", completeness)
                 ));
             }
             return new JArray(rows).ToString(Formatting.None);
@@ -708,7 +726,7 @@ namespace Omnipotent.Services.Omniscience
 
             using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = "SELECT person_id, display_name, notes, created_at, updated_at FROM persons WHERE person_id=$p AND merged_into_person_id IS NULL";
+                cmd.CommandText = "SELECT person_id, display_name, notes, created_at, updated_at, tier FROM persons WHERE person_id=$p AND merged_into_person_id IS NULL";
                 cmd.Parameters.AddWithValue("$p", personId);
                 using var r = cmd.ExecuteReader();
                 if (!r.Read()) return null;
@@ -718,7 +736,8 @@ namespace Omnipotent.Services.Omniscience
                     new JProperty("display_name", r.IsDBNull(1) ? "" : r.GetString(1)),
                     new JProperty("notes", r.IsDBNull(2) ? null : r.GetString(2)),
                     new JProperty("created_at", r.GetInt64(3)),
-                    new JProperty("updated_at", r.GetInt64(4))
+                    new JProperty("updated_at", r.GetInt64(4)),
+                    new JProperty("tier", r.IsDBNull(5) ? "archive" : r.GetString(5))
                 );
                 r.Close();
 

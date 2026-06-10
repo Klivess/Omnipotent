@@ -12,7 +12,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class TopicModule : IPersonAnalyticModule
     {
         public string Name => "topics";
-        public int Version => 1;
+        public int Version => 2;
 
         private static readonly Regex Tok = new(@"[a-zA-Z]{3,}", RegexOptions.Compiled);
         private static readonly Regex Url = new(@"https?://([\w.-]+)", RegexOptions.Compiled);
@@ -28,6 +28,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages,
+                AnalyticSplits.CompactWithArrays(6, "top_bigrams", "top_domains")));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             var bigrams = new Dictionary<string, int>();
             var domains = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -53,10 +59,10 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
             var topDom = domains.OrderByDescending(kv => kv.Value).Take(20)
                 .Select(kv => new JObject(new JProperty("domain", kv.Key), new JProperty("count", kv.Value)));
 
-            return Task.FromResult(new JObject(
+            return new JObject(
                 new JProperty("top_bigrams", new JArray(topBg)),
                 new JProperty("top_domains", new JArray(topDom))
-            ));
+            );
         }
     }
 }

@@ -383,6 +383,29 @@ namespace Omnipotent.Services.Omniscience.Replica
                 .ToList();
             if (toEmbed.Count == 0) return 0;
 
+            // The shared corpus-wide index (message_embeddings) may already hold most of
+            // these — only embed the gap.
+            var existing = new HashSet<string>();
+            using (var connCheck = db.Open())
+            {
+                foreach (var chunk in toEmbed.Select(m => m.MessageId).Chunk(500))
+                {
+                    using var check = connCheck.CreateCommand();
+                    var names = chunk.Select((_, i) => "$m" + i).ToList();
+                    check.CommandText = $"SELECT message_id FROM message_embeddings WHERE message_id IN ({string.Join(",", names)})";
+                    for (int i = 0; i < chunk.Length; i++) check.Parameters.AddWithValue(names[i], chunk[i]);
+                    using var rr = check.ExecuteReader();
+                    while (rr.Read()) existing.Add(rr.GetString(0));
+                }
+            }
+            int alreadyEmbedded = existing.Count;
+            toEmbed = toEmbed.Where(m => !existing.Contains(m.MessageId)).ToList();
+            if (toEmbed.Count == 0)
+            {
+                await UpdateStage(jobId, ReplicaStage.Embedding, 98, $"All {alreadyEmbedded} messages already in shared index", ct);
+                return alreadyEmbedded;
+            }
+
             using var embedder = new ReplicaEmbedder(http, msg => _ = service.ServiceLog(msg));
             await embedder.EnsureReadyAsync(ct);
 
@@ -402,16 +425,14 @@ namespace Omnipotent.Services.Omniscience.Replica
                     using var tx = conn.BeginTransaction();
                     using var cmd = conn.CreateCommand();
                     cmd.Transaction = tx;
-                    cmd.CommandText = @"INSERT OR REPLACE INTO replica_message_embeddings(person_id, message_id, embedding, embedded_at)
-                        VALUES($p, $m, $e, $t)";
-                    var pp = cmd.Parameters.Add("$p", SqliteType.Text);
+                    cmd.CommandText = @"INSERT OR REPLACE INTO message_embeddings(message_id, embedding, embedded_at)
+                        VALUES($m, $e, $t)";
                     var pm = cmd.Parameters.Add("$m", SqliteType.Text);
                     var pe = cmd.Parameters.Add("$e", SqliteType.Blob);
                     var pt = cmd.Parameters.Add("$t", SqliteType.Integer);
                     long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                     for (int i = 0; i < slice.Count; i++)
                     {
-                        pp.Value = personId;
                         pm.Value = slice[i].MessageId;
                         pe.Value = ReplicaEmbedder.PackEmbedding(vecs[i]);
                         pt.Value = now;
@@ -425,7 +446,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 int pct = 85 + (int)(13.0 * totalEmbedded / total); // 85 → 98
                 await UpdateStage(jobId, ReplicaStage.Embedding, pct, $"Embedded {totalEmbedded}/{total}", ct);
             }
-            return totalEmbedded;
+            return totalEmbedded + alreadyEmbedded;
         }
 
         // ── DB helpers ──

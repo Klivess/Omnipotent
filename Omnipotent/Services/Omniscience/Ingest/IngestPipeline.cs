@@ -31,6 +31,7 @@ namespace Omnipotent.Services.Omniscience.Ingest
         }
 
         public event Action<HarvestedMessage>? OnMessagePersisted;
+        public event Action<string, string>? OnImageAttachmentSaved; // (attachmentId, localPath)
 
         public async Task IngestAsync(HarvestedMessage msg, CancellationToken ct)
         {
@@ -118,27 +119,42 @@ namespace Omnipotent.Services.Omniscience.Ingest
             using (var get = conn.CreateCommand())
             {
                 get.Transaction = tx;
-                get.CommandText = "SELECT identity_id FROM platform_identities WHERE platform=$p AND platform_user_id=$u";
+                get.CommandText = "SELECT identity_id, platform_username, display_name, bio FROM platform_identities WHERE platform=$p AND platform_user_id=$u";
                 get.Parameters.AddWithValue("$p", ident.Platform);
                 get.Parameters.AddWithValue("$u", ident.PlatformUserId);
-                var existing = get.ExecuteScalar();
-                if (existing != null && existing != DBNull.Value)
+                string? idid = null, oldUsername = null, oldDisplay = null, oldBio = null;
+                using (var r = get.ExecuteReader())
                 {
-                    string idid = (string)existing;
-                    using var upd = conn.CreateCommand();
-                    upd.Transaction = tx;
-                    upd.CommandText = @"UPDATE platform_identities
-                        SET platform_username=COALESCE($un, platform_username),
-                            display_name=COALESCE($dn, display_name),
-                            bio=COALESCE($bio, bio),
-                            last_seen=$ls
-                        WHERE identity_id=$id";
-                    upd.Parameters.AddWithValue("$un", (object?)ident.Username ?? DBNull.Value);
-                    upd.Parameters.AddWithValue("$dn", (object?)ident.DisplayName ?? DBNull.Value);
-                    upd.Parameters.AddWithValue("$bio", (object?)ident.Bio ?? DBNull.Value);
-                    upd.Parameters.AddWithValue("$ls", new DateTimeOffset(now).ToUnixTimeMilliseconds());
-                    upd.Parameters.AddWithValue("$id", idid);
-                    upd.ExecuteNonQuery();
+                    if (r.Read())
+                    {
+                        idid = r.GetString(0);
+                        oldUsername = r.IsDBNull(1) ? null : r.GetString(1);
+                        oldDisplay = r.IsDBNull(2) ? null : r.GetString(2);
+                        oldBio = r.IsDBNull(3) ? null : r.GetString(3);
+                    }
+                }
+                if (idid != null)
+                {
+                    using (var upd = conn.CreateCommand())
+                    {
+                        upd.Transaction = tx;
+                        upd.CommandText = @"UPDATE platform_identities
+                            SET platform_username=COALESCE($un, platform_username),
+                                display_name=COALESCE($dn, display_name),
+                                bio=COALESCE($bio, bio),
+                                last_seen=$ls
+                            WHERE identity_id=$id";
+                        upd.Parameters.AddWithValue("$un", (object?)ident.Username ?? DBNull.Value);
+                        upd.Parameters.AddWithValue("$dn", (object?)ident.DisplayName ?? DBNull.Value);
+                        upd.Parameters.AddWithValue("$bio", (object?)ident.Bio ?? DBNull.Value);
+                        upd.Parameters.AddWithValue("$ls", new DateTimeOffset(now).ToUnixTimeMilliseconds());
+                        upd.Parameters.AddWithValue("$id", idid);
+                        upd.ExecuteNonQuery();
+                    }
+                    // Name/bio changes feed the identity timeline ("who were they last year").
+                    RecordIdentityChange(conn, tx, idid, "username", oldUsername, ident.Username, now);
+                    RecordIdentityChange(conn, tx, idid, "display_name", oldDisplay, ident.DisplayName, now);
+                    RecordIdentityChange(conn, tx, idid, "bio", oldBio, ident.Bio, now);
                     UpsertAltNames(conn, tx, idid, ident, now);
                     return idid;
                 }
@@ -178,6 +194,29 @@ namespace Omnipotent.Services.Omniscience.Ingest
             }
             UpsertAltNames(conn, tx, identityId, ident, now);
             return identityId;
+        }
+
+        // Records an identity field change (old \u2192 new) when the incoming value is present
+        // and different. Best-effort: identity_history only exists from schema v5.
+        private static void RecordIdentityChange(SqliteConnection conn, SqliteTransaction tx,
+            string identityId, string field, string? oldValue, string? newValue, DateTime now)
+        {
+            if (string.IsNullOrEmpty(newValue) || string.IsNullOrEmpty(oldValue)) return;
+            if (string.Equals(oldValue, newValue, StringComparison.Ordinal)) return;
+            try
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandText = @"INSERT INTO identity_history(identity_id, field, old_value, new_value, changed_at)
+                    VALUES($i,$f,$o,$n,$t)";
+                cmd.Parameters.AddWithValue("$i", identityId);
+                cmd.Parameters.AddWithValue("$f", field);
+                cmd.Parameters.AddWithValue("$o", oldValue);
+                cmd.Parameters.AddWithValue("$n", newValue);
+                cmd.Parameters.AddWithValue("$t", new DateTimeOffset(now).ToUnixTimeMilliseconds());
+                cmd.ExecuteNonQuery();
+            }
+            catch { /* pre-v5 schema */ }
         }
 
         // Insert any per-identity alt-names (per-guild nicknames, divergent global names, etc.)
@@ -312,6 +351,7 @@ namespace Omnipotent.Services.Omniscience.Ingest
                 try { File.Delete(tmp); } catch { }
             }
 
+            string attachmentId = Guid.NewGuid().ToString("N");
             await db.WriteLock.WaitAsync(ct);
             try
             {
@@ -320,7 +360,7 @@ namespace Omnipotent.Services.Omniscience.Ingest
                 cmd.CommandText = @"INSERT OR IGNORE INTO attachments
                     (attachment_id, message_id, kind, original_url, local_path, mime, size_bytes, sha256)
                     VALUES($id,$msg,$k,$u,$lp,$m,$s,$h)";
-                cmd.Parameters.AddWithValue("$id", Guid.NewGuid().ToString("N"));
+                cmd.Parameters.AddWithValue("$id", attachmentId);
                 cmd.Parameters.AddWithValue("$msg", messageId);
                 cmd.Parameters.AddWithValue("$k", (object?)att.Kind ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$u", att.OriginalUrl);
@@ -333,6 +373,11 @@ namespace Omnipotent.Services.Omniscience.Ingest
             finally
             {
                 db.WriteLock.Release();
+            }
+
+            if (att.Kind == "image")
+            {
+                try { OnImageAttachmentSaved?.Invoke(attachmentId, finalPath); } catch { }
             }
         }
     }

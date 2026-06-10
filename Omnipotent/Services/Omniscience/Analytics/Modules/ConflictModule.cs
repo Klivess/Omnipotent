@@ -16,7 +16,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class ConflictModule : IPersonAnalyticModule
     {
         public string Name => "conflict";
-        public int Version => 2;
+        public int Version => 3;
 
         private static readonly string[] Insults =
         {
@@ -32,6 +32,11 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             int total = 0, profane = 0, capsHeavy = 0, insulting = 0;
             var profanityCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var insultCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -76,7 +81,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 if (localScore >= 2) hourly[m.SentAt.Hour]++;
                 if (localScore >= 2 && c.Length is > 0 and < 240) samples.Add((localScore, c));
             }
-            return Task.FromResult(new JObject(
+            return new JObject(
                 new JProperty("messages_analysed", total),
                 new JProperty("profane_messages", profane),
                 new JProperty("caps_heavy_messages", capsHeavy),
@@ -93,7 +98,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("hourly_conflict_distribution", new JArray(hourly.Select(h => (JToken)h))),
                 new JProperty("conflict_score", total == 0 ? 0 :
                     (profane + capsHeavy + 2 * insulting) / (double)total)
-            ));
+            );
         }
     }
 }

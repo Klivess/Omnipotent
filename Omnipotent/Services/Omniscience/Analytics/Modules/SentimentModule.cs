@@ -12,7 +12,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class SentimentModule : IPersonAnalyticModule
     {
         public string Name => "sentiment";
-        public int Version => 2;
+        public int Version => 3;
 
         public static readonly IReadOnlyDictionary<string, double> Lex = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
         {
@@ -35,7 +35,14 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
+            var now = DateTime.UtcNow;
             double total = 0;
+            double weightedTotal = 0, weightSum = 0;
             int scored = 0;
             int pos = 0, neg = 0, neu = 0;
             // monthly trend
@@ -55,6 +62,9 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 if (hits == 0) { neu++; continue; }
                 double norm = s / Math.Max(1, hits);
                 total += norm;
+                double weight = TemporalWeighting.Weight(m.SentAt, now);
+                weightedTotal += norm * weight;
+                weightSum += weight;
                 scored++;
                 if (norm > 0.1) pos++; else if (norm < -0.1) neg++; else neu++;
                 string key = m.SentAt.ToString("yyyy-MM");
@@ -72,8 +82,9 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("month", k.Key),
                 new JProperty("avg", k.Value.sum / Math.Max(1, k.Value.n)),
                 new JProperty("count", k.Value.n)));
-            var payload = new JObject(
+            return new JObject(
                 new JProperty("avg_sentiment", avg),
+                new JProperty("recency_weighted_avg_sentiment", weightSum > 0 ? weightedTotal / weightSum : 0),
                 new JProperty("scored_messages", scored),
                 new JProperty("positive_count", pos),
                 new JProperty("negative_count", neg),
@@ -86,7 +97,6 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                     topNeg.OrderBy(t => t.score).Take(5).Select(t => new JObject(
                         new JProperty("score", t.score), new JProperty("text", t.text)))))
             );
-            return Task.FromResult(payload);
         }
     }
 }

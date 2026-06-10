@@ -14,7 +14,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class InterestInferenceModule : IPersonAnalyticModule
     {
         public string Name => "interests";
-        public int Version => 1;
+        public int Version => 2;
 
         private static readonly Dictionary<string, string[]> Categories = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -36,6 +36,12 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
         {
             using var conn = db.Open();
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
+            return Task.FromResult(AnalyticSplits.Apply(msgs, ComputeFromMessages,
+                AnalyticSplits.CompactWithArrays(5, "categories")));
+        }
+
+        internal static JObject ComputeFromMessages(List<AnalyticMessage> msgs)
+        {
             var hits = Categories.Keys.ToDictionary(k => k, _ => 0);
             foreach (var m in msgs)
             {
@@ -51,11 +57,11 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                 new JProperty("category", kv.Key),
                 new JProperty("hits", kv.Value),
                 new JProperty("share", total == 0 ? 0 : (double)kv.Value / total)));
-            return Task.FromResult(new JObject(
+            return new JObject(
                 new JProperty("total_hits", total),
                 new JProperty("messages_analysed", msgs.Count),
                 new JProperty("categories", new JArray(arr))
-            ));
+            );
         }
     }
 }

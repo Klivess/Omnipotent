@@ -21,7 +21,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
     public class MentionAffinityModule : IPersonAnalyticModule
     {
         public string Name => "mention_affinity";
-        public int Version => 1;
+        public int Version => 2;
 
         public Task<JObject> ComputeAsync(string personId, OmniscienceDb db, CancellationToken ct)
         {
@@ -34,6 +34,8 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
 
             var msgs = AnalyticHelpers.LoadMessages(conn, personId);
             var stats = new Dictionary<string, Stat>();
+            var statsRecent = new Dictionary<string, Stat>();
+            var cutoff90 = DateTime.UtcNow.AddDays(-90);
             // Pre-compile regex per candidate name (cap to avoid pathological regex sets).
             var regexes = candidates
                 .SelectMany(p => p.Names.Select(n => (p.PersonId, p.DisplayName, Name: n)))
@@ -54,18 +56,32 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                     if (!low.Contains(needle)) continue;
                     if (!Regex.IsMatch(low, "(^|[^a-z0-9_])" + Regex.Escape(needle) + "($|[^a-z0-9_])")) continue;
 
-                    if (!stats.TryGetValue(c.PersonId, out var s))
-                        s = new Stat { PersonId = c.PersonId, DisplayName = c.DisplayName };
-                    s.Mentions++;
-                    s.TotalSentiment += sent;
-                    if (sent > 0.1) s.PositiveMentions++;
-                    else if (sent < -0.1) s.NegativeMentions++;
-                    if (sent > 0.3 && s.Samples.Count < 3 && m.Content.Length < 240)
-                        s.Samples.Add(m.Content);
-                    stats[c.PersonId] = s;
+                    UpdateStat(stats, c.PersonId, c.DisplayName, sent, m.Content);
+                    if (m.SentAt >= cutoff90)
+                        UpdateStat(statsRecent, c.PersonId, c.DisplayName, sent, m.Content);
                 }
             }
 
+            return Task.FromResult(new JObject(
+                new JProperty("liked_people", Rank(stats, 20)),
+                new JProperty("liked_people_recent_90d", Rank(statsRecent, 10))));
+        }
+
+        private static void UpdateStat(Dictionary<string, Stat> stats, string personId, string displayName, double sent, string content)
+        {
+            if (!stats.TryGetValue(personId, out var s))
+                s = new Stat { PersonId = personId, DisplayName = displayName };
+            s.Mentions++;
+            s.TotalSentiment += sent;
+            if (sent > 0.1) s.PositiveMentions++;
+            else if (sent < -0.1) s.NegativeMentions++;
+            if (sent > 0.3 && s.Samples.Count < 3 && content.Length < 240)
+                s.Samples.Add(content);
+            stats[personId] = s;
+        }
+
+        private static JArray Rank(Dictionary<string, Stat> stats, int take)
+        {
             var ranked = stats.Values
                 .Where(s => s.Mentions >= 2)
                 .Select(s => new
@@ -76,7 +92,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                     s.Samples
                 })
                 .OrderByDescending(s => s.AffinityScore)
-                .Take(20)
+                .Take(take)
                 .Select(s => new JObject(
                     new JProperty("person_id", s.PersonId),
                     new JProperty("display_name", s.DisplayName),
@@ -86,8 +102,7 @@ namespace Omnipotent.Services.Omniscience.Analytics.Modules
                     new JProperty("avg_sentiment", s.AvgSentiment),
                     new JProperty("affinity_score", s.AffinityScore),
                     new JProperty("sample_messages", new JArray(s.Samples))));
-
-            return Task.FromResult(new JObject(new JProperty("liked_people", new JArray(ranked))));
+            return new JArray(ranked);
         }
 
         private static double ScoreSentiment(string content)
