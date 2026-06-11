@@ -241,104 +241,13 @@ namespace Omnipotent.Services.Stratum
             }, HttpMethod.Post, KMPermissions.Guest);
 
             // ── Agent Runs ──
+            // Legacy per-agent run starts — replaced by the unified Stratum Engineer conversation.
+            // Read endpoints (runs/list, runs/get, runs/events) stay so old run history remains viewable.
             await parent.CreateAPIRoute("/stratum/runs/start", async req =>
             {
-                try
-                {
-                    if (!RequireProject(req, out var user, out var project)) return;
-                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
-                    string agentTypeStr = (string?)body?.agentType ?? "Planning";
-                    string prompt = (string?)body?.prompt ?? "";
-                    if (string.IsNullOrWhiteSpace(prompt))
-                    {
-                        await req.ReturnResponse("prompt required", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-                    if (!Enum.TryParse<StratumAgentType>(agentTypeStr, true, out var agentType))
-                    {
-                        await req.ReturnResponse($"unknown agentType '{agentTypeStr}'", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    // Phase 2: only Planning is implemented. Reject other types up-front so
-                    // the UI can show a clear "coming in later phase" message.
-                    if (agentType != StratumAgentType.Planning && agentType != StratumAgentType.Mechanical && agentType != StratumAgentType.Simulation && agentType != StratumAgentType.Electronics && agentType != StratumAgentType.Firmware)
-                    {
-                        await req.ReturnResponse(
-                            JsonConvert.SerializeObject(new { error = $"Agent type {agentType} not yet implemented." }),
-                            code: HttpStatusCode.NotImplemented);
-                        return;
-                    }
-
-                    // Phase 7: per-user concurrency cap + rate limit.
-                    string? denyReason = parent.AgentManager.CheckAndRecordStart(user.UserID);
-                    if (denyReason != null)
-                    {
-                        await req.ReturnResponse(
-                            JsonConvert.SerializeObject(new { error = denyReason }),
-                            code: HttpStatusCode.TooManyRequests);
-                        return;
-                    }
-
-                    var attachmentIDs = new List<string>();
-                    if (body?.attachmentIDs != null)
-                    {
-                        foreach (var id in body.attachmentIDs)
-                        {
-                            string? s = (string?)id;
-                            if (!string.IsNullOrWhiteSpace(s)) attachmentIDs.Add(s);
-                        }
-                    }
-
-                    string targetRevID = project.Revisions.LastOrDefault()?.RevisionID ?? "";
-
-                    var run = new StratumAgentRun
-                    {
-                        RunID = Guid.NewGuid().ToString("N"),
-                        ProjectID = project.ProjectID,
-                        OwnerUserID = user.UserID,
-                        AgentType = agentType,
-                        UserPrompt = prompt,
-                        AttachmentIDs = attachmentIDs,
-                        TargetRevisionID = targetRevID,
-                        CreatedAt = DateTime.UtcNow,
-                        Status = StratumRunStatus.Pending,
-                    };
-
-                    if (agentType == StratumAgentType.Planning)
-                    {
-                        var plannerAgent = new StratumPlanningAgent();
-                        parent.AgentManager.StartRun(run, ctx => plannerAgent.RunAsync(ctx));
-                    }
-                    else if (agentType == StratumAgentType.Mechanical)
-                    {
-                        var mechAgent = new StratumMechanicalAgent(parent.PythonRunner);
-                        parent.AgentManager.StartRun(run, ctx => mechAgent.RunAsync(ctx));
-                    }
-                    else if (agentType == StratumAgentType.Electronics)
-                    {
-                        var catalog = await parent.GetPartsCatalogAsync();
-                        var elecAgent = new StratumElectronicsAgent(catalog);
-                        parent.AgentManager.StartRun(run, ctx => elecAgent.RunAsync(ctx));
-                    }
-                    else if (agentType == StratumAgentType.Firmware)
-                    {
-                        var fwAgent = new StratumFirmwareAgent(parent.PythonRunner);
-                        parent.AgentManager.StartRun(run, ctx => fwAgent.RunAsync(ctx));
-                    }
-                    else // Simulation
-                    {
-                        var simAgent = new StratumSimulationAgent(parent.ToolManager);
-                        parent.AgentManager.StartRun(run, ctx => simAgent.RunAsync(ctx));
-                    }
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        runID = run.RunID,
-                        status = run.Status.ToString(),
-                    }));
-                }
-                catch (Exception ex) { await Err(req, ex); }
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { error = "Per-agent runs have been replaced by the unified Stratum Engineer. Use POST /stratum/conversation/send." }),
+                    code: HttpStatusCode.Gone);
             }, HttpMethod.Post, KMPermissions.Guest);
 
             await parent.CreateAPIRoute("/stratum/runs/list", async req =>
@@ -558,54 +467,19 @@ namespace Omnipotent.Services.Stratum
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Guest);
 
-            // Send a message to the mechanical engineer. Body: { text: string }.
+            // Legacy chat write endpoints — replaced by the unified Engineer conversation.
             await parent.CreateAPIRoute("/stratum/chat/send", async req =>
             {
-                try
-                {
-                    if (!RequireProject(req, out var user, out var project)) return;
-                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
-                    string text = ((string?)body?.text ?? "").Trim();
-                    if (string.IsNullOrWhiteSpace(text))
-                    {
-                        await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-                    var chat = new StratumMechanicalEngineerChat(parent);
-                    var (userMsg, agentMsg) = await chat.SendUserMessageAsync(project, user.UserID, text, CancellationToken.None);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { userMessage = userMsg, agentMessage = agentMsg }));
-                }
-                catch (Exception ex) { await Err(req, ex); }
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { error = "The per-agent chat has been replaced by the unified Stratum Engineer conversation. Use POST /stratum/conversation/send." }),
+                    code: HttpStatusCode.Gone);
             }, HttpMethod.Post, KMPermissions.Guest);
 
-            // Approve a proposal message → patch the blueprint + spawn a focused amendment run.
-            // Query: messageID.
             await parent.CreateAPIRoute("/stratum/chat/approve-proposal", async req =>
             {
-                try
-                {
-                    if (!RequireProject(req, out var user, out var project)) return;
-                    string messageID = req.userParameters?.Get("messageID") ?? "";
-                    if (string.IsNullOrWhiteSpace(messageID))
-                    {
-                        await req.ReturnResponse("messageID required", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-                    string? denyReason = parent.AgentManager.CheckAndRecordStart(user.UserID);
-                    if (denyReason != null)
-                    {
-                        await req.ReturnResponse(JsonConvert.SerializeObject(new { error = denyReason }), code: HttpStatusCode.TooManyRequests);
-                        return;
-                    }
-                    var chat = new StratumMechanicalEngineerChat(parent);
-                    var run = await chat.ApproveProposalAsync(project, user.UserID, messageID, CancellationToken.None);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, runID = run?.RunID }));
-                }
-                catch (InvalidOperationException ex)
-                {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
-                }
-                catch (Exception ex) { await Err(req, ex); }
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { error = "Proposal approval moved to the unified conversation. Use POST /stratum/conversation/approve." }),
+                    code: HttpStatusCode.Gone);
             }, HttpMethod.Post, KMPermissions.Guest);
         }
 

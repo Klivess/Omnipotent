@@ -365,6 +365,34 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        /// <summary>
+        /// Append a user turn carrying text plus inline images (content-parts array). Used by the
+        /// vision feedback loop: requires a vision-capable model on a remote provider. Images are
+        /// sent as base64 data URIs.
+        /// </summary>
+        public void AppendUserContentToToolSession(string sessionId, string text, List<(byte[] data, string mimeType)> images)
+        {
+            var parts = new List<object>();
+            if (!string.IsNullOrWhiteSpace(text))
+                parts.Add(new HFWrapper.HFTextPart { text = text });
+            foreach (var (data, mimeType) in images ?? new List<(byte[], string)>())
+            {
+                if (data == null || data.Length == 0) continue;
+                parts.Add(new HFWrapper.HFImagePart
+                {
+                    image_url = new HFWrapper.HFImageUrl
+                    {
+                        url = $"data:{(string.IsNullOrWhiteSpace(mimeType) ? "image/png" : mimeType)};base64,{Convert.ToBase64String(data)}"
+                    }
+                });
+            }
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = parts });
+            }
+        }
+
         /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id.</summary>
         public void AppendToolResult(string sessionId, string toolCallId, string name, string content)
         {
@@ -384,7 +412,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -395,9 +423,9 @@ namespace Omnipotent.Services.KliveLLM
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride);
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride);
             var msg = response.choices[0].message;
-            var content = msg?.content ?? string.Empty;
+            var content = HFWrapper.ContentToText(msg?.content);
             var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
 
             lock (sessions)
@@ -463,7 +491,7 @@ namespace Omnipotent.Services.KliveLLM
                 // empty string so it neither crashes downstream parsing nor poisons the session
                 // history — a stored null re-serializes as "content": null on the next turn and is
                 // rejected by strict providers (Alibaba/Qwen) with a 400.
-                var content = response.choices[0].message.content ?? string.Empty;
+                var content = HFWrapper.ContentToText(response.choices[0].message.content);
                 session.chatHistory.AddMessage(AuthorRole.Assistant, content);
                 session.lastUpdated = DateTime.UtcNow;
 
@@ -577,13 +605,14 @@ namespace Omnipotent.Services.KliveLLM
             List<HFWrapper.HFMessage> structuredMessages,
             List<HFWrapper.HFTool> tools,
             int? maxTokensOverride,
-            bool forceFreeModel = false)
+            bool forceFreeModel = false,
+            string? modelOverride = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
-                model = remoteProvider.Model,
+                model = string.IsNullOrWhiteSpace(modelOverride) ? remoteProvider.Model : modelOverride,
                 stream = false,
                 max_tokens = maxTokensOverride,
                 tools = tools,

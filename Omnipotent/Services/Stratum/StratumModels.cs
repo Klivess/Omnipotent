@@ -75,6 +75,9 @@ namespace Omnipotent.Services.Stratum
         public const string Wiring = "wiring";
         public const string Firmware = "firmware";
         public const string SimulationResult = "simulation-result";
+        public const string Render = "render";                              // multi-view PNG of a part/assembly
+        public const string DimensionRegistry = "dimension-registry";       // shared named dimensions json
+        public const string VerifyReport = "verify-report";                 // STRATUM_VERIFY report json
     }
 
     /// <summary>

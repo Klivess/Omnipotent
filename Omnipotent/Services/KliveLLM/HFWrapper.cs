@@ -17,8 +17,11 @@ namespace Omnipotent.Services.KliveLLM
 
             // OpenAI permits null content when tool_calls is present, but some providers (Alibaba/Qwen
             // via OpenRouter) 400 on "content": null. Callers should coalesce to "" — never emit null.
+            //
+            // Either a plain string OR a content-parts array (List<object> of HFTextPart/HFImagePart)
+            // for vision-capable models. Use ContentToText() to read it as text — never cast directly.
             [JsonProperty("content")]
-            public string content;
+            public object content;
 
             // Present on an assistant turn that requested tool invocations.
             [JsonProperty("tool_calls", NullValueHandling = NullValueHandling.Ignore)]
@@ -31,6 +34,73 @@ namespace Omnipotent.Services.KliveLLM
             // Optional function name echoed back on a tool-result turn.
             [JsonProperty("name", NullValueHandling = NullValueHandling.Ignore)]
             public string name;
+        }
+
+        /// <summary>Text element of a content-parts array (OpenAI/OpenRouter vision format).</summary>
+        public class HFTextPart
+        {
+            [JsonProperty("type")]
+            public string type = "text";
+
+            [JsonProperty("text")]
+            public string text = "";
+        }
+
+        /// <summary>Image element of a content-parts array. Url is typically a base64 data URI.</summary>
+        public class HFImagePart
+        {
+            [JsonProperty("type")]
+            public string type = "image_url";
+
+            [JsonProperty("image_url")]
+            public HFImageUrl image_url = new();
+        }
+
+        public class HFImageUrl
+        {
+            [JsonProperty("url")]
+            public string url = "";
+        }
+
+        /// <summary>
+        /// Reads HFMessage.content as text regardless of shape: plain string, content-parts list,
+        /// or a JArray deserialized from a provider response. Image parts contribute nothing.
+        /// </summary>
+        public static string ContentToText(object content)
+        {
+            switch (content)
+            {
+                case null:
+                    return string.Empty;
+                case string s:
+                    return s;
+                case HFTextPart tp:
+                    return tp.text ?? string.Empty;
+                case Newtonsoft.Json.Linq.JValue jv:
+                    return jv.ToString();
+                case System.Collections.IEnumerable parts and not string:
+                {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var part in parts)
+                    {
+                        switch (part)
+                        {
+                            case HFTextPart t:
+                                sb.Append(t.text);
+                                break;
+                            case Newtonsoft.Json.Linq.JObject jo when (string?)jo["type"] == "text":
+                                sb.Append((string?)jo["text"]);
+                                break;
+                            case string str:
+                                sb.Append(str);
+                                break;
+                        }
+                    }
+                    return sb.ToString();
+                }
+                default:
+                    return content.ToString() ?? string.Empty;
+            }
         }
 
         public class HFToolCall

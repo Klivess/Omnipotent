@@ -14,7 +14,11 @@ namespace Omnipotent.Services.Stratum
         Mechanical,
         Electronics,
         Firmware,
-        Simulation
+        Simulation,
+        /// <summary>The unified Stratum Engineer: one tool-calling agent driving the whole
+        /// pipeline from the persistent project conversation. A "run" of this type is one
+        /// conversation turn.</summary>
+        Engineer
     }
 
     [JsonConverter(typeof(StringEnumConverter))]

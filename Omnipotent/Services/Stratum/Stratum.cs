@@ -20,9 +20,12 @@ namespace Omnipotent.Services.Stratum
         public StratumAgentManager AgentManager { get; private set; } = null!;
         public StratumPythonRunner PythonRunner { get; private set; } = null!;
         public StratumToolManager ToolManager { get; private set; } = null!;
+        public StratumTimelineStore Timeline { get; private set; } = null!;
+        public StratumEngineerTurnRunner EngineerTurnRunner { get; private set; } = null!;
         private StratumPartsCatalog? partsCatalog;
         private readonly SemaphoreSlim partsCatalogLock = new SemaphoreSlim(1, 1);
         private StratumRoutes routes = null!;
+        private StratumConversationRoutes conversationRoutes = null!;
 
         /// <summary>
         /// Lazily resolves the Mouser-backed parts catalog. The OmniSetting prompt only fires the
@@ -57,6 +60,8 @@ namespace Omnipotent.Services.Stratum
             AgentManager = new StratumAgentManager(this, RunStore);
             PythonRunner = new StratumPythonRunner();
             ToolManager = new StratumToolManager();
+            Timeline = new StratumTimelineStore(msg => ServiceLog(msg));
+            EngineerTurnRunner = new StratumEngineerTurnRunner(this, Timeline);
 
             // Mark any runs that were Running/AwaitingApproval before a restart as Interrupted —
             // their in-memory gate TCS is gone, so the user must start fresh.
@@ -64,11 +69,14 @@ namespace Omnipotent.Services.Stratum
             {
                 var allProjectIDs = Storage.AllProjectIDsSnapshot();
                 AgentManager.RecoverInterruptedRuns(allProjectIDs);
+                EngineerTurnRunner.RecoverInterruptedTurns();
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Stratum: failed to recover interrupted runs"); }
 
             routes = new StratumRoutes(this);
             await routes.RegisterRoutes();
+            conversationRoutes = new StratumConversationRoutes(this, Timeline, EngineerTurnRunner);
+            await conversationRoutes.RegisterRoutes();
 
             ServiceLog("Stratum service started.");
         }

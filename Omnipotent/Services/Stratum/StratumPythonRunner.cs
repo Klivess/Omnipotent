@@ -73,7 +73,25 @@ namespace Omnipotent.Services.Stratum
             await bootstrapLock.WaitAsync(ct);
             try
             {
-                if (Status().cadqueryInstalled) { bootstrapped = true; return; }
+                if (Status().cadqueryInstalled)
+                {
+                    // Venv predates the matplotlib requirement (render pipeline)? Top it up in place.
+                    var (mplExit, _, _) = await RunAsync(venvPython, new[] { "-c", "import matplotlib" }, null, TimeSpan.FromSeconds(30), null, null, ct);
+                    if (mplExit != 0)
+                    {
+                        progress("Installing matplotlib for headless part renders…");
+                        var (mplInstExit, _, mplErr) = await RunAsync(venvPython, new[] { "-m", "pip", "install", "matplotlib>=3.8,<4" }, null, TimeSpan.FromMinutes(5),
+                            line => progress($"pip: {line}"), ct);
+                        if (mplInstExit != 0)
+                        {
+                            string mplDetail = (mplErr ?? "").Trim();
+                            if (mplDetail.Length > 300) mplDetail = mplDetail.Substring(0, 300) + "…";
+                            progress($"matplotlib install failed (renders will be skipped): {mplDetail}");
+                        }
+                    }
+                    bootstrapped = true;
+                    return;
+                }
 
                 await EnsureVenvLocked(progress, ct);
 
@@ -375,6 +393,8 @@ namespace Omnipotent.Services.Stratum
             {
                 "cadquery>=2.4,<3.0",
                 "numpy>=1.24,<2.0",
+                // Headless multi-view part renders (Agg backend — no GPU/OpenGL needed).
+                "matplotlib>=3.8,<4",
                 // Newer cadquery uses cadquery-ocp; let pip resolve it.
             }) + "\n";
 
