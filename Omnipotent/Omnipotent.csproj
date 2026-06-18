@@ -9,6 +9,12 @@
 		<ApplicationIcon>favicon.ico</ApplicationIcon>
 		<ApplicationManifest>app.manifest</ApplicationManifest>
 		<UserSecretsId>e8c9937e-a45d-490b-b5b5-ed02c5bb4bce</UserSecretsId>
+		<!-- Steady-state perf for the long-running bot process: dynamic PGO re-optimizes hot paths
+		     (incl. Roslyn scripting) over time; Server GC raises throughput on a multi-service host. -->
+		<TieredCompilation>true</TieredCompilation>
+		<TieredPGO>true</TieredPGO>
+		<ServerGarbageCollection>true</ServerGarbageCollection>
+		<ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
 	</PropertyGroup>
 
 	<ItemGroup>

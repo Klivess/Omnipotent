@@ -444,6 +444,16 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly BindingFlags DeepFlags =
             BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
+        // Per-Type metadata caches for the DeepFlags discovery path (GetObjectMembers / GetObjectTypeInfo,
+        // which the agent calls repeatedly). Only the MemberInfo arrays are cached — never values, which are
+        // always read fresh — so this is safe and just skips redundant GetFields/GetProperties/GetMethods.
+        private static readonly ConcurrentDictionary<Type, FieldInfo[]> DeepFieldCache = new();
+        private static readonly ConcurrentDictionary<Type, PropertyInfo[]> DeepPropCache = new();
+        private static readonly ConcurrentDictionary<Type, MethodInfo[]> DeepMethodCache = new();
+        private static FieldInfo[] GetDeepFields(Type t) => DeepFieldCache.GetOrAdd(t, x => x.GetFields(DeepFlags));
+        private static PropertyInfo[] GetDeepProperties(Type t) => DeepPropCache.GetOrAdd(t, x => x.GetProperties(DeepFlags));
+        private static MethodInfo[] GetDeepMethods(Type t) => DeepMethodCache.GetOrAdd(t, x => x.GetMethods(DeepFlags));
+
         /// <summary>
         /// Read any field or property — including private ones — from any arbitrary object.
         /// Use this to navigate into sub-objects returned by GetServiceObject() or a previous GetObjectMember().
@@ -540,7 +550,7 @@ namespace Omnipotent.Services.KliveAgent
             if (type.BaseType != null && type.BaseType != typeof(object))
                 sb.AppendLine($"Base: {type.BaseType.FullName}");
 
-            var fields = type.GetFields(DeepFlags)
+            var fields = GetDeepFields(type)
                 .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
                 .OrderBy(f => f.Name);
             foreach (var f in fields)
@@ -556,12 +566,12 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine($"  field [{(f.IsPublic ? "pub" : "prv")}] {SimplifyTypeName(f.FieldType)} {f.Name}{state}");
             }
 
-            foreach (var p in type.GetProperties(DeepFlags)
+            foreach (var p in GetDeepProperties(type)
                 .Where(p => p.GetIndexParameters().Length == 0)
                 .OrderBy(p => p.Name))
                 sb.AppendLine($"  prop  {SimplifyTypeName(p.PropertyType)} {p.Name}");
 
-            foreach (var m in type.GetMethods(DeepFlags)
+            foreach (var m in GetDeepMethods(type)
                 .Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object))
                 .OrderBy(m => m.Name))
             {
@@ -619,7 +629,7 @@ namespace Omnipotent.Services.KliveAgent
                 || n.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
 
             if (WantKind("field"))
-                foreach (var f in type.GetFields(DeepFlags)
+                foreach (var f in GetDeepFields(type)
                     .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
                     .OrderBy(f => f.Name))
                     if (NameOk(f.Name))
@@ -641,14 +651,14 @@ namespace Omnipotent.Services.KliveAgent
                     }
 
             if (WantKind("property"))
-                foreach (var p in type.GetProperties(DeepFlags)
+                foreach (var p in GetDeepProperties(type)
                     .Where(p => p.GetIndexParameters().Length == 0)
                     .OrderBy(p => p.Name))
                     if (NameOk(p.Name))
                         result.Add(new AgentObjectMember { Kind = "property", Visibility = ((p.GetMethod ?? p.SetMethod)?.IsPublic == true) ? "public" : "private", Name = p.Name, Type = SimplifyTypeName(p.PropertyType), IsStatic = (p.GetMethod ?? p.SetMethod)?.IsStatic == true });
 
             if (WantKind("method"))
-                foreach (var m in type.GetMethods(DeepFlags)
+                foreach (var m in GetDeepMethods(type)
                     .Where(m => !m.IsSpecialName && m.DeclaringType != typeof(object))
                     .OrderBy(m => m.Name).ThenBy(m => m.GetParameters().Length))
                     if (NameOk(m.Name))
@@ -1944,6 +1954,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             var assemblies = AppDomain.CurrentDomain.GetAssemblies()
                 .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location))
+                .Where(a => !IsNonScriptReference(a))
                 .ToArray();
 
             scriptOptions = ScriptOptions.Default
@@ -1957,6 +1968,48 @@ namespace Omnipotent.Services.KliveAgent
                     "Omnipotent.Services.KliveAgent.Models",
                     "Omnipotent.Service_Manager"
                 );
+        }
+
+        /// <summary>
+        /// Assemblies that user scripts never legitimately name at COMPILE time (the Roslyn/scripting host,
+        /// analyzers, build/IDE tooling). Excluding them trims the reference set Roslyn binds against on the
+        /// first compile of every session, shaving cold-start time. Deliberately conservative: scripts DO
+        /// `new` and reference types across Omnipotent + its real deps (DSharpPlus, Newtonsoft, BouncyCastle,
+        /// the BCL …), so those stay referenced. If a script ever hits a missing-reference error, loosen this.
+        /// </summary>
+        private static bool IsNonScriptReference(Assembly a)
+        {
+            var name = a.GetName().Name ?? string.Empty;
+            return name.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)   // Roslyn itself
+                || name.StartsWith("Microsoft.VisualStudio", StringComparison.Ordinal)   // IDE/test tooling
+                || name.StartsWith("Microsoft.Build", StringComparison.Ordinal)          // MSBuild
+                || name.StartsWith("Microsoft.TestPlatform", StringComparison.Ordinal)
+                || name.Equals("Microsoft.DiaSymReader", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Pays Roslyn's one-time cold-start (JIT of the compiler + priming the shared AssemblyMetadata cache
+        /// for the whole reference set) at service boot instead of on the user's first message. Runs a tiny
+        /// throwaway script through BOTH code paths — the initial CSharpScript.Create+Compile+RunAsync and a
+        /// ContinueWithAsync continuation — since they JIT separately. Fire-and-forget; failures are harmless.
+        /// Because every session reuses the same scriptOptions (same MetadataReference objects), the cache this
+        /// primes is shared, so later sessions' first compiles are fast too.
+        /// </summary>
+        public async Task WarmupAsync()
+        {
+            try
+            {
+                var sw = Stopwatch.StartNew();
+                var session = CreateSession(new ScriptGlobals(agentService));
+                await session.ExecuteAsync("1 + 1");   // primes Create + Compile + RunAsync
+                await session.ExecuteAsync("2 + 2");   // primes the ContinueWithAsync path
+                sw.Stop();
+                try { await agentService.ServiceLog($"[KliveAgent] Script engine warmed up in {sw.ElapsedMilliseconds}ms.", appearInConsole: false); } catch { }
+            }
+            catch (Exception ex)
+            {
+                try { await agentService.ServiceLogError(ex, "[KliveAgent] Script engine warmup (non-fatal)."); } catch { }
+            }
         }
 
         public ScriptExecutionSession CreateSession(ScriptGlobals globals)

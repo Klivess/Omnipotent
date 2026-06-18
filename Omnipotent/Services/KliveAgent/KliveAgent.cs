@@ -71,6 +71,9 @@ namespace Omnipotent.Services.KliveAgent
                 // Initialize subsystems
                 scriptEngine = new KliveAgentScriptEngine(this);
                 scriptEngine.Initialize();
+                // Pay Roslyn's cold-start now (overlapped with the rest of init below) so the user's first
+                // script doesn't eat the ~1s+ first-compile penalty. Fire-and-forget; safe if it fails.
+                _ = scriptEngine.WarmupAsync();
 
                 Memory = new KliveAgentMemory(this);
                 await Memory.InitializeAsync();
