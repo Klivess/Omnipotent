@@ -157,12 +157,13 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code. Compile errors now show the error id, the exact line:col, the offending source line, and a caret (^) under the bad token — fix THAT line; don't blame a different call. Runtime errors show the exception type, inner-cause chain, and stack — read them.");
             sb.AppendLine("- RETURN TYPES: FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation each return ONE formatted string — Log() it directly; NEVER `foreach` over it (iterating a string yields chars → 'cannot convert char to string'). Only ListServices, GetObjectMembers, RecallMemories/ByTag return lists you loop.");
             sb.AppendLine("- CODEBASE CONTENT SEARCH: prefer the native `grep` tool over running SearchCode/SearchCodeRegex inside execute_csharp — `grep` returns the same `path:line` matches directly with NO compile step to get wrong. `pattern` is regex (set `fixedString=true` for a literal); `path` scopes to a file/subfolder. Drop into execute_csharp only when you need to post-process matches programmatically.");
+            sb.AppendLine("- READ & LIST FILES via native tools: `read_file` (repo-relative path, optional startLine/maxLines) and `list_directory` (codebase folder) run directly with NO compile step. CRITICAL: a file read is a TOOL CALL — NEVER paste `{\"path\":...}` JSON as an execute_csharp script; that's a syntax error, not code. For RUNTIME data (SavedData/...), call `get_global_path(\"SomeKey\")` to resolve the absolute path, and inside execute_csharp use ListDataDirectory(keyOrPath, pattern) for a STRUCTURED file list (Name/SizeBytes/LastModifiedUtc) you index/LINQ — e.g. pick a random reel: `var r = ListDataDirectory(\"MemeScraperReelsDataDirectory\",\"*.json\"); var pick = r[new Random().Next(r.Count)];`.");
             sb.AppendLine("- DON'T CHASE SOURCE FILES you don't need: once GetTypeSchema/GetObjectMembers have shown you a live object's methods, just call them. Read .cs source only when you genuinely need implementation details the live API can't give you.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
             sb.AppendLine("- NEVER invent identifiers. Method names, line numbers, file contents, and field values you put in your final answer MUST come verbatim from a tool output you actually received this turn. If the tool returned nothing useful, say 'I couldn't find that' — do NOT confabulate plausible-sounding C# names.");
             sb.AppendLine("- To list private static METHODS in a file (not fields), use SearchCodeRegex with a method-signature pattern: `SearchCodeRegex(@\"^\\s*private\\s+static\\s+(?!readonly)[\\w<>?,\\s\\[\\]]+\\s+\\w+\\s*\\(\", \"path/to/File.cs\")`. The `(?!readonly)` excludes field declarations.");
-            sb.AppendLine("- When the user names a specific file (e.g. 'Read X.cs and ...'), call ReadFile(path) directly. Use SearchCode/SearchCodeHybrid only when the file or location is unknown.");
+            sb.AppendLine("- When the user names a specific file (e.g. 'Read X.cs and ...'), call the `read_file` tool (or ReadFile(path) in a script) directly. Use grep/SearchCode/SearchCodeHybrid only when the file or location is unknown.");
             sb.AppendLine("- SearchCode(text, subfolder) accepts a single .cs file path as the second arg, not just a directory — pass the full file path when you want to search inside ONE file.");
             sb.AppendLine("- If the SAME tool errors twice with the SAME message, STOP retrying it. Switch tools (e.g. SearchCode → ReadFile, or RecallMemories → RecallMemoriesByTag) or accept the answer and finalize.");
             sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStatsSummary() — a FLAT, safely-serializable snapshot — or GetScriptFailureBreakdown() for the top error codes. (GetAgentStats() still exists but its nested shape can trip JSON depth limits.) Do NOT search the codebase or claim 'no metric exists'.");
@@ -171,7 +172,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
             sb.AppendLine("- For MULTI-STEP tasks (output of step 1 feeds step 2 feeds step 3), chain everything in ONE script block using local variables and `Log` each intermediate so you can see the chain. Use ONLY real APIs from this guide — do NOT invent helper functions like `ParseTopService` or `Aggregate`; if you need parsing, write the regex / LINQ inline. The full pipeline template appears below in [Common Patterns]. Do NOT split a pipeline into separate scripts — locals from script 1 are GONE in script 2.");
             sb.AppendLine("- EMPTY-PREMISE RULE: if the data needed to answer is empty (zero errors, zero matches, no memories with that tag), the EMPTY STATE IS THE ANSWER. Report it directly. Do NOT save a vacuous self-improvement memory, propose imaginary fixes, or fabricate work — 'no errors today' is a complete answer.");
-            sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
+            sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature, and each FIELD reports its live state: .IsNull (true/false) and .RuntimeType (actual type when it differs from declared). So check m.IsNull BEFORE diving into a field — don't discover nulls via NullReferenceException. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
             sb.AppendLine("- DSharpPlus live objects cache STALE/empty collections (DiscordGuild.Channels, GuildContainingKlives.Channels). For authoritative data use the async accessors: var g = await CallObjectMethod(GetObjectMember(GetService(\"KliveBotDiscord\"),\"Client\"), \"GetGuildAsync\", guildId, (bool?)null); then await CallObjectMethod(g, \"GetChannelsAsync\"). The live client field is 'Client', NOT 'botClient'.");
             sb.AppendLine("- Final answer = a reply that runs NO scripts (no execute_csharp call and no {{{ }}} block). Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
             sb.AppendLine();
@@ -377,9 +378,16 @@ namespace Omnipotent.Services.KliveAgent
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory"
         };
 
-        /// <summary>True for native tools that are dispatched directly (outside Roslyn) — memory tools plus
-        /// `grep`. Anything else is routed to execute_csharp.</summary>
-        private static bool IsNonScriptTool(string name) => name == "grep" || MemoryToolNames.Contains(name);
+        /// <summary>Native tools dispatched directly (outside Roslyn): the code/file/path tools.
+        /// Combined with MemoryToolNames in IsNonScriptTool.</summary>
+        private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
+        {
+            "grep", "read_file", "list_directory", "get_global_path"
+        };
+
+        /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
+        /// tools plus memory tools. Anything else is routed to execute_csharp.</summary>
+        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name);
 
         /// <summary>
         /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
@@ -413,6 +421,26 @@ namespace Omnipotent.Services.KliveAgent
                         maxResults = new { type = "integer", description = "Max matches to return (default 30)." },
                         fixedString = new { type = "boolean", description = "Treat pattern as a literal substring instead of regex (default false)." }
                     }, required = new[] { "pattern" } }),
+
+                Tool("read_file",
+                    "Read a SOURCE file from the codebase directly — no C#/compile step. Path is relative to the repo root (e.g. \"Omnipotent/Services/KliveAgent/KliveAgent.cs\"). NEVER send {\"path\":...} JSON as an execute_csharp script — that's THIS tool; call it. Use startLine/maxLines to page large files.",
+                    new { type = "object", properties = new {
+                        path = new { type = "string", description = "Repo-relative file path." },
+                        startLine = new { type = "integer", description = "1-based start line (default 1)." },
+                        maxLines = new { type = "integer", description = "Max lines to return (default 200)." }
+                    }, required = new[] { "path" } }),
+
+                Tool("list_directory",
+                    "List files and folders in a CODEBASE directory (repo-relative, e.g. \"Omnipotent/Services\"). Runs directly — no compile step. For RUNTIME data directories (SavedData/...), use get_global_path then read in execute_csharp.",
+                    new { type = "object", properties = new {
+                        path = new { type = "string", description = "Repo-relative directory (default: repo root)." }
+                    }, required = Array.Empty<string>() }),
+
+                Tool("get_global_path",
+                    "Resolve a runtime DATA path constant to an absolute path (e.g. \"MemeScraperReelsDataDirectory\" -> ...\\SavedData\\MemeScraper\\Instagram\\Reels). Use this instead of reflecting through OmniPaths.GlobalPaths by hand.",
+                    new { type = "object", properties = new {
+                        key = new { type = "string", description = "A GlobalPaths field name." }
+                    }, required = new[] { "key" } }),
 
                 Tool("recall_memories",
                     "Search your long-term memory for facts about Klive, his preferences/people/projects/history, " +
@@ -489,6 +517,20 @@ namespace Omnipotent.Services.KliveAgent
                     return BoolOr("fixedString", false)
                         ? globals.SearchCode(pattern, path, maxResults)
                         : globals.SearchCodeRegex(pattern, path, maxResults);
+                }
+                case "read_file":
+                {
+                    var path = Str("path");
+                    if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' is required.";
+                    return globals.ReadFile(path, IntOr("startLine", 1), IntOr("maxLines", 200));
+                }
+                case "list_directory":
+                    return globals.ListDirectory(Str("path") ?? string.Empty);
+                case "get_global_path":
+                {
+                    var key = Str("key");
+                    if (string.IsNullOrWhiteSpace(key)) return "Error: 'key' is required.";
+                    return globals.GetGlobalPath(key);
                 }
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));

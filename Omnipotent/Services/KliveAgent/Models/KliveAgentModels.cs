@@ -431,7 +431,36 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("isStatic")]
         public bool IsStatic { get; set; }
 
-        public override string ToString() => Signature ?? $"{Kind} {Type} {Name}";
+        /// <summary>For FIELDS read off a live object: whether the current value is null. Null = not probed
+        /// (methods, and properties — whose getters are skipped to avoid side effects).</summary>
+        [JsonProperty("isNull")]
+        public bool? IsNull { get; set; }
+
+        /// <summary>For FIELDS with a non-null live value whose runtime type differs from the declared type:
+        /// the actual runtime type name. Null otherwise.</summary>
+        [JsonProperty("runtimeType")]
+        public string? RuntimeType { get; set; }
+
+        public override string ToString()
+        {
+            if (Signature != null) return Signature;
+            var state = IsNull == true ? " = null" : (RuntimeType != null ? $" = {RuntimeType}" : string.Empty);
+            return $"{Kind} {Type} {Name}{state}";
+        }
+    }
+
+    /// <summary>A single entry from ListDataDirectory — a file or folder in a runtime data directory.
+    /// Scalars only, safe to serialize.</summary>
+    public class AgentFileEntry
+    {
+        public string Name { get; set; } = string.Empty;
+        public string FullPath { get; set; } = string.Empty;
+        public bool IsDirectory { get; set; }
+        public long SizeBytes { get; set; }
+        public DateTime LastModifiedUtc { get; set; }
+
+        public override string ToString() =>
+            IsDirectory ? $"[DIR]  {Name}/" : $"[FILE] {Name} ({SizeBytes:N0} bytes, {LastModifiedUtc:yyyy-MM-dd})";
     }
 
     public class ServiceInfo

@@ -544,7 +544,17 @@ namespace Omnipotent.Services.KliveAgent
                 .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
                 .OrderBy(f => f.Name);
             foreach (var f in fields)
-                sb.AppendLine($"  field [{(f.IsPublic ? "pub" : "prv")}] {SimplifyTypeName(f.FieldType)} {f.Name}");
+            {
+                string state = string.Empty;
+                try
+                {
+                    var val = f.GetValue(f.IsStatic ? null : obj);
+                    if (val == null) state = " = null";
+                    else if (val.GetType() != f.FieldType) state = $" = {SimplifyTypeName(val.GetType())}";
+                }
+                catch { }
+                sb.AppendLine($"  field [{(f.IsPublic ? "pub" : "prv")}] {SimplifyTypeName(f.FieldType)} {f.Name}{state}");
+            }
 
             foreach (var p in type.GetProperties(DeepFlags)
                 .Where(p => p.GetIndexParameters().Length == 0)
@@ -613,7 +623,22 @@ namespace Omnipotent.Services.KliveAgent
                     .Where(f => !f.Name.Contains("BackingField") && !f.Name.StartsWith("<"))
                     .OrderBy(f => f.Name))
                     if (NameOk(f.Name))
-                        result.Add(new AgentObjectMember { Kind = "field", Visibility = f.IsPublic ? "public" : "private", Name = f.Name, Type = SimplifyTypeName(f.FieldType), IsStatic = f.IsStatic });
+                    {
+                        // Probe the live value (fields only — cheap, no getter side effects) so the agent sees
+                        // null-state + the real runtime type at discovery time instead of via NullReferenceException.
+                        bool? isNull = null;
+                        string? runtimeType = null;
+                        try
+                        {
+                            var val = f.GetValue(f.IsStatic ? null : obj);
+                            isNull = val == null;
+                            if (val != null && val.GetType() != f.FieldType)
+                                runtimeType = SimplifyTypeName(val.GetType());
+                        }
+                        catch { }
+
+                        result.Add(new AgentObjectMember { Kind = "field", Visibility = f.IsPublic ? "public" : "private", Name = f.Name, Type = SimplifyTypeName(f.FieldType), IsStatic = f.IsStatic, IsNull = isNull, RuntimeType = runtimeType });
+                    }
 
             if (WantKind("property"))
                 foreach (var p in type.GetProperties(DeepFlags)
@@ -875,6 +900,27 @@ namespace Omnipotent.Services.KliveAgent
             return full;
         }
 
+        /// <summary>
+        /// Resolve a runtime DATA path constant to an absolute path — no more reflecting through
+        /// OmniPaths.GlobalPaths by hand. `key` is a GlobalPaths field name (e.g. "MemeScraperReelsDataDirectory").
+        /// Returns the absolute path under the app base directory, or a "Did you mean" suggestion on a typo.
+        /// Example: var dir = GetGlobalPath("MemeScraperReelsDataDirectory");
+        /// </summary>
+        public string GetGlobalPath(string key)
+        {
+            if (string.IsNullOrWhiteSpace(key)) return "Error: key is required.";
+
+            var gpType = typeof(Omnipotent.Data_Handling.OmniPaths.GlobalPaths);
+            var fields = gpType.GetFields(BindingFlags.Public | BindingFlags.Static);
+            var field = Array.Find(fields, f => f.Name.Equals(key, StringComparison.Ordinal))
+                ?? Array.Find(fields, f => f.Name.Equals(key, StringComparison.OrdinalIgnoreCase));
+            if (field == null)
+                return $"Unknown global path key '{key}'.{SuggestClosest(key, fields.Select(f => f.Name))}";
+
+            var token = field.GetValue(null) as string ?? string.Empty;
+            return Omnipotent.Data_Handling.OmniPaths.GetPath(token);
+        }
+
         /// <summary>List files and folders in a codebase directory. Path is relative to the project root (e.g. "Omnipotent/Services").</summary>
         public string ListDirectory(string relativePath = "")
         {
@@ -901,7 +947,64 @@ namespace Omnipotent.Services.KliveAgent
             return sb.ToString();
         }
 
-        /// <summary>Read a source file from the codebase. Path is relative to project root (e.g. "Omnipotent/Services/KliveAgent/KliveAgent.cs"). 
+        /// <summary>Resolve a data path that may be a GlobalPaths KEY (e.g. "MemeScraperReelsDataDirectory")
+        /// or a base-directory-relative / absolute path. Used by ListDataDirectory.</summary>
+        private static string ResolveDataPath(string pathOrKey)
+        {
+            if (string.IsNullOrWhiteSpace(pathOrKey)) return AppDomain.CurrentDomain.BaseDirectory;
+
+            var gpType = typeof(Omnipotent.Data_Handling.OmniPaths.GlobalPaths);
+            var fields = gpType.GetFields(BindingFlags.Public | BindingFlags.Static);
+            var field = Array.Find(fields, f => f.Name.Equals(pathOrKey, StringComparison.Ordinal))
+                ?? Array.Find(fields, f => f.Name.Equals(pathOrKey, StringComparison.OrdinalIgnoreCase));
+            if (field != null)
+                return Omnipotent.Data_Handling.OmniPaths.GetPath(field.GetValue(null) as string ?? string.Empty);
+
+            return Path.IsPathRooted(pathOrKey)
+                ? pathOrKey
+                : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, pathOrKey);
+        }
+
+        /// <summary>
+        /// STRUCTURED listing of a runtime DATA directory (what ListDirectory — codebase-only — can't reach).
+        /// `pathOrKey` is a GlobalPaths key (e.g. "MemeScraperReelsDataDirectory") OR a base-relative/absolute path.
+        /// Returns a List&lt;AgentFileEntry&gt; (Name, FullPath, IsDirectory, SizeBytes, LastModifiedUtc) to LINQ over
+        /// inline — e.g. pick a random file. Returns the FULL list (dirs can hold tens of thousands of files), so
+        /// index/LINQ it; do NOT Log() the whole thing.
+        /// Example: var reels = ListDataDirectory("MemeScraperReelsDataDirectory", "*.json"); var pick = reels[new Random().Next(reels.Count)];
+        /// </summary>
+        public List<AgentFileEntry> ListDataDirectory(string pathOrKey, string pattern = "*", bool recursive = false)
+        {
+            var result = new List<AgentFileEntry>();
+            var dir = ResolveDataPath(pathOrKey);
+            if (!Directory.Exists(dir)) return result;
+
+            var option = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            foreach (var path in Directory.GetFileSystemEntries(dir, string.IsNullOrWhiteSpace(pattern) ? "*" : pattern, option))
+            {
+                bool isDir = Directory.Exists(path);
+                long size = 0;
+                DateTime mtime;
+                try
+                {
+                    if (isDir) mtime = Directory.GetLastWriteTimeUtc(path);
+                    else { var fi = new FileInfo(path); size = fi.Length; mtime = fi.LastWriteTimeUtc; }
+                }
+                catch { mtime = DateTime.MinValue; }
+
+                result.Add(new AgentFileEntry
+                {
+                    Name = Path.GetFileName(path),
+                    FullPath = path,
+                    IsDirectory = isDir,
+                    SizeBytes = size,
+                    LastModifiedUtc = mtime
+                });
+            }
+            return result;
+        }
+
+        /// <summary>Read a source file from the codebase. Path is relative to project root (e.g. "Omnipotent/Services/KliveAgent/KliveAgent.cs").
         /// Returns up to maxLines lines starting from startLine (1-based). Use startLine/maxLines to page through large files.</summary>
         public string ReadFile(string relativePath, int startLine = 1, int maxLines = 200)
         {
