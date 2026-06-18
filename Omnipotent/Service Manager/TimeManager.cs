@@ -148,7 +148,10 @@ namespace Omnipotent.Service_Manager
                 try
                 {
                     ScheduledTask task = JsonConvert.DeserializeObject<ScheduledTask>(await GetDataHandler().ReadDataFromFile(item));
-                    tasks.Add(task);
+                    if (task != null)
+                    {
+                        tasks.Add(task);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -178,43 +181,58 @@ namespace Omnipotent.Service_Manager
         {
             //Begin task waiting loop
             //Begin waiting for each task, and checking for new tasks to appear.
-            ScheduledTask[] copyOfTasks = tasks.ToArray();
-            foreach (var item in copyOfTasks)
+            while (true)
             {
-                if (!waitingTasks.Contains(item.randomidentifier))
+                try
                 {
-                    if (item.HasTaskTimePassed())
+                    ScheduledTask[] copyOfTasks = tasks.ToArray();
+                    foreach (var item in copyOfTasks)
                     {
-                        Thread thread = new Thread(async () =>
+                        //Guard against null entries (e.g. from a corrupt/empty task file) to avoid crashing the loop.
+                        if (item == null)
                         {
-                            //Wait for that corresponding service to be active.
-                            try
-                            {
-                                while (GetServiceByName(item.agentName).IsServiceActive() == false) { Task.Delay(100).Wait(); }
-                            }
-                            catch (Exception) { }
-                            //Wait for that service to subscribe to taskdue
-                            await Task.Delay(600);
-                            if (TaskDue != null)
-                            {
-                                TaskDue.Invoke(this, item);
-                            }
-                            //Remove task from list, and delete file.
                             tasks.Remove(item);
-                            await DeleteTaskFileAsync(item);
-                        });
-                        thread.Start();
-                    }
-                    else
-                    {
-                        BeginWaitForTask(item);
-                        waitingTasks.Add(item.randomidentifier);
+                            continue;
+                        }
+                        if (!waitingTasks.Contains(item.randomidentifier))
+                        {
+                            if (item.HasTaskTimePassed())
+                            {
+                                Thread thread = new Thread(async () =>
+                                {
+                                    //Wait for that corresponding service to be active.
+                                    try
+                                    {
+                                        while (GetServiceByName(item.agentName).IsServiceActive() == false) { Task.Delay(100).Wait(); }
+                                    }
+                                    catch (Exception) { }
+                                    //Wait for that service to subscribe to taskdue
+                                    await Task.Delay(600);
+                                    if (TaskDue != null)
+                                    {
+                                        TaskDue.Invoke(this, item);
+                                    }
+                                    //Remove task from list, and delete file.
+                                    tasks.Remove(item);
+                                    await DeleteTaskFileAsync(item);
+                                });
+                                thread.Start();
+                            }
+                            else
+                            {
+                                BeginWaitForTask(item);
+                                waitingTasks.Add(item.randomidentifier);
+                            }
+                        }
                     }
                 }
+                catch (Exception ex)
+                {
+                    ServiceLogError(ex, "Error in TimeManager WaitLoop.");
+                }
+                await Task.Delay(2000);
+                GC.Collect();
             }
-            await Task.Delay(2000);
-            GC.Collect();
-            WaitLoop();
         }
 
         public async Task<ScheduledTask?> GetTask(string taskName)
