@@ -156,6 +156,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- GetService(name) returns object (sync). To read/call on it: `await CallObjectMethod(GetService(\"X\"), \"Method\", args)`, or `GetObjectMember(GetService(\"X\"), \"Field\")`.");
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code. Compile errors now show the error id, the exact line:col, the offending source line, and a caret (^) under the bad token — fix THAT line; don't blame a different call. Runtime errors show the exception type, inner-cause chain, and stack — read them.");
             sb.AppendLine("- RETURN TYPES: FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation each return ONE formatted string — Log() it directly; NEVER `foreach` over it (iterating a string yields chars → 'cannot convert char to string'). Only ListServices, GetObjectMembers, RecallMemories/ByTag return lists you loop.");
+            sb.AppendLine("- CODEBASE CONTENT SEARCH: prefer the native `grep` tool over running SearchCode/SearchCodeRegex inside execute_csharp — `grep` returns the same `path:line` matches directly with NO compile step to get wrong. `pattern` is regex (set `fixedString=true` for a literal); `path` scopes to a file/subfolder. Drop into execute_csharp only when you need to post-process matches programmatically.");
             sb.AppendLine("- DON'T CHASE SOURCE FILES you don't need: once GetTypeSchema/GetObjectMembers have shown you a live object's methods, just call them. Read .cs source only when you genuinely need implementation details the live API can't give you.");
             sb.AppendLine("- Never claim an action is done unless a script in this turn ran and returned [OK].");
             sb.AppendLine("- TRUST the tool result. If GetRecentErrors(N) returns an empty list, that means there are zero errors — that IS the answer. Do NOT reflect into OmniLogging fields to second-guess it.");
@@ -164,7 +165,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- When the user names a specific file (e.g. 'Read X.cs and ...'), call ReadFile(path) directly. Use SearchCode/SearchCodeHybrid only when the file or location is unknown.");
             sb.AppendLine("- SearchCode(text, subfolder) accepts a single .cs file path as the second arg, not just a directory — pass the full file path when you want to search inside ONE file.");
             sb.AppendLine("- If the SAME tool errors twice with the SAME message, STOP retrying it. Switch tools (e.g. SearchCode → ReadFile, or RecallMemories → RecallMemoriesByTag) or accept the answer and finalize.");
-            sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStats() — do NOT search the codebase or claim 'no metric exists'.");
+            sb.AppendLine("- For run-time stats about yourself (scripts run today, failure rate, token usage), call GetAgentStatsSummary() — a FLAT, safely-serializable snapshot — or GetScriptFailureBreakdown() for the top error codes. (GetAgentStats() still exists but its nested shape can trip JSON depth limits.) Do NOT search the codebase or claim 'no metric exists'.");
             sb.AppendLine("- For 'in the last N minutes' filters on errors, call GetRecentErrors(50) once and filter the formatted timestamps yourself. Do NOT call it repeatedly with shrinking limits.");
             sb.AppendLine("- To find FILES by filename (e.g. 'every .cs file containing X in the name'), use FindFiles(\"*Pattern*.cs\", \"subfolder\") — it returns the file list directly. Do NOT use SearchCode for filename queries; SearchCode searches CONTENT, not filenames.");
             sb.AppendLine("- To count or list PUBLIC METHODS of a class, call GetTypeSchema(\"TypeName\").Methods (already public-only). Filter `m.IsStatic` for instance vs static. Do NOT try to parse method signatures with SearchCodeRegex when GetTypeSchema works.");
@@ -376,6 +377,10 @@ namespace Omnipotent.Services.KliveAgent
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory"
         };
 
+        /// <summary>True for native tools that are dispatched directly (outside Roslyn) — memory tools plus
+        /// `grep`. Anything else is routed to execute_csharp.</summary>
+        private static bool IsNonScriptTool(string name) => name == "grep" || MemoryToolNames.Contains(name);
+
         /// <summary>
         /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
         /// plus first-class MEMORY tools so recall/save are a direct tool call, never a hand-written script.
@@ -399,6 +404,15 @@ namespace Omnipotent.Services.KliveAgent
                     "in {{{ }}} or markdown fences. NOTE: memory has its OWN dedicated tools (recall_memories, " +
                     "save_memory, …) — use those, not execute_csharp, for anything memory-related.",
                     new { type = "object", properties = new { code = new { type = "string", description = "The raw C# script to compile and run." } }, required = new[] { "code" } }),
+
+                Tool("grep",
+                    "Search the codebase CONTENTS and return matching 'path:line' lines. Runs directly — no C#/compile step, so it cannot fail to compile. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_csharp. 'pattern' is a regex (ripgrep-style) by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\").",
+                    new { type = "object", properties = new {
+                        pattern = new { type = "string", description = "Regex (or literal, if fixedString=true) to search for in file contents." },
+                        path = new { type = "string", description = "Optional file or subfolder to scope the search (e.g. \"Omnipotent/Services\")." },
+                        maxResults = new { type = "integer", description = "Max matches to return (default 30)." },
+                        fixedString = new { type = "boolean", description = "Treat pattern as a literal substring instead of regex (default false)." }
+                    }, required = new[] { "pattern" } }),
 
                 Tool("recall_memories",
                     "Search your long-term memory for facts about Klive, his preferences/people/projects/history, " +
@@ -429,10 +443,11 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
-        /// Executes a native MEMORY tool call by dispatching to the live memory API (reusing ScriptGlobals so
-        /// stats/side-effects match the script path). Returns a human-readable result string for the tool result.
+        /// Executes a native tool call (memory tools + `grep`) by dispatching to the live API (reusing
+        /// ScriptGlobals so stats/side-effects match the script path). Returns a human-readable result string
+        /// for the tool result. `grep` reuses the same code-search engine the scripts use, just without Roslyn.
         /// </summary>
-        private static async Task<string> DispatchMemoryToolAsync(ScriptGlobals globals, string toolName, string? argsJson)
+        private static async Task<string> DispatchNativeToolAsync(ScriptGlobals globals, string toolName, string? argsJson)
         {
             System.Text.Json.JsonElement root = default;
             bool hasArgs = false;
@@ -451,9 +466,30 @@ namespace Omnipotent.Services.KliveAgent
             string[]? Strs(string name) => hasArgs && root.TryGetProperty(name, out var e) && e.ValueKind == System.Text.Json.JsonValueKind.Array
                 ? e.EnumerateArray().Where(x => x.ValueKind == System.Text.Json.JsonValueKind.String).Select(x => x.GetString()!).ToArray()
                 : null;
+            bool BoolOr(string name, bool def)
+            {
+                if (!hasArgs || !root.TryGetProperty(name, out var e)) return def;
+                return e.ValueKind switch
+                {
+                    System.Text.Json.JsonValueKind.True => true,
+                    System.Text.Json.JsonValueKind.False => false,
+                    System.Text.Json.JsonValueKind.String => bool.TryParse(e.GetString(), out var b) ? b : def,
+                    _ => def
+                };
+            }
 
             switch (toolName)
             {
+                case "grep":
+                {
+                    var pattern = Str("pattern");
+                    if (string.IsNullOrWhiteSpace(pattern)) return "Error: 'pattern' is required.";
+                    var path = Str("path") ?? string.Empty;
+                    var maxResults = IntOr("maxResults", 30);
+                    return BoolOr("fixedString", false)
+                        ? globals.SearchCode(pattern, path, maxResults)
+                        : globals.SearchCodeRegex(pattern, path, maxResults);
+                }
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));
                 case "recall_memories_by_tag":
@@ -481,7 +517,7 @@ namespace Omnipotent.Services.KliveAgent
                     return await globals.DeleteMemory(id) ? $"Deleted memory {id}." : $"No memory matched '{id}'.";
                 }
                 default:
-                    return $"Unknown memory tool '{toolName}'.";
+                    return $"Unknown native tool '{toolName}'.";
             }
         }
 
@@ -519,12 +555,12 @@ namespace Omnipotent.Services.KliveAgent
             return args;
         }
 
-        // No hard iteration cap. The loop self-terminates when the LLM produces a no-script
-        // reply (final answer) or when the stuck-detector trips on truly looping behaviour
-        // (same error 3x or same script body run twice). This lets KliveAgent run arbitrarily
-        // long, complex tasks without an artificial ceiling on its cognition.
-        private const int StuckErrorThreshold = 3;
-        private const int StuckScriptRepeatThreshold = 2;
+        // No retry/stuck ceilings on the agent's own work: the loop self-terminates only when the
+        // LLM produces a no-script reply (the final answer). Repeated identical errors or scripts are
+        // NOT force-finalized — long, exploratory, error-correcting chains are exactly how API
+        // discovery makes progress, and each distinct compile error is a step closer, not a loop.
+        // The only hard stops are broken-output circuit breakers (empty completions / malformed tool
+        // envelopes) handled inline below, which guard a dead model channel that produces zero work.
 
         /// <summary>How many of the most recent agent turns replay their scripts+outputs into the
         /// conversation history. Recent turns are where "what did I just run / what did it return"
@@ -591,12 +627,9 @@ namespace Omnipotent.Services.KliveAgent
                 }
                 var currentPrompt = userPrompt;
                 string? firstIterationSystemPrompt = systemPrompt;
-                var errorFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
-                var scriptFrequency = new Dictionary<string, int>(StringComparer.Ordinal);
                 bool stuckForceFinal = false;
                 bool finalFormatRetryUsed = false;
                 int emptyFinalRetries = 0;
-                int consecutiveFailedScripts = 0;
                 int consecutiveNoOpResponses = 0;
 
                 // Streams the agent's current prose + the scripts it has run so far to the live
@@ -690,8 +723,8 @@ namespace Omnipotent.Services.KliveAgent
                         foreach (var tc in llmResponse.ToolCalls)
                         {
                             var name = tc.function?.name ?? string.Empty;
-                            if (MemoryToolNames.Contains(name))
-                                // Memory tool: dispatched straight to the memory API, not the script engine.
+                            if (IsNonScriptTool(name))
+                                // Memory / grep tool: dispatched straight to its API, not the script engine.
                                 segments.Add(new ResponseSegment { IsScript = false, ToolName = name, Content = tc.function?.arguments ?? string.Empty, ToolCallId = tc.id });
                             else
                                 segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_csharp", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id });
@@ -844,12 +877,12 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
-                        // Native MEMORY tool call — dispatch straight to the memory API (no Roslyn).
+                        // Native tool call (memory / grep) — dispatch straight to its API (no Roslyn).
                         if (!segment.IsScript && segment.ToolName != null)
                         {
                             string memOut; bool memOk = true;
-                            try { memOut = await DispatchMemoryToolAsync(sharedGlobals, segment.ToolName, segment.Content); }
-                            catch (Exception mex) { memOk = false; memOut = $"Memory tool error: {mex.GetType().Name}: {mex.Message}"; }
+                            try { memOut = await DispatchNativeToolAsync(sharedGlobals, segment.ToolName, segment.Content); }
+                            catch (Exception mex) { memOk = false; memOut = $"{segment.ToolName} tool error: {mex.GetType().Name}: {mex.Message}"; }
 
                             var memText = KliveAgentContextBudget.TruncateToTokens(memOut ?? string.Empty,
                                 memOk ? KliveAgentContextBudget.ScriptOutputBudget : KliveAgentContextBudget.ScriptErrorBudget);
@@ -866,16 +899,6 @@ namespace Omnipotent.Services.KliveAgent
                         }
 
                         scriptCountThisIter++;
-
-                        // Track repeated script bodies (a key stuck-loop signal).
-                        var scriptKey = NormaliseForFingerprint(segment.Content ?? string.Empty);
-                        if (!string.IsNullOrEmpty(scriptKey))
-                        {
-                            scriptFrequency.TryGetValue(scriptKey, out var prev);
-                            scriptFrequency[scriptKey] = prev + 1;
-                            if (scriptFrequency[scriptKey] >= StuckScriptRepeatThreshold)
-                                stuckForceFinal = true;
-                        }
 
                         var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
                         allScriptsExecuted.Add(result);
@@ -901,22 +924,14 @@ namespace Omnipotent.Services.KliveAgent
                         {
                             errorCountThisIter++;
                             var errMsg = result.ErrorMessage ?? "Unknown error.";
-                            var errKey = NormaliseForFingerprint(errMsg);
-                            if (!string.IsNullOrEmpty(errKey))
-                            {
-                                errorFrequency.TryGetValue(errKey, out var prev);
-                                errorFrequency[errKey] = prev + 1;
-                                if (errorFrequency[errKey] >= StuckErrorThreshold)
-                                    stuckForceFinal = true;
-                            }
+
+                            // Record the failure category (CS-code / runtime exception type) for the
+                            // agent's own GetScriptFailureBreakdown() — no longer a stuck-loop signal.
+                            agentService.Stats?.RecordScriptError(ClassifyScriptError(errMsg));
 
                             scriptObs.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
                             scriptObs.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, KliveAgentContextBudget.ScriptErrorBudget));
-                            consecutiveFailedScripts++;
-                            if (consecutiveFailedScripts >= 5) stuckForceFinal = true;
                         }
-
-                        if (result.Success) consecutiveFailedScripts = 0;
 
                         var scriptObsText = scriptObs.ToString().TrimEnd();
                         observationSb.AppendLine(scriptObsText);
@@ -939,21 +954,16 @@ namespace Omnipotent.Services.KliveAgent
                             "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.";
                     }
 
-                    // Hard safety cap: prevent runaway loops that never produce a final answer.
-                    // After 30 iterations, force the final-answer path. Real questions that
-                    // need >30 scripted steps should be split by the user; the agent should
-                    // not hang an API request indefinitely (exposed as a Tier-5 hang bug).
-                    if (iteration + 1 >= 30 && !stuckForceFinal)
-                    {
-                        stuckForceFinal = true;
-                    }
+                    // No hard iteration cap and no failure ceiling: the loop runs until the model
+                    // returns a no-script final answer. stuckForceFinal is only set by the
+                    // broken-output circuit breaker (consecutiveNoOpResponses) above.
 
                     // Feed the next turn. System prompt + prior turns already live in the session, so we
                     // never re-inject them. In tool mode where results were delivered as role:"tool"
                     // messages, send only the guidance (observations are already attached to the calls);
                     // otherwise send the aggregate observations + guidance as a user turn.
                     string guidance = stuckForceFinal
-                        ? "[Stuck-loop detected] You repeated a script or hit the same error 3+ times. STOP scripting. Reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you."
+                        ? "[Output error] Your recent replies weren't valid actions (empty, or malformed tool/XML envelopes that ran nothing). STOP and reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you."
                         : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.";
                     guidance += nudge;
 
@@ -1330,30 +1340,25 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
-        /// Reduces a script body or error string to a stable fingerprint for stuck-loop
-        /// detection: trims, collapses whitespace, strips most punctuation, lowercases,
-        /// and truncates. Two scripts that differ only in formatting will hash to the
-        /// same key, two genuinely different scripts will not.
+        /// Classifies a failed script's error message into a stable category for the agent's own
+        /// failure-breakdown stats: the first Roslyn diagnostic id (e.g. "CS1061") for compile
+        /// failures, "Runtime:&lt;ExceptionType&gt;" for runtime errors, else a coarse fallback.
         /// </summary>
-        private static string NormaliseForFingerprint(string s)
+        internal static string ClassifyScriptError(string? errMsg)
         {
-            if (string.IsNullOrWhiteSpace(s)) return string.Empty;
-            var sb = new StringBuilder(s.Length);
-            bool lastSpace = false;
-            foreach (var ch in s)
-            {
-                if (char.IsWhiteSpace(ch))
-                {
-                    if (!lastSpace) { sb.Append(' '); lastSpace = true; }
-                }
-                else
-                {
-                    sb.Append(char.ToLowerInvariant(ch));
-                    lastSpace = false;
-                }
-            }
-            var trimmed = sb.ToString().Trim();
-            return trimmed.Length <= 240 ? trimmed : trimmed[..240];
+            if (string.IsNullOrWhiteSpace(errMsg)) return "Unknown";
+
+            // Compile failures render as "[CS1061] line ..." — pull the first CS id.
+            var cs = Regex.Match(errMsg, @"\bCS\d{3,5}\b");
+            if (cs.Success) return cs.Value;
+
+            // Runtime failures render as "Runtime error: <ExceptionType>: <message>".
+            var rt = Regex.Match(errMsg, @"Runtime error:\s*([A-Za-z_][A-Za-z0-9_]*)");
+            if (rt.Success) return $"Runtime:{rt.Groups[1].Value}";
+
+            if (errMsg.StartsWith("Compilation failed", StringComparison.Ordinal)) return "Compile";
+            if (errMsg.Contains("timed out", StringComparison.OrdinalIgnoreCase)) return "Timeout";
+            return "Runtime";
         }
 
         /// <summary>

@@ -44,6 +44,8 @@ namespace Omnipotent.Services.KliveAgent
         private readonly ConcurrentDictionary<string, WeekBucket> _weeks = new();
         private readonly ConcurrentDictionary<string, MonthBucket> _months = new();
         private readonly ConcurrentDictionary<string, CapabilityBucket> _capabilities = new(StringComparer.OrdinalIgnoreCase);
+        // Failure category (CS-code / "Runtime:<Type>" / coarse fallback) -> count. Powers BuildScriptFailureBreakdown().
+        private readonly ConcurrentDictionary<string, long> _scriptErrorCodes = new(StringComparer.Ordinal);
 
         public async Task InitializeAsync()
         {
@@ -96,6 +98,10 @@ namespace Omnipotent.Services.KliveAgent
                 foreach (var capability in snapshot.Capabilities ?? new List<CapabilityBucket>())
                 {
                     if (!string.IsNullOrWhiteSpace(capability.Name)) _capabilities[capability.Name] = capability;
+                }
+                foreach (var kv in snapshot.ScriptErrorCodes ?? new Dictionary<string, long>())
+                {
+                    if (!string.IsNullOrWhiteSpace(kv.Key)) _scriptErrorCodes[kv.Key] = kv.Value;
                 }
             }
             catch
@@ -222,6 +228,20 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
+        /// <summary>Records a failed script's error category (a Roslyn id like "CS1061", "Runtime:&lt;Type&gt;",
+        /// or a coarse fallback). Cheap and in-memory; persisted with the rest of the stats snapshot.
+        /// Powers the agent's own GetScriptFailureBreakdown().</summary>
+        public void RecordScriptError(string? category)
+        {
+            category = string.IsNullOrWhiteSpace(category) ? "Unknown" : category.Trim();
+            _scriptErrorCodes.AddOrUpdate(category, 1, (_, c) => c + 1);
+            QueueSave();
+        }
+
+        private static bool IsCompileCode(string code) =>
+            code == "Compile"
+            || (code.Length >= 3 && code.StartsWith("CS", StringComparison.Ordinal) && char.IsDigit(code[2]));
+
         private void QueueSave()
         {
             lock (_saveScheduleLock)
@@ -279,7 +299,8 @@ namespace Omnipotent.Services.KliveAgent
                     Capabilities = _capabilities.Values
                         .OrderByDescending(capability => capability.Executions)
                         .ThenBy(capability => capability.Name, StringComparer.OrdinalIgnoreCase)
-                        .ToList()
+                        .ToList(),
+                    ScriptErrorCodes = _scriptErrorCodes.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal)
                 };
 
                 string tempPath = persistencePath + ".tmp";
@@ -412,6 +433,67 @@ namespace Omnipotent.Services.KliveAgent
             };
         }
 
+        /// <summary>Flat, scalar-only stats snapshot for the agent's own consumption — safe to JSON-serialize
+        /// at any depth (no nested anonymous objects / cycles). Backs ScriptGlobals.GetAgentStatsSummary().</summary>
+        public AgentStatsSummary BuildFlatSummary()
+        {
+            var todayKey = DayKey(DateTime.UtcNow);
+            _days.TryGetValue(todayKey, out var today);
+
+            long lifeScripts = TotalScriptsRun;
+            long lifeFailures = TotalScriptFailures;
+
+            return new AgentStatsSummary
+            {
+                TodayUtcDate = todayKey,
+                LifetimeScriptsRun = lifeScripts,
+                LifetimeScriptFailures = lifeFailures,
+                LifetimeScriptFailureRatePct = lifeScripts > 0 ? Math.Round((double)lifeFailures / lifeScripts * 100.0, 1) : 0.0,
+                LifetimeScriptSuccessRatePct = lifeScripts > 0 ? Math.Round((double)(lifeScripts - lifeFailures) / lifeScripts * 100.0, 1) : 100.0,
+                TodayScriptsRun = today?.Scripts ?? 0,
+                TodayScriptFailures = today?.ScriptFailures ?? 0,
+                LifetimeMessages = TotalMessages,
+                LifetimeIterations = TotalIterations,
+                AvgIterationsPerMessage = TotalMessages > 0 ? Math.Round((double)TotalIterations / TotalMessages, 2) : 0.0,
+                LifetimePromptTokens = TotalPromptTokens,
+                LifetimeCompletionTokens = TotalCompletionTokens,
+                EstimatedCostUsd = Math.Round(EstimateCost(TotalPromptTokens, TotalCompletionTokens), 4),
+                CapabilityCalls = TotalCapabilityCalls,
+                CapabilitySuccessRatePct = TotalCapabilityCalls > 0
+                    ? Math.Round((double)(TotalCapabilityCalls - TotalCapabilityFailures) / TotalCapabilityCalls * 100.0, 1)
+                    : 100.0,
+                MemorySaves = TotalMemorySaves,
+                MemoryRecalls = TotalMemoryRecalls
+            };
+        }
+
+        /// <summary>Flat failure breakdown for the agent's own script runs (totals + compile/runtime split +
+        /// top error codes). Scalars + a shallow list — safe to JSON-serialize. Backs
+        /// ScriptGlobals.GetScriptFailureBreakdown().</summary>
+        public AgentScriptFailureBreakdown BuildScriptFailureBreakdown()
+        {
+            var codes = _scriptErrorCodes.ToArray();
+            long categorized = codes.Sum(kv => kv.Value);
+            long compile = codes.Where(kv => IsCompileCode(kv.Key)).Sum(kv => kv.Value);
+
+            return new AgentScriptFailureBreakdown
+            {
+                TotalScripts = TotalScriptsRun,
+                TotalFailures = categorized,
+                FailureRatePct = TotalScriptsRun > 0
+                    ? Math.Round((double)TotalScriptFailures / TotalScriptsRun * 100.0, 1)
+                    : 0.0,
+                CompileFailures = compile,
+                RuntimeFailures = categorized - compile,
+                TopErrorCodes = codes
+                    .OrderByDescending(kv => kv.Value)
+                    .ThenBy(kv => kv.Key, StringComparer.Ordinal)
+                    .Take(10)
+                    .Select(kv => new ErrorCodeCount { Code = kv.Key, Count = kv.Value })
+                    .ToList()
+            };
+        }
+
         private sealed class StatsSnapshot
         {
             public long TotalMessages { get; set; }
@@ -434,6 +516,7 @@ namespace Omnipotent.Services.KliveAgent
             public List<WeekBucket> Weeks { get; set; } = new();
             public List<MonthBucket> Months { get; set; } = new();
             public List<CapabilityBucket> Capabilities { get; set; } = new();
+            public Dictionary<string, long> ScriptErrorCodes { get; set; } = new();
         }
 
         /// <summary>Shared metric fields for every time bucket (day/week/month). New fields default to

@@ -471,6 +471,33 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
+        /// Typed, NON-throwing member read — the safe way to pull a value off an `object` variable without
+        /// risking CS1061 from dot-access. Walks the full inheritance chain (public + private fields and
+        /// properties) and returns the value cast to T, or default(T) if obj is null, the member is missing,
+        /// or the value isn't a T. Prefer this over GetObjectMember(...) when you know the type you expect.
+        /// Example: var count = TryGetMember&lt;int&gt;(stats, "TotalScriptsRun");
+        ///          var name  = TryGetMember&lt;string&gt;(account, "Username") ?? "(unknown)";
+        /// </summary>
+        public T? TryGetMember<T>(object? obj, string memberName)
+        {
+            if (obj == null || string.IsNullOrWhiteSpace(memberName)) return default;
+
+            var t = obj.GetType();
+            while (t != null && t != typeof(object))
+            {
+                var field = t.GetField(memberName, DeepFlags);
+                if (field != null) return field.GetValue(obj) is T fv ? fv : default;
+
+                var prop = t.GetProperty(memberName, DeepFlags);
+                if (prop != null && prop.GetIndexParameters().Length == 0)
+                    return prop.GetValue(obj) is T pv ? pv : default;
+
+                t = t.BaseType;
+            }
+            return default;
+        }
+
+        /// <summary>
         /// Invoke any method — including private and async ones — on any arbitrary object.
         /// Handles Task and Task&lt;T&gt; automatically (awaits and unwraps the result).
         /// Use this to call methods on sub-objects returned by GetServiceObject() or GetObjectMember().
@@ -680,6 +707,33 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Return today's KliveAgent run-time stats (script counts, failure rate, token totals). Sourced directly from KliveAgentStats.</summary>
+        /// <summary>
+        /// FLAT, typed run-stats snapshot — every field is a scalar, so it serializes at any JSON depth
+        /// (no cycle / depth errors) and can be dot-accessed directly. PREFER this over GetAgentStats()
+        /// for script success rate, totals, and cost.
+        /// Example: var s = GetAgentStatsSummary(); Log($"{s.LifetimeScriptSuccessRatePct}% over {s.LifetimeScriptsRun} scripts");
+        /// </summary>
+        public AgentStatsSummary? GetAgentStatsSummary()
+        {
+            return agentService.Stats?.BuildFlatSummary();
+        }
+
+        /// <summary>
+        /// FLAT breakdown of your own script FAILURES: totals, compile-vs-runtime split, and the top error
+        /// codes (e.g. CS1061, Runtime:JsonException) with counts. Scalars + a shallow list — serializes
+        /// cleanly at any depth. Use this to see WHAT keeps failing without parsing GetRecentErrors.
+        /// Example: var b = GetScriptFailureBreakdown(); foreach (var e in b.TopErrorCodes) Log($"{e.Code}: {e.Count}");
+        /// </summary>
+        public AgentScriptFailureBreakdown? GetScriptFailureBreakdown()
+        {
+            return agentService.Stats?.BuildScriptFailureBreakdown();
+        }
+
+        /// <summary>
+        /// Rich, NESTED run-stats object (lifetime + today + daily/weekly/monthly history + top capabilities).
+        /// Note: the deep shape can trip System.Text.Json depth limits — for a quick, safely-serializable
+        /// view prefer GetAgentStatsSummary().
+        /// </summary>
         public object GetAgentStats()
         {
             var s = agentService.Stats;
@@ -1928,8 +1982,9 @@ namespace Omnipotent.Services.KliveAgent
 
             /// <summary>
             /// Renders compiler diagnostics with the detail the agent needs to self-correct: error id,
-            /// line:col, the offending source line, and a caret underline under the exact token — plus a
-            /// targeted hint for the recurring "iterated a string-returning tool" mistake.
+            /// line:col, up to 3 preceding lines of context, the offending source line, and a caret
+            /// underline under the exact token — plus targeted hints for the recurring gotchas
+            /// (string-returning tools iterated as lists, .Length vs .Count, GetTypeName, CS1061 on object).
             /// </summary>
             private static string FormatCompilationDiagnostics(string code, IEnumerable<Microsoft.CodeAnalysis.Diagnostic> errors)
             {
@@ -1948,6 +2003,11 @@ namespace Omnipotent.Services.KliveAgent
 
                     if (d.Location.IsInSource && lineNo >= 0 && lineNo < lines.Length)
                     {
+                        // Up to 3 preceding lines for context, so the model can see where it formed its
+                        // (wrong) assumption about a variable's type — not just the line that finally broke.
+                        for (int ctx = Math.Max(0, lineNo - 3); ctx < lineNo; ctx++)
+                            sb.AppendLine($"  {(ctx + 1).ToString().PadLeft(4)} | {lines[ctx]}");
+
                         var srcLine = lines[lineNo];
                         int spanLen = Math.Max(1, d.Location.SourceSpan.Length);
                         int caretLen = Math.Min(spanLen, Math.Max(1, srcLine.Length - col));
@@ -1960,6 +2020,16 @@ namespace Omnipotent.Services.KliveAgent
 
                 if (list.Any(d => d.GetMessage().Contains("'char' to 'string'", StringComparison.Ordinal)))
                     sb.AppendLine("Hint: the search/read tools (FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation) each return ONE formatted string, not a list — Log() the whole string; do NOT foreach over it (iterating a string yields chars).");
+
+                // Targeted hints for the recurring API-discovery gotchas, keyed off the diagnostic text.
+                bool lengthHint = list.Any(d => d.GetMessage().Contains("does not contain a definition for 'Length'", StringComparison.Ordinal));
+                bool typeNameHint = list.Any(d => d.GetMessage().Contains("does not contain a definition for 'GetTypeName'", StringComparison.Ordinal));
+                if (lengthHint)
+                    sb.AppendLine("Hint: use .Count for List<T>/collections (e.g. schema.Methods.Count); .Length is only for arrays and strings.");
+                if (typeNameHint)
+                    sb.AppendLine("Hint: there is no GetTypeName(); use ex.GetType().Name to get an exception's type name.");
+                if (!lengthHint && !typeNameHint && list.Any(d => d.Id == "CS1061"))
+                    sb.AppendLine("Hint: CS1061 = that member doesn't exist on the variable's compile-time type. If the variable is typed `object` (e.g. from GetObjectMember/CallObjectMethod), use TryGetMember<T>(obj, \"Name\") for a typed read, or GetObjectMembers(obj) to discover the real members first.");
 
                 return sb.ToString().TrimEnd();
             }

@@ -256,6 +256,50 @@ namespace Omnipotent.Services.KliveAgent.Models
         public long ExecutionTimeMs { get; set; }
     }
 
+    /// <summary>
+    /// Flat, scalar-only snapshot of KliveAgent's own run statistics. Every field is a primitive, so it
+    /// serializes cleanly at any JSON depth (no object cycles / depth-exhaustion, unlike the nested
+    /// GetAgentStats() shape) and can be dot-accessed directly. Returned by GetAgentStatsSummary().
+    /// </summary>
+    public class AgentStatsSummary
+    {
+        public string TodayUtcDate { get; set; } = "";
+        public long LifetimeScriptsRun { get; set; }
+        public long LifetimeScriptFailures { get; set; }
+        public double LifetimeScriptFailureRatePct { get; set; }
+        public double LifetimeScriptSuccessRatePct { get; set; }
+        public long TodayScriptsRun { get; set; }
+        public long TodayScriptFailures { get; set; }
+        public long LifetimeMessages { get; set; }
+        public long LifetimeIterations { get; set; }
+        public double AvgIterationsPerMessage { get; set; }
+        public long LifetimePromptTokens { get; set; }
+        public long LifetimeCompletionTokens { get; set; }
+        public double EstimatedCostUsd { get; set; }
+        public long CapabilityCalls { get; set; }
+        public double CapabilitySuccessRatePct { get; set; }
+        public long MemorySaves { get; set; }
+        public long MemoryRecalls { get; set; }
+    }
+
+    /// <summary>Flat failure breakdown for the agent's own script runs. TopErrorCodes is a shallow list
+    /// of {Code, Count} pairs (depth 2), safe to JSON-serialize. Returned by GetScriptFailureBreakdown().</summary>
+    public class AgentScriptFailureBreakdown
+    {
+        public long TotalScripts { get; set; }
+        public long TotalFailures { get; set; }
+        public double FailureRatePct { get; set; }
+        public long CompileFailures { get; set; }
+        public long RuntimeFailures { get; set; }
+        public List<ErrorCodeCount> TopErrorCodes { get; set; } = new();
+    }
+
+    public class ErrorCodeCount
+    {
+        public string Code { get; set; } = "";
+        public long Count { get; set; }
+    }
+
     public class AgentTypeSchema
     {
         [JsonProperty("name")]
