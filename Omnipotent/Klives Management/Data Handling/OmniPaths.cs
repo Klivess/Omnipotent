@@ -163,6 +163,11 @@ namespace Omnipotent.Data_Handling
             public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";
             public static string KAPIReachabilityMonitorStateFile = $"{KAPIReachabilityMonitorDirectory}/state.json";
 
+            //KliveMail
+            public static string KliveMailDirectory = $"{SavedDataDirectory}/KliveMail";
+            public static string KliveMailDbFile = $"{KliveMailDirectory}/klivemail.db";
+            public static string KliveMailAttachmentsDirectory = $"{KliveMailDirectory}/Attachments";
+
         };
 
         public static string GetPath(string path)

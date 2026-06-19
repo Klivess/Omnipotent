@@ -408,6 +408,28 @@ namespace Omnipotent.Services.KliveAPI
             fileStream.Close();
         }
 
+        // Returns the production TLS certificate (the same PFX used for HTTPS on klive.dev) so
+        // other services can reuse it — e.g. KliveMail's inbound SMTP STARTTLS. Returns null if
+        // the certificate has not been created yet (caller should fall back to plaintext / retry).
+        public X509Certificate2? GetServerCertificate()
+        {
+            try
+            {
+                if (certInstaller == null) return null;
+                string pfxPath = certInstaller.rootAuthorityPfxPath;
+                if (string.IsNullOrEmpty(pfxPath) || !File.Exists(pfxPath)) return null;
+                return new X509Certificate2(
+                    pfxPath,
+                    "klives",
+                    X509KeyStorageFlags.MachineKeySet | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, "Failed to load server certificate for reuse.");
+                return null;
+            }
+        }
+
         //Example of how to define a route
         //Action<KliveAPI.KliveAPI.UserRequest> lengthyBuffer = async (request) =>
         //  {
