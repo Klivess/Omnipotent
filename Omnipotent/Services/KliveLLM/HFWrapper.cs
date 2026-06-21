@@ -171,6 +171,11 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
             public object stream_options;
 
+            // OpenRouter reasoning control: e.g. { "enabled": true/false }. Lets us turn the model's
+            // thinking on/off for reasoning-capable models. Ignored by providers that don't support it.
+            [JsonProperty("reasoning", NullValueHandling = NullValueHandling.Ignore)]
+            public object reasoning;
+
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {
                 List<HFMessage> hFMessages = new();

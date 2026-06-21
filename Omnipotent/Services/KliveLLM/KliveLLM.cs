@@ -35,6 +35,7 @@ namespace Omnipotent.Services.KliveLLM
         private const string DefaultFreeOpenRouterModel = "openrouter/free";
         private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter" };
         private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
+        private static readonly string[] ThinkingTypeOptions = new[] { "Off", "Low", "Medium", "High" };
 
         private string huggingFaceToken = "";
         private HttpClient client;
@@ -47,6 +48,11 @@ namespace Omnipotent.Services.KliveLLM
         private ModelParams modelParams;
         private LLamaWeights modelWeights;
         private bool localModelReady = false;
+        // How hard the model is asked to "think" (reasoning). "Off" appends /no_think to the system
+        // prompt (Qwen-family + local) and disables OpenRouter reasoning; Low/Medium/High map to the
+        // OpenRouter reasoning effort. Refreshed live on settings change. Read by sessions at creation,
+        // so it also seeds the local model's directive.
+        internal string thinkingType = "Medium";
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
 
         private enum LLMProvider
@@ -88,6 +94,7 @@ namespace Omnipotent.Services.KliveLLM
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
             await EnsureProviderSettingsExistAsync();
+            thinkingType = await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
             client = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
 
             await EnsureLlamaBinariesAvailableAsync();
@@ -104,6 +111,12 @@ namespace Omnipotent.Services.KliveLLM
         private async void KliveLLM_OnOmniSettingsChanged(object? sender, OmniSettingsChangedEventArgs e)
         {
             bool valueChanged = string.Equals(e.PreviousValue, e.Setting.Value, StringComparison.Ordinal) == false;
+
+            if (e.Setting.Name == "ThinkingType" && valueChanged)
+            {
+                thinkingType = e.Setting.Value;
+                ServiceLog($"Thinking type updated to '{thinkingType}'.");
+            }
 
             if (e.Setting.Name == "RemoteLLMProvider" && valueChanged)
             {
@@ -180,6 +193,7 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
+            await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
         }
 
         private async Task SetupLocalLLM()
@@ -358,7 +372,7 @@ namespace Omnipotent.Services.KliveLLM
                 var s = new KliveLLMSession(this, false) { sessionId = sessionId };
                 s.structuredMessages.Clear();
                 if (!string.IsNullOrWhiteSpace(systemPrompt))
-                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "system", content = systemPrompt });
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "system", content = systemPrompt + ThinkingDirective });
                 sessions[sessionId] = s;
             }
         }
@@ -470,7 +484,7 @@ namespace Omnipotent.Services.KliveLLM
                 if (!string.IsNullOrWhiteSpace(systemPrompt))
                 {
                     s.chatHistory.Messages.Clear();
-                    s.chatHistory.AddMessage(AuthorRole.System, systemPrompt);
+                    s.chatHistory.AddMessage(AuthorRole.System, systemPrompt + ThinkingDirective);
                 }
                 lock (sessions)
                 {
@@ -487,7 +501,7 @@ namespace Omnipotent.Services.KliveLLM
                     if (!string.IsNullOrWhiteSpace(systemPrompt))
                     {
                         session.chatHistory.Messages.Clear();
-                        session.chatHistory.AddMessage(AuthorRole.System, systemPrompt);
+                        session.chatHistory.AddMessage(AuthorRole.System, systemPrompt + ThinkingDirective);
                     }
                     sessions[sessionId] = session;
                 }
@@ -599,6 +613,7 @@ namespace Omnipotent.Services.KliveLLM
                 max_tokens = maxTokensOverride,
             };
             ApplyServiceTier(ref payload, remoteProvider);
+            ApplyThinkingPreference(ref payload, remoteProvider);
             payload.BuildMessagesFromChatHistory(messages);
 
             return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
@@ -628,6 +643,7 @@ namespace Omnipotent.Services.KliveLLM
                 tools = tools,
             };
             ApplyServiceTier(ref payload, remoteProvider);
+            ApplyThinkingPreference(ref payload, remoteProvider);
             payload.BuildMessagesFromList(structuredMessages);
 
             return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
@@ -641,6 +657,24 @@ namespace Omnipotent.Services.KliveLLM
             {
                 payload.service_tier = remoteProvider.ServiceTier;
             }
+        }
+
+        /// <summary>True when the configured thinking type means "no reasoning at all".</summary>
+        private bool ThinkingDisabled => string.Equals(thinkingType, "Off", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Suffix folded into the system prompt so Qwen-family models (and the local model)
+        /// honour the thinking preference even on providers without a native reasoning switch. Only
+        /// "Off" needs a directive (/no_think); the effort levels rely on the provider/model default.</summary>
+        internal string ThinkingDirective => ThinkingDisabled ? " /no_think" : string.Empty;
+
+        /// <summary>Maps the thinking type to OpenRouter's native reasoning control. Other providers
+        /// rely on <see cref="ThinkingDirective"/> already present in the system prompt.</summary>
+        private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        {
+            if (remoteProvider.Provider != LLMProvider.OpenRouter) return;
+            payload.reasoning = ThinkingDisabled
+                ? new { enabled = false }
+                : new { effort = thinkingType.ToLowerInvariant() };
         }
 
         // Chooses the transport: when a token sink is supplied we stream (stream=true + SSE) so the UI
@@ -1325,8 +1359,9 @@ namespace Omnipotent.Services.KliveLLM
                     executor = new InteractiveExecutor(context);
                     chatSession = new ChatSession(executor, chatHistory);
                 }
-                // Seed system prompt - can be customized
-                chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant. /no_think");
+                // Seed system prompt - can be customized. The thinking directive (/no_think when thinking
+                // is Off) follows the configured ThinkingType.
+                chatHistory.AddMessage(AuthorRole.System, "You are a helpful assistant." + parentService.ThinkingDirective);
             }
         }
     }

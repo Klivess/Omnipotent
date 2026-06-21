@@ -662,6 +662,13 @@ namespace Omnipotent.Services.KliveAgent
                 // its own per-script timeout).
                 var sharedGlobals = new ScriptGlobals(agentService, cancellationToken);
                 var scriptSession = scriptEngine.CreateSession(sharedGlobals);
+
+                // Per-script hard timeout. A script that overruns this is abandoned so the agent never
+                // hangs; configurable so a legitimately long-running script can be given more room.
+                int scriptTimeoutSec = await agentService.GetIntOmniSetting("KliveAgent_ScriptTimeoutSeconds", 30);
+                if (scriptTimeoutSec < 1) scriptTimeoutSec = 1;
+                var scriptTimeout = TimeSpan.FromSeconds(scriptTimeoutSec);
+
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
@@ -1055,7 +1062,7 @@ namespace Omnipotent.Services.KliveAgent
 
                         scriptCountThisIter++;
 
-                        var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
+                        var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty, scriptTimeout);
                         allScriptsExecuted.Add(result);
 
                         // Stream the just-completed script (code + output) to the UI as it lands, with a

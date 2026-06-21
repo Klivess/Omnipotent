@@ -2047,6 +2047,7 @@ namespace Omnipotent.Services.KliveAgent
 
                     globals.TakeOutput();
 
+                    Task<ScriptState<object>> scriptTask;
                     if (state == null)
                     {
                         // First script in the session: compile explicitly to surface structured
@@ -2066,7 +2067,8 @@ namespace Omnipotent.Services.KliveAgent
                             };
                         }
 
-                        state = await script.RunAsync(globals, catchException: null, cancellationToken: cts.Token);
+                        // Run on a worker thread so we can enforce a HARD timeout below.
+                        scriptTask = Task.Run(() => script.RunAsync(globals, catchException: null, cancellationToken: cts.Token), cts.Token);
                     }
                     else
                     {
@@ -2074,8 +2076,40 @@ namespace Omnipotent.Services.KliveAgent
                         // Calling .Compile() on a state.Script.ContinueWith() result triggers a Roslyn
                         // globals-type mismatch (ScriptState<object> vs ScriptGlobals) that poisons all
                         // subsequent scripts in the session. ContinueWithAsync avoids this entirely.
-                        state = await state.ContinueWithAsync(code, scriptOptions, catchException: null, cancellationToken: cts.Token);
+                        scriptTask = Task.Run(() => state.ContinueWithAsync(code, scriptOptions, catchException: null, cancellationToken: cts.Token), cts.Token);
                     }
+
+                    // HARD wall-clock guard. The cancellation token alone is NOT enough: a script that
+                    // blocks synchronously (infinite loop, Thread.Sleep, a blocking native/IO call, .Result
+                    // on a stuck Task) never observes the token, so awaiting RunAsync directly would hang
+                    // the entire agent turn forever. Race the script against an independent timer (which also
+                    // trips on the per-run Stop/stall token) and ABANDON it if the timer wins — the abandoned
+                    // worker can't be force-killed in .NET, but the agent gets a result and keeps moving.
+                    var watchdog = Task.Delay(effectiveTimeout, globals.CancellationToken);
+                    var completed = await Task.WhenAny(scriptTask, watchdog);
+                    if (!ReferenceEquals(completed, scriptTask))
+                    {
+                        try { cts.Cancel(); } catch { } // nudge well-behaved scripts to unwind
+                        // Keep the abandoned task's eventual exception observed so it can't resurface as an
+                        // UnobservedTaskException. We deliberately do NOT update `state`, so the session
+                        // continues from the last good state.
+                        _ = scriptTask.ContinueWith(t => { _ = t.Exception; }, TaskScheduler.Default);
+
+                        stopwatch.Stop();
+                        bool stopped = globals.CancellationToken.IsCancellationRequested;
+                        return new AgentScriptResult
+                        {
+                            Code = code,
+                            Success = false,
+                            ErrorMessage = stopped
+                                ? "Script was stopped before it finished."
+                                : $"Script execution timed out after {effectiveTimeout.TotalSeconds:0}s and was abandoned — it was still running, most likely an infinite loop or a blocking call that ignores cancellation. Rewrite it to be non-blocking and to honour CancellationToken (e.g. await Task.Delay(ms, CancellationToken), pass a timeout to process/network waits, never use .Result/.Wait()).",
+                            Output = globals.TakeOutput(),
+                            ExecutionTimeMs = stopwatch.ElapsedMilliseconds
+                        };
+                    }
+
+                    state = await scriptTask;
 
                     stopwatch.Stop();
 
