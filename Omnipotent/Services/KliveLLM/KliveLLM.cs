@@ -298,7 +298,9 @@ namespace Omnipotent.Services.KliveLLM
             string? sessionId = null,
             int? maxTokensOverride = null,
             string? systemPrompt = null,
-            bool useFreeModel = false)
+            bool useFreeModel = false,
+            CancellationToken cancellationToken = default,
+            Action<string>? onToken = null)
         {
             if (useFreeModel)
             {
@@ -307,7 +309,9 @@ namespace Omnipotent.Services.KliveLLM
                     sessionId,
                     maxTokensOverride,
                     systemPrompt,
-                    forceFreeModel: true);
+                    forceFreeModel: true,
+                    cancellationToken: cancellationToken,
+                    onToken: onToken);
             }
 
             if (await GetActiveProviderAsync() != LLMProvider.Local)
@@ -316,7 +320,9 @@ namespace Omnipotent.Services.KliveLLM
                     prompt,
                     sessionId,
                     maxTokensOverride,
-                    systemPrompt);
+                    systemPrompt,
+                    cancellationToken: cancellationToken,
+                    onToken: onToken);
 
                 return hfResponse;
             }
@@ -324,7 +330,9 @@ namespace Omnipotent.Services.KliveLLM
             return await QueryLocalLLMAsync(
                 prompt,
                 sessionId,
-                maxTokensOverride);
+                maxTokensOverride,
+                cancellationToken: cancellationToken,
+                onToken: onToken);
         }
 
         // ── Native structured tool calling ──
@@ -412,7 +420,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -423,7 +431,7 @@ namespace Omnipotent.Services.KliveLLM
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride);
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken);
             var msg = response.choices[0].message;
             var content = HFWrapper.ContentToText(msg?.content);
             var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -452,7 +460,7 @@ namespace Omnipotent.Services.KliveLLM
             };
         }
 
-        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -485,7 +493,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
-            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken);
             {
                 // Providers occasionally return an assistant turn with null content. Coalesce to an
                 // empty string so it neither crashes downstream parsing nor poisons the session
@@ -580,7 +588,7 @@ namespace Omnipotent.Services.KliveLLM
         private const int RemoteInferenceMaxAttempts = 3;
         private const int RemoteInferenceBaseDelayMs = 800;
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -593,7 +601,7 @@ namespace Omnipotent.Services.KliveLLM
             ApplyServiceTier(ref payload, remoteProvider);
             payload.BuildMessagesFromChatHistory(messages);
 
-            return await SendPayloadWithRetryAsync(remoteProvider, payload);
+            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
         }
 
         /// <summary>
@@ -606,7 +614,9 @@ namespace Omnipotent.Services.KliveLLM
             List<HFWrapper.HFTool> tools,
             int? maxTokensOverride,
             bool forceFreeModel = false,
-            string? modelOverride = null)
+            string? modelOverride = null,
+            CancellationToken cancellationToken = default,
+            Action<string>? onToken = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -620,7 +630,7 @@ namespace Omnipotent.Services.KliveLLM
             ApplyServiceTier(ref payload, remoteProvider);
             payload.BuildMessagesFromList(structuredMessages);
 
-            return await SendPayloadWithRetryAsync(remoteProvider, payload);
+            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
         }
 
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
@@ -633,9 +643,177 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        // Chooses the transport: when a token sink is supplied we stream (stream=true + SSE) so the UI
+        // can show tokens as they generate; otherwise we use the buffered request with its retry policy.
+        // If a streaming attempt fails BEFORE any token is emitted (connect/headers/auth), we fall back
+        // to the buffered path so streaming never reduces reliability.
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendInferencePayloadAsync(
+            RemoteLLMProviderConfiguration remoteProvider,
+            HFWrapper.HFLLMInferenceRequest payload,
+            CancellationToken cancellationToken,
+            Action<string>? onToken)
+        {
+            if (onToken == null)
+                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken);
+
+            try
+            {
+                return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                try { await ServiceLog($"Streaming attempt failed before output ({ex.Message}); falling back to non-streaming."); } catch { }
+                payload.stream = false;
+                payload.stream_options = null;
+                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken);
+            }
+        }
+
+        // Streams an OpenAI-compatible chat completion: posts stream=true, reads the SSE body as it
+        // arrives, invokes onToken per content delta, merges any tool_call deltas by index, and
+        // synthesizes a normal HFLLMInferenceResponse so the rest of the pipeline is unchanged. A
+        // failure AFTER some content has streamed returns the partial result (no exception) rather than
+        // discarding the user-visible progress; a failure before any content throws (caller falls back).
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendStreamingPayloadAsync(
+            RemoteLLMProviderConfiguration remoteProvider,
+            HFWrapper.HFLLMInferenceRequest payload,
+            Action<string> onToken,
+            CancellationToken cancellationToken)
+        {
+            payload.stream = true;
+            payload.stream_options = new { include_usage = true };
+            string payloadJson = JsonConvert.SerializeObject(payload);
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
+            {
+                Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
+            };
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+            if (remoteProvider.Provider == LLMProvider.OpenRouter)
+            {
+                request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
+                request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
+            }
+
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                string body = await response.Content.ReadAsStringAsync(cancellationToken);
+                throw new HttpRequestException(
+                    $"{remoteProvider.DisplayName} streaming request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {body}");
+            }
+
+            var contentSb = new StringBuilder();
+            var toolCallsByIndex = new SortedDictionary<int, HFWrapper.HFToolCall>();
+            var argsByIndex = new Dictionary<int, StringBuilder>();
+            HFWrapper.HFLLMInferenceResponse.UsageDetails usage = null;
+            string finishReason = null;
+
+            try
+            {
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                string line;
+                while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (line.Length == 0) continue;
+                    if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
+
+                    var data = line.Substring(5).Trim();
+                    if (data == "[DONE]") break;
+
+                    HFWrapper.HFLLMStreamChunk chunk;
+                    try { chunk = JsonConvert.DeserializeObject<HFWrapper.HFLLMStreamChunk>(data); }
+                    catch { continue; } // skip keep-alive/comment lines and malformed fragments
+
+                    if (chunk == null) continue;
+                    if (chunk.usage != null) usage = chunk.usage;
+
+                    var choice = chunk.choices != null && chunk.choices.Count > 0 ? chunk.choices[0] : null;
+                    if (choice == null) continue;
+                    if (!string.IsNullOrEmpty(choice.finish_reason)) finishReason = choice.finish_reason;
+
+                    var delta = choice.delta;
+                    if (delta == null) continue;
+
+                    if (!string.IsNullOrEmpty(delta.content))
+                    {
+                        contentSb.Append(delta.content);
+                        try { onToken(delta.content); } catch { }
+                    }
+
+                    if (delta.tool_calls != null)
+                    {
+                        foreach (var tcd in delta.tool_calls)
+                        {
+                            if (!toolCallsByIndex.TryGetValue(tcd.index, out var tc))
+                            {
+                                tc = new HFWrapper.HFToolCall { function = new HFWrapper.HFFunctionCall() };
+                                toolCallsByIndex[tcd.index] = tc;
+                                argsByIndex[tcd.index] = new StringBuilder();
+                            }
+                            if (!string.IsNullOrEmpty(tcd.id)) tc.id = tcd.id;
+                            if (!string.IsNullOrEmpty(tcd.type)) tc.type = tcd.type;
+                            if (tcd.function != null)
+                            {
+                                if (!string.IsNullOrEmpty(tcd.function.name)) tc.function.name = tcd.function.name;
+                                if (tcd.function.arguments != null) argsByIndex[tcd.index].Append(tcd.function.arguments);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch when (contentSb.Length > 0 || toolCallsByIndex.Count > 0)
+            {
+                // Mid-stream drop after we already emitted output — return the partial answer rather
+                // than failing the whole turn.
+            }
+
+            List<HFWrapper.HFToolCall> toolCalls = null;
+            if (toolCallsByIndex.Count > 0)
+            {
+                toolCalls = new List<HFWrapper.HFToolCall>();
+                foreach (var kv in toolCallsByIndex)
+                {
+                    kv.Value.function.arguments = argsByIndex[kv.Key].ToString();
+                    toolCalls.Add(kv.Value);
+                }
+            }
+
+            return new HFWrapper.HFLLMInferenceResponse
+            {
+                choices = new List<HFWrapper.HFLLMInferenceResponse.Choice>
+                {
+                    new HFWrapper.HFLLMInferenceResponse.Choice
+                    {
+                        index = 0,
+                        finish_reason = finishReason,
+                        message = new HFWrapper.HFMessage
+                        {
+                            role = "assistant",
+                            content = contentSb.ToString(),
+                            tool_calls = toolCalls
+                        }
+                    }
+                },
+                usage = usage
+            };
+        }
+
         private async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
             RemoteLLMProviderConfiguration remoteProvider,
-            HFWrapper.HFLLMInferenceRequest payload)
+            HFWrapper.HFLLMInferenceRequest payload,
+            CancellationToken cancellationToken = default)
         {
             // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
             // fresh request per attempt from this cached body.
@@ -660,8 +838,15 @@ namespace Omnipotent.Services.KliveLLM
                         request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
                     }
 
-                    response = await client.SendAsync(request);
-                    responseContent = await response.Content.ReadAsStringAsync();
+                    response = await client.SendAsync(request, cancellationToken);
+                    responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+                }
+                // A deliberate cancellation (manual Stop / stall watchdog) surfaces as an
+                // OperationCanceledException tied to our token — it is NOT a transient blip, so
+                // propagate it immediately instead of burning retries on a run we're killing.
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
                 }
                 catch (Exception ex) when (IsTransientNetworkError(ex))
                 {
@@ -669,7 +854,7 @@ namespace Omnipotent.Services.KliveLLM
                     lastError = ex;
                     if (attempt >= RemoteInferenceMaxAttempts) throw;
                     try { await ServiceLog($"Remote LLM network error (attempt {attempt}/{RemoteInferenceMaxAttempts}): {ex.Message}. Retrying."); } catch { }
-                    await DelayBeforeRetryAsync(attempt, null);
+                    await DelayBeforeRetryAsync(attempt, null, cancellationToken);
                     continue;
                 }
 
@@ -686,7 +871,7 @@ namespace Omnipotent.Services.KliveLLM
                         {
                             lastError = httpEx;
                             try { await ServiceLog($"Remote LLM transient {status} (attempt {attempt}/{RemoteInferenceMaxAttempts}). Retrying."); } catch { }
-                            await DelayBeforeRetryAsync(attempt, response);
+                            await DelayBeforeRetryAsync(attempt, response, cancellationToken);
                             continue;
                         }
                         throw httpEx; // non-transient (4xx) or out of attempts
@@ -700,7 +885,7 @@ namespace Omnipotent.Services.KliveLLM
                         if (attempt < RemoteInferenceMaxAttempts)
                         {
                             lastError = emptyEx;
-                            await DelayBeforeRetryAsync(attempt, null);
+                            await DelayBeforeRetryAsync(attempt, null, cancellationToken);
                             continue;
                         }
                         throw emptyEx;
@@ -719,7 +904,7 @@ namespace Omnipotent.Services.KliveLLM
             || ex is System.IO.IOException
             || ex is System.Net.Sockets.SocketException;
 
-        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response)
+        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response, CancellationToken cancellationToken = default)
         {
             TimeSpan delay;
             if (response?.Headers?.RetryAfter?.Delta is TimeSpan retryAfter && retryAfter > TimeSpan.Zero)
@@ -731,7 +916,7 @@ namespace Omnipotent.Services.KliveLLM
                 double ms = RemoteInferenceBaseDelayMs * Math.Pow(2, attempt - 1);
                 delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
-            await Task.Delay(delay);
+            await Task.Delay(delay, cancellationToken);
         }
         private async Task EnsureModelDownloadedAsync()
         {
@@ -896,7 +1081,9 @@ namespace Omnipotent.Services.KliveLLM
             string? sessionId = null,
             int? maxTokensOverride = null,
             bool resetSessionBeforeQuery = false,
-            bool resetSessionAfterQuery = false)
+            bool resetSessionAfterQuery = false,
+            CancellationToken cancellationToken = default,
+            Action<string>? onToken = null)
         {
             var resp = new KliveLLMResponse() { Response = string.Empty, Conversation = new ChatHistory(), Success = false, ErrorMessage = string.Empty };
             if (!localModelReady || modelWeights == null)
@@ -967,10 +1154,10 @@ namespace Omnipotent.Services.KliveLLM
 
                     var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
                     StringBuilder sb = new StringBuilder();
-                    await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams))
+                    await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams, cancellationToken))
                     {
                         sb.Append(chunk);
-
+                        try { onToken?.Invoke(chunk); } catch { }
                     }
                     string raw = sb.ToString();
 

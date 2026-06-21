@@ -119,6 +119,9 @@ namespace Omnipotent.Services.KliveAgent
                 initializationMessage = "KliveAgent is ready.";
                 Interlocked.Exchange(ref initializationState, InitializationStateReady);
 
+                // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
+                _ = RunPendingRunWatchdogAsync();
+
                 await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
             }
             catch (Exception ex)
@@ -181,7 +184,8 @@ namespace Omnipotent.Services.KliveAgent
             AgentSourceChannel channel,
             string conversationId = null,
             string senderName = null,
-            Action<string, List<AgentScriptResult>> onProgress = null)
+            Action<AgentProgressUpdate> onProgress = null,
+            CancellationToken cancellationToken = default)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -217,7 +221,7 @@ namespace Omnipotent.Services.KliveAgent
             });
 
             // Process through the brain
-            var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress);
+            var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress, cancellationToken);
 
             // Persist conversation periodically (every 5 messages)
             if (conversation.Messages.Count % 5 == 0)
@@ -262,33 +266,64 @@ namespace Omnipotent.Services.KliveAgent
             var pendingResponse = new AgentPendingChatResponse
             {
                 ConversationId = conversationId,
+                // Carry the user's prompt so a page that reloads mid-run can re-render the turn before
+                // it has been persisted to the conversation file.
+                UserMessage = message,
                 // No canned placeholder — the bubble fills with the agent's real prose + code as it
                 // streams in (or its final answer for a no-script reply).
-                Response = string.Empty
+                Response = string.Empty,
+                CancellationSource = new CancellationTokenSource()
             };
 
             pendingApiResponses[pendingResponse.RequestId] = pendingResponse;
+            var runToken = pendingResponse.CancellationSource.Token;
 
             _ = Task.Run(async () =>
             {
                 try
                 {
                     // Stream the agent's prose + the scripts it runs into the pending response so the
-                    // poller shows it talking while it works, with code appearing as it executes.
+                    // poller shows it talking while it works, with code appearing as it executes. Every
+                    // update also bumps LastProgressAt — the heartbeat the stall watchdog watches.
                     var response = await HandleIncomingMessage(message, AgentSourceChannel.API, conversationId, senderName,
-                        onProgress: (text, scripts) =>
+                        onProgress: update =>
                         {
-                            pendingResponse.Response = text;
-                            pendingResponse.ScriptsExecuted = scripts;
-                        });
+                            if (update.Text != null) pendingResponse.Response = update.Text;
+                            if (update.Scripts != null) pendingResponse.ScriptsExecuted = update.Scripts;
+                            pendingResponse.Iteration = update.Iteration;
+                            pendingResponse.Phase = update.Phase;
+                            pendingResponse.StatusNote = update.StatusNote;
+                            pendingResponse.PromptTokens = update.PromptTokens;
+                            pendingResponse.CompletionTokens = update.CompletionTokens;
+                            if (update.NewActivity != null) pendingResponse.Activity.Add(update.NewActivity);
+                            pendingResponse.LastProgressAt = DateTime.UtcNow;
+                        },
+                        cancellationToken: runToken);
                     pendingResponse.FinalResponse = response;
-                    pendingResponse.Status = response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
+                    pendingResponse.Phase = "final";
+                    pendingResponse.Status = runToken.IsCancellationRequested
+                        ? AgentTaskStatus.Cancelled
+                        : response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
                     pendingResponse.ErrorMessage = response.Success ? null : response.ErrorMessage;
 
                     if (conversations.TryGetValue(conversationId, out var conversation))
                     {
                         await PersistConversationAsync(conversation);
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    pendingResponse.Status = AgentTaskStatus.Cancelled;
+                    pendingResponse.ErrorMessage = "Run was stopped.";
+                    pendingResponse.FinalResponse = new AgentChatResponse
+                    {
+                        Success = false,
+                        ConversationId = conversationId,
+                        Response = string.IsNullOrWhiteSpace(pendingResponse.Response)
+                            ? "_(Run stopped before completion.)_"
+                            : pendingResponse.Response,
+                        ErrorMessage = "Run was stopped."
+                    };
                 }
                 catch (Exception ex)
                 {
@@ -305,6 +340,8 @@ namespace Omnipotent.Services.KliveAgent
                 finally
                 {
                     pendingResponse.CompletedAt = DateTime.UtcNow;
+                    pendingResponse.LastProgressAt = DateTime.UtcNow;
+                    try { pendingResponse.CancellationSource?.Dispose(); } catch { }
                 }
             });
 
@@ -322,6 +359,66 @@ namespace Omnipotent.Services.KliveAgent
         {
             pendingApiResponses.TryGetValue(requestId, out var pendingResponse);
             return pendingResponse;
+        }
+
+        /// <summary>Manually stop a running message (the website's Stop button). Cancels the per-run
+        /// token, which unwinds the LLM call, the agent loop, and any running script; the run then
+        /// resolves to a truthful partial answer. Returns false if no such running request exists.</summary>
+        public bool CancelPendingApiResponse(string requestId)
+        {
+            if (string.IsNullOrWhiteSpace(requestId)) return false;
+            if (!pendingApiResponses.TryGetValue(requestId, out var pending)) return false;
+            if (pending.CompletedAt != null) return false;
+            try { pending.CancellationSource?.Cancel(); } catch { }
+            return true;
+        }
+
+        // ── Stall watchdog + pending-response eviction ──
+        // A run is "hung" only when it produces ZERO progress (no LLM reply, token, iteration, or script
+        // result) for a long, configurable window — NOT merely because it is slow. This lets genuinely
+        // long tasks run while still guaranteeing nothing blocks forever. The same loop evicts completed
+        // pending entries after a generous window so the in-memory dict can't grow unbounded.
+        private static readonly TimeSpan PendingRetentionWindow = TimeSpan.FromHours(6);
+
+        private async Task RunPendingRunWatchdogAsync()
+        {
+            while (true)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30));
+
+                    double stallMinutes = await GetIntOmniSetting("KliveAgent_StallTimeoutMinutes", 5);
+                    if (stallMinutes < 1) stallMinutes = 1;
+                    var stallWindow = TimeSpan.FromMinutes(stallMinutes);
+                    var now = DateTime.UtcNow;
+
+                    foreach (var kvp in pendingApiResponses)
+                    {
+                        var pending = kvp.Value;
+
+                        // Running but silent for too long → treat as hung, cancel it.
+                        if (pending.CompletedAt == null
+                            && pending.CancellationSource != null
+                            && !pending.CancellationSource.IsCancellationRequested
+                            && now - pending.LastProgressAt > stallWindow)
+                        {
+                            try { pending.CancellationSource.Cancel(); } catch { }
+                            try { await ServiceLog($"[KliveAgent] Stall watchdog cancelled run {kvp.Key} after {stallMinutes:0}min of no progress."); } catch { }
+                        }
+
+                        // Completed long ago → evict (durable record lives in the persisted conversation).
+                        if (pending.CompletedAt != null && now - pending.CompletedAt.Value > PendingRetentionWindow)
+                        {
+                            pendingApiResponses.TryRemove(kvp.Key, out _);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    try { await ServiceLogError(ex, "[KliveAgent] Pending-run watchdog iteration failed (non-fatal)."); } catch { }
+                }
+            }
         }
 
         private async Task<string> HandleDiscordDM(string message, string channelId, ulong authorDiscordId)

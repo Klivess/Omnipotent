@@ -107,6 +107,33 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Manual Stop: cancel a running message. The run unwinds (LLM call, agent loop, any running
+            // script) and resolves to a truthful partial answer.
+            await CreateRoute("/kliveagent/chat/cancel", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string requestId = body?.requestId;
+                    if (string.IsNullOrWhiteSpace(requestId))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "requestId is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var cancelled = service.CancelPendingApiResponse(requestId);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = cancelled }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
         }
 
         private async Task RegisterCapabilityRoutes()

@@ -167,6 +167,10 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("tool_choice", NullValueHandling = NullValueHandling.Ignore)]
             public object tool_choice;
 
+            // When streaming, ask the provider to include a final usage chunk (OpenAI/OpenRouter/HF).
+            [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
+            public object stream_options;
+
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {
                 List<HFMessage> hFMessages = new();
@@ -308,6 +312,67 @@ namespace Omnipotent.Services.KliveLLM
 
                 [JsonProperty("created")]
                 public double created { get; set; }
+            }
+        }
+
+        // ── Streaming (stream=true) chunk shapes ──
+        // OpenAI-compatible SSE: each `data: {json}` line is one chunk carrying incremental "delta"
+        // fields. Content deltas append to the answer; tool_call deltas are merged by index (id/name
+        // arrive once, arguments stream across many chunks). A final chunk may carry usage totals.
+        public class HFLLMStreamChunk
+        {
+            [JsonProperty("choices")]
+            public List<StreamChoice> choices { get; set; }
+
+            [JsonProperty("usage")]
+            public HFLLMInferenceResponse.UsageDetails usage { get; set; }
+
+            public class StreamChoice
+            {
+                [JsonProperty("index")]
+                public int index { get; set; }
+
+                [JsonProperty("finish_reason")]
+                public string finish_reason { get; set; }
+
+                [JsonProperty("delta")]
+                public Delta delta { get; set; }
+            }
+
+            public class Delta
+            {
+                [JsonProperty("role")]
+                public string role { get; set; }
+
+                [JsonProperty("content")]
+                public string content { get; set; }
+
+                [JsonProperty("tool_calls")]
+                public List<StreamToolCallDelta> tool_calls { get; set; }
+            }
+
+            public class StreamToolCallDelta
+            {
+                [JsonProperty("index")]
+                public int index { get; set; }
+
+                [JsonProperty("id")]
+                public string id { get; set; }
+
+                [JsonProperty("type")]
+                public string type { get; set; }
+
+                [JsonProperty("function")]
+                public StreamFunctionDelta function { get; set; }
+            }
+
+            public class StreamFunctionDelta
+            {
+                [JsonProperty("name")]
+                public string name { get; set; }
+
+                [JsonProperty("arguments")]
+                public string arguments { get; set; }
             }
         }
     }

@@ -152,6 +152,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- ONE composite script beats many tiny ones. Do discovery + action + Log() in a single block whenever you can. A memory recall fits cheaply inside that same block — fold it in rather than skipping it.");
             sb.AppendLine("- NO FILLER ACKNOWLEDGEMENTS. Never open with throwaway placeholders like \"On it\", \"Sure\", \"Let me…\", or \"Pulling that now\". Only write prose when you have something substantive to tell the user; otherwise just run the tool/script silently — the UI already shows your work executing. Your final reply must be the actual answer, never a stalling acknowledgement.");
             sb.AppendLine("- await Task / Task<T> ONLY. GetTypeSchema, GetService, ListServices, ExecuteServiceMethod (non-async overload), Log are SYNC — do not await.");
+            sb.AppendLine("- NEVER WRITE CODE THAT CAN HANG. Your scripts run on a timeout and WILL be killed if they block — wasting the whole step. Specifically: (a) no infinite/unbounded loops (`while(true)`, polling without an exit) — always have a bounded condition or a max-iteration count; (b) ALWAYS pass `CancellationToken` to anything that accepts one — `await Task.Delay(ms, CancellationToken)`, async I/O, HTTP, `process.WaitForExit(timeoutMs)`; (c) NEVER block a thread with `.Result`, `.Wait()`, or `.GetAwaiter().GetResult()` — always `await`; (d) NEVER wait on console/stdin or any input that won't arrive; (e) put an explicit timeout on every external process, socket, or network call so a stuck dependency can't freeze you. If you genuinely need to wait on something, wait in SHORT bounded steps and re-check, never indefinitely.");
             sb.AppendLine("- CallObjectMethod ALWAYS returns Task<object?> — you MUST `await` it; it auto-unwraps the called method's own Task/Task<T> (and property getters) for you. NEVER write `var x = CallObjectMethod(...)` without await, or x is a Task object, not the value (tell-tale: output shows 'System.Threading.Tasks.Task`1[...]').");
             sb.AppendLine("- GetService(name) returns object (sync). To read/call on it: `await CallObjectMethod(GetService(\"X\"), \"Method\", args)`, or `GetObjectMember(GetService(\"X\"), \"Field\")`.");
             sb.AppendLine("- If a script errors, READ the error and change approach. Never retry the same failing code. Compile errors now show the error id, the exact line:col, the offending source line, and a caret (^) under the bad token — fix THAT line; don't blame a different call. Runtime errors show the exception type, inner-cause chain, and stack — read them.");
@@ -613,7 +614,8 @@ namespace Omnipotent.Services.KliveAgent
             string userMessage,
             AgentConversation conversation,
             string? senderName = null,
-            Action<string, List<AgentScriptResult>>? onProgress = null)
+            Action<AgentProgressUpdate>? onProgress = null,
+            CancellationToken cancellationToken = default)
         {
             try
             {
@@ -645,13 +647,20 @@ namespace Omnipotent.Services.KliveAgent
                 try { useToolCalling = await llm.SupportsNativeToolCallingAsync(); }
                 catch { useToolCalling = false; }
 
+                // Per-token streaming: when on (and we have a live progress channel), the model's output
+                // is surfaced token-by-token as it generates. Configurable so it can be turned off.
+                bool streamTokens = onProgress != null && await agentService.GetBoolOmniSetting("KliveAgent_StreamTokens", defaultValue: true);
+
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions() : null;
 
                 llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
-                var sharedGlobals = new ScriptGlobals(agentService);
+                // Thread the per-run cancellation token into ScriptGlobals so a manual Stop or the stall
+                // watchdog also unwinds a script that is mid-execution (ExecuteAsync links this token with
+                // its own per-script timeout).
+                var sharedGlobals = new ScriptGlobals(agentService, cancellationToken);
                 var scriptSession = scriptEngine.CreateSession(sharedGlobals);
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
@@ -678,16 +687,46 @@ namespace Omnipotent.Services.KliveAgent
                 // progress channel. NEVER fabricates placeholder text: if the model hasn't actually
                 // said anything yet, we send only the live work-status note (or nothing) — no canned
                 // "On it." filler.
-                void ReportProgress(string runningNote)
+                // Emits a structured progress update: the agent's accumulated prose (+ optional running
+                // note), the scripts run so far, and live transparency fields (phase, iteration, running
+                // token totals, and an optional new activity-timeline event). NEVER fabricates placeholder
+                // prose — Text is left null when the model hasn't actually said anything, so the host won't
+                // overwrite the bubble with filler; status/activity still flow.
+                void ReportProgress(string phase, string runningNote, AgentActivityEvent newActivity = null, string? liveText = null)
                 {
                     if (onProgress == null) return;
-                    var shown = progressText.ToString();
-                    string body;
-                    if (shown.Length > 0 && !string.IsNullOrWhiteSpace(runningNote)) body = $"{shown}\n\n{runningNote}";
-                    else if (shown.Length > 0) body = shown;
-                    else if (!string.IsNullOrWhiteSpace(runningNote)) body = runningNote;
-                    else return; // nothing real to report — don't push a placeholder
-                    try { onProgress(body, new List<AgentScriptResult>(allScriptsExecuted)); } catch { }
+                    // Compose: committed prose from prior turns + the tokens streaming in this turn (if any)
+                    // + an optional status note. liveText is the in-flight model output for the CURRENT turn,
+                    // shown token-by-token before it's parsed and committed to progressText.
+                    var composed = new StringBuilder();
+                    var committed = progressText.ToString();
+                    if (committed.Length > 0) composed.Append(committed);
+                    if (!string.IsNullOrEmpty(liveText))
+                    {
+                        if (composed.Length > 0) composed.Append("\n\n");
+                        composed.Append(liveText);
+                    }
+                    if (!string.IsNullOrWhiteSpace(runningNote))
+                    {
+                        if (composed.Length > 0) composed.Append("\n\n");
+                        composed.Append(runningNote);
+                    }
+                    string? body = composed.Length > 0 ? composed.ToString() : null;
+                    try
+                    {
+                        onProgress(new AgentProgressUpdate
+                        {
+                            Text = body,
+                            Scripts = new List<AgentScriptResult>(allScriptsExecuted),
+                            Iteration = iterationsDone,
+                            Phase = phase,
+                            StatusNote = runningNote,
+                            PromptTokens = totalPromptTokens,
+                            CompletionTokens = totalCompletionTokens,
+                            NewActivity = newActivity
+                        });
+                    }
+                    catch { }
                 }
 
                 // Deliver a retry/guidance/observation prompt the right way for the active mode: a user-role
@@ -696,6 +735,40 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     if (useToolCalling) llm.AppendUserMessageToToolSession(llmSessionId, text);
                     else currentPrompt = text;
+                }
+
+                // Build a truthful partial answer when the run is stopped (manual Stop or stall watchdog):
+                // surface whatever prose + scripts the agent produced so far, persist the turn, and record
+                // stats — exactly like a normal finish, but flagged unsuccessful with a "stopped" note.
+                AgentChatResponse BuildStoppedResponse()
+                {
+                    var partial = progressText.ToString().Trim();
+                    var finalText = partial.Length > 0
+                        ? partial + "\n\n_(Run stopped before completion.)_"
+                        : "_(Run stopped before completion — no output was produced yet.)_";
+                    try { llm.ResetSession(llmSessionId); } catch { }
+                    conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
+                    conversation.Messages.Add(new AgentMessage
+                    {
+                        Role = AgentMessageRole.Agent,
+                        Content = finalText,
+                        ScriptResults = allScriptsExecuted.Count > 0 ? new List<AgentScriptResult>(allScriptsExecuted) : null
+                    });
+                    conversation.LastUpdated = DateTime.UtcNow;
+                    agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                        allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
+                        turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                    return new AgentChatResponse
+                    {
+                        ConversationId = conversation.ConversationId,
+                        Response = finalText,
+                        ScriptsExecuted = allScriptsExecuted,
+                        Success = false,
+                        ErrorMessage = "Run was stopped (manual cancel or stall watchdog).",
+                        PromptTokens = totalPromptTokens,
+                        CompletionTokens = totalCompletionTokens,
+                        Iterations = iterationsDone
+                    };
                 }
 
                 // ── Agentic Loop: Think → Script → Observe → repeat ──
@@ -707,22 +780,45 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     iterationsDone = iteration + 1;
 
+                    // Stopped between iterations (manual Stop / stall watchdog) — bail with a partial answer.
+                    if (cancellationToken.IsCancellationRequested)
+                        return BuildStoppedResponse();
+
+                    // Surface "thinking" while we wait on the model. This also acts as a stall-watchdog
+                    // heartbeat at the start of every step.
+                    ReportProgress("thinking", $"_…thinking (step {iteration + 1})_");
+
+                    // Per-iteration live buffer: streamed content tokens accumulate here and are pushed to
+                    // the UI as they arrive. Reset every iteration; the parsed prose is committed to
+                    // progressText afterwards so there is no double display.
+                    var liveBuffer = new StringBuilder();
+                    Action<string>? tokenSink = !streamTokens ? null : tok =>
+                    {
+                        if (string.IsNullOrEmpty(tok)) return;
+                        liveBuffer.Append(tok);
+                        ReportProgress("thinking", null, liveText: liveBuffer.ToString());
+                    };
+
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
                         if (useToolCalling)
                         {
                             // The structured session already holds system + user + any prior tool turns.
-                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!);
+                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, cancellationToken: cancellationToken, onToken: tokenSink);
                         }
                         else
                         {
                             // Pass system prompt only on iteration 0 so it is set as the LLM session's
                             // system role message once — not re-injected into every user turn.
                             llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                                systemPrompt: firstIterationSystemPrompt);
+                                systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink);
                             firstIterationSystemPrompt = null; // don't resend
                         }
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        return BuildStoppedResponse();
                     }
                     catch (Exception llmEx)
                     {
@@ -788,13 +884,22 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         var thought = string.Join("\n", segments.Where(IsProse)
                             .Select(s => s.Content)).Trim();
+                        AgentActivityEvent thoughtEvent = null;
                         if (thought.Length > 0)
                         {
                             if (progressText.Length > 0) progressText.AppendLine().AppendLine();
                             progressText.Append(thought);
+                            thoughtEvent = new AgentActivityEvent
+                            {
+                                Iteration = iteration + 1,
+                                Kind = "think",
+                                Text = thought.Length > 200 ? thought.Substring(0, 200) + "…" : thought
+                            };
                         }
                         int pendingCount = segments.Count(IsAction);
-                        ReportProgress($"_…running {pendingCount} step{(pendingCount == 1 ? "" : "s")} (step {iteration + 1})_");
+                        ReportProgress("running",
+                            $"_…running {pendingCount} step{(pendingCount == 1 ? "" : "s")} (step {iteration + 1})_",
+                            thoughtEvent);
                     }
 
                     // Detect Anthropic/OpenAI-style tool-call XML or JSON in the raw output — the
@@ -932,6 +1037,14 @@ namespace Omnipotent.Services.KliveAgent
                             if (!string.IsNullOrWhiteSpace(memText)) observationSb.AppendLine(memText);
                             observationSb.AppendLine();
 
+                            // Stream the tool invocation to the live activity timeline.
+                            ReportProgress("running", null, new AgentActivityEvent
+                            {
+                                Iteration = iteration + 1,
+                                Kind = memOk ? "tool" : "error",
+                                Text = $"{segment.ToolName} {(memOk ? "ok" : "error")}"
+                            });
+
                             if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
                             {
                                 llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName, memText);
@@ -945,8 +1058,16 @@ namespace Omnipotent.Services.KliveAgent
                         var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty);
                         allScriptsExecuted.Add(result);
 
-                        // Stream the just-completed script (code + output) to the UI as it lands.
-                        ReportProgress($"_…ran {allScriptsExecuted.Count} script{(allScriptsExecuted.Count == 1 ? "" : "s")} so far (step {iteration + 1})_");
+                        // Stream the just-completed script (code + output) to the UI as it lands, with a
+                        // timeline entry recording success/failure + duration.
+                        ReportProgress("observing",
+                            $"_…ran {allScriptsExecuted.Count} script{(allScriptsExecuted.Count == 1 ? "" : "s")} so far (step {iteration + 1})_",
+                            new AgentActivityEvent
+                            {
+                                Iteration = iteration + 1,
+                                Kind = result.Success ? "script" : "error",
+                                Text = $"ran script — {(result.Success ? "OK" : "ERROR")} ({result.ExecutionTimeMs}ms)"
+                            });
 
                         // Build this script's observation once, then route it to BOTH the aggregate
                         // observation buffer (text-mode feedback) and — when this came from a native

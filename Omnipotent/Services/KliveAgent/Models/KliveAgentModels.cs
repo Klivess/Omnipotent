@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using System.Threading;
 
 namespace Omnipotent.Services.KliveAgent.Models
 {
@@ -659,6 +660,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("status")]
         public AgentTaskStatus Status { get; set; } = AgentTaskStatus.Running;
 
+        /// <summary>The user's original message for this turn. Carried here so a page that reloads
+        /// mid-run can render the prompt+streaming-answer pair before the turn is persisted to the
+        /// conversation file.</summary>
+        [JsonProperty("userMessage")]
+        public string UserMessage { get; set; }
+
         [JsonProperty("response")]
         public string Response { get; set; }
 
@@ -666,6 +673,32 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// (before the final response is ready).</summary>
         [JsonProperty("scriptsExecuted")]
         public List<AgentScriptResult> ScriptsExecuted { get; set; } = new();
+
+        // ── Live transparency (streamed to the UI between polls) ──
+
+        /// <summary>1-based index of the agent's current Think→Script→Observe iteration.</summary>
+        [JsonProperty("iteration")]
+        public int Iteration { get; set; }
+
+        /// <summary>Coarse phase label: "thinking" | "running" | "observing" | "final".</summary>
+        [JsonProperty("phase")]
+        public string Phase { get; set; }
+
+        /// <summary>Short human-readable note about what the agent is doing right now.</summary>
+        [JsonProperty("statusNote")]
+        public string StatusNote { get; set; }
+
+        /// <summary>Running prompt-token total for the turn so far.</summary>
+        [JsonProperty("promptTokens")]
+        public int PromptTokens { get; set; }
+
+        /// <summary>Running completion-token total for the turn so far.</summary>
+        [JsonProperty("completionTokens")]
+        public int CompletionTokens { get; set; }
+
+        /// <summary>Append-only timeline of what the agent has done this turn (for the UI activity log).</summary>
+        [JsonProperty("activity")]
+        public List<AgentActivityEvent> Activity { get; set; } = new();
 
         [JsonProperty("finalResponse")]
         public AgentChatResponse FinalResponse { get; set; }
@@ -676,7 +709,51 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("completedAt")]
         public DateTime? CompletedAt { get; set; }
 
+        /// <summary>Last moment the run made real progress (LLM reply, token, iteration, or script
+        /// result). The stall watchdog cancels a run only when this stops advancing — so a slow but
+        /// progressing task is never aborted, while a truly hung one is.</summary>
+        [JsonIgnore]
+        public DateTime LastProgressAt { get; set; } = DateTime.UtcNow;
+
+        /// <summary>Cancellation source for this run. A manual Stop or the stall watchdog cancels it,
+        /// which unwinds the LLM HTTP call, the agent loop, and any running script.</summary>
+        [JsonIgnore]
+        public CancellationTokenSource CancellationSource { get; set; }
+
         [JsonProperty("errorMessage")]
         public string ErrorMessage { get; set; }
+    }
+
+    /// <summary>One entry in a run's live activity timeline.</summary>
+    public class AgentActivityEvent
+    {
+        [JsonProperty("timestamp")]
+        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+
+        [JsonProperty("iteration")]
+        public int Iteration { get; set; }
+
+        /// <summary>Kind of event: "think" | "script" | "tool" | "observe" | "final" | "error".</summary>
+        [JsonProperty("kind")]
+        public string Kind { get; set; }
+
+        [JsonProperty("text")]
+        public string Text { get; set; }
+    }
+
+    /// <summary>Structured progress carrier the brain pushes to its host (replaces the old
+    /// (text, scripts) callback) so the UI can show iteration, phase, running token counts and a
+    /// per-step activity timeline — not just accumulated prose.</summary>
+    public class AgentProgressUpdate
+    {
+        public string Text { get; set; }
+        public List<AgentScriptResult> Scripts { get; set; }
+        public int Iteration { get; set; }
+        public string Phase { get; set; }
+        public string StatusNote { get; set; }
+        public int PromptTokens { get; set; }
+        public int CompletionTokens { get; set; }
+        /// <summary>A new activity event to append, if this update introduces one.</summary>
+        public AgentActivityEvent NewActivity { get; set; }
     }
 }
