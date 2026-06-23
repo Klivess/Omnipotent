@@ -23,6 +23,11 @@ namespace Omnipotent.Services.KliveAgent
         private readonly KliveAgentCodebaseIndex index;
         private readonly KliveAgentSymbolGraph graph;
 
+        // Memoizes built maps. The codebase index/graph are immutable for the process lifetime, so a map
+        // is a pure function of (budget, seeds) — repeated or similar tasks reuse it instead of re-walking
+        // PageRank and re-rendering every file entry. Only populated once the index/graph are built.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> repoMapCache = new();
+
         // Simple words to use for seeding from user messages
         private static readonly Regex WordBoundaryRe =
             new(@"\b([A-Z][a-zA-Z0-9]{2,})\b", RegexOptions.Compiled);
@@ -45,12 +50,19 @@ namespace Omnipotent.Services.KliveAgent
             if (!index.IsBuilt || !graph.IsBuilt)
                 return "<!-- repo map not yet available — index is building -->";
 
+            // Cache lookup: the map is a pure function of (budget, seeds) once the index/graph are built.
+            var seedKey = seedHints == null ? string.Empty
+                : string.Join(",", seedHints.Where(s => !string.IsNullOrWhiteSpace(s))
+                    .Select(s => s.Trim()).OrderBy(s => s, StringComparer.Ordinal));
+            var cacheKey = maxTokens + "|" + seedKey;
+            if (repoMapCache.TryGetValue(cacheKey, out var cachedMap)) return cachedMap;
+
             // Resolve seed hints to file paths
             var seedFiles = ResolveSeeds(seedHints);
 
             var ranked = graph.GetRankedFiles(seedFiles.Count > 0 ? seedFiles : null, topN: 80);
             if (ranked.Count == 0)
-                return "<!-- repo map: no ranked files -->";
+                return repoMapCache[cacheKey] = "<!-- repo map: no ranked files -->";
 
             var sb = new StringBuilder();
             sb.AppendLine("[Repo Map — most architecturally relevant files for this task]");
@@ -71,7 +83,7 @@ namespace Omnipotent.Services.KliveAgent
                 used += cost;
             }
 
-            return sb.ToString().TrimEnd();
+            return repoMapCache[cacheKey] = sb.ToString().TrimEnd();
         }
 
         /// <summary>

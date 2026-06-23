@@ -314,7 +314,8 @@ namespace Omnipotent.Services.KliveLLM
             string? systemPrompt = null,
             bool useFreeModel = false,
             CancellationToken cancellationToken = default,
-            Action<string>? onToken = null)
+            Action<string>? onToken = null,
+            string? thinkingOverride = null)
         {
             if (useFreeModel)
             {
@@ -325,7 +326,8 @@ namespace Omnipotent.Services.KliveLLM
                     systemPrompt,
                     forceFreeModel: true,
                     cancellationToken: cancellationToken,
-                    onToken: onToken);
+                    onToken: onToken,
+                    thinkingOverride: thinkingOverride);
             }
 
             if (await GetActiveProviderAsync() != LLMProvider.Local)
@@ -336,7 +338,8 @@ namespace Omnipotent.Services.KliveLLM
                     maxTokensOverride,
                     systemPrompt,
                     cancellationToken: cancellationToken,
-                    onToken: onToken);
+                    onToken: onToken,
+                    thinkingOverride: thinkingOverride);
 
                 return hfResponse;
             }
@@ -434,7 +437,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -445,7 +448,7 @@ namespace Omnipotent.Services.KliveLLM
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken);
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete);
             var msg = response.choices[0].message;
             var content = HFWrapper.ContentToText(msg?.content);
             var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -474,7 +477,7 @@ namespace Omnipotent.Services.KliveLLM
             };
         }
 
-        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -507,7 +510,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, prompt);
-            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride);
             {
                 // Providers occasionally return an assistant turn with null content. Coalesce to an
                 // empty string so it neither crashes downstream parsing nor poisons the session
@@ -528,6 +531,26 @@ namespace Omnipotent.Services.KliveLLM
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
                 };
             }
+        }
+
+        // Best-effort: open (and pool) the HTTPS connection to the active remote provider so the first
+        // real inference call on a turn reuses a warm connection instead of paying the TLS/connect RTT.
+        // Meant to be fired fire-and-forget at the START of an agent run so it overlaps with prompt
+        // assembly. Errors are swallowed — a failed warm-up must never affect the actual request.
+        public async Task WarmUpConnectionAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                if (client == null) return;
+                if (await GetActiveProviderAsync() == LLMProvider.Local) return;
+                RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync();
+                using var request = new HttpRequestMessage(HttpMethod.Get, remoteProvider.ChatCompletionsEndpoint);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+                // We don't care about the status (a GET to the completions endpoint may 404/405) — the
+                // point is to complete the TLS handshake and leave a pooled connection behind.
+                using var _ = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            }
+            catch { /* warm-up is best-effort */ }
         }
 
         private async Task<RemoteLLMProviderConfiguration> GetRemoteProviderConfigurationAsync(bool forceFreeModel = false)
@@ -602,7 +625,7 @@ namespace Omnipotent.Services.KliveLLM
         private const int RemoteInferenceMaxAttempts = 3;
         private const int RemoteInferenceBaseDelayMs = 800;
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -613,8 +636,9 @@ namespace Omnipotent.Services.KliveLLM
                 max_tokens = maxTokensOverride,
             };
             ApplyServiceTier(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider);
+            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             payload.BuildMessagesFromChatHistory(messages);
+            ApplyPromptCaching(ref payload, remoteProvider);
 
             return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
         }
@@ -631,7 +655,9 @@ namespace Omnipotent.Services.KliveLLM
             bool forceFreeModel = false,
             string? modelOverride = null,
             CancellationToken cancellationToken = default,
-            Action<string>? onToken = null)
+            Action<string>? onToken = null,
+            string? thinkingOverride = null,
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -643,10 +669,55 @@ namespace Omnipotent.Services.KliveLLM
                 tools = tools,
             };
             ApplyServiceTier(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider);
+            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             payload.BuildMessagesFromList(structuredMessages);
+            ApplyPromptCaching(ref payload, remoteProvider);
 
-            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
+            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken, onToolCallComplete);
+        }
+
+        // Marker that KliveAgent's BuildSystemPrompt inserts between the STABLE system-prompt skeleton
+        // (personality + rules + patterns + memory discipline — identical across tasks) and the VOLATILE
+        // tail (task tool guide + repo map + memories). On OpenRouter the system message is split here and
+        // the skeleton is tagged with cache_control so its prefill is served from cache on every turn after
+        // the first. On any other provider the marker is simply stripped so the model never sees it.
+        public const string CacheBreakpointMarker = "KLIVE_CACHE_BREAKPOINT";
+
+        private static readonly object EphemeralCacheControl = new { type = "ephemeral" };
+
+        /// <summary>Rewrites the leading system message to enable OpenRouter prompt caching. The stable
+        /// skeleton (text before <see cref="CacheBreakpointMarker"/>, or the whole system message when the
+        /// marker is absent) becomes a content-part tagged with cache_control; the volatile remainder
+        /// follows as a plain part. For non-OpenRouter providers this only strips the marker.</summary>
+        private static void ApplyPromptCaching(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        {
+            if (payload.messages == null || payload.messages.Length == 0) return;
+
+            var system = payload.messages.FirstOrDefault(m => m != null && m.role == "system");
+            if (system == null) return;
+
+            string text = HFWrapper.ContentToText(system.content);
+            if (string.IsNullOrEmpty(text)) return;
+
+            int markerIdx = text.IndexOf(CacheBreakpointMarker, StringComparison.Ordinal);
+            string stable = markerIdx >= 0 ? text.Substring(0, markerIdx) : text;
+            string volatileTail = markerIdx >= 0 ? text.Substring(markerIdx + CacheBreakpointMarker.Length) : string.Empty;
+
+            if (remoteProvider.Provider != LLMProvider.OpenRouter)
+            {
+                // No native caching switch here — just guarantee the marker can never reach the model.
+                if (markerIdx >= 0) system.content = stable + volatileTail;
+                return;
+            }
+
+            var parts = new List<object>
+            {
+                new HFWrapper.HFTextPart { text = stable, cache_control = EphemeralCacheControl }
+            };
+            if (!string.IsNullOrEmpty(volatileTail))
+                parts.Add(new HFWrapper.HFTextPart { text = volatileTail });
+
+            system.content = parts;
         }
 
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
@@ -667,14 +738,43 @@ namespace Omnipotent.Services.KliveLLM
         /// "Off" needs a directive (/no_think); the effort levels rely on the provider/model default.</summary>
         internal string ThinkingDirective => ThinkingDisabled ? " /no_think" : string.Empty;
 
-        /// <summary>Maps the thinking type to OpenRouter's native reasoning control. Other providers
-        /// rely on <see cref="ThinkingDirective"/> already present in the system prompt.</summary>
-        private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        // Canonical low→high ordering of the reasoning effort levels. Used to clamp a per-call
+        // request against the user's configured ceiling (ThinkingType).
+        private static readonly string[] ThinkingLevelOrder = { "off", "low", "medium", "high" };
+
+        private static int ThinkingRank(string? level)
+        {
+            if (string.IsNullOrWhiteSpace(level)) return -1;
+            for (int i = 0; i < ThinkingLevelOrder.Length; i++)
+                if (string.Equals(ThinkingLevelOrder[i], level, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            return -1;
+        }
+
+        /// <summary>Resolves the effective reasoning effort for a single call. The per-call
+        /// <paramref name="requested"/> level is clamped so it never exceeds the user's configured
+        /// ThinkingType (the ceiling); a null/unknown request falls back to the ceiling. This keeps the
+        /// user's setting authoritative while letting the agent dial effort DOWN for cheap turns and UP
+        /// (toward the ceiling) for hard ones. Returns a canonical lowercase level (off/low/medium/high).</summary>
+        internal string ResolveThinkingLevel(string? requested)
+        {
+            int ceiling = ThinkingRank(thinkingType);
+            if (ceiling < 0) ceiling = ThinkingRank("Medium"); // defensive: unknown setting → Medium
+            int want = ThinkingRank(requested);
+            int effective = want < 0 ? ceiling : Math.Min(want, ceiling);
+            return ThinkingLevelOrder[effective];
+        }
+
+        /// <summary>Maps the (clamped) thinking level to OpenRouter's native reasoning control. Other
+        /// providers rely on <see cref="ThinkingDirective"/> already present in the system prompt.
+        /// <paramref name="thinkingOverride"/> is the agent's per-call request (null = use the ceiling).</summary>
+        private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider, string? thinkingOverride = null)
         {
             if (remoteProvider.Provider != LLMProvider.OpenRouter) return;
-            payload.reasoning = ThinkingDisabled
+            string effective = ResolveThinkingLevel(thinkingOverride);
+            payload.reasoning = string.Equals(effective, "off", StringComparison.OrdinalIgnoreCase)
                 ? new { enabled = false }
-                : new { effort = thinkingType.ToLowerInvariant() };
+                : new { effort = effective };
         }
 
         // Chooses the transport: when a token sink is supplied we stream (stream=true + SSE) so the UI
@@ -685,14 +785,15 @@ namespace Omnipotent.Services.KliveLLM
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
             CancellationToken cancellationToken,
-            Action<string>? onToken)
+            Action<string>? onToken,
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
         {
             if (onToken == null)
                 return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken);
 
             try
             {
-                return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken);
+                return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken, onToolCallComplete);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -716,7 +817,8 @@ namespace Omnipotent.Services.KliveLLM
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
             Action<string> onToken,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
         {
             payload.stream = true;
             payload.stream_options = new { include_usage = true };
@@ -746,6 +848,27 @@ namespace Omnipotent.Services.KliveLLM
             var argsByIndex = new Dictionary<int, StringBuilder>();
             HFWrapper.HFLLMInferenceResponse.UsageDetails usage = null;
             string finishReason = null;
+
+            // #9 Speculative dispatch: notify the caller the moment a tool_call's arguments are fully
+            // streamed so it can start executing that tool while the model is still generating later
+            // tool_calls. An index is COMPLETE once a higher index begins streaming (OpenAI emits
+            // tool_calls in index order); at stream end every remaining index is complete.
+            var firedToolCalls = new HashSet<int>();
+            void FireCompletedToolCalls(bool all)
+            {
+                if (onToolCallComplete == null || toolCallsByIndex.Count == 0) return;
+                int maxIdx = toolCallsByIndex.Keys.Max();
+                foreach (var kv in toolCallsByIndex)
+                {
+                    int idx = kv.Key;
+                    if (!all && idx >= maxIdx) continue;          // the highest index may still be streaming
+                    if (!firedToolCalls.Add(idx)) continue;       // already fired
+                    var tc = kv.Value;
+                    if (string.IsNullOrEmpty(tc.id) || string.IsNullOrEmpty(tc.function?.name)) { firedToolCalls.Remove(idx); continue; }
+                    tc.function.arguments = argsByIndex[idx].ToString();
+                    try { onToolCallComplete(tc); } catch { }
+                }
+            }
 
             try
             {
@@ -801,6 +924,9 @@ namespace Omnipotent.Services.KliveLLM
                             }
                         }
                     }
+
+                    // A tool_call becomes dispatchable as soon as a later index starts streaming.
+                    FireCompletedToolCalls(all: false);
                 }
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -812,6 +938,9 @@ namespace Omnipotent.Services.KliveLLM
                 // Mid-stream drop after we already emitted output — return the partial answer rather
                 // than failing the whole turn.
             }
+
+            // Stream finished (or dropped mid-way) — every remaining tool_call is now complete.
+            FireCompletedToolCalls(all: true);
 
             List<HFWrapper.HFToolCall> toolCalls = null;
             if (toolCallsByIndex.Count > 0)

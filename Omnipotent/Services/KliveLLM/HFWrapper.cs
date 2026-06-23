@@ -44,6 +44,12 @@ namespace Omnipotent.Services.KliveLLM
 
             [JsonProperty("text")]
             public string text = "";
+
+            // Anthropic/OpenRouter prompt-caching breakpoint, e.g. { "type": "ephemeral" }. When set on
+            // a text part, the provider caches everything up to and including it so the prefix prefill is
+            // reused on later requests. Omitted from the payload when null (no effect on the vision path).
+            [JsonProperty("cache_control", NullValueHandling = NullValueHandling.Ignore)]
+            public object cache_control;
         }
 
         /// <summary>Image element of a content-parts array. Url is typically a base64 data URI.</summary>

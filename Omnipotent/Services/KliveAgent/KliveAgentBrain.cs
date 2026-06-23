@@ -104,6 +104,15 @@ namespace Omnipotent.Services.KliveAgent
             // Extract PascalCase seed words from the user message for repo map personalisation
             var seeds = KliveAgentRepoMap.ExtractSeedsFromText(userMessage);
 
+            // Kick off the async BM25 memory recall FIRST so it overlaps with the synchronous, CPU-bound
+            // repo-map build below — the two are independent, so there's no reason to pay for them serially
+            // on the critical path before the first LLM call.
+            var memoriesTask = memory.FormatMemoriesForPrompt(
+                userMessage,
+                maxMemories: 4,
+                maxShortcuts: 3,
+                maxTokens: KliveAgentContextBudget.MemoryBudget);
+
             // Build token-budgeted, task-personalised repo map (only when the task has code signals).
             var repoMap = string.Empty;
             try
@@ -113,16 +122,9 @@ namespace Omnipotent.Services.KliveAgent
             }
             catch { /* best-effort */ }
 
-            // BM25-ranked memories, budget-capped
+            // BM25-ranked memories, budget-capped (started above; await the overlapped result here).
             var memoriesSection = string.Empty;
-            try
-            {
-                memoriesSection = await memory.FormatMemoriesForPrompt(
-                    userMessage,
-                    maxMemories: 4,
-                    maxShortcuts: 3,
-                    maxTokens: KliveAgentContextBudget.MemoryBudget);
-            }
+            try { memoriesSection = await memoriesTask; }
             catch { }
 
             var sb = new StringBuilder();
@@ -141,6 +143,8 @@ namespace Omnipotent.Services.KliveAgent
             {
                 sb.AppendLine("- To inspect or act, CALL THE execute_csharp TOOL with your C# in the 'code' argument. Locals persist across calls within the same turn.");
                 sb.AppendLine("- Do NOT wrap code in {{{ ... }}} or markdown fences, and do NOT emit XML tool-call tags. Use the native execute_csharp tool channel only. ONE call can do discovery + action + Log() together.");
+                sb.AppendLine("- PREFER NATIVE TOOLS over execute_csharp: grep, read_file, list_directory, recall_memories, recall_memories_by_tag, save_memory, get_global_path run INSTANTLY with no compile step. execute_csharp pays a C# compilation cost on EVERY call — reserve it for driving live services or post-processing data the native tools can't reach. If a native tool does the job, use it instead.");
+                sb.AppendLine("- PARALLELISE INDEPENDENT WORK: when a turn needs several lookups that don't depend on each other (e.g. recall_memories + grep + read_file, or two unrelated reads), emit them as MULTIPLE tool_calls in the SAME turn — they execute together and all results come back at once, saving a whole round-trip each. Only serialise calls when one's input genuinely depends on another's output. Never spend a full turn on a single lookup when others could ride alongside it.");
             }
             else
             {
@@ -236,6 +240,15 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("greetings, jokes, transient state, or anything already obvious from the conversation.");
             sb.AppendLine($"If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief, a duplicate), {(toolCallingMode ? "call the delete_memory tool" : "call DeleteMemory(id)")} to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
             sb.AppendLine();
+
+            // Cache breakpoint: everything ABOVE is the STABLE skeleton (personality + rules + patterns +
+            // memory discipline — identical across tasks); everything BELOW is task-VOLATILE (tool guide +
+            // repo map + memories). In tool-calling mode (the OpenRouter path) KliveLLM splits the system
+            // message here and marks the skeleton with cache_control so its prefill is served from cache on
+            // every turn after the first. The marker is split out / stripped before sending — never seen by
+            // the model — so it is inert for the local/text path.
+            if (toolCallingMode)
+                sb.Append(KliveLLM.KliveLLM.CacheBreakpointMarker);
 
             sb.Append(BuildToolGuide(userMessage, toolCallingMode));
 
@@ -389,6 +402,24 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
         /// tools plus memory tools. Anything else is routed to execute_csharp.</summary>
         private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name);
+
+        /// <summary>Read-only native tools have no side effects and never touch the Roslyn session, so
+        /// several of them in one turn can run concurrently (their I/O latency overlaps). Write tools
+        /// (save_*/delete_*) and execute_csharp are excluded — they run serially, in order.</summary>
+        private static bool IsParallelSafeNativeTool(string name) => name switch
+        {
+            "grep" or "read_file" or "list_directory" or "get_global_path"
+                or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts" => true,
+            _ => false
+        };
+
+        /// <summary>Runs a native tool, capturing success/failure as a value instead of throwing, so it
+        /// can be awaited from a pre-launched parallel task or inline with identical handling.</summary>
+        private static async Task<(bool ok, string output)> RunNativeToolAsync(ScriptGlobals globals, string toolName, string? argsJson)
+        {
+            try { return (true, await DispatchNativeToolAsync(globals, toolName, argsJson)); }
+            catch (Exception ex) { return (false, $"{toolName} tool error: {ex.GetType().Name}: {ex.Message}"); }
+        }
 
         /// <summary>
         /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
@@ -651,6 +682,11 @@ namespace Omnipotent.Services.KliveAgent
                 // is surfaced token-by-token as it generates. Configurable so it can be turned off.
                 bool streamTokens = onProgress != null && await agentService.GetBoolOmniSetting("KliveAgent_StreamTokens", defaultValue: true);
 
+                // Warm the provider connection concurrently with prompt assembly so the first inference
+                // call reuses a live pooled connection instead of paying the TLS/connect round-trip.
+                // Fire-and-forget: it must never block or fail the run.
+                _ = llm.WarmUpConnectionAsync(cancellationToken);
+
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions() : null;
 
@@ -668,6 +704,13 @@ namespace Omnipotent.Services.KliveAgent
                 int scriptTimeoutSec = await agentService.GetIntOmniSetting("KliveAgent_ScriptTimeoutSeconds", 30);
                 if (scriptTimeoutSec < 1) scriptTimeoutSec = 1;
                 var scriptTimeout = TimeSpan.FromSeconds(scriptTimeoutSec);
+
+                // Per-role models for adaptive routing (OpenRouter / native tool-calling path). Cheap,
+                // on-track turns take the fast model; turns that escalate reasoning effort take the stronger
+                // reasoning model. Empty = fall back to the provider's configured default model, so this is
+                // fully opt-in and decoupled from KliveLLM's global OpenRouterModelID.
+                string fastModel = (await agentService.GetStringOmniSetting("KliveAgent_FastModel", defaultValue: "")) ?? "";
+                string reasoningModel = (await agentService.GetStringOmniSetting("KliveAgent_ReasoningModel", defaultValue: "")) ?? "";
 
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
@@ -689,6 +732,10 @@ namespace Omnipotent.Services.KliveAgent
                 bool finalFormatRetryUsed = false;
                 int emptyFinalRetries = 0;
                 int consecutiveNoOpResponses = 0;
+                // Number of consecutive iterations whose scripts produced at least one error. Drives the
+                // adaptive thinking budget: a clean cheap turn asks for low reasoning effort; we escalate
+                // toward the user's ceiling as the task shows it's hard.
+                int consecutiveErrorIters = 0;
 
                 // Streams the agent's current prose + the scripts it has run so far to the live
                 // progress channel. NEVER fabricates placeholder text: if the model hasn't actually
@@ -742,6 +789,28 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     if (useToolCalling) llm.AppendUserMessageToToolSession(llmSessionId, text);
                     else currentPrompt = text;
+                }
+
+                // Adaptive reasoning effort for the upcoming LLM call. Cheap, on-track turns ask for LOW
+                // effort (no wasted reasoning tokens — the dominant per-turn latency cost). We escalate
+                // toward MEDIUM/HIGH only when the task shows it's hard: recent script errors, broken-output
+                // no-ops, or a long-running loop. KliveLLM clamps this request to the user's configured
+                // ThinkingType, so it never exceeds what they allow and collapses to a no-op at a fixed level.
+                string DetermineThinkingLevel(int iter)
+                {
+                    if (stuckForceFinal || consecutiveErrorIters >= 2 || iter >= 12) return "high";
+                    if (consecutiveErrorIters >= 1 || consecutiveNoOpResponses >= 1 || iter >= 6) return "medium";
+                    return "low";
+                }
+
+                // Adaptive model routing keyed to the same difficulty signal as the thinking budget: a
+                // "low" (cheap, on-track) turn takes the fast model; an escalated turn takes the reasoning
+                // model. Returns null (→ provider default) when the matching role isn't configured.
+                string? DetermineModelOverride(string thinkingLevel)
+                {
+                    bool heavy = !string.Equals(thinkingLevel, "low", StringComparison.OrdinalIgnoreCase);
+                    string pick = heavy ? reasoningModel : fastModel;
+                    return string.IsNullOrWhiteSpace(pick) ? null : pick;
                 }
 
                 // Build a truthful partial answer when the run is stopped (manual Stop or stall watchdog):
@@ -806,20 +875,35 @@ namespace Omnipotent.Services.KliveAgent
                         ReportProgress("thinking", null, liveText: liveBuffer.ToString());
                     };
 
+                    string thinkingForThisCall = DetermineThinkingLevel(iteration);
+                    string? modelForThisCall = DetermineModelOverride(thinkingForThisCall);
+
+                    // #9 Speculative dispatch: as each read-only native tool_call finishes streaming, start
+                    // it immediately (keyed by call id) so its I/O overlaps with the model still generating
+                    // the rest of the turn. #6's pre-launch below reuses these tasks instead of re-running.
+                    var speculativeTasks = new System.Collections.Concurrent.ConcurrentDictionary<string, Task<(bool ok, string output)>>();
+                    void OnToolCallComplete(HFWrapper.HFToolCall tc)
+                    {
+                        var name = tc?.function?.name;
+                        if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tc!.id)) return;
+                        if (!IsParallelSafeNativeTool(name)) return;   // only read-only native tools are safe to start early
+                        speculativeTasks.TryAdd(tc.id, RunNativeToolAsync(sharedGlobals, name, tc.function?.arguments));
+                    }
+
                     KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
                     try
                     {
                         if (useToolCalling)
                         {
                             // The structured session already holds system + user + any prior tool turns.
-                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, cancellationToken: cancellationToken, onToken: tokenSink);
+                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete);
                         }
                         else
                         {
                             // Pass system prompt only on iteration 0 so it is set as the LLM session's
                             // system role message once — not re-injected into every user turn.
                             llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                                systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink);
+                                systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall);
                             firstIterationSystemPrompt = null; // don't resend
                         }
                     }
@@ -1021,6 +1105,23 @@ namespace Omnipotent.Services.KliveAgent
                     // already in the tool results); when not, observations themselves are sent back.
                     bool anyToolResultsAppended = false;
 
+                    // #6 Parallel tool execution: read-only native tools in this turn are independent of each
+                    // other (and of the turn's scripts), so kick them ALL off up front to overlap their I/O.
+                    // Their RESULTS are still consumed below in original segment order, and execute_csharp
+                    // scripts (which chain Roslyn session state) + write tools still run serially in order.
+                    var prelaunchedTools = new Dictionary<ResponseSegment, Task<(bool ok, string output)>>();
+                    foreach (var seg in segments)
+                    {
+                        if (!seg.IsScript && seg.ToolName != null && IsParallelSafeNativeTool(seg.ToolName))
+                        {
+                            // Reuse the task already started mid-stream (#9) when available; otherwise start it now.
+                            if (seg.ToolCallId != null && speculativeTasks.TryGetValue(seg.ToolCallId, out var specTask))
+                                prelaunchedTools[seg] = specTask;
+                            else
+                                prelaunchedTools[seg] = RunNativeToolAsync(sharedGlobals, seg.ToolName, seg.Content);
+                        }
+                    }
+
                     foreach (var segment in segments)
                     {
                         // Prose (no action) — just record the agent's thought.
@@ -1034,9 +1135,12 @@ namespace Omnipotent.Services.KliveAgent
                         // Native tool call (memory / grep) — dispatch straight to its API (no Roslyn).
                         if (!segment.IsScript && segment.ToolName != null)
                         {
-                            string memOut; bool memOk = true;
-                            try { memOut = await DispatchNativeToolAsync(sharedGlobals, segment.ToolName, segment.Content); }
-                            catch (Exception mex) { memOk = false; memOut = $"{segment.ToolName} tool error: {mex.GetType().Name}: {mex.Message}"; }
+                            bool memOk; string memOut;
+                            if (prelaunchedTools.TryGetValue(segment, out var preTask))
+                                (memOk, memOut) = await preTask;        // parallel-safe read-only tool: started up front
+                            else
+                                (memOk, memOut) = await RunNativeToolAsync(sharedGlobals, segment.ToolName, segment.Content); // write tool: serial, in order
+                            if (!memOk) errorCountThisIter++;
 
                             var memText = KliveAgentContextBudget.TruncateToTokens(memOut ?? string.Empty,
                                 memOk ? KliveAgentContextBudget.ScriptOutputBudget : KliveAgentContextBudget.ScriptErrorBudget);
@@ -1116,6 +1220,11 @@ namespace Omnipotent.Services.KliveAgent
                         }
                     }
 
+                    // Track the per-turn error streak so the adaptive thinking budget can escalate when
+                    // the agent keeps hitting failures (and relax again once a turn comes back clean).
+                    if (errorCountThisIter > 0) consecutiveErrorIters++;
+                    else consecutiveErrorIters = 0;
+
                     // Soft nudge once the task has gone deep — informational, not a stop.
                     string nudge = string.Empty;
                     if (iteration + 1 == 12 && !stuckForceFinal)
@@ -1132,9 +1241,16 @@ namespace Omnipotent.Services.KliveAgent
                     // never re-inject them. In tool mode where results were delivered as role:"tool"
                     // messages, send only the guidance (observations are already attached to the calls);
                     // otherwise send the aggregate observations + guidance as a user turn.
+                    // Finalize-sooner nudge: when this turn's actions ALL succeeded, push hard for the
+                    // final answer so the agent doesn't burn extra round-trips re-checking what it already
+                    // has. This is a prompt nudge only — never a forced stop or iteration cap — so a task
+                    // that genuinely needs more steps can still take them.
+                    bool madeCleanProgress = hasScripts && errorCountThisIter == 0;
                     string guidance = stuckForceFinal
                         ? "[Output error] Your recent replies weren't valid actions (empty, or malformed tool/XML envelopes that ran nothing). STOP and reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you."
-                        : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.";
+                        : (madeCleanProgress
+                            ? "Those calls succeeded. If they answer the user's question, give the final text-only answer NOW (no scripts/tools) — do NOT run more lookups 'to be safe'. Continue only if a SPECIFIC, named piece of the answer is still genuinely missing."
+                            : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.");
                     guidance += nudge;
 
                     if (useToolCalling && anyToolResultsAppended)

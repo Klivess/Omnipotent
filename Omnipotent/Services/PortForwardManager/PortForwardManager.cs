@@ -107,6 +107,29 @@ namespace Omnipotent.Services.PortForwardManager
             return true;
         }
 
+        // Returns the gateway's external (public) IP as a string, or null if no UPnP device is available.
+        public async Task<string?> GetExternalIPAddress()
+        {
+            var device = await DiscoverDeviceAsync();
+            if (device == null) return null;
+            try { return (await device.GetExternalIPAsync())?.ToString(); }
+            catch { return null; }
+        }
+
+        // Removes a port mapping. Returns true if a device was present and the delete was attempted.
+        public async Task<bool> RemovePortForward(int publicPort, string protocol)
+        {
+            var device = await DiscoverDeviceAsync();
+            if (device == null) return false;
+            var protocolEnum = protocol.ToUpper() == "UDP" ? Open.Nat.Protocol.Udp : Open.Nat.Protocol.Tcp;
+            try
+            {
+                await device.DeletePortMapAsync(new Open.Nat.Mapping(protocolEnum, publicPort, publicPort));
+                return true;
+            }
+            catch { return false; }
+        }
+
         private async Task<NatDevice?> DiscoverDeviceAsync()
         {
             try

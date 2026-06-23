@@ -45,8 +45,22 @@ namespace Omnipotent.Services.KliveAgent
                 .ToList();
         }
 
+        // Reflection-derived schemas are immutable for the process lifetime, so memoize them across ALL
+        // sessions (static). GetTypeSchema is called repeatedly across a task's iterations and across tasks;
+        // this skips the reflection walk after the first lookup for a given type name.
+        private static readonly ConcurrentDictionary<string, AgentTypeSchema> TypeSchemaCache = new(StringComparer.Ordinal);
+
         /// <summary>Get a machine-readable schema of a type including public methods, properties, and fields.</summary>
         public AgentTypeSchema? GetTypeSchema(string typeName)
+        {
+            if (string.IsNullOrWhiteSpace(typeName)) return null;
+            if (TypeSchemaCache.TryGetValue(typeName, out var cached)) return cached;
+            var schema = BuildTypeSchema(typeName);
+            if (schema != null) TypeSchemaCache[typeName] = schema; // only cache resolved types, never a transient miss
+            return schema;
+        }
+
+        private AgentTypeSchema? BuildTypeSchema(string typeName)
         {
             var type = ResolveType(typeName);
             if (type == null) return null;

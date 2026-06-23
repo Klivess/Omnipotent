@@ -94,6 +94,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Stratum.Stratum());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new PortForwardManager());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveGames.KliveGames());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveMail.KliveMail());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KAPIReachabilityMonitor.KAPIReachabilityMonitor());
                 //omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniUpdater.OmniUpdater());
