@@ -67,6 +67,29 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
                 return (IReadOnlyList<GameVersionInfo>)list;
             });
 
+        /// <summary>
+        /// Authoritative required Java major for a Minecraft version, read from the Mojang manifest
+        /// (covers releases AND snapshots, incl. the new year-based scheme like "26.2"). Used by ALL
+        /// flavors since Paper/Fabric/Forge all run the same underlying MC server. Falls back to the
+        /// heuristic only when the version isn't found or has no javaVersion field (e.g. offline).
+        /// </summary>
+        public async Task<int> GetJavaMajorForVersionAsync(string version, CancellationToken ct)
+        {
+            try
+            {
+                var manifest = await GetJsonAsync(MojangManifest, ct);
+                var entry = (manifest["versions"] as JArray)?.FirstOrDefault(v => (string?)v["id"] == version);
+                if (entry != null)
+                {
+                    var versionJson = await GetJsonAsync((string)entry["url"]!, ct);
+                    int? jm = (int?)versionJson["javaVersion"]?["majorVersion"];
+                    if (jm.HasValue && jm.Value > 0) return jm.Value;
+                }
+            }
+            catch { }
+            return JavaProvisioner.FallbackJavaMajor(version);
+        }
+
         /// <summary>Resolves a vanilla version's server.jar URL + sha1 + required Java major.</summary>
         public async Task<(string url, string sha1, int javaMajor)> GetVanillaServerAsync(string version, CancellationToken ct)
         {

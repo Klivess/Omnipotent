@@ -77,6 +77,15 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
 
         public async Task<LaunchSpec> BuildLaunchSpecAsync(GameServerInstance inst, CancellationToken ct)
         {
+            // Reconcile the required Java major against the authoritative source on every launch, so a
+            // server can never start under the wrong runtime (self-heals instances provisioned earlier).
+            try
+            {
+                int major = await _versions.GetJavaMajorForVersionAsync(inst.Version, ct);
+                if (major > 0) inst.JavaMajor = major;
+            }
+            catch { /* offline — fall back to the stored major */ }
+
             string javaExe = await _java.EnsureJavaAsync(inst.JavaMajor, null, ct);
 
             var args = new List<string>();

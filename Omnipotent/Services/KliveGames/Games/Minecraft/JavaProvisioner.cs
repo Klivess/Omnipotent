@@ -27,22 +27,29 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
         /// authoritative Mojang value is unavailable (e.g. for Paper/Fabric/Forge installs).</summary>
         public static int FallbackJavaMajor(string mcVersion)
         {
-            // Parse "1.MINOR(.PATCH)".
+            // Only used when the authoritative Mojang lookup is unavailable. Prefer over-provisioning
+            // (a newer JRE runs older bytecode) so a server never starts under too old a runtime.
             try
             {
-                var parts = mcVersion.Split('.');
-                if (parts.Length >= 2 && int.TryParse(parts[1], out int minor))
+                var parts = mcVersion.Split('.', '-');
+                if (parts.Length >= 1 && int.TryParse(parts[0], out int major))
                 {
-                    int patch = parts.Length >= 3 && int.TryParse(parts[2], out int p) ? p : 0;
-                    if (minor >= 21) return 21;
-                    if (minor == 20) return patch >= 5 ? 21 : 17;
-                    if (minor >= 18) return 17;
-                    if (minor == 17) return 16;
-                    return 8;
+                    if (major == 1 && parts.Length >= 2 && int.TryParse(parts[1], out int minor))
+                    {
+                        // Classic "1.MINOR(.PATCH)" scheme.
+                        int patch = parts.Length >= 3 && int.TryParse(parts[2], out int p) ? p : 0;
+                        if (minor >= 21) return 21;
+                        if (minor == 20) return patch >= 5 ? 21 : 17;
+                        if (minor >= 18) return 17;
+                        if (minor == 17) return 16;
+                        return 8;
+                    }
+                    if (major != 1)
+                        return 25; // new year-based scheme (e.g. "26.2") — assume a current LTS runtime
                 }
             }
             catch { }
-            return 17; // safe modern default
+            return 21; // safe modern default
         }
 
         /// <summary>Ensures a Temurin JRE of the given major is available locally; returns the java.exe path.</summary>

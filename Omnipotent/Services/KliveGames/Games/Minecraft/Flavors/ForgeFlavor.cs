@@ -23,7 +23,7 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft.Flavors
                 throw new Exception($"No Forge build is available for Minecraft {inst.Version}.");
 
             inst.LoaderVersion = forgeVersion;
-            inst.JavaMajor = JavaProvisioner.FallbackJavaMajor(inst.Version);
+            inst.JavaMajor = await versions.GetJavaMajorForVersionAsync(inst.Version, ct);
 
             // Forge's installer is a Java program, so we need Java before we can install.
             progress.Report("Preparing Java for the Forge installer…");

@@ -15,7 +15,7 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft.Flavors
             string loader = await versions.GetFabricLatestLoaderAsync(ct);
             string installer = await versions.GetFabricLatestInstallerAsync(ct);
             inst.LoaderVersion = loader;
-            inst.JavaMajor = JavaProvisioner.FallbackJavaMajor(inst.Version);
+            inst.JavaMajor = await versions.GetJavaMajorForVersionAsync(inst.Version, ct);
 
             // The Fabric "server launcher" jar is self-contained: it downloads the matching vanilla
             // server jar and the loader libraries on its first launch (needs internet on first start).
