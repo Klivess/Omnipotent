@@ -601,33 +601,29 @@ namespace Omnipotent.Services.KliveGames
 
         private async Task<string> EnsurePublicAsync(GameServerInstance inst, bool persist)
         {
+            // The public join address is always the domain (klive.dev resolves to this host's public IP);
+            // we still try to open the UPnP forward so it's reachable without manual router config.
+            inst.PublicJoinAddress = $"klive.dev:{inst.Port}";
             try
             {
                 var availableObj = await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>("IsUpnpAvailable");
                 bool available = availableObj is bool b && b;
-                if (!available)
+                if (available)
                 {
-                    inst.PublicJoinAddress = null;
+                    await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>(
+                        "EnsurePortForwarded", inst.Port, inst.Port, "TCP", $"KliveGames: {inst.Name}");
                     if (persist) await SaveInstanceAsync(inst);
-                    return $"No UPnP router was found — forward TCP {inst.Port} manually to make this server reachable.";
+                    return $"Server is public at {inst.PublicJoinAddress}.";
                 }
 
-                await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>(
-                    "EnsurePortForwarded", inst.Port, inst.Port, "TCP", $"KliveGames: {inst.Name}");
-
-                var extObj = await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>("GetExternalIPAddress");
-                string? ext = extObj as string;
-                inst.PublicJoinAddress = string.IsNullOrEmpty(ext) ? null : $"{ext}:{inst.Port}";
                 if (persist) await SaveInstanceAsync(inst);
-
-                return inst.PublicJoinAddress != null
-                    ? $"Server is public at {inst.PublicJoinAddress}."
-                    : $"Port {inst.Port} forwarded (external IP unavailable).";
+                return $"Join at {inst.PublicJoinAddress} — no UPnP router found, so make sure TCP {inst.Port} is forwarded to this machine.";
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "[KliveGames] Port-forward setup failed.");
-                return $"Port-forward setup failed: {ex.Message}";
+                if (persist) await SaveInstanceAsync(inst);
+                return $"Join at {inst.PublicJoinAddress} (auto port-forward failed: {ex.Message}).";
             }
         }
 

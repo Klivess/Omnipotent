@@ -365,6 +365,21 @@ namespace Omnipotent.Services.KliveGames
             await parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivegames/servers/console",
                 (Func<HttpListenerContext, WebSocket, NameValueCollection, Omnipotent.Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
                 {
+                    // Browsers can't set an Authorization header on a WebSocket, so this route is registered
+                    // as Anybody and authorized here from the ?authorization= query param (Klives only).
+                    var resolved = user;
+                    if (resolved == null)
+                    {
+                        var pw = queryParams["authorization"];
+                        if (!string.IsNullOrEmpty(pw))
+                            resolved = await parent.ExecuteServiceMethod<Omnipotent.Profiles.KMProfileManager>("GetProfileByPassword", pw) as KMProfile;
+                    }
+                    if (resolved == null || resolved.KlivesManagementRank < KMPermissions.Klives)
+                    {
+                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None);
+                        return;
+                    }
+
                     string? id = queryParams["id"];
                     var inst = id != null ? parent.GetInstance(id) : null;
                     var hub = id != null ? parent.GetConsoleHub(id) : null;
@@ -404,7 +419,7 @@ namespace Omnipotent.Services.KliveGames
                         hub.RemoveSubscriber(subId);
                         try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
                     }
-                }), KMPermissions.Klives);
+                }), KMPermissions.Anybody);
         }
     }
 }
