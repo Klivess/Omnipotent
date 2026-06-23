@@ -7,7 +7,7 @@ using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveGames.Models;
 using static Omnipotent.Profiles.KMProfileManager;
-using KGRequest = Omnipotent.Services.KliveAPI.KGRequest;
+using KGRequest = global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
 
 namespace Omnipotent.Services.KliveGames
 {

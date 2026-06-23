@@ -38,6 +38,7 @@ namespace Omnipotent.Services.KliveGames
         private readonly ConcurrentDictionary<string, GameConsoleHub> _consoleHubs = new();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
         private readonly ConcurrentDictionary<string, List<DateTime>> _restartHistory = new();
+        private readonly ConcurrentDictionary<string, DateTime> _pendingListPoll = new();
 
         private GameProviderRegistry _providers = null!;
         private readonly BackupManager _backups = new();
@@ -377,12 +378,12 @@ namespace Omnipotent.Services.KliveGames
             await ServiceLog($"[KliveGames] Deleted '{inst.Name}'.");
         }
 
-        public async Task SendCommandAsync(string id, string command)
+        public async Task SendCommandAsync(string id, string command, bool echo = true)
         {
             if (_processes.TryGetValue(id, out var proc) && proc.IsRunning)
             {
                 await proc.SendCommandAsync(command);
-                if (_consoleHubs.TryGetValue(id, out var hub))
+                if (echo && _consoleHubs.TryGetValue(id, out var hub))
                     await hub.BroadcastLineAsync($"> {command}");
             }
         }
@@ -410,21 +411,17 @@ namespace Omnipotent.Services.KliveGames
 
         private void HandleConsoleLine(GameServerInstance inst, GameConsoleHub hub, IGameProvider provider, string line)
         {
-            _ = hub.BroadcastLineAsync(line);
             try
             {
-                if (inst.Status == GameServerStatus.Starting && provider.TryParseStarted(line))
-                {
-                    inst.Status = GameServerStatus.Running;
-                    inst.RunningSinceUtc = DateTime.UtcNow;
-                    _ = BroadcastStatus(inst);
-                    _ = SaveInstanceAsync(inst);
-                }
+                bool suppress = false;
 
                 if (provider.TryParseListReply(line, out _, out int max, out var names))
                 {
                     inst.OnlinePlayers = names.ToList();
                     inst.MaxPlayers = max;
+                    // Hide the reply to an internal (monitor) roster poll so the live console isn't spammed.
+                    if (_pendingListPoll.TryRemove(inst.Id, out var t) && DateTime.UtcNow - t < TimeSpan.FromSeconds(3))
+                        suppress = true;
                 }
                 else if (provider.TryParsePlayerJoin(line, out var joined))
                 {
@@ -433,6 +430,16 @@ namespace Omnipotent.Services.KliveGames
                 else if (provider.TryParsePlayerLeave(line, out var left))
                 {
                     inst.OnlinePlayers.Remove(left);
+                }
+
+                if (!suppress) _ = hub.BroadcastLineAsync(line);
+
+                if (inst.Status == GameServerStatus.Starting && provider.TryParseStarted(line))
+                {
+                    inst.Status = GameServerStatus.Running;
+                    inst.RunningSinceUtc = DateTime.UtcNow;
+                    _ = BroadcastStatus(inst);
+                    _ = SaveInstanceAsync(inst);
                 }
             }
             catch { }
@@ -531,7 +538,12 @@ namespace Omnipotent.Services.KliveGames
                         foreach (var inst in _instances.Values.Where(i => i.Status == GameServerStatus.Running))
                         {
                             var provider = _providers.Get(inst.GameType);
-                            try { await SendCommandAsync(inst.Id, provider.BuildListCommand()); } catch { }
+                            try
+                            {
+                                _pendingListPoll[inst.Id] = DateTime.UtcNow;
+                                await SendCommandAsync(inst.Id, provider.BuildListCommand(), echo: false);
+                            }
+                            catch { }
                         }
                     }
                 }
