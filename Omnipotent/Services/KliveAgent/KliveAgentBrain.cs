@@ -782,6 +782,11 @@ namespace Omnipotent.Services.KliveAgent
                 // tool channel). Irreversible actions still route through the human approval gate.
                 bool computerUseEnabled = useToolCalling && await agentService.GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: true);
 
+                // Context compaction for the vision loop: how many recent screenshots to keep in the tool
+                // session (older ones are flattened to a one-line note so a long GUI task can't overflow the
+                // model's context window and start hallucinating stale state).
+                int retainedScreenshots = Math.Max(1, await agentService.GetIntOmniSetting("KliveAgent_MaxRetainedScreenshots", 3));
+
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;
 
@@ -1367,7 +1372,7 @@ namespace Omnipotent.Services.KliveAgent
                     // role:"tool" results (which must stay text-only). Reuses KliveLLM's existing vision path.
                     if (useToolCalling && pendingModelImages.Count > 0)
                     {
-                        try { llm.AppendUserContentToToolSession(llmSessionId, "Screenshot(s) from the computer action(s) above:", pendingModelImages); }
+                        try { llm.AppendUserContentToToolSession(llmSessionId, "Screenshot(s) from the computer action(s) above:", pendingModelImages, keepRecentImages: retainedScreenshots); }
                         catch { }
                     }
 

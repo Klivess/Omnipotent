@@ -394,8 +394,14 @@ namespace Omnipotent.Services.KliveLLM
         /// Append a user turn carrying text plus inline images (content-parts array). Used by the
         /// vision feedback loop: requires a vision-capable model on a remote provider. Images are
         /// sent as base64 data URIs.
+        ///
+        /// CONTEXT COMPACTION: a long computer-use task adds one screenshot per step; left unbounded the
+        /// image history overflows the model's context window and it starts hallucinating stale on-screen
+        /// state. So after adding the new screenshot, all but the most recent <paramref name="keepRecentImages"/>
+        /// image messages are flattened to a one-line text placeholder — the model always keeps the latest
+        /// view(s) for current state, at a fraction of the tokens.
         /// </summary>
-        public void AppendUserContentToToolSession(string sessionId, string text, List<(byte[] data, string mimeType)> images)
+        public void AppendUserContentToToolSession(string sessionId, string text, List<(byte[] data, string mimeType)> images, int keepRecentImages = 3)
         {
             var parts = new List<object>();
             if (!string.IsNullOrWhiteSpace(text))
@@ -414,8 +420,47 @@ namespace Omnipotent.Services.KliveLLM
             lock (sessions)
             {
                 if (sessions.TryGetValue(sessionId, out var s))
+                {
                     s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = parts });
+                    PruneOldToolImages(s, keepRecentImages);
+                }
             }
+        }
+
+        /// <summary>Flatten all but the most recent <paramref name="keepRecent"/> image-bearing user messages
+        /// to a tiny text placeholder, to keep the vision/computer-use context window from overflowing. Only
+        /// touches standalone screenshot messages — assistant tool_calls and their tool results are untouched,
+        /// so the tool-call protocol stays intact.</summary>
+        private static void PruneOldToolImages(KliveLLMSession s, int keepRecent)
+        {
+            if (keepRecent < 1) keepRecent = 1;
+            var imageIdx = new List<int>();
+            for (int i = 0; i < s.structuredMessages.Count; i++)
+            {
+                var m = s.structuredMessages[i];
+                if (m.role == "user" && MessageHasImage(m)) imageIdx.Add(i);
+            }
+            int toPrune = imageIdx.Count - keepRecent;
+            for (int k = 0; k < toPrune; k++)
+            {
+                s.structuredMessages[imageIdx[k]] = new HFWrapper.HFMessage
+                {
+                    role = "user",
+                    content = "[Earlier screenshot omitted to conserve context — rely on the most recent screenshot for the current on-screen state.]"
+                };
+            }
+        }
+
+        private static bool MessageHasImage(HFWrapper.HFMessage m)
+        {
+            if (m.content is string) return false;
+            if (m.content is System.Collections.IEnumerable parts)
+                foreach (var p in parts)
+                {
+                    if (p is HFWrapper.HFImagePart) return true;
+                    if (p is Newtonsoft.Json.Linq.JObject jo && (string?)jo["type"] == "image_url") return true;
+                }
+            return false;
         }
 
         /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id.</summary>
