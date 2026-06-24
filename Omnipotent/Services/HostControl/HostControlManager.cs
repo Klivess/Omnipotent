@@ -3,8 +3,6 @@ using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using OpenQA.Selenium;
-using OpenQA.Selenium.Chrome;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
@@ -15,14 +13,14 @@ namespace Omnipotent.Services.HostControl
 {
     /// <summary>
     /// Owns ALL host (desktop) interaction for KliveAgent's computer-use tools: perception (screen
-    /// capture), actuation (SendInput mouse/keyboard, window focus/launch, Selenium browser), the global
-    /// exclusive input lock, the encrypted-credential vault + secret substitution, and the human approval
-    /// gate. The single chokepoint for safety, gating, and audit. Windows-only by construction.
+    /// capture), actuation (SendInput mouse/keyboard, window focus/launch), the global exclusive input
+    /// lock, the encrypted-credential vault + secret substitution, and the human approval gate. The single
+    /// chokepoint for safety, gating, and audit. Windows-only by construction.
     ///
-    /// It is invoked by KliveAgentBrain via ExecuteToolAsync (one branch in DispatchNativeToolAsync) and
-    /// by execute_csharp scripts via the ScriptGlobals.Computer* pass-throughs. No hard wall-clock
-    /// timeouts: slow/blocked actions heartbeat through onProgress so the stall watchdog never aborts
-    /// legitimate work.
+    /// The web is driven the SAME way a human does it: the agent screenshots the real system browser and
+    /// clicks/types/scrolls — NO Selenium, NO scripted browser API. It is invoked ONLY as native LLM tools
+    /// (KliveAgentBrain → ExecuteToolAsync). No hard wall-clock timeouts: slow/blocked actions heartbeat
+    /// through onProgress so the stall watchdog never aborts legitimate work.
     /// </summary>
     [SupportedOSPlatform("windows")]
     public class HostControlManager : OmniService
@@ -41,11 +39,6 @@ namespace Omnipotent.Services.HostControl
         private CoordFrame? lastFrame;
         private byte[]? lastFrameJpeg;
         private readonly record struct CoordFrame(double Scale, int OriginX, int OriginY, int ShownW, int ShownH);
-
-        // Lazily-created persistent browser (logins/cookies survive across tasks via a fixed profile dir).
-        private Omnipotent.Services.SeleniumManager.SeleniumManager? seleniumMgr;
-        private Omnipotent.Services.SeleniumManager.SeleniumManager.SeleniumObject? browser;
-        private readonly SemaphoreSlim browserLock = new(1, 1);
 
         public ApprovalBroker Approvals => approvals;
         public EncryptedMemoryStore Secrets => secrets;
@@ -224,8 +217,8 @@ namespace Omnipotent.Services.HostControl
                         ? ComputerToolResult.Ok("Clipboard set.")
                         : ComputerToolResult.Fail("Could not set clipboard."));
 
-                case "computer_browser":
-                    return await BrowserAsync(a, ct, onProgress);
+                case "computer_open_browser":
+                    return await OpenBrowserAsync(a);
 
                 case "computer_confirm_action":
                     return await ConfirmActionAsync(a, ct, onProgress);
@@ -239,7 +232,7 @@ namespace Omnipotent.Services.HostControl
                     if (string.IsNullOrWhiteSpace(n) || v == null) return ComputerToolResult.Fail("Provide 'name' and 'value'.");
                     await secrets.SaveAsync(n, v);
                     await ServiceLog($"[HostControl] saved encrypted memory '{n}'.");
-                    return ComputerToolResult.Ok($"Saved encrypted memory '{n}'. Reference it as {{{n}}} in computer_type/computer_browser fill text; its value is never shown to you.");
+                    return ComputerToolResult.Ok($"Saved encrypted memory '{n}'. Reference it as {{{n}}} inside computer_type text; its value is never shown to you.");
                 }
                 case "list_encrypted_memories":
                 {
@@ -262,7 +255,7 @@ namespace Omnipotent.Services.HostControl
         private ComputerToolResult CaptureFrameResult(string target, string label, int? tx = null, int? ty = null)
         {
             var guard = OsGuard();
-            if (guard != null && target != "browser") return guard;
+            if (guard != null) return guard;
 
             ScreenCapturer.CaptureResult cap = target == "fullscreen"
                 ? capturer.CaptureVirtualScreen()
@@ -296,31 +289,22 @@ namespace Omnipotent.Services.HostControl
             return ComputerToolResult.Ok(sb.ToString().TrimEnd());
         }
 
-        private async Task<ComputerToolResult> ReadScreenAsync()
+        private Task<ComputerToolResult> ReadScreenAsync()
         {
-            // Browser DOM is far richer than blind pixels when a page is open.
-            if (browser != null)
-            {
-                try
-                {
-                    var driver = await GetBrowserDriverAsync();
-                    var text = (string)driver.ExecuteScript(
-                        "return (document.title||'')+'\\nURL: '+location.href+'\\n\\n'+(document.body?document.body.innerText.substring(0,4000):'');");
-                    return ComputerToolResult.Ok("[Browser DOM]\n" + text);
-                }
-                catch { /* fall through to window list */ }
-            }
-
-            var sb = new StringBuilder("Visible windows:\n");
+            var sb = new StringBuilder();
+            var fg = NativeInput.GetForegroundWindowInfo();
+            if (fg != null)
+                sb.AppendLine($"Active window: \"{fg.Value.Title}\" {fg.Value.Width}x{fg.Value.Height}.");
+            sb.AppendLine("Visible windows:");
             foreach (var w in NativeInput.EnumerateVisibleWindows().Take(25))
                 sb.AppendLine($"  \"{w.Title}\" (pid {w.ProcessId}) {w.Width}x{w.Height}");
-            sb.AppendLine("\n(For arbitrary apps, rely on the screenshot — call computer_screenshot.)");
-            return ComputerToolResult.Ok(sb.ToString().TrimEnd());
+            sb.AppendLine("\n(To read page/app content, call computer_screenshot — you read it visually.)");
+            return Task.FromResult(ComputerToolResult.Ok(sb.ToString().TrimEnd()));
         }
 
         // ── Actuation helpers ──
         private ComputerToolResult? OsGuard() =>
-            OsControlAvailable ? null : ComputerToolResult.Fail("OS-level control is unavailable (non-interactive/headless session). Use computer_browser instead.");
+            OsControlAvailable ? null : ComputerToolResult.Fail("OS-level control is unavailable: this isn't an interactive desktop session. Computer-use needs to run on the logged-in Windows machine.");
 
         private async Task<ComputerToolResult> MutatingAsync(CancellationToken ct, Action<HostControlProgress> onProgress, string kind, Action act, string label, int? tx = null, int? ty = null)
         {
@@ -388,10 +372,12 @@ namespace Omnipotent.Services.HostControl
         {
             int maxMs = IntOr(a, "maxMs", IntOr(a, "forMs", 4000));
             maxMs = Math.Clamp(maxMs, 100, 600000);
-            string? untilText = Str(a, "untilText");
-            bool untilImageChange = a.TryGetProperty("untilImageChange", out var ic) && ic.ValueKind == JsonValueKind.True;
+            // We can't OCR for untilText, so any "wait until ready" intent (untilText or untilImageChange)
+            // resolves the same way: stop as soon as the screen stops changing → settled, then return.
+            bool waitForSettle = (a.TryGetProperty("untilImageChange", out var ic) && ic.ValueKind == JsonValueKind.True)
+                                 || !string.IsNullOrEmpty(Str(a, "untilText"));
 
-            byte[]? baseline = untilImageChange ? CaptureRawHashSource() : null;
+            byte[]? baseline = waitForSettle ? CaptureRawHashSource() : null;
             var sw = Stopwatch.StartNew();
             string resolved = "time elapsed";
             int lastHeartbeat = 0;
@@ -408,17 +394,7 @@ namespace Omnipotent.Services.HostControl
                     onProgress(new HostControlProgress { Note = $"waiting… ({sw.ElapsedMilliseconds / 1000}s)", Activity = new AgentActivityEvent { Kind = "wait", Text = $"waiting {sw.ElapsedMilliseconds / 1000}s" } });
                 }
 
-                if (untilText != null && browser != null)
-                {
-                    try
-                    {
-                        var driver = await GetBrowserDriverAsync();
-                        var body = (string)driver.ExecuteScript("return document.body? document.body.innerText : '';");
-                        if (body.Contains(untilText, StringComparison.OrdinalIgnoreCase)) { resolved = $"text \"{untilText}\" appeared"; break; }
-                    }
-                    catch { }
-                }
-                else if (untilImageChange && baseline != null)
+                if (waitForSettle && baseline != null)
                 {
                     var now = CaptureRawHashSource();
                     if (now != null && !HashEqual(baseline, now)) { resolved = "screen changed"; break; }
@@ -447,13 +423,60 @@ namespace Omnipotent.Services.HostControl
             if (match.Handle == IntPtr.Zero) return ComputerToolResult.Fail("No matching visible window found.");
 
             await inputLock.WaitAsync(ct);
-            try { NativeInput.FocusWindow(match.Handle); await Task.Delay(300, ct); }
+            // Maximize on focus so the agent gets the biggest possible working area (and a readable screenshot).
+            try { NativeInput.FocusWindow(match.Handle, maximize: true); await Task.Delay(350, ct); }
             finally { inputLock.Release(); }
 
             onProgress(new HostControlProgress { Activity = new AgentActivityEvent { Kind = "action", Text = $"focus \"{Trim(match.Title, 30)}\"" } });
             var result = CaptureFrameResult("active", "focus window");
-            result.Text = $"Focused \"{match.Title}\". " + result.Text;
+            result.Text = $"Focused + maximized \"{match.Title}\". " + result.Text;
             return result;
+        }
+
+        /// <summary>Open or focus the user's real system browser (maximized), so the agent can drive it with
+        /// mouse/keyboard. If a browser window is already open it is brought to the front and maximized.</summary>
+        private async Task<ComputerToolResult> OpenBrowserAsync(JsonElement a)
+        {
+            var guard = OsGuard();
+            if (guard != null) return guard;
+
+            // Prefer an already-open browser window.
+            string[] browserProcs = { "chrome", "msedge", "firefox", "brave", "opera", "vivaldi" };
+            var open = NativeInput.EnumerateVisibleWindows()
+                .FirstOrDefault(w => browserProcs.Any(p =>
+                    string.Equals(SafeProcName(w.ProcessId), p, StringComparison.OrdinalIgnoreCase)));
+
+            if (open.Handle != IntPtr.Zero)
+            {
+                await inputLock.WaitAsync();
+                try { NativeInput.FocusWindow(open.Handle, maximize: true); await Task.Delay(400); }
+                finally { inputLock.Release(); }
+                var r = CaptureFrameResult("active", "browser focused");
+                r.Text = $"Focused + maximized the open browser \"{open.Title}\". To go somewhere, click the address bar (or press Ctrl+L), type the URL, press Enter. " + r.Text;
+                return r;
+            }
+
+            // None open → launch the default browser. UseShellExecute on a URL opens the user's default browser.
+            try
+            {
+                var landing = Str(a, "url");
+                if (string.IsNullOrWhiteSpace(landing)) landing = "https://www.google.com";
+                else if (!landing.StartsWith("http", StringComparison.OrdinalIgnoreCase)) landing = "https://" + landing;
+                Process.Start(new ProcessStartInfo { FileName = landing, UseShellExecute = true });
+                await Task.Delay(2500); // give it a moment to appear
+                var fg2 = NativeInput.GetForegroundWindowInfo();
+                if (fg2 != null) { await inputLock.WaitAsync(); try { NativeInput.FocusWindow(fg2.Value.Handle, maximize: true); } finally { inputLock.Release(); } }
+                var r = CaptureFrameResult("active", "browser opened");
+                r.Text = "Opened the default browser. Drive it visually: click the address bar (or Ctrl+L), type a URL, press Enter; click links/buttons by their on-screen position. " + r.Text;
+                return r;
+            }
+            catch (Exception ex) { return ComputerToolResult.Fail($"Could not open a browser: {ex.Message}"); }
+        }
+
+        private static string SafeProcName(uint pid)
+        {
+            try { return Process.GetProcessById((int)pid).ProcessName; }
+            catch { return string.Empty; }
         }
 
         private async Task<ComputerToolResult> LaunchAppAsync(JsonElement a)
@@ -463,17 +486,26 @@ namespace Omnipotent.Services.HostControl
             var target = Str(a, "path") ?? Str(a, "shellName");
             if (string.IsNullOrWhiteSpace(target)) return ComputerToolResult.Fail("Provide 'path' or 'shellName'.");
 
-            var allow = await ParseListSettingAsync("KliveAgent_AppAllowList");
-            if (allow.Count == 0)
-                return ComputerToolResult.Fail("App launching is disabled: KliveAgent_AppAllowList is empty. Add the app to the allow-list first.");
-            if (!allow.Any(x => target.Contains(x, StringComparison.OrdinalIgnoreCase)))
-                return ComputerToolResult.Fail($"\"{target}\" is not in KliveAgent_AppAllowList. Refusing.");
+            // Browsers are always allowed (use computer_open_browser for the default browser). Everything
+            // else must be in KliveAgent_AppAllowList.
+            string[] browsers = { "chrome", "msedge", "edge", "firefox", "brave", "opera", "vivaldi" };
+            bool isBrowser = browsers.Any(b => target.Contains(b, StringComparison.OrdinalIgnoreCase));
+            if (!isBrowser)
+            {
+                var allow = await ParseListSettingAsync("KliveAgent_AppAllowList");
+                if (allow.Count == 0)
+                    return ComputerToolResult.Fail("App launching is disabled: KliveAgent_AppAllowList is empty. Add the app to the allow-list first (browsers are always allowed).");
+                if (!allow.Any(x => target.Contains(x, StringComparison.OrdinalIgnoreCase)))
+                    return ComputerToolResult.Fail($"\"{target}\" is not in KliveAgent_AppAllowList. Refusing.");
+            }
 
             try
             {
                 var psi = new ProcessStartInfo { FileName = target, Arguments = Str(a, "args") ?? string.Empty, UseShellExecute = true };
                 Process.Start(psi);
-                await Task.Delay(1500);
+                await Task.Delay(2000);
+                var fg = NativeInput.GetForegroundWindowInfo();
+                if (fg != null) NativeInput.FocusWindow(fg.Value.Handle, maximize: true);
                 await ServiceLog($"[HostControl] launched app: {target}");
                 return WindowState();
             }
@@ -526,105 +558,6 @@ namespace Omnipotent.Services.HostControl
             }, label: $"APPROVED click: {Trim(summary, 40)}", tx: x, ty: y);
         }
 
-        // ── Browser sub-actions (reuse SeleniumManager) ──
-        private async Task<ComputerToolResult> BrowserAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress)
-        {
-            var action = (Str(a, "action") ?? "screenshot").ToLowerInvariant();
-            var driver = await GetBrowserDriverAsync();
-            string note;
-
-            switch (action)
-            {
-                case "open":
-                case "navigate":
-                {
-                    var url = Str(a, "url") ?? string.Empty;
-                    if (string.IsNullOrWhiteSpace(url)) return ComputerToolResult.Fail("Provide 'url'.");
-                    if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase)) url = "https://" + url;
-                    if (!await DomainAllowedAsync(url)) return ComputerToolResult.Fail($"Domain not in KliveAgent_DomainAllowList: {url}");
-                    onProgress(new HostControlProgress { Note = $"navigate {url}", Activity = new AgentActivityEvent { Kind = "action", Text = $"navigate {Trim(url, 50)}" } });
-                    driver.Navigate().GoToUrl(url);
-                    note = $"Navigated to {driver.Url}. Title: {driver.Title}.";
-                    break;
-                }
-                case "fill":
-                {
-                    var sel = Str(a, "selector"); var val = Str(a, "value") ?? string.Empty;
-                    if (string.IsNullOrWhiteSpace(sel)) return ComputerToolResult.Fail("Provide 'selector'.");
-                    var (resolved, used) = await substituter.ResolveAsync(val);
-                    var el = driver.FindElement(By.CssSelector(sel));
-                    el.Clear(); el.SendKeys(resolved);
-                    if (used.Count > 0) await ServiceLog($"[HostControl] browser-filled {sel} using secrets: {string.Join(", ", used)}");
-                    note = $"Filled {sel} with \"{substituter.Redact(val)}\".";
-                    break;
-                }
-                case "click_selector":
-                {
-                    var sel = Str(a, "selector");
-                    if (string.IsNullOrWhiteSpace(sel)) return ComputerToolResult.Fail("Provide 'selector'.");
-                    driver.FindElement(By.CssSelector(sel)).Click();
-                    note = $"Clicked element {sel}.";
-                    break;
-                }
-                case "scroll":
-                {
-                    driver.ExecuteScript($"window.scrollBy(0, {IntOr(a, "dy", 600)});");
-                    note = "Scrolled.";
-                    break;
-                }
-                case "read_dom":
-                {
-                    var text = (string)driver.ExecuteScript("return (document.title||'')+'\\nURL: '+location.href+'\\n\\n'+(document.body?document.body.innerText.substring(0,5000):'');");
-                    return AttachBrowserFrame(driver, "[Browser DOM]\n" + text, "read_dom");
-                }
-                default:
-                    note = $"Unknown browser action '{action}'. Showing current page.";
-                    break;
-            }
-
-            await Task.Delay(400, ct);
-            return AttachBrowserFrame(driver, note, action);
-        }
-
-        private ComputerToolResult AttachBrowserFrame(ChromeDriver driver, string text, string label)
-        {
-            try
-            {
-                var png = ((ITakesScreenshot)driver).GetScreenshot().AsByteArray;
-                var jpeg = capturer.ReencodeToJpeg(png);
-                return new ComputerToolResult
-                {
-                    Success = true,
-                    Text = text + " (Browser screenshot attached — interact with the page via selectors, not screen coordinates.)",
-                    ModelImageJpeg = jpeg,
-                    AnnotatedJpeg = capturer.Annotate(jpeg, label)
-                };
-            }
-            catch
-            {
-                return ComputerToolResult.Ok(text);
-            }
-        }
-
-        private async Task<ChromeDriver> GetBrowserDriverAsync()
-        {
-            await browserLock.WaitAsync();
-            try
-            {
-                seleniumMgr ??= await GetSeleniumManager();
-                if (browser == null)
-                {
-                    browser = seleniumMgr.CreateSeleniumObject("HostControlBrowser", TimeSpan.FromHours(6));
-                    var profile = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory), "HostControl", "ChromeProfile");
-                    Directory.CreateDirectory(profile);
-                    browser.AddArgumentToOptions($"--user-data-dir={profile}");
-                    browser.AddArgumentToOptions("--start-maximized");
-                }
-                return browser.UseChromeDriver();
-            }
-            finally { browserLock.Release(); }
-        }
-
         // ── Coordinate mapping ──
         private (int x, int y) MapToPhysical(int modelX, int modelY)
         {
@@ -661,14 +594,6 @@ namespace Omnipotent.Services.HostControl
         {
             var raw = await GetStringOmniSetting(settingName, defaultValue: "") ?? "";
             return raw.Split(new[] { ',', '\n', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-        }
-
-        private async Task<bool> DomainAllowedAsync(string url)
-        {
-            var allow = await ParseListSettingAsync("KliveAgent_DomainAllowList");
-            if (allow.Count == 0) return true; // empty = navigation (reversible) is unrestricted
-            try { var host = new Uri(url).Host; return allow.Any(d => host.Contains(d, StringComparison.OrdinalIgnoreCase)); }
-            catch { return false; }
         }
 
         private static Omnipotent.Threading.MouseButton ParseButton(string? b) => (b ?? "left").ToLowerInvariant() switch

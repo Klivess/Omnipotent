@@ -21,7 +21,7 @@ namespace Omnipotent.Services.HostControl
         /// <param name="Scale">shownPixels / physicalPixels. physicalX = OriginX + modelX / Scale.</param>
         public sealed record CaptureResult(byte[] Jpeg, int ShownWidth, int ShownHeight, int OriginX, int OriginY, double Scale, string Description);
 
-        public CaptureResult CaptureActiveWindow(int maxWidth = 1400, long quality = 70)
+        public CaptureResult CaptureActiveWindow(int maxWidth = 1920, long quality = 72)
         {
             var info = NativeInput.GetForegroundWindowInfo();
             if (info == null || info.Value.Width <= 0 || info.Value.Height <= 0)
@@ -33,7 +33,7 @@ namespace Omnipotent.Services.HostControl
             return CaptureRegion(w.Left, w.Top, w.Width, w.Height, maxWidth, quality, $"active window \"{w.Title}\"");
         }
 
-        public CaptureResult CaptureVirtualScreen(int maxWidth = 1600, long quality = 70)
+        public CaptureResult CaptureVirtualScreen(int maxWidth = 1920, long quality = 72)
         {
             var (vx, vy, vw, vh) = NativeInput.GetVirtualScreenBounds();
             return CaptureRegion(vx, vy, vw, vh, maxWidth, quality, "full screen");

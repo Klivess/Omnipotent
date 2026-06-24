@@ -245,13 +245,14 @@ namespace Omnipotent.Services.KliveAgent
             if (computerUseEnabled)
             {
                 sb.AppendLine("[Computer Control]");
-                sb.AppendLine("You can SEE and CONTROL this Windows machine (mouse, keyboard, screen) and a logged-in Chrome browser, alongside your C#/Omnipotent abilities — MERGE them freely in one task (e.g. execute_csharp to fetch data, then drive the GUI with it, then script the result back).");
-                sb.AppendLine("- LOOK BEFORE YOU ACT: call computer_screenshot, then give click/move/scroll coordinates in THAT image's pixel space. After each action you get a fresh screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and rethink; never click blind or repeat a failed action unchanged.");
-                sb.AppendLine("- BROWSER vs DESKTOP: for websites prefer computer_browser (open/navigate/fill/click_selector/read_dom) with CSS selectors — it's more reliable than visual clicking. Use computer_screenshot + computer_click for native apps or when no selector fits.");
-                sb.AppendLine("- REVERSIBLE actions (scroll, hover, navigate, read, open a page, fill a field) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click (a gated click) or computer_confirm_action (gate then act) — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
-                sb.AppendLine("- SECRETS: never ask the user for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") or a browser fill value \"{SainsburyPassword}\" — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
-                sb.AppendLine("- WAITING is not hanging: for slow page loads/checkouts use computer_wait (untilText / untilImageChange / maxMs). Don't busy-loop screenshots.");
-                sb.AppendLine("- If OS-level control reports unavailable (headless), fall back to computer_browser only.");
+                sb.AppendLine("You can SEE and physically CONTROL this Windows machine — mouse, keyboard, and screen — exactly like a human sitting at it. This is a CORE capability, not a fallback: when a task needs the GUI or the web, USE IT.");
+                sb.AppendLine("- THESE ARE DIRECT TOOLS. Call computer_screenshot / computer_click / computer_type / computer_key / computer_scroll / computer_open_browser etc. as native tool calls — the SAME way you call grep or read_file. NEVER write them inside execute_csharp, and NEVER pass their JSON arguments to execute_csharp. execute_csharp is only for C# against Omnipotent services; computer_* tools drive the desktop.");
+                sb.AppendLine("- LOOK, THEN ACT: call computer_screenshot first; give click/move/scroll coordinates in THAT image's pixel space. Every action returns a fresh screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and rethink; never click blind or repeat a failed action unchanged.");
+                sb.AppendLine("- THE WEB = THE REAL BROWSER. To use a website, call computer_open_browser (opens/focuses the user's actual browser, maximized). Then navigate like a person: click the address bar (or computer_key {keys:[\"ctrl\",\"l\"]}), computer_type the URL, computer_key {key:\"enter\"}; click links and buttons by their on-screen position. There is NO scripted browser/Selenium API and you do NOT need a URL handed to you — decide where to go and drive there yourself.");
+                sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
+                sb.AppendLine("- REVERSIBLE actions (scroll, hover, read, open a page, type into a field, navigate) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click (a gated click) or computer_confirm_action (gate then act) — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
+                sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
+                sb.AppendLine("- WAITING is not hanging: for slow page loads/checkouts use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");
                 sb.AppendLine();
             }
 
@@ -420,8 +421,8 @@ namespace Omnipotent.Services.KliveAgent
         {
             "computer_screenshot", "computer_window_state", "computer_read_screen", "computer_move",
             "computer_click", "computer_drag", "computer_scroll", "computer_type", "computer_key",
-            "computer_wait", "computer_focus_window", "computer_launch_app", "computer_clipboard_get",
-            "computer_clipboard_set", "computer_browser", "computer_confirm_action", "computer_confirm_and_click",
+            "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser",
+            "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action", "computer_confirm_and_click",
             "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
         };
 
@@ -565,12 +566,12 @@ namespace Omnipotent.Services.KliveAgent
             tools.Add(Tool("computer_key", "Press a key or chord. Use {key:\"enter\"} or {keys:[\"ctrl\",\"v\"]}. Names: enter,tab,esc,space,backspace,delete,arrows,home,end,pageup,pagedown,f1..f12,ctrl,alt,shift,win,a-z,0-9.", Obj(new { key = strType, keys = new { type = "array", items = strType } })));
             tools.Add(Tool("computer_wait", "Wait for the UI to settle WITHOUT a hard timeout risk. Stops early when untilText appears (browser) or untilImageChange is true, else after maxMs (default 4000, capped 600000). Use for page loads/checkouts.", Obj(new { maxMs = intType, untilText = strType, untilImageChange = new { type = "boolean" } })));
             tools.Add(Tool("computer_focus_window", "Bring a window to the foreground by title substring or process name.", Obj(new { titleContains = strType, processName = strType })));
-            tools.Add(Tool("computer_launch_app", "Launch an allow-listed app/exe (KliveAgent_AppAllowList). Refused if not allow-listed.", Obj(new { path = strType, shellName = strType, args = strType })));
+            tools.Add(Tool("computer_launch_app", "Launch an app/exe. Browsers (chrome/edge/firefox/…) are always allowed; other apps must be in KliveAgent_AppAllowList. The launched window is maximized.", Obj(new { path = strType, shellName = strType, args = strType })));
             tools.Add(Tool("computer_clipboard_get", "Read the Windows clipboard text.", Obj(new { })));
             tools.Add(Tool("computer_clipboard_set", "Set the Windows clipboard text.", Obj(new { text = strType }, "text")));
-            tools.Add(Tool("computer_browser",
-                "Drive the controlled Chrome (persistent login profile). action: \"open\"/\"navigate\" (url), \"fill\" (selector,value — value may contain a {Secret}), \"click_selector\" (selector), \"read_dom\", \"scroll\" (dy). Prefer CSS selectors over visual clicks for the browser. Returns a screenshot.",
-                Obj(new { action = strType, url = strType, selector = strType, value = strType, dy = intType }, "action")));
+            tools.Add(Tool("computer_open_browser",
+                "Open or focus the user's REAL system browser (maximized) so you can drive it like a human. Then NAVIGATE by clicking the address bar (or computer_key {keys:[\"ctrl\",\"l\"]}), computer_type the URL, and computer_key {key:\"enter\"} — click links/buttons by their on-screen position. No URL is required to start. Returns a screenshot.",
+                Obj(new { url = strType })));
             tools.Add(Tool("computer_confirm_action",
                 "GATE an irreversible non-click action (e.g. pressing Enter to submit/pay/send). Blocks until Klive approves on the website or Discord. On APPROVED, do the action next; on DENIED, stop and report.",
                 Obj(new { summary = strType }, "summary")));

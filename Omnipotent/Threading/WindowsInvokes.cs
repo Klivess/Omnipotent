@@ -87,6 +87,7 @@ namespace Omnipotent.Threading
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
         private const int SW_RESTORE = 9;
+        private const int SW_SHOWMAXIMIZED = 3;
 
         public readonly record struct WindowInfo(IntPtr Handle, string Title, uint ProcessId, int Left, int Top, int Right, int Bottom)
         {
@@ -126,10 +127,10 @@ namespace Omnipotent.Threading
             return list;
         }
 
-        /// <summary>Bring a window to the foreground (restoring it if minimised). Returns the focused window info.</summary>
-        public static WindowInfo? FocusWindow(IntPtr handle)
+        /// <summary>Bring a window to the foreground (restoring or maximising it). Returns the focused window info.</summary>
+        public static WindowInfo? FocusWindow(IntPtr handle, bool maximize = false)
         {
-            ShowWindow(handle, SW_RESTORE);
+            ShowWindow(handle, maximize ? SW_SHOWMAXIMIZED : SW_RESTORE);
             SetForegroundWindow(handle);
             return DescribeWindow(handle);
         }
