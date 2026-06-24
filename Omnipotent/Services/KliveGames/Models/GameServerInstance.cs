@@ -52,6 +52,10 @@ namespace Omnipotent.Services.KliveGames.Models
         /// <summary>Launch target — the jar filename or args-file the launch command runs.</summary>
         public string LaunchTarget { get; set; } = "";
 
+        /// <summary>Game-specific deploy-time options collected by the wizard (e.g. Terraria world size/
+        /// difficulty). Read by the provider during <c>PrepareServerAsync</c>. Empty for Minecraft.</summary>
+        public Dictionary<string, string> DeployOptions { get; set; } = new();
+
         // ---- Timestamps ----
         public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
         public DateTime? LastStartedUtc { get; set; }

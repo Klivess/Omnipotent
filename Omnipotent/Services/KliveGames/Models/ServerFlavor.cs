@@ -14,5 +14,7 @@ namespace Omnipotent.Services.KliveGames.Models
         Fabric = 2,
         /// <summary>Minecraft Forge mod loader (classic modpacks).</summary>
         Forge = 3,
+        /// <summary>tModLoader — modded Terraria (GitHub release, bundled .NET runtime, Mods/ folder).</summary>
+        TModLoader = 4,
     }
 }

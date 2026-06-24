@@ -107,6 +107,12 @@ namespace Omnipotent.Services.KliveGames
                 protocol = p.Protocol,
                 defaultPort = p.DefaultPort,
                 flavors = p.SupportedFlavors,
+                requiresEula = p.RequiresEula,
+                usesMemoryLimit = p.UsesMemoryLimit,
+                supportedPlayerActions = p.SupportedPlayerActions,
+                // Deploy-option schema is flavor-dependent in principle; surface the first flavor's set
+                // (Terraria's options are identical across flavors; Minecraft's is empty).
+                deployOptions = p.GetDeployOptionsSchema(p.SupportedFlavors.FirstOrDefault()),
             });
             await Ok(req, new { success = true, games });
         }
@@ -176,11 +182,13 @@ namespace Omnipotent.Services.KliveGames
         {
             var inst = parent.GetInstance(Q(req, "id") ?? "");
             if (inst == null) { await Err(req, "Server not found.", HttpStatusCode.NotFound); return; }
-            var schema = parent.Providers.Get(inst.GameType).GetConfigSchema(inst);
+            var provider = parent.Providers.Get(inst.GameType);
+            var schema = provider.GetConfigSchema(inst);
             await Ok(req, new
             {
                 success = true,
                 schema,
+                usesMemoryLimit = provider.UsesMemoryLimit,
                 ram = inst.RamMb,
                 jvmArgs = inst.JvmArgs,
                 useAikarFlags = inst.UseAikarFlags,
@@ -284,7 +292,8 @@ namespace Omnipotent.Services.KliveGames
         {
             var inst = parent.GetInstance(Q(req, "id") ?? "");
             if (inst == null) { await Err(req, "Server not found.", HttpStatusCode.NotFound); return; }
-            await Ok(req, new { success = true, players = inst.OnlinePlayers, max = inst.MaxPlayers, count = inst.OnlinePlayers.Count });
+            var actions = parent.Providers.Get(inst.GameType).SupportedPlayerActions;
+            await Ok(req, new { success = true, players = inst.OnlinePlayers, max = inst.MaxPlayers, count = inst.OnlinePlayers.Count, supportedActions = actions });
         }
 
         private async Task HandlePlayersAction(KGRequest req)

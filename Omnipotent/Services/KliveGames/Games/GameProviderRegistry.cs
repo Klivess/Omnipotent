@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveGames.Games.Minecraft;
+using Omnipotent.Services.KliveGames.Games.Terraria;
 using Omnipotent.Services.KliveGames.Models;
 
 namespace Omnipotent.Services.KliveGames.Games
@@ -13,7 +14,8 @@ namespace Omnipotent.Services.KliveGames.Games
         public GameProviderRegistry(Func<string, Task> logError)
         {
             Register(new MinecraftProvider(logError));
-            // Future: Register(new TerrariaProvider(...)); Register(new SatisfactoryProvider(...));
+            Register(new TerrariaProvider(logError));
+            // Future: Register(new SatisfactoryProvider(...));
         }
 
         private void Register(IGameProvider provider) => _providers[provider.GameType] = provider;

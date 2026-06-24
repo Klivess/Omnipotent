@@ -49,6 +49,16 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
         public int DefaultPort => 25565;
         public IReadOnlyList<ServerFlavor> SupportedFlavors => _flavors.Keys.ToList();
 
+        public bool RequiresEula => true;
+        public bool UsesMemoryLimit => true;
+        public string PortConfigKey => "server-port";
+        public IReadOnlyList<string> SupportedPlayerActions => new[]
+        {
+            "op", "deop", "kick", "ban", "pardon", "whitelist-add", "whitelist-remove",
+        };
+        public IReadOnlyList<ConfigSchemaField> GetDeployOptionsSchema(ServerFlavor flavor)
+            => Array.Empty<ConfigSchemaField>(); // Minecraft has no extra deploy-time fields
+
         public Task<IReadOnlyList<GameVersionInfo>> GetAvailableVersionsAsync(ServerFlavor flavor, CancellationToken ct)
             => GetFlavor(flavor).GetVersionsAsync(_versions, ct);
 
@@ -98,7 +108,15 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
             // LaunchTarget is either an "@argfile" token (modern Forge) or a jar filename.
             if (inst.LaunchTarget.StartsWith("@"))
             {
-                args.Add(inst.LaunchTarget);
+                // Resolve the argfile to an ABSOLUTE path so java can always find it regardless of how
+                // the working directory is interpreted. (The module/classpath entries *inside* the file
+                // are still relative, which is why WorkingDirectory below remains the server folder.)
+                string argRel = inst.LaunchTarget.Substring(1);
+                string argAbs = Path.GetFullPath(Path.Combine(inst.ServerDirectory, argRel));
+                if (!File.Exists(argAbs))
+                    throw new FileNotFoundException(
+                        $"Forge launch arguments file is missing ({argAbs}). The Forge install looks incomplete — delete and redeploy this server.");
+                args.Add("@" + argAbs.Replace('\\', '/'));
                 args.Add("nogui");
             }
             else

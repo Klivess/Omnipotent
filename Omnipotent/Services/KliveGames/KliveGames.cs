@@ -31,6 +31,8 @@ namespace Omnipotent.Services.KliveGames
             public bool AutoStart { get; set; } = false;
             public bool StartAfterCreate { get; set; } = true;
             public bool EulaAccepted { get; set; } = false;
+            /// <summary>Game-specific deploy options (e.g. Terraria world size/difficulty/maxPlayers/password).</summary>
+            public Dictionary<string, string> Options { get; set; } = new();
         }
 
         private readonly ConcurrentDictionary<string, GameServerInstance> _instances = new();
@@ -188,10 +190,11 @@ namespace Omnipotent.Services.KliveGames
         {
             if (string.IsNullOrWhiteSpace(req.Name)) throw new ArgumentException("A server name is required.");
             if (string.IsNullOrWhiteSpace(req.Version)) throw new ArgumentException("A version is required.");
-            if (!req.EulaAccepted) throw new InvalidOperationException("The Minecraft EULA must be accepted to deploy a server.");
 
             var provider = _providers.Get(req.GameType);
             if (!provider.Implemented) throw new InvalidOperationException($"{provider.DisplayName} is not available yet.");
+            if (provider.RequiresEula && !req.EulaAccepted)
+                throw new InvalidOperationException($"The {provider.DisplayName} EULA must be accepted to deploy a server.");
 
             int port = AllocatePort(req.Port > 0 ? req.Port : provider.DefaultPort);
 
@@ -207,12 +210,13 @@ namespace Omnipotent.Services.KliveGames
                 Flavor = req.Flavor,
                 Version = req.Version,
                 Port = port,
-                RamMb = Math.Clamp(req.RamMb, 512, 32768),
+                RamMb = provider.UsesMemoryLimit ? Math.Clamp(req.RamMb, 512, 32768) : req.RamMb,
                 UseAikarFlags = req.UseAikarFlags,
                 Public = req.Public,
                 AutoStart = req.AutoStart,
                 Status = GameServerStatus.Provisioning,
                 ServerDirectory = serverDir,
+                DeployOptions = req.Options ?? new(),
                 CreatedUtc = DateTime.UtcNow,
             };
 
@@ -540,8 +544,10 @@ namespace Omnipotent.Services.KliveGames
                             var provider = _providers.Get(inst.GameType);
                             try
                             {
+                                var listCmd = provider.BuildListCommand();
+                                if (string.IsNullOrEmpty(listCmd)) continue; // game uses join/leave parsing only
                                 _pendingListPoll[inst.Id] = DateTime.UtcNow;
-                                await SendCommandAsync(inst.Id, provider.BuildListCommand(), echo: false);
+                                await SendCommandAsync(inst.Id, listCmd, echo: false);
                             }
                             catch { }
                         }
@@ -633,8 +639,8 @@ namespace Omnipotent.Services.KliveGames
             var provider = _providers.Get(inst.GameType);
             await provider.ApplyConfigAsync(inst, values);
 
-            // Keep the managed port in sync if the operator changed server-port.
-            if (values.TryGetValue("server-port", out var sp) && int.TryParse(sp, out int newPort) && newPort != inst.Port)
+            // Keep the managed port in sync if the operator changed the port via config.
+            if (values.TryGetValue(provider.PortConfigKey, out var sp) && int.TryParse(sp, out int newPort) && newPort != inst.Port)
             {
                 inst.Port = newPort;
                 if (inst.Public) _ = EnsurePublicAsync(inst, true);

@@ -24,6 +24,26 @@ namespace Omnipotent.Services.KliveGames.Games
 
         IReadOnlyList<ServerFlavor> SupportedFlavors { get; }
 
+        // ---- Capabilities (let the orchestrator/UI stay game-agnostic) ----
+
+        /// <summary>Whether deployment requires accepting an EULA (Minecraft true, Terraria false).</summary>
+        bool RequiresEula { get; }
+
+        /// <summary>Whether this game uses a configurable memory limit / JVM heap (controls RAM + JVM UI).</summary>
+        bool UsesMemoryLimit { get; }
+
+        /// <summary>The config key that mirrors the listen port (e.g. "server-port" / "port") so the
+        /// orchestrator can keep <c>inst.Port</c> in sync when the user edits config.</summary>
+        string PortConfigKey { get; }
+
+        /// <summary>Player-management actions this game supports (subset of op/deop/kick/ban/pardon/whitelist-*).</summary>
+        IReadOnlyList<string> SupportedPlayerActions { get; }
+
+        /// <summary>Extra fields the deploy wizard should collect for this game (e.g. Terraria world
+        /// size/difficulty). Returned values arrive back in the create request's Options and are stored
+        /// on the instance for <see cref="PrepareServerAsync"/>. Empty for Minecraft.</summary>
+        IReadOnlyList<ConfigSchemaField> GetDeployOptionsSchema(ServerFlavor flavor);
+
         /// <summary>Lists deployable versions (+ latest build/loader) for the deploy wizard.</summary>
         Task<IReadOnlyList<GameVersionInfo>> GetAvailableVersionsAsync(ServerFlavor flavor, CancellationToken ct);
 
