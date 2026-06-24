@@ -58,7 +58,8 @@ namespace Omnipotent.Services.HostControl
                 await secrets.InitializeAsync();
                 substituter = new SecretSubstituter(secrets);
                 approvals = new ApprovalBroker(this);
-                await ServiceLog($"[HostControl] Ready. OS-level control {(OsControlAvailable ? "ENABLED" : "DISABLED (non-interactive/headless) — browser-only")}.");
+                osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
+                await ServiceLog($"[HostControl] Ready. OS-level control {(osControlEnabled ? "ENABLED" : "disabled via KliveAgent_OsControlEnabled")}. Interactive session: {Environment.UserInteractive}, server: {OmniPaths.CheckIfOnServer()}.");
             }
             catch (Exception ex)
             {
@@ -67,7 +68,12 @@ namespace Omnipotent.Services.HostControl
         }
 
         // ── Capability / environment ──
-        private bool OsControlAvailable => Environment.UserInteractive && !OmniPaths.CheckIfOnServer();
+        // OS-level control is ON by default — KliveAgent drives whatever machine it runs on. It is NOT
+        // gated on CheckIfOnServer() ("server" doesn't imply headless) nor on Environment.UserInteractive;
+        // the only switch is the KliveAgent_OsControlEnabled setting (default true), refreshed before every
+        // action in ExecuteToolAsync.
+        private volatile bool osControlEnabled = true;
+        private bool OsControlAvailable => osControlEnabled;
 
         // ── OmniSettings-backed secret storage helpers (used by EncryptedMemoryStore) ──
         internal async Task SetSettingRaw(string key, string value) =>
@@ -121,6 +127,8 @@ namespace Omnipotent.Services.HostControl
             {
                 if (!await ComputerUseEnabledAsync())
                     return ComputerToolResult.Fail("Computer-use is disabled (set KliveAgent_ComputerUseEnabled).");
+                // Refresh the OS-control switch each action so toggling the setting takes effect immediately.
+                osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
                 return await RunAsync(toolName, args, ct, onProgress);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -304,7 +312,7 @@ namespace Omnipotent.Services.HostControl
 
         // ── Actuation helpers ──
         private ComputerToolResult? OsGuard() =>
-            OsControlAvailable ? null : ComputerToolResult.Fail("OS-level control is unavailable: this isn't an interactive desktop session. Computer-use needs to run on the logged-in Windows machine.");
+            OsControlAvailable ? null : ComputerToolResult.Fail("OS-level control is turned off. Set KliveAgent_OsControlEnabled=true to let KliveAgent control this machine.");
 
         private async Task<ComputerToolResult> MutatingAsync(CancellationToken ct, Action<HostControlProgress> onProgress, string kind, Action act, string label, int? tx = null, int? ty = null)
         {
