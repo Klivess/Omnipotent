@@ -700,6 +700,16 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("activity")]
         public List<AgentActivityEvent> Activity { get; set; } = new();
 
+        /// <summary>Latest annotated screenshot from a computer-use action (base64 JPEG), streamed to the
+        /// website so the page can render a live video of what the agent is doing on the host machine.</summary>
+        [JsonProperty("latestFrame")]
+        public string LatestFrame { get; set; }
+
+        /// <summary>Set while a computer-use action is blocked awaiting Klive's approval (the website renders
+        /// an inline approve/deny card with the target screenshot). Null when nothing is pending.</summary>
+        [JsonProperty("pendingApproval")]
+        public PendingApproval PendingApproval { get; set; }
+
         [JsonProperty("finalResponse")]
         public AgentChatResponse FinalResponse { get; set; }
 
@@ -722,6 +732,26 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("errorMessage")]
         public string ErrorMessage { get; set; }
+    }
+
+    /// <summary>A human-in-the-loop approval request for an irreversible computer-use action. Surfaced to
+    /// the website (inline approve/deny card with the target screenshot) and resolved via the
+    /// /kliveagent/chat/approve route. The action blocks until Status leaves "pending".</summary>
+    public class PendingApproval
+    {
+        [JsonProperty("approvalId")]
+        public string ApprovalId { get; set; } = string.Empty;
+
+        [JsonProperty("message")]
+        public string Message { get; set; } = string.Empty;
+
+        /// <summary>Annotated screenshot of exactly what is about to happen (base64 JPEG), or null.</summary>
+        [JsonProperty("frameBase64")]
+        public string FrameBase64 { get; set; }
+
+        /// <summary>"pending" | "approved" | "denied".</summary>
+        [JsonProperty("status")]
+        public string Status { get; set; } = "pending";
     }
 
     /// <summary>One entry in a run's live activity timeline.</summary>
@@ -755,5 +785,11 @@ namespace Omnipotent.Services.KliveAgent.Models
         public int CompletionTokens { get; set; }
         /// <summary>A new activity event to append, if this update introduces one.</summary>
         public AgentActivityEvent NewActivity { get; set; }
+
+        /// <summary>Latest annotated computer-use frame (JPEG bytes) for the website video stream, if any.</summary>
+        public byte[] Frame { get; set; }
+
+        /// <summary>A computer-use approval request/resolution to surface to the website, if any.</summary>
+        public PendingApproval Approval { get; set; }
     }
 }

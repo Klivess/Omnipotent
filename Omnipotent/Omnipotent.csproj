@@ -15,6 +15,9 @@
 		<TieredPGO>true</TieredPGO>
 		<ServerGarbageCollection>true</ServerGarbageCollection>
 		<ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+		<!-- The app is Windows-only (admin manifest, Win10 host). Suppress the platform-compat analyzer
+		     so the Windows-only HostControl/System.Drawing surface doesn't spam CA1416 across call sites. -->
+		<NoWarn>$(NoWarn);CA1416</NoWarn>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -64,6 +67,7 @@
 		<PackageReference Include="SmtpServer" Version="11.1.0" />
 		<PackageReference Include="Spectre.Console" Version="0.55.0" />
 		<PackageReference Include="SteamKit2" Version="3.4.0" />
+		<PackageReference Include="System.Drawing.Common" Version="9.0.4" />
 		<PackageReference Include="System.Management" Version="10.0.5" />
 		<PackageReference Include="Tesseract" Version="5.2.0" />
 		<PackageReference Include="System.Net.Http" Version="4.3.4" />

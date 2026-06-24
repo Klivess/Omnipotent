@@ -134,6 +134,34 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Approve/deny a pending computer-use action (the website's inline Approve/Deny buttons).
+            // Unblocks the waiting action via HostControlManager's ApprovalBroker.
+            await CreateRoute("/kliveagent/chat/approve", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string approvalId = body?.approvalId;
+                    bool approved = body?.approved ?? false;
+                    if (string.IsNullOrWhiteSpace(approvalId))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "approvalId is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var resolved = await service.SubmitApprovalAsync(approvalId, approved);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = resolved }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
         }
 
         private async Task RegisterCapabilityRoutes()

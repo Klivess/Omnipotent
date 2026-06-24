@@ -866,6 +866,40 @@ namespace Omnipotent.Services.KliveAgent
             await Task.Delay(milliseconds, CancellationToken);
         }
 
+        // ── Computer Control (host desktop + browser) ──
+        // Thin pass-throughs to HostControlManager so a single execute_csharp block can interleave live-service
+        // scripting with driving the GUI. These honour CancellationToken and the same gating/secret rules as
+        // the native computer_* tools. (Long waits are better done with the native computer_wait tool, which
+        // is not subject to the per-script timeout.)
+
+        private Omnipotent.Services.HostControl.HostControlManager? HostControl()
+            => GetService("HostControlManager") as Omnipotent.Services.HostControl.HostControlManager;
+
+        private async Task<string> RunComputerToolAsync(string tool, object args)
+        {
+            var hcm = HostControl();
+            if (hcm == null) return "HostControlManager service is not running.";
+            var json = System.Text.Json.JsonSerializer.Serialize(args);
+            return await hcm.ExecuteToolTextAsync(tool, json, CancellationToken);
+        }
+
+        /// <summary>Capture the screen ("active", "fullscreen", or "browser"). Returns a text note (the image
+        /// itself reaches the model only via the native computer_screenshot tool path).</summary>
+        public Task<string> ComputerScreenshot(string target = "active") => RunComputerToolAsync("computer_screenshot", new { target });
+        public Task<string> ComputerClick(int x, int y, string button = "left", int clicks = 1) => RunComputerToolAsync("computer_click", new { x, y, button, clicks });
+        public Task<string> ComputerMove(int x, int y) => RunComputerToolAsync("computer_move", new { x, y });
+        public Task<string> ComputerType(string text) => RunComputerToolAsync("computer_type", new { text });
+        public Task<string> ComputerKey(params string[] keys) => RunComputerToolAsync("computer_key", new { keys });
+        public Task<string> ComputerScroll(int dy, int dx = 0) => RunComputerToolAsync("computer_scroll", new { dy, dx });
+        public Task<string> ComputerWait(int maxMs, string? untilText = null) => RunComputerToolAsync("computer_wait", new { maxMs, untilText });
+        public Task<string> ComputerReadScreen() => RunComputerToolAsync("computer_read_screen", new { });
+        public Task<string> ComputerBrowser(string action, string? url = null, string? selector = null, string? value = null) => RunComputerToolAsync("computer_browser", new { action, url, selector, value });
+
+        /// <summary>Securely store a credential under a name. The value is encrypted and never readable; enter
+        /// it later by writing {Name} inside ComputerType/ComputerBrowser fill text.</summary>
+        public Task<string> SaveEncryptedMemory(string name, string value) => RunComputerToolAsync("save_encrypted_memory", new { name, value });
+        public List<string> ListEncryptedMemoryNames() => HostControl()?.ListEncryptedMemoryNames() ?? new List<string>();
+
         // ── Codebase Reading ──
 
         private static readonly string CodebaseRoot = ResolveCodebaseRoot();

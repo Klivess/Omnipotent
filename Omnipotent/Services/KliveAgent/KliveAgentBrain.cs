@@ -1,4 +1,5 @@
 ﻿using Omnipotent.Service_Manager;
+using Omnipotent.Services.HostControl;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
 using System.Globalization;
@@ -95,7 +96,7 @@ namespace Omnipotent.Services.KliveAgent
 
         // â”€â”€ Prompt Assembly â”€â”€
 
-        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false)
+        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false, bool computerUseEnabled = false)
         {
             var personality = await agentService.GetStringOmniSetting(
                 "KliveAgent_Personality",
@@ -240,6 +241,19 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("greetings, jokes, transient state, or anything already obvious from the conversation.");
             sb.AppendLine($"If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief, a duplicate), {(toolCallingMode ? "call the delete_memory tool" : "call DeleteMemory(id)")} to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
             sb.AppendLine();
+
+            if (computerUseEnabled)
+            {
+                sb.AppendLine("[Computer Control]");
+                sb.AppendLine("You can SEE and CONTROL this Windows machine (mouse, keyboard, screen) and a logged-in Chrome browser, alongside your C#/Omnipotent abilities — MERGE them freely in one task (e.g. execute_csharp to fetch data, then drive the GUI with it, then script the result back).");
+                sb.AppendLine("- LOOK BEFORE YOU ACT: call computer_screenshot, then give click/move/scroll coordinates in THAT image's pixel space. After each action you get a fresh screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and rethink; never click blind or repeat a failed action unchanged.");
+                sb.AppendLine("- BROWSER vs DESKTOP: for websites prefer computer_browser (open/navigate/fill/click_selector/read_dom) with CSS selectors — it's more reliable than visual clicking. Use computer_screenshot + computer_click for native apps or when no selector fits.");
+                sb.AppendLine("- REVERSIBLE actions (scroll, hover, navigate, read, open a page, fill a field) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click (a gated click) or computer_confirm_action (gate then act) — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
+                sb.AppendLine("- SECRETS: never ask the user for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") or a browser fill value \"{SainsburyPassword}\" — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
+                sb.AppendLine("- WAITING is not hanging: for slow page loads/checkouts use computer_wait (untilText / untilImageChange / maxMs). Don't busy-loop screenshots.");
+                sb.AppendLine("- If OS-level control reports unavailable (headless), fall back to computer_browser only.");
+                sb.AppendLine();
+            }
 
             // Cache breakpoint: everything ABOVE is the STABLE skeleton (personality + rules + patterns +
             // memory discipline — identical across tasks); everything BELOW is task-VOLATILE (tool guide +
@@ -399,9 +413,23 @@ namespace Omnipotent.Services.KliveAgent
             "grep", "read_file", "list_directory", "get_global_path"
         };
 
+        /// <summary>Computer-use ("host control") tools: dispatched outside Roslyn to HostControlManager,
+        /// bypassing the per-script timeout so a legitimately slow GUI step is never killed. Includes the
+        /// encrypted-credential vault ops (save/list/delete) since the vault lives in HostControl.</summary>
+        private static readonly HashSet<string> ComputerUseToolNames = new(StringComparer.Ordinal)
+        {
+            "computer_screenshot", "computer_window_state", "computer_read_screen", "computer_move",
+            "computer_click", "computer_drag", "computer_scroll", "computer_type", "computer_key",
+            "computer_wait", "computer_focus_window", "computer_launch_app", "computer_clipboard_get",
+            "computer_clipboard_set", "computer_browser", "computer_confirm_action", "computer_confirm_and_click",
+            "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
+        };
+
+        private static bool IsComputerTool(string name) => ComputerUseToolNames.Contains(name);
+
         /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
-        /// tools plus memory tools. Anything else is routed to execute_csharp.</summary>
-        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name);
+        /// tools plus memory tools plus computer-use tools. Anything else is routed to execute_csharp.</summary>
+        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name);
 
         /// <summary>Read-only native tools have no side effects and never touch the Roslyn session, so
         /// several of them in one turn can run concurrently (their I/O latency overlaps). Write tools
@@ -425,7 +453,7 @@ namespace Omnipotent.Services.KliveAgent
         /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
         /// plus first-class MEMORY tools so recall/save are a direct tool call, never a hand-written script.
         /// </summary>
-        public static List<HFWrapper.HFTool> BuildToolDefinitions()
+        public static List<HFWrapper.HFTool> BuildToolDefinitions(bool includeComputerUse = false)
         {
             static HFWrapper.HFTool Tool(string name, string description, object parameters) => new()
             {
@@ -433,7 +461,7 @@ namespace Omnipotent.Services.KliveAgent
                 function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
             };
 
-            return new List<HFWrapper.HFTool>
+            var tools = new List<HFWrapper.HFTool>
             {
                 Tool("execute_csharp",
                     "Execute a C# script in-process against Omnipotent's live service graph (Roslyn). " +
@@ -500,6 +528,60 @@ namespace Omnipotent.Services.KliveAgent
                     "Forget a memory by its id (or short-id prefix shown in recalls). Use to curate noise/duplicates/outdated beliefs.",
                     new { type = "object", properties = new { id = new { type = "string", description = "The memory id or short-id prefix." } }, required = new[] { "id" } }),
             };
+
+            if (includeComputerUse)
+                AddComputerUseTools(tools, Tool);
+
+            return tools;
+        }
+
+        /// <summary>
+        /// Computer-use ("host control") tools: drive the real Windows desktop (mouse/keyboard/screen) and
+        /// the browser. Each returns a text observation; perception tools also return a screenshot fed to
+        /// the vision model. Coordinates are in the pixel space of the most recent screenshot. Irreversible
+        /// actions (pay/submit/order/send) MUST go through computer_confirm_and_click / computer_confirm_action,
+        /// which block on Klive's approval. Only added to the catalogue when KliveAgent_ComputerUseEnabled is on.
+        /// </summary>
+        private static void AddComputerUseTools(List<HFWrapper.HFTool> tools, Func<string, string, object, HFWrapper.HFTool> Tool)
+        {
+            object Obj(object props, params string[] required) => new { type = "object", properties = props, required = required };
+            var strType = new { type = "string" };
+            var intType = new { type = "integer" };
+
+            tools.Add(Tool("computer_screenshot",
+                "Capture the screen as an image you can SEE (fed to your vision). Returns the pixel size; coordinates you give to computer_click/move/etc. are in THIS image's pixel space. ALWAYS screenshot before clicking blind.",
+                Obj(new { target = new { type = "string", description = "\"active\" (active window, default), \"fullscreen\", or \"browser\" (the controlled Chrome viewport)." } })));
+            tools.Add(Tool("computer_window_state", "Report the active window (title/pos/size), the virtual-screen size, and whether OS-level control is available.", Obj(new { })));
+            tools.Add(Tool("computer_read_screen", "Read structured on-screen text: the browser DOM text+URL when a page is open, otherwise the list of visible windows. Complements the screenshot.", Obj(new { })));
+            tools.Add(Tool("computer_move", "Move the mouse to (x,y) in the last screenshot's pixel space.", Obj(new { x = intType, y = intType }, "x", "y")));
+            tools.Add(Tool("computer_click",
+                "Left/right/middle click at (x,y) in the last screenshot's pixel space. Reversible navigation only — for any irreversible/pay/submit/send button use computer_confirm_and_click instead.",
+                Obj(new { x = intType, y = intType, button = strType, clicks = intType }, "x", "y")));
+            tools.Add(Tool("computer_drag", "Press at (fromX,fromY), drag to (toX,toY), release.", Obj(new { fromX = intType, fromY = intType, toX = intType, toY = intType }, "fromX", "fromY", "toX", "toY")));
+            tools.Add(Tool("computer_scroll", "Scroll by dy (and optional dx) wheel notches, at optional (x,y) else screen center. Negative dy scrolls down.", Obj(new { dy = intType, dx = intType, x = intType, y = intType }, "dy")));
+            tools.Add(Tool("computer_type",
+                "Type text into the focused field. To enter a saved secret WITHOUT ever seeing it, embed its name in braces, e.g. \"{SainsburyEmail}\" — the harness substitutes the decrypted value at keystroke time. Click the field first.",
+                Obj(new { text = strType }, "text")));
+            tools.Add(Tool("computer_key", "Press a key or chord. Use {key:\"enter\"} or {keys:[\"ctrl\",\"v\"]}. Names: enter,tab,esc,space,backspace,delete,arrows,home,end,pageup,pagedown,f1..f12,ctrl,alt,shift,win,a-z,0-9.", Obj(new { key = strType, keys = new { type = "array", items = strType } })));
+            tools.Add(Tool("computer_wait", "Wait for the UI to settle WITHOUT a hard timeout risk. Stops early when untilText appears (browser) or untilImageChange is true, else after maxMs (default 4000, capped 600000). Use for page loads/checkouts.", Obj(new { maxMs = intType, untilText = strType, untilImageChange = new { type = "boolean" } })));
+            tools.Add(Tool("computer_focus_window", "Bring a window to the foreground by title substring or process name.", Obj(new { titleContains = strType, processName = strType })));
+            tools.Add(Tool("computer_launch_app", "Launch an allow-listed app/exe (KliveAgent_AppAllowList). Refused if not allow-listed.", Obj(new { path = strType, shellName = strType, args = strType })));
+            tools.Add(Tool("computer_clipboard_get", "Read the Windows clipboard text.", Obj(new { })));
+            tools.Add(Tool("computer_clipboard_set", "Set the Windows clipboard text.", Obj(new { text = strType }, "text")));
+            tools.Add(Tool("computer_browser",
+                "Drive the controlled Chrome (persistent login profile). action: \"open\"/\"navigate\" (url), \"fill\" (selector,value — value may contain a {Secret}), \"click_selector\" (selector), \"read_dom\", \"scroll\" (dy). Prefer CSS selectors over visual clicks for the browser. Returns a screenshot.",
+                Obj(new { action = strType, url = strType, selector = strType, value = strType, dy = intType }, "action")));
+            tools.Add(Tool("computer_confirm_action",
+                "GATE an irreversible non-click action (e.g. pressing Enter to submit/pay/send). Blocks until Klive approves on the website or Discord. On APPROVED, do the action next; on DENIED, stop and report.",
+                Obj(new { summary = strType }, "summary")));
+            tools.Add(Tool("computer_confirm_and_click",
+                "GATE + perform an irreversible click (place order, confirm booking, final Pay, submit, send). Shows Klive the target screenshot and blocks until approved, then clicks (x,y). Use this for EVERY money/outward action.",
+                Obj(new { x = intType, y = intType, summary = strType, button = strType }, "x", "y", "summary")));
+            tools.Add(Tool("save_encrypted_memory",
+                "Securely store a credential/secret (e.g. an email or password) under a name. The value is encrypted and NEVER shown back to you — reference it later as {Name} inside computer_type or computer_browser fill.",
+                Obj(new { name = strType, value = strType }, "name", "value")));
+            tools.Add(Tool("list_encrypted_memories", "List the NAMES of stored encrypted memories (never their values).", Obj(new { })));
+            tools.Add(Tool("delete_encrypted_memory", "Delete a stored encrypted memory by name.", Obj(new { name = strType }, "name")));
         }
 
         /// <summary>
@@ -687,8 +769,12 @@ namespace Omnipotent.Services.KliveAgent
                 // Fire-and-forget: it must never block or fail the run.
                 _ = llm.WarmUpConnectionAsync(cancellationToken);
 
-                var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling);
-                var toolDefinitions = useToolCalling ? BuildToolDefinitions() : null;
+                // Computer-use ("host control") tools are opt-in (default off) and only available on the
+                // structured tool-calling path (they require vision + a tool channel).
+                bool computerUseEnabled = useToolCalling && await agentService.GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: false);
+
+                var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
+                var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;
 
                 llm.ResetSession(llmSessionId);
 
@@ -746,7 +832,7 @@ namespace Omnipotent.Services.KliveAgent
                 // token totals, and an optional new activity-timeline event). NEVER fabricates placeholder
                 // prose — Text is left null when the model hasn't actually said anything, so the host won't
                 // overwrite the bubble with filler; status/activity still flow.
-                void ReportProgress(string phase, string runningNote, AgentActivityEvent newActivity = null, string? liveText = null)
+                void ReportProgress(string phase, string runningNote, AgentActivityEvent newActivity = null, string? liveText = null, byte[] frame = null, PendingApproval approval = null)
                 {
                     if (onProgress == null) return;
                     // Compose: committed prose from prior turns + the tokens streaming in this turn (if any)
@@ -777,7 +863,9 @@ namespace Omnipotent.Services.KliveAgent
                             StatusNote = runningNote,
                             PromptTokens = totalPromptTokens,
                             CompletionTokens = totalCompletionTokens,
-                            NewActivity = newActivity
+                            NewActivity = newActivity,
+                            Frame = frame,
+                            Approval = approval
                         });
                     }
                     catch { }
@@ -1100,6 +1188,9 @@ namespace Omnipotent.Services.KliveAgent
 
                     int scriptCountThisIter = 0;
                     int errorCountThisIter = 0;
+                    // Screenshots from computer-use tools this turn, fed to the vision model as a user image
+                    // message AFTER all role:"tool" results (providers require tool results to stay text-only).
+                    var pendingModelImages = new List<(byte[] data, string mimeType)>();
                     // True once at least one script's result has been delivered as a role:"tool" message.
                     // When set, the trailing guidance goes back as a plain user turn (observations are
                     // already in the tool results); when not, observations themselves are sent back.
@@ -1132,9 +1223,52 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
-                        // Native tool call (memory / grep) — dispatch straight to its API (no Roslyn).
+                        // Native tool call (memory / grep / computer-use) — dispatch straight to its API (no Roslyn).
                         if (!segment.IsScript && segment.ToolName != null)
                         {
+                            // Computer-use tool → HostControlManager. Has its own path: it streams annotated
+                            // frames + activity to the website, may block on a human approval (heartbeating so
+                            // the stall watchdog stays calm), and feeds its screenshot to the vision model.
+                            if (IsComputerTool(segment.ToolName))
+                            {
+                                ComputerToolResult cr;
+                                if (sharedGlobals.GetService("HostControlManager") is HostControlManager hcm)
+                                {
+                                    cr = await hcm.ExecuteToolAsync(segment.ToolName, segment.Content, cancellationToken, hcp =>
+                                    {
+                                        var act = hcp.Activity == null ? null
+                                            : new AgentActivityEvent { Iteration = iteration + 1, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
+                                        ReportProgress("running", hcp.Note, act, frame: hcp.AnnotatedFrameJpeg, approval: hcp.Approval);
+                                    });
+                                }
+                                else
+                                {
+                                    cr = ComputerToolResult.Fail("HostControlManager service is not running.");
+                                }
+
+                                if (!cr.Success) errorCountThisIter++;
+
+                                var crText = KliveAgentContextBudget.TruncateToTokens(cr.Text ?? string.Empty,
+                                    cr.Success ? KliveAgentContextBudget.ScriptOutputBudget : KliveAgentContextBudget.ScriptErrorBudget);
+                                observationSb.AppendLine($"[{(cr.Success ? "OK" : "ERROR")} | {segment.ToolName}]");
+                                if (!string.IsNullOrWhiteSpace(crText)) observationSb.AppendLine(crText);
+                                observationSb.AppendLine();
+
+                                ReportProgress("running", null,
+                                    new AgentActivityEvent { Iteration = iteration + 1, Kind = cr.Success ? "action" : "error", Text = $"{segment.ToolName} {(cr.Success ? "ok" : "error")}" },
+                                    frame: cr.AnnotatedJpeg);
+
+                                if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
+                                {
+                                    llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName, crText);
+                                    anyToolResultsAppended = true;
+                                }
+                                if (useToolCalling && cr.ModelImageJpeg != null)
+                                    pendingModelImages.Add((cr.ModelImageJpeg, "image/jpeg"));
+
+                                continue;
+                            }
+
                             bool memOk; string memOut;
                             if (prelaunchedTools.TryGetValue(segment, out var preTask))
                                 (memOk, memOut) = await preTask;        // parallel-safe read-only tool: started up front
@@ -1218,6 +1352,14 @@ namespace Omnipotent.Services.KliveAgent
                             llm.AppendToolResult(llmSessionId, segment.ToolCallId, "execute_csharp", scriptObsText);
                             anyToolResultsAppended = true;
                         }
+                    }
+
+                    // Feed any computer-use screenshots to the vision model as ONE user image turn, after all
+                    // role:"tool" results (which must stay text-only). Reuses KliveLLM's existing vision path.
+                    if (useToolCalling && pendingModelImages.Count > 0)
+                    {
+                        try { llm.AppendUserContentToToolSession(llmSessionId, "Screenshot(s) from the computer action(s) above:", pendingModelImages); }
+                        catch { }
                     }
 
                     // Track the per-turn error streak so the adaptive thinking budget can escalate when
