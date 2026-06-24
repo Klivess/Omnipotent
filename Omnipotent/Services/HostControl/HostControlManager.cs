@@ -264,13 +264,30 @@ namespace Omnipotent.Services.HostControl
                     }, label: "drag", tx: IntOr(a, "toX", 0), ty: IntOr(a, "toY", 0));
 
                 case "computer_scroll":
+                {
+                    // Intuitive interface: {direction:"down"|"up"|"left"|"right", amount:N notches}. Falls back
+                    // to raw dy/dx; defaults to scrolling DOWN so the model never wrestles with the wheel sign.
+                    int amount = Math.Abs(IntOr(a, "amount", 5));
+                    if (amount == 0) amount = 5;
+                    int dy = IntOr(a, "dy", 0), dx = IntOr(a, "dx", 0);
+                    switch ((Str(a, "direction") ?? "").Trim().ToLowerInvariant())
+                    {
+                        case "down": dy = -amount; break;
+                        case "up": dy = amount; break;
+                        case "right": dx = amount; break;
+                        case "left": dx = -amount; break;
+                    }
+                    if (dy == 0 && dx == 0) dy = -amount; // default: down
+                    int fdy = dy, fdx = dx;
+                    var dirLabel = fdy < 0 ? "down" : fdy > 0 ? "up" : fdx > 0 ? "right" : "left";
                     return await MutatingAsync(ct, onProgress, "scroll", () =>
                     {
                         int cx = a.TryGetProperty("x", out _) ? IntOr(a, "x", 0) : ScreenCenterX();
                         int cy = a.TryGetProperty("y", out _) ? IntOr(a, "y", 0) : ScreenCenterY();
                         var (px, py) = MapToPhysical(cx, cy);
-                        NativeInput.Scroll(px, py, IntOr(a, "dy", 0), IntOr(a, "dx", 0));
-                    }, label: $"scroll dy={IntOr(a, "dy", 0)}");
+                        NativeInput.Scroll(px, py, fdy, fdx);
+                    }, label: $"scroll {dirLabel} {Math.Max(Math.Abs(fdy), Math.Abs(fdx))}");
+                }
 
                 case "computer_type":
                     return await TypeAsync(a, ct, onProgress);

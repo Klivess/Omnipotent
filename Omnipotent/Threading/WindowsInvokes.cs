@@ -235,12 +235,24 @@ namespace Omnipotent.Threading
             Send(MouseAbs(toX, toY, MOUSEEVENTF_LEFTUP));
         }
 
+        // Scroll the content under (x,y). dy/dx are in wheel "notches": +dy scrolls UP, -dy scrolls DOWN
+        // (standard wheel sign); +dx right, -dx left. The cursor is parked over the target first, then the
+        // wheel is delivered as proper WHEEL events (dx=dy=0, ABSOLUTE flags OFF — the previous code left
+        // them on, which is malformed and silently did nothing). Sent one notch at a time for reliability.
         public static void Scroll(int x, int y, int dy, int dx = 0)
         {
             Send(MouseAbs(x, y, MOUSEEVENTF_MOVE));
-            if (dy != 0) Send(MouseAbs(x, y, MOUSEEVENTF_WHEEL, unchecked((uint)(dy * WHEEL_DELTA))));
-            if (dx != 0) Send(MouseAbs(x, y, MOUSEEVENTF_HWHEEL, unchecked((uint)(dx * WHEEL_DELTA))));
+            int v = Math.Clamp(dy, -100, 100);
+            int h = Math.Clamp(dx, -100, 100);
+            for (int i = 0; i < Math.Abs(v); i++) Send(WheelInput(MOUSEEVENTF_WHEEL, Math.Sign(v) * WHEEL_DELTA));
+            for (int i = 0; i < Math.Abs(h); i++) Send(WheelInput(MOUSEEVENTF_HWHEEL, Math.Sign(h) * WHEEL_DELTA));
         }
+
+        private static INPUT WheelInput(uint wheelFlag, int delta) => new()
+        {
+            type = INPUT_MOUSE,
+            U = new InputUnion { mi = new MOUSEINPUT { dx = 0, dy = 0, mouseData = unchecked((uint)delta), dwFlags = wheelFlag, time = 0, dwExtraInfo = IntPtr.Zero } }
+        };
 
         // Type arbitrary Unicode text via UNICODE scan codes (handles any character, incl. surrogate pairs).
         public static void TypeUnicode(string text)
