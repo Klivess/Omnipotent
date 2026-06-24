@@ -205,14 +205,16 @@ namespace Omnipotent.Threading
 
         public static void MoveMouse(int x, int y) => Send(MouseAbs(x, y, MOUSEEVENTF_MOVE));
 
+        private static (uint down, uint up) ButtonFlags(MouseButton button) => button switch
+        {
+            MouseButton.Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+            MouseButton.Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+            _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+        };
+
         public static void Click(int x, int y, MouseButton button, int clicks = 1)
         {
-            (uint down, uint up) = button switch
-            {
-                MouseButton.Right => (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-                MouseButton.Middle => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
-                _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-            };
+            var (down, up) = ButtonFlags(button);
             Send(MouseAbs(x, y, MOUSEEVENTF_MOVE));
             for (int i = 0; i < Math.Max(1, clicks); i++)
             {
@@ -221,18 +223,51 @@ namespace Omnipotent.Threading
             }
         }
 
-        public static void Drag(int fromX, int fromY, int toX, int toY)
+        /// <summary>Press (and HOLD) a mouse button at (x,y) without releasing — pair with MouseButtonUp.</summary>
+        public static void MouseButtonDown(int x, int y, MouseButton button)
         {
+            var (down, _) = ButtonFlags(button);
+            Send(MouseAbs(x, y, MOUSEEVENTF_MOVE));
+            Send(MouseAbs(x, y, down));
+        }
+
+        /// <summary>Release a held mouse button at (x,y).</summary>
+        public static void MouseButtonUp(int x, int y, MouseButton button)
+        {
+            var (_, up) = ButtonFlags(button);
+            Send(MouseAbs(x, y, MOUSEEVENTF_MOVE));
+            Send(MouseAbs(x, y, up));
+        }
+
+        public static void Drag(int fromX, int fromY, int toX, int toY, MouseButton button = MouseButton.Left)
+        {
+            var (down, up) = ButtonFlags(button);
             Send(MouseAbs(fromX, fromY, MOUSEEVENTF_MOVE));
-            Send(MouseAbs(fromX, fromY, MOUSEEVENTF_LEFTDOWN));
-            // a couple of interpolated moves so apps treat it as a real drag, not a teleport
-            for (int i = 1; i <= 4; i++)
+            Send(MouseAbs(fromX, fromY, down));
+            // interpolated moves so apps treat it as a real drag, not a teleport
+            for (int i = 1; i <= 6; i++)
             {
-                int ix = fromX + (toX - fromX) * i / 4;
-                int iy = fromY + (toY - fromY) * i / 4;
+                int ix = fromX + (toX - fromX) * i / 6;
+                int iy = fromY + (toY - fromY) * i / 6;
                 Send(MouseAbs(ix, iy, MOUSEEVENTF_MOVE));
             }
-            Send(MouseAbs(toX, toY, MOUSEEVENTF_LEFTUP));
+            Send(MouseAbs(toX, toY, up));
+        }
+
+        /// <summary>Press (and HOLD) a key/modifier by name without releasing — pair with KeyUp. False if unknown.</summary>
+        public static bool KeyDown(string name)
+        {
+            if (!TryMapKey(name, out var vk)) return false;
+            Send(new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk } } });
+            return true;
+        }
+
+        /// <summary>Release a held key/modifier by name. False if unknown.</summary>
+        public static bool KeyUp(string name)
+        {
+            if (!TryMapKey(name, out var vk)) return false;
+            Send(new INPUT { type = INPUT_KEYBOARD, U = new InputUnion { ki = new KEYBDINPUT { wVk = vk, dwFlags = KEYEVENTF_KEYUP } } });
+            return true;
         }
 
         // Scroll the content under (x,y). dy/dx are in wheel "notches": +dy scrolls UP, -dy scrolls DOWN

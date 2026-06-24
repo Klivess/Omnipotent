@@ -37,6 +37,14 @@ namespace Omnipotent.Services.HostControl
         // Input is a process-global, exclusive resource: only one mutating OS-input action at a time.
         private readonly SemaphoreSlim inputLock = new(1, 1);
 
+        // Held (pressed-and-not-released) mouse buttons / keys, so a press-and-hold can span multiple tool
+        // calls (e.g. mouse_down → move → mouse_up, or hold Shift across clicks). A safety watchdog releases
+        // anything left held after the run goes idle, so nothing ever stays physically stuck.
+        private readonly object holdLock = new();
+        private readonly HashSet<Omnipotent.Threading.MouseButton> heldButtons = new();
+        private readonly HashSet<string> heldKeys = new(StringComparer.OrdinalIgnoreCase);
+        private DateTime lastHoldUtc = DateTime.MinValue;
+
         // Coordinate frame of the most recent screenshot shown to the model, so its image-space click
         // coordinates map back to physical screen pixels.
         private readonly object frameLock = new();
@@ -63,6 +71,7 @@ namespace Omnipotent.Services.HostControl
                 substituter = new SecretSubstituter(secrets);
                 approvals = new ApprovalBroker(this);
                 osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
+                _ = Task.Run(HeldInputSafetyLoopAsync);
                 await RegisterScreenStreamRouteAsync();
                 await ServiceLog($"[HostControl] Ready. OS-level control {(osControlEnabled ? "ENABLED" : "disabled via KliveAgent_OsControlEnabled")}. Interactive session: {Environment.UserInteractive}, server: {OmniPaths.CheckIfOnServer()}.");
             }
@@ -199,6 +208,8 @@ namespace Omnipotent.Services.HostControl
                     return ComputerToolResult.Fail("Computer-use is disabled (set KliveAgent_ComputerUseEnabled).");
                 // Refresh the OS-control switch each action so toggling the setting takes effect immediately.
                 osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
+                // Any tool call while inputs are held = the drag/hold is still in progress → keep it alive.
+                lock (holdLock) { if (heldButtons.Count > 0 || heldKeys.Count > 0) lastHoldUtc = DateTime.UtcNow; }
                 return await RunAsync(toolName, args, ct, onProgress);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -249,19 +260,46 @@ namespace Omnipotent.Services.HostControl
                     }, label: $"move ({IntOr(a, "x", 0)},{IntOr(a, "y", 0)})", tx: IntOr(a, "x", 0), ty: IntOr(a, "y", 0));
 
                 case "computer_click":
+                {
+                    var mods = NormalizeModifiers(Strs(a, "modifiers"));
                     return await MutatingAsync(ct, onProgress, "click", () =>
                     {
                         var (px, py) = MapToPhysical(IntOr(a, "x", 0), IntOr(a, "y", 0));
-                        NativeInput.Click(px, py, ParseButton(Str(a, "button")), Math.Max(1, IntOr(a, "clicks", 1)));
-                    }, label: $"click ({IntOr(a, "x", 0)},{IntOr(a, "y", 0)})", tx: IntOr(a, "x", 0), ty: IntOr(a, "y", 0));
+                        WithModifiers(mods, () => NativeInput.Click(px, py, ParseButton(Str(a, "button")), Math.Max(1, IntOr(a, "clicks", 1))));
+                    }, label: $"{ModLabel(mods)}click ({IntOr(a, "x", 0)},{IntOr(a, "y", 0)})", tx: IntOr(a, "x", 0), ty: IntOr(a, "y", 0));
+                }
 
                 case "computer_drag":
+                {
+                    var mods = NormalizeModifiers(Strs(a, "modifiers"));
+                    var btn = ParseButton(Str(a, "button"));
                     return await MutatingAsync(ct, onProgress, "drag", () =>
                     {
                         var (fx, fy) = MapToPhysical(IntOr(a, "fromX", 0), IntOr(a, "fromY", 0));
                         var (tx2, ty2) = MapToPhysical(IntOr(a, "toX", 0), IntOr(a, "toY", 0));
-                        NativeInput.Drag(fx, fy, tx2, ty2);
-                    }, label: "drag", tx: IntOr(a, "toX", 0), ty: IntOr(a, "toY", 0));
+                        WithModifiers(mods, () => NativeInput.Drag(fx, fy, tx2, ty2, btn));
+                    }, label: $"{ModLabel(mods)}drag", tx: IntOr(a, "toX", 0), ty: IntOr(a, "toY", 0));
+                }
+
+                case "computer_mouse_down":
+                    return await HoldMouseAsync(a, ct, onProgress, down: true);
+
+                case "computer_mouse_up":
+                    return await HoldMouseAsync(a, ct, onProgress, down: false);
+
+                case "computer_key_down":
+                    return await HoldKeyAsync(a, ct, onProgress, down: true);
+
+                case "computer_key_up":
+                    return await HoldKeyAsync(a, ct, onProgress, down: false);
+
+                case "computer_release_all":
+                {
+                    await ReleaseHeldInputsAsync(auto: false);
+                    var r = CaptureFrameResult("active", "release all");
+                    r.Text = "Released all held mouse buttons and keys. " + r.Text;
+                    return r;
+                }
 
                 case "computer_scroll":
                 {
@@ -747,6 +785,107 @@ namespace Omnipotent.Services.HostControl
         {
             var raw = await GetStringOmniSetting(settingName, defaultValue: "") ?? "";
             return raw.Split(new[] { ',', '\n', ';' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        }
+
+        // ── Held inputs (press-and-hold) + modifier combos ──
+        private static string[] NormalizeModifiers(string[]? mods) =>
+            mods == null ? Array.Empty<string>() : mods.Where(m => !string.IsNullOrWhiteSpace(m)).ToArray();
+
+        private static string ModLabel(string[] mods) => mods.Length == 0 ? "" : string.Join("+", mods) + "+";
+
+        /// <summary>Hold the given modifier keys for the duration of the action, then release (reverse order).</summary>
+        private static void WithModifiers(string[] mods, Action action)
+        {
+            foreach (var m in mods) NativeInput.KeyDown(m);
+            try { action(); }
+            finally { for (int i = mods.Length - 1; i >= 0; i--) NativeInput.KeyUp(mods[i]); }
+        }
+
+        private async Task<ComputerToolResult> HoldMouseAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress, bool down)
+        {
+            var guard = OsGuard();
+            if (guard != null) return guard;
+            var button = ParseButton(Str(a, "button"));
+            bool hasXY = a.TryGetProperty("x", out _) && a.TryGetProperty("y", out _);
+            int x = IntOr(a, "x", 0), y = IntOr(a, "y", 0);
+
+            await inputLock.WaitAsync(ct);
+            try
+            {
+                var (px, py) = hasXY ? MapToPhysical(x, y) : NativeInput.GetCursorPosition();
+                if (down) NativeInput.MouseButtonDown(px, py, button); else NativeInput.MouseButtonUp(px, py, button);
+                await Task.Delay(120, ct);
+            }
+            finally { inputLock.Release(); }
+
+            lock (holdLock) { if (down) heldButtons.Add(button); else heldButtons.Remove(button); lastHoldUtc = DateTime.UtcNow; }
+            var label = $"{button.ToString().ToLowerInvariant()} button {(down ? "down" : "up")}";
+            onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
+            var result = CaptureFrameResult("active", label, hasXY ? x : (int?)null, hasXY ? y : (int?)null);
+            result.Text = (down ? $"Pressed and HOLDING the {button.ToString().ToLowerInvariant()} button — move (computer_move) then computer_mouse_up to release. " : $"Released the {button.ToString().ToLowerInvariant()} button. ") + result.Text;
+            return result;
+        }
+
+        private async Task<ComputerToolResult> HoldKeyAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress, bool down)
+        {
+            var guard = OsGuard();
+            if (guard != null) return guard;
+            var key = Str(a, "key");
+            if (string.IsNullOrWhiteSpace(key)) return ComputerToolResult.Fail("Provide 'key'.");
+
+            bool ok;
+            await inputLock.WaitAsync(ct);
+            try { ok = down ? NativeInput.KeyDown(key) : NativeInput.KeyUp(key); await Task.Delay(80, ct); }
+            finally { inputLock.Release(); }
+            if (!ok) return ComputerToolResult.Fail($"Unrecognized key '{key}'.");
+
+            lock (holdLock) { if (down) heldKeys.Add(key); else heldKeys.Remove(key); lastHoldUtc = DateTime.UtcNow; }
+            var label = $"key {key} {(down ? "down" : "up")}";
+            onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
+            var result = CaptureFrameResult("active", label);
+            result.Text = (down ? $"Holding '{key}' down — do actions then computer_key_up to release. " : $"Released '{key}'. ") + result.Text;
+            return result;
+        }
+
+        /// <summary>Release every held mouse button and key. Used by computer_release_all and by the safety
+        /// watchdog when a run leaves something held after going idle, so nothing ever stays physically stuck.</summary>
+        public async Task ReleaseHeldInputsAsync(bool auto)
+        {
+            List<Omnipotent.Threading.MouseButton> btns;
+            List<string> keys;
+            lock (holdLock)
+            {
+                btns = heldButtons.ToList();
+                keys = heldKeys.ToList();
+                heldButtons.Clear();
+                heldKeys.Clear();
+            }
+            if (btns.Count == 0 && keys.Count == 0) return;
+            var (cx, cy) = NativeInput.GetCursorPosition();
+            await inputLock.WaitAsync();
+            try
+            {
+                foreach (var b in btns) NativeInput.MouseButtonUp(cx, cy, b);
+                foreach (var k in keys) NativeInput.KeyUp(k);
+            }
+            finally { inputLock.Release(); }
+            if (auto) await ServiceLog($"[HostControl] Safety-released held inputs (buttons: {btns.Count}, keys: {keys.Count}).");
+        }
+
+        private async Task HeldInputSafetyLoopAsync()
+        {
+            while (true)
+            {
+                try
+                {
+                    await Task.Delay(2000);
+                    int safetyMs = Math.Max(3000, await GetIntOmniSetting("KliveAgent_HeldInputSafetyMs", 12000));
+                    bool stale;
+                    lock (holdLock) stale = (heldButtons.Count > 0 || heldKeys.Count > 0) && (DateTime.UtcNow - lastHoldUtc).TotalMilliseconds > safetyMs;
+                    if (stale) await ReleaseHeldInputsAsync(auto: true);
+                }
+                catch { }
+            }
         }
 
         private static Omnipotent.Threading.MouseButton ParseButton(string? b) => (b ?? "left").ToLowerInvariant() switch

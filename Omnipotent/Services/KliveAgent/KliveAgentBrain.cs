@@ -251,6 +251,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- MEASURE, THEN CLICK: every screenshot is overlaid with a labeled coordinate-ruler grid (lines + numbers every 100px, origin 0,0 top-left). To click something, READ the gridlines around it to measure the x,y of its CENTRE, then computer_click(x,y) (or computer_move). Interpolate between gridlines for precision. This works for ANY element — buttons, icons, images, blank areas — and for repeated/identical elements (you pick the specific one by position).");
                 sb.AppendLine("- LOOK, THEN ACT: every action returns a fresh gridded screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and re-measure; never repeat a failed action unchanged. If a click misses, re-read the grid and adjust the coordinates.");
                 sb.AppendLine("- CAN'T SEE IT? SCROLL. If the element/answer you need isn't on screen, computer_scroll({direction:\"down\"}) (or up/left/right) and screenshot again — keep scrolling to explore long pages. Hover the cursor over the pane you want to scroll by passing its x,y.");
+                sb.AppendLine("- FULL MOUSE+KEYBOARD: you have everything a human at the keyboard/mouse does — left/right/middle click, double/triple-click (clicks:2/3), modifier-clicks (computer_click modifiers:[\"ctrl\"|\"shift\"|\"alt\"]), hover (computer_move), drag-and-drop (computer_drag), press-and-HOLD (computer_mouse_down/up, computer_key_down/up — e.g. hold Shift across clicks to range-select, or drag a slider), type text, key chords (computer_key), and scroll. Always pair a *_down with its *_up.");
                 sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
                 sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
                 sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
@@ -423,6 +424,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             "computer_screenshot", "computer_window_state", "computer_read_screen", "computer_move",
             "computer_click", "computer_drag", "computer_scroll", "computer_type", "computer_key",
+            "computer_mouse_down", "computer_mouse_up", "computer_key_down", "computer_key_up", "computer_release_all",
             "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser", "computer_navigate",
             "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action", "computer_confirm_and_click",
             "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
@@ -558,9 +560,16 @@ namespace Omnipotent.Services.KliveAgent
             tools.Add(Tool("computer_read_screen", "List the visible windows (titles/sizes). For page/app CONTENT, call computer_screenshot and read it visually.", Obj(new { })));
             tools.Add(Tool("computer_move", "Move the mouse to (x,y) in the last screenshot's pixel space (read the coordinate-ruler grid to measure).", Obj(new { x = intType, y = intType }, "x", "y")));
             tools.Add(Tool("computer_click",
-                "Left/right/middle click at (x,y) in the last screenshot's pixel space. The screenshot has a labeled coordinate-ruler grid — read the gridlines to measure the exact x,y of the element's center. Reversible navigation only — for any irreversible/pay/submit/send button use computer_confirm_and_click instead.",
-                Obj(new { x = intType, y = intType, button = strType, clicks = intType }, "x", "y")));
-            tools.Add(Tool("computer_drag", "Press at (fromX,fromY), drag to (toX,toY), release.", Obj(new { fromX = intType, fromY = intType, toX = intType, toY = intType }, "fromX", "fromY", "toX", "toY")));
+                "Click at (x,y) — measure from the screenshot's coordinate-ruler grid. button:\"left\"(default)/\"right\"/\"middle\"; clicks:2 = double-click, 3 = triple. modifiers:[\"ctrl\"|\"shift\"|\"alt\"|\"win\"] are HELD during the click (ctrl-click, shift-click range-select, etc.). Reversible only — for irreversible/pay/submit/send buttons use computer_confirm_and_click.",
+                Obj(new { x = intType, y = intType, button = strType, clicks = intType, modifiers = new { type = "array", items = strType } }, "x", "y")));
+            tools.Add(Tool("computer_drag",
+                "Press at (fromX,fromY), drag to (toX,toY), release. button:left(default)/right/middle; modifiers held during the drag. For drag-and-drop, selecting, sliders, reordering.",
+                Obj(new { fromX = intType, fromY = intType, toX = intType, toY = intType, button = strType, modifiers = new { type = "array", items = strType } }, "fromX", "fromY", "toX", "toY")));
+            tools.Add(Tool("computer_mouse_down", "Press and HOLD a mouse button (without releasing) at (x,y), or at the current cursor if omitted. Pair with computer_mouse_up. For manual drags, hold-to-select, drawing.", Obj(new { x = intType, y = intType, button = strType })));
+            tools.Add(Tool("computer_mouse_up", "Release a held mouse button at (x,y), or at the current cursor if omitted.", Obj(new { x = intType, y = intType, button = strType })));
+            tools.Add(Tool("computer_key_down", "Press and HOLD a key/modifier (e.g. \"shift\", \"ctrl\", \"a\") without releasing. Pair with computer_key_up. For hold-to-repeat or holding a modifier across several actions.", Obj(new { key = strType }, "key")));
+            tools.Add(Tool("computer_key_up", "Release a held key/modifier.", Obj(new { key = strType }, "key")));
+            tools.Add(Tool("computer_release_all", "Release ALL currently-held mouse buttons and keys. Use to recover if a hold got stuck.", Obj(new { })));
             tools.Add(Tool("computer_scroll",
                 "Scroll the page/content. {direction:\"down\"|\"up\"|\"left\"|\"right\", amount:N} where N = wheel notches (default 5). Defaults to DOWN. Pass x,y (in the gridded screenshot's pixel space) to scroll a specific pane; else it scrolls the screen centre. Scroll, then computer_screenshot to see the new content.",
                 Obj(new { direction = strType, amount = intType, x = intType, y = intType, dy = intType, dx = intType })));
