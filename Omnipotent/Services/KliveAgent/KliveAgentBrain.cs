@@ -769,9 +769,10 @@ namespace Omnipotent.Services.KliveAgent
                 // Fire-and-forget: it must never block or fail the run.
                 _ = llm.WarmUpConnectionAsync(cancellationToken);
 
-                // Computer-use ("host control") tools are opt-in (default off) and only available on the
-                // structured tool-calling path (they require vision + a tool channel).
-                bool computerUseEnabled = useToolCalling && await agentService.GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: false);
+                // Computer-use ("host control") tools are ON by default (set KliveAgent_ComputerUseEnabled=false
+                // to disable) and only available on the structured tool-calling path (they require vision + a
+                // tool channel). Irreversible actions still route through the human approval gate.
+                bool computerUseEnabled = useToolCalling && await agentService.GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: true);
 
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;

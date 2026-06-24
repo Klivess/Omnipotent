@@ -148,7 +148,7 @@ namespace Omnipotent.Services.HostControl
             return r.Text;
         }
 
-        public async Task<bool> ComputerUseEnabledAsync() => await GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: false);
+        public async Task<bool> ComputerUseEnabledAsync() => await GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: true);
         private async Task<bool> DryRunAsync() => await GetBoolOmniSetting("KliveAgent_ComputerUseDryRun", defaultValue: false);
 
         // ── Encrypted memory (vault) API surface ──
