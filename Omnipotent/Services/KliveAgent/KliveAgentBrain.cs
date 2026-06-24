@@ -245,14 +245,15 @@ namespace Omnipotent.Services.KliveAgent
             if (computerUseEnabled)
             {
                 sb.AppendLine("[Computer Control]");
-                sb.AppendLine("You can SEE and physically CONTROL this Windows machine — mouse, keyboard, and screen — exactly like a human sitting at it. This is a CORE capability, not a fallback: when a task needs the GUI or the web, USE IT.");
-                sb.AppendLine("- THESE ARE DIRECT TOOLS. Call computer_screenshot / computer_click / computer_type / computer_key / computer_scroll / computer_open_browser etc. as native tool calls — the SAME way you call grep or read_file. NEVER write them inside execute_csharp, and NEVER pass their JSON arguments to execute_csharp. execute_csharp is only for C# against Omnipotent services; computer_* tools drive the desktop.");
-                sb.AppendLine("- LOOK, THEN ACT: call computer_screenshot first; give click/move/scroll coordinates in THAT image's pixel space. Every action returns a fresh screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and rethink; never click blind or repeat a failed action unchanged.");
-                sb.AppendLine("- THE WEB = THE REAL BROWSER. To use a website, call computer_open_browser (opens/focuses the user's actual browser, maximized). Then navigate like a person: click the address bar (or computer_key {keys:[\"ctrl\",\"l\"]}), computer_type the URL, computer_key {key:\"enter\"}; click links and buttons by their on-screen position. There is NO scripted browser/Selenium API and you do NOT need a URL handed to you — decide where to go and drive there yourself.");
+                sb.AppendLine("You can SEE and physically CONTROL this Windows machine — mouse, keyboard, and screen — exactly like a human sitting at it. This is a CORE capability that is ON. When a task needs the GUI or the web, USE IT — do NOT claim you lack a screen, do NOT say it's disabled, and NEVER offer to scrape a site over HTTP instead. Just do it on the real screen.");
+                sb.AppendLine("- THESE ARE DIRECT TOOLS. Call computer_navigate / computer_screenshot / computer_click_text / computer_click / computer_type etc. as native tool calls — the SAME way you call grep or read_file. NEVER write them inside execute_csharp, and NEVER pass their JSON arguments to execute_csharp. execute_csharp is only for C# against Omnipotent services; computer_* tools drive the desktop.");
+                sb.AppendLine("- THE WEB IN ONE STEP: to go to a page, call computer_navigate({url:\"...\"}) — it opens/focuses the real browser, types the URL, and waits for load. You decide the URL; none is handed to you. There is NO Selenium/scripted-browser API — you drive the actual browser.");
+                sb.AppendLine("- MEASURE, THEN CLICK: every screenshot is overlaid with a labeled coordinate-ruler grid (lines + numbers every 100px, origin 0,0 top-left). To click something, READ the gridlines around it to measure the x,y of its CENTRE, then computer_click(x,y) (or computer_move). Interpolate between gridlines for precision. This works for ANY element — buttons, icons, images, blank areas — and for repeated/identical elements (you pick the specific one by position).");
+                sb.AppendLine("- LOOK, THEN ACT: every action returns a fresh gridded screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and re-measure; never repeat a failed action unchanged. If a click misses, re-read the grid and adjust the coordinates.");
                 sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
-                sb.AppendLine("- REVERSIBLE actions (scroll, hover, read, open a page, type into a field, navigate) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click (a gated click) or computer_confirm_action (gate then act) — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
+                sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
                 sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
-                sb.AppendLine("- WAITING is not hanging: for slow page loads/checkouts use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");
+                sb.AppendLine("- WAITING is not hanging: computer_navigate already waits for load; for other slow steps use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");
                 sb.AppendLine();
             }
 
@@ -421,7 +422,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             "computer_screenshot", "computer_window_state", "computer_read_screen", "computer_move",
             "computer_click", "computer_drag", "computer_scroll", "computer_type", "computer_key",
-            "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser",
+            "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser", "computer_navigate",
             "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action", "computer_confirm_and_click",
             "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
         };
@@ -553,10 +554,10 @@ namespace Omnipotent.Services.KliveAgent
                 "Capture the screen as an image you can SEE (fed to your vision). Returns the pixel size; coordinates you give to computer_click/move/etc. are in THIS image's pixel space. ALWAYS screenshot before clicking blind.",
                 Obj(new { target = new { type = "string", description = "\"active\" (active window, default), \"fullscreen\", or \"browser\" (the controlled Chrome viewport)." } })));
             tools.Add(Tool("computer_window_state", "Report the active window (title/pos/size), the virtual-screen size, and whether OS-level control is available.", Obj(new { })));
-            tools.Add(Tool("computer_read_screen", "Read structured on-screen text: the browser DOM text+URL when a page is open, otherwise the list of visible windows. Complements the screenshot.", Obj(new { })));
-            tools.Add(Tool("computer_move", "Move the mouse to (x,y) in the last screenshot's pixel space.", Obj(new { x = intType, y = intType }, "x", "y")));
+            tools.Add(Tool("computer_read_screen", "List the visible windows (titles/sizes). For page/app CONTENT, call computer_screenshot and read it visually.", Obj(new { })));
+            tools.Add(Tool("computer_move", "Move the mouse to (x,y) in the last screenshot's pixel space (read the coordinate-ruler grid to measure).", Obj(new { x = intType, y = intType }, "x", "y")));
             tools.Add(Tool("computer_click",
-                "Left/right/middle click at (x,y) in the last screenshot's pixel space. Reversible navigation only — for any irreversible/pay/submit/send button use computer_confirm_and_click instead.",
+                "Left/right/middle click at (x,y) in the last screenshot's pixel space. The screenshot has a labeled coordinate-ruler grid — read the gridlines to measure the exact x,y of the element's center. Reversible navigation only — for any irreversible/pay/submit/send button use computer_confirm_and_click instead.",
                 Obj(new { x = intType, y = intType, button = strType, clicks = intType }, "x", "y")));
             tools.Add(Tool("computer_drag", "Press at (fromX,fromY), drag to (toX,toY), release.", Obj(new { fromX = intType, fromY = intType, toX = intType, toY = intType }, "fromX", "fromY", "toX", "toY")));
             tools.Add(Tool("computer_scroll", "Scroll by dy (and optional dx) wheel notches, at optional (x,y) else screen center. Negative dy scrolls down.", Obj(new { dy = intType, dx = intType, x = intType, y = intType }, "dy")));
@@ -570,8 +571,11 @@ namespace Omnipotent.Services.KliveAgent
             tools.Add(Tool("computer_clipboard_get", "Read the Windows clipboard text.", Obj(new { })));
             tools.Add(Tool("computer_clipboard_set", "Set the Windows clipboard text.", Obj(new { text = strType }, "text")));
             tools.Add(Tool("computer_open_browser",
-                "Open or focus the user's REAL system browser (maximized) so you can drive it like a human. Then NAVIGATE by clicking the address bar (or computer_key {keys:[\"ctrl\",\"l\"]}), computer_type the URL, and computer_key {key:\"enter\"} — click links/buttons by their on-screen position. No URL is required to start. Returns a screenshot.",
+                "Open or focus the user's REAL system browser (maximized) so you can drive it like a human. No URL required. To actually go to a page, prefer computer_navigate. Returns a screenshot.",
                 Obj(new { url = strType })));
+            tools.Add(Tool("computer_navigate",
+                "Go to a web page in ONE reliable step: focuses/opens the real browser, focuses the address bar, types the URL, presses Enter, and waits for the page to load. e.g. {url:\"openpsychometrics.org/tests/FSIQ/\"}. Use this instead of manually clicking the address bar.",
+                Obj(new { url = strType }, "url")));
             tools.Add(Tool("computer_confirm_action",
                 "GATE an irreversible non-click action (e.g. pressing Enter to submit/pay/send). Blocks until Klive approves on the website or Discord. On APPROVED, do the action next; on DENIED, stop and report.",
                 Obj(new { summary = strType }, "summary")));

@@ -114,6 +114,64 @@ namespace Omnipotent.Services.HostControl
             }
         }
 
+        /// <summary>
+        /// Overlay a semi-transparent coordinate "measuring ruler" grid (labeled in the image's own pixel
+        /// space) so the vision model can read off exact x,y to click. Lines every <paramref name="step"/> px;
+        /// brighter lines + edge labels every 5 steps. The labels match the coordinates computer_click expects.
+        /// </summary>
+        public byte[] WithGrid(byte[] jpeg, int step = 100)
+        {
+            try
+            {
+                using var src = (Bitmap)Image.FromStream(new MemoryStream(jpeg));
+                using var bmp = new Bitmap(src);
+                int w = bmp.Width, h = bmp.Height;
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.None;
+                    using var minor = new Pen(Color.FromArgb(45, 0, 210, 255), 1);
+                    using var major = new Pen(Color.FromArgb(105, 0, 225, 255), 1);
+                    using var font = new Font("Consolas", 8.5f, FontStyle.Bold);
+                    using var labelBg = new SolidBrush(Color.FromArgb(165, 0, 0, 0));
+                    using var labelFg = new SolidBrush(Color.FromArgb(255, 130, 235, 255));
+                    int major5 = step * 5;
+
+                    for (int x = step; x < w; x += step)
+                    {
+                        bool maj = x % major5 == 0;
+                        g.DrawLine(maj ? major : minor, x, 0, x, h);
+                        if (maj || step >= 100)
+                        {
+                            var s = x.ToString();
+                            var sz = g.MeasureString(s, font);
+                            g.FillRectangle(labelBg, x + 1, 0, sz.Width, sz.Height);
+                            g.DrawString(s, font, labelFg, x + 1, 0);
+                        }
+                    }
+                    for (int y = step; y < h; y += step)
+                    {
+                        bool maj = y % major5 == 0;
+                        g.DrawLine(maj ? major : minor, 0, y, w, y);
+                        if (maj || step >= 100)
+                        {
+                            var s = y.ToString();
+                            var sz = g.MeasureString(s, font);
+                            g.FillRectangle(labelBg, 0, y + 1, sz.Width, sz.Height);
+                            g.DrawString(s, font, labelFg, 0, y + 1);
+                        }
+                    }
+                    // Corner hint so the model knows the origin + the image's pixel extents.
+                    var dim = $"{w}x{h}px  (0,0 top-left)";
+                    using var hintFont = new Font("Consolas", 9, FontStyle.Bold);
+                    var dsz = g.MeasureString(dim, hintFont);
+                    g.FillRectangle(labelBg, w - dsz.Width - 4, h - dsz.Height - 3, dsz.Width + 4, dsz.Height + 2);
+                    g.DrawString(dim, hintFont, labelFg, w - dsz.Width - 2, h - dsz.Height - 2);
+                }
+                return EncodeJpeg(bmp, 80);
+            }
+            catch { return jpeg; } // grid is best-effort; never fail an action over it
+        }
+
         public static byte[] EncodeJpeg(Bitmap bmp, long quality)
         {
             var encoder = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == ImageFormat.Jpeg.Guid);

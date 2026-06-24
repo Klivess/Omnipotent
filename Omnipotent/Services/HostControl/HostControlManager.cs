@@ -1,9 +1,13 @@
+using System.Collections.Specialized;
 using System.Diagnostics;
+using System.Net;
+using System.Net.WebSockets;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.Notifications;
@@ -59,6 +63,7 @@ namespace Omnipotent.Services.HostControl
                 substituter = new SecretSubstituter(secrets);
                 approvals = new ApprovalBroker(this);
                 osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
+                await RegisterScreenStreamRouteAsync();
                 await ServiceLog($"[HostControl] Ready. OS-level control {(osControlEnabled ? "ENABLED" : "disabled via KliveAgent_OsControlEnabled")}. Interactive session: {Environment.UserInteractive}, server: {OmniPaths.CheckIfOnServer()}.");
             }
             catch (Exception ex)
@@ -105,6 +110,71 @@ namespace Omnipotent.Services.HostControl
         {
             try { await ExecuteServiceMethod<NotificationsService>("CancelTrackedTextPrompt", approvalId, "Resolved on the website."); }
             catch { }
+        }
+
+        // ── Live screen video stream (continuous, independent of the agent's discrete actions) ──
+        // A KliveAPI WebSocket route that, per connected viewer, captures the whole desktop at a configurable
+        // frame rate and pushes raw JPEG frames. The website's LiveScreen renders these as a live video. The
+        // capture loop is read-only (no input lock), so the video keeps flowing while the agent acts.
+        private async Task RegisterScreenStreamRouteAsync()
+        {
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+                    "/kliveagent/screen/stream",
+                    (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
+                    {
+                        // Browsers can't set an Authorization header on a WebSocket, so this is registered as
+                        // Anybody and authorized here from the ?authorization= query param (Klives only).
+                        var resolved = user;
+                        if (resolved == null)
+                        {
+                            var pw = queryParams["authorization"];
+                            if (!string.IsNullOrEmpty(pw))
+                                resolved = await ExecuteServiceMethod<KMProfileManager>("GetProfileByPassword", pw) as KMProfileManager.KMProfile;
+                        }
+                        if (resolved == null || resolved.KlivesManagementRank < KMProfileManager.KMPermissions.Klives)
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        await StreamScreenAsync(socket);
+                    }),
+                    KMProfileManager.KMPermissions.Anybody);
+                await ServiceLog("[HostControl] Screen-stream WebSocket route registered (/kliveagent/screen/stream).");
+            }
+            catch (Exception ex) { await ServiceLogError(ex, "[HostControl] Failed to register screen-stream route (non-fatal)."); }
+        }
+
+        private async Task StreamScreenAsync(WebSocket socket)
+        {
+            if (!await ComputerUseEnabledAsync())
+            {
+                try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "computer-use disabled", CancellationToken.None); } catch { }
+                return;
+            }
+
+            int fps = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamFps", 6), 1, 30);
+            int width = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamWidth", 1366), 320, 3840);
+            int quality = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamQuality", 45), 10, 92);
+            int delayMs = Math.Max(25, 1000 / fps);
+
+            try
+            {
+                while (socket.State == WebSocketState.Open)
+                {
+                    byte[] jpeg;
+                    try { jpeg = capturer.CaptureVirtualScreen(width, quality).Jpeg; }
+                    catch { await Task.Delay(delayMs); continue; }
+                    await socket.SendAsync(new ArraySegment<byte>(jpeg), WebSocketMessageType.Binary, true, CancellationToken.None);
+                    await Task.Delay(delayMs);
+                }
+            }
+            catch { /* viewer disconnected or send failed → end the loop */ }
+            finally
+            {
+                try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+            }
         }
 
         // ── Public entry points ──
@@ -228,6 +298,9 @@ namespace Omnipotent.Services.HostControl
                 case "computer_open_browser":
                     return await OpenBrowserAsync(a);
 
+                case "computer_navigate":
+                    return await NavigateAsync(a, ct, onProgress);
+
                 case "computer_confirm_action":
                     return await ConfirmActionAsync(a, ct, onProgress);
 
@@ -275,12 +348,15 @@ namespace Omnipotent.Services.HostControl
                 lastFrameJpeg = cap.Jpeg;
             }
 
+            // The model image carries a labeled coordinate-ruler grid so the model can MEASURE the exact
+            // pixel to click. The website fallback frame keeps the cleaner action annotation.
+            var modelImage = capturer.WithGrid(cap.Jpeg);
             var annotated = capturer.Annotate(cap.Jpeg, label, tx, ty);
             return new ComputerToolResult
             {
                 Success = true,
-                Text = $"Captured {cap.Description} ({cap.ShownWidth}x{cap.ShownHeight} px shown). Coordinates you return are in this image's pixel space.",
-                ModelImageJpeg = cap.Jpeg,
+                Text = $"Captured {cap.Description} ({cap.ShownWidth}x{cap.ShownHeight} px shown). The image has a coordinate-ruler grid — read the gridlines to measure the exact x,y you pass to computer_click/move. (0,0 = top-left.)",
+                ModelImageJpeg = modelImage,
                 AnnotatedJpeg = annotated
             };
         }
@@ -301,12 +377,11 @@ namespace Omnipotent.Services.HostControl
         {
             var sb = new StringBuilder();
             var fg = NativeInput.GetForegroundWindowInfo();
-            if (fg != null)
-                sb.AppendLine($"Active window: \"{fg.Value.Title}\" {fg.Value.Width}x{fg.Value.Height}.");
+            if (fg != null) sb.AppendLine($"Active window: \"{fg.Value.Title}\" {fg.Value.Width}x{fg.Value.Height}.");
             sb.AppendLine("Visible windows:");
             foreach (var w in NativeInput.EnumerateVisibleWindows().Take(25))
                 sb.AppendLine($"  \"{w.Title}\" (pid {w.ProcessId}) {w.Width}x{w.Height}");
-            sb.AppendLine("\n(To read page/app content, call computer_screenshot — you read it visually.)");
+            sb.AppendLine("\n(To read page/app content, call computer_screenshot — the image has a pixel grid you read visually.)");
             return Task.FromResult(ComputerToolResult.Ok(sb.ToString().TrimEnd()));
         }
 
@@ -447,38 +522,91 @@ namespace Omnipotent.Services.HostControl
         {
             var guard = OsGuard();
             if (guard != null) return guard;
+            await EnsureBrowserFocusedAsync(Str(a, "url"));
+            await Task.Delay(300);
+            var r = CaptureFrameResult("active", "browser");
+            r.Text = "Browser is focused and maximized. To go to a page, use computer_navigate(url) — one step, no fiddling with the address bar. " + r.Text;
+            return r;
+        }
 
-            // Prefer an already-open browser window.
+        /// <summary>Bring the user's real browser to the front (maximized), launching the default browser to
+        /// <paramref name="landingUrl"/> if none is open. Shared by computer_open_browser and computer_navigate.</summary>
+        private async Task EnsureBrowserFocusedAsync(string? landingUrl)
+        {
             string[] browserProcs = { "chrome", "msedge", "firefox", "brave", "opera", "vivaldi" };
             var open = NativeInput.EnumerateVisibleWindows()
-                .FirstOrDefault(w => browserProcs.Any(p =>
-                    string.Equals(SafeProcName(w.ProcessId), p, StringComparison.OrdinalIgnoreCase)));
+                .FirstOrDefault(w => browserProcs.Any(p => string.Equals(SafeProcName(w.ProcessId), p, StringComparison.OrdinalIgnoreCase)));
 
             if (open.Handle != IntPtr.Zero)
             {
                 await inputLock.WaitAsync();
                 try { NativeInput.FocusWindow(open.Handle, maximize: true); await Task.Delay(400); }
                 finally { inputLock.Release(); }
-                var r = CaptureFrameResult("active", "browser focused");
-                r.Text = $"Focused + maximized the open browser \"{open.Title}\". To go somewhere, click the address bar (or press Ctrl+L), type the URL, press Enter. " + r.Text;
-                return r;
+                return;
             }
 
-            // None open → launch the default browser. UseShellExecute on a URL opens the user's default browser.
+            var landing = string.IsNullOrWhiteSpace(landingUrl) ? "https://www.google.com"
+                : (landingUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? landingUrl : "https://" + landingUrl);
             try
             {
-                var landing = Str(a, "url");
-                if (string.IsNullOrWhiteSpace(landing)) landing = "https://www.google.com";
-                else if (!landing.StartsWith("http", StringComparison.OrdinalIgnoreCase)) landing = "https://" + landing;
                 Process.Start(new ProcessStartInfo { FileName = landing, UseShellExecute = true });
-                await Task.Delay(2500); // give it a moment to appear
-                var fg2 = NativeInput.GetForegroundWindowInfo();
-                if (fg2 != null) { await inputLock.WaitAsync(); try { NativeInput.FocusWindow(fg2.Value.Handle, maximize: true); } finally { inputLock.Release(); } }
-                var r = CaptureFrameResult("active", "browser opened");
-                r.Text = "Opened the default browser. Drive it visually: click the address bar (or Ctrl+L), type a URL, press Enter; click links/buttons by their on-screen position. " + r.Text;
-                return r;
+                await Task.Delay(2800);
+                var fg = NativeInput.GetForegroundWindowInfo();
+                if (fg != null) { await inputLock.WaitAsync(); try { NativeInput.FocusWindow(fg.Value.Handle, maximize: true); } finally { inputLock.Release(); } }
             }
-            catch (Exception ex) { return ComputerToolResult.Fail($"Could not open a browser: {ex.Message}"); }
+            catch { /* best-effort */ }
+        }
+
+        /// <summary>Atomic, reliable browser navigation: focus/open the browser, focus the address bar (Ctrl+L),
+        /// type the URL, Enter, then wait for the page to settle. One step instead of a brittle click+type dance.</summary>
+        private async Task<ComputerToolResult> NavigateAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress)
+        {
+            var guard = OsGuard();
+            if (guard != null) return guard;
+            var url = Str(a, "url");
+            if (string.IsNullOrWhiteSpace(url)) return ComputerToolResult.Fail("Provide 'url'.");
+            if (!url.StartsWith("http", StringComparison.OrdinalIgnoreCase)) url = "https://" + url;
+
+            onProgress(new HostControlProgress { Note = $"navigate {url}", Activity = new AgentActivityEvent { Kind = "action", Text = $"navigate {Trim(url, 50)}" } });
+            await EnsureBrowserFocusedAsync(url);
+
+            await inputLock.WaitAsync(ct);
+            try
+            {
+                NativeInput.TryPressKeys(new[] { "ctrl", "l" }); // focus the address bar
+                await Task.Delay(250, ct);
+                NativeInput.TypeUnicode(url);
+                await Task.Delay(150, ct);
+                NativeInput.TryPressKeys(new[] { "enter" });
+            }
+            finally { inputLock.Release(); }
+
+            await SettleAsync(ct, onProgress, 9000);
+            var result = CaptureFrameResult("active", $"navigated {Trim(url, 40)}");
+            result.Text = $"Navigated the browser to {url}. " + result.Text;
+            return result;
+        }
+
+        /// <summary>Wait until the screen stops changing (page settled) or maxMs elapses, heartbeating so the
+        /// stall watchdog stays calm during a legitimate load. No hard timeout that could kill real work.</summary>
+        private async Task SettleAsync(CancellationToken ct, Action<HostControlProgress> onProgress, int maxMs)
+        {
+            var sw = Stopwatch.StartNew();
+            int lastHeartbeat = 0, stableMs = 0;
+            byte[]? prev = null;
+            while (sw.ElapsedMilliseconds < maxMs && stableMs < 900)
+            {
+                if (ct.IsCancellationRequested) break;
+                await Task.Delay(300, ct);
+                var cur = CaptureRawHashSource();
+                if (prev != null && cur != null && HashEqual(prev, cur)) stableMs += 300; else stableMs = 0;
+                prev = cur;
+                if (sw.ElapsedMilliseconds - lastHeartbeat >= 3000)
+                {
+                    lastHeartbeat = (int)sw.ElapsedMilliseconds;
+                    onProgress(new HostControlProgress { Note = $"loading… ({sw.ElapsedMilliseconds / 1000}s)", Activity = new AgentActivityEvent { Kind = "wait", Text = "loading page" } });
+                }
+            }
         }
 
         private static string SafeProcName(uint pid)
