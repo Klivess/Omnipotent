@@ -296,6 +296,10 @@ namespace Omnipotent.Services.KliveAgent
                             pendingResponse.PromptTokens = update.PromptTokens;
                             pendingResponse.CompletionTokens = update.CompletionTokens;
                             if (update.NewActivity != null) pendingResponse.Activity.Add(update.NewActivity);
+                            // Computer-use: stream the latest annotated frame (video) + any approval card.
+                            if (update.Frame != null) pendingResponse.LatestFrame = Convert.ToBase64String(update.Frame);
+                            if (update.Approval != null)
+                                pendingResponse.PendingApproval = update.Approval.Status == "pending" ? update.Approval : null;
                             pendingResponse.LastProgressAt = DateTime.UtcNow;
                         },
                         cancellationToken: runToken);
@@ -371,6 +375,17 @@ namespace Omnipotent.Services.KliveAgent
             if (pending.CompletedAt != null) return false;
             try { pending.CancellationSource?.Cancel(); } catch { }
             return true;
+        }
+
+        /// <summary>Resolve a pending computer-use approval (the website's Approve/Deny buttons). Forwards to
+        /// HostControlManager's ApprovalBroker, which unblocks the waiting action. Returns false if no such
+        /// approval is pending.</summary>
+        public async Task<bool> SubmitApprovalAsync(string approvalId, bool approved)
+        {
+            if (string.IsNullOrWhiteSpace(approvalId)) return false;
+            var hcms = await GetServicesByType<Omnipotent.Services.HostControl.HostControlManager>();
+            if (hcms == null || hcms.Length == 0) return false;
+            return ((Omnipotent.Services.HostControl.HostControlManager)hcms[0]).Approvals.SubmitDecision(approvalId, approved);
         }
 
         // ── Stall watchdog + pending-response eviction ──
