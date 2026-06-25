@@ -38,4 +38,28 @@ namespace Omnipotent.Services.HostControl
 
     /// <summary>How an action is classified for gating. Mirrors AgentCapabilityPermissionTier semantics.</summary>
     public enum HostActionTier { Safe, Moderate, Dangerous }
+
+    /// <summary>
+    /// One pending human-intervention handoff (request_human): the agent is blocked waiting for Klive to
+    /// take over the machine (solve a captcha / login / 2FA) via a token-scoped remote-desktop session.
+    /// The <see cref="Token"/> is a 256-bit random bearer capability that authorizes the screen stream +
+    /// input routes ONLY while this handoff is pending; it dies the moment <see cref="Completion"/> resolves.
+    /// Resolution races: the operator finishing (Done / idle-after-interaction), a Stop, or the max-minutes cap.
+    /// </summary>
+    public sealed class PendingHandoff
+    {
+        public string Token { get; init; } = string.Empty;
+        public string ApprovalId { get; init; } = string.Empty;
+        public string Reason { get; init; } = string.Empty;
+        public DateTime CreatedAtUtc { get; init; } = DateTime.UtcNow;
+
+        /// <summary>1 once the operator has sent at least one input event over the solve session (Interlocked).</summary>
+        public int Interacted;
+        /// <summary>UTC ticks of the operator's last input event, so an "idle after interacting" auto-resume can fire (Interlocked).</summary>
+        public long LastInputUtcTicks;
+
+        /// <summary>Completes with the outcome ("done" | "cancelled" | "timeout"). While not completed the handoff is pending.</summary>
+        public TaskCompletionSource<string> Completion { get; init; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool IsPending => !Completion.Task.IsCompleted;
+    }
 }

@@ -242,6 +242,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine($"If a memory shown in [Memories & Shortcuts] is junk (a per-turn task changelog, an outdated belief, a duplicate), {(toolCallingMode ? "call the delete_memory tool" : "call DeleteMemory(id)")} to forget it. Curate aggressively — fewer, better memories beat many noisy ones.");
             sb.AppendLine();
 
+            sb.AppendLine("[Waiting on the world]");
+            sb.AppendLine("When a task needs you to WAIT for something external before continuing — a person to act/reply, a remote state to change, a file/email/build/result to appear — call the wait_for tool. It pauses your turn (no token cost while waiting, and NOT bound by the 30s script limit) until the thing happens, then you continue automatically with the new value. Do NOT end your turn with 'your move' / 'let me know' and stop — that forces the user to ping you again. For a back-and-forth, loop: act → wait_for({until:\"change\"}) → act. NEVER hand-roll a long polling loop inside execute_csharp; it is killed at the per-script timeout. (For on-screen waits, computer_wait is the equivalent.)");
+            sb.AppendLine();
+
             if (computerUseEnabled)
             {
                 sb.AppendLine("[Computer Control]");
@@ -256,6 +260,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
                 sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
                 sb.AppendLine("- WAITING is not hanging: computer_navigate already waits for load; for other slow steps use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");
+                sb.AppendLine("- STUCK ON A CAPTCHA / LOGIN / 2FA? HAND OFF — DON'T QUIT. If you hit a captcha, a login wall, a 2FA or email/SMS verification code, or you genuinely can't tell which element is correct, call request_human(reason). Klive gets a remote-desktop link, takes over the real screen, solves it, and you AUTO-RESUME exactly where you left off. NEVER end your turn telling the user to solve it themselves, never abandon the task, and never spin a retry loop. (For a plain image-grid captcha you may try it yourself ~twice first, then hand off.)");
                 sb.AppendLine();
             }
 
@@ -427,14 +432,20 @@ namespace Omnipotent.Services.KliveAgent
             "computer_mouse_down", "computer_mouse_up", "computer_key_down", "computer_key_up", "computer_release_all",
             "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser", "computer_navigate",
             "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action", "computer_confirm_and_click",
+            "request_human",
             "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
         };
 
         private static bool IsComputerTool(string name) => ComputerUseToolNames.Contains(name);
 
+        /// <summary>The general "wait for an external event" tool — orchestrated by the brain (it needs the
+        /// script session + progress heartbeat), NOT subject to the per-script 30s cap. The un-timed sibling
+        /// of computer_wait, for service/HTTP/file observables.</summary>
+        private static bool IsWaitTool(string name) => name == "wait_for";
+
         /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
-        /// tools plus memory tools plus computer-use tools. Anything else is routed to execute_csharp.</summary>
-        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name);
+        /// tools plus memory tools plus computer-use tools plus wait_for. Anything else is routed to execute_csharp.</summary>
+        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name) || IsWaitTool(name);
 
         /// <summary>Read-only native tools have no side effects and never touch the Roslyn session, so
         /// several of them in one turn can run concurrently (their I/O latency overlaps). Write tools
@@ -532,6 +543,22 @@ namespace Omnipotent.Services.KliveAgent
                 Tool("delete_memory",
                     "Forget a memory by its id (or short-id prefix shown in recalls). Use to curate noise/duplicates/outdated beliefs.",
                     new { type = "object", properties = new { id = new { type = "string", description = "The memory id or short-id prefix." } }, required = new[] { "id" } }),
+
+                Tool("wait_for",
+                    "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
+                    "Use this whenever you must wait for someone/something else: a person to act, a remote state to change, a file/email/build to appear. " +
+                    "Observe ONE of: 'url' (poll an HTTP GET) or 'check' (a short C# probe that Log()s the value to watch). " +
+                    "Stop condition 'until': \"change\" (default — returns as soon as the observable differs from now), \"contains\" (returns when it contains 'target'), or \"true\". " +
+                    "It blocks (heartbeating, no LLM cost while waiting) up to maxMinutes, polling every intervalSeconds, and returns the new value so your NEXT turn can react. " +
+                    "For on-SCREEN waits prefer computer_wait. NEVER hand-roll a long polling loop in execute_csharp — it gets killed at the per-script timeout.",
+                    new { type = "object", properties = new {
+                        url = new { type = "string", description = "URL to poll with a GET (use this OR 'check')." },
+                        check = new { type = "string", description = "A short C# probe that Log()s the value to watch (use this OR 'url'). Fully general: services, files, DOM, etc." },
+                        until = new { type = "string", description = "\"change\" (default) | \"contains\" | \"true\"." },
+                        target = new { type = "string", description = "Text to wait for when until=\"contains\"." },
+                        intervalSeconds = new { type = "integer", description = "Poll cadence (default 5, min 2)." },
+                        maxMinutes = new { type = "integer", description = "Max time to wait (default 20)." }
+                    }, required = Array.Empty<string>() }),
             };
 
             if (includeComputerUse)
@@ -594,6 +621,9 @@ namespace Omnipotent.Services.KliveAgent
             tools.Add(Tool("computer_confirm_and_click",
                 "GATE + perform an irreversible click (place order, confirm booking, final Pay, submit, send). Shows Klive the target screenshot and blocks until approved, then clicks (x,y). Use this for EVERY money/outward action.",
                 Obj(new { x = intType, y = intType, summary = strType, button = strType }, "x", "y", "summary")));
+            tools.Add(Tool("request_human",
+                "Hand off to a human (Klive) when you hit something you can't or shouldn't do yourself: a CAPTCHA, a login wall, a 2FA/verification code, or you genuinely can't tell which control is correct. Klive gets a remote-desktop link, takes over the real screen, solves it, and you AUTO-RESUME exactly where you left off — so do NOT end your turn, do NOT abandon the task, and do NOT spin a retry loop. For a simple image-grid captcha you may attempt it yourself ~twice first, then call this. Blocks (no hard timeout) until it's handled.",
+                Obj(new { reason = strType, maxMinutes = intType })));
             tools.Add(Tool("save_encrypted_memory",
                 "Securely store a credential/secret (e.g. an email or password) under a name. The value is encrypted and NEVER shown back to you — reference it later as {Name} inside computer_type or computer_browser fill.",
                 Obj(new { name = strType, value = strType }, "name", "value")));
@@ -739,6 +769,105 @@ namespace Omnipotent.Services.KliveAgent
         /// conversation history. Recent turns are where "what did I just run / what did it return"
         /// matters most; older turns stay text-only to keep prompt cost bounded.</summary>
         private const int HistoryScriptRecentTurns = 3;
+
+        /// <summary>
+        /// Implements the wait_for tool: poll an observable (an HTTP url, or a C# probe script) on an
+        /// interval and return when it changes / contains text / is true, or when maxMinutes elapses.
+        /// Heartbeats via <paramref name="heartbeat"/> (wired by the caller to ReportProgress so the stall
+        /// watchdog sees a *waiting* run, not a hung one), honours the run cancellation token, and is NOT
+        /// bound by the per-script 30s timeout — each individual probe is a short script, the overall wait
+        /// is orchestrated here on the native-tool path.
+        /// </summary>
+        private async Task<(bool ok, string text)> RunWaitForAsync(string? argsJson, CancellationToken ct, Action<string> heartbeat)
+        {
+            System.Text.Json.JsonElement a;
+            try
+            {
+                var doc = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson!);
+                a = doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object ? doc.RootElement : System.Text.Json.JsonDocument.Parse("{}").RootElement;
+            }
+            catch { a = System.Text.Json.JsonDocument.Parse("{}").RootElement; }
+
+            string? Str(string n) => a.TryGetProperty(n, out var e) && e.ValueKind == System.Text.Json.JsonValueKind.String ? e.GetString() : null;
+            int IntOr(string n, int def) => a.TryGetProperty(n, out var e) && e.TryGetInt32(out var v) ? v : def;
+
+            string? url = Str("url");
+            string? check = Str("check");
+            if (string.IsNullOrWhiteSpace(url) && string.IsNullOrWhiteSpace(check))
+                return (false, "wait_for needs either 'url' (an HTTP GET to poll) or 'check' (a C# probe that Log()s the value to watch).");
+
+            string until = (Str("until") ?? "change").Trim().ToLowerInvariant();
+            string? target = Str("target");
+            int interval = Math.Clamp(IntOr("intervalSeconds", await agentService.GetIntOmniSetting("KliveAgent_WaitPollSeconds", 5)), 2, 300);
+            int maxMin = Math.Clamp(IntOr("maxMinutes", await agentService.GetIntOmniSetting("KliveAgent_MaxWaitMinutes", 20)), 1, 720);
+
+            // Probe via a DEDICATED throwaway script session so it can't pollute the agent's main session.
+            KliveAgentScriptEngine.ScriptExecutionSession? probe =
+                string.IsNullOrWhiteSpace(check) ? null : scriptEngine.CreateSession(new ScriptGlobals(agentService, ct));
+            using var http = string.IsNullOrWhiteSpace(url) ? null : new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(25) };
+
+            async Task<string> Observe()
+            {
+                if (http != null)
+                {
+                    try { return await http.GetStringAsync(url!, ct); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { return "HTTP_ERROR: " + ex.Message; }
+                }
+                var r = await probe!.ExecuteAsync(check!, TimeSpan.FromSeconds(25));
+                return r.Success ? (r.Output ?? string.Empty) : ("PROBE_ERROR: " + r.ErrorMessage);
+            }
+
+            static bool Truthy(string s)
+            {
+                s = s.Trim();
+                return s.Equals("true", StringComparison.OrdinalIgnoreCase) || s == "1" || s.Contains("True", StringComparison.Ordinal);
+            }
+            bool Met(string baseline, string cur) => until switch
+            {
+                "contains" => target != null && cur.Contains(target, StringComparison.OrdinalIgnoreCase),
+                "true" => Truthy(cur),
+                _ => !string.Equals(cur.Trim(), baseline.Trim(), StringComparison.Ordinal),
+            };
+
+            static string Trunc(string s) => string.IsNullOrEmpty(s) ? "(empty)" : (s.Length <= 600 ? s : s.Substring(0, 600) + "…");
+
+            string baseline;
+            try { baseline = await Observe(); }
+            catch (OperationCanceledException) { return (false, "Wait cancelled (run stopped)."); }
+
+            // contains/true may already hold on the first look.
+            if (until != "change" && Met(baseline, baseline))
+                return (true, $"Condition already satisfied. Value: {Trunc(baseline)}");
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long maxMs = (long)maxMin * 60_000L;
+            int lastHb = 0;
+            while (sw.ElapsedMilliseconds < maxMs)
+            {
+                if (ct.IsCancellationRequested) return (false, "Wait cancelled (run stopped).");
+                try { await Task.Delay(interval * 1000, ct); }
+                catch (OperationCanceledException) { return (false, "Wait cancelled (run stopped)."); }
+
+                string cur;
+                try { cur = await Observe(); }
+                catch (OperationCanceledException) { return (false, "Wait cancelled (run stopped)."); }
+
+                // A transient fetch error is not "the thing happened" — unless we were waiting for the
+                // observable to come BACK (baseline was itself an error). Otherwise keep waiting.
+                bool curErr = cur.StartsWith("HTTP_ERROR", StringComparison.Ordinal) || cur.StartsWith("PROBE_ERROR", StringComparison.Ordinal);
+                bool baseErr = baseline.StartsWith("HTTP_ERROR", StringComparison.Ordinal) || baseline.StartsWith("PROBE_ERROR", StringComparison.Ordinal);
+                if (!(curErr && !baseErr) && Met(baseline, cur))
+                    return (true, $"Condition met after {sw.ElapsedMilliseconds / 1000}s. Current value:\n{Trunc(cur)}");
+
+                if (sw.ElapsedMilliseconds - lastHb >= 5000)
+                {
+                    lastHb = (int)sw.ElapsedMilliseconds;
+                    heartbeat($"waiting for {(until == "change" ? "a change" : until == "contains" ? $"\"{target}\"" : "the condition")}… ({sw.ElapsedMilliseconds / 1000}s elapsed)");
+                }
+            }
+            return (true, $"Waited {maxMin} min with no match (until={until}). Last value:\n{Trunc(baseline)}\nDecide whether to wait_for again or proceed.");
+        }
 
         public async Task<AgentChatResponse> ProcessMessageAsync(
             string userMessage,
@@ -1289,6 +1418,32 @@ namespace Omnipotent.Services.KliveAgent
                                 if (useToolCalling && cr.ModelImageJpeg != null)
                                     pendingModelImages.Add((cr.ModelImageJpeg, "image/jpeg"));
 
+                                continue;
+                            }
+
+                            // wait_for → pause (un-timed, heartbeating, cancellable) until an external
+                            // condition is met. Orchestrated here because it needs the script session +
+                            // progress channel; the per-script 30s cap never applies.
+                            if (IsWaitTool(segment.ToolName))
+                            {
+                                var (wok, wtext) = await RunWaitForAsync(segment.Content, cancellationToken, note =>
+                                    ReportProgress("waiting", note, new AgentActivityEvent { Iteration = iteration + 1, Kind = "wait", Text = note }));
+                                if (!wok) errorCountThisIter++;
+
+                                var wt = KliveAgentContextBudget.TruncateToTokens(wtext ?? string.Empty,
+                                    wok ? KliveAgentContextBudget.ScriptOutputBudget : KliveAgentContextBudget.ScriptErrorBudget);
+                                observationSb.AppendLine($"[{(wok ? "OK" : "ERROR")} | wait_for]");
+                                if (!string.IsNullOrWhiteSpace(wt)) observationSb.AppendLine(wt);
+                                observationSb.AppendLine();
+
+                                ReportProgress("running", null,
+                                    new AgentActivityEvent { Iteration = iteration + 1, Kind = wok ? "wait" : "error", Text = $"wait_for {(wok ? "done" : "error")}" });
+
+                                if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
+                                {
+                                    llm.AppendToolResult(llmSessionId, segment.ToolCallId, "wait_for", wt);
+                                    anyToolResultsAppended = true;
+                                }
                                 continue;
                             }
 

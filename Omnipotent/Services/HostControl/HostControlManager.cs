@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Net;
@@ -52,6 +53,10 @@ namespace Omnipotent.Services.HostControl
         private byte[]? lastFrameJpeg;
         private readonly record struct CoordFrame(double Scale, int OriginX, int OriginY, int ShownW, int ShownH);
 
+        // Open human-intervention handoffs (request_human), keyed by their scoped capability token. A token
+        // authorizes the remote stream + input routes only while its handoff is pending (see AuthorizeRemoteAsync).
+        private readonly ConcurrentDictionary<string, PendingHandoff> handoffs = new();
+
         public ApprovalBroker Approvals => approvals;
         public EncryptedMemoryStore Secrets => secrets;
 
@@ -73,6 +78,7 @@ namespace Omnipotent.Services.HostControl
                 osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
                 _ = Task.Run(HeldInputSafetyLoopAsync);
                 await RegisterScreenStreamRouteAsync();
+                await RegisterRemoteInputRouteAsync();
                 await ServiceLog($"[HostControl] Ready. OS-level control {(osControlEnabled ? "ENABLED" : "disabled via KliveAgent_OsControlEnabled")}. Interactive session: {Environment.UserInteractive}, server: {OmniPaths.CheckIfOnServer()}.");
             }
             catch (Exception ex)
@@ -134,20 +140,19 @@ namespace Omnipotent.Services.HostControl
                     (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
                     {
                         // Browsers can't set an Authorization header on a WebSocket, so this is registered as
-                        // Anybody and authorized here from the ?authorization= query param (Klives only).
-                        var resolved = user;
-                        if (resolved == null)
-                        {
-                            var pw = queryParams["authorization"];
-                            if (!string.IsNullOrEmpty(pw))
-                                resolved = await ExecuteServiceMethod<KMProfileManager>("GetProfileByPassword", pw) as KMProfileManager.KMProfile;
-                        }
-                        if (resolved == null || resolved.KlivesManagementRank < KMProfileManager.KMPermissions.Klives)
+                        // Anybody and authorized here: a Klives ?authorization= password, OR a pending handoff
+                        // ?token= (scoped capability for a captcha-solve session).
+                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user);
+                        if (auth == RemoteAuthKind.Denied)
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
                         }
-                        await StreamScreenAsync(socket);
+                        // Optional per-connection fps/quality so an interactive viewer (remote desktop / solve
+                        // page) can request smoother video, falling back to the idle stream defaults.
+                        int? fps = TryQueryInt(queryParams, "fps");
+                        int? quality = TryQueryInt(queryParams, "quality");
+                        await StreamScreenAsync(socket, fps, quality, handoff);
                     }),
                     KMProfileManager.KMPermissions.Anybody);
                 await ServiceLog("[HostControl] Screen-stream WebSocket route registered (/kliveagent/screen/stream).");
@@ -155,7 +160,7 @@ namespace Omnipotent.Services.HostControl
             catch (Exception ex) { await ServiceLogError(ex, "[HostControl] Failed to register screen-stream route (non-fatal)."); }
         }
 
-        private async Task StreamScreenAsync(WebSocket socket)
+        private async Task StreamScreenAsync(WebSocket socket, int? fpsOverride = null, int? qualityOverride = null, PendingHandoff? handoff = null)
         {
             if (!await ComputerUseEnabledAsync())
             {
@@ -163,15 +168,17 @@ namespace Omnipotent.Services.HostControl
                 return;
             }
 
-            int fps = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamFps", 6), 1, 30);
+            int fps = Math.Clamp(fpsOverride ?? await GetIntOmniSetting("KliveAgent_StreamFps", 6), 1, 30);
             int width = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamWidth", 1366), 320, 3840);
-            int quality = Math.Clamp(await GetIntOmniSetting("KliveAgent_StreamQuality", 45), 10, 92);
+            int quality = Math.Clamp(qualityOverride ?? await GetIntOmniSetting("KliveAgent_StreamQuality", 45), 10, 92);
             int delayMs = Math.Max(25, 1000 / fps);
 
             try
             {
                 while (socket.State == WebSocketState.Open)
                 {
+                    // A token-scoped (captcha-solve) stream ends the instant its handoff resolves.
+                    if (handoff != null && !handoff.IsPending) break;
                     byte[] jpeg;
                     try { jpeg = capturer.CaptureVirtualScreen(width, quality).Jpeg; }
                     catch { await Task.Delay(delayMs); continue; }
@@ -184,6 +191,183 @@ namespace Omnipotent.Services.HostControl
             {
                 try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
             }
+        }
+
+        // ── Remote control (two-way input) ──
+        // The view-only stream above is paired with this input channel: a WebSocket that receives the
+        // operator's pointer/keyboard events (normalized 0..1 coords) and REPLAYS them on the real machine
+        // via NativeInput, under the same exclusive input lock the agent uses. This powers BOTH the Admin
+        // remote-desktop (password auth) and the captcha-solve page (token auth) — one route, two callers.
+        private enum RemoteAuthKind { Denied, Password, Token }
+
+        /// <summary>Authorize a remote stream/input WebSocket: a Klives ?authorization= password, OR a pending
+        /// handoff ?token= (scoped capability). Returns the matched handoff for a token session.</summary>
+        private async Task<(RemoteAuthKind kind, PendingHandoff? handoff)> AuthorizeRemoteAsync(NameValueCollection q, KMProfileManager.KMProfile? user)
+        {
+            var resolved = user;
+            if (resolved == null)
+            {
+                var pw = q["authorization"];
+                if (!string.IsNullOrEmpty(pw))
+                    resolved = await ExecuteServiceMethod<KMProfileManager>("GetProfileByPassword", pw) as KMProfileManager.KMProfile;
+            }
+            if (resolved != null && resolved.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives)
+                return (RemoteAuthKind.Password, null);
+
+            var token = q["token"];
+            if (!string.IsNullOrEmpty(token) && handoffs.TryGetValue(token, out var h) && h.IsPending)
+                return (RemoteAuthKind.Token, h);
+
+            return (RemoteAuthKind.Denied, null);
+        }
+
+        private static int? TryQueryInt(NameValueCollection q, string key) =>
+            int.TryParse(q[key], out var v) ? v : (int?)null;
+
+        private async Task RegisterRemoteInputRouteAsync()
+        {
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+                    "/kliveagent/remote/input",
+                    (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
+                    {
+                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user);
+                        if (auth == RemoteAuthKind.Denied)
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        await HandleRemoteInputAsync(socket, handoff);
+                    }),
+                    KMProfileManager.KMPermissions.Anybody);
+                await ServiceLog("[HostControl] Remote-input WebSocket route registered (/kliveagent/remote/input).");
+            }
+            catch (Exception ex) { await ServiceLogError(ex, "[HostControl] Failed to register remote-input route (non-fatal)."); }
+        }
+
+        /// <summary>Receive loop: each text frame is one JSON input event ({t:"move|down|up|click|dblclick|
+        /// scroll|text|key|keydown|keyup|resolve", ...}). Locally-held buttons are released on disconnect so a
+        /// drag can never stay stuck.</summary>
+        private async Task HandleRemoteInputAsync(WebSocket socket, PendingHandoff? handoff)
+        {
+            if (!await ComputerUseEnabledAsync())
+            {
+                try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "computer-use disabled", CancellationToken.None); } catch { }
+                return;
+            }
+
+            var buffer = new byte[16 * 1024];
+            var sb = new StringBuilder();
+            var heldLocal = new HashSet<Omnipotent.Threading.MouseButton>();
+            try
+            {
+                while (socket.State == WebSocketState.Open)
+                {
+                    sb.Clear();
+                    WebSocketReceiveResult res;
+                    do
+                    {
+                        res = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                        if (res.MessageType == WebSocketMessageType.Close) return;
+                        if (res.MessageType == WebSocketMessageType.Text)
+                            sb.Append(Encoding.UTF8.GetString(buffer, 0, res.Count));
+                    } while (!res.EndOfMessage);
+
+                    var msg = sb.ToString();
+                    if (string.IsNullOrWhiteSpace(msg)) continue;
+                    JsonElement ev;
+                    try { ev = JsonDocument.Parse(msg).RootElement; } catch { continue; }
+                    if (ev.ValueKind != JsonValueKind.Object) continue;
+                    await ApplyRemoteInputAsync(ev, handoff, heldLocal);
+                }
+            }
+            catch { /* viewer disconnected or a malformed frame → unwind */ }
+            finally
+            {
+                if (heldLocal.Count > 0)
+                {
+                    var (cx, cy) = NativeInput.GetCursorPosition();
+                    await inputLock.WaitAsync();
+                    try { foreach (var b in heldLocal) NativeInput.MouseButtonUp(cx, cy, b); } finally { inputLock.Release(); }
+                }
+                try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+            }
+        }
+
+        private async Task ApplyRemoteInputAsync(JsonElement ev, PendingHandoff? handoff, HashSet<Omnipotent.Threading.MouseButton> heldLocal)
+        {
+            var t = (Str(ev, "t") ?? string.Empty).ToLowerInvariant();
+
+            // Any event from the operator counts as activity (drives the "idle after interacting" auto-resume).
+            if (handoff != null)
+            {
+                Interlocked.Exchange(ref handoff.Interacted, 1);
+                Interlocked.Exchange(ref handoff.LastInputUtcTicks, DateTime.UtcNow.Ticks);
+            }
+
+            if (t == "resolve" || t == "done")
+            {
+                if (handoff != null) ResolveHandoff(handoff, "done");
+                return;
+            }
+
+            if (!OsControlAvailable || !await ComputerUseEnabledAsync()) return;
+
+            var button = ParseButton(Str(ev, "button"));
+            (int px, int py) Pt()
+            {
+                var (vx, vy, vw, vh) = NativeInput.GetVirtualScreenBounds();
+                double nx = Math.Clamp(DblOr(ev, "x", 0), 0, 1);
+                double ny = Math.Clamp(DblOr(ev, "y", 0), 0, 1);
+                return (vx + (int)Math.Round(nx * Math.Max(1, vw - 1)), vy + (int)Math.Round(ny * Math.Max(1, vh - 1)));
+            }
+
+            await inputLock.WaitAsync();
+            try
+            {
+                switch (t)
+                {
+                    case "move": { var (px, py) = Pt(); NativeInput.MoveMouse(px, py); break; }
+                    case "down": { var (px, py) = Pt(); NativeInput.MouseButtonDown(px, py, button); heldLocal.Add(button); break; }
+                    case "up": { var (px, py) = Pt(); NativeInput.MouseButtonUp(px, py, button); heldLocal.Remove(button); break; }
+                    case "click":
+                    {
+                        var (px, py) = Pt();
+                        int clicks = Math.Max(1, IntOr(ev, "clicks", 1));
+                        var mods = NormalizeModifiers(Strs(ev, "modifiers"));
+                        WithModifiers(mods, () => NativeInput.Click(px, py, button, clicks));
+                        break;
+                    }
+                    case "dblclick": { var (px, py) = Pt(); NativeInput.Click(px, py, button, 2); break; }
+                    case "scroll": { var (px, py) = Pt(); NativeInput.Scroll(px, py, IntOr(ev, "dy", 0), IntOr(ev, "dx", 0)); break; }
+                    case "text": NativeInput.TypeUnicode(Str(ev, "text") ?? string.Empty); break;
+                    case "key":
+                    {
+                        var keys = Strs(ev, "keys");
+                        if ((keys == null || keys.Length == 0) && Str(ev, "key") is { } single) keys = new[] { single };
+                        if (keys != null && keys.Length > 0) NativeInput.TryPressKeys(keys);
+                        break;
+                    }
+                    case "keydown": if (Str(ev, "key") is { } kd) NativeInput.KeyDown(kd); break;
+                    case "keyup": if (Str(ev, "key") is { } ku) NativeInput.KeyUp(ku); break;
+                }
+            }
+            finally { inputLock.Release(); }
+        }
+
+        private bool ResolveHandoff(PendingHandoff h, string outcome)
+        {
+            var ok = h.Completion.TrySetResult(outcome);
+            handoffs.TryRemove(h.Token, out _);
+            return ok;
+        }
+
+        private static string MintHandoffToken()
+        {
+            Span<byte> b = stackalloc byte[32];
+            RandomNumberGenerator.Fill(b);
+            return Convert.ToBase64String(b).Replace('+', '-').Replace('/', '_').TrimEnd('=');
         }
 
         // ── Public entry points ──
@@ -361,6 +545,9 @@ namespace Omnipotent.Services.HostControl
 
                 case "computer_confirm_and_click":
                     return await ConfirmAndClickAsync(a, ct, onProgress);
+
+                case "request_human":
+                    return await RequestHumanAsync(a, ct, onProgress);
 
                 case "save_encrypted_memory":
                 {
@@ -749,6 +936,128 @@ namespace Omnipotent.Services.HostControl
             }, label: $"APPROVED click: {Trim(summary, 40)}", tx: x, ty: y);
         }
 
+        // ── Human intervention (request_human) ──
+        // The agent hit something it can't or shouldn't do itself (captcha / login / 2FA / genuine
+        // uncertainty). Mint a scoped capability token, ping Klive with a remote-desktop deep link + raise
+        // the website card, then BLOCK (heartbeating, no hard timeout) until the operator finishes — at which
+        // point the agent auto-resumes. Reuses the same screen-stream + input routes as the Admin remote
+        // desktop, just authorized by the token instead of a password.
+        private async Task<ComputerToolResult> RequestHumanAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress)
+        {
+            var guard = OsGuard();
+            if (guard != null) return guard;
+
+            var reason = Str(a, "reason");
+            if (string.IsNullOrWhiteSpace(reason))
+                reason = "I hit something I need you for (captcha / login / verification). Please take over for a moment.";
+            int maxMinutes = Math.Clamp(IntOr(a, "maxMinutes", await GetIntOmniSetting("KliveAgent_HumanHandoffMaxMinutes", 20)), 1, 240);
+            int idleResolveMs = Math.Max(2000, await GetIntOmniSetting("KliveAgent_HumanHandoffIdleResolveMs", 4000));
+
+            // Best-effort: keep the obstacle in the foreground so the operator lands right on it.
+            try
+            {
+                var fg = NativeInput.GetForegroundWindowInfo();
+                if (fg != null) { await inputLock.WaitAsync(ct); try { NativeInput.FocusWindow(fg.Value.Handle, maximize: false); } finally { inputLock.Release(); } }
+            }
+            catch { }
+
+            // Mint the scoped token + register the pending handoff (the token IS the dictionary key).
+            var token = MintHandoffToken();
+            var handoff = new PendingHandoff { Token = token, ApprovalId = Guid.NewGuid().ToString("N"), Reason = reason };
+            Interlocked.Exchange(ref handoff.LastInputUtcTicks, DateTime.UtcNow.Ticks);
+            handoffs[token] = handoff;
+            var solveUrl = $"https://klive.dev/shared/solve?token={token}";
+
+            byte[]? annotated = null;
+            try { var cap = capturer.CaptureVirtualScreen(1366, 55); annotated = capturer.Annotate(cap.Jpeg, "NEEDS YOU: " + Trim(reason, 60)); } catch { }
+
+            var card = new PendingApproval
+            {
+                ApprovalId = handoff.ApprovalId,
+                Message = reason,
+                FrameBase64 = annotated != null ? Convert.ToBase64String(annotated) : null,
+                Status = "pending",
+                Kind = "intervention",
+                SolveUrl = solveUrl
+            };
+            onProgress(new HostControlProgress
+            {
+                Note = "Waiting for you to take over: " + reason,
+                Approval = card,
+                AnnotatedFrameJpeg = annotated,
+                Activity = new AgentActivityEvent { Kind = "approval", Text = "human handoff: " + Trim(reason, 40) }
+            });
+
+            await SendDiscordHandoffAsync(reason, solveUrl);
+            await ServiceLog($"[HostControl] request_human: handoff opened — {Trim(reason, 80)}");
+
+            var deadline = DateTime.UtcNow.AddMinutes(maxMinutes);
+            var sw = Stopwatch.StartNew();
+            int lastHeartbeat = 0;
+            string outcome = "timeout";
+            try
+            {
+                while (handoff.IsPending)
+                {
+                    if (ct.IsCancellationRequested) { ResolveHandoff(handoff, "cancelled"); outcome = "cancelled"; break; }
+                    if (DateTime.UtcNow >= deadline) { ResolveHandoff(handoff, "timeout"); outcome = "timeout"; break; }
+
+                    await Task.WhenAny(handoff.Completion.Task, Task.Delay(1000));
+                    if (handoff.Completion.Task.IsCompletedSuccessfully) { outcome = handoff.Completion.Task.Result; break; }
+
+                    // Auto-resume: once the operator has touched it and then gone idle, they're done — resume.
+                    // (If they merely paused, the agent will re-observe a still-present obstacle and can call
+                    // request_human again, so an early resume is self-healing, never destructive.)
+                    if (Interlocked.CompareExchange(ref handoff.Interacted, 0, 0) == 1)
+                    {
+                        long idleMs = (DateTime.UtcNow.Ticks - Interlocked.Read(ref handoff.LastInputUtcTicks)) / TimeSpan.TicksPerMillisecond;
+                        if (idleMs >= idleResolveMs) { ResolveHandoff(handoff, "done"); outcome = "done"; break; }
+                    }
+
+                    if (sw.ElapsedMilliseconds - lastHeartbeat >= 4000)
+                    {
+                        lastHeartbeat = (int)sw.ElapsedMilliseconds;
+                        onProgress(new HostControlProgress
+                        {
+                            Note = $"Waiting for you to solve it… ({sw.ElapsedMilliseconds / 1000}s).",
+                            Approval = card,
+                            Activity = new AgentActivityEvent { Kind = "wait", Text = "awaiting human takeover" }
+                        });
+                    }
+                }
+            }
+            finally
+            {
+                handoffs.TryRemove(token, out _);
+                card.Status = (outcome == "done") ? "approved" : "denied";
+                onProgress(new HostControlProgress
+                {
+                    Note = $"Handoff {outcome}.",
+                    Approval = card,
+                    Activity = new AgentActivityEvent { Kind = outcome == "done" ? "action" : "error", Text = "handoff " + outcome }
+                });
+            }
+
+            var result = CaptureFrameResult("active", "after human handoff");
+            result.Text = outcome switch
+            {
+                "done" => "A human took over and finished (the captcha/login/verification was handled). " + result.Text + " Re-read the screen and CONTINUE the task from here.",
+                "cancelled" => "Human handoff cancelled (run stopped).",
+                _ => $"No human completed the handoff within {maxMinutes} min — the obstacle may still be present. " + result.Text + " Decide whether to wait again (request_human) or stop and tell the user."
+            };
+            return result;
+        }
+
+        private async Task SendDiscordHandoffAsync(string reason, string solveUrl)
+        {
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    $"🖐️ **KliveAgent needs you.** {Trim(reason, 200)}\nTake over on the machine (remote desktop): {solveUrl}");
+            }
+            catch { /* notification is best-effort; the website card is the primary channel */ }
+        }
+
         // ── Coordinate mapping ──
         private (int x, int y) MapToPhysical(int modelX, int modelY)
         {
@@ -899,6 +1208,8 @@ namespace Omnipotent.Services.HostControl
             a.ValueKind == JsonValueKind.Object && a.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
         private static int IntOr(JsonElement a, string name, int def) =>
             a.ValueKind == JsonValueKind.Object && a.TryGetProperty(name, out var e) && e.TryGetInt32(out var v) ? v : def;
+        private static double DblOr(JsonElement a, string name, double def) =>
+            a.ValueKind == JsonValueKind.Object && a.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.Number && e.TryGetDouble(out var v) ? v : def;
         private static string[]? Strs(JsonElement a, string name) =>
             a.ValueKind == JsonValueKind.Object && a.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.Array
                 ? e.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString()!).ToArray()

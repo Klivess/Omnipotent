@@ -2122,7 +2122,7 @@ namespace Omnipotent.Services.KliveAgent
                             Success = false,
                             ErrorMessage = stopped
                                 ? "Script was stopped before it finished."
-                                : $"Script execution timed out after {effectiveTimeout.TotalSeconds:0}s and was abandoned — it was still running, most likely an infinite loop or a blocking call that ignores cancellation. Rewrite it to be non-blocking and to honour CancellationToken (e.g. await Task.Delay(ms, CancellationToken), pass a timeout to process/network waits, never use .Result/.Wait()).",
+                                : $"Script execution timed out after {effectiveTimeout.TotalSeconds:0}s and was abandoned — it was still running, most likely an infinite loop or a blocking call that ignores cancellation. Rewrite it to be non-blocking and to honour CancellationToken (e.g. await Task.Delay(ms, CancellationToken), pass a timeout to process/network waits, never use .Result/.Wait()). If you were POLLING or WAITING for something to happen, do NOT loop here — use the wait_for tool (or computer_wait for the screen); those pause without this per-script limit.",
                             Output = globals.TakeOutput(),
                             ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                         };

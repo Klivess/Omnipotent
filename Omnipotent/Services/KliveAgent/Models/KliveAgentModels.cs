@@ -752,6 +752,17 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// <summary>"pending" | "approved" | "denied".</summary>
         [JsonProperty("status")]
         public string Status { get; set; } = "pending";
+
+        /// <summary>"approval" (irreversible-action approve/deny) or "intervention" (human takeover: captcha
+        /// /login/2FA). The website renders an approve/deny card for the former and an "Open Remote Desktop"
+        /// launcher for the latter.</summary>
+        [JsonProperty("kind")]
+        public string Kind { get; set; } = "approval";
+
+        /// <summary>For an intervention: the token-scoped remote-desktop solve URL the operator opens to take
+        /// over. Null for a plain approval.</summary>
+        [JsonProperty("solveUrl")]
+        public string SolveUrl { get; set; }
     }
 
     /// <summary>One entry in a run's live activity timeline.</summary>
