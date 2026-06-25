@@ -95,6 +95,14 @@ namespace Omnipotent.Services.HostControl
         private volatile bool osControlEnabled = true;
         private bool OsControlAvailable => osControlEnabled;
 
+        // Motion-clip config, refreshed before every action in ExecuteToolAsync (same as osControlEnabled) so
+        // toggling a setting takes effect immediately. See ScreenCapturer's clip machinery.
+        private volatile bool clipEnabled = true;
+        private volatile int clipSampleFps = 12;
+        private volatile int clipWindowMs = 1200;
+        private volatile int clipMaxFrames = 4;
+        private volatile int clipMotionThreshold = 2;
+
         // ── OmniSettings-backed secret storage helpers (used by EncryptedMemoryStore) ──
         internal async Task SetSettingRaw(string key, string value) =>
             await ExecuteServiceMethod<OmniGlobalSettingsManager>("SetStringOmniSetting", key, value, this.serviceID, this.name);
@@ -392,6 +400,12 @@ namespace Omnipotent.Services.HostControl
                     return ComputerToolResult.Fail("Computer-use is disabled (set KliveAgent_ComputerUseEnabled).");
                 // Refresh the OS-control switch each action so toggling the setting takes effect immediately.
                 osControlEnabled = await GetBoolOmniSetting("KliveAgent_OsControlEnabled", defaultValue: true);
+                // Refresh the motion-clip config likewise (cheap; read once per action, not per sampled frame).
+                clipEnabled = await GetBoolOmniSetting("KliveAgent_ClipEnabled", defaultValue: true);
+                clipSampleFps = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipSampleFps", 12), 2, 30);
+                clipWindowMs = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipWindowMs", 1200), 200, 6000);
+                clipMaxFrames = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipMaxFrames", 4), 1, 12);
+                clipMotionThreshold = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipMotionThreshold", 2), 1, 64);
                 // Any tool call while inputs are held = the drag/hold is still in progress → keep it alive.
                 lock (holdLock) { if (heldButtons.Count > 0 || heldKeys.Count > 0) lastHoldUtc = DateTime.UtcNow; }
                 return await RunAsync(toolName, args, ct, onProgress);
@@ -428,7 +442,7 @@ namespace Omnipotent.Services.HostControl
             switch (tool)
             {
                 case "computer_screenshot":
-                    return CaptureFrameResult(Str(a, "target") ?? "active", "screenshot");
+                    return await CaptureClipAsync(Str(a, "target") ?? "active", "screenshot", null, null, null, ct);
 
                 case "computer_window_state":
                     return WindowState();
@@ -480,7 +494,7 @@ namespace Omnipotent.Services.HostControl
                 case "computer_release_all":
                 {
                     await ReleaseHeldInputsAsync(auto: false);
-                    var r = CaptureFrameResult("active", "release all");
+                    var r = await CaptureClipAsync("active", "release all", null, null, null, ct);
                     r.Text = "Released all held mouse buttons and keys. " + r.Text;
                     return r;
                 }
@@ -575,7 +589,10 @@ namespace Omnipotent.Services.HostControl
         }
 
         // ── Perception ──
-        private ComputerToolResult CaptureFrameResult(string target, string label, int? tx = null, int? ty = null)
+        // Capture ONE settled frame: the current on-screen state, gridded for the model + annotated for the
+        // website, and (under frameLock) the coordinate frame so the model's click coords map to pixels.
+        // This is the synchronous building block; CaptureClipAsync wraps it with a motion filmstrip.
+        private ComputerToolResult CaptureSettledFrame(string target, string label, int? tx = null, int? ty = null)
         {
             var guard = OsGuard();
             if (guard != null) return guard;
@@ -599,8 +616,70 @@ namespace Omnipotent.Services.HostControl
                 Success = true,
                 Text = $"Captured {cap.Description} ({cap.ShownWidth}x{cap.ShownHeight} px shown). The image has a coordinate-ruler grid — read the gridlines to measure the exact x,y you pass to computer_click/move. (0,0 = top-left.)",
                 ModelImageJpeg = modelImage,
-                AnnotatedJpeg = annotated
+                AnnotatedJpeg = annotated,
+                ModelImageFrames = new List<ClipFrame> { new ClipFrame { Jpeg = modelImage, IsSettled = true, HasGrid = true } }
             };
+        }
+
+        private ScreenCapturer.ClipCaptureOptions ClipOpts() => new()
+        {
+            SampleFps = clipSampleFps,
+            WindowMs = clipWindowMs,
+            MaxFrames = clipMaxFrames,
+            MotionThreshold = clipMotionThreshold,
+            SampleMaxWidth = 1000,
+            SampleQuality = 55
+        };
+
+        /// <summary>
+        /// Perception with a short motion "clip": collects the in-between frames sampled across the action
+        /// (oldest→newest), then captures the freshest SETTLED frame (gridded) as the final/current state.
+        /// A still result collapses to just the settled frame — identical cost to a single screenshot.
+        /// Pass a <paramref name="recorder"/> already started BEFORE a mutating action (so the clip spans the
+        /// gesture); pass null for pure perception (a fresh short window is sampled on the spot).
+        /// </summary>
+        private async Task<ComputerToolResult> CaptureClipAsync(string target, string label, int? tx, int? ty, ScreenCapturer.ClipRecorder? recorder, CancellationToken ct)
+        {
+            if (!clipEnabled)
+            {
+                recorder?.RequestFinish();
+                if (recorder != null) { try { await recorder.FinishAsync(ct); } catch { } }
+                return CaptureSettledFrame(target, label, tx, ty);
+            }
+
+            recorder ??= capturer.BeginClip(target, ClipOpts());
+            List<ScreenCapturer.ClipSample> samples;
+            try { samples = await recorder.FinishAsync(ct); }
+            catch { samples = new List<ScreenCapturer.ClipSample>(); }
+
+            // Settled frame LAST = freshest/current; also sets lastFrame for coordinate mapping (today's behaviour).
+            var settled = CaptureSettledFrame(target, label, tx, ty);
+            if (!settled.Success) return settled;
+
+            try
+            {
+                byte[]? rawSettled;
+                lock (frameLock) rawSettled = lastFrameJpeg; // raw (gridless) settled frame, for diffing vs. intermediates
+                var settledThumb = rawSettled != null ? ScreenCapturer.GrayThumb(rawSettled) : Array.Empty<byte>();
+                var intermediates = capturer.SelectIntermediates(samples, settledThumb, ClipOpts());
+
+                var frames = new List<ClipFrame>(intermediates)
+                {
+                    new ClipFrame
+                    {
+                        Jpeg = settled.ModelImageJpeg ?? Array.Empty<byte>(),
+                        IsSettled = true,
+                        HasGrid = true,
+                        OffsetMs = (intermediates.Count > 0 ? intermediates[^1].OffsetMs : 0) + 1
+                    }
+                };
+                settled.ModelImageFrames = frames;
+                if (intermediates.Count > 0)
+                    settled.Text = $"Clip: {frames.Count} frames captured across this action (oldest→newest); the LAST frame is the current gridded state. The earlier frames show what changed in-between (catch transient toasts/errors/animations there — but read click coordinates only from the LAST frame). " + settled.Text;
+            }
+            catch { /* keep the single settled frame already set by CaptureSettledFrame */ }
+
+            return settled;
         }
 
         private ComputerToolResult WindowState()
@@ -636,16 +715,21 @@ namespace Omnipotent.Services.HostControl
             var guard = OsGuard();
             if (guard != null) return guard;
 
+            // Start filming BEFORE the gesture so the clip spans the action itself (a menu that opens then the
+            // click closes it, drag motion, a transition). Capture is read-only, so it runs concurrently with
+            // act() without taking inputLock. When clips are off, keep the original fixed settle delay.
+            var recorder = clipEnabled ? capturer.BeginClip("active", ClipOpts()) : null;
             await inputLock.WaitAsync(ct);
             try
             {
                 act();
-                await Task.Delay(350, ct); // let the UI settle before we observe the result
+                if (recorder == null) await Task.Delay(350, ct); // let the UI settle before we observe the result
             }
             finally { inputLock.Release(); }
+            recorder?.RequestFinish(); // gesture fired — now watch for the screen to settle (adaptive, bounded)
 
             onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
-            var result = CaptureFrameResult("active", label, tx, ty);
+            var result = await CaptureClipAsync("active", label, tx, ty, recorder, ct);
             result.Text = $"Did: {label}. " + result.Text;
             return result;
         }
@@ -665,7 +749,7 @@ namespace Omnipotent.Services.HostControl
 
             if (used.Count > 0) await ServiceLog($"[HostControl] typed text using secrets: {string.Join(", ", used)}");
             onProgress(new HostControlProgress { Note = $"type \"{Trim(redacted, 40)}\"", Activity = new AgentActivityEvent { Kind = "action", Text = $"type {Trim(redacted, 40)}" } });
-            var result = CaptureFrameResult("active", "type");
+            var result = await CaptureClipAsync("active", "type", null, null, null, ct);
             result.Text = $"Typed \"{redacted}\". " + result.Text;
             return result;
         }
@@ -688,7 +772,7 @@ namespace Omnipotent.Services.HostControl
             if (!ok) return ComputerToolResult.Fail($"Unrecognized key(s): {string.Join("+", keys)}.");
             var label = $"press {string.Join("+", keys)}";
             onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
-            var result = CaptureFrameResult("active", label);
+            var result = await CaptureClipAsync("active", label, null, null, null, ct);
             result.Text = $"Pressed {string.Join("+", keys)}. " + result.Text;
             return result;
         }
@@ -726,7 +810,7 @@ namespace Omnipotent.Services.HostControl
                 }
             }
 
-            var result = CaptureFrameResult("active", "after wait");
+            var result = await CaptureClipAsync("active", "after wait", null, null, null, ct);
             result.Text = $"Waited {sw.ElapsedMilliseconds}ms ({resolved}). " + result.Text;
             return result;
         }
@@ -753,7 +837,7 @@ namespace Omnipotent.Services.HostControl
             finally { inputLock.Release(); }
 
             onProgress(new HostControlProgress { Activity = new AgentActivityEvent { Kind = "action", Text = $"focus \"{Trim(match.Title, 30)}\"" } });
-            var result = CaptureFrameResult("active", "focus window");
+            var result = await CaptureClipAsync("active", "focus window", null, null, null, ct);
             result.Text = $"Focused + maximized \"{match.Title}\". " + result.Text;
             return result;
         }
@@ -766,7 +850,7 @@ namespace Omnipotent.Services.HostControl
             if (guard != null) return guard;
             await EnsureBrowserFocusedAsync(Str(a, "url"));
             await Task.Delay(300);
-            var r = CaptureFrameResult("active", "browser");
+            var r = await CaptureClipAsync("active", "browser", null, null, null, CancellationToken.None);
             r.Text = "Browser is focused and maximized. To go to a page, use computer_navigate(url) — one step, no fiddling with the address bar. " + r.Text;
             return r;
         }
@@ -824,7 +908,7 @@ namespace Omnipotent.Services.HostControl
             finally { inputLock.Release(); }
 
             await SettleAsync(ct, onProgress, 9000);
-            var result = CaptureFrameResult("active", $"navigated {Trim(url, 40)}");
+            var result = await CaptureClipAsync("active", $"navigated {Trim(url, 40)}", null, null, null, ct);
             result.Text = $"Navigated the browser to {url}. " + result.Text;
             return result;
         }
@@ -924,7 +1008,7 @@ namespace Omnipotent.Services.HostControl
             if (await DryRunAsync())
             {
                 await ServiceLog($"[HostControl] DRY-RUN: would have clicked ({x},{y}) — {summary}");
-                var dr = CaptureFrameResult("active", "DRY-RUN click " + summary, x, y);
+                var dr = await CaptureClipAsync("active", "DRY-RUN click " + summary, x, y, null, ct);
                 dr.Text = $"DRY-RUN: approved and would have clicked ({x},{y}) [{summary}] but dry-run is on, so nothing was clicked. " + dr.Text;
                 return dr;
             }
@@ -966,7 +1050,7 @@ namespace Omnipotent.Services.HostControl
             var handoff = new PendingHandoff { Token = token, ApprovalId = Guid.NewGuid().ToString("N"), Reason = reason };
             Interlocked.Exchange(ref handoff.LastInputUtcTicks, DateTime.UtcNow.Ticks);
             handoffs[token] = handoff;
-            var solveUrl = $"https://klive.dev/shared/solve?token={token}";
+            var solveUrl = $"https://klive.uk/shared/solve?token={token}";
 
             byte[]? annotated = null;
             try { var cap = capturer.CaptureVirtualScreen(1366, 55); annotated = capturer.Annotate(cap.Jpeg, "NEEDS YOU: " + Trim(reason, 60)); } catch { }
@@ -1038,7 +1122,7 @@ namespace Omnipotent.Services.HostControl
                 });
             }
 
-            var result = CaptureFrameResult("active", "after human handoff");
+            var result = await CaptureClipAsync("active", "after human handoff", null, null, null, ct);
             result.Text = outcome switch
             {
                 "done" => "A human took over and finished (the captcha/login/verification was handled). " + result.Text + " Re-read the screen and CONTINUE the task from here.",
@@ -1065,8 +1149,9 @@ namespace Omnipotent.Services.HostControl
             lock (frameLock) f = lastFrame;
             if (f == null)
             {
-                // Establish a frame on demand (the model normally screenshots first).
-                CaptureFrameResult("active", "auto");
+                // Establish a frame on demand (the model normally screenshots first). Synchronous single frame
+                // — this is only a coordinate-mapping fallback, not a perception result fed to the model.
+                CaptureSettledFrame("active", "auto");
                 lock (frameLock) f = lastFrame;
             }
             if (f == null) return (modelX, modelY);
@@ -1130,7 +1215,7 @@ namespace Omnipotent.Services.HostControl
             lock (holdLock) { if (down) heldButtons.Add(button); else heldButtons.Remove(button); lastHoldUtc = DateTime.UtcNow; }
             var label = $"{button.ToString().ToLowerInvariant()} button {(down ? "down" : "up")}";
             onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
-            var result = CaptureFrameResult("active", label, hasXY ? x : (int?)null, hasXY ? y : (int?)null);
+            var result = await CaptureClipAsync("active", label, hasXY ? x : (int?)null, hasXY ? y : (int?)null, null, ct);
             result.Text = (down ? $"Pressed and HOLDING the {button.ToString().ToLowerInvariant()} button — move (computer_move) then computer_mouse_up to release. " : $"Released the {button.ToString().ToLowerInvariant()} button. ") + result.Text;
             return result;
         }
@@ -1151,7 +1236,7 @@ namespace Omnipotent.Services.HostControl
             lock (holdLock) { if (down) heldKeys.Add(key); else heldKeys.Remove(key); lastHoldUtc = DateTime.UtcNow; }
             var label = $"key {key} {(down ? "down" : "up")}";
             onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
-            var result = CaptureFrameResult("active", label);
+            var result = await CaptureClipAsync("active", label, null, null, null, ct);
             result.Text = (down ? $"Holding '{key}' down — do actions then computer_key_up to release. " : $"Released '{key}'. ") + result.Text;
             return result;
         }

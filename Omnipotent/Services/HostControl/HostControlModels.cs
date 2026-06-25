@@ -13,14 +13,37 @@ namespace Omnipotent.Services.HostControl
         public string Text { get; set; } = string.Empty;
         public string? ErrorMessage { get; set; }
 
-        /// <summary>Raw JPEG screenshot for the vision model (downscaled). Null when the action produced no frame.</summary>
+        /// <summary>Raw JPEG screenshot for the vision model (downscaled). Null when the action produced no frame.
+        /// Always equals the SETTLED (final) frame — kept for back-compat and as the single-frame fallback.</summary>
         public byte[]? ModelImageJpeg { get; set; }
+
+        /// <summary>Ordered "clip" / filmstrip for the vision model (oldest→newest): zero or more intermediate
+        /// motion frames (gridless, downscaled — they show what transiently happened DURING the action: toasts,
+        /// errors, animations, a menu that opened then closed) followed by the SETTLED current-state frame
+        /// (gridded — the model measures click coordinates from this LAST frame). When null/empty, callers fall
+        /// back to <see cref="ModelImageJpeg"/>. A static action collapses to a single (settled) frame, so this
+        /// never costs more than today's one screenshot when nothing moved.</summary>
+        public List<ClipFrame>? ModelImageFrames { get; set; }
 
         /// <summary>Annotated JPEG (action label + target box + cursor) for the website video stream.</summary>
         public byte[]? AnnotatedJpeg { get; set; }
 
         public static ComputerToolResult Fail(string message) => new() { Success = false, Text = message, ErrorMessage = message };
         public static ComputerToolResult Ok(string text) => new() { Success = true, Text = text };
+    }
+
+    /// <summary>One frame of a perception "clip" fed to the vision model. Intermediate frames carry the
+    /// in-between motion (gridless, downscaled); the final frame (<see cref="IsSettled"/>) is the gridded
+    /// current on-screen state the model reads click coordinates from.</summary>
+    public sealed class ClipFrame
+    {
+        public byte[] Jpeg { get; init; } = Array.Empty<byte>();
+        /// <summary>Milliseconds from clip start (oldest = smallest).</summary>
+        public int OffsetMs { get; init; }
+        /// <summary>True for the final, current-state frame (the one with the coordinate grid).</summary>
+        public bool IsSettled { get; init; }
+        /// <summary>True if a coordinate-ruler grid is overlaid (only the settled frame).</summary>
+        public bool HasGrid { get; init; }
     }
 
     /// <summary>

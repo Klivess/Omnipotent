@@ -253,7 +253,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- THESE ARE DIRECT TOOLS. Call computer_navigate / computer_screenshot / computer_click_text / computer_click / computer_type etc. as native tool calls — the SAME way you call grep or read_file. NEVER write them inside execute_csharp, and NEVER pass their JSON arguments to execute_csharp. execute_csharp is only for C# against Omnipotent services; computer_* tools drive the desktop.");
                 sb.AppendLine("- THE WEB IN ONE STEP: to go to a page, call computer_navigate({url:\"...\"}) — it opens/focuses the real browser, types the URL, and waits for load. You decide the URL; none is handed to you. There is NO Selenium/scripted-browser API — you drive the actual browser.");
                 sb.AppendLine("- MEASURE, THEN CLICK: every screenshot is overlaid with a labeled coordinate-ruler grid (lines + numbers every 100px, origin 0,0 top-left). To click something, READ the gridlines around it to measure the x,y of its CENTRE, then computer_click(x,y) (or computer_move). Interpolate between gridlines for precision. This works for ANY element — buttons, icons, images, blank areas — and for repeated/identical elements (you pick the specific one by position).");
-                sb.AppendLine("- LOOK, THEN ACT: every action returns a fresh gridded screenshot — verify the result before the next step. If the screen isn't what you expected, screenshot again and re-measure; never repeat a failed action unchanged. If a click misses, re-read the grid and adjust the coordinates.");
+                sb.AppendLine("- LOOK, THEN ACT: every action returns a short CLIP — a sequence of frames (oldest→newest) showing what happened DURING it, ending in the current gridded state. The LAST frame is the live screen: measure clicks ONLY from it. The earlier frames are there to catch things that flashed by and vanished (a toast/error, a menu that opened then closed, a page transition, what scrolled past) — read them for WHAT HAPPENED, never for click coordinates. A still screen returns a single frame. Verify the result before the next step; if the screen isn't what you expected, screenshot again and re-measure; never repeat a failed action unchanged.");
                 sb.AppendLine("- CAN'T SEE IT? SCROLL. If the element/answer you need isn't on screen, computer_scroll({direction:\"down\"}) (or up/left/right) and screenshot again — keep scrolling to explore long pages. Hover the cursor over the pane you want to scroll by passing its x,y.");
                 sb.AppendLine("- FULL MOUSE+KEYBOARD: you have everything a human at the keyboard/mouse does — left/right/middle click, double/triple-click (clicks:2/3), modifier-clicks (computer_click modifiers:[\"ctrl\"|\"shift\"|\"alt\"]), hover (computer_move), drag-and-drop (computer_drag), press-and-HOLD (computer_mouse_down/up, computer_key_down/up — e.g. hold Shift across clicks to range-select, or drag a slider), type text, key chords (computer_key), and scroll. Always pair a *_down with its *_up.");
                 sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
@@ -456,6 +456,30 @@ namespace Omnipotent.Services.KliveAgent
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts" => true,
             _ => false
         };
+
+        /// <summary>Trim a turn's accumulated clip frames to a total budget, preserving chronological order.
+        /// Every action's settled (current-state) frame is kept first; the remaining budget is filled with the
+        /// most RECENT intermediate motion frames. So a frame-heavy turn loses old in-between frames before it
+        /// ever loses an action's end-state — and when settled frames alone exceed the cap, the newest win.</summary>
+        private static List<(byte[] data, string mimeType)> BudgetClipFrames(List<(byte[] data, string mimeType, bool settled)> all, int cap)
+        {
+            if (all.Count <= cap)
+                return all.Select(f => (f.data, f.mimeType)).ToList();
+
+            var keep = new bool[all.Count];
+            int kept = 0;
+            // 1) keep settled (current-state) frames, newest first
+            for (int i = all.Count - 1; i >= 0 && kept < cap; i--)
+                if (all[i].settled) { keep[i] = true; kept++; }
+            // 2) fill the rest with the most recent intermediate frames
+            for (int i = all.Count - 1; i >= 0 && kept < cap; i--)
+                if (!all[i].settled && !keep[i]) { keep[i] = true; kept++; }
+
+            var outList = new List<(byte[] data, string mimeType)>();
+            for (int i = 0; i < all.Count; i++)
+                if (keep[i]) outList.Add((all[i].data, all[i].mimeType));
+            return outList;
+        }
 
         /// <summary>Runs a native tool, capturing success/failure as a value instead of throwing, so it
         /// can be awaited from a pre-launched parallel task or inline with identical handling.</summary>
@@ -1340,9 +1364,12 @@ namespace Omnipotent.Services.KliveAgent
 
                     int scriptCountThisIter = 0;
                     int errorCountThisIter = 0;
-                    // Screenshots from computer-use tools this turn, fed to the vision model as a user image
-                    // message AFTER all role:"tool" results (providers require tool results to stay text-only).
-                    var pendingModelImages = new List<(byte[] data, string mimeType)>();
+                    // Motion-clip frames from computer-use tools this turn, fed to the vision model as a user
+                    // image message AFTER all role:"tool" results (providers require tool results to stay
+                    // text-only). Each action contributes an ordered filmstrip (intermediate motion frames +
+                    // a final settled frame); the `settled` flag lets the per-turn budget keep current-state
+                    // frames while trimming intermediates when a multi-action turn gets frame-heavy.
+                    var pendingModelImages = new List<(byte[] data, string mimeType, bool settled)>();
                     // True once at least one script's result has been delivered as a role:"tool" message.
                     // When set, the trailing guidance goes back as a plain user turn (observations are
                     // already in the tool results); when not, observations themselves are sent back.
@@ -1415,8 +1442,21 @@ namespace Omnipotent.Services.KliveAgent
                                     llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName, crText);
                                     anyToolResultsAppended = true;
                                 }
-                                if (useToolCalling && cr.ModelImageJpeg != null)
-                                    pendingModelImages.Add((cr.ModelImageJpeg, "image/jpeg"));
+                                if (useToolCalling)
+                                {
+                                    // Feed the whole clip (oldest→newest) so the model sees what happened during
+                                    // the action, not just the end-state. Fall back to the single settled frame.
+                                    if (cr.ModelImageFrames != null && cr.ModelImageFrames.Count > 0)
+                                    {
+                                        foreach (var f in cr.ModelImageFrames)
+                                            if (f.Jpeg != null && f.Jpeg.Length > 0)
+                                                pendingModelImages.Add((f.Jpeg, "image/jpeg", f.IsSettled));
+                                    }
+                                    else if (cr.ModelImageJpeg != null)
+                                    {
+                                        pendingModelImages.Add((cr.ModelImageJpeg, "image/jpeg", true));
+                                    }
+                                }
 
                                 continue;
                             }
@@ -1532,11 +1572,16 @@ namespace Omnipotent.Services.KliveAgent
                         }
                     }
 
-                    // Feed any computer-use screenshots to the vision model as ONE user image turn, after all
+                    // Feed any computer-use clip frames to the vision model as ONE user image turn, after all
                     // role:"tool" results (which must stay text-only). Reuses KliveLLM's existing vision path.
                     if (useToolCalling && pendingModelImages.Count > 0)
                     {
-                        try { llm.AppendUserContentToToolSession(llmSessionId, "Screenshot(s) from the computer action(s) above:", pendingModelImages, keepRecentImages: retainedScreenshots); }
+                        // Per-turn frame budget: a multi-action turn can pile up many frames. Cap the total,
+                        // dropping intermediate (motion) frames oldest-first while preserving every action's
+                        // settled current-state frame so on-screen state is never lost.
+                        int perTurnCap = Math.Max(1, await agentService.GetIntOmniSetting("KliveAgent_ClipMaxFramesPerTurn", 8));
+                        var framesToSend = BudgetClipFrames(pendingModelImages, perTurnCap);
+                        try { llm.AppendUserContentToToolSession(llmSessionId, "Frames from the computer action(s) above (oldest→newest; each action is a short clip ending in its current on-screen state — the newest frame). Read click coordinates only from the latest gridded frame; use the earlier frames to catch transient changes:", framesToSend, keepRecentImages: retainedScreenshots); }
                         catch { }
                     }
 
