@@ -103,6 +103,13 @@ namespace Omnipotent.Services.HostControl
         private volatile int clipMaxFrames = 4;
         private volatile int clipMotionThreshold = 2;
 
+        // Input humanization (curved/eased movement, click dwell, human typing cadence) — reduces the
+        // robot-like signal anti-bot/captcha systems score against. Refreshed per action like the clip config.
+        private volatile HumanizationLevel humanizationLevel = HumanizationLevel.Balanced;
+        private volatile bool humanizationTypos = false;
+        /// <summary>Fresh per-action humanization profile (null = humanization off → original instant input).</summary>
+        private HumanInputProfile? Human() => HumanInputProfile.Create(humanizationLevel, humanizationTypos);
+
         // ── OmniSettings-backed secret storage helpers (used by EncryptedMemoryStore) ──
         internal async Task SetSettingRaw(string key, string value) =>
             await ExecuteServiceMethod<OmniGlobalSettingsManager>("SetStringOmniSetting", key, value, this.serviceID, this.name);
@@ -406,6 +413,9 @@ namespace Omnipotent.Services.HostControl
                 clipWindowMs = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipWindowMs", 1200), 200, 6000);
                 clipMaxFrames = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipMaxFrames", 4), 1, 12);
                 clipMotionThreshold = Math.Clamp(await GetIntOmniSetting("KliveAgent_ClipMotionThreshold", 2), 1, 64);
+                // Refresh input-humanization config (same cadence) so the level/typo toggles take effect live.
+                humanizationLevel = HumanInputProfile.ParseLevel(await GetStringOmniSetting("KliveAgent_HumanizationLevel", defaultValue: "balanced"));
+                humanizationTypos = await GetBoolOmniSetting("KliveAgent_HumanizationTypos", defaultValue: false);
                 // Any tool call while inputs are held = the drag/hold is still in progress → keep it alive.
                 lock (holdLock) { if (heldButtons.Count > 0 || heldKeys.Count > 0) lastHoldUtc = DateTime.UtcNow; }
                 return await RunAsync(toolName, args, ct, onProgress);
@@ -454,8 +464,19 @@ namespace Omnipotent.Services.HostControl
                     return await MutatingAsync(ct, onProgress, "move", () =>
                     {
                         var (px, py) = MapToPhysical(IntOr(a, "x", 0), IntOr(a, "y", 0));
-                        NativeInput.MoveMouse(px, py);
+                        NativeInput.MoveMouse(px, py, Human(), ct);
                     }, label: $"move ({IntOr(a, "x", 0)},{IntOr(a, "y", 0)})", tx: IntOr(a, "x", 0), ty: IntOr(a, "y", 0));
+
+                case "computer_mouse_move_relative":
+                {
+                    int rdx = IntOr(a, "dx", 0), rdy = IntOr(a, "dy", 0);
+                    // Smooth the delta into sub-moves so games integrate it as real motion (not one big jump).
+                    int rsteps = Math.Clamp(IntOr(a, "steps", Math.Max(1, (Math.Abs(rdx) + Math.Abs(rdy)) / 40)), 1, 200);
+                    return await MutatingAsync(ct, onProgress, "mouse_move_relative", () =>
+                    {
+                        NativeInput.MoveMouseRelative(rdx, rdy, rsteps, 3);
+                    }, label: $"mouse Δ({rdx},{rdy})");
+                }
 
                 case "computer_click":
                 {
@@ -463,7 +484,7 @@ namespace Omnipotent.Services.HostControl
                     return await MutatingAsync(ct, onProgress, "click", () =>
                     {
                         var (px, py) = MapToPhysical(IntOr(a, "x", 0), IntOr(a, "y", 0));
-                        WithModifiers(mods, () => NativeInput.Click(px, py, ParseButton(Str(a, "button")), Math.Max(1, IntOr(a, "clicks", 1))));
+                        WithModifiers(mods, () => NativeInput.Click(px, py, ParseButton(Str(a, "button")), Math.Max(1, IntOr(a, "clicks", 1)), Human(), ct));
                     }, label: $"{ModLabel(mods)}click ({IntOr(a, "x", 0)},{IntOr(a, "y", 0)})", tx: IntOr(a, "x", 0), ty: IntOr(a, "y", 0));
                 }
 
@@ -475,7 +496,7 @@ namespace Omnipotent.Services.HostControl
                     {
                         var (fx, fy) = MapToPhysical(IntOr(a, "fromX", 0), IntOr(a, "fromY", 0));
                         var (tx2, ty2) = MapToPhysical(IntOr(a, "toX", 0), IntOr(a, "toY", 0));
-                        WithModifiers(mods, () => NativeInput.Drag(fx, fy, tx2, ty2, btn));
+                        WithModifiers(mods, () => NativeInput.Drag(fx, fy, tx2, ty2, btn, Human(), ct));
                     }, label: $"{ModLabel(mods)}drag", tx: IntOr(a, "toX", 0), ty: IntOr(a, "toY", 0));
                 }
 
@@ -521,7 +542,7 @@ namespace Omnipotent.Services.HostControl
                         int cx = a.TryGetProperty("x", out _) ? IntOr(a, "x", 0) : ScreenCenterX();
                         int cy = a.TryGetProperty("y", out _) ? IntOr(a, "y", 0) : ScreenCenterY();
                         var (px, py) = MapToPhysical(cx, cy);
-                        NativeInput.Scroll(px, py, fdy, fdx);
+                        NativeInput.Scroll(px, py, fdy, fdx, Human(), ct);
                     }, label: $"scroll {dirLabel} {Math.Max(Math.Abs(fdy), Math.Abs(fdx))}");
                 }
 
@@ -715,6 +736,11 @@ namespace Omnipotent.Services.HostControl
             var guard = OsGuard();
             if (guard != null) return guard;
 
+            // Reaction time: a human notices, THEN acts — a short randomized pause before the gesture (no-op
+            // when humanization is off). Cancellable; surfaces as "Action cancelled" upstream if stopped.
+            var reactionProfile = Human();
+            if (reactionProfile != null) await Task.Delay(reactionProfile.ReactionMs(), ct);
+
             // Start filming BEFORE the gesture so the clip spans the action itself (a menu that opens then the
             // click closes it, drag motion, a transition). Capture is read-only, so it runs concurrently with
             // act() without taking inputLock. When clips are off, keep the original fixed settle delay.
@@ -743,8 +769,20 @@ namespace Omnipotent.Services.HostControl
             var (resolved, used) = await substituter.ResolveAsync(raw);
             var redacted = substituter.Redact(raw);
 
+            var prof = Human();
+            // Typo simulation is HARD-OFF for secret-bearing text (used.Count > 0) — a credential must be typed
+            // exactly, never with an injected backspace-correction that could lock an account.
+            bool allowTypos = humanizationTypos && used.Count == 0;
+            if (prof != null) await Task.Delay(prof.ReactionMs(), ct); // reaction before typing
+
             await inputLock.WaitAsync(ct);
-            try { NativeInput.TypeUnicode(resolved); await Task.Delay(250, ct); }
+            try
+            {
+                if (prof != null)
+                    await NativeInput.TypeUnicodeHumanAsync(resolved, prof, allowTypos, ct,
+                        onTick: () => onProgress(new HostControlProgress { Note = "typing…", Activity = new AgentActivityEvent { Kind = "action", Text = "typing" } }));
+                else { NativeInput.TypeUnicode(resolved); await Task.Delay(250, ct); }
+            }
             finally { inputLock.Release(); }
 
             if (used.Count > 0) await ServiceLog($"[HostControl] typed text using secrets: {string.Join(", ", used)}");
@@ -764,16 +802,29 @@ namespace Omnipotent.Services.HostControl
                 keys = new[] { single.GetString()! };
             if (keys == null || keys.Length == 0) return ComputerToolResult.Fail("Provide 'key' or 'keys'.");
 
-            bool ok;
+            // Hold each press briefly so games (which poll input per frame) register it; repeat for "tap N
+            // times" (e.g. move a menu cursor down 3). Defaults stay snappy for normal app/browser chords.
+            int holdMs = Math.Clamp(IntOr(a, "holdMs", 55), 1, 2000);
+            int repeats = Math.Clamp(IntOr(a, "repeats", 1), 1, 50);
+
+            bool ok = true;
             await inputLock.WaitAsync(ct);
-            try { ok = NativeInput.TryPressKeys(keys); await Task.Delay(250, ct); }
+            try
+            {
+                for (int r = 0; r < repeats && ok; r++)
+                {
+                    ok = NativeInput.TryPressKeys(keys, holdMs);
+                    if (r < repeats - 1) await Task.Delay(70, ct); // gap between repeated taps so each is distinct
+                }
+                await Task.Delay(120, ct);
+            }
             finally { inputLock.Release(); }
 
             if (!ok) return ComputerToolResult.Fail($"Unrecognized key(s): {string.Join("+", keys)}.");
-            var label = $"press {string.Join("+", keys)}";
+            var label = repeats > 1 ? $"press {string.Join("+", keys)} x{repeats}" : $"press {string.Join("+", keys)}";
             onProgress(new HostControlProgress { Note = label, Activity = new AgentActivityEvent { Kind = "action", Text = label } });
             var result = await CaptureClipAsync("active", label, null, null, null, ct);
-            result.Text = $"Pressed {string.Join("+", keys)}. " + result.Text;
+            result.Text = $"Pressed {string.Join("+", keys)}{(repeats > 1 ? $" {repeats} times" : "")}. " + result.Text;
             return result;
         }
 
@@ -1016,7 +1067,7 @@ namespace Omnipotent.Services.HostControl
             return await MutatingAsync(ct, onProgress, "confirm-click", () =>
             {
                 var (px, py) = MapToPhysical(x, y);
-                NativeInput.Click(px, py, ParseButton(Str(a, "button")));
+                NativeInput.Click(px, py, ParseButton(Str(a, "button")), 1, Human(), ct);
             }, label: $"APPROVED click: {Trim(summary, 40)}", tx: x, ty: y);
         }
 
@@ -1203,12 +1254,13 @@ namespace Omnipotent.Services.HostControl
             bool hasXY = a.TryGetProperty("x", out _) && a.TryGetProperty("y", out _);
             int x = IntOr(a, "x", 0), y = IntOr(a, "y", 0);
 
+            var prof = Human();
             await inputLock.WaitAsync(ct);
             try
             {
                 var (px, py) = hasXY ? MapToPhysical(x, y) : NativeInput.GetCursorPosition();
-                if (down) NativeInput.MouseButtonDown(px, py, button); else NativeInput.MouseButtonUp(px, py, button);
-                await Task.Delay(120, ct);
+                if (down) NativeInput.MouseButtonDown(px, py, button, prof, ct); else NativeInput.MouseButtonUp(px, py, button, prof, ct);
+                if (prof == null) await Task.Delay(120, ct);
             }
             finally { inputLock.Release(); }
 
