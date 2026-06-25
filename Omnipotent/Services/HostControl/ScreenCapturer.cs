@@ -323,7 +323,7 @@ namespace Omnipotent.Services.HostControl
         }
 
         /// <summary>Mean absolute luma delta between two equal-size thumbnails (0 = identical, 255 = inverted).</summary>
-        private static double ThumbDelta(byte[] a, byte[] b)
+        public static double ThumbDelta(byte[] a, byte[] b)
         {
             if (a == null || b == null || a.Length == 0 || a.Length != b.Length) return 255;
             long sum = 0;

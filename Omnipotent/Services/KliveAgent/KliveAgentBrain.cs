@@ -573,15 +573,17 @@ namespace Omnipotent.Services.KliveAgent
 
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
-                    "Use this whenever you must wait for someone/something else: a person to act, a remote state to change, a file/email/build to appear. " +
-                    "Observe ONE of: 'url' (poll an HTTP GET) or 'check' (a short C# probe that Log()s the value to watch). " +
-                    "Stop condition 'until': \"change\" (default — returns as soon as the observable differs from now), \"contains\" (returns when it contains 'target'), or \"true\". " +
-                    "It blocks (heartbeating, no LLM cost while waiting) up to maxMinutes, polling every intervalSeconds, and returns the new value so your NEXT turn can react. " +
-                    "For on-SCREEN waits prefer computer_wait. NEVER hand-roll a long polling loop in execute_csharp — it gets killed at the per-script timeout.",
+                    "Use this whenever you must wait for someone/something else: a person to act (incl. in a GUI/game), a remote state to change, a file/email/build to appear. " +
+                    "Observe ONE of: watch:\"screen\" (wait until the SCREEN changes — the right choice for games/GUIs, e.g. an opponent's move; uses a perceptual diff so a ticking clock doesn't trigger it, tune with 'threshold'), 'url' (poll an HTTP GET), or 'check' (a short C# probe that Log()s the value to watch). If you give none, it watches the screen. " +
+                    "Stop condition 'until' (url/check only): \"change\" (default), \"contains\" (returns when it contains 'target'), or \"true\". " +
+                    "It blocks (heartbeating, no LLM cost while waiting) up to maxMinutes, polling every intervalSeconds, and ALWAYS returns — the moment the event fires, or with a 'no change yet, decide what to do' summary at maxMinutes, or early if a url/check probe keeps erroring (so a broken check never hangs). " +
+                    "For a SHORT settle right after your own action, computer_wait is simpler. NEVER hand-roll a long polling loop in execute_csharp — it gets killed at the per-script timeout.",
                     new { type = "object", properties = new {
-                        url = new { type = "string", description = "URL to poll with a GET (use this OR 'check')." },
-                        check = new { type = "string", description = "A short C# probe that Log()s the value to watch (use this OR 'url'). Fully general: services, files, DOM, etc." },
-                        until = new { type = "string", description = "\"change\" (default) | \"contains\" | \"true\"." },
+                        watch = new { type = "string", description = "\"screen\" to wait until the display changes (no url/check needed). Best for games/GUIs / waiting on another player." },
+                        threshold = new { type = "number", description = "For watch:\"screen\": how big a change counts (mean 0..255 perceptual delta, default 2). Lower = more sensitive; raise if minor animation keeps tripping it." },
+                        url = new { type = "string", description = "URL to poll with a GET (use this OR 'check' OR watch:\"screen\")." },
+                        check = new { type = "string", description = "A short C# probe that Log()s the value to watch. Fully general: services, files, DOM, etc." },
+                        until = new { type = "string", description = "\"change\" (default) | \"contains\" | \"true\" (url/check only)." },
                         target = new { type = "string", description = "Text to wait for when until=\"contains\"." },
                         intervalSeconds = new { type = "integer", description = "Poll cadence (default 5, min 2)." },
                         maxMinutes = new { type = "integer", description = "Max time to wait (default 20)." }
@@ -821,13 +823,55 @@ namespace Omnipotent.Services.KliveAgent
 
             string? url = Str("url");
             string? check = Str("check");
-            if (string.IsNullOrWhiteSpace(url) && string.IsNullOrWhiteSpace(check))
-                return (false, "wait_for needs either 'url' (an HTTP GET to poll) or 'check' (a C# probe that Log()s the value to watch).");
+            string watch = (Str("watch") ?? "").Trim().ToLowerInvariant();
 
             string until = (Str("until") ?? "change").Trim().ToLowerInvariant();
             string? target = Str("target");
             int interval = Math.Clamp(IntOr("intervalSeconds", await agentService.GetIntOmniSetting("KliveAgent_WaitPollSeconds", 5)), 2, 300);
             int maxMin = Math.Clamp(IntOr("maxMinutes", await agentService.GetIntOmniSetting("KliveAgent_MaxWaitMinutes", 20)), 1, 720);
+
+            // SCREEN watcher: "wait until the screen changes" — the right tool when waiting on a GUI/game/another
+            // player (e.g. an opponent's move) where the observable is the screen itself. Explicit watch:"screen",
+            // or implied when no url/check is given. Uses a perceptual diff so a ticking clock / cursor blink
+            // doesn't count, but a real change (a piece moves, a dialog appears) does. Always bounded; returns the
+            // moment it changes so the next turn can screenshot and react.
+            bool screenMode = watch is "screen" or "display" || (string.IsNullOrWhiteSpace(url) && string.IsNullOrWhiteSpace(check));
+            if (screenMode)
+            {
+                var hcm = agentService.GetServiceByName("HostControlManager") as HostControlManager;
+                if (hcm == null)
+                    return (false, "Can't watch the screen — HostControl isn't available. Provide 'url' or 'check', or use computer_wait.");
+
+                double threshold = a.TryGetProperty("threshold", out var te) && te.TryGetDouble(out var tv) ? tv : 2.0;
+                threshold = Math.Clamp(threshold, 0.5, 64);
+                var baseSig = hcm.CaptureScreenSignature();
+                var swScreen = System.Diagnostics.Stopwatch.StartNew();
+                long maxMsScreen = (long)maxMin * 60_000L;
+                int lastHbScreen = 0;
+                double maxSeen = 0;
+                while (swScreen.ElapsedMilliseconds < maxMsScreen)
+                {
+                    if (ct.IsCancellationRequested) return (false, "Wait cancelled (run stopped).");
+                    try { await Task.Delay(interval * 1000, ct); }
+                    catch (OperationCanceledException) { return (false, "Wait cancelled (run stopped)."); }
+
+                    var cur = hcm.CaptureScreenSignature();
+                    if (baseSig == null) { baseSig = cur; continue; } // recover if the first capture failed
+                    if (cur != null)
+                    {
+                        double d = HostControlManager.ScreenSignatureDelta(baseSig, cur);
+                        if (d > maxSeen) maxSeen = d;
+                        if (d >= threshold)
+                            return (true, $"The screen changed after {swScreen.ElapsedMilliseconds / 1000}s (Δ={d:F1} ≥ {threshold:F1}). Take a screenshot to see the new state and continue.");
+                    }
+                    if (swScreen.ElapsedMilliseconds - lastHbScreen >= 5000)
+                    {
+                        lastHbScreen = (int)swScreen.ElapsedMilliseconds;
+                        heartbeat($"watching the screen for a change… ({swScreen.ElapsedMilliseconds / 1000}s elapsed)");
+                    }
+                }
+                return (true, $"Watched the screen for {maxMin} min with no change ≥ threshold {threshold:F1} (biggest change seen was Δ={maxSeen:F1}). If the event likely DID happen, screenshot now or wait_for again with threshold a little below {maxSeen:F1}; otherwise proceed.");
+            }
 
             // Probe via a DEDICATED throwaway script session so it can't pollute the agent's main session.
             KliveAgentScriptEngine.ScriptExecutionSession? probe =
@@ -871,6 +915,7 @@ namespace Omnipotent.Services.KliveAgent
             var sw = System.Diagnostics.Stopwatch.StartNew();
             long maxMs = (long)maxMin * 60_000L;
             int lastHb = 0;
+            int errStreak = 0;
             while (sw.ElapsedMilliseconds < maxMs)
             {
                 if (ct.IsCancellationRequested) return (false, "Wait cancelled (run stopped).");
@@ -885,6 +930,17 @@ namespace Omnipotent.Services.KliveAgent
                 // observable to come BACK (baseline was itself an error). Otherwise keep waiting.
                 bool curErr = cur.StartsWith("HTTP_ERROR", StringComparison.Ordinal) || cur.StartsWith("PROBE_ERROR", StringComparison.Ordinal);
                 bool baseErr = baseline.StartsWith("HTTP_ERROR", StringComparison.Ordinal) || baseline.StartsWith("PROBE_ERROR", StringComparison.Ordinal);
+
+                // A BROKEN probe (compile error, bad URL, screenshot that always fails) must not silently burn
+                // the whole maxMinutes looking like a hang. If it keeps erroring and we aren't explicitly
+                // waiting for it to recover, bail early with the error so the agent fixes its approach.
+                if (curErr && !baseErr)
+                {
+                    if (++errStreak >= 4)
+                        return (false, $"wait_for's {(http != null ? "url" : "check")} kept failing ({errStreak}× in a row): {Trunc(cur)}\nFix the probe, or use watch:\"screen\" / computer_wait instead of polling a broken check.");
+                }
+                else errStreak = 0;
+
                 if (!(curErr && !baseErr) && Met(baseline, cur))
                     return (true, $"Condition met after {sw.ElapsedMilliseconds / 1000}s. Current value:\n{Trunc(cur)}");
 

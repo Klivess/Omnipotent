@@ -1219,6 +1219,18 @@ namespace Omnipotent.Services.HostControl
         {
             try { return capturer.CaptureActiveWindow(640, 40).Jpeg; } catch { return null; }
         }
+
+        /// <summary>A cheap perceptual signature of the WHOLE screen (a 32×32 grayscale thumbnail) for
+        /// change detection — used by wait_for's screen watcher. Robust to tiny noise (a ticking clock barely
+        /// moves the mean) while catching real changes. Null if capture fails.</summary>
+        public byte[]? CaptureScreenSignature()
+        {
+            try { return ScreenCapturer.GrayThumb(capturer.CaptureVirtualScreen(480, 35).Jpeg); }
+            catch { return null; }
+        }
+
+        /// <summary>Mean perceptual delta (0..255) between two screen signatures from <see cref="CaptureScreenSignature"/>.</summary>
+        public static double ScreenSignatureDelta(byte[] a, byte[] b) => ScreenCapturer.ThumbDelta(a, b);
         private static bool HashEqual(byte[] a, byte[] b)
         {
             using var sha = SHA1.Create();
