@@ -30,6 +30,9 @@ namespace Omnipotent.Services.KliveAgent
         private readonly ConcurrentDictionary<string, AgentPendingChatResponse> pendingApiResponses = new();
         private int initializationState = InitializationStateStarting;
         private string initializationMessage = "KliveAgent is initializing.";
+        // 0..100 setup progress for the website's loading bar; 100 == ready to talk. Advanced step-by-step
+        // through ServiceMain so the bar reflects the (codebase-index-dominated) warmup actually happening.
+        private volatile int initializationProgress = 0;
 
         // Discord DM handler delegate — set by KliveBotDiscord when agent is active.
         // Args: (messageContent, channelId, authorDiscordId). KliveAgent only serves Klives over Discord.
@@ -58,7 +61,7 @@ namespace Omnipotent.Services.KliveAgent
 
             try
             {
-                initializationMessage = "KliveAgent is warming up internal subsystems.";
+                SetInitProgress(3, "Warming up internal subsystems…");
 
                 // Ensure data directories exist
                 await EnsureDirectories();
@@ -69,12 +72,14 @@ namespace Omnipotent.Services.KliveAgent
                 await Stats.InitializeAsync();
 
                 // Initialize subsystems
+                SetInitProgress(15, "Starting the script engine…");
                 scriptEngine = new KliveAgentScriptEngine(this);
                 scriptEngine.Initialize();
                 // Pay Roslyn's cold-start now (overlapped with the rest of init below) so the user's first
                 // script doesn't eat the ~1s+ first-compile penalty. Fire-and-forget; safe if it fails.
                 _ = scriptEngine.WarmupAsync();
 
+                SetInitProgress(30, "Loading memory…");
                 Memory = new KliveAgentMemory(this);
                 await Memory.InitializeAsync();
 
@@ -92,20 +97,24 @@ namespace Omnipotent.Services.KliveAgent
                     await ServiceLogError(pruneEx, "[KliveAgent] Memory prune failed (non-fatal).");
                 }
 
+                SetInitProgress(45, "Restoring background tasks…");
                 BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
                 await BackgroundTasks.InitializeAsync();
 
                 Capabilities = new KliveAgentCapabilityRegistry(this);
 
-                // Initialize codebase intelligence (spec Ch. 3, 4, 7)
+                // Initialize codebase intelligence (spec Ch. 3, 4, 7) — the slowest part of warmup.
+                SetInitProgress(55, "Indexing the codebase…");
                 var codebaseRoot = ResolveCodebaseRoot();
                 var indexCacheDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory);
                 CodebaseIndex = new KliveAgentCodebaseIndex(codebaseRoot, indexCacheDir);
                 await CodebaseIndex.InitializeAsync();
 
+                SetInitProgress(75, "Building the symbol graph…");
                 SymbolGraph = new KliveAgentSymbolGraph(CodebaseIndex);
                 await SymbolGraph.BuildAsync();
 
+                SetInitProgress(88, "Preparing the agent brain…");
                 RepoMap = new KliveAgentRepoMap(CodebaseIndex, SymbolGraph);
 
                 brain = new KliveAgentBrain(this, scriptEngine, Memory);
@@ -114,9 +123,10 @@ namespace Omnipotent.Services.KliveAgent
                 DiscordDMHandler = HandleDiscordDM;
 
                 // Load persisted conversations
+                SetInitProgress(95, "Loading conversations…");
                 await LoadConversationsAsync();
 
-                initializationMessage = "KliveAgent is ready.";
+                SetInitProgress(100, "KliveAgent is ready.");
                 Interlocked.Exchange(ref initializationState, InitializationStateReady);
 
                 // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
@@ -152,6 +162,29 @@ namespace Omnipotent.Services.KliveAgent
             statusCode = HttpStatusCode.Accepted;
             message = initializationMessage;
             return false;
+        }
+
+        /// <summary>Advance the setup progress (0..100) + the human-readable step message the website's
+        /// loading bar shows while KliveAgent warms up.</summary>
+        private void SetInitProgress(int percent, string message)
+        {
+            initializationProgress = Math.Clamp(percent, 0, 100);
+            initializationMessage = message;
+        }
+
+        /// <summary>Setup status for the website's loading bar. ready == true (progress 100) means the agent
+        /// can be talked to. Safe to call at any time, including before initialization finishes.</summary>
+        public (bool ready, string state, int progress, string message) GetInitializationStatus()
+        {
+            var currentState = Volatile.Read(ref initializationState);
+            string state = currentState switch
+            {
+                InitializationStateReady => "ready",
+                InitializationStateFailed => "failed",
+                _ => "starting",
+            };
+            int progress = currentState == InitializationStateReady ? 100 : Math.Clamp(initializationProgress, 0, 100);
+            return (currentState == InitializationStateReady, state, progress, initializationMessage);
         }
 
         // ── Codebase Root Resolution ──

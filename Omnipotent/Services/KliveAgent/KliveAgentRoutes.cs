@@ -19,6 +19,7 @@ namespace Omnipotent.Services.KliveAgent
 
         public async Task RegisterRoutes()
         {
+            await RegisterStatusRoute();
             await RegisterChatRoutes();
             await RegisterCapabilityRoutes();
             await RegisterConversationRoutes();
@@ -42,6 +43,19 @@ namespace Omnipotent.Services.KliveAgent
 
                 await handler(req);
             }, method, permission);
+        }
+
+        // ── Setup status (for the website's loading bar) ──
+        // Deliberately NOT wrapped in CreateRoute: that helper returns an error while the agent is still
+        // warming up, but THIS endpoint must answer during warmup so the page can show setup progress.
+
+        private async Task RegisterStatusRoute()
+        {
+            await service.CreateAPIRoute("/kliveagent/status", async (req) =>
+            {
+                var (ready, state, progress, message) = service.GetInitializationStatus();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message }));
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         // ── Chat ──
