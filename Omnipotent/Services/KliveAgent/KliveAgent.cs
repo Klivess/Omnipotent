@@ -322,13 +322,18 @@ namespace Omnipotent.Services.KliveAgent
                         onProgress: update =>
                         {
                             if (update.Text != null) pendingResponse.Response = update.Text;
-                            if (update.Scripts != null) pendingResponse.ScriptsExecuted = update.Scripts;
+                            // COPY-ON-WRITE the live lists: the poll route serializes this object from another
+                            // thread, and Newtonsoft throws "Collection was modified" (→ HTTP 500 on the poll)
+                            // if it enumerates a List while we mutate it. Always hand the reader a fresh,
+                            // immutable snapshot instead of mutating/sharing the run's live list.
+                            if (update.Scripts != null) pendingResponse.ScriptsExecuted = new List<AgentScriptResult>(update.Scripts);
                             pendingResponse.Iteration = update.Iteration;
                             pendingResponse.Phase = update.Phase;
                             pendingResponse.StatusNote = update.StatusNote;
                             pendingResponse.PromptTokens = update.PromptTokens;
                             pendingResponse.CompletionTokens = update.CompletionTokens;
-                            if (update.NewActivity != null) pendingResponse.Activity.Add(update.NewActivity);
+                            if (update.NewActivity != null)
+                                pendingResponse.Activity = new List<AgentActivityEvent>(pendingResponse.Activity) { update.NewActivity };
                             // Computer-use: stream the latest annotated frame (video) + any approval card.
                             if (update.Frame != null) pendingResponse.LatestFrame = Convert.ToBase64String(update.Frame);
                             if (update.Approval != null)

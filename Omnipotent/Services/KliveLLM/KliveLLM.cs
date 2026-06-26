@@ -463,12 +463,15 @@ namespace Omnipotent.Services.KliveLLM
             return false;
         }
 
-        /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id.</summary>
-        public void AppendToolResult(string sessionId, string toolCallId, string name, string content)
+        /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id. After appending,
+        /// OLD tool results are compacted (see <see cref="PruneOldToolResults"/>) so a long task's accumulated
+        /// script/observation output doesn't bloat the window — the model keeps the most recent results in full.</summary>
+        public void AppendToolResult(string sessionId, string toolCallId, string name, string content, int keepRecentFull = 16)
         {
             lock (sessions)
             {
                 if (sessions.TryGetValue(sessionId, out var s))
+                {
                     s.structuredMessages.Add(new HFWrapper.HFMessage
                     {
                         role = "tool",
@@ -476,6 +479,37 @@ namespace Omnipotent.Services.KliveLLM
                         name = name,
                         content = content ?? string.Empty
                     });
+                    PruneOldToolResults(s, keepRecentFull);
+                }
+            }
+        }
+
+        /// <summary>Shorten the CONTENT of tool-result messages older than the most recent <paramref name="keepRecent"/>,
+        /// replacing a long output with a tiny stub. The message and its tool_call_id/name pairing are KEPT (so the
+        /// tool-call protocol stays valid) — only the bulky, now-stale text is dropped. The model can always re-run a
+        /// tool to fetch fresh data. This is the text analog of <see cref="PruneOldToolImages"/>.</summary>
+        private static void PruneOldToolResults(KliveLLMSession s, int keepRecent, int stubOverChars = 240)
+        {
+            if (keepRecent < 1) keepRecent = 1;
+            var toolIdx = new List<int>();
+            for (int i = 0; i < s.structuredMessages.Count; i++)
+                if (s.structuredMessages[i].role == "tool") toolIdx.Add(i);
+
+            int toPrune = toolIdx.Count - keepRecent;
+            for (int k = 0; k < toPrune; k++)
+            {
+                var m = s.structuredMessages[toolIdx[k]];
+                if (m.content is string str && str.Length > stubOverChars)
+                {
+                    s.structuredMessages[toolIdx[k]] = new HFWrapper.HFMessage
+                    {
+                        role = "tool",
+                        tool_call_id = m.tool_call_id,
+                        name = m.name,
+                        content = str.Substring(0, 160).TrimEnd() +
+                            $"\n[…{str.Length - 160} chars of this earlier tool output trimmed to save context — re-run the tool if you still need it.]"
+                    };
+                }
             }
         }
 
