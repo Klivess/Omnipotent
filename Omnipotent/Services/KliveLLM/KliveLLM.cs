@@ -513,6 +513,81 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        // ── In-task context compaction ──
+        // A long agentic task adds one assistant+tool exchange per step; left unbounded the request grows into
+        // the hundreds-of-thousands of tokens, where the model loses the thread and MIS-PERCEIVES its own
+        // earlier context (re-running discovery, repeating mistakes it already corrected). When the session
+        // exceeds the budget we collapse the OLDER middle of the conversation into a compact deterministic
+        // digest (the task + the tool actions taken and their key outcomes) and keep the system prompt + the
+        // most recent exchanges verbatim — so the window stays sharp while the thread of work is preserved.
+        private const int InTaskCompactAboveTokens = 70000;
+        private const int InTaskKeepRecentMessages = 28;
+
+        private static int EstimateMessageTokens(HFWrapper.HFMessage m)
+        {
+            int chars = HFWrapper.ContentToText(m.content)?.Length ?? 0;
+            if (m.tool_calls != null)
+                foreach (var tc in m.tool_calls)
+                    chars += (tc.function?.name?.Length ?? 0) + (tc.function?.arguments?.Length ?? 0) + 8;
+            int tokens = chars / 4;
+            if (MessageHasImage(m)) tokens += 1100; // a downscaled screenshot the text estimate misses
+            return tokens;
+        }
+
+        private static void CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent)
+        {
+            var msgs = s.structuredMessages;
+            if (msgs.Count <= keepRecent + 2) return;
+            int total = 0;
+            foreach (var m in msgs) total += EstimateMessageTokens(m);
+            if (total <= aboveTokens) return;
+
+            int headStart = 0; // keep leading system message(s) verbatim
+            while (headStart < msgs.Count && msgs[headStart].role == "system") headStart++;
+
+            // Tail = last keepRecent messages, advanced so it does NOT begin on an ORPHAN tool result (one whose
+            // assistant tool_call would be in the dropped head) — that keeps the tool-call protocol valid.
+            int cut = Math.Max(headStart, msgs.Count - keepRecent);
+            while (cut < msgs.Count && msgs[cut].role == "tool") cut++;
+            if (cut <= headStart || cut >= msgs.Count) return; // nothing safe to drop / would empty the recent tail
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("[Context compacted to keep the window sharp. Digest of EARLIER steps this task — the verbatim messages were summarised. Trust this plus the recent messages below; DON'T redo discovery already shown here, and re-run a tool only if you need fresh detail:]");
+            for (int i = headStart; i < cut; i++)
+            {
+                var m = msgs[i];
+                var text = HFWrapper.ContentToText(m.content)?.Trim();
+                if (m.role == "user")
+                {
+                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("USER: " + Clip(text, 240));
+                }
+                else if (m.role == "assistant")
+                {
+                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("you: " + Clip(text, 200));
+                    if (m.tool_calls != null)
+                        foreach (var tc in m.tool_calls)
+                            sb.AppendLine("  ⇒ called " + (tc.function?.name ?? "tool") + "(" + Clip(tc.function?.arguments ?? "", 120) + ")");
+                }
+                else if (m.role == "tool")
+                {
+                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("  ⤷ " + (m.name ?? "result") + ": " + Clip(FirstLine(text), 200));
+                }
+            }
+            var digest = sb.ToString();
+            const int digestMaxChars = 6000; // keep the TAIL (most recent progress) when the digest itself is long
+            if (digest.Length > digestMaxChars)
+                digest = digest.Substring(0, 420) + "\n…(older steps elided)…\n" + digest.Substring(digest.Length - (digestMaxChars - 440));
+
+            var rebuilt = new List<HFWrapper.HFMessage>(msgs.Count - (cut - headStart) + 1);
+            for (int i = 0; i < headStart; i++) rebuilt.Add(msgs[i]);
+            rebuilt.Add(new HFWrapper.HFMessage { role = "user", content = digest });
+            for (int i = cut; i < msgs.Count; i++) rebuilt.Add(msgs[i]);
+            s.structuredMessages = rebuilt;
+
+            static string Clip(string x, int n) => string.IsNullOrEmpty(x) ? "" : (x.Length <= n ? x : x.Substring(0, n) + "…");
+            static string FirstLine(string x) { int nl = x.IndexOf('\n'); return nl < 0 ? x : x.Substring(0, nl); }
+        }
+
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
@@ -524,6 +599,9 @@ namespace Omnipotent.Services.KliveLLM
             {
                 if (!sessions.TryGetValue(sessionId, out session))
                     return new KliveLLMResponse { Success = false, ErrorMessage = "Tool session not found. Call StartToolSession first.", SessionId = sessionId };
+                // Keep the request from spiralling into hundreds-of-thousands of tokens (where the model
+                // mis-perceives its own context). Compacts the older middle in place when over budget.
+                CompactToolSessionIfNeeded(session, InTaskCompactAboveTokens, InTaskKeepRecentMessages);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 

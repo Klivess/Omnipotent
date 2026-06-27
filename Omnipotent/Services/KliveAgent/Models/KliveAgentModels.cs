@@ -442,10 +442,19 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("runtimeType")]
         public string? RuntimeType { get; set; }
 
+        /// <summary>Best-effort string of the member's live VALUE at discovery time (fields and simple
+        /// parameterless property getters; truncated, side-effect-guarded). Null = method, unreadable, or a
+        /// getter that threw. Lets a script read <c>m.Value</c> directly instead of a follow-up
+        /// CallObjectMethod("get_X") per member — which is exactly the pattern that bloated long runs.</summary>
+        [JsonProperty("value")]
+        public string? Value { get; set; }
+
         public override string ToString()
         {
             if (Signature != null) return Signature;
-            var state = IsNull == true ? " = null" : (RuntimeType != null ? $" = {RuntimeType}" : string.Empty);
+            var state = Value != null ? $" = {Value}"
+                : IsNull == true ? " = null"
+                : (RuntimeType != null ? $" = {RuntimeType}" : string.Empty);
             return $"{Kind} {Type} {Name}{state}";
         }
     }

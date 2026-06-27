@@ -652,16 +652,18 @@ namespace Omnipotent.Services.KliveAgent
                         // null-state + the real runtime type at discovery time instead of via NullReferenceException.
                         bool? isNull = null;
                         string? runtimeType = null;
+                        string? value = null;
                         try
                         {
                             var val = f.GetValue(f.IsStatic ? null : obj);
                             isNull = val == null;
                             if (val != null && val.GetType() != f.FieldType)
                                 runtimeType = SimplifyTypeName(val.GetType());
+                            value = SafeMemberValueString(val);
                         }
                         catch { }
 
-                        result.Add(new AgentObjectMember { Kind = "field", Visibility = f.IsPublic ? "public" : "private", Name = f.Name, Type = SimplifyTypeName(f.FieldType), IsStatic = f.IsStatic, IsNull = isNull, RuntimeType = runtimeType });
+                        result.Add(new AgentObjectMember { Kind = "field", Visibility = f.IsPublic ? "public" : "private", Name = f.Name, Type = SimplifyTypeName(f.FieldType), IsStatic = f.IsStatic, IsNull = isNull, RuntimeType = runtimeType, Value = value });
                     }
 
             if (WantKind("property"))
@@ -669,7 +671,28 @@ namespace Omnipotent.Services.KliveAgent
                     .Where(p => p.GetIndexParameters().Length == 0)
                     .OrderBy(p => p.Name))
                     if (NameOk(p.Name))
-                        result.Add(new AgentObjectMember { Kind = "property", Visibility = ((p.GetMethod ?? p.SetMethod)?.IsPublic == true) ? "public" : "private", Name = p.Name, Type = SimplifyTypeName(p.PropertyType), IsStatic = (p.GetMethod ?? p.SetMethod)?.IsStatic == true });
+                    {
+                        // Read the getter best-effort so the agent gets m.Value directly. Guarded: parameterless
+                        // readable getters only, all exceptions swallowed (a throwing/lazy getter just yields null),
+                        // value truncated. This kills the repeated "read each property via a separate
+                        // CallObjectMethod(get_X)" pattern that balloons context on long inspection runs.
+                        var getter = p.GetMethod;
+                        bool? pIsNull = null;
+                        string? pRuntime = null;
+                        string? pValue = null;
+                        if (getter != null && getter.IsPublic)
+                        {
+                            try
+                            {
+                                var val = p.GetValue(getter.IsStatic ? null : obj);
+                                pIsNull = val == null;
+                                if (val != null && val.GetType() != p.PropertyType) pRuntime = SimplifyTypeName(val.GetType());
+                                pValue = SafeMemberValueString(val);
+                            }
+                            catch { }
+                        }
+                        result.Add(new AgentObjectMember { Kind = "property", Visibility = ((p.GetMethod ?? p.SetMethod)?.IsPublic == true) ? "public" : "private", Name = p.Name, Type = SimplifyTypeName(p.PropertyType), IsStatic = (p.GetMethod ?? p.SetMethod)?.IsStatic == true, IsNull = pIsNull, RuntimeType = pRuntime, Value = pValue });
+                    }
 
             if (WantKind("method"))
                 foreach (var m in GetDeepMethods(type)
@@ -682,6 +705,32 @@ namespace Omnipotent.Services.KliveAgent
                     }
 
             return result;
+        }
+
+        /// <summary>Best-effort, side-effect-safe string of a discovered member value for AgentObjectMember.Value.
+        /// Scalars/enums/dates render directly; collections are summarised by count (never dumped — that's what
+        /// balloons context); objects with no useful ToString return null; everything is truncated.</summary>
+        private string? SafeMemberValueString(object? val)
+        {
+            if (val == null) return null;
+            try
+            {
+                if (val is string s) return Trunc(s);
+                var t = val.GetType();
+                if (t.IsPrimitive || t.IsEnum || val is decimal || val is DateTime || val is DateTimeOffset || val is TimeSpan || val is Guid)
+                    return val.ToString();
+                if (val is System.Collections.IEnumerable en)
+                {
+                    int n = 0; foreach (var _ in en) { if (++n > 1000) break; }
+                    return $"{SimplifyTypeName(t)} ({n} item{(n == 1 ? "" : "s")})";
+                }
+                var str = val.ToString();
+                if (string.IsNullOrEmpty(str) || str == t.ToString() || str == t.FullName) return null; // ToString not overridden → uninformative
+                return Trunc(str);
+            }
+            catch { return null; }
+
+            static string Trunc(string x) => x.Length <= 200 ? x : x.Substring(0, 200) + "…";
         }
 
         // ── Output ──
