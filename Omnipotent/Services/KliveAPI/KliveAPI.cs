@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using System.Net;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System.Web;
 using System.Collections.Specialized;
 using Omnipotent.Profiles;
@@ -48,24 +49,24 @@ namespace Omnipotent.Services.KliveAPI
             public KMProfileManager.KMPermissions authenticationLevelRequired;
             public HttpMethod method;
             public string normalizedMethod;
-
-            public List<TimeSpan> TimeTakenToProcess;
-            public async Task InvokeAction(UserRequest request)
-            {
-                Stopwatch stopwatch = Stopwatch.StartNew();
-                await action(request);
-                stopwatch.Stop();
-                if (TimeTakenToProcess == null)
-                {
-                    TimeTakenToProcess = new List<TimeSpan>();
-                }
-                TimeTakenToProcess.Add(stopwatch.Elapsed);
-            }
         }
         public struct WebSocketRouteInfo
         {
             public Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler;
             public KMProfileManager.KMPermissions authenticationLevelRequired;
+        }
+
+        /// <summary>
+        /// Receives a route handler's response instead of the real HttpListener
+        /// response when a UserRequest runs as a /batch sub-request.
+        /// </summary>
+        public sealed class CapturedResponse
+        {
+            public int StatusCode = 200;
+            public string ContentType = "application/json";
+            public NameValueCollection Headers = new();
+            public byte[] Body = Array.Empty<byte>();
+            public bool Completed;
         }
 
         public struct UserRequest
@@ -78,13 +79,19 @@ namespace Omnipotent.Services.KliveAPI
             public string userMessageContent;
             public byte[] userMessageBytes;
 
+            // NOTE: UserRequest is a struct that gets copied around — any state that
+            // must survive copies has to be a reference type (copies share the ref).
+            [JsonIgnore]
+            internal Stopwatch? requestTimer;
+            [JsonIgnore]
+            internal CapturedResponse? capture;
+
             [JsonIgnore]
             public KliveAPI ParentService;
             public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
                 try
                 {
-                    HttpListenerResponse resp = context.Response;
                     if (contentType == "application/json")
                     {
                         if (OmniPaths.IsValidJson(response) != true)
@@ -92,6 +99,20 @@ namespace Omnipotent.Services.KliveAPI
                             response = JsonConvert.SerializeObject(response);
                         }
                     }
+
+                    // Batch sub-request: divert everything into the capture buffer,
+                    // leave the real HttpListener response untouched.
+                    if (capture != null)
+                    {
+                        capture.StatusCode = (int)code;
+                        capture.ContentType = contentType;
+                        if (headers != null) capture.Headers.Add(headers);
+                        capture.Body = Encoding.UTF8.GetBytes(response);
+                        capture.Completed = true;
+                        return;
+                    }
+
+                    HttpListenerResponse resp = context.Response;
                     resp.Headers.Set("Content-Type", contentType);
                     if (headers != null)
                     {
@@ -102,15 +123,54 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     if (req.HttpMethod == "OPTIONS")
                     {
-                        resp.Headers.Add("Access-Control-Allow-Headers", "*");
-                        resp.Headers.Add("Access-Control-Allow-Methods", "*");
-                        resp.Headers.Add("Access-Control-Max-Age", "1728000");
-                        resp.Headers.Add("Access-Control-Expose-Headers", "*");
+                        resp.Headers.Set("Access-Control-Allow-Headers", "*");
+                        resp.Headers.Set("Access-Control-Allow-Methods", "*");
+                        resp.Headers.Set("Access-Control-Max-Age", "1728000");
                     }
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.Headers.Add("Access-Control-Expose-Headers", "*");
+                    resp.Headers.Set("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Set("Access-Control-Expose-Headers", "*");
+                    SetTimingHeaders(resp);
 
                     byte[] buffer = Encoding.UTF8.GetBytes(response);
+
+                    // ETag / If-None-Match => 304 for successful GETs. Weak tag over the
+                    // uncompressed bytes (one tag covers every Content-Encoding), checked
+                    // before compression so matches cost no compression CPU.
+                    const int MaxETagPayloadBytes = 8 * 1024 * 1024;
+                    if (req.HttpMethod == "GET" && code == HttpStatusCode.OK
+                        && buffer.Length > 0 && buffer.Length <= MaxETagPayloadBytes)
+                    {
+                        string etag = HttpResponseHelpers.ComputeWeakETag(buffer);
+                        resp.Headers.Set("ETag", etag);
+                        resp.Headers.Set("Cache-Control", "private, no-cache");
+                        if (HttpResponseHelpers.ETagMatches(req.Headers["If-None-Match"], etag))
+                        {
+                            resp.StatusCode = (int)HttpStatusCode.NotModified;
+                            resp.ContentLength64 = 0;
+                            resp.OutputStream.Close();
+                            return;
+                        }
+                    }
+
+                    // Negotiated compression for compressible payloads worth the CPU.
+                    if (HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
+                    {
+                        resp.Headers.Set("Vary", "Accept-Encoding");
+                        if (buffer.Length >= 1024 && string.IsNullOrEmpty(resp.Headers["Content-Encoding"]))
+                        {
+                            var encoding = HttpResponseHelpers.PickEncoding(req.Headers["Accept-Encoding"]);
+                            if (encoding != HttpResponseHelpers.ContentEncoding.None)
+                            {
+                                byte[] compressed = HttpResponseHelpers.Compress(buffer, encoding);
+                                if (compressed.Length < buffer.Length)
+                                {
+                                    buffer = compressed;
+                                    resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
+                                }
+                            }
+                        }
+                    }
+
                     resp.ContentLength64 = buffer.Length;
                     resp.StatusCode = (int)code;
                     using Stream ros = resp.OutputStream;
@@ -119,6 +179,14 @@ namespace Omnipotent.Services.KliveAPI
                 catch (Exception ex)
                 {
                     ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
+                    if (capture != null)
+                    {
+                        capture.StatusCode = (int)HttpStatusCode.InternalServerError;
+                        capture.ContentType = "text/plain";
+                        capture.Body = Encoding.UTF8.GetBytes("Error occurred on server.");
+                        capture.Completed = true;
+                        return;
+                    }
                     try
                     {
                         context.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
@@ -139,12 +207,19 @@ namespace Omnipotent.Services.KliveAPI
             {
                 try
                 {
+                    if (capture != null)
+                    {
+                        capture.StatusCode = (int)code;
+                        capture.ContentType = contentType;
+                        if (headers != null) capture.Headers.Add(headers);
+                        capture.Body = data;
+                        capture.Completed = true;
+                        return;
+                    }
+
                     HttpListenerResponse resp = context.Response;
                     resp.ContentType = contentType;
                     resp.StatusCode = (int)code;
-                    resp.ContentLength64 = data.Length;
-                    resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                    resp.Headers.Add("Access-Control-Expose-Headers", "*");
                     if (headers != null)
                     {
                         for (int i = 0; i < headers.Count; i++)
@@ -152,8 +227,34 @@ namespace Omnipotent.Services.KliveAPI
                             resp.Headers.Add(headers.GetKey(i), headers.Get(i));
                         }
                     }
+                    resp.Headers.Set("Access-Control-Allow-Origin", "*");
+                    resp.Headers.Set("Access-Control-Expose-Headers", "*");
+                    SetTimingHeaders(resp);
+
+                    byte[] buffer = data;
+                    // Same negotiated compression as ReturnResponse; the content-type
+                    // allowlist naturally skips already-compressed media/archives.
+                    if (HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
+                    {
+                        resp.Headers.Set("Vary", "Accept-Encoding");
+                        if (buffer.Length >= 1024 && string.IsNullOrEmpty(resp.Headers["Content-Encoding"]))
+                        {
+                            var encoding = HttpResponseHelpers.PickEncoding(req.Headers["Accept-Encoding"]);
+                            if (encoding != HttpResponseHelpers.ContentEncoding.None)
+                            {
+                                byte[] compressed = HttpResponseHelpers.Compress(buffer, encoding);
+                                if (compressed.Length < buffer.Length)
+                                {
+                                    buffer = compressed;
+                                    resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
+                                }
+                            }
+                        }
+                    }
+
+                    resp.ContentLength64 = buffer.Length;
                     using Stream ros = resp.OutputStream;
-                    await ros.WriteAsync(data, 0, data.Length);
+                    await ros.WriteAsync(buffer, 0, buffer.Length);
                 }
                 catch (Exception ex)
                 {
@@ -163,12 +264,14 @@ namespace Omnipotent.Services.KliveAPI
 
             public Stream PrepareStreamResponse(string contentType, long contentLength, HttpStatusCode code = HttpStatusCode.OK, NameValueCollection headers = null)
             {
+                if (capture != null)
+                {
+                    throw new NotSupportedException("Streaming routes cannot run inside /batch.");
+                }
                 HttpListenerResponse resp = context.Response;
                 resp.ContentType = contentType;
                 resp.StatusCode = (int)code;
                 resp.ContentLength64 = contentLength;
-                resp.Headers.Add("Access-Control-Allow-Origin", "*");
-                resp.Headers.Add("Access-Control-Expose-Headers", "*");
                 if (headers != null)
                 {
                     for (int i = 0; i < headers.Count; i++)
@@ -176,7 +279,29 @@ namespace Omnipotent.Services.KliveAPI
                         resp.Headers.Add(headers.GetKey(i), headers.Get(i));
                     }
                 }
+                resp.Headers.Set("Access-Control-Allow-Origin", "*");
+                resp.Headers.Set("Access-Control-Expose-Headers", "*");
+                SetTimingHeaders(resp);
                 return resp.OutputStream;
+            }
+
+            /// <summary>
+            /// Server-Timing lets browser devtools show real server processing time
+            /// on every response; Timing-Allow-Origin is required for the website's
+            /// cross-origin requests to read it.
+            /// </summary>
+            private void SetTimingHeaders(HttpListenerResponse resp)
+            {
+                try
+                {
+                    double ms = requestTimer?.Elapsed.TotalMilliseconds ?? 0;
+                    resp.Headers.Set("Server-Timing", $"app;dur={ms.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
+                    resp.Headers.Set("Timing-Allow-Origin", "*");
+                }
+                catch
+                {
+                    // Never let observability headers break a response.
+                }
             }
         }
 
@@ -222,6 +347,14 @@ namespace Omnipotent.Services.KliveAPI
 
                 ServiceLog($"Listening on: {string.Join(", ", listener.Prefixes)}");
 
+                // http.sys negotiates TLS 1.3 (saves 1 RTT on cold connections) only on
+                // Windows 11 / Server 2022+ (build >= 20348). Log so a stuck-on-TLS-1.2
+                // server is diagnosable without guessing.
+                int osBuild = Environment.OSVersion.Version.Build;
+                ServiceLog(osBuild >= 20348
+                    ? $"OS build {osBuild}: http.sys TLS 1.3 supported (verify with openssl s_client -tls1_3)."
+                    : $"OS build {osBuild}: http.sys TLS 1.3 NOT supported — cold connections stay on TLS 1.2 (2-RTT handshake) until OS upgrade.");
+
                 ServerListenLoop();
                 //Create profile manager
                 CreateAndStartService(new KMProfileManager());
@@ -259,6 +392,10 @@ namespace Omnipotent.Services.KliveAPI
                 string resp = JsonConvert.SerializeObject(copy);
                 await req.ReturnResponse(resp, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
+            // One round-trip for what used to be N parallel dashboard GETs.
+            // Guest (not Anybody) so a stale-cookie call fails once at pipeline
+            // level (smart-tarpit fast-fail) instead of N per-item 401s.
+            await CreateRoute("/batch", HandleBatchRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Guest);
             await CreateRoute("/KliveAPI/Statistics", async (req) =>
             {
                 await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary() ?? new
@@ -287,6 +424,156 @@ namespace Omnipotent.Services.KliveAPI
                     slowestRoutes = Array.Empty<object>()
                 }), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+        }
+
+        /// <summary>
+        /// Dispatches a JSON array of GET sub-requests through the existing route
+        /// handlers and returns their combined responses, collapsing what used to
+        /// be N parallel browser fetches (and N connection/preflight round-trips)
+        /// into a single request. Each sub-request is permission-checked and
+        /// isolated individually; a failing item never fails the whole batch.
+        /// Body shape: [{"path":"/route?query"}, ...] (bare-string items accepted too).
+        /// </summary>
+        private async Task HandleBatchRequest(UserRequest req)
+        {
+            const int MaxItems = 20;
+            const int MaxBodyBytes = 64 * 1024;
+
+            if ((req.userMessageBytes?.Length ?? 0) > MaxBodyBytes)
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { error = "Batch body too large." }), "application/json", null, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            List<string> paths = new();
+            try
+            {
+                var token = JToken.Parse(req.userMessageContent ?? string.Empty);
+                if (token is JArray arr)
+                {
+                    foreach (var item in arr)
+                    {
+                        if (item.Type == JTokenType.String) paths.Add(item.ToString());
+                        else if (item is JObject obj && obj["path"] != null) paths.Add(obj["path"].ToString());
+                    }
+                }
+            }
+            catch
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { error = "Invalid batch body; expected a JSON array." }), "application/json", null, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            if (paths.Count == 0)
+            {
+                await req.ReturnResponse("[]", "application/json");
+                return;
+            }
+            if (paths.Count > MaxItems)
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { error = $"Batch limited to {MaxItems} items." }), "application/json", null, HttpStatusCode.BadRequest);
+                return;
+            }
+
+            var results = new JObject[paths.Count];
+            var tasks = new Task[paths.Count];
+            for (int i = 0; i < paths.Count; i++)
+            {
+                int index = i;
+                string rawPath = paths[i];
+                // Task.Run so sub-requests run in parallel like today's browser burst
+                // (handlers with synchronous prologues don't serialise each other).
+                tasks[i] = Task.Run(async () => { results[index] = await ExecuteBatchItem(req, rawPath); });
+            }
+            await Task.WhenAll(tasks);
+
+            var response = new JArray();
+            foreach (var r in results) response.Add(r);
+            await req.ReturnResponse(response.ToString(Formatting.None), "application/json");
+        }
+
+        private async Task<JObject> ExecuteBatchItem(UserRequest batchReq, string rawPath)
+        {
+            var result = new JObject { ["path"] = rawPath ?? "" };
+            try
+            {
+                if (string.IsNullOrWhiteSpace(rawPath)) return BatchError(result, 400, "Empty path.");
+
+                string pathPart = rawPath;
+                string queryPart = "";
+                int q = rawPath.IndexOf('?');
+                if (q >= 0)
+                {
+                    pathPart = rawPath[..q];
+                    queryPart = rawPath[(q + 1)..];
+                }
+
+                string normalized = NormalizeRoute(pathPart);
+                if (string.Equals(normalized, "/batch", StringComparison.OrdinalIgnoreCase))
+                    return BatchError(result, 400, "Nested /batch is not allowed.");
+
+                if (!ControllerLookup.TryGetValue(normalized, out RouteInfo routeInfo))
+                    return BatchError(result, 404, "Route not found.");
+                if (routeInfo.normalizedMethod != "GET")
+                    return BatchError(result, 405, "Only GET routes may be batched.");
+
+                // Permission — mirror the pipeline's checks exactly (auth-bypass guard).
+                var required = routeInfo.authenticationLevelRequired;
+                bool allowed = required == KMProfileManager.KMPermissions.Anybody
+                    || (batchReq.user != null && batchReq.user.CanLogin && batchReq.user.KlivesManagementRank >= required);
+                if (!allowed) return BatchError(result, 401, "Insufficient permission.");
+
+                // Sub-request is a copy of the batch request writing into a capture buffer.
+                UserRequest sub = batchReq;
+                sub.route = normalized;
+                sub.userParameters = string.IsNullOrEmpty(queryPart)
+                    ? new NameValueCollection()
+                    : HttpUtility.ParseQueryString(queryPart);
+                sub.userMessageBytes = Array.Empty<byte>();
+                sub.userMessageContent = string.Empty;
+                sub.capture = new CapturedResponse();
+
+                var itemStopwatch = Stopwatch.StartNew();
+                await routeInfo.action(sub);
+                itemStopwatch.Stop();
+
+                if (!sub.capture.Completed)
+                {
+                    apiStatistics?.RecordRequest(normalized, "GET", 500, itemStopwatch.Elapsed, true);
+                    return BatchError(result, 500, "Handler did not produce a response.");
+                }
+
+                apiStatistics?.RecordRequest(normalized, "GET", sub.capture.StatusCode, itemStopwatch.Elapsed, true);
+
+                result["status"] = sub.capture.StatusCode;
+                result["ok"] = sub.capture.StatusCode is >= 200 and < 300;
+                result["contentType"] = sub.capture.ContentType;
+                string text = Encoding.UTF8.GetString(sub.capture.Body);
+                if (sub.capture.ContentType != null
+                    && sub.capture.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase)
+                    && OmniPaths.IsValidJson(text))
+                {
+                    result["body"] = new JRaw(text);
+                }
+                else
+                {
+                    result["body"] = text;
+                }
+                return result;
+            }
+            catch (Exception ex)
+            {
+                return BatchError(result, 500, ex.Message);
+            }
+        }
+
+        private static JObject BatchError(JObject result, int status, string message)
+        {
+            result["status"] = status;
+            result["ok"] = false;
+            result["contentType"] = "application/json";
+            result["body"] = new JObject { ["error"] = message };
+            return result;
         }
 
         private async void StartWatchdog()
@@ -688,6 +975,7 @@ namespace Omnipotent.Services.KliveAPI
                 request.route = route;
                 request.context = context;
                 request.ParentService = this;
+                request.requestTimer = requestStopwatch;
                 request.userParameters = nameValueCollection;
                 request.user = null;
                 request.userMessageBytes = Array.Empty<byte>();
@@ -828,13 +1116,13 @@ namespace Omnipotent.Services.KliveAPI
 
                         if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                         {
-                            await routeData.InvokeAction(request);
+                            await routeData.action(request);
                             return;
                         }
 
                         if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
                         {
-                            await routeData.InvokeAction(request);
+                            await routeData.action(request);
                             return;
                         }
 
@@ -859,7 +1147,7 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
                     {
-                        await routeData.InvokeAction(request);
+                        await routeData.action(request);
                     }
                     else
                     {
@@ -891,7 +1179,17 @@ namespace Omnipotent.Services.KliveAPI
                         }
                         if (isWebsiteNoProfile)
                         {
-                            try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
+                            // Smart tarpit: the first few failures per IP fail fast so a
+                            // legitimate user with a stale cookie gets an instant logout
+                            // redirect instead of 6-9s hangs; repeat offenders (scanners)
+                            // still get the escalating delay. If OmniDefence is down we
+                            // fail fast rather than slow.
+                            const int FastFailAuthFailures = 3;
+                            int recentFailures = defence?.RegisterAuthFailure(defenceIp) ?? 0;
+                            if (recentFailures > FastFailAuthFailures)
+                            {
+                                try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
+                            }
                             await DenyRequest(request, DeniedRequestReason.NoProfile, HttpStatusCode.Forbidden);
                         }
                         else

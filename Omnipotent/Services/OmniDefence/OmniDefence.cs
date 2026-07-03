@@ -122,6 +122,15 @@ namespace Omnipotent.Services.OmniDefence
 
         public bool IsLinkedToKlives(string ip) => tracker.IsLinkedToKlives(ip);
 
+        /// <summary>
+        /// Registers an auth failure for the IP and returns the count of failures
+        /// within the last 10 minutes (including this one). KliveAPI uses this to
+        /// fast-fail the first few failures (stale cookies) and tarpit only repeat
+        /// offenders.
+        /// </summary>
+        public int RegisterAuthFailure(string ip)
+            => tracker.RecordAuthFailureAndCount(ip, TimeSpan.FromMinutes(10));
+
         public bool IsHoneypotRoute(string route) => honeypotRoutes.ContainsKey(route);
 
         // ------------------------------------------------------------------

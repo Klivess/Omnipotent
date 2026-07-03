@@ -27,6 +27,7 @@ namespace Omnipotent.Services.OmniDefence
 
         private readonly OmniDefenceStore store;
         private readonly ConcurrentDictionary<string, IpRecord> cache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<long>> recentAuthFailures = new(StringComparer.OrdinalIgnoreCase);
 
         // Tunables (overridable from OmniDefence service via Set* methods).
         public int AutoWatchScore { get; set; } = 50;
@@ -77,6 +78,27 @@ namespace Omnipotent.Services.OmniDefence
                 nameof(IpStatus.Honeypot) => GateDecision.Honeypot,
                 _ => GateDecision.Allow
             };
+        }
+
+        /// <summary>
+        /// Records an auth failure for this IP now and returns how many failures
+        /// fall within the rolling window (including this one). In-memory only —
+        /// resets on restart, which is acceptable: its purpose is deciding whether
+        /// a failing caller gets a fast 403 or an escalating tarpit.
+        /// </summary>
+        public int RecordAuthFailureAndCount(string ip, TimeSpan window)
+        {
+            if (string.IsNullOrEmpty(ip)) return 0;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long cutoff = now - (long)window.TotalSeconds;
+            var queue = recentAuthFailures.GetOrAdd(ip, _ => new ConcurrentQueue<long>());
+            queue.Enqueue(now);
+            // Prune expired entries and cap length so a hammering scanner can't grow memory.
+            while (queue.TryPeek(out long oldest) && (oldest < cutoff || queue.Count > 100))
+            {
+                if (!queue.TryDequeue(out _)) break;
+            }
+            return queue.Count;
         }
 
         /// <summary>

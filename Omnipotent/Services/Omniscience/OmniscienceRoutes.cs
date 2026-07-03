@@ -31,7 +31,11 @@ namespace Omnipotent.Services.Omniscience
         // tripping the KliveAPI watchdog. We deliberately allow only a handful in flight
         // at once; remaining requests park asynchronously on the semaphore (no thread
         // held) until a slot frees.
-        private static readonly SemaphoreSlim ReadGate = new(initialCount: 3, maxCount: 3);
+        // SQLite WAL readers scale across cores, so allow a few more in flight on
+        // bigger boxes while still capping thread-pool exposure. Clamped so tiny
+        // hosts keep the original 3 and large ones never run away.
+        private static readonly int ReadGateSize = Math.Clamp(Environment.ProcessorCount / 2, 3, 8);
+        private static readonly SemaphoreSlim ReadGate = new(initialCount: ReadGateSize, maxCount: ReadGateSize);
 
         // ── Per-route TTL response cache ──
         // The Omniscience DB grows into the millions of rows. The dashboard routes do
