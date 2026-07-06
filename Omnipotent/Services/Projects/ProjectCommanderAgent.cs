@@ -1,0 +1,182 @@
+using Omnipotent.Services.KliveLLM;
+
+namespace Omnipotent.Services.Projects
+{
+    /// <summary>
+    /// The Commander's doctrine (system prompt) and tool definitions. Per §8 the escalation bar
+    /// in this prompt is a first-class design artifact — with no hard-coded no-go zones, it
+    /// carries most of the safety weight, so it is written deliberately and audited via the
+    /// spend overlay and twice-daily reports.
+    /// </summary>
+    public static class ProjectCommanderAgent
+    {
+        public static string BuildSystemPrompt(Project project) =>
+$@"You are the COMMANDER of an autonomous Project — a persistent 24/7 agent task force pursuing one long-horizon goal for Klives. You do not chat idly; you make measurable progress toward the goal, wake by wake, and you sleep between stimuli.
+
+THE GOAL: {project.Goal}
+
+HOW YOU OPERATE:
+- You wake in response to a stimulus (an event, a message from Klives, a sub-agent report, a timer, or a watchdog nudge). Each wake you are handed a fresh rehydrated context: the standing digest (plan, org chart, budget, open threads), recent events, and retrieved history. There is no persistent conversation — the event log is your memory. Trust the digest and retrieved facts over any half-memory.
+- Each wake is a bounded round of thinking and acting: assess what changed, take the next concrete steps with your tools, then finish with a short status and go back to sleep. Do not try to finish the whole project in one wake.
+- You distribute work: spawn sub-agents in the cheapest capability tier whose tools the job needs (text < image < video < audio — the tier list is a price list). Retire them when done. Sub-agents may spawn short-lived helpers ONE level deep; no deeper.
+- Keep the plan current with update_plan and report_progress so your digest and Klives' reports stay accurate.
+
+MONEY & AUTONOMY:
+- You have a token budget (${project.TokenBudgetUsd:0.##}) and a real-money budget (${project.MoneyBudgetUsd:0.##}). Spend deliberately. At ~80% token burn you are warned; at 100% the project pauses until Klives grants more.
+- Real-money spends at or below ${project.MoneyAutonomousThresholdUsd:0.##} per action are yours to make. Anything larger needs approval via request_user_approval. Credentials you create live in the project vault (vault_save) — reference them by {{name}} in typed text; you never see their values.
+- To ask for more budget or a higher agent cap, use request_budget_increase and make the case plainly.
+
+THE ESCALATION BAR (this is where your judgment carries the safety of the whole system — there are no hard-coded forbidden actions):
+- Escalate to Klives (request_user_approval) BEFORE any action that is: hard to reverse, legally or reputationally significant, spends real money above your threshold, publishes something public under Klives' identity, contacts real third parties in Klives' name, or that you would be uncomfortable defending in the evening report.
+- When you are unsure whether something clears the bar, it does — escalate. A cheap approval beats an expensive mistake.
+- Never fabricate progress. Only claim something is done if an event in your context proves it. If blocked by a human-only obstacle (captcha, phone verification), use request_human.
+
+Be concise and concrete. Report measured facts, not adjectives. Everything you do is on the timeline Klives watches.";
+
+        /// <summary>
+        /// The Commander's tool definitions. Computer-use tools are added per-agent by the
+        /// runner only when the acting agent's tier permits them (ProjectTierRouter gating), so
+        /// they are not in this always-on core set.
+        /// </summary>
+        public static List<HFWrapper.HFTool> BuildCoreToolDefinitions()
+        {
+            HFWrapper.HFTool Tool(string name, string description, object parameters) => new()
+            {
+                function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
+            };
+
+            object Obj(object properties, params string[] required) => new
+            {
+                type = "object",
+                properties,
+                required,
+            };
+            object Str(string desc) => new { type = "string", description = desc };
+            object Num(string desc) => new { type = "number", description = desc };
+
+            return new List<HFWrapper.HFTool>
+            {
+                Tool("update_plan", "Replace your current plan of attack. Keep it short and current; it seeds your digest.",
+                    Obj(new { plan = Str("The current plan, a few concise sentences or bullet points.") }, "plan")),
+
+                Tool("report_progress", "Record a progress note against the goal for the timeline and reports.",
+                    Obj(new { note = Str("What advanced, what was verified, what's next.") }, "note")),
+
+                Tool("spawn_sub_agent", "Spawn a sub-agent in a capability tier to do a piece of work. Pick the cheapest tier whose tools it needs.",
+                    Obj(new
+                    {
+                        role = Str("Short role name, e.g. 'market-researcher'."),
+                        tier = Str("One of: Text, TextImage, TextImageVideo, TextImageVideoAudio."),
+                        objective = Str("What this agent should accomplish."),
+                    }, "role", "tier", "objective")),
+
+                Tool("retire_sub_agent", "Retire a sub-agent that has finished its work, freeing a slot against the cap.",
+                    Obj(new { agentID = Str("The agent's ID.") }, "agentID")),
+
+                Tool("send_agent_message", "Send a message to a sub-agent (rides the stimulus bus). Use to task or steer it.",
+                    Obj(new { agentID = Str("Target agent ID."), message = Str("The message.") }, "agentID", "message")),
+
+                Tool("request_user_approval", "Suspend and ask Klives to approve/deny an action that clears the escalation bar. Returns their decision and comment.",
+                    Obj(new
+                    {
+                        title = Str("Short title of what you want to do."),
+                        description = Str("What exactly you will do if approved."),
+                        rationale = Str("Why it advances the goal and why it needs approval."),
+                    }, "title", "description", "rationale")),
+
+                Tool("request_budget_increase", "Ask Klives to raise the token budget, money budget, or agent cap. Returns their decision.",
+                    Obj(new
+                    {
+                        kind = Str("One of: tokens, money, agents."),
+                        amount = Num("Requested new limit."),
+                        rationale = Str("Why the increase is justified by progress/plan."),
+                    }, "kind", "amount", "rationale")),
+
+                Tool("vault_save", "Store a credential/secret in the project vault under a name. Reference it later as {name} in typed text; you never see the value again.",
+                    Obj(new { name = Str("Reference name."), value = Str("The secret value to store.") }, "name", "value")),
+
+                Tool("vault_list", "List the names of secrets stored in the project vault (values are never shown).",
+                    Obj(new { }, Array.Empty<string>())),
+
+                Tool("request_human", "Ask a human (Klives) to clear a human-only obstacle such as a captcha or phone verification, surfaced through Discord.",
+                    Obj(new { what = Str("What the human needs to do.") }, "what")),
+
+                // ── KliveAgent shared memory (this project is part of Klives' assistant — memory transfers across projects) ──
+                Tool("recall_memories", "Recall relevant facts from Klives' shared memory (spans all projects and KliveAgent). Use before assuming; Klives' preferences, credentials-context, and past learnings live here.",
+                    Obj(new { query = Str("What you're trying to remember."), max = Num("Max results (default 8).") }, "query")),
+
+                Tool("save_memory", "Save a durable fact to Klives' shared memory so it persists across wakes, projects, and KliveAgent. Save learnings, preferences, and important outcomes — not transient state.",
+                    Obj(new { content = Str("The fact to remember."), tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, "content")),
+
+                // ── work tools (text tier and up) ──
+                Tool("run_script", "Run a C# script for real work: computation, parsing, API orchestration. Globals: Http (HttpClient), Output(value), ReadFile/WriteFile/ListFiles (project volume). The script's return value and Output() lines come back to you.",
+                    Obj(new { code = Str("C# script body. End with an expression or use Output(...).") }, "code")),
+
+                Tool("http_request", "Make an HTTP request. Returns status + body (truncated).",
+                    Obj(new
+                    {
+                        url = Str("Absolute http(s) URL."),
+                        method = Str("GET (default), POST, PUT, DELETE…"),
+                        body = Str("Request body for non-GET."),
+                        contentType = Str("Body content type (default application/json)."),
+                    }, "url")),
+
+                Tool("read_file", "Read a text file from the project volume (shared with your desktop containers at /project).",
+                    Obj(new { path = Str("Path relative to the volume root.") }, "path")),
+
+                Tool("write_file", "Write a text file to the project volume. Creates directories as needed.",
+                    Obj(new { path = Str("Path relative to the volume root."), content = Str("File content.") }, "path", "content")),
+
+                Tool("list_files", "List files/directories on the project volume.",
+                    Obj(new { path = Str("Directory relative to the volume root (default: root).") }, Array.Empty<string>())),
+
+                // ── stimulus hooks: shape what wakes you ──
+                Tool("create_stimulus_hook", "Subscribe to a stimulus source so events wake you (or a sub-agent). Sources: timer {intervalSeconds}, webhook {}, file-watch {path}, screen-diff {agentID?, intervalSeconds?, threshold?}, script {script, pollSeconds}.",
+                    Obj(new
+                    {
+                        sourceKind = Str("timer | webhook | file-watch | screen-diff | script"),
+                        sourceSpec = new { type = "object", description = "Source-specific spec object (see tool description)." },
+                        criterion = Str("Natural-language recognition criterion: when does a raw event count? Empty = always deliver."),
+                        destinationAgentID = Str("Which agent the confirmed stimulus wakes (default: you)."),
+                    }, "sourceKind")),
+
+                Tool("list_stimulus_hooks", "List this project's stimulus hooks.", Obj(new { }, Array.Empty<string>())),
+
+                Tool("delete_stimulus_hook", "Delete a stimulus hook by ID.",
+                    Obj(new { hookID = Str("The hook's ID.") }, "hookID")),
+
+                Tool("complete_project", "Declare the goal achieved. Opens an approval gate with Klives; on approval the project completes, the Discord channel archives and desktops are released.",
+                    Obj(new { summary = Str("Evidence the goal is achieved.") }, "summary")),
+            };
+        }
+
+        /// <summary>
+        /// Computer-use tool definitions for agents whose tier permits desktop perception
+        /// (Commander included — it is video-tier). Dispatched to the acting agent's container
+        /// via ContainerToolAdapter; every mutating action returns a screenshot via the vision path.
+        /// </summary>
+        public static List<HFWrapper.HFTool> BuildComputerToolDefinitions()
+        {
+            HFWrapper.HFTool Tool(string name, string description, object parameters) => new()
+            {
+                function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
+            };
+            object Obj(object properties, params string[] required) => new { type = "object", properties, required };
+            object Str(string desc) => new { type = "string", description = desc };
+            object Num(string desc) => new { type = "number", description = desc };
+
+            return new List<HFWrapper.HFTool>
+            {
+                Tool("computer_screenshot", "Capture the desktop. Returns the current frame — coordinates are pixels, (0,0) top-left.", Obj(new { }, Array.Empty<string>())),
+                Tool("computer_click", "Click at (x, y).", Obj(new { x = Num("X pixel."), y = Num("Y pixel."), button = Str("left (default) | middle | right"), clicks = Num("1 (default) or 2 for double-click.") }, "x", "y")),
+                Tool("computer_move", "Move the mouse to (x, y) without clicking.", Obj(new { x = Num("X"), y = Num("Y") }, "x", "y")),
+                Tool("computer_drag", "Drag from (fromX, fromY) to (toX, toY).", Obj(new { fromX = Num("From X"), fromY = Num("From Y"), toX = Num("To X"), toY = Num("To Y"), button = Str("left (default)") }, "fromX", "fromY", "toX", "toY")),
+                Tool("computer_scroll", "Scroll at a point.", Obj(new { direction = Str("down (default) | up | left | right"), amount = Num("Notches (default 5)."), x = Num("X (default: centre)"), y = Num("Y (default: centre)") }, Array.Empty<string>())),
+                Tool("computer_type", "Type text at the current focus. Reference vault secrets as {name} — they substitute at keystroke time and you never see the value.", Obj(new { text = Str("Text to type.") }, "text")),
+                Tool("computer_key", "Press a key or chord, e.g. 'enter', 'ctrl+l', 'alt+f4'.", Obj(new { key = Str("Key name or chord.") }, "key")),
+                Tool("computer_wait", "Wait for the screen to settle.", Obj(new { ms = Num("Milliseconds (default 1000, max 30000).") }, Array.Empty<string>())),
+                Tool("computer_release_all", "Release all held buttons/keys and the shared-desktop input lock.", Obj(new { }, Array.Empty<string>())),
+            };
+        }
+    }
+}

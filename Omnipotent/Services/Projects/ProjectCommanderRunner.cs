@@ -1,0 +1,249 @@
+using Omnipotent.Services.KliveLLM;
+
+namespace Omnipotent.Services.Projects
+{
+    /// <summary>
+    /// Executes one Commander wake: rehydrate context → tool loop → sleep. Cloned from
+    /// StratumEngineerTurnRunner's battle-tested loop (background task, stuck-loop detection,
+    /// tool-call budget, post-loop digest compaction, single-flight-per-project, crash recovery)
+    /// with the design-doc deltas:
+    ///   * Wake-triggered, not message-triggered — the seed comes from ProjectWakeCycle, not a
+    ///     user message. No persistent session survives between wakes (§7).
+    ///   * NO hard wall-clock timeout (§: "no hard timeouts"). A wake is bounded because it is
+    ///     one round of reasoning+action, and a per-wake tool-call budget bounds runaway loops;
+    ///     true cross-wake stalls are the watchdog's job (P7), never a kill here.
+    /// </summary>
+    public class ProjectCommanderRunner
+    {
+        private readonly Projects parent;
+
+        private const int MaxToolCallsPerWake = 60;
+        private const int StuckIdenticalCallThreshold = 3;
+
+        public ProjectCommanderRunner(Projects parent)
+        {
+            this.parent = parent;
+        }
+
+        /// <summary>
+        /// Wakes the Commander in response to a trigger. Returns immediately with the wake ID;
+        /// the loop runs in the background and streams events. If a wake is already active on the
+        /// project, this is a no-op (returns null) — one wake at a time, per §7.
+        /// </summary>
+        public string? Wake(Project project, string triggerDescription)
+        {
+            var digest = parent.Digests.GetDigest(project.ProjectID);
+            if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID))
+                return null; // already awake
+
+            string wakeID = Guid.NewGuid().ToString("N");
+            digest.ActiveWakeID = wakeID;
+            parent.Digests.SaveDigest(digest);
+
+            parent.EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                WakeID = wakeID,
+                AgentID = "commander",
+                Type = ProjectEventTypes.CommanderWake,
+                Author = "system",
+                Text = $"Commander woke. Trigger: {Trunc(triggerDescription, 200)}",
+            });
+
+            _ = Task.Run(() => ExecuteWakeAsync(project, wakeID, triggerDescription));
+            return wakeID;
+        }
+
+        private async Task ExecuteWakeAsync(Project project, string wakeID, string triggerDescription)
+        {
+            string projectID = project.ProjectID;
+            long wakeStartSeq = parent.EventLog.GetLastSequence(projectID);
+            string outcome = ProjectEventTypes.WakeCompleted;
+            string outcomeText = "Wake completed; Commander asleep.";
+            int stuckTrips = 0;
+            using var cts = new CancellationTokenSource();
+
+            try
+            {
+                var llmServices = await parent.GetServicesByType<KliveLLM.KliveLLM>();
+                if (llmServices == null || llmServices.Length == 0)
+                    throw new InvalidOperationException("KliveLLM service not available.");
+                var llm = (KliveLLM.KliveLLM)llmServices[0];
+                if (!await llm.SupportsNativeToolCallingAsync())
+                    throw new InvalidOperationException("The Commander requires a remote LLM provider with native tool calling.");
+
+                var settings = parent.Settings.Get(projectID);
+                string model = settings.CommanderModel;
+                bool visionEnabled = settings.VisionEnabled;
+                parent.SubAgents.EnsureCommander(projectID);
+
+                // The Commander is video-tier: core tools plus the full computer-use surface.
+                var toolDefs = ProjectCommanderAgent.BuildCoreToolDefinitions();
+                toolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions());
+
+                string sessionId = $"projects-commander-{projectID}-{wakeID}";
+                llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
+                llm.AppendUserMessageToToolSession(sessionId, parent.WakeCycle.BuildWakeSeed(project, triggerDescription));
+
+                var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
+                int toolCalls = 0;
+
+                while (true)
+                {
+                    cts.Token.ThrowIfCancellationRequested();
+
+                    if (toolCalls >= MaxToolCallsPerWake)
+                        llm.AppendUserMessageToToolSession(sessionId,
+                            $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake} calls). Stop calling tools and reply with a concise status: what you did this wake and what the next wake should do.");
+
+                    var resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
+                    if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
+
+                    // Meter this round's spend against the budget (provisional now; reconciled if a gen-id is available).
+                    if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
+                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens);
+
+                    bool overBudget = toolCalls >= MaxToolCallsPerWake;
+                    if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
+                    {
+                        string final = string.IsNullOrWhiteSpace(resp.Response) ? "(no closing status)" : resp.Response.Trim();
+                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", final));
+                        break;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(resp.Response))
+                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderThought, "commander", resp.Response.Trim()));
+
+                    foreach (var call in resp.ToolCalls)
+                    {
+                        cts.Token.ThrowIfCancellationRequested();
+                        string toolName = call.function?.name ?? "";
+                        string argsJson = call.function?.arguments ?? "";
+                        toolCalls++;
+
+                        string sig = toolName + "|" + argsJson;
+                        recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
+                        if (recentSignatures[sig] >= StuckIdenticalCallThreshold)
+                        {
+                            stuckTrips++;
+                            llm.AppendToolResult(sessionId, call.id, toolName,
+                                $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}× — the result won't change. Change approach or wrap up this wake.");
+                            continue;
+                        }
+
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                            Type = ProjectEventTypes.ToolCall, Author = "commander",
+                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id, PayloadJson = argsJson,
+                        });
+
+                        var result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);
+
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                            Type = ProjectEventTypes.ToolResult, Author = "commander",
+                            Text = result.ResultText, ToolName = toolName, ToolCallId = call.id,
+                            ArtifactIDs = result.ArtifactIDs,
+                        });
+                        llm.AppendToolResult(sessionId, call.id, toolName, result.ResultText);
+
+                        // Vision return: the post-action screenshot rides a follow-up user message
+                        // (tool-result image support is inconsistent across providers — same
+                        // approach Stratum uses for renders). Old screenshots auto-compact.
+                        if (visionEnabled && result.Jpeg != null)
+                        {
+                            llm.AppendUserContentToToolSession(sessionId,
+                                $"Screenshot after your {toolName} call. Verify the screen shows what you expect before acting further.",
+                                new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") });
+                        }
+
+                        if (result.EndWake) { outcomeText = "Wake ended by a tool (constraint)."; goto done; }
+                    }
+                }
+                done: ;
+            }
+            catch (OperationCanceledException)
+            {
+                outcome = ProjectEventTypes.WakeFailed;
+                outcomeText = "Wake cancelled.";
+            }
+            catch (Exception ex)
+            {
+                outcome = ProjectEventTypes.WakeFailed;
+                outcomeText = $"Wake failed: {ex.Message}";
+            }
+            finally
+            {
+                try
+                {
+                    // Record stuck-loop trips into the digest for the watchdog (P7), clear the active wake.
+                    var digest = parent.Digests.GetDigest(projectID);
+                    digest.RecentStuckLoopTrips = stuckTrips;
+                    if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
+                    parent.Digests.SaveDigest(digest);
+
+                    parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
+
+                    // Refresh budget/org in the digest, then compact — never in the hot path.
+                    await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
+                }
+                catch { /* never mask the wake outcome */ }
+            }
+        }
+
+        /// <summary>
+        /// Watchdog escalation (P7): forces a fresh wake even if the digest still marks one active
+        /// — the previous wake is presumed wedged. Safe by construction: rehydrate-on-wake means
+        /// there is no in-memory state to corrupt, so clearing the stale marker and waking again is
+        /// indistinguishable from any other wake. Never a hard kill.
+        /// </summary>
+        public string ForceWake(Project project, string reason)
+        {
+            var digest = parent.Digests.GetDigest(project.ProjectID);
+            digest.ActiveWakeID = null; // abandon the presumed-stuck wake's marker
+            parent.Digests.SaveDigest(digest);
+            string wakeID = Wake(project, $"[watchdog force-wake] {reason}") ?? "";
+            return wakeID;
+        }
+
+        /// <summary>Startup crash recovery: clear any wake left active by a restart (rehydrate-on-wake makes this safe).</summary>
+        public void RecoverInterruptedWakes()
+        {
+            foreach (var digest in parent.Digests.AllDigestsWithActiveWakes())
+            {
+                try
+                {
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = digest.ProjectID, WakeID = digest.ActiveWakeID,
+                        Type = ProjectEventTypes.WakeFailed, Author = "system",
+                        Text = "Omnipotent restarted mid-wake. Committed events preserved; next stimulus rehydrates the Commander.",
+                    });
+                    digest.ActiveWakeID = null;
+                    parent.Digests.SaveDigest(digest);
+                }
+                catch { }
+            }
+        }
+
+        private static ProjectEvent WakeEvt(string projectID, string wakeID, string type, string author, string text) => new()
+        {
+            ProjectID = projectID, WakeID = wakeID, AgentID = "commander", Type = type, Author = author, Text = text,
+        };
+
+        private static string DescribeCall(string toolName, string argsJson)
+        {
+            try
+            {
+                var jo = Newtonsoft.Json.Linq.JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+                var bits = jo.Properties().Take(4).Select(p => $"{p.Name}={Trunc(p.Value.ToString(), 60)}");
+                return $"{toolName}({string.Join(", ", bits)})";
+            }
+            catch { return toolName; }
+        }
+
+        private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
+    }
+}

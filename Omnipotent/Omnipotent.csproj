@@ -33,6 +33,7 @@
 		<PackageReference Include="ByteSize" Version="2.1.2" />
 		<PackageReference Include="Cake.Powershell" Version="4.0.0" />
 		<PackageReference Include="Certes" Version="3.0.4" />
+		<PackageReference Include="Docker.DotNet" Version="3.125.15" />
 		<PackageReference Include="DSharpPlus" Version="4.5.2" />
 		<PackageReference Include="DSharpPlus.CommandsNext" Version="4.5.2" />
 		<PackageReference Include="DSharpPlus.Interactivity" Version="4.5.2" />

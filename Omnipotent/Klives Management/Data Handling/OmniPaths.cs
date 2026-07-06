@@ -159,6 +159,16 @@ namespace Omnipotent.Data_Handling
             public static string StratumRunsDirectory = $"{StratumDirectory}/Runs";
             public static string StratumConversationsDirectory = $"{StratumDirectory}/Conversations";
 
+            //Projects (autonomous 24/7 agent task force)
+            public static string ProjectsDirectory = $"{SavedDataDirectory}/Projects";
+            public static string ProjectsIndexFile = $"{ProjectsDirectory}/projects.json";
+            public static string ProjectsEventLogDirectory = $"{ProjectsDirectory}/EventLog";
+            public static string ProjectsDigestsDirectory = $"{ProjectsDirectory}/Digests";
+            public static string ProjectsVaultsDirectory = $"{ProjectsDirectory}/Vaults";
+            public static string ProjectsStimulusDirectory = $"{ProjectsDirectory}/Stimulus";
+            public static string ProjectsContainersFile = $"{ProjectsDirectory}/containers.json";
+            public static string ProjectsVolumesDirectory = $"{ProjectsDirectory}/Volumes";
+
             //KAPI Reachability Monitor
             public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";
             public static string KAPIReachabilityMonitorStateFile = $"{KAPIReachabilityMonitorDirectory}/state.json";

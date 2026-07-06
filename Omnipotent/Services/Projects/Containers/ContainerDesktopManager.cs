@@ -1,0 +1,99 @@
+using System.Collections.Concurrent;
+using System.Runtime.Versioning;
+
+namespace Omnipotent.Services.Projects.Containers
+{
+    /// <summary>
+    /// The platform's desktop subsystem: owns the orchestrator, the registry, the per-container
+    /// VNC transport pool, and the shared-desktop input lock. Implements both allocation
+    /// mechanics the Commander can choose between (§4) — per-agent containers and one shared
+    /// project desktop with an input lock. Docker being unreachable is non-fatal: desktop
+    /// operations surface a clear error and the text-tier of the fleet keeps working (§4:
+    /// text-tier agents get no desktop at all).
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public class ContainerDesktopManager
+    {
+        private readonly ContainerRegistry registry;
+        private readonly ContainerOrchestrator orchestrator;
+        private readonly InputLockCoordinator inputLock = new();
+        private readonly Action<string> log;
+
+        // One transport per container ID, lazily connected.
+        private readonly ConcurrentDictionary<string, VncTransport> transports = new(StringComparer.Ordinal);
+        private readonly string vncHost;
+
+        public ContainerRegistry Registry => registry;
+        public ContainerOrchestrator Orchestrator => orchestrator;
+        public InputLockCoordinator InputLock => inputLock;
+
+        public ContainerDesktopManager(
+            Action<string> log,
+            Func<string, string> imageForProject,
+            string dockerUri,
+            string vncHost = "127.0.0.1")
+        {
+            this.log = log ?? (_ => { });
+            this.vncHost = vncHost;
+            registry = new ContainerRegistry(log);
+            orchestrator = new ContainerOrchestrator(registry, log, imageForProject, dockerUri);
+        }
+
+        /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
+        public Task ReconcileAsync(CancellationToken ct = default) => orchestrator.ReconcileAsync(ct);
+
+        /// <summary>
+        /// Ensures a desktop exists for the given agent under the project's allocation mode and
+        /// returns a tool adapter bound to it. PerAgentContainers → a container per agent;
+        /// SharedDesktopWithInputLock → one project desktop all agents share behind the lock.
+        /// </summary>
+        public async Task<ContainerToolAdapter> GetAdapterForAgentAsync(
+            Project project, string agentID,
+            Func<string, Task<string>>? resolveSecretsAsync = null,
+            CancellationToken ct = default)
+        {
+            var record = await EnsureDesktopAsync(project, agentID, ct);
+            var transport = GetTransport(record);
+            bool shared = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock;
+            return new ContainerToolAdapter(
+                transport, record.ContainerID, agentID,
+                inputLock: shared ? inputLock : null,
+                resolveSecretsAsync: resolveSecretsAsync);
+        }
+
+        /// <summary>Creates (or resolves) the desktop record an agent should use.</summary>
+        public async Task<DesktopContainerRecord> EnsureDesktopAsync(Project project, string agentID, CancellationToken ct = default)
+        {
+            if (project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock)
+            {
+                var shared = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == null);
+                shared ??= await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
+                return shared;
+            }
+
+            var mine = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == agentID);
+            mine ??= await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
+            return mine;
+        }
+
+        /// <summary>The transport for a container by ID (for the live-view stream route), or null if unknown.</summary>
+        public VncTransport? GetTransportByContainerID(string containerID)
+        {
+            var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost);
+            return record == null ? null : GetTransport(record);
+        }
+
+        private VncTransport GetTransport(DesktopContainerRecord record)
+        {
+            return transports.GetOrAdd(record.ContainerID,
+                _ => new VncTransport(vncHost, record.VncHostPort, log));
+        }
+
+        /// <summary>Tears down a container and its transport (agent retired / project completed).</summary>
+        public async Task DisposeDesktopAsync(string containerID, CancellationToken ct = default)
+        {
+            if (transports.TryRemove(containerID, out var t)) t.Dispose();
+            await orchestrator.StopContainerAsync(containerID, ct);
+        }
+    }
+}
