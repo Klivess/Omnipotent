@@ -37,10 +37,39 @@ namespace Omnipotent.Services.Projects.Containers
             this.vncHost = vncHost;
             registry = new ContainerRegistry(log);
             orchestrator = new ContainerOrchestrator(registry, log, imageForProject, dockerUri);
+            bootstrapper = new ContainerDependencyBootstrapper(this.log);
         }
 
         /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
         public Task ReconcileAsync(CancellationToken ct = default) => orchestrator.ReconcileAsync(ct);
+
+        /// <summary>Probes the Docker daemon; null when healthy, else a human-readable reason.</summary>
+        public Task<string?> ProbeDaemonAsync(CancellationToken ct = default) => orchestrator.ProbeDaemonAsync(ct);
+
+        private readonly ContainerDependencyBootstrapper bootstrapper;
+
+        /// <summary>One-line remedy shown to the agent/logs when the desktop layer is unusable.</summary>
+        public string SetupHint =>
+            $"Desktop control needs Docker running on the host ({orchestrator.DockerUri}) and the desktop image built. " +
+            $"Auto-setup state: {bootstrapper.LastStatus} " +
+            "Until the desktop is up, use text/HTTP/script tools — they don't need a desktop.";
+
+        /// <summary>
+        /// Self-heals the desktop layer's host dependencies: installs/starts Docker (winget →
+        /// launch → wait for daemon) and auto-builds the default desktop image from the shipped
+        /// build context. Safe to fire-and-forget from tool failures — the bootstrapper is
+        /// single-flight with a cooldown. Returns null when the layer is ready, else the
+        /// current human-readable status.
+        /// </summary>
+        public async Task<string?> TryBootstrapAsync(string defaultImageTag, CancellationToken ct = default)
+        {
+            bool daemonUp = await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct);
+            if (!daemonUp) return bootstrapper.LastStatus;
+
+            string contextDir = Path.Combine(AppContext.BaseDirectory, "Services", "Projects", "Containers");
+            string? imageProblem = await orchestrator.EnsureImageBuiltAsync(defaultImageTag, contextDir, "desktop.Dockerfile", ct);
+            return imageProblem; // null = fully ready
+        }
 
         /// <summary>
         /// Ensures a desktop exists for the given agent under the project's allocation mode and

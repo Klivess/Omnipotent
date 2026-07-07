@@ -52,6 +52,111 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         /// <summary>
+        /// Probes the Docker daemon with a short timeout. Returns null when it answers, or a
+        /// human-readable reason when it doesn't (daemon not running, wrong endpoint, etc.). This
+        /// turns the opaque "The operation has timed out." (a named-pipe connect timeout when no
+        /// daemon is listening) into an actionable diagnosis for the agent and the logs.
+        /// </summary>
+        public async Task<string?> ProbeDaemonAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                var docker = await GetClientAsync();
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(TimeSpan.FromSeconds(4));
+                await docker.System.PingAsync(timeout.Token);
+                return null;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return $"the Docker daemon at {dockerUri} did not respond within 4s — it is not running (or is unreachable at that endpoint).";
+            }
+            catch (Exception ex)
+            {
+                return $"the Docker daemon at {dockerUri} is unreachable: {ex.Message}";
+            }
+        }
+
+        /// <summary>The Docker endpoint this orchestrator targets (for diagnostics).</summary>
+        public string DockerUri => dockerUri;
+
+        /// <summary>True when <paramref name="imageTag"/> exists locally.</summary>
+        public async Task<bool> ImageExistsAsync(string imageTag, CancellationToken ct = default)
+        {
+            var docker = await GetClientAsync();
+            var images = await docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
+            return images.Any(i => i.RepoTags?.Contains(imageTag) == true);
+        }
+
+        /// <summary>
+        /// Builds the desktop image from a shipped build context when it's missing on this host —
+        /// the second half of dependency self-healing (daemon install being the first). The context
+        /// is tarred in-process (no docker CLI needed); .sh files are normalised to LF so a CRLF
+        /// git checkout can't produce a container whose entrypoint dies on '\r'. Returns null on
+        /// success (or already-present), else a human-readable reason.
+        /// </summary>
+        public async Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName, CancellationToken ct = default)
+        {
+            try
+            {
+                if (await ImageExistsAsync(imageTag, ct)) return null;
+                if (!Directory.Exists(contextDir) || !File.Exists(Path.Combine(contextDir, dockerfileName)))
+                    return $"desktop image '{imageTag}' is missing and the build context was not found at {contextDir}.";
+
+                log($"Desktop image '{imageTag}' not found — building it now (first build takes several minutes)…");
+                var docker = await GetClientAsync();
+                using var context = CreateTarContext(contextDir);
+                string? buildError = null;
+                await docker.Images.BuildImageFromDockerfileAsync(
+                    new ImageBuildParameters
+                    {
+                        Dockerfile = dockerfileName,
+                        Tags = new List<string> { imageTag },
+                    },
+                    context,
+                    null, null,
+                    new Progress<JSONMessage>(m =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(m.Stream)) log($"docker build: {m.Stream.TrimEnd()}");
+                        if (m.Error != null) buildError = m.Error.Message;
+                    }),
+                    ct);
+
+                if (buildError != null) return $"docker build failed: {buildError}";
+                if (!await ImageExistsAsync(imageTag, ct)) return "docker build finished but the image is still missing.";
+                log($"Desktop image '{imageTag}' built successfully.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return $"desktop image build failed: {ex.Message}";
+            }
+        }
+
+        /// <summary>In-process tar of the build-context directory (flat — the context is two small files).</summary>
+        private static MemoryStream CreateTarContext(string contextDir)
+        {
+            var ms = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(ms, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                foreach (var file in Directory.GetFiles(contextDir))
+                {
+                    string name = Path.GetFileName(file);
+                    byte[] bytes = name.EndsWith(".sh", StringComparison.OrdinalIgnoreCase)
+                        ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n"))
+                        : File.ReadAllBytes(file);
+                    var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, name)
+                    {
+                        DataStream = new MemoryStream(bytes),
+                    };
+                    writer.WriteEntry(entry);
+                }
+            }
+            ms.Position = 0;
+            return ms;
+        }
+
+        /// <summary>
         /// Creates and starts a desktop container. <paramref name="agentID"/> null = the
         /// project's shared desktop; non-null = a per-agent container. The project volume is
         /// mounted at /project in every container of the project (shared directories, §4).

@@ -325,7 +325,32 @@ namespace Omnipotent.Services.Projects
                 }
                 return new CommanderToolResult(result.Text) { Jpeg = result.Jpeg, ArtifactIDs = artifactIDs };
             }
-            catch (Exception ex) { return new CommanderToolResult($"{toolName} failed: {ex.Message}"); }
+            catch (Exception ex)
+            {
+                // The most common cause of a desktop-tool failure is that Docker isn't running —
+                // which otherwise surfaces as an opaque "The operation has timed out." Diagnose it,
+                // kick off dependency self-healing in the background (single-flight; installs/starts
+                // Docker and builds the image), and hand the agent an actionable message.
+                string? daemon = await Desktops!.ProbeDaemonAsync(ct);
+                if (daemon != null)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            string? problem = await Desktops.TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage);
+                            ServiceLog(problem == null
+                                ? "Projects: desktop layer self-healed — Docker up and image present."
+                                : $"Projects: desktop self-heal incomplete — {problem}");
+                        }
+                        catch (Exception bex) { _ = ServiceLogError(bex, "Projects: desktop self-heal failed"); }
+                    });
+                    return new CommanderToolResult(
+                        $"{toolName} can't run: {daemon} Auto-setup has been kicked off (installing/starting Docker if possible — can take several minutes). " +
+                        "Continue with text/HTTP/script tools for now and retry a computer_* tool in ~5 minutes; if it still fails, the result will say exactly what's blocking.");
+                }
+                return new CommanderToolResult($"{toolName} failed: {ex.Message}");
+            }
         }
 
         /// <summary>
@@ -461,6 +486,20 @@ namespace Omnipotent.Services.Projects
 
             _ = Task.Run(async () =>
             {
+                // Self-heal the desktop layer at startup: if the Docker daemon is unreachable the
+                // bootstrapper installs/starts Docker Desktop itself (winget → launch → wait) and
+                // auto-builds the desktop image when missing — instead of leaving computer_* tools
+                // to fail with opaque timeouts until a human intervenes.
+                try
+                {
+                    string? problem = await manager.TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage);
+                    if (problem != null)
+                        ServiceLog($"Projects: DESKTOP CONTAINERS NOT READY — {problem}");
+                    else
+                        ServiceLog("Projects: desktop layer ready (Docker daemon up, desktop image present).");
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: desktop bootstrap failed"); }
+
                 try { await manager.ReconcileAsync(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reconcile failed"); }
             });
