@@ -70,7 +70,24 @@ namespace Omnipotent.Services.Projects
                     }
 
                     var p = parent.Store.CreateProject(name, goal, tokenBudget, moneyBudget, moneyThreshold, agentCap);
-                    parent.Settings.EnsureCreated(p.ProjectID); // seed this project's own settings with defaults
+                    var settings = parent.Settings.EnsureCreated(p.ProjectID); // seed this project's own settings with defaults
+                    // Optional per-project settings configured on the new-project page (model routing,
+                    // vision/containers, desktop image). Applied BEFORE the first wake so the Commander
+                    // wakes on the models Klives chose, not the inherited defaults.
+                    if (body?.settings != null)
+                    {
+                        try
+                        {
+                            var patch = ((Newtonsoft.Json.Linq.JObject)body.settings).ToObject<Dictionary<string, string>>() ?? new();
+                            foreach (var kv in patch)
+                            {
+                                if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
+                                settings.TrySet(kv.Key, kv.Value ?? "");
+                            }
+                            parent.Settings.Save(settings);
+                        }
+                        catch (Exception sex) { _ = parent.ServiceLogError(sex, "Projects: applying create-time settings failed (using defaults)"); }
+                    }
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = p.ProjectID,
