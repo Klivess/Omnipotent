@@ -88,7 +88,11 @@ namespace Omnipotent.Services.Projects
             //    (so a brand-new idle project isn't flagged before it has ever run). A keepalive
             //    timer hook should fire at least this often; its absence is the "no stimuli" stall.
             var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
-            if (tail.Count > 0 && (lastWake == null || now - lastWake.Timestamp > MaxWakeGap))
+            // A never-woken project is measured from creation, not flagged instantly — the
+            // init event makes the tail non-empty the moment the project is created, which
+            // used to produce "stalled (last: never)" seconds after creation.
+            var lastBeat = lastWake?.Timestamp ?? project.CreatedAt;
+            if (tail.Count > 0 && now - lastBeat > MaxWakeGap)
                 return $"No Commander wake in over {MaxWakeGap.TotalMinutes:0} minutes (last: {(lastWake == null ? "never" : lastWake.Timestamp.ToString("u"))}).";
 
             // 2. Zero-progress-over-N-wakes: the last N completed wakes produced no tool-call /

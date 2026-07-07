@@ -23,6 +23,8 @@ namespace Omnipotent.Services.Projects
         {
             ContractResolver = new CamelCasePropertyNamesContractResolver(),
             ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
+            // Enums travel as strings ("Active", not 1) — the website compares/lowercases them.
+            Converters = { new Newtonsoft.Json.Converters.StringEnumConverter() },
         };
         private static string Json(object o) => JsonConvert.SerializeObject(o, CamelCase);
 
@@ -82,6 +84,12 @@ namespace Omnipotent.Services.Projects
                         try { await parent.DiscordManager.CreateProjectChannelAsync(p); }
                         catch (Exception dex) { _ = parent.ServiceLogError(dex, "Projects: create Discord channel failed"); }
                     }
+                    // First wake: a project must start itself. Without this nothing wakes the
+                    // Commander until the keepalive timer, and the watchdog reports a "stall"
+                    // on a project that has never run.
+                    parent.CommanderRunner.Wake(p,
+                        "Project created by Klives just now. Read the goal, form an initial plan (update_plan), " +
+                        "create the stimulus hooks you need (create_stimulus_hook), and take the first concrete steps.");
                     await req.ReturnResponse(Json(p));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -229,7 +237,10 @@ namespace Omnipotent.Services.Projects
                     var applied = new List<string>();
                     var unknown = new List<string>();
                     foreach (var kv in patch)
+                    {
+                        if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue; // routing field, not a setting
                         (settings.TrySet(kv.Key, kv.Value) ? applied : unknown).Add(kv.Key);
+                    }
                     parent.Settings.Save(settings);
                     parent.EventLog.Append(new ProjectEvent
                     {
@@ -239,6 +250,32 @@ namespace Omnipotent.Services.Projects
                         Text = $"Settings updated: {string.Join(", ", applied)}." + (unknown.Count > 0 ? $" Unknown keys ignored: {string.Join(", ", unknown)}." : ""),
                     });
                     await req.ReturnResponse(Json(new { applied, unknown, settings }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // ── System default settings (what NEW projects inherit) — Projects' own config, not OmniSettings ──
+            await parent.CreateAPIRoute("/projects/system/settings", async req =>
+            {
+                try { await req.ReturnResponse(Json(parent.Settings.GetSystemDefaults())); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/system/settings/update", async req =>
+            {
+                try
+                {
+                    var patch = JsonConvert.DeserializeObject<Dictionary<string, string>>(req.userMessageContent ?? "{}") ?? new();
+                    var defaults = parent.Settings.GetSystemDefaults();
+                    var applied = new List<string>();
+                    var unknown = new List<string>();
+                    foreach (var kv in patch)
+                    {
+                        if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
+                        (defaults.TrySet(kv.Key, kv.Value) ? applied : unknown).Add(kv.Key);
+                    }
+                    parent.Settings.SaveSystemDefaults(defaults);
+                    await req.ReturnResponse(Json(new { applied, unknown, settings = defaults }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
@@ -393,7 +430,15 @@ namespace Omnipotent.Services.Projects
 
         private bool RequireProject(Services.KliveAPI.KliveAPI.UserRequest req, out Project? project)
         {
+            // projectID may arrive on the query string (GETs, some POSTs) OR in the JSON body
+            // (the website's POSTs send it there). userParameters is query-only, so fall back to
+            // the body — otherwise every body-projectID POST 404s.
             string projectID = req.userParameters?.Get("projectID") ?? "";
+            if (string.IsNullOrWhiteSpace(projectID) && !string.IsNullOrWhiteSpace(req.userMessageContent))
+            {
+                try { projectID = (string?)Newtonsoft.Json.Linq.JObject.Parse(req.userMessageContent)["projectID"] ?? ""; }
+                catch { /* body isn't a JSON object with projectID */ }
+            }
             project = string.IsNullOrWhiteSpace(projectID) ? null : parent.Store.GetProject(projectID);
             if (project == null)
             {

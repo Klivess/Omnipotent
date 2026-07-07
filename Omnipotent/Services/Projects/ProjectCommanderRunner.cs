@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveLLM;
+using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Projects
 {
@@ -19,6 +20,12 @@ namespace Omnipotent.Services.Projects
 
         private const int MaxToolCallsPerWake = 60;
         private const int StuckIdenticalCallThreshold = 3;
+        private const int MaxPendingTriggers = 12;
+
+        // Triggers that arrived while a wake was active. One wake at a time still holds, but a
+        // stimulus (e.g. a Klives message mid-wake) must not vanish — it re-wakes the Commander
+        // as soon as the active wake finishes.
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> pendingTriggers = new(StringComparer.Ordinal);
 
         public ProjectCommanderRunner(Projects parent)
         {
@@ -28,13 +35,19 @@ namespace Omnipotent.Services.Projects
         /// <summary>
         /// Wakes the Commander in response to a trigger. Returns immediately with the wake ID;
         /// the loop runs in the background and streams events. If a wake is already active on the
-        /// project, this is a no-op (returns null) — one wake at a time, per §7.
+        /// project, the trigger is queued and re-wakes the Commander when the active wake ends
+        /// (returns null) — one wake at a time, per §7, but no stimulus is ever dropped.
         /// </summary>
         public string? Wake(Project project, string triggerDescription)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
             if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID))
-                return null; // already awake
+            {
+                var q = pendingTriggers.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<string>());
+                if (q.Count < MaxPendingTriggers && !q.Contains(triggerDescription))
+                    q.Enqueue(triggerDescription);
+                return null; // already awake — queued for the follow-up wake
+            }
 
             string wakeID = Guid.NewGuid().ToString("N");
             digest.ActiveWakeID = wakeID;
@@ -108,6 +121,13 @@ namespace Omnipotent.Services.Projects
                     {
                         string final = string.IsNullOrWhiteSpace(resp.Response) ? "(no closing status)" : resp.Response.Trim();
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", final));
+                        // When Klives spoke to the Commander, the answer must reach him where he
+                        // asked — the event log alone reads as silence from Discord.
+                        if (TriggeredByKlives(triggerDescription) && parent.DiscordManager != null)
+                        {
+                            try { await parent.DiscordManager.PostCommanderReplyAsync(project, final); }
+                            catch { /* best-effort surface */ }
+                        }
                         break;
                     }
 
@@ -186,11 +206,39 @@ namespace Omnipotent.Services.Projects
 
                     parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
 
+                    // A failed Klives-triggered wake must not read as silence either.
+                    if (outcome == ProjectEventTypes.WakeFailed && TriggeredByKlives(triggerDescription) && parent.DiscordManager != null)
+                    {
+                        try { await parent.DiscordManager.PostCommanderReplyAsync(project, $"⚠️ {outcomeText}"); }
+                        catch { }
+                    }
+
                     // Refresh budget/org in the digest, then compact — never in the hot path.
                     await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
                 }
                 catch { /* never mask the wake outcome */ }
+
+                DrainPendingTriggers(projectID);
             }
+        }
+
+        /// <summary>Klives-message triggers get their wake's closing status mirrored to Discord.</summary>
+        private static bool TriggeredByKlives(string trigger) =>
+            trigger.Contains("Message from Klives", StringComparison.Ordinal);
+
+        /// <summary>Re-wakes the Commander with any triggers that arrived during the wake that just ended.</summary>
+        private void DrainPendingTriggers(string projectID)
+        {
+            try
+            {
+                if (!pendingTriggers.TryRemove(projectID, out var queued) || queued.IsEmpty) return;
+                var refreshed = parent.Store.GetProject(projectID);
+                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return;
+                var missed = queued.Distinct().ToList();
+                Wake(refreshed, missed.Count == 1 ? missed[0]
+                    : "Stimuli that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
+            }
+            catch { /* never mask the wake outcome */ }
         }
 
         /// <summary>

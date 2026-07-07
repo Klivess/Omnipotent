@@ -157,9 +157,35 @@ namespace Omnipotent.Services.Projects.Discord
                     Text = e.Message.Content,
                 });
                 if (project.Status == ProjectStatus.Active)
+                {
                     parent.CommanderRunner.Wake(project, $"Message from Klives (Discord): {e.Message.Content}");
+                    // The wake's closing reply can be minutes away — show life immediately.
+                    try { await e.Channel.TriggerTypingAsync(); } catch { }
+                }
+                else
+                {
+                    // A message into a paused project used to be swallowed silently.
+                    await e.Message.RespondAsync($"Project is **{project.Status}** — the Commander won't act until it's resumed (message logged for its next wake).");
+                }
             }
             catch (Exception ex) { log($"Discord reply routing failed: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Posts the Commander's prose (a wake's closing reply to Klives) to the project channel
+        /// as plain chat — the counterpart of reply routing, without which the Commander answers
+        /// only into the event log and Discord reads as silence.
+        /// </summary>
+        public async Task PostCommanderReplyAsync(Project project, string text)
+        {
+            if (project.DiscordChannelID == 0 || string.IsNullOrWhiteSpace(text)) return;
+            try
+            {
+                var channel = await discord.Client.GetChannelAsync(project.DiscordChannelID);
+                for (int at = 0; at < text.Length; at += 1900)
+                    await channel.SendMessageAsync(text.Substring(at, Math.Min(1900, text.Length - at)));
+            }
+            catch (Exception ex) { log($"Commander reply post failed for {project.ProjectID}: {ex.Message}"); }
         }
 
         // ── reports ──

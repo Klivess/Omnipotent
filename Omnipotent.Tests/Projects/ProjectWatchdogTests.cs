@@ -39,6 +39,31 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void FreshProject_WithInitEventButNoWakeYet_IsNotStalled()
+        {
+            // The create route logs a "Project initialised" event immediately, so the tail is
+            // non-empty before the first wake — that must not read as "stalled (last: never)".
+            var (svc, pid) = NewProjectService();
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Author = "klives", Text = "Project initialised." });
+            var wd = new ProjectWatchdog(svc, _ => { });
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public void NeverWokenProject_OlderThanWakeGap_IsDiagnosedAsStall()
+        {
+            var (svc, pid) = NewProjectService();
+            var p = svc.Store.GetProject(pid)!;
+            p.CreatedAt = DateTime.UtcNow.AddHours(-1);
+            svc.Store.SaveProject(p);
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Author = "klives", Text = "Project initialised." });
+            var wd = new ProjectWatchdog(svc, _ => { });
+            var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
+            Assert.NotNull(diag);
+            Assert.Contains("never", diag);
+        }
+
+        [Fact]
         public void RecentWakeWithProgress_IsHealthy()
         {
             var (svc, pid) = NewProjectService();

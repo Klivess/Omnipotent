@@ -7,24 +7,66 @@ namespace Omnipotent.Services.Projects
     /// <summary>
     /// Storage for per-project settings (Projects' own setting system, not OmniSettings). One
     /// small JSON doc per project, atomic rewrite — same durability shape as the ledger/vault.
-    /// Missing files return defaults, so a project created before a new setting existed simply
-    /// picks up that setting's default.
     ///
-    /// Layout: Projects/Settings/&lt;projectID&gt;.settings.json
+    /// SYSTEM DEFAULTS: a single `_system-defaults.json` holds the values NEW projects inherit,
+    /// editable by Klives. It layers over the hardcoded <see cref="ProjectSettings.Defaults"/>
+    /// (which remain the ultimate fallback). A project's settings are seeded from the system
+    /// defaults at creation and are independent thereafter — editing the system defaults never
+    /// retroactively changes an existing project.
+    ///
+    /// Layout: Projects/Settings/&lt;projectID&gt;.settings.json  +  Projects/Settings/_system-defaults.json
     /// </summary>
     public class ProjectSettingsStore
     {
         private readonly string dir;
+        private readonly string systemDefaultsPath;
+        private readonly object systemLock = new();
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
 
         public ProjectSettingsStore()
         {
             dir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "Settings");
             Directory.CreateDirectory(dir);
+            systemDefaultsPath = Path.Combine(dir, "_system-defaults.json");
         }
 
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".settings.json");
+
+        // ── system defaults (what new projects inherit) ──
+
+        /// <summary>The system-wide default settings new projects inherit. Falls back to the
+        /// hardcoded <see cref="ProjectSettings.Defaults"/> when no override file exists.</summary>
+        public ProjectSettings GetSystemDefaults()
+        {
+            lock (systemLock)
+            {
+                if (File.Exists(systemDefaultsPath))
+                {
+                    try
+                    {
+                        var s = JsonConvert.DeserializeObject<ProjectSettings>(File.ReadAllText(systemDefaultsPath));
+                        if (s != null) { s.ProjectID = ""; return s; }
+                    }
+                    catch { }
+                }
+                return new ProjectSettings { ProjectID = "" }; // hardcoded ProjectSettings.Defaults
+            }
+        }
+
+        public void SaveSystemDefaults(ProjectSettings defaults)
+        {
+            lock (systemLock)
+            {
+                defaults.ProjectID = "";
+                defaults.UpdatedAt = DateTime.UtcNow;
+                string tmp = systemDefaultsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllText(tmp, JsonConvert.SerializeObject(defaults, Formatting.Indented));
+                File.Move(tmp, systemDefaultsPath, overwrite: true);
+            }
+        }
+
+        // ── per-project settings ──
 
         public ProjectSettings Get(string projectID)
         {
@@ -40,8 +82,11 @@ namespace Omnipotent.Services.Projects
                     }
                     catch { }
                 }
-                return new ProjectSettings { ProjectID = projectID };
             }
+            // No per-project file yet — inherit the system defaults (stamped with this project's ID).
+            var seeded = GetSystemDefaults();
+            seeded.ProjectID = projectID;
+            return seeded;
         }
 
         public void Save(ProjectSettings settings)
@@ -56,10 +101,10 @@ namespace Omnipotent.Services.Projects
             }
         }
 
-        /// <summary>Seeds a project's settings with defaults at creation (idempotent).</summary>
+        /// <summary>Seeds a project's settings from the system defaults at creation (idempotent).</summary>
         public ProjectSettings EnsureCreated(string projectID)
         {
-            var s = Get(projectID);
+            var s = Get(projectID); // inherits system defaults when no file exists yet
             Save(s);
             return s;
         }

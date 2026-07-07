@@ -2,6 +2,7 @@ using Omnipotent.Services.Projects;
 
 namespace Omnipotent.Tests.Projects
 {
+    [Collection("ProjectsSerial")]
     public class ProjectVaultTests
     {
         private static string NewProjectId() => "test_" + Guid.NewGuid().ToString("N");
