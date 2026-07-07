@@ -61,19 +61,48 @@ namespace Omnipotent.Services.Projects.Containers
                 resolveSecretsAsync: resolveSecretsAsync);
         }
 
-        /// <summary>Creates (or resolves) the desktop record an agent should use.</summary>
+        /// <summary>Creates (or resolves) the desktop record an agent should use. A freshly created
+        /// container is probed until its desktop server answers, so the first computer_* tool doesn't
+        /// race the container's boot (x11vnc/Xvfb take a few seconds to come up).</summary>
         public async Task<DesktopContainerRecord> EnsureDesktopAsync(Project project, string agentID, CancellationToken ct = default)
         {
             if (project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock)
             {
                 var shared = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == null);
-                shared ??= await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
+                if (shared != null) return shared;
+                shared = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
+                await WaitForDesktopReadyAsync(shared, ct);
                 return shared;
             }
 
             var mine = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == agentID);
-            mine ??= await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
+            if (mine != null) return mine;
+            mine = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
+            await WaitForDesktopReadyAsync(mine, ct);
             return mine;
+        }
+
+        /// <summary>
+        /// Blocks until a freshly created container's desktop server accepts an RFB handshake, or a
+        /// bounded budget elapses. Each connect attempt already fails fast (VncTransport's handshake
+        /// timeout), so this is a short retry loop, not an open-ended wait. Never throws — if the
+        /// desktop never comes up, the first tool call surfaces the clear per-connect error instead.
+        /// </summary>
+        private async Task WaitForDesktopReadyAsync(DesktopContainerRecord record, CancellationToken ct)
+        {
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(45);
+            var transport = GetTransport(record);
+            for (int attempt = 1; DateTime.UtcNow < deadline; attempt++)
+            {
+                try { await transport.ConnectAsync(ct); log($"Desktop {record.ContainerID[..12]} ready after {attempt} probe(s)."); return; }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                catch (Exception ex)
+                {
+                    if (attempt == 1) log($"Waiting for desktop {record.ContainerID[..12]} to come up ({ex.Message})…");
+                    try { await Task.Delay(TimeSpan.FromSeconds(2), ct); } catch { return; }
+                }
+            }
+            log($"Desktop {record.ContainerID[..12]} did not become ready within the boot window — tools will report the connection error.");
         }
 
         /// <summary>The transport for a container by ID (for the live-view stream route), or null if unknown.</summary>

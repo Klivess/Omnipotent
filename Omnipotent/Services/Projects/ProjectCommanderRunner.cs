@@ -27,9 +27,51 @@ namespace Omnipotent.Services.Projects
         // as soon as the active wake finishes.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> pendingTriggers = new(StringComparer.Ordinal);
 
+        // Klives steering that should land WITHIN the current wake (not after it): drained at the
+        // top of each tool-loop turn and injected into the live session, so a message reshapes the
+        // Commander's behaviour on its very next model turn instead of one whole wake later.
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> steerQueue = new(StringComparer.Ordinal);
+
+        // The live wake's cancellation source per project, so Klives can halt an in-flight wake
+        // (pause/archive) instead of waiting for it to run itself out.
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> activeWakeCts = new(StringComparer.Ordinal);
+
         public ProjectCommanderRunner(Projects parent)
         {
             this.parent = parent;
+        }
+
+        /// <summary>
+        /// Delivers a Klives message with minimal latency. If a wake is in flight, the message is
+        /// injected into that live session so the Commander honours it within the current wake
+        /// (fast steering, item 5); otherwise it wakes the Commander normally. The caller is
+        /// responsible for having logged the KlivesMessage event.
+        /// </summary>
+        public void Steer(Project project, string text)
+        {
+            if (activeWakeCts.ContainsKey(project.ProjectID))
+            {
+                steerQueue.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<string>()).Enqueue(text);
+                return;
+            }
+            Wake(project, $"Message from Klives: {text}");
+        }
+
+        /// <summary>
+        /// Halts the project's in-flight wake, if any (Klives paused/archived it). Cancels the
+        /// live tool loop; rehydrate-on-wake makes this safe — no in-memory state is corrupted, the
+        /// committed event log is intact, and a later resume simply wakes fresh. Returns true if a
+        /// wake was actually cancelled.
+        /// </summary>
+        public bool CancelActiveWake(string projectID)
+        {
+            steerQueue.TryRemove(projectID, out _);
+            pendingTriggers.TryRemove(projectID, out _);
+            if (activeWakeCts.TryGetValue(projectID, out var cts))
+            {
+                try { cts.Cancel(); return true; } catch { return false; }
+            }
+            return false;
         }
 
         /// <summary>
@@ -74,7 +116,11 @@ namespace Omnipotent.Services.Projects
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = "Wake completed; Commander asleep.";
             int stuckTrips = 0;
+            // Whether Klives is expecting a reply from this wake — either it was triggered by his
+            // message, or he steered it mid-flight. Drives the Discord reply mirror.
+            bool klivesInvolved = TriggeredByKlives(triggerDescription);
             using var cts = new CancellationTokenSource();
+            activeWakeCts[projectID] = cts; // registered so Klives can halt this wake
 
             try
             {
@@ -105,6 +151,16 @@ namespace Omnipotent.Services.Projects
                 {
                     cts.Token.ThrowIfCancellationRequested();
 
+                    // Fast steering: fold in any Klives messages that arrived since the last turn so
+                    // the Commander adjusts within THIS wake. Injected only at a turn boundary (never
+                    // mid tool-call-batch) so the tool_call/tool_result pairing stays valid.
+                    if (steerQueue.TryGetValue(projectID, out var sq))
+                        while (sq.TryDequeue(out var steer))
+                        {
+                            llm.AppendUserMessageToToolSession(sessionId, $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer}");
+                            klivesInvolved = true;
+                        }
+
                     if (toolCalls >= MaxToolCallsPerWake)
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake} calls). Stop calling tools and reply with a concise status: what you did this wake and what the next wake should do.");
@@ -112,9 +168,11 @@ namespace Omnipotent.Services.Projects
                     var resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
-                    // Meter this round's spend against the budget (provisional now; reconciled if a gen-id is available).
+                    // Meter this round's spend against the budget. The generation id lets the ledger
+                    // reconcile to the router's ACTUAL cost — essential once the model in use differs
+                    // from the one the flat provisional estimate assumes (item 7).
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
-                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens);
+                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
@@ -123,7 +181,7 @@ namespace Omnipotent.Services.Projects
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", final));
                         // When Klives spoke to the Commander, the answer must reach him where he
                         // asked — the event log alone reads as silence from Discord.
-                        if (TriggeredByKlives(triggerDescription) && parent.DiscordManager != null)
+                        if (klivesInvolved && parent.DiscordManager != null)
                         {
                             try { await parent.DiscordManager.PostCommanderReplyAsync(project, final); }
                             catch { /* best-effort surface */ }
@@ -187,7 +245,7 @@ namespace Omnipotent.Services.Projects
             catch (OperationCanceledException)
             {
                 outcome = ProjectEventTypes.WakeFailed;
-                outcomeText = "Wake cancelled.";
+                outcomeText = "Wake halted by Klives (project paused or archived).";
             }
             catch (Exception ex)
             {
@@ -207,7 +265,7 @@ namespace Omnipotent.Services.Projects
                     parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
 
                     // A failed Klives-triggered wake must not read as silence either.
-                    if (outcome == ProjectEventTypes.WakeFailed && TriggeredByKlives(triggerDescription) && parent.DiscordManager != null)
+                    if (outcome == ProjectEventTypes.WakeFailed && klivesInvolved && parent.DiscordManager != null)
                     {
                         try { await parent.DiscordManager.PostCommanderReplyAsync(project, $"⚠️ {outcomeText}"); }
                         catch { }
@@ -218,6 +276,8 @@ namespace Omnipotent.Services.Projects
                 }
                 catch { /* never mask the wake outcome */ }
 
+                // Deregister this wake's cancellation source (only if it's still ours).
+                activeWakeCts.TryRemove(new KeyValuePair<string, CancellationTokenSource>(projectID, cts));
                 DrainPendingTriggers(projectID);
             }
         }
@@ -226,15 +286,23 @@ namespace Omnipotent.Services.Projects
         private static bool TriggeredByKlives(string trigger) =>
             trigger.Contains("Message from Klives", StringComparison.Ordinal);
 
-        /// <summary>Re-wakes the Commander with any triggers that arrived during the wake that just ended.</summary>
+        /// <summary>Re-wakes the Commander with any triggers or steers that arrived during (or at the tail
+        /// end of) the wake that just ended — so nothing is stranded by the finish/enqueue race.</summary>
         private void DrainPendingTriggers(string projectID)
         {
             try
             {
-                if (!pendingTriggers.TryRemove(projectID, out var queued) || queued.IsEmpty) return;
+                pendingTriggers.TryRemove(projectID, out var queued);
+                steerQueue.TryRemove(projectID, out var leftoverSteers);
                 var refreshed = parent.Store.GetProject(projectID);
-                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return;
-                var missed = queued.Distinct().ToList();
+                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return; // halted/archived: drop, events stay logged
+
+                var missed = new List<string>();
+                if (queued != null) missed.AddRange(queued);
+                if (leftoverSteers != null) missed.AddRange(leftoverSteers.Select(s => $"Message from Klives: {s}"));
+                missed = missed.Distinct().ToList();
+                if (missed.Count == 0) return;
+
                 Wake(refreshed, missed.Count == 1 ? missed[0]
                     : "Stimuli that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
             }

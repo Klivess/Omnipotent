@@ -631,6 +631,7 @@ namespace Omnipotent.Services.KliveLLM
                 ToolCalls = toolCalls,
                 PromptTokens = response.usage?.prompt_tokens ?? 0,
                 CompletionTokens = response.usage?.completion_tokens ?? 0,
+                GenerationId = response.id,
             };
         }
 
@@ -1378,6 +1379,10 @@ namespace Omnipotent.Services.KliveLLM
             public string ErrorMessage { get; set; }
             public int PromptTokens { get; set; }
             public int CompletionTokens { get; set; }
+
+            /// <summary>The provider's generation/response id (OpenRouter's `id`), used to fetch
+            /// the authoritative per-request cost from /generation. Null when unavailable.</summary>
+            public string? GenerationId { get; set; }
 
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.

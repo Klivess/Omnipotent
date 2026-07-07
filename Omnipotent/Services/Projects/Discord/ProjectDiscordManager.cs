@@ -66,6 +66,19 @@ namespace Omnipotent.Services.Projects.Discord
             return channel.Id;
         }
 
+        /// <summary>Renames the project's Discord channel to match a project rename (best-effort).</summary>
+        public async Task RenameProjectChannelAsync(Project project)
+        {
+            if (project.DiscordChannelID == 0) return;
+            try
+            {
+                var channel = await discord.Client.GetChannelAsync(project.DiscordChannelID);
+                string name = "project-" + Sanitise(project.Name);
+                await channel.ModifyAsync(c => c.Name = name);
+            }
+            catch (Exception ex) { log($"Rename channel failed for {project.ProjectID}: {ex.Message}"); }
+        }
+
         public async Task ArchiveChannelAsync(Project project)
         {
             if (project.DiscordChannelID == 0) return;
@@ -158,8 +171,9 @@ namespace Omnipotent.Services.Projects.Discord
                 });
                 if (project.Status == ProjectStatus.Active)
                 {
-                    parent.CommanderRunner.Wake(project, $"Message from Klives (Discord): {e.Message.Content}");
-                    // The wake's closing reply can be minutes away — show life immediately.
+                    // Steer: injected into the live wake if one is running (fast steering, item 5).
+                    parent.CommanderRunner.Steer(project, e.Message.Content);
+                    // The reply can be a moment away — show life immediately.
                     try { await e.Channel.TriggerTypingAsync(); } catch { }
                 }
                 else

@@ -96,7 +96,7 @@ namespace Omnipotent.Services.Projects
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
-                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens);
+                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)

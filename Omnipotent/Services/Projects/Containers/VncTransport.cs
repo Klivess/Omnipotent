@@ -49,53 +49,62 @@ namespace Omnipotent.Services.Projects.Containers
 
         // ── connection ──
 
+        /// <summary>Overall budget for TCP connect + the RFB handshake. Without this a container
+        /// whose x11vnc hasn't come up (docker-proxy accepts the TCP connection but no RFB bytes
+        /// ever arrive) would hang a computer_* tool indefinitely — the "all computer_* tools
+        /// timeout" symptom. A bounded failure surfaces a clear error the agent can act on.</summary>
+        private static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(12);
+
         public async Task ConnectAsync(CancellationToken ct = default)
         {
             await connectGate.WaitAsync(ct);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            linked.CancelAfter(HandshakeTimeout);
+            var hct = linked.Token;
             try
             {
                 if (Connected) return;
                 DisposeConnection();
 
                 tcp = new TcpClient { NoDelay = true };
-                await tcp.ConnectAsync(host, port, ct);
+                await tcp.ConnectAsync(host, port, hct);
                 stream = tcp.GetStream();
 
                 // ProtocolVersion handshake: server sends 12 bytes, we answer 3.8.
-                byte[] version = await ReadExactAsync(12, ct);
+                byte[] version = await ReadExactAsync(12, hct);
                 string serverVersion = System.Text.Encoding.ASCII.GetString(version);
                 if (!serverVersion.StartsWith("RFB ")) throw new InvalidOperationException($"Not an RFB server: '{serverVersion}'");
-                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes("RFB 003.008\n"), ct);
+                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes("RFB 003.008\n"), hct);
 
                 // Security: server lists types; we require None (1).
-                byte nTypes = (await ReadExactAsync(1, ct))[0];
+                byte nTypes = (await ReadExactAsync(1, hct))[0];
                 if (nTypes == 0)
                 {
-                    string reason = await ReadReasonStringAsync(ct);
+                    string reason = await ReadReasonStringAsync(hct);
                     throw new InvalidOperationException($"RFB handshake refused: {reason}");
                 }
-                byte[] types = await ReadExactAsync(nTypes, ct);
+                byte[] types = await ReadExactAsync(nTypes, hct);
                 if (!types.Contains((byte)1))
                     throw new InvalidOperationException("RFB server does not offer security type None — desktop containers must run x11vnc -nopw on a loopback-bound port.");
-                await stream.WriteAsync(new byte[] { 1 }, ct);
+                await stream.WriteAsync(new byte[] { 1 }, hct);
 
                 // SecurityResult (3.8 sends it for None too).
-                byte[] secResult = await ReadExactAsync(4, ct);
+                byte[] secResult = await ReadExactAsync(4, hct);
                 if (BinaryPrimitives.ReadUInt32BigEndian(secResult) != 0)
                 {
-                    string reason = await ReadReasonStringAsync(ct);
+                    string reason = await ReadReasonStringAsync(hct);
                     throw new InvalidOperationException($"RFB security failed: {reason}");
                 }
 
                 // ClientInit: shared = 1 (the website's live view coexists with the agent).
-                await stream.WriteAsync(new byte[] { 1 }, ct);
+                await stream.WriteAsync(new byte[] { 1 }, hct);
 
                 // ServerInit: geometry + pixel format + name.
-                byte[] init = await ReadExactAsync(24, ct);
+                byte[] init = await ReadExactAsync(24, hct);
                 Width = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(0));
                 Height = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(2));
                 uint nameLen = BinaryPrimitives.ReadUInt32BigEndian(init.AsSpan(20));
-                DesktopName = System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)nameLen, ct));
+                DesktopName = System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)nameLen, hct));
                 lock (fbLock) framebuffer = new byte[Width * Height * 4];
 
                 // SetPixelFormat: 32bpp true-colour, little-endian, BGRA layout (blue shift 0).
@@ -107,18 +116,25 @@ namespace Omnipotent.Services.Projects.Containers
                 BinaryPrimitives.WriteUInt16BigEndian(spf.AsSpan(10), 255);  // green max
                 BinaryPrimitives.WriteUInt16BigEndian(spf.AsSpan(12), 255);  // blue max
                 spf[14] = 16; spf[15] = 8; spf[16] = 0;      // red/green/blue shifts → BGRA in memory
-                await stream.WriteAsync(spf, ct);
+                await stream.WriteAsync(spf, hct);
 
                 // SetEncodings: Raw only (loopback bandwidth is free; simplicity wins).
                 var se = new byte[8];
                 se[0] = 2;
                 BinaryPrimitives.WriteUInt16BigEndian(se.AsSpan(2), 1);
                 BinaryPrimitives.WriteInt32BigEndian(se.AsSpan(4), 0); // Raw
-                await stream.WriteAsync(se, ct);
+                await stream.WriteAsync(se, hct);
 
                 loopCts = new CancellationTokenSource();
                 receiveLoop = Task.Run(() => ReceiveLoopAsync(loopCts.Token));
                 log($"VNC connected to {host}:{port} — '{DesktopName}' {Width}x{Height}.");
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                // The timeout fired (not the caller's token) — the desktop never completed the RFB
+                // handshake. Surface it as a clear, actionable failure, not a silent hang.
+                DisposeConnection();
+                throw new TimeoutException($"VNC handshake to {host}:{port} did not complete within {HandshakeTimeout.TotalSeconds:0}s — the container's desktop server (x11vnc) is not responding yet or has failed to start.");
             }
             finally { connectGate.Release(); }
         }

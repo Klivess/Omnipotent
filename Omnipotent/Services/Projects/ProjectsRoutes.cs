@@ -129,13 +129,94 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     project!.Status = ProjectStatus.Paused;
                     parent.Store.SaveProject(project);
+                    // Halt the in-flight wake too, so "pause" stops work promptly rather than only
+                    // preventing the NEXT wake (item 1: halt progression).
+                    bool halted = parent.CommanderRunner.CancelActiveWake(project.ProjectID);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
                         Type = ProjectEventTypes.Status,
                         Author = "klives",
-                        Text = "Project paused by Klives.",
+                        Text = halted ? "Project paused by Klives — in-flight wake halted." : "Project paused by Klives.",
                     });
+                    await req.ReturnResponse(Json(project));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // ── Archive / unarchive (shelving, item 2) ──
+            await parent.CreateAPIRoute("/projects/archive", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    project!.Status = ProjectStatus.Archived;
+                    parent.Store.SaveProject(project);
+                    parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID,
+                        Type = ProjectEventTypes.Status,
+                        Author = "klives",
+                        Text = "Project archived (shelved) by Klives.",
+                    });
+                    await req.ReturnResponse(Json(project));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/unarchive", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    // Restore to Paused (not Active) — Klives explicitly resumes when ready, so
+                    // unshelving never silently sets the fleet back to work.
+                    project!.Status = ProjectStatus.Paused;
+                    parent.Store.SaveProject(project);
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID,
+                        Type = ProjectEventTypes.Status,
+                        Author = "klives",
+                        Text = "Project unshelved by Klives (paused — resume to set it working).",
+                    });
+                    await req.ReturnResponse(Json(project));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // ── Rename (agents learn of it via the log + wake seed, item 4) ──
+            await parent.CreateAPIRoute("/projects/rename", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
+                    string newName = ((string?)body?.name ?? "").Trim();
+                    if (string.IsNullOrWhiteSpace(newName))
+                    {
+                        await req.ReturnResponse("name required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    string oldName = project!.Name;
+                    if (newName == oldName) { await req.ReturnResponse(Json(project)); return; }
+                    project.Name = newName;
+                    parent.Store.SaveProject(project);
+                    // Logged as a Klives message so it lands in the Commander's recent-events window
+                    // and it registers the rename on its next wake (the wake seed reads project.Name).
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID,
+                        Type = ProjectEventTypes.KlivesMessage,
+                        Author = "klives",
+                        Text = $"Project renamed from \"{oldName}\" to \"{newName}\".",
+                    });
+                    if (parent.DiscordManager != null)
+                    {
+                        try { await parent.DiscordManager.RenameProjectChannelAsync(project); }
+                        catch (Exception dex) { _ = parent.ServiceLogError(dex, "Projects: rename Discord channel failed"); }
+                    }
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -319,8 +400,9 @@ namespace Omnipotent.Services.Projects
                         Author = "klives",
                         Text = text,
                     });
+                    // Steer: lands within the active wake if one is running, else wakes fresh (item 5).
                     if (project.Status == ProjectStatus.Active)
-                        parent.CommanderRunner.Wake(project, $"Message from Klives: {text}");
+                        parent.CommanderRunner.Steer(project, text);
                     await req.ReturnResponse(Json(evt));
                 }
                 catch (Exception ex) { await Err(req, ex); }
