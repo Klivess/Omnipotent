@@ -197,6 +197,29 @@ namespace Omnipotent.Services.Projects
             => promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
              + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
 
+        /// <summary>
+        /// Called after Klives edits a project's budgets from the UI. Re-arms the once-only 80%
+        /// warning if the new budget puts spend back under the warn line (otherwise a raised budget
+        /// could never warn again), and reports whether spend is now within the token budget (the
+        /// caller uses that to un-pause a BudgetPaused project).
+        /// </summary>
+        public bool NotifyBudgetChanged(string projectID)
+        {
+            var project = projectStore.GetProject(projectID);
+            if (project == null) return false;
+            lock (LockFor(projectID))
+            {
+                var ledger = LoadLocked(projectID);
+                double fraction = project.TokenBudgetUsd > 0 ? ledger.TokenSpendUsd / project.TokenBudgetUsd : 0;
+                if (ledger.TokenWarned && fraction < WarnFraction)
+                {
+                    ledger.TokenWarned = false;
+                    SaveLocked(ledger);
+                }
+                return fraction < 1.0;
+            }
+        }
+
         /// <summary>Compact human-readable budget state for the standing digest / wake seed.</summary>
         public string DescribeState(string projectID)
         {

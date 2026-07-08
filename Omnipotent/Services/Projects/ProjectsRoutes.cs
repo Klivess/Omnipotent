@@ -194,6 +194,67 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // Klives-side budget editing (the Commander's own path stays request_budget_increase).
+            // POST { projectID, tokenBudgetUsd?, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap? }
+            // Only supplied fields change. Raising the token budget above current spend un-pauses a
+            // BudgetPaused project; the change is logged as a KlivesMessage so the Commander sees it.
+            await parent.CreateAPIRoute("/projects/budget/update", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
+                    double? tokenBudget = (double?)body?.tokenBudgetUsd;
+                    double? moneyBudget = (double?)body?.moneyBudgetUsd;
+                    double? moneyThreshold = (double?)body?.moneyAutonomousThresholdUsd;
+                    int? agentCap = (int?)body?.subAgentCap;
+
+                    if (tokenBudget is <= 0)
+                    {
+                        await req.ReturnResponse("tokenBudgetUsd must be > 0 — a Project is a goal AND a budget", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (moneyBudget is < 0 || moneyThreshold is < 0 || agentCap is < 1)
+                    {
+                        await req.ReturnResponse("moneyBudgetUsd/moneyAutonomousThresholdUsd must be ≥ 0 and subAgentCap ≥ 1", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var changes = new List<string>();
+                    if (tokenBudget.HasValue && tokenBudget.Value != project!.TokenBudgetUsd)
+                    { changes.Add($"token budget ${project.TokenBudgetUsd:0.##} → ${tokenBudget.Value:0.##}"); project.TokenBudgetUsd = tokenBudget.Value; }
+                    if (moneyBudget.HasValue && moneyBudget.Value != project!.MoneyBudgetUsd)
+                    { changes.Add($"money budget ${project.MoneyBudgetUsd:0.##} → ${moneyBudget.Value:0.##}"); project.MoneyBudgetUsd = moneyBudget.Value; }
+                    if (moneyThreshold.HasValue && moneyThreshold.Value != project!.MoneyAutonomousThresholdUsd)
+                    { changes.Add($"autonomous threshold ${project.MoneyAutonomousThresholdUsd:0.##} → ${moneyThreshold.Value:0.##}"); project.MoneyAutonomousThresholdUsd = moneyThreshold.Value; }
+                    if (agentCap.HasValue && agentCap.Value != project!.SubAgentCap)
+                    { changes.Add($"agent cap {project.SubAgentCap} → {agentCap.Value}"); project.SubAgentCap = agentCap.Value; }
+
+                    if (changes.Count == 0) { await req.ReturnResponse(Json(project)); return; }
+                    parent.Store.SaveProject(project!);
+
+                    // Re-arm the 80% warning for the new budget; un-pause if spend is back within it.
+                    bool withinBudget = parent.Budget.NotifyBudgetChanged(project!.ProjectID);
+                    if (project.Status == ProjectStatus.BudgetPaused && withinBudget && tokenBudget.HasValue)
+                    {
+                        project.Status = ProjectStatus.Active;
+                        parent.Store.SaveProject(project);
+                        changes.Add("project resumed from budget-pause");
+                    }
+
+                    // KlivesMessage (not Status) so it lands in the Commander's recent-events window.
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID,
+                        Type = ProjectEventTypes.KlivesMessage,
+                        Author = "klives",
+                        Text = $"Budgets updated by Klives: {string.Join(", ", changes)}.",
+                    });
+                    await req.ReturnResponse(Json(project));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             await parent.CreateAPIRoute("/projects/resume", async req =>
             {
                 try
