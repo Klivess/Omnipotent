@@ -778,10 +778,29 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
+        /// Authorizes a Projects WebSocket connection as Klives. Browsers cannot set an Authorization
+        /// HEADER on a WebSocket, so KliveAPI's header-based gate can never pass for a browser client —
+        /// WS routes must register as Anybody and check the ?authorization= password here (the exact
+        /// pattern HostControl's /kliveagent/screen/stream uses). This was the root cause of the live
+        /// desktop never connecting: the route was registered Klives-gated, so every browser got 401.
+        /// </summary>
+        private async Task<bool> AuthorizeWsAsKlivesAsync(NameValueCollection query, Profiles.KMProfileManager.KMProfile? user)
+        {
+            var resolved = user;
+            if (resolved == null)
+            {
+                string? pw = query["authorization"];
+                if (!string.IsNullOrEmpty(pw))
+                    resolved = await ExecuteServiceMethod<Profiles.KMProfileManager>("GetProfileByPassword", pw) as Profiles.KMProfileManager.KMProfile;
+            }
+            return resolved != null && resolved.KlivesManagementRank >= Profiles.KMProfileManager.KMPermissions.Klives;
+        }
+
+        /// <summary>
         /// Registers the event-stream WebSocket (Phase 3 push): /projects/events/stream?projectID=..&amp;since=..
         /// Per-project subscribers get every ProjectEvent (replay-after-cursor then live); a fleet
-        /// subscriber (no projectID) gets a lightweight signal on any project's event. Klives-only,
-        /// reusing the existing WS auth. Platform-independent (text, not frames).
+        /// subscriber (no projectID) gets a lightweight signal on any project's event. Registered as
+        /// Anybody at the KliveAPI layer, authorized in-handler (see AuthorizeWsAsKlivesAsync).
         /// </summary>
         private async Task RegisterEventStreamRouteAsync()
         {
@@ -791,7 +810,7 @@ namespace Omnipotent.Services.Projects
                     "/projects/events/stream",
                     (Func<HttpListenerContext, WebSocket, NameValueCollection, Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
                     {
-                        if (user == null || user.KlivesManagementRank < Profiles.KMProfileManager.KMPermissions.Klives)
+                        if (!await AuthorizeWsAsKlivesAsync(query, user))
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
@@ -801,7 +820,7 @@ namespace Omnipotent.Services.Projects
                         await EventBroadcaster.HandleAsync(socket, projectID, since,
                             (pid, sinceExclusive) => EventLog.ReadSince(pid, sinceExclusive));
                     }),
-                    Profiles.KMProfileManager.KMPermissions.Klives);
+                    Profiles.KMProfileManager.KMPermissions.Anybody);
                 ServiceLog("Projects: event-stream route registered (/projects/events/stream).");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register event-stream route (non-fatal)"); }
@@ -821,14 +840,16 @@ namespace Omnipotent.Services.Projects
                     "/projects/containers/screen/stream",
                     (Func<HttpListenerContext, WebSocket, NameValueCollection, Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
                     {
-                        if (user == null || user.KlivesManagementRank < Profiles.KMProfileManager.KMPermissions.Klives)
+                        // Anybody at the KliveAPI layer + in-handler Klives auth: browsers can't send an
+                        // Authorization header on a WebSocket (see AuthorizeWsAsKlivesAsync).
+                        if (!await AuthorizeWsAsKlivesAsync(query, user))
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
                         }
                         await StreamContainerScreenAsync(socket, query);
                     }),
-                    Profiles.KMProfileManager.KMPermissions.Klives);
+                    Profiles.KMProfileManager.KMPermissions.Anybody);
                 ServiceLog("Projects: container screen-stream route registered (/projects/containers/screen/stream).");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register container screen-stream route (non-fatal)"); }

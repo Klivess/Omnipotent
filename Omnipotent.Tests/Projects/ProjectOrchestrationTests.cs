@@ -243,6 +243,29 @@ namespace Omnipotent.Tests.Projects
             // The event lets the watchdog progress detector and the twice-daily reports see real spend.
             Assert.Contains(log.ReadSince(pid, 0), e => e.Type == ProjectEventTypes.MoneySpent);
         }
+
+        [Fact]
+        public async Task BudgetRaise_RearmsWarning_AndReportsWithinBudget()
+        {
+            // Burn past 80% of a $1 budget → warned once and (past 100%) paused.
+            var (ledger, store, log, pid) = NewSetup(tokenBudget: 1.0);
+            await ledger.RecordTokenSpendAsync(pid, 0, 80_000); // $1.20 provisional
+            Assert.Equal(ProjectStatus.BudgetPaused, store.GetProject(pid)!.Status);
+
+            // Klives raises the budget well above spend (the /projects/budget/update flow).
+            var p = store.GetProject(pid)!;
+            p.TokenBudgetUsd = 100;
+            store.SaveProject(p);
+            Assert.True(ledger.NotifyBudgetChanged(pid)); // spend is now within budget → caller may un-pause
+
+            // The once-only 80% warning must be re-armed for the NEW budget: spending toward the new
+            // 80% line must warn a second time.
+            int warningsBefore = log.ReadSince(pid, 0).Count(e => e.Type == ProjectEventTypes.BudgetWarning);
+            p.Status = ProjectStatus.Active; store.SaveProject(p);
+            await ledger.RecordTokenSpendAsync(pid, 0, 6_000_000); // +$90 → past 80% of $100
+            int warningsAfter = log.ReadSince(pid, 0).Count(e => e.Type == ProjectEventTypes.BudgetWarning);
+            Assert.Equal(warningsBefore + 1, warningsAfter);
+        }
     }
 
     public class ProjectGateManagerTests
