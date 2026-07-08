@@ -126,6 +126,22 @@ namespace Omnipotent.Services.KliveMail
             return null;
         }
 
+        /// <summary>
+        /// Raised once for each stored inbound message (one per envelope recipient). Lets other
+        /// services observe inbound mail without polling — e.g. the Projects stimulus bus wakes a
+        /// project when a matching email arrives. Subscribers must not throw; exceptions are logged.
+        /// </summary>
+        public event Action<Models.StoredMessage>? MailStored;
+
+        // Called by the message store once a message is persisted.
+        internal void RaiseMailStored(Models.StoredMessage message)
+        {
+            var handler = MailStored;
+            if (handler == null) return;
+            try { handler(message); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "KliveMail: a MailStored subscriber threw.", false); }
+        }
+
         // Called by the message store once a message is persisted.
         public async Task NotifyMailReceived(IEnumerable<string> recipients, string from, string subject)
             => await ServiceLog($"KliveMail received mail for [{string.Join(", ", recipients)}] from {from}: {subject}");

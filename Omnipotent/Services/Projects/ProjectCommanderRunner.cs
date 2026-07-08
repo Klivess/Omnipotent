@@ -116,6 +116,7 @@ namespace Omnipotent.Services.Projects
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = "Wake completed; Commander asleep.";
             int stuckTrips = 0;
+            long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
@@ -151,6 +152,17 @@ namespace Omnipotent.Services.Projects
                 {
                     cts.Token.ThrowIfCancellationRequested();
 
+                    // Budget guardrail: RecordTokenSpendAsync flips Status→BudgetPaused synchronously when
+                    // the token budget is exhausted, but doesn't cancel this wake. Re-read status at the
+                    // turn boundary so the pause actually stops the loop BEFORE the next (costly) LLM call
+                    // — otherwise the in-flight wake overshoots the budget to natural completion.
+                    var freshStatus = parent.Store.GetProject(projectID)?.Status;
+                    if (freshStatus == ProjectStatus.BudgetPaused)
+                    {
+                        outcomeText = "Wake stopped — token budget exhausted (project paused pending a budget increase).";
+                        goto done;
+                    }
+
                     // Fast steering: fold in any Klives messages that arrived since the last turn so
                     // the Commander adjusts within THIS wake. Injected only at a turn boundary (never
                     // mid tool-call-batch) so the tool_call/tool_result pairing stays valid.
@@ -172,7 +184,11 @@ namespace Omnipotent.Services.Projects
                     // reconcile to the router's ACTUAL cost — essential once the model in use differs
                     // from the one the flat provisional estimate assumes (item 7).
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
+                    {
+                        wakePromptTokens += resp.PromptTokens;
+                        wakeCompletionTokens += resp.CompletionTokens;
                         await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
+                    }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
@@ -262,6 +278,10 @@ namespace Omnipotent.Services.Projects
                     if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
                     parent.Digests.SaveDigest(digest);
 
+                    // Per-wake cost attribution: the ledger is cumulative, so stamp this wake's own
+                    // token spend + provisional cost onto its closing event for the timeline/reports.
+                    if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
+                        outcomeText += $" (this wake: ~${parent.Budget.EstimateCost(wakePromptTokens, wakeCompletionTokens):0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                     parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
 
                     // A failed Klives-triggered wake must not read as silence either.
@@ -317,6 +337,14 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public string ForceWake(Project project, string reason)
         {
+            // Cancel the presumed-wedged wake FIRST so it can't keep running (and burning tokens)
+            // alongside the fresh one, and so a wake blocked on a gate/steer actually unwinds. Without
+            // this the old wake's cts stayed live and ExecuteWakeAsync's registry overwrite made it
+            // un-cancelable — briefly running two concurrent wakes. Rehydrate-on-wake makes this safe.
+            if (activeWakeCts.TryGetValue(project.ProjectID, out var oldCts))
+            {
+                try { oldCts.Cancel(); } catch { }
+            }
             var digest = parent.Digests.GetDigest(project.ProjectID);
             digest.ActiveWakeID = null; // abandon the presumed-stuck wake's marker
             parent.Digests.SaveDigest(digest);

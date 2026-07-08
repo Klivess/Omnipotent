@@ -24,7 +24,35 @@ namespace Omnipotent.Services.KliveAgent
             if (!Directory.Exists(dir))
             {
                 await agentService.GetDataHandler().CreateDirectory(dir);
+                return;
             }
+
+            // Restore persisted task history so GetAllTasks/GetActiveTasks survive a restart. A task
+            // still marked Running was interrupted by the restart — background C# ran partway with
+            // side effects, so it cannot be safely resumed. Mark it orphaned (Failed) rather than
+            // silently losing it or pretending it's still alive.
+            int loaded = 0, orphaned = 0;
+            foreach (var file in Directory.GetFiles(dir, "*.json"))
+            {
+                try
+                {
+                    var info = await agentService.GetDataHandler().ReadAndDeserialiseDataFromFile<AgentBackgroundTaskInfo>(file);
+                    if (info == null || string.IsNullOrWhiteSpace(info.TaskId)) continue;
+                    if (info.Status == AgentTaskStatus.Running)
+                    {
+                        info.Status = AgentTaskStatus.Failed;
+                        info.ErrorMessage = "Interrupted by an Omnipotent restart (background tasks do not resume across restarts).";
+                        info.CompletedAt = DateTime.UtcNow;
+                        await PersistTaskAsync(info);
+                        orphaned++;
+                    }
+                    tasks[info.TaskId] = info;
+                    loaded++;
+                }
+                catch { }
+            }
+            if (loaded > 0)
+                agentService.ServiceLog($"Restored {loaded} background task record(s){(orphaned > 0 ? $"; {orphaned} were interrupted by a restart and marked failed" : "")}.");
         }
 
         public string SpawnTask(string description, string code)
@@ -38,6 +66,10 @@ namespace Omnipotent.Services.KliveAgent
             var cts = new CancellationTokenSource();
             tasks[taskInfo.TaskId] = taskInfo;
             cancellationTokens[taskInfo.TaskId] = cts;
+
+            // Persist at spawn (Running state) so a restart can SEE an interrupted task and mark it
+            // orphaned, rather than losing it — the finally block only persists terminal states.
+            _ = PersistTaskAsync(taskInfo);
 
             _ = Task.Run(async () =>
             {

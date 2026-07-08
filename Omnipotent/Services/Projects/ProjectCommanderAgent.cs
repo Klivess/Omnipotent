@@ -27,6 +27,7 @@ HOW YOU OPERATE:
 
 SELF-SUFFICIENCY (you have your own computer — use it):
 - You command desktop containers (full mouse/keyboard/screen control), a C# script engine, HTTP, and a project file volume. Between them almost everything is doable yourself: research, writing and running code, git operations, installing tools, creating accounts, testing on the website. Exhaust your own tools before involving Klives.
+- Your C# scripts (run_script) execute IN-PROCESS inside Omnipotent itself — fine for general scripting, but they can also reach and control the whole Omnipotent platform through its referenced assembly. Treat that reach with the same judgment as any other action: the escalation bar applies to what a script does.
 - Never ask Klives to do your work for you ('commit this yourself', 'run this command', 'create a token for me' when you can create it from your desktop). If a credential genuinely only Klives holds, ask ONCE via request_human, store what you receive with vault_save, and never ask for it again.
 - request_human is strictly for obstacles that structurally require a human: captchas, SMS/2FA codes, physical-world actions, or decisions/credentials only Klives possesses. It is not for work that is hard, tedious, or unfamiliar — that work is yours.
 - Do not repeat a request Klives has already answered, and do not re-raise an unanswered one wake after wake. Log it as an open thread, make progress elsewhere, and let him respond in his own time.
@@ -103,6 +104,13 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         rationale = Str("Why the increase is justified by progress/plan."),
                     }, "kind", "amount", "rationale")),
 
+                Tool("record_money_spend", "Record a real-money spend against the project's money budget. Spends at or below your autonomy threshold and within budget are recorded immediately; anything larger (or over budget) opens an approval gate first. Call this whenever you commit real money (a purchase, a subscription, an API top-up).",
+                    Obj(new
+                    {
+                        amount = Num("Amount in USD."),
+                        description = Str("What the money was/will be spent on."),
+                    }, "amount", "description")),
+
                 Tool("vault_save", "Store a credential/secret in the project vault under a name. Reference it later as {name} in typed text; you never see the value again.",
                     Obj(new { name = Str("Reference name."), value = Str("The secret value to store.") }, "name", "value")),
 
@@ -120,8 +128,14 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                     Obj(new { content = Str("The fact to remember."), tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, "content")),
 
                 // ── work tools (text tier and up) ──
-                Tool("run_script", "Run a C# script for real work: computation, parsing, API orchestration. Globals: Http (HttpClient), Output(value), ReadFile/WriteFile/ListFiles (project volume). The script's return value and Output() lines come back to you.",
+                Tool("run_script", "Run a C# script IN-PROCESS INSIDE Omnipotent (the host platform this project runs on). Use it for general script writing — computation, parsing, API orchestration — but know it is NOT sandboxed to that: the Omnipotent assembly is referenced, so through its namespaces/types the script can reach and control all of Omnipotent itself (live services, state, host resources). Globals: Http (HttpClient), Output(value), ReadFile/WriteFile/ListFiles (project volume). The script's return value and Output() lines come back to you. The escalation bar applies to what a script DOES, exactly as it would to any other action.",
                     Obj(new { code = Str("C# script body. End with an expression or use Output(...).") }, "code")),
+
+                Tool("run_powershell", "Run a PowerShell script on the HOST machine (where Omnipotent runs), in its security context (elevated if Omnipotent is). Use for real host operations: installs, service/process control, git, filesystem, diagnostics. This is the host, NOT your desktop container. Returns exit code + stdout + stderr.",
+                    Obj(new { script = Str("PowerShell script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120).") }, "script")),
+
+                Tool("run_bash", "Run a Bash script on the HOST machine (WSL/Git Bash), in Omnipotent's security context. The host, NOT your desktop container. Returns exit code + stdout + stderr; says so if bash isn't installed.",
+                    Obj(new { script = Str("Bash script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120).") }, "script")),
 
                 Tool("http_request", "Make an HTTP request. Returns status + body (truncated).",
                     Obj(new
@@ -142,10 +156,10 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                     Obj(new { path = Str("Directory relative to the volume root (default: root).") }, Array.Empty<string>())),
 
                 // ── stimulus hooks: shape what wakes you ──
-                Tool("create_stimulus_hook", "Subscribe to a stimulus source so events wake you (or a sub-agent). Sources: timer {intervalSeconds}, webhook {}, file-watch {path}, screen-diff {agentID?, intervalSeconds?, threshold?}, script {script, pollSeconds}.",
+                Tool("create_stimulus_hook", "Subscribe to a stimulus source so events wake you (or a sub-agent). Sources: timer {intervalSeconds}, webhook {}, file-watch {path}, screen-diff {agentID?, intervalSeconds?, threshold?}, script {script, pollSeconds}, email {to?, from?, subjectContains?}, discord {channelId?, authorId?, contains?}, process-exit {processName?|pid?, pollSeconds?}. Spec filters are optional; the recognition criterion still triages what actually counts.",
                     Obj(new
                     {
-                        sourceKind = Str("timer | webhook | file-watch | screen-diff | script"),
+                        sourceKind = Str("timer | webhook | file-watch | screen-diff | script | email | discord | process-exit"),
                         sourceSpec = new { type = "object", description = "Source-specific spec object (see tool description)." },
                         criterion = Str("Natural-language recognition criterion: when does a raw event count? Empty = always deliver."),
                         destinationAgentID = Str("Which agent the confirmed stimulus wakes (default: you)."),
@@ -182,9 +196,13 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                 Tool("computer_click", "Click at (x, y).", Obj(new { x = Num("X pixel."), y = Num("Y pixel."), button = Str("left (default) | middle | right"), clicks = Num("1 (default) or 2 for double-click.") }, "x", "y")),
                 Tool("computer_move", "Move the mouse to (x, y) without clicking.", Obj(new { x = Num("X"), y = Num("Y") }, "x", "y")),
                 Tool("computer_drag", "Drag from (fromX, fromY) to (toX, toY).", Obj(new { fromX = Num("From X"), fromY = Num("From Y"), toX = Num("To X"), toY = Num("To Y"), button = Str("left (default)") }, "fromX", "fromY", "toX", "toY")),
+                Tool("computer_mouse_down", "Press and HOLD a mouse button at (x, y) — pair with computer_mouse_up for custom drags/hold gestures.", Obj(new { x = Num("X pixel."), y = Num("Y pixel."), button = Str("left (default) | middle | right") }, "x", "y")),
+                Tool("computer_mouse_up", "Release a held mouse button at (x, y).", Obj(new { x = Num("X pixel."), y = Num("Y pixel."), button = Str("left (default) | middle | right") }, "x", "y")),
                 Tool("computer_scroll", "Scroll at a point.", Obj(new { direction = Str("down (default) | up | left | right"), amount = Num("Notches (default 5)."), x = Num("X (default: centre)"), y = Num("Y (default: centre)") }, Array.Empty<string>())),
                 Tool("computer_type", "Type text at the current focus. Reference vault secrets as {name} — they substitute at keystroke time and you never see the value.", Obj(new { text = Str("Text to type.") }, "text")),
                 Tool("computer_key", "Press a key or chord, e.g. 'enter', 'ctrl+l', 'alt+f4'.", Obj(new { key = Str("Key name or chord.") }, "key")),
+                Tool("computer_key_down", "Press and HOLD a single key (e.g. 'shift') — pair with computer_key_up.", Obj(new { key = Str("Key name.") }, "key")),
+                Tool("computer_key_up", "Release a held key.", Obj(new { key = Str("Key name.") }, "key")),
                 Tool("computer_wait", "Wait for the screen to settle.", Obj(new { ms = Num("Milliseconds (default 1000, max 30000).") }, Array.Empty<string>())),
                 Tool("computer_release_all", "Release all held buttons/keys and the shared-desktop input lock.", Obj(new { }, Array.Empty<string>())),
             };

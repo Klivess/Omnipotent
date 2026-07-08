@@ -42,7 +42,7 @@ namespace Omnipotent.Services.KliveAgent
                         var entry = await service.GetDataHandler().ReadAndDeserialiseDataFromFile<AgentMemoryEntry>(file);
                         if (entry != null) cachedMemories.Add(entry);
                     }
-                    catch { }
+                    catch (Exception ex) { _ = service.ServiceLogError(ex, $"[KliveAgent] Skipped unreadable memory file {Path.GetFileName(file)}.", false); }
                 }
                 cacheLoaded = true;
             }
@@ -54,12 +54,47 @@ namespace Omnipotent.Services.KliveAgent
 
         public async Task<AgentMemoryEntry> SaveMemoryAsync(string content, string[] tags = null, string source = "agent", int importance = 1, string memoryType = "general", string title = null)
         {
+            if (!cacheLoaded) await LoadCacheAsync();
+            int clampedImportance = Math.Clamp(importance, 1, 5);
+            var newTags = tags?.ToList() ?? new List<string>();
+
+            // Dedup on save: if a memory with identical normalised content and the same type already
+            // exists, merge into it (union tags, keep the higher importance) instead of writing a
+            // near-duplicate file. Curation is no longer left entirely to the model deleting dupes.
+            AgentMemoryEntry existing;
+            await cacheLock.WaitAsync();
+            try
+            {
+                string normalized = NormalizeContent(content);
+                existing = cachedMemories.FirstOrDefault(m =>
+                    m.MemoryType == memoryType && NormalizeContent(m.Content) == normalized);
+                if (existing != null)
+                {
+                    existing.Importance = Math.Max(existing.Importance, clampedImportance);
+                    foreach (var t in newTags)
+                        if (!existing.Tags.Any(et => string.Equals(et, t, StringComparison.OrdinalIgnoreCase)))
+                            existing.Tags.Add(t);
+                    if (string.IsNullOrEmpty(existing.Title) && !string.IsNullOrEmpty(title))
+                        existing.Title = title;
+                }
+            }
+            finally { cacheLock.Release(); }
+
+            if (existing != null)
+            {
+                var existingPath = Path.Combine(
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentMemoriesDirectory),
+                    $"{existing.Id}.json");
+                await service.GetDataHandler().SerialiseObjectToFile(existingPath, existing);
+                return existing;
+            }
+
             var entry = new AgentMemoryEntry
             {
                 Content = content,
-                Tags = tags?.ToList() ?? new List<string>(),
+                Tags = newTags,
                 Source = source,
-                Importance = Math.Clamp(importance, 1, 5),
+                Importance = clampedImportance,
                 MemoryType = memoryType,
                 Title = title
             };
@@ -81,6 +116,13 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             return entry;
+        }
+
+        /// <summary>Normalises content for dedup: trim, lowercase, collapse internal whitespace.</summary>
+        private static string NormalizeContent(string? content)
+        {
+            if (string.IsNullOrWhiteSpace(content)) return string.Empty;
+            return System.Text.RegularExpressions.Regex.Replace(content.Trim().ToLowerInvariant(), @"\s+", " ");
         }
 
         public async Task<List<AgentMemoryEntry>> RecallMemoriesAsync(string query, int maxResults = 10)
@@ -106,13 +148,14 @@ namespace Omnipotent.Services.KliveAgent
                     ((m.Content ?? "") + " " + string.Join(" ", m.Tags ?? new List<string>())).ToLowerInvariant()).ToList();
                 double avgLen = corpus.Count == 0 ? 1 : corpus.Average(c => c.Length);
                 int N = corpus.Count;
+                var df = BuildDocFrequencies(queryTerms, corpus);
 
                 return cachedMemories
                     .Select((m, i) =>
                     {
                         var doc = corpus[i];
-                        double bm25 = Bm25Score(queryTerms, doc, N, corpus, avgLen);
-                        return new { Memory = m, Score = bm25 + m.Importance * 0.5 };
+                        double bm25 = Bm25Score(queryTerms, doc, N, df, avgLen);
+                        return new { Memory = m, Score = bm25 + m.Importance * 0.5 + RecencyBoost(m.CreatedAt) };
                     })
                     .Where(x => x.Score > 0)
                     .OrderByDescending(x => x.Score)
@@ -193,12 +236,13 @@ namespace Omnipotent.Services.KliveAgent
                      string.Join(" ", m.Tags ?? new List<string>())).ToLowerInvariant()).ToList();
                 double avgLen = corpus.Count == 0 ? 1 : corpus.Average(c => c.Length);
                 int N = corpus.Count;
+                var df = BuildDocFrequencies(queryTerms, corpus);
 
                 return shortcuts
                     .Select((m, i) =>
                     {
                         var doc = corpus[i];
-                        double bm25 = Bm25Score(queryTerms, doc, N, corpus, avgLen);
+                        double bm25 = Bm25Score(queryTerms, doc, N, df, avgLen);
                         return new { Memory = m, Score = bm25 + m.Importance * 0.5 };
                     })
                     .Where(x => x.Score > 0)
@@ -323,12 +367,33 @@ namespace Omnipotent.Services.KliveAgent
             return id.Length <= 8 ? id : id[..8];
         }
 
-        // BM25 scorer (k1=1.5, b=0.75) — spec Chapter 5
+        /// <summary>
+        /// Precomputes document frequency for each distinct query term ONCE per recall. Previously df
+        /// was recomputed inside the per-document scorer (a full corpus scan per term, per document →
+        /// O(terms × N²)); precomputing collapses it to a single O(terms × N) pass.
+        /// </summary>
+        private static Dictionary<string, int> BuildDocFrequencies(List<string> queryTerms, List<string> corpus)
+        {
+            var df = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var term in queryTerms.Distinct(StringComparer.Ordinal))
+                df[term] = corpus.Count(d => d.Contains(term, StringComparison.Ordinal));
+            return df;
+        }
+
+        /// <summary>A small recency nudge so a fresh memory isn't permanently outranked by an old
+        /// high-importance one. Decays smoothly (~45-day scale); always ≥0, at most ~0.5.</summary>
+        private static double RecencyBoost(DateTime createdAtUtc)
+        {
+            double ageDays = Math.Max(0, (DateTime.UtcNow - createdAtUtc).TotalDays);
+            return 0.5 * Math.Exp(-ageDays / 45.0);
+        }
+
+        // BM25 scorer (k1=1.5, b=0.75) — spec Chapter 5. df is precomputed (see BuildDocFrequencies).
         private static double Bm25Score(
             List<string> queryTerms,
             string document,
             int N,
-            List<string> corpus,
+            IReadOnlyDictionary<string, int> df,
             double avgDocLen)
         {
             const double k1 = 1.5, b = 0.75;
@@ -337,8 +402,8 @@ namespace Omnipotent.Services.KliveAgent
             {
                 int tf = CountOccurrences(document, term);
                 if (tf == 0) continue;
-                int df = corpus.Count(d => d.Contains(term, StringComparison.Ordinal));
-                double idf = Math.Log((N - df + 0.5) / (df + 0.5) + 1);
+                int dfi = df.TryGetValue(term, out var v) ? v : 0;
+                double idf = Math.Log((N - dfi + 0.5) / (dfi + 0.5) + 1);
                 score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * document.Length / avgDocLen));
             }
             return score;

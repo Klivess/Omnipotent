@@ -88,6 +88,7 @@ namespace Omnipotent.Services.Projects
         public const string WakeCompleted = "wake-completed";
         public const string WakeFailed = "wake-failed";
         public const string CommanderThought = "commander-thought";    // intermediate prose during a wake
+        public const string AgentThought = "agent-thought";            // sub-agent intermediate prose during a wake
         public const string CommanderMessage = "commander-message";    // prose addressed to Klives
         public const string KlivesMessage = "klives-message";          // Klives → Commander (website chat or Discord reply)
         public const string AgentMessage = "agent-message";            // inter-agent message riding the bus

@@ -69,44 +69,16 @@ namespace Omnipotent.Services.Projects
                         return;
                     }
 
-                    var p = parent.Store.CreateProject(name, goal, tokenBudget, moneyBudget, moneyThreshold, agentCap);
-                    var settings = parent.Settings.EnsureCreated(p.ProjectID); // seed this project's own settings with defaults
                     // Optional per-project settings configured on the new-project page (model routing,
-                    // vision/containers, desktop image). Applied BEFORE the first wake so the Commander
-                    // wakes on the models Klives chose, not the inherited defaults.
+                    // vision/containers, desktop image), applied at creation before the first wake.
+                    Dictionary<string, string>? settingsPatch = null;
                     if (body?.settings != null)
                     {
-                        try
-                        {
-                            var patch = ((Newtonsoft.Json.Linq.JObject)body.settings).ToObject<Dictionary<string, string>>() ?? new();
-                            foreach (var kv in patch)
-                            {
-                                if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
-                                settings.TrySet(kv.Key, kv.Value ?? "");
-                            }
-                            parent.Settings.Save(settings);
-                        }
-                        catch (Exception sex) { _ = parent.ServiceLogError(sex, "Projects: applying create-time settings failed (using defaults)"); }
+                        try { settingsPatch = ((Newtonsoft.Json.Linq.JObject)body.settings).ToObject<Dictionary<string, string>>(); }
+                        catch (Exception sex) { _ = parent.ServiceLogError(sex, "Projects: parsing create-time settings failed (using defaults)"); }
                     }
-                    parent.EventLog.Append(new ProjectEvent
-                    {
-                        ProjectID = p.ProjectID,
-                        Type = ProjectEventTypes.Status,
-                        Author = "klives",
-                        Text = $"Project initialised. Goal: {goal} — token budget ${tokenBudget:0.##}, money budget ${moneyBudget:0.##} (autonomous ≤ ${moneyThreshold:0.##}), agent cap {agentCap}.",
-                    });
-                    // Create the project's Discord channel (best-effort; the website works regardless).
-                    if (parent.DiscordManager != null)
-                    {
-                        try { await parent.DiscordManager.CreateProjectChannelAsync(p); }
-                        catch (Exception dex) { _ = parent.ServiceLogError(dex, "Projects: create Discord channel failed"); }
-                    }
-                    // First wake: a project must start itself. Without this nothing wakes the
-                    // Commander until the keepalive timer, and the watchdog reports a "stall"
-                    // on a project that has never run.
-                    parent.CommanderRunner.Wake(p,
-                        "Project created by Klives just now. Read the goal, form an initial plan (update_plan), " +
-                        "create the stimulus hooks you need (create_stimulus_hook), and take the first concrete steps.");
+
+                    var p = await parent.CreateProjectAsync(name, goal, tokenBudget, moneyBudget, moneyThreshold, agentCap, settingsPatch);
                     await req.ReturnResponse(Json(p));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -393,17 +365,9 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    var evt = parent.EventLog.Append(new ProjectEvent
-                    {
-                        ProjectID = project!.ProjectID,
-                        Type = ProjectEventTypes.KlivesMessage,
-                        Author = "klives",
-                        Text = text,
-                    });
-                    // Steer: lands within the active wake if one is running, else wakes fresh (item 5).
-                    if (project.Status == ProjectStatus.Active)
-                        parent.CommanderRunner.Steer(project, text);
-                    await req.ReturnResponse(Json(evt));
+                    // Logs the Klives message and steers/wakes the Commander (lands within a live wake).
+                    parent.MessageProject(project!.ProjectID, text);
+                    await req.ReturnResponse(Json(new { ok = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
@@ -445,7 +409,27 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    await req.ReturnResponse(Json(parent.Hooks.List(project!.ProjectID)));
+                    var enriched = parent.Hooks.List(project!.ProjectID).Select(h =>
+                    {
+                        var arm = h.Enabled ? parent.Adapters.GetArmInfo(h.HookID) : null;
+                        return new
+                        {
+                            h.HookID,
+                            h.ProjectID,
+                            h.OwningAgentID,
+                            h.SourceKind,
+                            h.SourceSpecJson,
+                            h.RecognitionCriterion,
+                            h.DestinationAgentID,
+                            h.Priority,
+                            h.Durability,
+                            h.Enabled,
+                            h.CreatedAt,
+                            ArmState = arm?.State.ToString() ?? (h.Enabled ? "Unknown" : "Disabled"),
+                            ArmDetail = arm?.Detail ?? "",
+                        };
+                    });
+                    await req.ReturnResponse(Json(enriched));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);

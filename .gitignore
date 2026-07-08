@@ -410,3 +410,5 @@ agent_test_results.txt
 agent_benchmark.ps1
 agent_benchmark_tier2.ps1
 Omnipotent.Tests/Omnipotent.Tests.csproj.lscache
+Omnipotent/Services/KliveAgent/AGENT_ARCHITECTURE.md
+Omnipotent/Services/KliveAgent/AGENT_ARCHITECTURE.md

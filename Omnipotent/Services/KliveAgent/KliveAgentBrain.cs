@@ -87,6 +87,14 @@ namespace Omnipotent.Services.KliveAgent
             new("GetAgentStats", "Return today's KliveAgent run-time stats. Top-level: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, todayUtcDate, fullSummary. fullSummary contains nested objects: lifetime{messages,promptTokens,completionTokens,totalTokens,iterations,scripts,scriptFailures,scriptSuccessRatePct,...}, today{messages,promptTokens,completionTokens,totalTokens,scripts,scriptFailures,scriptFailureRatePct,...} (today is null on a fresh day before any activity), and dailyHistory[] with the same per-day shape. Access nested values via JSON serialization or GetObjectMember chains.")
         ];
 
+        private static readonly PromptToolDescriptor[] ProjectsTools =
+        [
+            new("CreateProject", "Delegate long-running autonomous work to the Projects task force: CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap?). Returns the new project ID. Use for goals that outlast one chat — the Commander pursues them 24/7 and shares this memory."),
+            new("ListProjects", "List all Projects with a one-line status (id, name, status, budget, active agents, last event)."),
+            new("GetProjectStatus", "Get one Project's status/budget/agent summary by ID."),
+            new("SteerProject", "Send a message to a Project's Commander (steers a live wake or wakes it): SteerProject(projectID, message).")
+        ];
+
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
         {
             this.agentService = agentService;
@@ -515,9 +523,11 @@ namespace Omnipotent.Services.KliveAgent
             var tools = new List<HFWrapper.HFTool>
             {
                 Tool("execute_csharp",
-                    "Execute a C# script in-process against Omnipotent's live service graph (Roslyn). " +
-                    "Write plain C# using the ScriptGlobals API (GetService, GetTypeSchema, GetObjectMembers, " +
-                    "CallObjectMethod, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
+                    "Execute a C# script IN-PROCESS INSIDE Omnipotent (Roslyn) — the script runs in the live " +
+                    "server's context, so it is equally good for general-purpose scripting (computation, parsing, " +
+                    "file/data work, HTTP) AND it can read, drive, and control ALL of Omnipotent: every live " +
+                    "service, its state, and its methods, via the ScriptGlobals API (GetService, GetTypeSchema, " +
+                    "GetObjectMembers, CallObjectMethod, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
                     "Locals persist across calls within the same turn. `await` any Task-returning call. " +
                     "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
                     "in {{{ }}} or markdown fences. NOTE: memory has its OWN dedicated tools (recall_memories, " +
@@ -1042,6 +1052,14 @@ namespace Omnipotent.Services.KliveAgent
                 string fastModel = (await agentService.GetStringOmniSetting("KliveAgent_FastModel", defaultValue: "")) ?? "";
                 string reasoningModel = (await agentService.GetStringOmniSetting("KliveAgent_ReasoningModel", defaultValue: "")) ?? "";
 
+                // Per-run guardrails: the agentic loop has no iteration cap by design, but an unbounded
+                // token/time budget can burn real money if the model never emits a final answer. Soft
+                // warn at 80% (nudge it to wrap up), hard-stop at 100% (demand a final answer, then end).
+                // 0 disables either cap. Defaults are generous so normal tasks never hit them.
+                int maxRunTokens = await agentService.GetIntOmniSetting("KliveAgent_MaxRunTokens", 600_000);
+                int maxRunMinutes = await agentService.GetIntOmniSetting("KliveAgent_MaxRunMinutes", 30);
+                int maxLlmRetries = Math.Max(0, await agentService.GetIntOmniSetting("KliveAgent_MaxLlmRetries", 2));
+
                 int totalPromptTokens = 0;
                 int totalCompletionTokens = 0;
                 int iterationsDone = 0;
@@ -1062,6 +1080,9 @@ namespace Omnipotent.Services.KliveAgent
                 bool finalFormatRetryUsed = false;
                 int emptyFinalRetries = 0;
                 int consecutiveNoOpResponses = 0;
+                // Per-run budget state (see maxRunTokens/maxRunMinutes above).
+                bool budgetWarned = false;
+                bool budgetForceFinal = false;
                 // Number of consecutive iterations whose scripts produced at least one error. Drives the
                 // adaptive thinking budget: a clean cheap turn asks for low reasoning effort; we escalate
                 // toward the user's ceiling as the task shows it's hard.
@@ -1192,6 +1213,31 @@ namespace Omnipotent.Services.KliveAgent
                     if (cancellationToken.IsCancellationRequested)
                         return BuildStoppedResponse();
 
+                    // Per-run budget guardrail (token/wall-clock). Soft-warn once at 80%; at 100% demand a
+                    // final answer this turn and finalize regardless of what the model returns.
+                    {
+                        int usedTokens = totalPromptTokens + totalCompletionTokens;
+                        double elapsedMin = turnStopwatch.Elapsed.TotalMinutes;
+                        bool tokenHard = maxRunTokens > 0 && usedTokens >= maxRunTokens;
+                        bool timeHard = maxRunMinutes > 0 && elapsedMin >= maxRunMinutes;
+                        if (tokenHard || timeHard)
+                        {
+                            budgetForceFinal = true;
+                            stuckForceFinal = true; // skip empty/format retries on the final path
+                            SendModelPrompt($"[Run limit reached] You have hit this run's {(tokenHard ? "token" : "time")} budget. STOP calling tools now. Reply with your best final answer to the user based on what you already have — no scripts, no tool calls.");
+                        }
+                        else
+                        {
+                            double tokenFrac = maxRunTokens > 0 ? usedTokens / (double)maxRunTokens : 0;
+                            double timeFrac = maxRunMinutes > 0 ? elapsedMin / maxRunMinutes : 0;
+                            if (!budgetWarned && (tokenFrac >= 0.8 || timeFrac >= 0.8))
+                            {
+                                budgetWarned = true;
+                                SendModelPrompt("[Budget notice] You are near this run's limit. Start wrapping up: finish the task in the next step or two, or give your best current answer.");
+                            }
+                        }
+                    }
+
                     // Surface "thinking" while we wait on the model. This also acts as a stall-watchdog
                     // heartbeat at the start of every step.
                     ReportProgress("thinking", $"_…thinking (step {iteration + 1})_");
@@ -1222,36 +1268,49 @@ namespace Omnipotent.Services.KliveAgent
                         speculativeTasks.TryAdd(tc.id, RunNativeToolAsync(sharedGlobals, name, tc.function?.arguments));
                     }
 
-                    KliveLLM.KliveLLM.KliveLLMResponse llmResponse;
-                    try
+                    // Brain-level retry: the transport backs off on transient HTTP errors, but an exception
+                    // that surfaces here (e.g. a stream that died before the first token) otherwise aborts
+                    // the whole run. Retry the turn a few times before giving up.
+                    KliveLLM.KliveLLM.KliveLLMResponse llmResponse = null;
+                    for (int llmAttempt = 0; ; llmAttempt++)
                     {
-                        if (useToolCalling)
+                        try
                         {
-                            // The structured session already holds system + user + any prior tool turns.
-                            llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete);
+                            if (useToolCalling)
+                            {
+                                // The structured session already holds system + user + any prior tool turns.
+                                llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete);
+                            }
+                            else
+                            {
+                                // Pass system prompt only on iteration 0 so it is set as the LLM session's
+                                // system role message once — not re-injected into every user turn.
+                                llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
+                                    systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall);
+                                firstIterationSystemPrompt = null; // don't resend
+                            }
+                            break;
                         }
-                        else
+                        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                         {
-                            // Pass system prompt only on iteration 0 so it is set as the LLM session's
-                            // system role message once — not re-injected into every user turn.
-                            llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                                systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall);
-                            firstIterationSystemPrompt = null; // don't resend
+                            return BuildStoppedResponse();
                         }
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                    {
-                        return BuildStoppedResponse();
-                    }
-                    catch (Exception llmEx)
-                    {
-                        return new AgentChatResponse
+                        catch (Exception llmEx)
                         {
-                            ConversationId = conversation.ConversationId,
-                            Response = $"LLM query failed: {llmEx.Message}",
-                            Success = false,
-                            ErrorMessage = llmEx.ToString()
-                        };
+                            if (llmAttempt >= maxLlmRetries)
+                            {
+                                return new AgentChatResponse
+                                {
+                                    ConversationId = conversation.ConversationId,
+                                    Response = $"LLM query failed: {llmEx.Message}",
+                                    Success = false,
+                                    ErrorMessage = llmEx.ToString()
+                                };
+                            }
+                            ReportProgress("thinking", $"_…transient error, retrying (attempt {llmAttempt + 2})_");
+                            try { await Task.Delay(TimeSpan.FromSeconds(1.5 * (llmAttempt + 1)), cancellationToken); }
+                            catch (OperationCanceledException) { return BuildStoppedResponse(); }
+                        }
                     }
 
                     if (llmResponse == null || !llmResponse.Success)
@@ -1335,12 +1394,23 @@ namespace Omnipotent.Services.KliveAgent
                     else consecutiveNoOpResponses = 0;
                     if (consecutiveNoOpResponses >= 2) stuckForceFinal = true;
 
-                    // No scripts â†’ this is the final answer
-                    if (!hasScripts)
+                    // No scripts → this is the final answer. Also finalize (ignoring any scripts) when the
+                    // per-run budget was hit — the model was told to stop; we end here regardless.
+                    if (!hasScripts || budgetForceFinal)
                     {
                         var finalText = string.Join("\n", segments
-                            .Where(s => !s.IsScript)
+                            .Where(s => !s.IsScript && s.ToolName == null)
                             .Select(s => s.Content)).Trim();
+
+                        // Budget stop with no clean prose (the model tried to keep working): synthesize an
+                        // honest final answer from whatever progress was streamed so the user isn't left blank.
+                        if (budgetForceFinal && string.IsNullOrWhiteSpace(finalText))
+                        {
+                            var progressed = progressText.ToString().Trim();
+                            finalText = "I've reached this run's budget limit, so I'm stopping here. "
+                                + (progressed.Length > 0 ? "Here's where I got to:\n\n" + progressed
+                                                         : "I wasn't able to finish the task within the limit — try narrowing it or raising the run budget.");
+                        }
 
                         // Guard: the model occasionally returns an empty/whitespace completion (no text,
                         // no script). Don't surface a blank bubble and DON'T fake a canned reply — empties
@@ -1939,6 +2009,10 @@ namespace Omnipotent.Services.KliveAgent
                     + "save_shortcut(title, content, tags?); get_shortcuts(); delete_memory(id).");
             else
                 AppendToolNames(sb, "Memory", MemoryTools);
+
+            // Projects delegation is always surfaced (small set) — the interactive assistant can hand
+            // long-running goals to the autonomous task force it shares memory with.
+            AppendToolNames(sb, "Projects", ProjectsTools);
 
             sb.AppendLine("If a tool you need isn't listed, run: GetTypeSchema(\"ScriptGlobals\") to see every tool, or GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\") for one signature.");
 

@@ -86,6 +86,9 @@ namespace Omnipotent.Services.KliveMail.Smtp
                     stored.HasAttachments = stored.Attachments.Count > 0;
 
                     await repo.InsertMessageAsync(stored, cancellationToken);
+
+                    // Notify observers (e.g. the Projects stimulus bus) that mail arrived.
+                    service.RaiseMailStored(stored);
                 }
 
                 await service.NotifyMailReceived(recipients, fromAddress, message.Subject ?? "(no subject)");

@@ -46,10 +46,14 @@ namespace Omnipotent.Services.Projects
         public StimulusHookStore? HookStore { get; set; }
         /// <summary>Re-arms adapters after a hook mutation.</summary>
         public Action? RearmAdapters { get; set; }
+        /// <summary>Runtime arm status for a hook (armed / passive / error), so listings show inert hooks.</summary>
+        public Func<string, HookArmInfo?>? GetHookArmInfo { get; set; }
         /// <summary>Artifact storage for files the agent wants kept on the timeline.</summary>
         public ProjectArtifactStore? Artifacts { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
         public Func<Task>? CompleteProjectAsync { get; set; }
+        /// <summary>Disposes a retired agent's own desktop container (frees ~1 GB immediately, not at project end).</summary>
+        public Func<string, Task>? DisposeAgentDesktopAsync { get; set; }
         /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max) → formatted results.</summary>
         public Func<string, int, Task<string>>? RecallMemoriesAsync { get; set; }
         /// <summary>Save to KliveAgent's shared memory: (content, tags) → confirmation.</summary>
@@ -119,6 +123,10 @@ namespace Omnipotent.Services.Projects
                 {
                     string id = (string?)a["agentID"] ?? "";
                     bool ok = subAgents.Retire(project.ProjectID, id);
+                    // Free the retired agent's own desktop immediately rather than leaking it until
+                    // the project completes.
+                    if (ok && DisposeAgentDesktopAsync != null)
+                        try { await DisposeAgentDesktopAsync(id); } catch { }
                     return new CommanderToolResult(ok ? $"Retired agent {id}." : $"No active agent {id}.");
                 }
 
@@ -178,6 +186,40 @@ namespace Omnipotent.Services.Projects
                         }
                     }
                     return new CommanderToolResult($"Klives {res.Decision}: {res.Comment}");
+                }
+
+                case "record_money_spend":
+                {
+                    double amount = (double?)a["amount"] ?? 0;
+                    string description = (string?)a["description"] ?? "";
+                    if (amount <= 0) return new CommanderToolResult("Provide a positive 'amount' in USD.");
+                    if (string.IsNullOrWhiteSpace(description)) return new CommanderToolResult("Provide a 'description' of the spend.");
+
+                    // Autonomous (within per-action threshold and remaining budget) → record now.
+                    // Otherwise open an approval gate; record only on approval.
+                    if (budget.IsMoneySpendAutonomous(project.ProjectID, amount))
+                    {
+                        budget.RecordMoneySpend(project.ProjectID, amount, description);
+                        return new CommanderToolResult($"Recorded autonomous spend ${amount:0.##}: {description}. {budget.DescribeState(project.ProjectID)}");
+                    }
+
+                    var p = projectStore.GetProject(project.ProjectID);
+                    double threshold = p?.MoneyAutonomousThresholdUsd ?? 0;
+                    var gate = new ProjectGate
+                    {
+                        ProjectID = project.ProjectID,
+                        WakeID = wakeID,
+                        AgentID = actingAgentID,
+                        Kind = "money",
+                        Title = $"Approve real-money spend: ${amount:0.##}",
+                        Description = $"{description} (${amount:0.##}).",
+                        Rationale = $"Above the autonomous threshold (${threshold:0.##}) or would exceed the money budget.",
+                    };
+                    var res = await gates.OpenGateAndWaitAsync(gate, ct);
+                    if (res.Decision != GateDecision.Approve)
+                        return new CommanderToolResult($"Klives {res.Decision}: {res.Comment} — spend NOT recorded.");
+                    budget.RecordMoneySpend(project.ProjectID, amount, description);
+                    return new CommanderToolResult($"Approved and recorded ${amount:0.##}: {description}. {budget.DescribeState(project.ProjectID)}");
                 }
 
                 case "vault_save":
@@ -278,6 +320,24 @@ namespace Omnipotent.Services.Projects
                     return await RunScriptAsync(code, ct);
                 }
 
+                case "run_powershell":
+                {
+                    string ps = (string?)a["script"] ?? "";
+                    if (string.IsNullOrWhiteSpace(ps)) return new CommanderToolResult("Provide 'script' — a PowerShell script body.");
+                    int secs = (int?)a["timeoutSeconds"] ?? 120;
+                    var r = await HostShell.RunPowerShellAsync(ps, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
+                }
+
+                case "run_bash":
+                {
+                    string bash = (string?)a["script"] ?? "";
+                    if (string.IsNullOrWhiteSpace(bash)) return new CommanderToolResult("Provide 'script' — a bash script body.");
+                    int secs = (int?)a["timeoutSeconds"] ?? 120;
+                    var r = await HostShell.RunBashAsync(bash, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
+                }
+
                 // ── stimulus hook CRUD (§5.1 — Commander side) ──
 
                 case "create_stimulus_hook":
@@ -304,7 +364,14 @@ namespace Omnipotent.Services.Projects
                     if (HookStore == null) return new CommanderToolResult("Hook store unavailable.");
                     var hooks = HookStore.List(project.ProjectID);
                     return new CommanderToolResult(hooks.Count == 0 ? "No hooks." : string.Join("\n",
-                        hooks.Select(h => $"{h.HookID}: {h.SourceKind} → {h.DestinationAgentID} ({(h.Enabled ? "enabled" : "disabled")}) criterion: {Trunc(h.RecognitionCriterion, 80)}")));
+                        hooks.Select(h =>
+                        {
+                            var arm = h.Enabled ? GetHookArmInfo?.Invoke(h.HookID) : null;
+                            string armText = h.Enabled
+                                ? (arm == null ? "not armed" : $"{arm.State}: {arm.Detail}")
+                                : "disabled";
+                            return $"{h.HookID}: {h.SourceKind} → {h.DestinationAgentID} [{armText}] criterion: {Trunc(h.RecognitionCriterion, 80)}";
+                        })));
                 }
 
                 case "delete_stimulus_hook":

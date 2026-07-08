@@ -63,8 +63,14 @@ Implemented in [KliveAgentBrain.cs](KliveAgentBrain.cs) `ProcessMessageAsync`:
 4. **Execute** each script through the Roslyn `KliveAgentScriptEngine`; capture `[OK | ms]` output
    or `[ERROR | ms]`, truncated to a token budget, into a `[Script Observations]` block.
 5. **Observe & loop** — feed observations back as the next turn. Repeat.
-6. **Stop** when the model replies with no scripts (the final answer). Guardrails: stuck-loop
-   detection (same script twice / same error 3×), a soft nudge at 12 steps, a hard cap at 30.
+6. **Stop** when the model replies with no scripts (the final answer). Guardrails (as actually
+   implemented): a 2-strike breaker on XML/JSON tool-envelope or empty no-op turns; adaptive
+   reasoning/model escalation as a task shows difficulty; a per-run **token + wall-clock budget**
+   (`KliveAgent_MaxRunTokens` / `KliveAgent_MaxRunMinutes`) that warns at 80% and force-finalises at
+   100%; and an external zero-progress stall watchdog. There is deliberately **no fixed iteration
+   cap** — the earlier "same script twice / same error 3× / hard cap at 30" logic was removed in
+   favour of these signals, so the loop can take as many steps as a task genuinely needs while the
+   budget bounds runaway cost.
 
 ### Context management
 
@@ -81,11 +87,23 @@ budget. Persistent memory (`KliveAgentMemory`) gives cross-conversation recall v
 | Action surface | Arbitrary runtime C# (Roslyn) over the live service graph | Fixed JSON-schema tools (read/edit/shell) |
 | Purpose | Operate & orchestrate Omnipotent services | Edit files, run build/test, modify code |
 | Tool invocation | Model emits `{{{ C# }}}`; harness regex-parses & compiles | Provider returns structured `tool_calls` |
-| Loop | Think→Script→Observe, stuck detection, no hard step cap (safety cap 30) | ReAct loop, usually bounded |
-| Memory of its own actions | Now persisted + replayed into later turns (Phase 1) | Native via tool/assistant/tool-result messages |
-| Streaming | Non-streaming today (Phase 2 adds it) | Streamed |
-| Reliability | Retry/backoff on transient LLM errors (Phase 6) | Provider SDK retries |
-| Context mgmt | Budgeted selection; compaction planned (Phase 8) | Token-counted, compaction/summarization |
+| Loop | Think→Script→Observe; no fixed iteration cap, bounded by a per-run token/time budget + no-op/stall breakers | ReAct loop, usually bounded |
+| Memory of its own actions | Persisted + replayed into later turns; shared memory pool deduped on save, recency-ranked | Native via tool/assistant/tool-result messages |
+| Streaming | Token streaming implemented (SSE from the provider, surfaced to the UI) | Streamed |
+| Reliability | Transport retry/backoff **and** brain-level per-turn retry on transient LLM errors | Provider SDK retries |
+| Context mgmt | Budgeted selection + implemented earlier-turn compaction (`BuildEarlierSummary`) | Token-counted, compaction/summarization |
+
+## Status note (kept honest)
+
+Phases 1–8 below described a hardening plan; most has shipped and this document has been trued up
+to match the code (the earlier draft claimed a non-existent 30-step cap and called shipped features
+"planned"). What is actually live: action persistence+replay (P1), token streaming + talk-while-
+working (P2), analytics rollups (P4), Discord owner-gating (P5), transport **and** brain-level
+retries (P6), native `execute_csharp` tool calling **alongside** the retained text-protocol parser
+(P7 shipped as a *hybrid* — the regex fallback was NOT removed, since local/prose replies still need
+it), and earlier-turn compaction (P8). Added on top of the original plan: a per-run token/wall-clock
+budget, background-task restore-on-restart, and memory dedup/recency/df-cache. Still open: a
+killable (process-isolated) script sandbox — a timed-out Roslyn script is abandoned, not force-killed.
 
 ## Rationale for the hardening phases
 
@@ -104,6 +122,13 @@ budget. Persistent memory (`KliveAgentMemory`) gives cross-conversation recall v
   only to Klives; everyone else gets the plain KliveLLM chatbot.
 - **Phase 6 – retries.** A transient provider blip no longer aborts the whole agent loop.
 - **Phase 7 – hybrid native tool calling.** Expose script execution as a single native
-  `execute_csharp` tool so the model uses the provider's structured `tool_calls` channel —
-  removing the regex parsing and "don't emit XML" defensive rules — while keeping Roslyn's power.
-- **Phase 8 – compaction.** Summarize the oldest turns near the budget instead of dropping them.
+  `execute_csharp` tool so a tool-capable model uses the provider's structured `tool_calls` channel.
+  Shipped as a **hybrid**: the regex text-protocol parser and anti-XML defensive rules are **kept**
+  as the fallback for Local providers and prose/`{{{ }}}` replies — so they were not removed as the
+  original plan imagined; both paths coexist.
+- **Phase 8 – compaction.** Summarize the oldest turns near the budget instead of dropping them
+  (implemented as `BuildEarlierSummary`).
+- **Later hardening (beyond the original 8).** Per-run token/wall-clock budget with an 80% wrap-up
+  nudge and 100% force-finalise; brain-level retry of a transient LLM turn; background-task
+  restore-or-orphan on restart; shared-memory dedup-on-save + recency ranking + one-pass document
+  frequency. Deliberately still open: a process-isolated, force-killable script sandbox.

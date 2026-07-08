@@ -234,6 +234,15 @@ namespace Omnipotent.Tests.Projects
             ledger.RecordMoneySpend(pid, 95, "bulk order"); // $95 of $100 spent
             Assert.False(ledger.IsMoneySpendAutonomous(pid, 8)); // 95+8 > 100 even though 8 < threshold
         }
+
+        [Fact]
+        public void MoneySpend_EmitsMoneySpentEvent()
+        {
+            var (ledger, _, log, pid) = NewSetup(tokenBudget: 100);
+            ledger.RecordMoneySpend(pid, 3.50, "domain renewal");
+            // The event lets the watchdog progress detector and the twice-daily reports see real spend.
+            Assert.Contains(log.ReadSince(pid, 0), e => e.Type == ProjectEventTypes.MoneySpent);
+        }
     }
 
     public class ProjectGateManagerTests

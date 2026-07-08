@@ -32,6 +32,9 @@ namespace Omnipotent.Services.Projects
 
         private const double WarnFraction = 0.80;
 
+        /// <summary>Raised (projectID) when a project crosses 100% and is auto-paused, so a surface can alert Klives.</summary>
+        public event Action<string>? BudgetPausedRaised;
+
         public ProjectBudgetLedger(ProjectStore projectStore, ProjectEventLogStore eventLog,
             OpenRouterCostFetcher costFetcher, Action<string> log)
         {
@@ -168,6 +171,7 @@ namespace Omnipotent.Services.Projects
                     Author = "system",
                     Text = $"Token budget exhausted (${ledger.TokenSpendUsd:0.##} of ${project.TokenBudgetUsd:0.##}). Project paused — a budget conversation with Klives is required to continue.",
                 });
+                try { BudgetPausedRaised?.Invoke(projectID); } catch { }
             }
             else if (fraction >= WarnFraction && !ledger.TokenWarned)
             {
@@ -186,6 +190,12 @@ namespace Omnipotent.Services.Projects
                 });
             }
         }
+
+        /// <summary>Provisional USD cost for a token count (the same yardstick applied per turn), for
+        /// per-wake cost attribution in the timeline. The reconciled OpenRouter figure supersedes it cumulatively.</summary>
+        public double EstimateCost(long promptTokens, long completionTokens)
+            => promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
+             + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
 
         /// <summary>Compact human-readable budget state for the standing digest / wake seed.</summary>
         public string DescribeState(string projectID)

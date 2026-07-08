@@ -25,10 +25,10 @@ namespace Omnipotent.Services.Projects
         /// <summary>Tools available to every tier (scripts/HTTP/files/messaging/agent lifecycle).</summary>
         private static readonly HashSet<string> TextTierTools = new(StringComparer.Ordinal)
         {
-            "run_script", "http_request", "read_file", "write_file", "list_files",
+            "run_script", "run_powershell", "run_bash", "http_request", "read_file", "write_file", "list_files",
             "send_agent_message", "spawn_sub_agent", "retire_sub_agent",
             "create_stimulus_hook", "list_stimulus_hooks", "delete_stimulus_hook",
-            "request_user_approval", "request_budget_increase",
+            "request_user_approval", "request_budget_increase", "record_money_spend",
             "vault_save", "vault_list", "request_human",
             "update_plan", "report_progress",
             "recall_memories", "save_memory",

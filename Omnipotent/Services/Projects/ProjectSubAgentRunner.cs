@@ -18,20 +18,39 @@ namespace Omnipotent.Services.Projects
         private readonly Projects parent;
         private readonly ConcurrentDictionary<string, bool> activeWakes = new(StringComparer.Ordinal); // key: projectID/agentID
 
+        // Triggers/messages that arrived for a sub-agent while it was already awake. Parity with the
+        // Commander: a directed stimulus to a busy sub-agent must not vanish. Drained at each tool-loop
+        // turn boundary (so it lands mid-wake, like Commander steering) and, for any leftover at the
+        // finish/enqueue race, folded into a follow-up wake. Keyed by projectID/agentID.
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> steerQueue = new(StringComparer.Ordinal);
+
         private const int MaxToolCallsPerWake = 30; // sub-agents do focused legwork, not strategy
         private const int StuckIdenticalCallThreshold = 3;
         private const int RecentEventsForSeed = 30;
+        private const int MaxPendingTriggers = 12;
 
         public ProjectSubAgentRunner(Projects parent)
         {
             this.parent = parent;
         }
 
-        /// <summary>Wakes a sub-agent for a directed stimulus. No-op if it is already awake.</summary>
+        private static string Key(string projectID, string agentID) => $"{projectID}/{agentID}";
+
+        /// <summary>
+        /// Wakes a sub-agent for a directed stimulus. If it is already awake, the trigger is queued
+        /// (deduped, capped) so the running wake picks it up at its next turn boundary and, failing
+        /// that, a follow-up wake fires — no directed message is dropped. Returns the wake ID, or null
+        /// if it was queued onto an active wake.
+        /// </summary>
         public string? Wake(Project project, ProjectAgentRecord agent, string trigger)
         {
-            string key = $"{project.ProjectID}/{agent.AgentID}";
-            if (!activeWakes.TryAdd(key, true)) return null; // already awake
+            string key = Key(project.ProjectID, agent.AgentID);
+            if (!activeWakes.TryAdd(key, true))
+            {
+                var q = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
+                if (q.Count < MaxPendingTriggers && !q.Contains(trigger)) q.Enqueue(trigger);
+                return null; // already awake — folded into the live wake / a follow-up
+            }
 
             string wakeID = Guid.NewGuid().ToString("N");
             parent.EventLog.Append(new ProjectEvent
@@ -46,9 +65,29 @@ namespace Omnipotent.Services.Projects
             _ = Task.Run(async () =>
             {
                 try { await ExecuteWakeAsync(project, agent, wakeID, trigger); }
-                finally { activeWakes.TryRemove(key, out _); }
+                finally
+                {
+                    activeWakes.TryRemove(key, out _);
+                    DrainPendingSteers(project, agent);
+                }
             });
             return wakeID;
+        }
+
+        /// <summary>Re-wakes the sub-agent with any steers stranded by the finish/enqueue race.</summary>
+        private void DrainPendingSteers(Project project, ProjectAgentRecord agent)
+        {
+            try
+            {
+                if (!steerQueue.TryRemove(Key(project.ProjectID, agent.AgentID), out var q) || q.IsEmpty) return;
+                var refreshed = parent.Store.GetProject(project.ProjectID);
+                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return;
+                var missed = q.ToList().Distinct().ToList();
+                if (missed.Count == 0) return;
+                Wake(refreshed, agent, missed.Count == 1 ? missed[0]
+                    : "Messages that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
+            }
+            catch { /* never mask the wake outcome */ }
         }
 
         private async Task ExecuteWakeAsync(Project project, ProjectAgentRecord agent, string wakeID, string trigger)
@@ -56,6 +95,7 @@ namespace Omnipotent.Services.Projects
             string projectID = project.ProjectID;
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = $"Agent {agent.AgentID} finished its wake.";
+            long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             using var cts = new CancellationTokenSource();
 
             try
@@ -85,9 +125,26 @@ namespace Omnipotent.Services.Projects
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
                 int toolCalls = 0;
 
+                string steerKey = Key(projectID, agent.AgentID);
+
                 while (true)
                 {
                     cts.Token.ThrowIfCancellationRequested();
+
+                    // Budget guardrail (parity with the Commander): stop this sub-agent wake if the project
+                    // was paused (e.g. token budget exhausted) since the last turn, before the next LLM call.
+                    if (parent.Store.GetProject(projectID)?.Status == ProjectStatus.BudgetPaused)
+                    {
+                        outcomeText = $"Agent {agent.AgentID} stopped — project budget paused.";
+                        break;
+                    }
+
+                    // Fold in any messages that arrived mid-wake (parity with Commander steering),
+                    // only at a turn boundary so tool_call/tool_result pairing stays valid.
+                    if (steerQueue.TryGetValue(steerKey, out var sq))
+                        while (sq.TryDequeue(out var steer))
+                            llm.AppendUserMessageToToolSession(sessionId, $"NEW MESSAGE (mid-wake — take this into account now): {steer}");
+
                     if (toolCalls >= MaxToolCallsPerWake)
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake}). Stop and report your status to the commander via send_agent_message, then reply with a one-line summary.");
@@ -96,7 +153,11 @@ namespace Omnipotent.Services.Projects
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
+                    {
+                        wakePromptTokens += resp.PromptTokens;
+                        wakeCompletionTokens += resp.CompletionTokens;
                         await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
+                    }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
@@ -105,6 +166,11 @@ namespace Omnipotent.Services.Projects
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentMessage, final));
                         break;
                     }
+
+                    // Persist the sub-agent's intermediate reasoning (parity with the Commander's
+                    // CommanderThought) so a human can reconstruct why it acted, not just what it did.
+                    if (!string.IsNullOrWhiteSpace(resp.Response))
+                        parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentThought, resp.Response.Trim()));
 
                     foreach (var call in resp.ToolCalls)
                     {
@@ -143,7 +209,7 @@ namespace Omnipotent.Services.Projects
                         {
                             ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
                             Type = ProjectEventTypes.ToolCall, Author = "agent",
-                            Text = $"{toolName}", ToolName = toolName, ToolCallId = call.id, PayloadJson = argsJson,
+                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id, PayloadJson = argsJson,
                         });
 
                         var result = await parent.CommanderToolDispatch(project, agent.AgentID, wakeID, toolName, argsJson, cts.Token);
@@ -175,6 +241,8 @@ namespace Omnipotent.Services.Projects
             }
             finally
             {
+                if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
+                    outcomeText += $" (this wake: ~${parent.Budget.EstimateCost(wakePromptTokens, wakeCompletionTokens):0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                 try { parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, outcome, outcomeText)); }
                 catch { }
             }
@@ -224,6 +292,17 @@ RULES:
         {
             ProjectID = projectID, WakeID = wakeID, AgentID = agentID, Type = type, Author = "agent", Text = text,
         };
+
+        private static string DescribeCall(string toolName, string argsJson)
+        {
+            try
+            {
+                var jo = Newtonsoft.Json.Linq.JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+                var bits = jo.Properties().Take(4).Select(p => $"{p.Name}={Trunc(p.Value.ToString(), 60)}");
+                return $"{toolName}({string.Join(", ", bits)})";
+            }
+            catch { return toolName; }
+        }
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
     }

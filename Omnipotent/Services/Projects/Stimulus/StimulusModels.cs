@@ -1,5 +1,13 @@
 namespace Omnipotent.Services.Projects.Stimulus
 {
+    /// <summary>An IDisposable that runs a callback once on dispose — used to package event unsubscription as a token.</summary>
+    public sealed class ActionDisposable : IDisposable
+    {
+        private Action? onDispose;
+        public ActionDisposable(Action onDispose) => this.onDispose = onDispose;
+        public void Dispose() { var a = onDispose; onDispose = null; a?.Invoke(); }
+    }
+
     /// <summary>Delivery durability class for a stimulus (§5.4).</summary>
     public enum StimulusDurability
     {

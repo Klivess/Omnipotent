@@ -121,7 +121,31 @@ namespace Omnipotent.Services.Projects.Discord
                 new DiscordButtonComponent(ButtonStyle.Danger, baseId + "_d", "Deny"),
                 new DiscordButtonComponent(ButtonStyle.Secondary, baseId + "_x", "Discuss"));
 
+            // @mention Klives so a blocking approval reaches him on his phone (mention in content;
+            // embeds don't ping). The agent is suspended awaiting this — it matters that he sees it.
+            embed.WithContent($"<@{OmniPaths.KlivesDiscordAccountID}>");
+            embed.WithAllowedMention(new UserMention(OmniPaths.KlivesDiscordAccountID));
+
             await channel.SendMessageAsync(embed);
+        }
+
+        /// <summary>
+        /// Posts an attention ping to the project channel with an @mention of Klives — for blocking
+        /// events (interventions, budget pauses, stalls) so he's notified even away from the website.
+        /// The mention lives in message content because embeds alone don't ping.
+        /// </summary>
+        public async Task PostAttentionAsync(Project project, string title, string body)
+        {
+            if (project.DiscordChannelID == 0) return;
+            try
+            {
+                var channel = await discord.Client.GetChannelAsync(project.DiscordChannelID);
+                var msg = KliveBotDiscord.MakeSimpleEmbed(title, body, DiscordColor.Gold);
+                msg.WithContent($"<@{OmniPaths.KlivesDiscordAccountID}>");
+                msg.WithAllowedMention(new UserMention(OmniPaths.KlivesDiscordAccountID));
+                await channel.SendMessageAsync(msg);
+            }
+            catch (Exception ex) { log($"Attention ping failed for {project.ProjectID}: {ex.Message}"); }
         }
 
         private async Task OnComponentInteraction(DiscordClient sender, ComponentInteractionCreateEventArgs e)

@@ -26,6 +26,7 @@ namespace Omnipotent.Services.Projects
             public long EventCountAtRaise;
             public bool Diagnosed;
             public bool ForceWoken;
+            public bool PingedForGate;
         }
         private readonly ConcurrentDictionary<string, Escalation> escalations = new(StringComparer.Ordinal);
 
@@ -96,20 +97,33 @@ namespace Omnipotent.Services.Projects
                 return $"No Commander wake in over {MaxWakeGap.TotalMinutes:0} minutes (last: {(lastWake == null ? "never" : lastWake.Timestamp.ToString("u"))}).";
 
             // 2. Zero-progress-over-N-wakes: the last N completed wakes produced no tool-call /
-            //    artifact / spawn events, and the plan hasn't changed.
+            //    artifact / spawn / sub-agent-activity events, and the plan hasn't changed.
             var recentWakeStarts = tail.Where(e => e.Type == ProjectEventTypes.CommanderWake).TakeLast(ZeroProgressWakes).ToList();
             if (recentWakeStarts.Count >= ZeroProgressWakes)
             {
                 long firstWakeSeq = recentWakeStarts[0].Sequence;
                 bool anyProgress = tail.Any(e => e.Sequence >= firstWakeSeq &&
-                    (e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ArtifactAdded or ProjectEventTypes.AgentSpawned or ProjectEventTypes.MoneySpent));
-                if (!anyProgress)
-                    return $"No progress across the last {ZeroProgressWakes} wakes (no tool calls, artifacts, or spawns).";
+                    (e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ArtifactAdded
+                        or ProjectEventTypes.AgentSpawned or ProjectEventTypes.MoneySpent
+                        or ProjectEventTypes.AgentWake or ProjectEventTypes.AgentMessage or ProjectEventTypes.AgentThought));
+                // A pending approval gate isn't "no progress" — it's waiting on Klives (handled below).
+                bool waitingOnKlives = (parent.Gates?.ListPending(project.ProjectID).Count ?? 0) > 0;
+                if (!anyProgress && !waitingOnKlives)
+                    return $"No progress across the last {ZeroProgressWakes} wakes (no tool calls, artifacts, spawns, or sub-agent activity).";
             }
 
             // 3. Repeated-action loops: the last wake tripped the stuck-loop guard heavily.
             if (digest.RecentStuckLoopTrips >= 3)
                 return $"Commander tripped its stuck-loop guard {digest.RecentStuckLoopTrips}× in the last wake.";
+
+            // 4. Stuck sub-agent: it woke but never finished within MaxWakeGap. The Commander's own
+            //    heartbeat can look healthy while a sub-agent is wedged, so check per-agent liveness.
+            var staleAgentWake = tail
+                .Where(e => e.Type == ProjectEventTypes.AgentWake && now - e.Timestamp > MaxWakeGap)
+                .FirstOrDefault(w => !tail.Any(e => e.WakeID == w.WakeID &&
+                    (e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed)));
+            if (staleAgentWake != null)
+                return $"Sub-agent {staleAgentWake.AgentID} has been awake without finishing for over {MaxWakeGap.TotalMinutes:0} minutes.";
 
             return null;
         }
@@ -143,7 +157,7 @@ namespace Omnipotent.Services.Projects
                     Text = $"Watchdog: {diagnosis} Escalated to Klives; auto-rehydrating the Commander if there's no response within {GraceWindow.TotalMinutes:0} minutes.",
                 });
                 if (parent.DiscordManager != null)
-                    await parent.DiscordManager.PostReportAsync(project, "⚠️ Project stalled",
+                    await parent.DiscordManager.PostAttentionAsync(project, "⚠️ Project stalled",
                         $"{diagnosis}\n\nReply here to steer, or I'll auto-rehydrate the Commander in {GraceWindow.TotalMinutes:0} minutes.");
                 log($"Watchdog escalated project {project.ProjectID}: {diagnosis}");
                 return;
@@ -152,6 +166,20 @@ namespace Omnipotent.Services.Projects
             // Grace window elapsed with no response → force a fresh wake (never a kill).
             if (!esc.ForceWoken && DateTime.UtcNow - esc.RaisedUtc >= GraceWindow)
             {
+                // Gate-aware: a wake blocked on an approval gate isn't stalled — it's waiting on Klives.
+                // Force-waking would cancel the gate wait, so instead ping him (once) and keep waiting.
+                var pending = parent.Gates.ListPending(project.ProjectID);
+                if (pending.Count > 0)
+                {
+                    if (!esc.PingedForGate && parent.DiscordManager != null)
+                    {
+                        esc.PingedForGate = true;
+                        await parent.DiscordManager.PostAttentionAsync(project, "⏳ Waiting on your approval",
+                            $"The Commander is blocked awaiting your decision on: {pending[0].Title}. Approve or deny to unblock it.");
+                    }
+                    return; // do NOT force-wake a gate-blocked wake
+                }
+
                 esc.ForceWoken = true;
                 parent.EventLog.Append(new ProjectEvent
                 {

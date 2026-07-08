@@ -18,6 +18,10 @@ namespace Omnipotent.Services.KliveAgent
         private const double PromptCostPerMillion = 3.0;
         private const double CompletionCostPerMillion = 15.0;
 
+        /// <summary>Optional sink for persistence failures — wired to the service log by KliveAgent so
+        /// a failed stats save is surfaced instead of silently swallowed.</summary>
+        public Action<Exception, string>? ErrorLogger { get; set; }
+
         public KliveAgentStats(string persistencePath)
         {
             this.persistencePath = persistencePath;
@@ -316,8 +320,9 @@ namespace Omnipotent.Services.KliveAgent
                     File.Move(tempPath, persistencePath);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                ErrorLogger?.Invoke(ex, "[KliveAgent] Failed to persist stats.");
             }
         }
 

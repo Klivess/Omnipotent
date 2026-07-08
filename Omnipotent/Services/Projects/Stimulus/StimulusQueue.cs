@@ -180,27 +180,29 @@ namespace Omnipotent.Services.Projects.Stimulus
             lock (fileGate)
             {
                 if (!File.Exists(path)) return;
-                var lines = File.ReadAllLines(path).ToList();
-                bool changed = false;
-                for (int i = 0; i < lines.Count; i++)
+                // Compaction: delivered lines have no further purpose (replay only needs the
+                // undelivered set, and the event log is the audit trail), so instead of flipping a
+                // Delivered flag and letting the file grow forever, rewrite keeping ONLY still-
+                // undelivered work — dropping the just-delivered envelope and any prior delivered lines.
+                var kept = new List<string>();
+                foreach (var raw in File.ReadAllLines(path))
                 {
-                    if (string.IsNullOrWhiteSpace(lines[i])) continue;
+                    if (string.IsNullOrWhiteSpace(raw)) continue;
                     QueueLine? ql = null;
-                    try { ql = JsonConvert.DeserializeObject<QueueLine>(lines[i]); } catch { }
-                    if (ql != null && ql.Envelope.EnvelopeID == env.EnvelopeID && !ql.Delivered)
-                    {
-                        ql.Delivered = true;
-                        lines[i] = JsonConvert.SerializeObject(ql);
-                        changed = true;
-                        break;
-                    }
+                    try { ql = JsonConvert.DeserializeObject<QueueLine>(raw); } catch { }
+                    if (ql == null) continue;                                   // drop corrupt lines
+                    if (ql.Delivered) continue;                                 // drop already-delivered
+                    if (ql.Envelope.EnvelopeID == env.EnvelopeID) continue;     // the one we just delivered
+                    kept.Add(raw);
                 }
-                if (changed)
+                if (kept.Count == 0)
                 {
-                    string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                    File.WriteAllLines(tmp, lines);
-                    File.Move(tmp, path, overwrite: true);
+                    try { File.Delete(path); } catch { }
+                    return;
                 }
+                string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllLines(tmp, kept);
+                File.Move(tmp, path, overwrite: true);
             }
         }
 

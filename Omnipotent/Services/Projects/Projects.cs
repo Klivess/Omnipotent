@@ -1,3 +1,4 @@
+using DSharpPlus;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.Projects.Containers;
 using Omnipotent.Services.Projects.Discord;
@@ -30,6 +31,8 @@ namespace Omnipotent.Services.Projects
     {
         public ProjectStore Store { get; private set; } = null!;
         public ProjectEventLogStore EventLog { get; private set; } = null!;
+        /// <summary>Phase 3 server-push: fans the event log out to WebSocket clients (replaces polling).</summary>
+        public ProjectEventBroadcaster EventBroadcaster { get; private set; } = null!;
         public ProjectDigestStore Digests { get; private set; } = null!;
         public ProjectRetrievalIndex Retrieval { get; private set; } = null!;
         public ProjectWakeCycle WakeCycle { get; private set; } = null!;
@@ -51,6 +54,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Per-project Discord integration. Null until KliveBotDiscord is available.</summary>
         public ProjectDiscordManager? DiscordManager { get; private set; }
         private ProjectReportScheduler? reportScheduler;
+        private System.Threading.Timer? discordInitRetryTimer;
         // ── Phase 7: watchdog ──
         public ProjectWatchdog Watchdog { get; private set; } = null!;
         private System.Threading.Timer? keepaliveTimer;
@@ -76,6 +80,7 @@ namespace Omnipotent.Services.Projects
         {
             Store = new ProjectStore(msg => ServiceLog(msg));
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
+            EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg));
             Digests = new ProjectDigestStore(msg => ServiceLog(msg));
             Retrieval = new ProjectRetrievalIndex(EventLog);
             EventLog.EventAppended += Retrieval.Ingest;
@@ -88,17 +93,28 @@ namespace Omnipotent.Services.Projects
                 tokenProvider: () => GetStringOmniSettingNullable("OpenRouterLLMToken"),
                 log: msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg));
+            // Alert Klives when a project auto-pauses on budget exhaustion (checks DiscordManager at
+            // fire time, so it works even if Discord came up after the ledger was created).
+            Budget.BudgetPausedRaised += pid =>
+            {
+                var proj = Store.GetProject(pid);
+                if (proj != null && DiscordManager != null)
+                    _ = DiscordManager.PostAttentionAsync(proj, "⛔ Budget exhausted — project paused",
+                        $"{Budget.DescribeState(pid)}. Approve a budget increase to continue, or leave it paused.");
+            };
             TierRouter = new ProjectTierRouter(Settings);
             Gates = new ProjectGateManager(EventLog, msg => ServiceLog(msg));
             SubAgents = new ProjectSubAgentManager(Store, EventLog);
             CommanderRunner = new ProjectCommanderRunner(this);
             SubAgentRunner = new ProjectSubAgentRunner(this);
             Artifacts = new ProjectArtifactStore(msg => ServiceLog(msg));
-            // 48h raw-media retention sweep (§7), hourly.
-            retentionTimer = new System.Threading.Timer(_ =>
+            // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
+            retentionTimer = new System.Threading.Timer(async _ =>
             {
                 try { Artifacts.RunRetentionSweep(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: artifact retention sweep failed"); }
+                try { await ReapContainersAsync(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
             }, null, TimeSpan.FromMinutes(10), TimeSpan.FromHours(1));
 
             // Phase 4: stimulus bus. Triage uses a free omni model with a cheap paid fallback.
@@ -139,12 +155,17 @@ namespace Omnipotent.Services.Projects
             try { CommanderRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted wakes"); }
 
+            // Wire the email push source (via KliveMail) before arming so email hooks attach at boot.
+            // The Discord push source is wired later in InitialiseDiscordAsync once the bot is confirmed up.
+            await WireMailStimulusSourceAsync();
+
             // Replay durable undelivered stimuli, then arm the source adapters.
             try { Bus.Replay(); Adapters.ArmAll(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: stimulus replay/arm failed"); }
 
             routes = new ProjectsRoutes(this);
             await routes.RegisterRoutes();
+            await RegisterEventStreamRouteAsync();
 
             await InitialiseDesktopsAsync();
             await InitialiseDiscordAsync();
@@ -200,7 +221,20 @@ namespace Omnipotent.Services.Projects
                 foreach (var project in Store.ListProjects())
                 {
                     if (project.Status != ProjectStatus.Active) continue;
-                    var tail = EventLog.ReadTail(project.ProjectID, 20);
+                    var tail = EventLog.ReadTail(project.ProjectID, 30);
+
+                    // LLM-outage backoff: if recent wakes keep failing (provider down), don't keep
+                    // firing a doomed keepalive every 15 min — back off exponentially (cap 4h) so a
+                    // sustained outage produces occasional retries, not a steady stream of WakeFailed.
+                    var outcomes = tail.Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed).ToList();
+                    int consecutiveFailures = 0;
+                    for (int i = outcomes.Count - 1; i >= 0 && outcomes[i].Type == ProjectEventTypes.WakeFailed; i--) consecutiveFailures++;
+                    if (consecutiveFailures >= 2)
+                    {
+                        var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
+                        if (DateTime.UtcNow - outcomes[^1].Timestamp < backoff) continue; // still backing off
+                    }
+
                     var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
                     // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
                     if (lastWake == null || DateTime.UtcNow - lastWake.Timestamp > TimeSpan.FromMinutes(14))
@@ -242,6 +276,88 @@ namespace Omnipotent.Services.Projects
             catch (Exception ex) { return $"(memory save failed: {ex.Message})"; }
         }
 
+        // ── External/agent-facing API (used by the routes AND by KliveAgent's bridge tools) ──
+
+        /// <summary>
+        /// Creates a project the same way the /projects/create route does — seeds settings, logs the
+        /// init event, creates the Discord channel (best-effort) and fires the first Commander wake.
+        /// Public so the interactive KliveAgent assistant can delegate long-running work to an
+        /// autonomous project (Projects is part of KliveAgent — same shared memory).
+        /// </summary>
+        public async Task<Project> CreateProjectAsync(string name, string goal, double tokenBudgetUsd,
+            double moneyBudgetUsd, double moneyAutonomousThresholdUsd, int subAgentCap,
+            IDictionary<string, string>? settingsPatch = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("name required", nameof(name));
+            if (string.IsNullOrWhiteSpace(goal)) throw new ArgumentException("goal required", nameof(goal));
+            if (tokenBudgetUsd <= 0) throw new ArgumentException("tokenBudgetUsd must be > 0 — a Project is a goal AND a budget", nameof(tokenBudgetUsd));
+
+            var p = Store.CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
+            var settings = Settings.EnsureCreated(p.ProjectID);
+            if (settingsPatch != null)
+            {
+                try
+                {
+                    foreach (var kv in settingsPatch)
+                    {
+                        if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
+                        settings.TrySet(kv.Key, kv.Value ?? "");
+                    }
+                    Settings.Save(settings);
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: applying create-time settings failed (using defaults)"); }
+            }
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = p.ProjectID,
+                Type = ProjectEventTypes.Status,
+                Author = "klives",
+                Text = $"Project initialised. Goal: {goal} — token budget ${tokenBudgetUsd:0.##}, money budget ${moneyBudgetUsd:0.##} (autonomous ≤ ${moneyAutonomousThresholdUsd:0.##}), agent cap {subAgentCap}.",
+            });
+            if (DiscordManager != null)
+            {
+                try { await DiscordManager.CreateProjectChannelAsync(p); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: create Discord channel failed"); }
+            }
+            // First wake: a project must start itself (matches the route's behaviour).
+            CommanderRunner.Wake(p,
+                "Project created by Klives just now. Read the goal, form an initial plan (update_plan), " +
+                "create the stimulus hooks you need (create_stimulus_hook), and take the first concrete steps.");
+            return p;
+        }
+
+        /// <summary>
+        /// Logs a Klives message to a project and steers/wakes the Commander (lands within a live wake
+        /// if one is running). Returns false if the project ID is unknown. Used by /projects/message
+        /// and the KliveAgent bridge.
+        /// </summary>
+        public bool MessageProject(string projectID, string text)
+        {
+            var project = Store.GetProject(projectID);
+            if (project == null) return false;
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                Type = ProjectEventTypes.KlivesMessage,
+                Author = "klives",
+                Text = text,
+            });
+            if (project.Status == ProjectStatus.Active)
+                CommanderRunner.Steer(project, text);
+            return true;
+        }
+
+        /// <summary>Compact one-line status (status/goal/budget/agents/last-event) for the bridge. Null if unknown.</summary>
+        public string? DescribeProjectStatus(string projectID)
+        {
+            var p = Store.GetProject(projectID);
+            if (p == null) return null;
+            int agents = SubAgents.ListActive(p.ProjectID).Count;
+            var last = EventLog.ReadTail(p.ProjectID, 1).LastOrDefault();
+            string lastText = last != null ? $"{last.Type} @ {last.Timestamp:u}" : "no activity";
+            return $"[{p.ProjectID}] \"{p.Name}\" — {p.Status}. Goal: {p.Goal}. Budget: {Budget.DescribeState(p.ProjectID)}. Active agents: {agents}. Last event: {lastText}.";
+        }
+
         /// <summary>Queries the utility model with a one-shot prompt; used by triage and digest rebuilds.</summary>
         private async Task<string?> QueryUtilityModelAsync(string prompt, string modelOverride)
         {
@@ -277,13 +393,16 @@ namespace Omnipotent.Services.Projects
                 project, EventLog, Digests, SubAgents, Gates, Budget, Vault, Store, actingAgentID, wakeID)
             {
                 SendAgentMessageAsync = SendAgentMessageHook,
-                // request_human surfaces through the project's own Discord channel when present.
+                // request_human surfaces through the project's own Discord channel with an @mention —
+                // the agent is blocked on a human-only obstacle, so it should actually ping Klives.
                 RequestHumanAsync = DiscordManager == null ? RequestHumanHook
-                    : what => DiscordManager.PostReportAsync(project, "Human assistance needed", what),
+                    : what => DiscordManager.PostAttentionAsync(project, "🙋 Human assistance needed", what),
                 HookStore = Hooks,
                 RearmAdapters = () => Adapters.ArmAll(),
+                GetHookArmInfo = hookID => Adapters.GetArmInfo(hookID),
                 Artifacts = Artifacts,
                 CompleteProjectAsync = () => CompleteProjectAsync(project),
+                DisposeAgentDesktopAsync = agentID => DisposeAgentDesktopAsync(project.ProjectID, agentID),
                 RecallMemoriesAsync = RecallKliveAgentMemoriesAsync,
                 SaveMemoryAsync = SaveKliveAgentMemoryAsync,
             };
@@ -322,6 +441,17 @@ namespace Omnipotent.Services.Projects
                     var art = Artifacts.Save(project.ProjectID, result.Jpeg, "image/jpeg",
                         description: $"Desktop after {toolName} by {actingAgentID}: {result.Text}");
                     artifactIDs.Add(art.ArtifactID);
+                    // First-class timeline event: the ArtifactAdded type existed but was never appended,
+                    // so desktop work never registered as "progress" for the watchdog. Emit it now.
+                    EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID,
+                        AgentID = actingAgentID,
+                        Type = ProjectEventTypes.ArtifactAdded,
+                        Author = actingAgentID == "commander" ? "commander" : "agent",
+                        Text = $"Screenshot after {toolName}",
+                        ArtifactIDs = new List<string> { art.ArtifactID },
+                    });
                 }
                 return new CommanderToolResult(result.Text) { Jpeg = result.Jpeg, ArtifactIDs = artifactIDs };
             }
@@ -384,6 +514,65 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>Disposes a specific agent's own desktop container(s), if any. Safe no-op without Desktops.</summary>
+        public async Task DisposeAgentDesktopAsync(string projectID, string agentID)
+        {
+            if (Desktops == null || string.IsNullOrWhiteSpace(agentID)) return;
+            try
+            {
+                foreach (var rec in Desktops.Registry.ForProject(projectID).Where(r => r.AgentID == agentID))
+                    await Desktops.DisposeDesktopAsync(rec.ContainerID);
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: retire-time desktop dispose failed"); }
+        }
+
+        /// <summary>
+        /// Hourly container reap (§ resource hygiene): prunes orphaned Lost registry records and
+        /// tears down desktops that are no longer needed — those owned by a retired agent, belonging
+        /// to a finished project, or on a project idle beyond the reap window (recreated on next use).
+        /// Never touches a project with a live wake. Idle window via Projects_ContainerIdleReapHours
+        /// (host-global resource policy; 0 disables idle reaping).
+        /// </summary>
+        private async Task ReapContainersAsync()
+        {
+            if (Desktops == null) return;
+            try
+            {
+                var reg = Desktops.Registry;
+                // 1. Prune orphaned Lost records so they don't accumulate forever.
+                foreach (var lost in reg.All().Where(r => r.Lost))
+                    reg.Remove(lost.ContainerID);
+
+                int idleHours = await GetIntOmniSetting("Projects_ContainerIdleReapHours", 6);
+                foreach (var project in Store.ListProjects())
+                {
+                    var containers = reg.ForProject(project.ProjectID);
+                    if (containers.Count == 0) continue;
+
+                    var digest = Digests.GetDigest(project.ProjectID);
+                    if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID)) continue; // never reap a live wake
+
+                    bool finished = project.Status is ProjectStatus.Completed or ProjectStatus.Archived;
+                    var lastEvt = EventLog.ReadTail(project.ProjectID, 1).LastOrDefault();
+                    bool idle = idleHours > 0 && lastEvt != null &&
+                                DateTime.UtcNow - lastEvt.Timestamp > TimeSpan.FromHours(idleHours);
+                    var activeIDs = new HashSet<string>(
+                        SubAgents.ListActive(project.ProjectID).Select(a => a.AgentID), StringComparer.Ordinal);
+
+                    foreach (var c in containers)
+                    {
+                        bool ownerRetired = c.AgentID != null && !activeIDs.Contains(c.AgentID);
+                        if (finished || idle || ownerRetired)
+                        {
+                            try { await Desktops.DisposeDesktopAsync(c.ContainerID); }
+                            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap dispose failed"); }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
+        }
+
         /// <summary>Post-wake digest refresh + compaction, via the utility model. Never blocks a wake's hot path.</summary>
         public async Task RebuildDigestAfterWakeAsync(Project project, long wakeStartSeq)
         {
@@ -419,17 +608,45 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private async Task InitialiseDiscordAsync()
         {
+            if (DiscordManager != null) return; // already initialised (idempotent for the retry timer)
             try
             {
                 var services = await GetServicesByType<KliveBotDiscord>();
                 if (services == null || services.Length == 0)
                 {
-                    ServiceLog("Projects: KliveBotDiscord not available — Discord surface disabled (website still works).");
+                    ServiceLog("Projects: KliveBotDiscord not available yet — will retry Discord init periodically.");
+                    ScheduleDiscordInitRetry();
                     return;
                 }
                 var discord = (KliveBotDiscord)services[0];
                 DiscordManager = new ProjectDiscordManager(this, discord, msg => ServiceLog(msg));
                 DiscordManager.Initialise();
+
+                // Wire the Discord push stimulus source so 'discord' hooks observe real messages,
+                // then re-arm so any existing discord hooks attach to the now-live source.
+                Adapters.DiscordSource = handler =>
+                {
+                    Task OnMsg(DiscordClient sender, DSharpPlus.EventArgs.MessageCreateEventArgs args)
+                    {
+                        try
+                        {
+                            _ = handler(new InboundDiscordStimulus
+                            {
+                                ChannelId = args.Channel.Id.ToString(),
+                                AuthorId = args.Author.Id.ToString(),
+                                AuthorName = args.Author.Username,
+                                Content = args.Message.Content ?? "",
+                                IsPrivate = args.Channel.IsPrivate,
+                            });
+                        }
+                        catch { }
+                        return Task.CompletedTask;
+                    }
+                    discord.Client.MessageCreated += OnMsg;
+                    return new ActionDisposable(() => { try { discord.Client.MessageCreated -= OnMsg; } catch { } });
+                };
+                try { Adapters.ArmAll(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: re-arm after Discord source wiring failed"); }
 
                 // A gate opening posts an approval card to the project's channel; the button press
                 // and a website click race to resolve the same gate (first responder wins).
@@ -441,10 +658,63 @@ namespace Omnipotent.Services.Projects
 
                 reportScheduler = new ProjectReportScheduler(this, DiscordManager, msg => ServiceLog(msg));
                 reportScheduler.Start();
+                // Success — stop retrying if a retry timer was running.
+                discordInitRetryTimer?.Dispose();
+                discordInitRetryTimer = null;
                 ServiceLog("Projects: Discord surface initialised.");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: Discord init failed (non-fatal)"); }
         }
+
+        /// <summary>Retries Discord init periodically until KliveBotDiscord is available (it may start after us).</summary>
+        private void ScheduleDiscordInitRetry()
+        {
+            if (discordInitRetryTimer != null) return; // already scheduled
+            discordInitRetryTimer = new System.Threading.Timer(async _ =>
+            {
+                if (DiscordManager != null) { discordInitRetryTimer?.Dispose(); discordInitRetryTimer = null; return; }
+                try { await InitialiseDiscordAsync(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: Discord init retry failed"); }
+            }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
+        }
+
+        /// <summary>
+        /// Wires the email push stimulus source: subscribes to KliveMail's inbound-mail event and
+        /// exposes a subscribe factory the adapter manager uses to fan out to 'email' hooks. No-op if
+        /// KliveMail isn't available (email hooks then arm in the Error state, visible to Klives).
+        /// </summary>
+        private async Task WireMailStimulusSourceAsync()
+        {
+            try
+            {
+                var services = await GetServicesByType<KliveMail.KliveMail>();
+                if (services == null || services.Length == 0)
+                {
+                    ServiceLog("Projects: KliveMail not available — email stimulus hooks will be inert.");
+                    return;
+                }
+                var mail = (KliveMail.KliveMail)services[0];
+                Adapters.MailSource = handler =>
+                {
+                    Action<KliveMail.Models.StoredMessage> h = m =>
+                    {
+                        _ = handler(new InboundMailStimulus
+                        {
+                            To = m.ToAddress,
+                            From = m.FromAddress,
+                            Subject = m.Subject ?? "",
+                            BodyPreview = m.BodyText ?? StripHtml(m.BodyHtml),
+                        });
+                    };
+                    mail.MailStored += h;
+                    return new ActionDisposable(() => { try { mail.MailStored -= h; } catch { } });
+                };
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to wire KliveMail stimulus source"); }
+        }
+
+        private static string StripHtml(string? html)
+            => string.IsNullOrEmpty(html) ? "" : System.Text.RegularExpressions.Regex.Replace(html, "<[^>]+>", " ").Trim();
 
         /// <summary>
         /// Brings up the desktop-container subsystem (P2). Whether a given PROJECT uses containers
@@ -505,6 +775,36 @@ namespace Omnipotent.Services.Projects
             });
 
             _ = RegisterScreenStreamRouteAsync();
+        }
+
+        /// <summary>
+        /// Registers the event-stream WebSocket (Phase 3 push): /projects/events/stream?projectID=..&amp;since=..
+        /// Per-project subscribers get every ProjectEvent (replay-after-cursor then live); a fleet
+        /// subscriber (no projectID) gets a lightweight signal on any project's event. Klives-only,
+        /// reusing the existing WS auth. Platform-independent (text, not frames).
+        /// </summary>
+        private async Task RegisterEventStreamRouteAsync()
+        {
+            try
+            {
+                await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+                    "/projects/events/stream",
+                    (Func<HttpListenerContext, WebSocket, NameValueCollection, Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+                    {
+                        if (user == null || user.KlivesManagementRank < Profiles.KMProfileManager.KMPermissions.Klives)
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        string? projectID = query["projectID"];
+                        long since = long.TryParse(query["since"], out var s) ? s : 0;
+                        await EventBroadcaster.HandleAsync(socket, projectID, since,
+                            (pid, sinceExclusive) => EventLog.ReadSince(pid, sinceExclusive));
+                    }),
+                    Profiles.KMProfileManager.KMPermissions.Klives);
+                ServiceLog("Projects: event-stream route registered (/projects/events/stream).");
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register event-stream route (non-fatal)"); }
         }
 
         /// <summary>

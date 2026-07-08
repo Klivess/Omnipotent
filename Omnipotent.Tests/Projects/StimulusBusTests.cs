@@ -1,3 +1,4 @@
+using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects;
 using Omnipotent.Services.Projects.Stimulus;
 
@@ -99,6 +100,32 @@ namespace Omnipotent.Tests.Projects
             await Task.Delay(200);
             Assert.Equal(0, replayed); // already delivered, nothing to replay
         }
+
+        [Fact]
+        public async Task DeliveredEnvelopes_AreCompacted_NotAccumulated()
+        {
+            string pid = NewPid();
+            var dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsStimulusDirectory);
+            var q = new StimulusQueue(_ => { });
+            int delivered = 0;
+            var gate = new object();
+            q.OnDeliver = _ => { lock (gate) delivered++; return Task.CompletedTask; };
+
+            // Deliver several envelopes on the same (project, hook) queue file.
+            for (int i = 0; i < 5; i++)
+                await q.EnqueueAsync(Env(pid, "hookC", "msg" + i), "commander");
+
+            // Wait until all are delivered.
+            for (int i = 0; i < 50 && delivered < 5; i++) await Task.Delay(50);
+            Assert.Equal(5, delivered);
+            await Task.Delay(100); // let the final compaction settle
+
+            // The queue file must NOT retain a line per delivered envelope — compaction drops them
+            // (the file is deleted once nothing undelivered remains).
+            var file = Path.Combine(dir, $"{pid}__hookC.queue.jsonl");
+            long remainingLines = File.Exists(file) ? File.ReadAllLines(file).Count(l => !string.IsNullOrWhiteSpace(l)) : 0;
+            Assert.Equal(0, remainingLines);
+        }
     }
 
     public class StimulusAgentTests
@@ -156,6 +183,91 @@ namespace Omnipotent.Tests.Projects
             var agent = Agent((_, _) => throw new Exception("down"));
             var r = await agent.EvaluateAsync(Env("x"), "criterion");
             Assert.True(r.Confirmed); // over-deliver rather than drop a real event
+        }
+    }
+
+    [Collection("ProjectsSerial")]
+    public class StimulusAdapterManagerTests
+    {
+        private static (StimulusAdapterManager mgr, StimulusHookStore hooks, string pid) NewManager(
+            bool withMailSource = false, bool withDiscordSource = false)
+        {
+            var log = new ProjectEventLogStore(_ => { });
+            var hooks = new StimulusHookStore(log);
+            var queue = new StimulusQueue(_ => { });
+            var store = new ProjectStore(_ => { });
+            var triage = new StimulusAgent((_, _) => Task.FromResult<string?>("CONFIRM: x"), _ => ("free", "fallback"), _ => { });
+            var bus = new StimulusBus(hooks, queue, triage, log, store, _ => { });
+            var mgr = new StimulusAdapterManager(bus, hooks, _ => { });
+            if (withMailSource) mgr.MailSource = _ => new ActionDisposable(() => { });
+            if (withDiscordSource) mgr.DiscordSource = _ => new ActionDisposable(() => { });
+            return (mgr, hooks, "test_" + Guid.NewGuid().ToString("N"));
+        }
+
+        [Fact]
+        public void FileWatch_MissingPath_ArmsAsError()
+        {
+            var (mgr, hooks, pid) = NewManager();
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "file-watch", SourceSpecJson = "{\"path\":\"C:/nope_" + Guid.NewGuid().ToString("N") + "\"}" });
+            mgr.ArmAll();
+            Assert.Equal(HookArmState.Error, mgr.GetArmInfo(h.HookID)!.State);
+            mgr.Dispose();
+        }
+
+        [Fact]
+        public void ProcessExit_NoSpec_ArmsAsError()
+        {
+            var (mgr, hooks, pid) = NewManager();
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "process-exit", SourceSpecJson = "{}" });
+            mgr.ArmAll();
+            Assert.Equal(HookArmState.Error, mgr.GetArmInfo(h.HookID)!.State);
+            mgr.Dispose();
+        }
+
+        [Fact]
+        public void Webhook_ArmsAsPassive()
+        {
+            var (mgr, hooks, pid) = NewManager();
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "webhook" });
+            mgr.ArmAll();
+            Assert.Equal(HookArmState.Passive, mgr.GetArmInfo(h.HookID)!.State);
+            mgr.Dispose();
+        }
+
+        [Fact]
+        public void Timer_ArmsAsArmed()
+        {
+            var (mgr, hooks, pid) = NewManager();
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "timer", SourceSpecJson = "{\"intervalSeconds\":3600}" });
+            mgr.ArmAll();
+            Assert.Equal(HookArmState.Armed, mgr.GetArmInfo(h.HookID)!.State);
+            mgr.Dispose();
+        }
+
+        [Fact]
+        public void Email_ArmsAsErrorWithoutSource_ArmedWithSource()
+        {
+            var (mgr, hooks, pid) = NewManager(withMailSource: false);
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "email" });
+            mgr.ArmAll();
+            Assert.Equal(HookArmState.Error, mgr.GetArmInfo(h.HookID)!.State);
+            mgr.Dispose();
+
+            var (mgr2, hooks2, pid2) = NewManager(withMailSource: true);
+            var h2 = hooks2.Create(new StimulusHookRecord { ProjectID = pid2, SourceKind = "email" });
+            mgr2.ArmAll();
+            Assert.Equal(HookArmState.Armed, mgr2.GetArmInfo(h2.HookID)!.State);
+            mgr2.Dispose();
+        }
+
+        [Fact]
+        public void DisabledHook_IsNotArmed()
+        {
+            var (mgr, hooks, pid) = NewManager();
+            var h = hooks.Create(new StimulusHookRecord { ProjectID = pid, SourceKind = "timer", Enabled = false, SourceSpecJson = "{\"intervalSeconds\":3600}" });
+            mgr.ArmAll();
+            Assert.Null(mgr.GetArmInfo(h.HookID));
+            mgr.Dispose();
         }
     }
 

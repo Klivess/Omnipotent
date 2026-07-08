@@ -68,7 +68,10 @@ namespace Omnipotent.Services.KliveAgent
 
                 Stats = new KliveAgentStats(Path.Combine(
                     OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory),
-                    "KliveAgentStats.json"));
+                    "KliveAgentStats.json"))
+                {
+                    ErrorLogger = (ex, msg) => _ = ServiceLogError(ex, msg, false)
+                };
                 await Stats.InitializeAsync();
 
                 // Initialize subsystems
@@ -256,11 +259,9 @@ namespace Omnipotent.Services.KliveAgent
             // Process through the brain
             var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress, cancellationToken);
 
-            // Persist conversation periodically (every 5 messages)
-            if (conversation.Messages.Count % 5 == 0)
-            {
-                await PersistConversationAsync(conversation);
-            }
+            // Persist after every turn so a crash never loses recent messages (the Discord path used
+            // to persist only every 5th message, dropping up to ~5 turns on an unexpected restart).
+            await PersistConversationAsync(conversation);
 
             return response;
         }
@@ -567,7 +568,7 @@ namespace Omnipotent.Services.KliveAgent
                             conversations[conv.ConversationId] = conv;
                         }
                     }
-                    catch { }
+                    catch (Exception ex) { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); }
                 }
 
                 if (conversations.Count > 0)
@@ -590,7 +591,7 @@ namespace Omnipotent.Services.KliveAgent
                     $"{conversation.ConversationId}.json");
                 await GetDataHandler().SerialiseObjectToFile(path, conversation);
             }
-            catch { }
+            catch (Exception ex) { await ServiceLogError(ex, "[KliveAgent] Failed to persist conversation.", false); }
         }
     }
 }

@@ -1,5 +1,6 @@
 using Microsoft.CodeAnalysis.CSharp.Scripting;
 using Microsoft.CodeAnalysis.Scripting;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using System.Collections.Concurrent;
@@ -43,6 +44,57 @@ namespace Omnipotent.Services.KliveAgent
                     Uptime   = s.GetServiceUptime().ToString(@"hh\:mm\:ss")
                 })
                 .ToList();
+        }
+
+        // ── Projects bridge (delegate long-running work to the autonomous task force) ──
+        // Projects is part of KliveAgent (same shared memory). These let the interactive assistant
+        // spin up, inspect and steer autonomous projects without hand-reflecting the Projects internals.
+
+        private Omnipotent.Services.Projects.Projects? GetProjectsService()
+            => agentService?.GetActiveServices()
+                .OfType<Omnipotent.Services.Projects.Projects>()
+                .FirstOrDefault(s => s.IsServiceActive());
+
+        /// <summary>Create and start an autonomous Project (a goal + a budget). Returns the new project's ID, or an error string.</summary>
+        public async Task<string> CreateProject(string name, string goal, double tokenBudgetUsd,
+            double moneyBudgetUsd = 0, double moneyAutonomousThresholdUsd = 0, int subAgentCap = 5)
+        {
+            var projects = GetProjectsService();
+            if (projects == null) return "Projects service is not available.";
+            try
+            {
+                var p = await projects.CreateProjectAsync(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
+                return p.ProjectID;
+            }
+            catch (Exception ex) { return $"Failed to create project: {ex.Message}"; }
+        }
+
+        /// <summary>List every Project with a one-line status (id, name, status, budget, active agents, last event).</summary>
+        public string ListProjects()
+        {
+            var projects = GetProjectsService();
+            if (projects == null) return "Projects service is not available.";
+            var all = projects.Store.ListProjects();
+            if (all.Count == 0) return "No projects.";
+            return string.Join("\n", all.Select(p => projects.DescribeProjectStatus(p.ProjectID)));
+        }
+
+        /// <summary>Send a message to a Project's Commander — steers a live wake or wakes it. Returns confirmation.</summary>
+        public string SteerProject(string projectID, string message)
+        {
+            var projects = GetProjectsService();
+            if (projects == null) return "Projects service is not available.";
+            return projects.MessageProject(projectID, message)
+                ? $"Message delivered to project {projectID}."
+                : $"No project with ID {projectID}.";
+        }
+
+        /// <summary>Get a single Project's current status/budget/agent summary.</summary>
+        public string GetProjectStatus(string projectID)
+        {
+            var projects = GetProjectsService();
+            if (projects == null) return "Projects service is not available.";
+            return projects.DescribeProjectStatus(projectID) ?? $"No project with ID {projectID}.";
         }
 
         // Reflection-derived schemas are immutable for the process lifetime, so memoize them across ALL
@@ -750,6 +802,33 @@ namespace Omnipotent.Services.KliveAgent
             var output = outputBuffer.ToString();
             outputBuffer.Clear();
             return output.TrimEnd();
+        }
+
+        // ── Host shell (runs on the machine Omnipotent itself runs on) ──
+
+        /// <summary>
+        /// Run a PowerShell script on the HOST and return exit code + stdout + stderr as one string.
+        /// Runs in Omnipotent's own security context (elevated if Omnipotent is). Prefers pwsh, falls
+        /// back to Windows PowerShell. Use for real host operations: installs, service control, git,
+        /// file system, diagnostics. Times out (default 120s) and kills the whole process tree.
+        /// </summary>
+        public async Task<string> RunPowerShell(string script, int timeoutSeconds = 120)
+        {
+            if (string.IsNullOrWhiteSpace(script)) return "Provide a PowerShell script.";
+            var result = await HostShell.RunPowerShellAsync(script, TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 1, 900)), ct: CancellationToken);
+            return result.Format();
+        }
+
+        /// <summary>
+        /// Run a Bash script on the HOST (WSL/Git Bash) and return exit code + stdout + stderr as
+        /// one string. Same host security context and timeout semantics as <see cref="RunPowerShell"/>.
+        /// Returns a clear message if no bash is installed.
+        /// </summary>
+        public async Task<string> RunBash(string script, int timeoutSeconds = 120)
+        {
+            if (string.IsNullOrWhiteSpace(script)) return "Provide a bash script.";
+            var result = await HostShell.RunBashAsync(script, TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 1, 900)), ct: CancellationToken);
+            return result.Format();
         }
 
         // ── Memory ──
