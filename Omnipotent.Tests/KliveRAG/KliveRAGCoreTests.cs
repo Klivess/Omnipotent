@@ -208,6 +208,27 @@ namespace Omnipotent.Tests.KliveRAG
             cmd.ExecuteNonQuery();
         }
 
+        [Fact]
+        public async Task Retriever_ExcludeSources_KeepsOmniLogsOutOfInjectionButSearchable()
+        {
+            await writer.UpsertAsync(Doc("omnilog:e1", "NullReferenceException in OmniTrader backtester engine", RagSource.OmniLogs, single: true));
+            await writer.UpsertAsync(Doc("repodoc:t", "OmniTrader backtester runs one BacktestSession.", RagSource.RepoDocs));
+
+            var retriever = new HybridRetriever(db, new RagEmbedQueue(db, new HttpClient(), _ => { }));
+
+            // Injection-style: omni-logs excluded.
+            var injected = await retriever.SearchAsync("OmniTrader backtester", new RagSearchOptions
+            {
+                MaxResults = 5,
+                ExcludeSources = new[] { RagSource.OmniLogs },
+            });
+            Assert.DoesNotContain(injected, h => h.Source == RagSource.OmniLogs);
+
+            // Tool-style (no exclusion): omni-logs present.
+            var tool = await retriever.SearchAsync("OmniTrader backtester exception", new RagSearchOptions { MaxResults = 5 });
+            Assert.Contains(tool, h => h.DocId == "omnilog:e1");
+        }
+
         private int CountChunks(string docId)
         {
             using var conn = db.Open();

@@ -163,7 +163,8 @@ ON CONFLICT(url_hash) DO UPDATE SET url=$u, fetched_at=$f, expires_at=$e, status
             return $"{uri.Scheme}://{uri.Host.ToLowerInvariant()}{path}{uri.Query}".TrimEnd('/');
         }
 
-        /// <summary>Nightly TTL eviction: drop expired web docs (chunks + embeddings cascade) and stale cache rows.</summary>
+        /// <summary>Nightly TTL eviction: drop ANY expired doc (web + omni-logs — chunks + embeddings
+        /// cascade) and stale web-cache rows.</summary>
         public async Task EvictExpiredAsync(CancellationToken ct)
         {
             await db.WriteLock.WaitAsync(ct);
@@ -173,8 +174,7 @@ ON CONFLICT(url_hash) DO UPDATE SET url=$u, fetched_at=$f, expires_at=$e, status
                 using var conn = db.Open();
                 using (var cmd = conn.CreateCommand())
                 {
-                    cmd.CommandText = "DELETE FROM rag_documents WHERE source=$s AND expires_at IS NOT NULL AND expires_at < $now";
-                    cmd.Parameters.AddWithValue("$s", RagSource.Web);
+                    cmd.CommandText = "DELETE FROM rag_documents WHERE expires_at IS NOT NULL AND expires_at < $now";
                     cmd.Parameters.AddWithValue("$now", now);
                     cmd.ExecuteNonQuery();
                 }

@@ -34,7 +34,12 @@ namespace Omnipotent.Services.KliveRAG
         private ProjectsEventConnector projectsEvents = null!;
         private KliveAgentConnector agentFiles = null!;
         private OmniscienceConnector omniscience = null!;
+        private OmniLogConnector omniLogs = null!;
         private OmniscienceFederation federation = null!;
+
+        /// <summary>Sources kept OUT of the auto-injected prompt block (too noisy to inject), but still
+        /// reachable via the explicit search_knowledge tool.</summary>
+        private static readonly string[] InjectionExcludedSources = { RagSource.OmniLogs };
 
         // Web stack (SearXNG container + fetch/extract/cache pipeline).
         public SearxngContainerManager Searxng { get; private set; } = null!;
@@ -70,11 +75,14 @@ namespace Omnipotent.Services.KliveRAG
                 (await GetServicesByType<Projects.Projects>()).FirstOrDefault() as Projects.Projects;
             Func<Task<Omniscience.Omniscience?>> resolveOmni = async () =>
                 (await GetServicesByType<Omniscience.Omniscience>()).FirstOrDefault() as Omniscience.Omniscience;
+            Func<Task<Omnipotent.Logging.OmniLogging?>> resolveLogs = async () =>
+                (await GetServicesByType<Omnipotent.Logging.OmniLogging>()).FirstOrDefault() as Omnipotent.Logging.OmniLogging;
 
             repoDocs = new RepoDocsConnector(Writer, msg => _ = ServiceLog(msg));
             projectsEvents = new ProjectsEventConnector(Writer, msg => _ = ServiceLog(msg), resolveProjects);
             agentFiles = new KliveAgentConnector(Writer, msg => _ = ServiceLog(msg));
             omniscience = new OmniscienceConnector(Writer, msg => _ = ServiceLog(msg), resolveOmni);
+            omniLogs = new OmniLogConnector(Writer, msg => _ = ServiceLog(msg), resolveLogs);
             federation = new OmniscienceFederation(resolveOmni, msg => _ = ServiceLog(msg));
 
             // Web stack: lazy container (started on first web_search), plus fetch/extract/cache.
@@ -104,6 +112,7 @@ namespace Omnipotent.Services.KliveRAG
                 await RunConnectorSafe(agentFiles, cts.Token);
                 await RunConnectorSafe(omniscience, cts.Token);
                 await RunConnectorSafe(projectsEvents, cts.Token); // also wires the live EventAppended push
+                await RunConnectorSafe(omniLogs, cts.Token);
             });
 
             // Periodic incremental scans (nightly full sweep is added in a later phase).
@@ -111,6 +120,7 @@ namespace Omnipotent.Services.KliveRAG
             _ = PeriodicLoop(agentFiles, TimeSpan.FromMinutes(15));
             _ = PeriodicLoop(omniscience, TimeSpan.FromMinutes(30));
             _ = PeriodicLoop(projectsEvents, TimeSpan.FromMinutes(10));
+            _ = PeriodicLoop(omniLogs, TimeSpan.FromMinutes(5)); // errors are ephemeral in-memory — capture often
 
             // Non-blocking: reattach to a surviving SearXNG container if Docker is already up.
             _ = Task.Run(() => Searxng.ReconcileAsync(cts.Token));
@@ -166,7 +176,7 @@ namespace Omnipotent.Services.KliveRAG
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
                 timeoutCts.CancelAfter(timeout);
-                var opts = new RagSearchOptions { MaxResults = 6, ExcludeProjectId = excludeProjectId };
+                var opts = new RagSearchOptions { MaxResults = 6, ExcludeProjectId = excludeProjectId, ExcludeSources = InjectionExcludedSources };
                 var hits = await Retriever.SearchAsync(query, opts, timeoutCts.Token);
                 return HybridRetriever.FormatForPrompt(hits, maxTokens,
                     "[Relevant Knowledge] (Klives' cross-system knowledge base — search_knowledge / read_knowledge_doc for more)");
@@ -182,7 +192,7 @@ namespace Omnipotent.Services.KliveRAG
             {
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
                 timeoutCts.CancelAfter(timeout);
-                var opts = new RagSearchOptions { MaxResults = maxResults, ExcludeProjectId = excludeProjectId };
+                var opts = new RagSearchOptions { MaxResults = maxResults, ExcludeProjectId = excludeProjectId, ExcludeSources = InjectionExcludedSources };
                 var hits = await Retriever.SearchAsync(query, opts, timeoutCts.Token);
                 return HybridRetriever.ToKnowledgeHits(hits);
             }
@@ -282,6 +292,7 @@ namespace Omnipotent.Services.KliveRAG
                 if (source == null || source == RagSource.Omniscience) await RunConnectorSafe(omniscience, cts.Token);
                 if (source == null || source == RagSource.ProjectsEvents || source == RagSource.ProjectsDigests)
                     await RunConnectorSafe(projectsEvents, cts.Token);
+                if (source == null || source == RagSource.OmniLogs) await RunConnectorSafe(omniLogs, cts.Token);
                 return true;
             }
             finally { reindexGate.Release(); }

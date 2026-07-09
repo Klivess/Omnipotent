@@ -17,10 +17,11 @@ namespace Omnipotent.Services.KliveRAG
         public const string Omniscience = "omniscience";
         public const string RepoDocs = "repo-docs";
         public const string Web = "web";
+        public const string OmniLogs = "omni-logs";
 
         public static readonly string[] All =
         {
-            ProjectsEvents, ProjectsDigests, AgentConversations, AgentMemories, Omniscience, RepoDocs, Web
+            ProjectsEvents, ProjectsDigests, AgentConversations, AgentMemories, Omniscience, RepoDocs, Web, OmniLogs
         };
 
         public static bool IsKnown(string source) => Array.IndexOf(All, source) >= 0;
@@ -92,6 +93,9 @@ namespace Omnipotent.Services.KliveRAG
         public int MaxResults = 8;
         /// <summary>Restrict to these sources (null/empty = all).</summary>
         public IReadOnlyCollection<string>? Sources;
+        /// <summary>Drop hits from these sources (applied after <see cref="Sources"/>). Used to keep noisy
+        /// sources like omni-logs out of the auto-injection path while leaving them searchable via tools.</summary>
+        public IReadOnlyCollection<string>? ExcludeSources;
         /// <summary>Drop hits from projects-events / projects-digests of this project (avoids duplicating a project's own log leg).</summary>
         public string? ExcludeProjectId;
         /// <summary>Also federate into Omniscience's raw-message semantic index (tool path only).</summary>

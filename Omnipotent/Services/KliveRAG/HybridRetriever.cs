@@ -37,9 +37,12 @@ namespace Omnipotent.Services.KliveRAG
             var sourceFilter = opts.Sources != null && opts.Sources.Count > 0
                 ? new HashSet<string>(opts.Sources, StringComparer.Ordinal)
                 : null;
+            var excludeSources = opts.ExcludeSources != null && opts.ExcludeSources.Count > 0
+                ? new HashSet<string>(opts.ExcludeSources, StringComparer.Ordinal)
+                : null;
 
-            var vectorTask = VectorLegAsync(query, sourceFilter, ct);
-            var lexical = LexicalLeg(query, sourceFilter);
+            var vectorTask = VectorLegAsync(query, sourceFilter, excludeSources, ct);
+            var lexical = LexicalLeg(query, sourceFilter, excludeSources);
             var vector = await vectorTask;
 
             // RRF fuse: each leg contributes 1/(k + rank) for chunks it ranked.
@@ -109,8 +112,11 @@ namespace Omnipotent.Services.KliveRAG
 
         private sealed record Candidate(string ChunkId, string DocId, string Source, long CreatedAt);
 
+        private static bool Allowed(string source, HashSet<string>? include, HashSet<string>? exclude)
+            => (include == null || include.Contains(source)) && (exclude == null || !exclude.Contains(source));
+
         // Brute-force cosine over all embeddings, streamed, top-K kept. Source filter prunes in SQL.
-        private async Task<List<Candidate>> VectorLegAsync(string query, HashSet<string>? sourceFilter, CancellationToken ct)
+        private async Task<List<Candidate>> VectorLegAsync(string query, HashSet<string>? sourceFilter, HashSet<string>? excludeSources, CancellationToken ct)
         {
             float[] qv;
             try { qv = await embed.EmbedQueryAsync(query, ct); }
@@ -129,7 +135,7 @@ FROM rag_chunk_embeddings e JOIN rag_chunks c ON c.chunk_id = e.chunk_id";
             {
                 ct.ThrowIfCancellationRequested();
                 string source = r.GetString(2);
-                if (sourceFilter != null && !sourceFilter.Contains(source)) continue;
+                if (!Allowed(source, sourceFilter, excludeSources)) continue;
                 var v = ReplicaEmbedder.UnpackEmbedding((byte[])r.GetValue(4));
                 if (v.Length != qv.Length) continue;
                 float score = ReplicaEmbedder.CosineSimilarity(qv, v);
@@ -150,13 +156,13 @@ FROM rag_chunk_embeddings e JOIN rag_chunks c ON c.chunk_id = e.chunk_id";
             return top.OrderByDescending(t => t.Score).Select(t => t.Cand).ToList();
         }
 
-        private List<Candidate> LexicalLeg(string query, HashSet<string>? sourceFilter)
+        private List<Candidate> LexicalLeg(string query, HashSet<string>? sourceFilter, HashSet<string>? excludeSources)
         {
-            return db.FtsAvailable ? FtsLeg(query, sourceFilter) : FallbackLexicalLeg(query, sourceFilter);
+            return db.FtsAvailable ? FtsLeg(query, sourceFilter, excludeSources) : FallbackLexicalLeg(query, sourceFilter, excludeSources);
         }
 
         // FTS5 bm25() — lower is better, so results come back best-first already.
-        private List<Candidate> FtsLeg(string query, HashSet<string>? sourceFilter)
+        private List<Candidate> FtsLeg(string query, HashSet<string>? sourceFilter, HashSet<string>? excludeSources)
         {
             string match = BuildFtsMatch(query);
             if (match.Length == 0) return new List<Candidate>();
@@ -176,7 +182,7 @@ ORDER BY bm25(rag_chunks_fts) LIMIT $n";
                 while (r.Read() && result.Count < LegLimit)
                 {
                     string source = r.GetString(2);
-                    if (sourceFilter != null && !sourceFilter.Contains(source)) continue;
+                    if (!Allowed(source, sourceFilter, excludeSources)) continue;
                     result.Add(new Candidate(r.GetString(0), r.GetString(1), source, r.GetInt64(3)));
                 }
             }
@@ -185,7 +191,7 @@ ORDER BY bm25(rag_chunks_fts) LIMIT $n";
         }
 
         // Fallback when FTS5 is absent: term-overlap scan bounded by a candidate cap.
-        private List<Candidate> FallbackLexicalLeg(string query, HashSet<string>? sourceFilter)
+        private List<Candidate> FallbackLexicalLeg(string query, HashSet<string>? sourceFilter, HashSet<string>? excludeSources)
         {
             var terms = Tokenize(query).Distinct().ToList();
             if (terms.Count == 0) return new List<Candidate>();
@@ -197,7 +203,7 @@ ORDER BY bm25(rag_chunks_fts) LIMIT $n";
             while (r.Read())
             {
                 string source = r.GetString(2);
-                if (sourceFilter != null && !sourceFilter.Contains(source)) continue;
+                if (!Allowed(source, sourceFilter, excludeSources)) continue;
                 string text = r.GetString(4).ToLowerInvariant();
                 int overlap = terms.Count(t => text.Contains(t));
                 if (overlap > 0)
