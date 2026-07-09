@@ -165,7 +165,7 @@ namespace Omnipotent.Services.Projects
 
             routes = new ProjectsRoutes(this);
             await routes.RegisterRoutes();
-            await RegisterEventStreamRouteAsync();
+            await RegisterWebSocketRoutesAsync();
 
             await InitialiseDesktopsAsync();
             await InitialiseDiscordAsync();
@@ -773,8 +773,8 @@ namespace Omnipotent.Services.Projects
                 try { await manager.ReconcileAsync(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reconcile failed"); }
             });
-
-            _ = RegisterScreenStreamRouteAsync();
+            // NOTE: the screen-stream WS route is registered in RegisterWebSocketRoutesAsync (at init,
+            // decoupled from this method) so it exists even when Docker/desktops fail to come up.
         }
 
         /// <summary>
@@ -797,18 +797,33 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// Registers the event-stream WebSocket (Phase 3 push): /projects/events/stream?projectID=..&amp;since=..
-        /// Per-project subscribers get every ProjectEvent (replay-after-cursor then live); a fleet
-        /// subscriber (no projectID) gets a lightweight signal on any project's event. Registered as
-        /// Anybody at the KliveAPI layer, authorized in-handler (see AuthorizeWsAsKlivesAsync).
+        /// Registers both Projects WebSocket routes against a TYPED KliveAPI reference (not via
+        /// reflection ExecuteServiceMethod, whose delegate marshalling is fragile and was never
+        /// exercised at runtime), at init time and decoupled from the desktop subsystem — so the
+        /// screen-stream route exists even when Docker/desktops fail to come up:
+        ///   * /projects/events/stream?projectID=..&amp;since=..  — per-project events (replay-after-cursor
+        ///     then live) or, with no projectID, a fleet firehose signal.
+        ///   * /projects/containers/screen/stream?containerID=..&amp;fps=..  — JPEG frames from a container's
+        ///     VNC transport (read-only capture, coexists with an acting agent).
+        /// Both register as Anybody at the KliveAPI layer and authorize in-handler — browsers cannot
+        /// set an Authorization header on a WebSocket, so the ?authorization= password is checked here
+        /// (see AuthorizeWsAsKlivesAsync). This was the root cause of the live view never connecting.
         /// </summary>
-        private async Task RegisterEventStreamRouteAsync()
+        private async Task RegisterWebSocketRoutesAsync()
         {
             try
             {
-                await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
-                    "/projects/events/stream",
-                    (Func<HttpListenerContext, WebSocket, NameValueCollection, Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+                var apis = await GetServicesByType<Omnipotent.Services.KliveAPI.KliveAPI>();
+                if (apis == null || apis.Length == 0)
+                {
+                    _ = ServiceLogError(new InvalidOperationException("KliveAPI service not available"),
+                        "Projects: cannot register WebSocket routes — the live view will not connect");
+                    return;
+                }
+                var api = (Omnipotent.Services.KliveAPI.KliveAPI)apis[0];
+
+                await api.CreateWebSocketRoute("/projects/events/stream",
+                    async (context, socket, query, user) =>
                     {
                         if (!await AuthorizeWsAsKlivesAsync(query, user))
                         {
@@ -819,40 +834,29 @@ namespace Omnipotent.Services.Projects
                         long since = long.TryParse(query["since"], out var s) ? s : 0;
                         await EventBroadcaster.HandleAsync(socket, projectID, since,
                             (pid, sinceExclusive) => EventLog.ReadSince(pid, sinceExclusive));
-                    }),
+                    },
                     Profiles.KMProfileManager.KMPermissions.Anybody);
                 ServiceLog("Projects: event-stream route registered (/projects/events/stream).");
-            }
-            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register event-stream route (non-fatal)"); }
-        }
 
-        /// <summary>
-        /// Live-view WebSocket: /projects/containers/screen/stream?containerID=..&amp;fps=..
-        /// Pushes JPEG frames from a container's VNC transport, mirroring HostControl's
-        /// /kliveagent/screen/stream. Read-only capture, so it coexists with an acting agent.
-        /// </summary>
-        [SupportedOSPlatform("windows")]
-        private async Task RegisterScreenStreamRouteAsync()
-        {
-            try
-            {
-                await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
-                    "/projects/containers/screen/stream",
-                    (Func<HttpListenerContext, WebSocket, NameValueCollection, Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+                await api.CreateWebSocketRoute("/projects/containers/screen/stream",
+                    async (context, socket, query, user) =>
                     {
-                        // Anybody at the KliveAPI layer + in-handler Klives auth: browsers can't send an
-                        // Authorization header on a WebSocket (see AuthorizeWsAsKlivesAsync).
                         if (!await AuthorizeWsAsKlivesAsync(query, user))
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
                         }
+                        if (Desktops == null || !OperatingSystem.IsWindows())
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "desktop subsystem unavailable", CancellationToken.None); } catch { }
+                            return;
+                        }
                         await StreamContainerScreenAsync(socket, query);
-                    }),
+                    },
                     Profiles.KMProfileManager.KMPermissions.Anybody);
                 ServiceLog("Projects: container screen-stream route registered (/projects/containers/screen/stream).");
             }
-            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register container screen-stream route (non-fatal)"); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register WebSocket routes (non-fatal)"); }
         }
 
         [SupportedOSPlatform("windows")]

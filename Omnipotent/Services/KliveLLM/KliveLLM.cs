@@ -632,6 +632,7 @@ namespace Omnipotent.Services.KliveLLM
                 PromptTokens = response.usage?.prompt_tokens ?? 0,
                 CompletionTokens = response.usage?.completion_tokens ?? 0,
                 GenerationId = response.id,
+                CostUsd = response.usage?.cost,
             };
         }
 
@@ -687,6 +688,8 @@ namespace Omnipotent.Services.KliveLLM
                     Success = true,
                     PromptTokens = response.usage?.prompt_tokens ?? 0,
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
+                    GenerationId = response.id,
+                    CostUsd = response.usage?.cost,
                 };
             }
         }
@@ -794,6 +797,7 @@ namespace Omnipotent.Services.KliveLLM
                 max_tokens = maxTokensOverride,
             };
             ApplyServiceTier(ref payload, remoteProvider);
+            ApplyUsageAccounting(ref payload, remoteProvider);
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             payload.BuildMessagesFromChatHistory(messages);
             ApplyPromptCaching(ref payload, remoteProvider);
@@ -827,6 +831,7 @@ namespace Omnipotent.Services.KliveLLM
                 tools = tools,
             };
             ApplyServiceTier(ref payload, remoteProvider);
+            ApplyUsageAccounting(ref payload, remoteProvider);
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             payload.BuildMessagesFromList(structuredMessages);
             ApplyPromptCaching(ref payload, remoteProvider);
@@ -886,6 +891,17 @@ namespace Omnipotent.Services.KliveLLM
             {
                 payload.service_tier = remoteProvider.ServiceTier;
             }
+        }
+
+        // Ask OpenRouter to report the REAL per-request cost back in the response usage object
+        // (usage.cost, in credits == USD). This is the authoritative figure the Projects budget ledger
+        // meters against — accurate for whatever model is actually in use, instead of a flat per-million
+        // estimate that is wildly wrong for cheap/free models. It arrives in the same response (and the
+        // final streamed usage chunk), so there's no separate round-trip. No-op for other providers.
+        private static void ApplyUsageAccounting(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        {
+            if (remoteProvider.Provider == LLMProvider.OpenRouter)
+                payload.usage = new { include = true };
         }
 
         /// <summary>True when the configured thinking type means "no reasoning at all".</summary>
@@ -1383,6 +1399,12 @@ namespace Omnipotent.Services.KliveLLM
             /// <summary>The provider's generation/response id (OpenRouter's `id`), used to fetch
             /// the authoritative per-request cost from /generation. Null when unavailable.</summary>
             public string? GenerationId { get; set; }
+
+            /// <summary>The REAL USD cost of this turn, reported by OpenRouter in the response's usage
+            /// object (usage.cost, credits == USD). This is authoritative and needs no /generation
+            /// round-trip. Null when the provider doesn't report a cost (HuggingFace/local), in which
+            /// case callers fall back to a provisional estimate + optional /generation reconciliation.</summary>
+            public double? CostUsd { get; set; }
 
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.

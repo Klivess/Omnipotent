@@ -177,6 +177,13 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
             public object stream_options;
 
+            // OpenRouter usage accounting: { "include": true } asks the response's usage object to
+            // carry the actual `cost` charged for this request (in credits == USD). This is the
+            // authoritative spend figure the Projects budget ledger meters against — far more accurate
+            // than a flat per-model estimate. Ignored by providers that don't support it.
+            [JsonProperty("usage", NullValueHandling = NullValueHandling.Ignore)]
+            public object usage;
+
             // OpenRouter reasoning control: e.g. { "enabled": true/false }. Lets us turn the model's
             // thinking on/off for reasoning-capable models. Ignored by providers that don't support it.
             [JsonProperty("reasoning", NullValueHandling = NullValueHandling.Ignore)]
@@ -273,6 +280,13 @@ namespace Omnipotent.Services.KliveLLM
 
             public class UsageDetails
             {
+                // OpenRouter usage accounting: the actual amount charged for this request, in credits
+                // (1 credit == 1 USD). Null when the provider doesn't report a cost (HuggingFace, local,
+                // or OpenRouter with accounting disabled). Present in the final streamed usage chunk too,
+                // so the streaming path surfaces it with no extra work.
+                [JsonProperty("cost")]
+                public double? cost { get; set; }
+
                 [JsonProperty("total_tokens")]
                 public int total_tokens { get; set; }
 

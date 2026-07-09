@@ -117,6 +117,7 @@ namespace Omnipotent.Services.Projects
             string outcomeText = "Wake completed; Commander asleep.";
             int stuckTrips = 0;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
+            double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
@@ -180,14 +181,16 @@ namespace Omnipotent.Services.Projects
                     var resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
-                    // Meter this round's spend against the budget. The generation id lets the ledger
-                    // reconcile to the router's ACTUAL cost — essential once the model in use differs
-                    // from the one the flat provisional estimate assumes (item 7).
+                    // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
+                    // the response usage object (resp.CostUsd) — authoritative for whatever model is in
+                    // use, so the ledger books it directly instead of a flat provisional. The generation
+                    // id remains a fallback for providers that don't report a cost.
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
                     {
                         wakePromptTokens += resp.PromptTokens;
                         wakeCompletionTokens += resp.CompletionTokens;
-                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
+                        wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
+                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                     }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
@@ -279,9 +282,10 @@ namespace Omnipotent.Services.Projects
                     parent.Digests.SaveDigest(digest);
 
                     // Per-wake cost attribution: the ledger is cumulative, so stamp this wake's own
-                    // token spend + provisional cost onto its closing event for the timeline/reports.
+                    // token spend + cost onto its closing event for the timeline/reports. wakeCostUsd is
+                    // the real OpenRouter spend when available, else the provisional estimate.
                     if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
-                        outcomeText += $" (this wake: ~${parent.Budget.EstimateCost(wakePromptTokens, wakeCompletionTokens):0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
+                        outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                     parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
 
                     // A failed Klives-triggered wake must not read as silence either.

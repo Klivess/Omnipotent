@@ -69,29 +69,38 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// Records an LLM turn's spend. Applies the provisional estimate immediately, then (if a
-        /// generation ID is given) reconciles against the real OpenRouter cost in the background.
-        /// Emits budget warning/pause events as thresholds are crossed.
+        /// Records an LLM turn's spend. When <paramref name="actualCostUsd"/> is supplied (OpenRouter
+        /// reports the real per-request cost in the completion's usage object), that authoritative figure
+        /// is booked directly — accurate for whatever model is in use, and immediate, with no /generation
+        /// round-trip. Otherwise a flat per-model provisional is applied and (if a generation ID is given)
+        /// reconciled against the real OpenRouter cost in the background. Emits budget warning/pause
+        /// events as thresholds are crossed.
         /// </summary>
-        public async Task RecordTokenSpendAsync(string projectID, long promptTokens, long completionTokens, string? generationId = null)
+        public async Task RecordTokenSpendAsync(string projectID, long promptTokens, long completionTokens, string? generationId = null, double? actualCostUsd = null)
         {
-            double provisional = promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
-                               + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
+            // The completion already carries the real cost — book it and skip the estimate/reconcile
+            // path entirely. A provider that doesn't report cost (HuggingFace/local) falls back to the
+            // flat provisional, which the /generation fetch later reconciles when a generation ID exists.
+            bool haveActual = actualCostUsd.HasValue && actualCostUsd.Value >= 0;
+            double amount = haveActual
+                ? actualCostUsd!.Value
+                : promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
+                + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
 
             lock (LockFor(projectID))
             {
                 var ledger = LoadLocked(projectID);
                 ledger.PromptTokens += promptTokens;
                 ledger.CompletionTokens += completionTokens;
-                ledger.TokenSpendUsd += provisional;
-                if (!string.IsNullOrWhiteSpace(generationId))
-                    ledger.PendingReconcile[generationId] = provisional;
+                ledger.TokenSpendUsd += amount;
+                if (!haveActual && !string.IsNullOrWhiteSpace(generationId))
+                    ledger.PendingReconcile[generationId] = amount;
                 SaveLocked(ledger);
             }
 
             CheckTokenThresholds(projectID);
 
-            if (!string.IsNullOrWhiteSpace(generationId))
+            if (!haveActual && !string.IsNullOrWhiteSpace(generationId))
                 _ = Task.Run(() => ReconcileAsync(projectID, generationId!));
         }
 

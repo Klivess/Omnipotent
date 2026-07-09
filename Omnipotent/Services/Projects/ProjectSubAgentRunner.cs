@@ -96,6 +96,7 @@ namespace Omnipotent.Services.Projects
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = $"Agent {agent.AgentID} finished its wake.";
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
+            double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
             using var cts = new CancellationTokenSource();
 
             try
@@ -156,7 +157,8 @@ namespace Omnipotent.Services.Projects
                     {
                         wakePromptTokens += resp.PromptTokens;
                         wakeCompletionTokens += resp.CompletionTokens;
-                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId);
+                        wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
+                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                     }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
@@ -242,7 +244,7 @@ namespace Omnipotent.Services.Projects
             finally
             {
                 if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
-                    outcomeText += $" (this wake: ~${parent.Budget.EstimateCost(wakePromptTokens, wakeCompletionTokens):0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
+                    outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                 try { parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, outcome, outcomeText)); }
                 catch { }
             }

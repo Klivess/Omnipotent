@@ -30,6 +30,11 @@ namespace Omnipotent.Services.Omniscience.Radar
         private readonly ConcurrentQueue<PendingAlert> pending = new();
         private readonly CancellationTokenSource cts = new();
 
+        // KliveBot's own Discord user id, cached once the bot connects. The bot pings
+        // Klives from its own account (project channels, notifications) — those aren't
+        // people talking about him, so they must never fire a radar alert.
+        private volatile string? botUserId;
+
         // Messages older than this are backfill, not live conversation — never alert.
         private static readonly TimeSpan LiveWindow = TimeSpan.FromMinutes(10);
         private static readonly TimeSpan BurstWindow = TimeSpan.FromSeconds(90);
@@ -68,7 +73,36 @@ namespace Omnipotent.Services.Omniscience.Radar
             string raw = await service.GetStringOmniSetting("OmniscienceRadarAliases", "klives");
             SetAliases(raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             RefreshWatchlists();
+            _ = Task.Run(ResolveBotUserIdAsync);
             _ = Task.Run(DispatchLoopAsync);
+        }
+
+        /// <summary>
+        /// Waits for KliveBot to connect, then caches its own Discord user id so
+        /// <see cref="InspectMessage"/> can ignore the bot's own messages.
+        /// </summary>
+        private async Task ResolveBotUserIdAsync()
+        {
+            try
+            {
+                for (int i = 0; i < 180 && !cts.IsCancellationRequested; i++)
+                {
+                    var bots = await service.GetServicesByType<KliveBotDiscord>();
+                    var bot = bots is { Length: > 0 } ? bots[0] as KliveBotDiscord : null;
+                    ulong? id = bot?.Client?.CurrentUser?.Id;
+                    if (id is > 0)
+                    {
+                        botUserId = id.Value.ToString();
+                        return;
+                    }
+                    try { await Task.Delay(1000, cts.Token); }
+                    catch (OperationCanceledException) { return; }
+                }
+            }
+            catch (Exception ex)
+            {
+                _ = service.ServiceLogError(ex, "[Omniscience] Radar could not resolve KliveBot user id");
+            }
         }
 
         /// <summary>Reloads watchlists from the DB. Called on a timer and after CRUD.</summary>
@@ -171,6 +205,7 @@ namespace Omnipotent.Services.Omniscience.Radar
                 if (DateTime.UtcNow - msg.SentAt > LiveWindow) return; // backfill
                 string klivesId = OmniPaths.KlivesDiscordAccountID.ToString();
                 if (msg.Author?.PlatformUserId == klivesId) return;    // own messages
+                if (botUserId != null && msg.Author?.PlatformUserId == botUserId) return; // KliveBot's own pings/notifications
 
                 string channelLabel = msg.ConversationKind switch
                 {
