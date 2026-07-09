@@ -67,6 +67,8 @@ namespace Omnipotent.Services.Projects
         /// <summary>P5 hook: surface a human-only obstacle through Discord. Set when Discord exists.</summary>
         public Func<string, Task>? RequestHumanHook { get; set; }
         public ProjectArtifactStore Artifacts { get; private set; } = null!;
+        /// <summary>Named live values agents maintain for Klives' at-a-glance project dashboard.</summary>
+        public ProjectObservableStore Observables { get; private set; } = null!;
         public ProjectSubAgentRunner SubAgentRunner { get; private set; } = null!;
         private System.Threading.Timer? retentionTimer;
 
@@ -116,6 +118,10 @@ namespace Omnipotent.Services.Projects
             CommanderRunner = new ProjectCommanderRunner(this);
             SubAgentRunner = new ProjectSubAgentRunner(this);
             Artifacts = new ProjectArtifactStore(msg => ServiceLog(msg));
+            Observables = new ProjectObservableStore(msg => ServiceLog(msg));
+            // Live observable values render into every wake seed, so agents always see the
+            // dashboard exactly as Klives does.
+            WakeCycle.DescribeObservables = pid => Observables.DescribeAll(pid);
             // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
             retentionTimer = new System.Threading.Timer(async _ =>
             {
@@ -409,7 +415,9 @@ namespace Omnipotent.Services.Projects
                 RearmAdapters = () => Adapters.ArmAll(),
                 GetHookArmInfo = hookID => Adapters.GetArmInfo(hookID),
                 Artifacts = Artifacts,
+                Observables = Observables,
                 CompleteProjectAsync = () => CompleteProjectAsync(project),
+                RenameDiscordChannelAsync = DiscordManager == null ? null : () => DiscordManager.RenameProjectChannelAsync(project),
                 DisposeAgentDesktopAsync = agentID => DisposeAgentDesktopAsync(project.ProjectID, agentID),
                 RecallMemoriesAsync = RecallKliveAgentMemoriesAsync,
                 SaveMemoryAsync = SaveKliveAgentMemoryAsync,

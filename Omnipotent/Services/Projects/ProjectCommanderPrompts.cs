@@ -27,7 +27,8 @@ namespace Omnipotent.Services.Projects
             List<ProjectEvent> recentEvents,
             List<ProjectRetrievalIndex.RetrievalHit> retrievalHits,
             string triggerDescription,
-            List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledgeHits = null)
+            List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledgeHits = null,
+            string? observablesBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -40,6 +41,14 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine("── STANDING DIGEST ──");
             string digestBlock = ComposeDigestBlock(digest);
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digestBlock, ProjectsContextBudget.DigestBudget));
+
+            // Live observable values — read from the store at seed time, never digested prose,
+            // so the numbers the Commander sees are exactly the numbers Klives sees.
+            if (!string.IsNullOrWhiteSpace(observablesBlock))
+            {
+                sb.AppendLine("── OBSERVABLES (live values you maintain for Klives via update_observable) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observablesBlock, ProjectsContextBudget.ObservablesBudget));
+            }
 
             // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The
             // Commander's own log is deliberately NOT here — that's the RETRIEVED-FROM-LOG leg below.

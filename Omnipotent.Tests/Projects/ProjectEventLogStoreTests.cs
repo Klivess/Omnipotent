@@ -42,6 +42,31 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void ReadTail_ReturnsMostRecentEvents_InAscendingOrder()
+        {
+            // Regression guard for the "workspace opened on days-old history" bug: the initial backlog
+            // load asks for the tail, which must be the NEWEST `count` events (not the oldest), in
+            // ascending order, and its last sequence must equal GetLastSequence so the client cursor
+            // and the displayed events agree (otherwise everything between is silently skipped).
+            var store = NewStore();
+            string pid = NewProjectId();
+            for (int i = 1; i <= 20; i++)
+                store.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+
+            var tail = store.ReadTail(pid, 5);
+            Assert.Equal(5, tail.Count);
+            Assert.Equal("e16", tail[0].Text);
+            Assert.Equal("e20", tail[^1].Text);
+            Assert.Equal(store.GetLastSequence(pid), tail[^1].Sequence);
+
+            // Asking for more than exist returns them all, still oldest→newest.
+            var allTail = store.ReadTail(pid, 500);
+            Assert.Equal(20, allTail.Count);
+            Assert.Equal("e1", allTail[0].Text);
+            Assert.Equal("e20", allTail[^1].Text);
+        }
+
+        [Fact]
         public void SequenceCounter_SurvivesStoreRestart()
         {
             string pid = NewProjectId();

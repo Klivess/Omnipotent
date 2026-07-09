@@ -9,7 +9,7 @@
 #
 # Build:  docker build -t omnipotent/projects-desktop:latest -f desktop.Dockerfile .
 # The image is shared by all projects; project-specific software is installed post-boot by
-# agents themselves (apt via a script tool), never baked into per-project images.
+# agents themselves (passwordless sudo → apt), never baked into per-project images.
 
 FROM debian:bookworm-slim
 
@@ -23,11 +23,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         firefox-esr \
         xdotool wmctrl xclip x11-utils \
         curl ca-certificates fonts-dejavu \
-        python3 \
+        python3 python3-pip python3-venv \
+        sudo \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Non-root desktop user; /project is the shared per-project volume mount.
-RUN useradd -m -s /bin/bash agent && mkdir -p /project && chown agent:agent /project
+# Non-root desktop user with passwordless sudo — the desktop is the agent's own machine, and
+# installing the tools a task needs (apt/pip) is part of the job. Security model unchanged:
+# the container boundary, not the user boundary, is what isolates a desktop from the host.
+# /project is the shared per-project volume mount.
+RUN useradd -m -s /bin/bash agent && mkdir -p /project && chown agent:agent /project \
+    && echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent && chmod 0440 /etc/sudoers.d/agent
 
 COPY desktop-entrypoint.sh /usr/local/bin/desktop-entrypoint.sh
 RUN chmod +x /usr/local/bin/desktop-entrypoint.sh

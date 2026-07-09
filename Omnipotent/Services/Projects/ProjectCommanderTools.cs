@@ -50,8 +50,12 @@ namespace Omnipotent.Services.Projects
         public Func<string, HookArmInfo?>? GetHookArmInfo { get; set; }
         /// <summary>Artifact storage for files the agent wants kept on the timeline.</summary>
         public ProjectArtifactStore? Artifacts { get; set; }
+        /// <summary>Named live values the agents maintain for Klives' at-a-glance dashboard.</summary>
+        public ProjectObservableStore? Observables { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
         public Func<Task>? CompleteProjectAsync { get; set; }
+        /// <summary>Renames the project's Discord channel to match a new project name (null-safe).</summary>
+        public Func<Task>? RenameDiscordChannelAsync { get; set; }
         /// <summary>Disposes a retired agent's own desktop container (frees ~1 GB immediately, not at project end).</summary>
         public Func<string, Task>? DisposeAgentDesktopAsync { get; set; }
         /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max) → formatted results.</summary>
@@ -109,6 +113,109 @@ namespace Omnipotent.Services.Projects
                     string note = (string?)a["note"] ?? "";
                     eventLog.Append(Evt(ProjectEventTypes.CommanderMessage, "commander", note));
                     return new CommanderToolResult("Progress recorded.");
+                }
+
+                case "list_observables":
+                {
+                    if (Observables == null) return new CommanderToolResult("Observables unavailable.");
+                    var list = Observables.List(project.ProjectID);
+                    if (list.Count == 0)
+                        return new CommanderToolResult("No observables yet. Create one with update_observable(op:'set').");
+                    return new CommanderToolResult(string.Join("\n", list.Select(o =>
+                        $"{o.Name} = {ProjectObservableStore.FormatValue(o)}"
+                        + (string.IsNullOrWhiteSpace(o.Description) ? "" : $" — {o.Description}")
+                        + $" (updated {o.UpdatedAt:MM-dd HH:mm}Z by {o.UpdatedBy})")));
+                }
+
+                case "update_observable":
+                {
+                    if (Observables == null) return new CommanderToolResult("Observables unavailable.");
+                    string name = ((string?)a["name"] ?? "").Trim();
+                    string op = ((string?)a["op"] ?? "").Trim().ToLowerInvariant();
+                    if (name.Length == 0) return new CommanderToolResult("Provide 'name'.");
+                    try
+                    {
+                        switch (op)
+                        {
+                            case "delete":
+                            {
+                                if (!Observables.Delete(project.ProjectID, name))
+                                    return new CommanderToolResult($"No observable named '{name}'.");
+                                AppendObservableEvent(name, op, $"{name}: deleted", null);
+                                return new CommanderToolResult($"Deleted observable '{name}'.");
+                            }
+                            case "set":
+                            {
+                                double? num = (double?)a["value"];
+                                string? text = (string?)a["textValue"];
+                                ObservableFormat? fmt =
+                                    Enum.TryParse<ObservableFormat>((string?)a["format"] ?? "", true, out var f) ? f : null;
+                                var change = Observables.Set(project.ProjectID, name, num, text, fmt,
+                                    (string?)a["unit"], (string?)a["description"], actingAgentID);
+                                AppendObservableEvent(change.Observable.Name, op,
+                                    $"{change.Observable.Name}: {change.PreviousDisplay ?? "(new)"} → {change.NewDisplay} (set)", change);
+                                return new CommanderToolResult($"Observable '{change.Observable.Name}' = {change.NewDisplay}.");
+                            }
+                            case "add": case "subtract": case "multiply": case "divide":
+                            {
+                                double? operand = (double?)a["value"];
+                                if (operand == null) return new CommanderToolResult($"Provide numeric 'value' for op '{op}'.");
+                                var change = Observables.Adjust(project.ProjectID, name, op, operand.Value, actingAgentID);
+                                AppendObservableEvent(change.Observable.Name, op,
+                                    $"{change.Observable.Name}: {change.PreviousDisplay} → {change.NewDisplay} ({op} {operand.Value})", change, operand);
+                                return new CommanderToolResult($"Observable '{change.Observable.Name}' = {change.NewDisplay}.");
+                            }
+                            default:
+                                return new CommanderToolResult($"Unknown op '{op}'. Use set, add, subtract, multiply, divide, or delete.");
+                        }
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        return new CommanderToolResult(ex.Message);
+                    }
+                }
+
+                case "update_project":
+                {
+                    string? newName = (string?)a["name"];
+                    string? newDescription = (string?)a["description"];
+                    newName = string.IsNullOrWhiteSpace(newName) ? null : newName.Trim();
+                    newDescription = string.IsNullOrWhiteSpace(newDescription) ? null : newDescription.Trim();
+                    if (newName == null && newDescription == null)
+                        return new CommanderToolResult("Provide 'name' and/or 'description' to change. Nothing was updated.");
+
+                    var p = projectStore.GetProject(project.ProjectID);
+                    if (p == null) return new CommanderToolResult("Project record not found.");
+
+                    var changes = new List<string>();
+                    bool nameChanged = false;
+                    if (newName != null && newName != p.Name)
+                    {
+                        changes.Add($"name \"{p.Name}\" → \"{newName}\"");
+                        // Mutate the persisted record AND the in-wake snapshot (the Discord-rename
+                        // delegate and this wake's later event authoring both read the snapshot).
+                        p.Name = newName;
+                        project.Name = newName;
+                        nameChanged = true;
+                    }
+                    if (newDescription != null && newDescription != p.Goal)
+                    {
+                        changes.Add("description revised");
+                        p.Goal = newDescription;
+                        project.Goal = newDescription;
+                    }
+                    if (changes.Count == 0)
+                        return new CommanderToolResult("No change — the new values already match the current name/description.");
+
+                    projectStore.SaveProject(p);
+                    // Logged so Klives sees the identity change on the timeline and it seeds the next wake.
+                    eventLog.Append(Evt(ProjectEventTypes.Status, "commander", $"Project details updated: {string.Join("; ", changes)}."));
+
+                    // Mirror a name change to the project's Discord channel, exactly as the Klives-side rename does.
+                    if (nameChanged && RenameDiscordChannelAsync != null)
+                        try { await RenameDiscordChannelAsync(); } catch { }
+
+                    return new CommanderToolResult($"Updated {string.Join("; ", changes)}. The change is live and seeds your next wake.");
                 }
 
                 case "spawn_sub_agent":
@@ -546,6 +653,30 @@ namespace Omnipotent.Services.Projects
             Author = author,
             Text = text,
         };
+
+        /// <summary>
+        /// Logs an observable mutation to the timeline (which also pushes it to the UI over the
+        /// event WS stream). Payload is the small structured change only — never the history.
+        /// </summary>
+        private void AppendObservableEvent(string name, string op, string text,
+            ProjectObservableStore.ObservableChange? change, double? operand = null)
+        {
+            string author = actingAgentID == "commander" ? "commander" : "agent";
+            var evt = Evt(ProjectEventTypes.ObservableChanged, author, text);
+            evt.PayloadJson = JsonConvert.SerializeObject(new
+            {
+                name,
+                op,
+                operand,
+                observableID = change?.Observable.ObservableID,
+                type = change?.Observable.Type.ToString(),
+                format = change?.Observable.Format.ToString(),
+                unit = change?.Observable.Unit,
+                previous = change?.PreviousDisplay,
+                current = change?.NewDisplay,
+            });
+            eventLog.Append(evt);
+        }
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
     }

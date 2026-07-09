@@ -250,7 +250,15 @@ namespace Omnipotent.Services.Projects
             }
         }
 
-        private static string BuildSystemPrompt(Project project, ProjectAgentRecord agent) =>
+        private static string BuildSystemPrompt(Project project, ProjectAgentRecord agent)
+        {
+            // Only video-tier sub-agents actually get a desktop container; entice them to live on it.
+            string desktopNote = ProjectTierRouter.TierGetsDesktop(agent.Tier)
+                ? @"
+- YOUR DESKTOP is a real computer that's yours — use it, don't just poke at it. Open a browser and actually browse, install and use the right GUI app for the task (you have passwordless sudo: `sudo apt-get update && sudo apt-get install <package>` in the terminal), organise your work into real files and folders, and keep the machine tidy — even personalise it (yes, the wallpaper) if it helps you own it. The GUI is often the shortest, most reliable path, since so many tools and sites are built for a human at a screen — which is exactly what you are equipped to be. Anything that must outlive the machine goes in /project."
+                : "";
+
+            return
 $@"You are a {agent.Tier}-tier SUB-AGENT (role: {agent.Role}, ID: {agent.AgentID}) in an autonomous project task force. The COMMANDER assigns you work; you do focused legwork and report back.
 
 THE PROJECT'S GOAL (context, not your whole job): {project.Goal}
@@ -259,7 +267,9 @@ RULES:
 - Do the specific task in your trigger message. Don't expand scope — the commander owns strategy.
 - Work with your tools, verify results, then send your findings to the commander with send_agent_message(agentID: ""commander"", message: ...) BEFORE you finish. An unreported result is a wasted wake.
 - If blocked, report the blocker rather than spinning. If an action needs approval or spends money, that's the commander's call — report it as a recommendation.
+- When your work changes a tracked number, update the matching Observable (update_observable) so Klives' live dashboard stays current.{desktopNote}
 - Be concise and factual. Everything you do is on a timeline Klives watches.";
+        }
 
         private async Task<string> BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger)
         {
@@ -267,6 +277,15 @@ RULES:
             var sb = new StringBuilder();
             sb.AppendLine("── PROJECT PLAN (commander's, for context) ──");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digest.CurrentPlan is { Length: > 0 } p ? p : "(none)", 400));
+
+            // Live observable values (Klives' dashboard) — same block the Commander sees.
+            string observables = "";
+            try { observables = parent.Observables.DescribeAll(project.ProjectID); } catch { }
+            if (!string.IsNullOrWhiteSpace(observables))
+            {
+                sb.AppendLine("── OBSERVABLES (live values shown to Klives; keep yours current via update_observable) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observables, ProjectsContextBudget.ObservablesBudget));
+            }
 
             // Thin cross-system knowledge leg (KliveRAG), keyed by role + task; own project excluded.
             if (parent.WakeCycle.KnowledgeSearchAsync != null)

@@ -27,6 +27,12 @@ namespace Omnipotent.Services.Projects
         public Func<string, string?, Task<List<Omnipotent.Services.KliveRAG.KnowledgeHit>>>? KnowledgeSearchAsync;
 
         /// <summary>
+        /// Optional live-observables leg: projectID → current-values block for the seed. Set by the
+        /// Projects service in ServiceMain (ProjectObservableStore.DescribeAll).
+        /// </summary>
+        public Func<string, string>? DescribeObservables;
+
+        /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
@@ -55,7 +61,13 @@ namespace Omnipotent.Services.Projects
                 try { knowledge = await KnowledgeSearchAsync(query, project.ProjectID); } catch { knowledge = null; }
             }
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge);
+            string? observables = null;
+            if (DescribeObservables != null)
+            {
+                try { observables = DescribeObservables(project.ProjectID); } catch { observables = null; }
+            }
+
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables);
         }
 
         private static string Truncate(string s, int max) =>

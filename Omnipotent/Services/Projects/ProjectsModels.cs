@@ -104,6 +104,7 @@ namespace Omnipotent.Services.Projects
         public const string ArtifactAdded = "artifact-added";
         public const string DigestRebuilt = "digest-rebuilt";
         public const string HookChanged = "hook-changed";              // stimulus hook CRUD is itself an event (§5.1)
+        public const string ObservableChanged = "observable-changed";  // a named live value shown to Klives was created/updated/deleted
         public const string WatchdogEscalation = "watchdog-escalation";
         public const string Status = "status";                         // generic progress note
     }

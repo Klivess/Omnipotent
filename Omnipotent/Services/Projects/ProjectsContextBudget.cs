@@ -25,6 +25,9 @@ namespace Omnipotent.Services.Projects
         /// <summary>Thinner knowledge budget for sub-agent wakes (their seed is deliberately lean).</summary>
         public const int SubAgentKnowledgeBudget = 400;
 
+        /// <summary>Current observable values (the live dashboard agents maintain for Klives).</summary>
+        public const int ObservablesBudget = 300;
+
         /// <summary>The triggering stimulus payload + verdict itself.</summary>
         public const int StimulusBudget = 800;
 

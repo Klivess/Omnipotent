@@ -24,7 +24,12 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly SemaphoreSlim clientGate = new(1, 1);
 
         private const int VncContainerPort = 5901;
-        private const long DefaultMemoryBytes = 1L * 1024 * 1024 * 1024; // ~1 GB per desktop (§4)
+        // ~2 GB per desktop: XFCE + Firefox alone sit near 1 GB, and agents are expected to
+        // apt-install and run real applications on their machines (§4 revised).
+        private const long DefaultMemoryBytes = 2L * 1024 * 1024 * 1024;
+        /// <summary>Image label carrying the SHA-256 of the build context, so a changed
+        /// Dockerfile/entrypoint triggers a rebuild instead of being silently ignored.</summary>
+        private const string ContextHashLabel = "omnipotent.projects.context-hash";
 
         public ContainerOrchestrator(
             ContainerRegistry registry,
@@ -82,28 +87,45 @@ namespace Omnipotent.Services.Projects.Containers
 
         /// <summary>True when <paramref name="imageTag"/> exists locally.</summary>
         public async Task<bool> ImageExistsAsync(string imageTag, CancellationToken ct = default)
+            => await FindImageAsync(imageTag, ct) != null;
+
+        private async Task<ImagesListResponse?> FindImageAsync(string imageTag, CancellationToken ct)
         {
             var docker = await GetClientAsync();
             var images = await docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
-            return images.Any(i => i.RepoTags?.Contains(imageTag) == true);
+            return images.FirstOrDefault(i => i.RepoTags?.Contains(imageTag) == true);
         }
 
         /// <summary>
         /// Builds the desktop image from a shipped build context when it's missing on this host —
-        /// the second half of dependency self-healing (daemon install being the first). The context
-        /// is tarred in-process (no docker CLI needed); .sh files are normalised to LF so a CRLF
-        /// git checkout can't produce a container whose entrypoint dies on '\r'. Returns null on
-        /// success (or already-present), else a human-readable reason.
+        /// the second half of dependency self-healing (daemon install being the first). The image
+        /// carries a label with the build context's hash, so a shipped change to the
+        /// Dockerfile/entrypoint rebuilds the (same-tagged) image on the next bootstrap instead of
+        /// being silently ignored; running containers keep the old image until they're recreated.
+        /// The context is tarred in-process (no docker CLI needed); .sh files are normalised to LF
+        /// so a CRLF git checkout can't produce a container whose entrypoint dies on '\r'. Returns
+        /// null on success (or already current), else a human-readable reason.
         /// </summary>
         public async Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName, CancellationToken ct = default)
         {
             try
             {
-                if (await ImageExistsAsync(imageTag, ct)) return null;
-                if (!Directory.Exists(contextDir) || !File.Exists(Path.Combine(contextDir, dockerfileName)))
-                    return $"desktop image '{imageTag}' is missing and the build context was not found at {contextDir}.";
+                bool contextAvailable = Directory.Exists(contextDir) && File.Exists(Path.Combine(contextDir, dockerfileName));
+                var existing = await FindImageAsync(imageTag, ct);
+                if (!contextAvailable)
+                {
+                    // No context shipped on this host: a present image (however old) beats no desktop.
+                    return existing != null ? null
+                        : $"desktop image '{imageTag}' is missing and the build context was not found at {contextDir}.";
+                }
 
-                log($"Desktop image '{imageTag}' not found — building it now (first build takes several minutes)…");
+                string contextHash = ComputeContextHash(contextDir);
+                if (existing?.Labels != null && existing.Labels.TryGetValue(ContextHashLabel, out var builtHash) && builtHash == contextHash)
+                    return null; // image is current
+
+                log(existing == null
+                    ? $"Desktop image '{imageTag}' not found — building it now (first build takes several minutes)…"
+                    : $"Desktop image '{imageTag}' is stale (build context changed) — rebuilding…");
                 var docker = await GetClientAsync();
                 using var context = CreateTarContext(contextDir);
                 string? buildError = null;
@@ -112,6 +134,7 @@ namespace Omnipotent.Services.Projects.Containers
                     {
                         Dockerfile = dockerfileName,
                         Tags = new List<string> { imageTag },
+                        Labels = new Dictionary<string, string> { [ContextHashLabel] = contextHash },
                     },
                     context,
                     null, null,
@@ -141,19 +164,37 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 foreach (var file in Directory.GetFiles(contextDir))
                 {
-                    string name = Path.GetFileName(file);
-                    byte[] bytes = name.EndsWith(".sh", StringComparison.OrdinalIgnoreCase)
-                        ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n"))
-                        : File.ReadAllBytes(file);
-                    var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, name)
+                    var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, Path.GetFileName(file))
                     {
-                        DataStream = new MemoryStream(bytes),
+                        DataStream = new MemoryStream(ReadContextFile(file)),
                     };
                     writer.WriteEntry(entry);
                 }
             }
             ms.Position = 0;
             return ms;
+        }
+
+        /// <summary>A context file's bytes as they enter the build: .sh normalised to LF.</summary>
+        private static byte[] ReadContextFile(string file) =>
+            file.EndsWith(".sh", StringComparison.OrdinalIgnoreCase)
+                ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n"))
+                : File.ReadAllBytes(file);
+
+        /// <summary>SHA-256 over the context's file names + normalised contents (order-stable), so
+        /// the staleness check sees exactly what the build would see.</summary>
+        private static string ComputeContextHash(string contextDir)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            using var ms = new MemoryStream();
+            foreach (var file in Directory.GetFiles(contextDir).OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase))
+            {
+                byte[] name = System.Text.Encoding.UTF8.GetBytes(Path.GetFileName(file) + "\0");
+                ms.Write(name, 0, name.Length);
+                byte[] bytes = ReadContextFile(file);
+                ms.Write(bytes, 0, bytes.Length);
+            }
+            return Convert.ToHexString(sha.ComputeHash(ms.ToArray())).ToLowerInvariant();
         }
 
         /// <summary>

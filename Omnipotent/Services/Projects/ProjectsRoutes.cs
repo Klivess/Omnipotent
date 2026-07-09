@@ -275,8 +275,13 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Timeline ──
-            // Incremental read for the website's timeline/conversation panels:
-            // GET /projects/events?projectID=..&since=..&max=..
+            // Read for the website's timeline/conversation panels:
+            //   GET /projects/events?projectID=..&tail=true&max=..  — initial backlog (most-recent N)
+            //   GET /projects/events?projectID=..&since=..&max=..    — incremental page-forward
+            // tail=true is load-bearing for the initial load: reading forward from since=0 returns the
+            // OLDEST `max` events while the client advances its cursor to lastSequence, so any project
+            // with more than `max` events showed ancient history and silently skipped everything after
+            // it. The tail path returns the newest events so the panels open on current activity.
             await parent.CreateAPIRoute("/projects/events", async req =>
             {
                 try
@@ -284,7 +289,10 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     long since = long.TryParse(req.userParameters?.Get("since"), out var s) ? s : 0;
                     int max = int.TryParse(req.userParameters?.Get("max"), out var m) ? Math.Clamp(m, 1, 2000) : 500;
-                    var events = parent.EventLog.ReadSince(project!.ProjectID, since, max);
+                    bool tail = bool.TryParse(req.userParameters?.Get("tail"), out var t) && t;
+                    var events = (tail && since <= 0)
+                        ? parent.EventLog.ReadTail(project!.ProjectID, max)
+                        : parent.EventLog.ReadSince(project!.ProjectID, since, max);
                     await req.ReturnResponse(Json(new
                     {
                         events,

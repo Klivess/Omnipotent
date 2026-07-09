@@ -31,6 +31,7 @@ namespace Omnipotent.Services.Projects
             "request_user_approval", "request_budget_increase", "record_money_spend",
             "vault_save", "vault_list", "request_human",
             "update_plan", "report_progress",
+            "update_observable", "list_observables",
             "recall_memories", "save_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
         };
