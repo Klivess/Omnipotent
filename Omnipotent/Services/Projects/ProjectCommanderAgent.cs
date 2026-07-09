@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveLLM;
+using Omnipotent.Services.ComputerControl;
 
 namespace Omnipotent.Services.Projects
 {
@@ -44,6 +45,10 @@ THE ESCALATION BAR (this is where your judgment carries the safety of the whole 
 - Routine, reversible work toward the goal NEVER needs approval: running code and scripts, using your desktop, reading/writing the project volume, working in Klives' own repos and services, spawning sub-agents, testing. Asking approval for work you're equipped to do wastes Klives' attention and stalls the project.
 - When you are genuinely unsure whether an action clears the bar above, it does — escalate. A cheap approval beats an expensive mistake. But 'this task is big/unfamiliar' is not the bar; irreversibility and external consequence are.
 - Never fabricate progress. Only claim something is done if an event in your context proves it. If blocked by a human-only obstacle (captcha, phone verification), use request_human.
+
+VISUAL CONTROL:
+- Observe with computer_screenshot or computer_find_text, locate by OCR or grid coordinates, take one action, wait for the expected visual state, then observe the final gridded frame. Never retry blind clicks; after two failed attempts change approach or report the blocker.
+- OCR is for ordinary visible controls only. CAPTCHA, 2FA, and verification walls require request_human. Use computer_navigate/open_browser and computer_launch_app rather than brittle manual launcher/address-bar sequences. Typed text and vault substitutions are redacted, so verify success visually.
 
 Be concise and concrete. Report measured facts, not adjectives. Everything you do is on the timeline Klives watches.";
 
@@ -219,6 +224,18 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
         /// </summary>
         public static List<HFWrapper.HFTool> BuildComputerToolDefinitions()
         {
+            return VisualComputerToolCatalog.Build(new ComputerCapabilities
+            {
+                SupportsOcr = true,
+                SupportsWindowControl = true,
+                SupportsBrowserControl = true,
+                SupportsClipboard = true,
+                SupportsAppLaunch = true,
+                SupportsHumanization = true,
+                SupportsMotionFrames = true,
+            });
+
+#pragma warning disable CS0162 // retained below temporarily for source-history-friendly context
             HFWrapper.HFTool Tool(string name, string description, object parameters) => new()
             {
                 function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
@@ -243,6 +260,7 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                 Tool("computer_wait", "Wait for the screen to settle.", Obj(new { ms = Num("Milliseconds (default 1000, max 30000).") }, Array.Empty<string>())),
                 Tool("computer_release_all", "Release all held buttons/keys and the shared-desktop input lock.", Obj(new { }, Array.Empty<string>())),
             };
+#pragma warning restore CS0162
         }
     }
 }

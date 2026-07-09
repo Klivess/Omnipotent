@@ -21,6 +21,9 @@ namespace Omnipotent.Services.Projects.Containers
 
         // One transport per container ID, lazily connected.
         private readonly ConcurrentDictionary<string, VncTransport> transports = new(StringComparer.Ordinal);
+        // Captures and input must observe one coherent desktop state.  VncTransport serialises
+        // socket writes, but this gate serialises the whole observe → act → settle transaction.
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> actionGates = new(StringComparer.Ordinal);
         private readonly string vncHost;
 
         public ContainerRegistry Registry => registry;
@@ -79,6 +82,7 @@ namespace Omnipotent.Services.Projects.Containers
         public async Task<ContainerToolAdapter> GetAdapterForAgentAsync(
             Project project, string agentID,
             Func<string, Task<string>>? resolveSecretsAsync = null,
+            int actionSettleMs = 350, int typingDelayMs = 18,
             CancellationToken ct = default)
         {
             var record = await EnsureDesktopAsync(project, agentID, ct);
@@ -86,8 +90,12 @@ namespace Omnipotent.Services.Projects.Containers
             bool shared = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock;
             return new ContainerToolAdapter(
                 transport, record.ContainerID, agentID,
+                actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1)),
                 inputLock: shared ? inputLock : null,
-                resolveSecretsAsync: resolveSecretsAsync);
+                dockerControlAsync: (command, argument, token) => orchestrator.ExecuteDesktopControlAsync(record.ContainerID, command, argument, token),
+                resolveSecretsAsync: resolveSecretsAsync,
+                actionSettleMs: actionSettleMs,
+                typingDelayMs: typingDelayMs);
         }
 
         /// <summary>Creates (or resolves) the desktop record an agent should use. A freshly created
@@ -151,7 +159,20 @@ namespace Omnipotent.Services.Projects.Containers
         public async Task DisposeDesktopAsync(string containerID, CancellationToken ct = default)
         {
             if (transports.TryRemove(containerID, out var t)) t.Dispose();
+            if (actionGates.TryRemove(containerID, out var gate)) gate.Dispose();
             await orchestrator.StopContainerAsync(containerID, ct);
+        }
+
+        /// <summary>Wake cancellation/retirement cleanup for a shared desktop lease. Input events
+        /// are released by the active adapter; this guarantees no expired wake still owns the lock.</summary>
+        public async Task ReleaseAgentInputsAsync(string projectID, string agentID)
+        {
+            foreach (var record in registry.ForProject(projectID))
+            {
+                inputLock.Release(record.ContainerID, agentID);
+                if (transports.TryGetValue(record.ContainerID, out var transport))
+                    try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
+            }
         }
     }
 }

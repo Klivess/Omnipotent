@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.ComputerControl;
 using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
@@ -28,7 +29,7 @@ namespace Omnipotent.Services.HostControl
     /// through onProgress so the stall watchdog never aborts legitimate work.
     /// </summary>
     [SupportedOSPlatform("windows")]
-    public class HostControlManager : OmniService
+    public class HostControlManager : OmniService, IComputerController
     {
         private readonly ScreenCapturer capturer = new();
         private EncryptedMemoryStore secrets = null!;
@@ -59,6 +60,17 @@ namespace Omnipotent.Services.HostControl
 
         public ApprovalBroker Approvals => approvals;
         public EncryptedMemoryStore Secrets => secrets;
+        public ComputerCapabilities Capabilities { get; } = new()
+        {
+            SupportsOcr = true,
+            SupportsWindowControl = true,
+            SupportsBrowserControl = true,
+            SupportsClipboard = true,
+            SupportsAppLaunch = true,
+            SupportsRelativeMouse = true,
+            SupportsHumanization = true,
+            SupportsMotionFrames = true,
+        };
 
         public HostControlManager()
         {
@@ -438,6 +450,30 @@ namespace Omnipotent.Services.HostControl
             return r.Text;
         }
 
+        /// <summary>Target-neutral adapter used by callers that do not care whether the desktop is
+        /// Win32 or VNC.  Existing KliveAgent image plumbing remains source-compatible.</summary>
+        public async Task<ComputerActionResult> ExecuteComputerActionAsync(ComputerActionRequest request, CancellationToken ct = default)
+        {
+            var result = await ExecuteToolAsync(request.ToolName, request.ArgumentsJson, ct);
+            var frames = result.ModelImageFrames?.Select(f => new ComputerFrame
+            {
+                Jpeg = f.Jpeg, OffsetMs = f.OffsetMs, IsSettled = f.IsSettled, HasCoordinateGrid = f.HasGrid
+            }).ToList() ?? new List<ComputerFrame>();
+            return new ComputerActionResult
+            {
+                Success = result.Success,
+                Text = result.Text,
+                Error = result.ErrorMessage,
+                AuditSummary = ComputerAudit.Describe(request.ToolName, request.ArgumentsJson),
+                Observation = result.ModelImageJpeg == null ? null : new ComputerObservation
+                {
+                    FinalFrameJpeg = result.ModelImageJpeg,
+                    Frames = frames,
+                    IsSettled = true,
+                }
+            };
+        }
+
         public async Task<bool> ComputerUseEnabledAsync() => await GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: true);
         private async Task<bool> DryRunAsync() => await GetBoolOmniSetting("KliveAgent_ComputerUseDryRun", defaultValue: false);
 
@@ -453,6 +489,12 @@ namespace Omnipotent.Services.HostControl
             {
                 case "computer_screenshot":
                     return await CaptureClipAsync(Str(a, "target") ?? "active", "screenshot", null, null, null, ct);
+
+                case "computer_find_text":
+                    return await FindVisibleTextAsync(a, ct, onProgress, click: false);
+
+                case "computer_click_text":
+                    return await FindVisibleTextAsync(a, ct, onProgress, click: true);
 
                 case "computer_window_state":
                     return WindowState();
@@ -727,6 +769,40 @@ namespace Omnipotent.Services.HostControl
             return Task.FromResult(ComputerToolResult.Ok(sb.ToString().TrimEnd()));
         }
 
+        private async Task<ComputerToolResult> FindVisibleTextAsync(JsonElement a, CancellationToken ct,
+            Action<HostControlProgress> onProgress, bool click)
+        {
+            string needle = Str(a, "text") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(needle)) return ComputerToolResult.Fail("Provide visible 'text' to locate.");
+            var observed = CaptureSettledFrame("active", click ? "find text" : "find text");
+            if (!observed.Success || observed.ModelImageJpeg == null) return observed;
+            var matches = await ComputerVision.FindTextAsync(observed.ModelImageJpeg, needle, ct);
+            int occurrence = Math.Max(0, IntOr(a, "occurrence", 0));
+            if (matches.Count <= occurrence)
+            {
+                observed.Text = $"No visible OCR match for '{Trim(needle, 80)}' at occurrence {occurrence}. It may be off-screen, obscured, or local OCR data is unavailable. " + observed.Text;
+                return observed;
+            }
+            var match = matches[occurrence];
+            string detail = $"OCR match {occurrence}: '{Trim(match.Text, 120)}' centre=({match.CentreX},{match.CentreY}) confidence={match.Confidence:0}.";
+            if (!click)
+            {
+                observed.Text = detail + " " + observed.Text;
+                return observed;
+            }
+            var clickArgs = new Dictionary<string, object?>
+            {
+                ["x"] = match.CentreX,
+                ["y"] = match.CentreY,
+                ["button"] = Str(a, "button") ?? "left",
+                ["clicks"] = Math.Max(1, IntOr(a, "clicks", 1)),
+            };
+            var clickDoc = JsonDocument.Parse(System.Text.Json.JsonSerializer.Serialize(clickArgs));
+            var clicked = await RunAsync("computer_click", clickDoc.RootElement, ct, onProgress);
+            clicked.Text = detail + " Clicked OCR match. " + clicked.Text;
+            return clicked;
+        }
+
         // ── Actuation helpers ──
         private ComputerToolResult? OsGuard() =>
             OsControlAvailable ? null : ComputerToolResult.Fail("OS-level control is turned off. Set KliveAgent_OsControlEnabled=true to let KliveAgent control this machine.");
@@ -830,12 +906,13 @@ namespace Omnipotent.Services.HostControl
 
         private async Task<ComputerToolResult> WaitAsync(JsonElement a, CancellationToken ct, Action<HostControlProgress> onProgress)
         {
-            int maxMs = IntOr(a, "maxMs", IntOr(a, "forMs", 4000));
+            int maxMs = IntOr(a, "maxMs", IntOr(a, "ms", IntOr(a, "forMs", 4000)));
             maxMs = Math.Clamp(maxMs, 100, 600000);
             // We can't OCR for untilText, so any "wait until ready" intent (untilText or untilImageChange)
             // resolves the same way: stop as soon as the screen stops changing → settled, then return.
-            bool waitForSettle = (a.TryGetProperty("untilImageChange", out var ic) && ic.ValueKind == JsonValueKind.True)
-                                 || !string.IsNullOrEmpty(Str(a, "untilText"));
+            bool waitForImageChange = a.TryGetProperty("untilImageChange", out var ic) && ic.ValueKind == JsonValueKind.True;
+            string? untilText = Str(a, "untilText");
+            bool waitForSettle = waitForImageChange || !string.IsNullOrEmpty(untilText);
 
             byte[]? baseline = waitForSettle ? CaptureRawHashSource() : null;
             var sw = Stopwatch.StartNew();
@@ -854,10 +931,19 @@ namespace Omnipotent.Services.HostControl
                     onProgress(new HostControlProgress { Note = $"waiting… ({sw.ElapsedMilliseconds / 1000}s)", Activity = new AgentActivityEvent { Kind = "wait", Text = $"waiting {sw.ElapsedMilliseconds / 1000}s" } });
                 }
 
-                if (waitForSettle && baseline != null)
+                if (waitForImageChange && baseline != null)
                 {
                     var now = CaptureRawHashSource();
                     if (now != null && !HashEqual(baseline, now)) { resolved = "screen changed"; break; }
+                }
+                if (!string.IsNullOrEmpty(untilText) && sw.ElapsedMilliseconds % 800 < 420)
+                {
+                    var frame = CaptureSettledFrame("active", "wait OCR");
+                    if (frame.ModelImageJpeg != null && (await ComputerVision.FindTextAsync(frame.ModelImageJpeg, untilText, ct)).Count > 0)
+                    {
+                        resolved = $"text appeared: {Trim(untilText, 80)}";
+                        break;
+                    }
                 }
             }
 

@@ -85,6 +85,48 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>The Docker endpoint this orchestrator targets (for diagnostics).</summary>
         public string DockerUri => dockerUri;
 
+        /// <summary>
+        /// Executes one fixed desktop-control operation inside an owned desktop container. This is
+        /// intentionally not a shell API: operation and arguments are validated before an exec is
+        /// created, and browser URLs are passed as a positional parameter rather than interpolated
+        /// into a command string.
+        /// </summary>
+        public async Task ExecuteDesktopControlAsync(string containerID, ContainerDesktopControlCommand command, string? argument,
+            CancellationToken ct = default)
+        {
+            IList<string> cmd = command switch
+            {
+                ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr >/dev/null 2>&1 &" },
+                ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
+                    (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr --new-window \"$1\" >/dev/null 2>&1 &", "desktop-control", uri.AbsoluteUri },
+                ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
+                ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Firefox" },
+                ContainerDesktopControlCommand.FocusTerminal when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Terminal" },
+                _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
+            };
+
+            var docker = await GetClientAsync();
+            var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+            {
+                AttachStdout = true,
+                AttachStderr = true,
+                Tty = false,
+                User = "agent",
+                WorkingDir = "/home/agent",
+                Cmd = cmd,
+            }, ct);
+            using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, ct);
+            var (stdout, stderr) = await output.ReadOutputToEndAsync(ct);
+            var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, ct);
+            if (inspected.ExitCode != 0)
+                throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+        }
+
         /// <summary>True when <paramref name="imageTag"/> exists locally.</summary>
         public async Task<bool> ImageExistsAsync(string imageTag, CancellationToken ct = default)
             => await FindImageAsync(imageTag, ct) != null;

@@ -483,9 +483,12 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
+                var computerSettings = Settings.Get(project.ProjectID);
                 var adapter = await Desktops!.GetAdapterForAgentAsync(
                     project, actingAgentID,
                     resolveSecretsAsync: text => Task.FromResult(Vault.ResolveSecrets(project.ProjectID, text)),
+                    actionSettleMs: computerSettings.ComputerActionSettleMs,
+                    typingDelayMs: computerSettings.ComputerTypingDelayMs,
                     ct: ct);
                 var result = await adapter.ExecuteAsync(toolName, argsJson, ct);
 
@@ -509,7 +512,12 @@ namespace Omnipotent.Services.Projects
                         ArtifactIDs = new List<string> { art.ArtifactID },
                     });
                 }
-                return new CommanderToolResult(result.Text) { Jpeg = result.Jpeg, ArtifactIDs = artifactIDs };
+                return new CommanderToolResult(result.Text)
+                {
+                    Jpeg = result.Jpeg,
+                    Frames = result.Frames,
+                    ArtifactIDs = artifactIDs
+                };
             }
             catch (Exception ex)
             {

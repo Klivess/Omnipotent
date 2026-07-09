@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
+using Omnipotent.Services.ComputerControl;
 
 namespace Omnipotent.Services.Projects
 {
@@ -211,7 +212,8 @@ namespace Omnipotent.Services.Projects
                         {
                             ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
                             Type = ProjectEventTypes.ToolCall, Author = "agent",
-                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id, PayloadJson = argsJson,
+                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
+                            PayloadJson = toolName.StartsWith("computer_", StringComparison.Ordinal) ? null : argsJson,
                         });
 
                         var result = await parent.CommanderToolDispatch(project, agent.AgentID, wakeID, toolName, argsJson, cts.Token);
@@ -227,9 +229,12 @@ namespace Omnipotent.Services.Projects
 
                         if (visionEnabled && result.Jpeg != null)
                         {
+                            var frames = result.Frames.Count > 0
+                                ? result.Frames.Select(f => (f.Jpeg, "image/jpeg")).ToList()
+                                : new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") };
                             llm.AppendUserContentToToolSession(sessionId,
-                                $"Screenshot after your {toolName} call. Verify before continuing.",
-                                new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") });
+                                $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify before continuing.",
+                                frames);
                         }
                         if (result.EndWake) goto done;
                     }
@@ -243,6 +248,7 @@ namespace Omnipotent.Services.Projects
             }
             finally
             {
+                try { if (parent.Desktops != null) await parent.Desktops.ReleaseAgentInputsAsync(projectID, agent.AgentID); } catch { }
                 if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
                     outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                 try { parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, outcome, outcomeText)); }
@@ -268,6 +274,7 @@ RULES:
 - Work with your tools, verify results, then send your findings to the commander with send_agent_message(agentID: ""commander"", message: ...) BEFORE you finish. An unreported result is a wasted wake.
 - If blocked, report the blocker rather than spinning. If an action needs approval or spends money, that's the commander's call — report it as a recommendation.
 - When your work changes a tracked number, update the matching Observable (update_observable) so Klives' live dashboard stays current.{desktopNote}
+- For browser/GUI work: observe, locate by OCR or grid coordinates, take one action, wait for the expected screen state, then observe again. Do not retry blind clicks. CAPTCHA, login verification, and 2FA are human-only blockers; report them to the commander.
 - Be concise and factual. Everything you do is on a timeline Klives watches.";
         }
 
@@ -335,6 +342,7 @@ RULES:
 
         private static string DescribeCall(string toolName, string argsJson)
         {
+            if (toolName.StartsWith("computer_", StringComparison.Ordinal)) return ComputerAudit.Describe(toolName, argsJson);
             try
             {
                 var jo = Newtonsoft.Json.Linq.JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);

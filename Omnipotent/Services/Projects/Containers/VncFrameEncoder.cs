@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using Omnipotent.Services.ComputerControl;
 
 namespace Omnipotent.Services.Projects.Containers
 {
@@ -38,6 +39,11 @@ namespace Omnipotent.Services.Projects.Containers
             }
             return Encode(bmp, quality);
         }
+
+        /// <summary>Encodes a final model-facing frame.  VNC coordinates already match its
+        /// framebuffer, so the grid is applied after encoding without any scale translation.</summary>
+        public static byte[] EncodeGriddedJpeg(byte[] bgra, int width, int height, int maxWidth = 1280, long quality = 70)
+            => ComputerVision.AddCoordinateGrid(EncodeJpeg(bgra, width, height, maxWidth, quality));
 
         private static byte[] Encode(Bitmap bmp, long quality)
         {

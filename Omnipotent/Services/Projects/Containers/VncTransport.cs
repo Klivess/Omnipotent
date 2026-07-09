@@ -39,6 +39,7 @@ namespace Omnipotent.Services.Projects.Containers
         // Pointer state: RFB PointerEvent always carries the full button mask.
         private byte buttonMask;
         private int pointerX, pointerY;
+        private string clipboardText = string.Empty;
 
         public VncTransport(string host, int port, Action<string> log)
         {
@@ -221,7 +222,7 @@ namespace Omnipotent.Services.Projects.Containers
             else if (dx > 0) await Notches(1 << 6, dx);   // right
         }
 
-        public async Task TypeTextAsync(string text, CancellationToken ct = default)
+        public async Task TypeTextAsync(string text, int charDelayMs = 18, CancellationToken ct = default)
         {
             foreach (char c in text)
             {
@@ -231,12 +232,12 @@ namespace Omnipotent.Services.Projects.Containers
                 await SendKeyAsync(keysym, true, ct);
                 await SendKeyAsync(keysym, false, ct);
                 if (shift) await SendKeyAsync(VncKeysyms.ShiftL, false, ct);
-                await Task.Delay(18, ct);
+                if (charDelayMs > 0) await Task.Delay(Math.Clamp(charDelayMs, 0, 500), ct);
             }
         }
 
         /// <summary>Presses a chord like "ctrl+l" or a single named key like "enter".</summary>
-        public async Task KeyChordAsync(string chord, CancellationToken ct = default)
+        public async Task KeyChordAsync(string chord, int holdMs = 55, int repeats = 1, CancellationToken ct = default)
         {
             var parts = chord.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             var keysyms = new List<uint>();
@@ -246,8 +247,13 @@ namespace Omnipotent.Services.Projects.Containers
                 if (ks == null) throw new ArgumentException($"Unknown key '{part}' in chord '{chord}'.");
                 keysyms.Add(ks.Value);
             }
-            foreach (var ks in keysyms) await SendKeyAsync(ks, true, ct);
-            for (int i = keysyms.Count - 1; i >= 0; i--) await SendKeyAsync(keysyms[i], false, ct);
+            for (int repeat = 0; repeat < Math.Clamp(repeats, 1, 50); repeat++)
+            {
+                foreach (var ks in keysyms) await SendKeyAsync(ks, true, ct);
+                await Task.Delay(Math.Clamp(holdMs, 1, 2000), ct);
+                for (int i = keysyms.Count - 1; i >= 0; i--) await SendKeyAsync(keysyms[i], false, ct);
+                if (repeat + 1 < repeats) await Task.Delay(70, ct);
+            }
         }
 
         public Task KeyDownAsync(string key, CancellationToken ct = default)
@@ -262,6 +268,25 @@ namespace Omnipotent.Services.Projects.Containers
             foreach (var mod in new[] { VncKeysyms.ShiftL, VncKeysyms.ControlL, VncKeysyms.AltL, VncKeysyms.SuperL })
                 await SendKeyAsync(mod, false, ct);
         }
+
+        /// <summary>RFB ClientCutText. The VNC server mirrors it into the container X selection;
+        /// no shell command is involved.</summary>
+        public async Task SetClipboardTextAsync(string text, CancellationToken ct = default)
+        {
+            text ??= string.Empty;
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
+            var msg = new byte[8 + bytes.Length];
+            msg[0] = 6;
+            BinaryPrimitives.WriteUInt32BigEndian(msg.AsSpan(4), (uint)bytes.Length);
+            Buffer.BlockCopy(bytes, 0, msg, 8, bytes.Length);
+            await SendAsync(msg, ct);
+            clipboardText = text;
+        }
+
+        /// <summary>The most recent server clipboard announcement. A VNC server is not required
+        /// to proactively publish selections, so callers receive an explicit unavailable state
+        /// until one has been observed.</summary>
+        public string? GetClipboardText() => string.IsNullOrEmpty(clipboardText) ? null : clipboardText;
 
         // ── wire helpers ──
 
@@ -367,7 +392,8 @@ namespace Omnipotent.Services.Projects.Containers
                         {
                             await ReadExactAsync(3, ct);
                             uint len = BinaryPrimitives.ReadUInt32BigEndian(await ReadExactAsync(4, ct));
-                            await ReadExactAsync((int)len, ct);
+                            clipboardText = System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)Math.Min(len, 1024 * 1024), ct));
+                            if (len > 1024 * 1024) await ReadExactAsync((int)(len - 1024 * 1024), ct);
                             break;
                         }
                         default:

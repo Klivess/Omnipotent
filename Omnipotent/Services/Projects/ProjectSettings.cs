@@ -36,6 +36,10 @@ namespace Omnipotent.Services.Projects
         public bool ContainersEnabled { get; set; } = false;
         /// <summary>Desktop image for this project's containers.</summary>
         public string DesktopImage { get; set; } = Defaults.DesktopImage;
+        /// <summary>Post-action visual settle delay for this project's VNC desktops.</summary>
+        public int ComputerActionSettleMs { get; set; } = Defaults.ComputerActionSettleMs;
+        /// <summary>Delay between VNC text keystrokes; slower values help fragile web UIs.</summary>
+        public int ComputerTypingDelayMs { get; set; } = Defaults.ComputerTypingDelayMs;
 
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
@@ -64,12 +68,15 @@ namespace Omnipotent.Services.Projects
                 case "visionenabled": VisionEnabled = ParseBool(value); break;
                 case "containersenabled": ContainersEnabled = ParseBool(value); break;
                 case "desktopimage": DesktopImage = value; break;
+                case "computeractionsettlems": ComputerActionSettleMs = Math.Clamp(ParseInt(value, Defaults.ComputerActionSettleMs), 50, 5000); break;
+                case "computertypingdelayms": ComputerTypingDelayMs = Math.Clamp(ParseInt(value, Defaults.ComputerTypingDelayMs), 0, 500); break;
                 default: return false;
             }
             return true;
         }
 
         private static bool ParseBool(string v) => v.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
+        private static int ParseInt(string v, int fallback) => int.TryParse(v, out var parsed) ? parsed : fallback;
 
         public static class Defaults
         {
@@ -82,6 +89,8 @@ namespace Omnipotent.Services.Projects
             public const string StimulusFreeModel = "openai/gpt-4.1-mini";
             public const string StimulusFallbackModel = "openai/gpt-4.1-mini";
             public const string DesktopImage = "omnipotent/projects-desktop:latest";
+            public const int ComputerActionSettleMs = 350;
+            public const int ComputerTypingDelayMs = 18;
         }
     }
 }

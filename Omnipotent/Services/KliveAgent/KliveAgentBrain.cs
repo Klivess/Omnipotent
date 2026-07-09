@@ -1,6 +1,7 @@
 ﻿using Omnipotent.Service_Manager;
 using Omnipotent.Services.HostControl;
 using Omnipotent.Services.KliveAgent.Models;
+using Omnipotent.Services.ComputerControl;
 using Omnipotent.Services.KliveLLM;
 using System.Globalization;
 using System.Reflection;
@@ -468,6 +469,7 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly HashSet<string> ComputerUseToolNames = new(StringComparer.Ordinal)
         {
             "computer_screenshot", "computer_window_state", "computer_read_screen", "computer_move",
+            "computer_find_text", "computer_click_text",
             "computer_mouse_move_relative",
             "computer_click", "computer_drag", "computer_scroll", "computer_type", "computer_key",
             "computer_mouse_down", "computer_mouse_up", "computer_key_down", "computer_key_up", "computer_release_all",
@@ -682,7 +684,25 @@ namespace Omnipotent.Services.KliveAgent
             var strType = new { type = "string" };
             var intType = new { type = "integer" };
 
-            tools.Add(Tool("computer_screenshot",
+            // The shared visual surface is also used by isolated Project desktops.  Host-only
+            // approval, handoff, and encrypted-memory operations are appended below.
+            tools.AddRange(VisualComputerToolCatalog.Build(new ComputerCapabilities
+            {
+                SupportsWindowControl = true,
+                SupportsBrowserControl = true,
+                SupportsClipboard = true,
+                SupportsAppLaunch = true,
+                SupportsRelativeMouse = true,
+                SupportsHumanization = true,
+                SupportsMotionFrames = true,
+            }));
+
+            tools.Add(Tool("computer_window_state",
+                "Report the active window (title/pos/size), the virtual-screen size, and whether OS-level control is available.", Obj(new { })));
+            tools.Add(Tool("computer_read_screen", "List visible window titles/sizes. For content, use computer_screenshot or computer_find_text.", Obj(new { })));
+            tools.Add(Tool("computer_mouse_move_relative", "Move the mouse by a raw relative delta for games that ignore absolute pointer movement.", Obj(new { dx = intType, dy = intType, steps = intType }, "dx", "dy")));
+
+            /*tools.Add(Tool("computer_screenshot",
                 "Capture the screen as an image you can SEE (fed to your vision). Returns the pixel size; coordinates you give to computer_click/move/etc. are in THIS image's pixel space. ALWAYS screenshot before clicking blind.",
                 Obj(new { target = new { type = "string", description = "\"active\" (active window, default), \"fullscreen\", or \"browser\" (the controlled Chrome viewport)." } })));
             tools.Add(Tool("computer_window_state", "Report the active window (title/pos/size), the virtual-screen size, and whether OS-level control is available.", Obj(new { })));
@@ -717,7 +737,7 @@ namespace Omnipotent.Services.KliveAgent
                 Obj(new { url = strType })));
             tools.Add(Tool("computer_navigate",
                 "Go to a web page in ONE reliable step: focuses/opens the real browser, focuses the address bar, types the URL, presses Enter, and waits for the page to load. e.g. {url:\"openpsychometrics.org/tests/FSIQ/\"}. Use this instead of manually clicking the address bar.",
-                Obj(new { url = strType }, "url")));
+                Obj(new { url = strType }, "url")));*/
             tools.Add(Tool("computer_confirm_action",
                 "GATE an irreversible non-click action (e.g. pressing Enter to submit/pay/send). Blocks until Klive approves on the website or Discord. On APPROVED, do the action next; on DENIED, stop and report.",
                 Obj(new { summary = strType }, "summary")));

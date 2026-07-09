@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveLLM;
+using Omnipotent.Services.ComputerControl;
 using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Projects
@@ -232,7 +233,8 @@ namespace Omnipotent.Services.Projects
                         {
                             ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
                             Type = ProjectEventTypes.ToolCall, Author = "commander",
-                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id, PayloadJson = argsJson,
+                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
+                            PayloadJson = toolName.StartsWith("computer_", StringComparison.Ordinal) ? null : argsJson,
                         });
 
                         var result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);
@@ -251,9 +253,12 @@ namespace Omnipotent.Services.Projects
                         // approach Stratum uses for renders). Old screenshots auto-compact.
                         if (visionEnabled && result.Jpeg != null)
                         {
+                            var frames = result.Frames.Count > 0
+                                ? result.Frames.Select(f => (f.Jpeg, "image/jpeg")).ToList()
+                                : new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") };
                             llm.AppendUserContentToToolSession(sessionId,
-                                $"Screenshot after your {toolName} call. Verify the screen shows what you expect before acting further.",
-                                new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") });
+                                $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify it before acting further.",
+                                frames);
                         }
 
                         if (result.EndWake) { outcomeText = "Wake ended by a tool (constraint)."; goto done; }
@@ -273,6 +278,7 @@ namespace Omnipotent.Services.Projects
             }
             finally
             {
+                try { if (parent.Desktops != null) await parent.Desktops.ReleaseAgentInputsAsync(projectID, "commander"); } catch { }
                 try
                 {
                     // Record stuck-loop trips into the digest for the watchdog (P7), clear the active wake.
@@ -383,6 +389,7 @@ namespace Omnipotent.Services.Projects
 
         private static string DescribeCall(string toolName, string argsJson)
         {
+            if (toolName.StartsWith("computer_", StringComparison.Ordinal)) return ComputerAudit.Describe(toolName, argsJson);
             try
             {
                 var jo = Newtonsoft.Json.Linq.JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);

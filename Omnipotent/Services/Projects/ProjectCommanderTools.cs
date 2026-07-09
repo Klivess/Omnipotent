@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects.Stimulus;
+using Omnipotent.Services.ComputerControl;
 using System.Text;
 
 namespace Omnipotent.Services.Projects
@@ -15,6 +16,9 @@ namespace Omnipotent.Services.Projects
         public bool EndWake { get; init; }
         /// <summary>Optional frame (screenshot after a computer_* action) for the vision return path.</summary>
         public byte[]? Jpeg { get; init; }
+        /// <summary>Ordered visual action frames. The final entry is gridded and current; earlier
+        /// entries are motion-significant context for transient states.</summary>
+        public List<ComputerFrame> Frames { get; init; } = new();
         /// <summary>Artifacts produced by this call, referenced on the tool-result event.</summary>
         public List<string> ArtifactIDs { get; init; } = new();
     }

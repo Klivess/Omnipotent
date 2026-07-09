@@ -45,10 +45,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>The full set of computer-use tools; require a container desktop (video tier).</summary>
         private static readonly HashSet<string> ComputerTools = new(StringComparer.Ordinal)
         {
-            "computer_screenshot", "computer_move", "computer_click", "computer_drag",
+            "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
+            "computer_move", "computer_click", "computer_drag",
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
-            "computer_wait",
+            "computer_wait", "computer_open_browser", "computer_navigate", "computer_focus_window", "computer_launch_app",
+            "computer_clipboard_get", "computer_clipboard_set",
         };
 
         /// <summary>
