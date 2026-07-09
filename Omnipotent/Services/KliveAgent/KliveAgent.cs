@@ -44,6 +44,24 @@ namespace Omnipotent.Services.KliveAgent
             threadAnteriority = ThreadAnteriority.Standard;
         }
 
+        /// <summary>
+        /// Fetches a budgeted cross-system knowledge block (KliveRAG) for the system prompt. Resolves the
+        /// service lazily and fails soft — returns "" if KliveRAG is absent, cold, slow or errors, so the
+        /// prompt build never blocks or breaks when the index isn't there. Races a short timeout.
+        /// </summary>
+        public async Task<string> SearchKnowledgeForPromptAsync(string userMessage, int maxTokens)
+        {
+            try
+            {
+                var rag = GetActiveServices()
+                    .OfType<Omnipotent.Services.KliveRAG.KliveRAG>()
+                    .FirstOrDefault(s => s.IsServiceActive());
+                if (rag == null) return string.Empty;
+                return await rag.SearchForPromptAsync(userMessage, maxTokens, TimeSpan.FromMilliseconds(400));
+            }
+            catch { return string.Empty; }
+        }
+
         protected override async void ServiceMain()
         {
             var enabled = await GetBoolOmniSetting("KliveAgent_Enabled", defaultValue: true);

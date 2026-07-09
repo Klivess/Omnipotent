@@ -58,6 +58,14 @@ namespace Omnipotent.Services.Projects
         public Func<string, int, Task<string>>? RecallMemoriesAsync { get; set; }
         /// <summary>Save to KliveAgent's shared memory: (content, tags) → confirmation.</summary>
         public Func<string, string[], Task<string>>? SaveMemoryAsync { get; set; }
+        /// <summary>Cross-system knowledge search (KliveRAG): (query, max) → formatted cited results.</summary>
+        public Func<string, int, Task<string>>? SearchKnowledgeAsync { get; set; }
+        /// <summary>Open a knowledge document by id: (docId, maxTokens) → full text.</summary>
+        public Func<string, int, Task<string>>? ReadKnowledgeDocAsync { get; set; }
+        /// <summary>Live web search (SearXNG): (query, maxResults, fetchTop, timeRange) → formatted results.</summary>
+        public Func<string, int, int, string?, Task<string>>? WebSearchAsync { get; set; }
+        /// <summary>Fetch+index one web page: (url) → extracted text.</summary>
+        public Func<string, Task<string>>? WebFetchAsync { get; set; }
 
         private static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
 
@@ -261,6 +269,43 @@ namespace Omnipotent.Services.Projects
                     if (string.IsNullOrWhiteSpace(content)) return new CommanderToolResult("Provide 'content' to remember.");
                     var tags = a["tags"] is JArray arr ? arr.Select(t => t.ToString()).ToArray() : Array.Empty<string>();
                     return new CommanderToolResult(await SaveMemoryAsync(content, tags));
+                }
+
+                case "search_knowledge":
+                {
+                    if (SearchKnowledgeAsync == null) return new CommanderToolResult("Knowledge service unavailable.");
+                    string query = (string?)a["query"] ?? "";
+                    if (string.IsNullOrWhiteSpace(query)) return new CommanderToolResult("Provide a 'query'.");
+                    int max = (int?)a["max"] ?? 8;
+                    return new CommanderToolResult(await SearchKnowledgeAsync(query, Math.Clamp(max, 1, 20)));
+                }
+
+                case "read_knowledge_doc":
+                {
+                    if (ReadKnowledgeDocAsync == null) return new CommanderToolResult("Knowledge service unavailable.");
+                    string docId = (string?)a["docId"] ?? "";
+                    if (string.IsNullOrWhiteSpace(docId)) return new CommanderToolResult("Provide a 'docId'.");
+                    int maxTokens = (int?)a["maxTokens"] ?? 1500;
+                    return new CommanderToolResult(await ReadKnowledgeDocAsync(docId, Math.Clamp(maxTokens, 200, 3000)));
+                }
+
+                case "web_search":
+                {
+                    if (WebSearchAsync == null) return new CommanderToolResult("Knowledge service unavailable.");
+                    string query = (string?)a["query"] ?? "";
+                    if (string.IsNullOrWhiteSpace(query)) return new CommanderToolResult("Provide a 'query'.");
+                    int maxResults = (int?)a["maxResults"] ?? 6;
+                    int fetchTop = (int?)a["fetchTop"] ?? 2;
+                    string? timeRange = (string?)a["timeRange"];
+                    return new CommanderToolResult(await WebSearchAsync(query, maxResults, fetchTop, timeRange));
+                }
+
+                case "web_fetch":
+                {
+                    if (WebFetchAsync == null) return new CommanderToolResult("Knowledge service unavailable.");
+                    string url = (string?)a["url"] ?? "";
+                    if (string.IsNullOrWhiteSpace(url)) return new CommanderToolResult("Provide a 'url'.");
+                    return new CommanderToolResult(await WebFetchAsync(url));
                 }
 
                 // ── work tools: scripts / HTTP / files on the project volume ──

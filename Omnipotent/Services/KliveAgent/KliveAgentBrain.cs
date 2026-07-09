@@ -87,6 +87,14 @@ namespace Omnipotent.Services.KliveAgent
             new("GetAgentStats", "Return today's KliveAgent run-time stats. Top-level: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, todayUtcDate, fullSummary. fullSummary contains nested objects: lifetime{messages,promptTokens,completionTokens,totalTokens,iterations,scripts,scriptFailures,scriptSuccessRatePct,...}, today{messages,promptTokens,completionTokens,totalTokens,scripts,scriptFailures,scriptFailureRatePct,...} (today is null on a fresh day before any activity), and dailyHistory[] with the same per-day shape. Access nested values via JSON serialization or GetObjectMember chains.")
         ];
 
+        private static readonly PromptToolDescriptor[] KnowledgeTools =
+        [
+            new("SearchKnowledge", "Search Klives' whole cross-system knowledge base (past Projects, your conversations & memories, Omniscience facts, repo docs, cached web) by free-text query. Returns cited snippets with doc ids. Use for \"have we done/decided this before\" and \"what do we know about X\" questions."),
+            new("ReadKnowledgeDoc", "Open the full text of a knowledge document by the doc id shown in a SearchKnowledge result."),
+            new("WebSearch", "Search the LIVE web (self-hosted SearXNG). Use for current/external info the knowledge base won't have; fetchTop>0 also indexes the top pages for full-text follow-up."),
+            new("WebFetch", "Download one web page by URL, extract its text, index it, and return the text.")
+        ];
+
         private static readonly PromptToolDescriptor[] ProjectsTools =
         [
             new("CreateProject", "Delegate long-running autonomous work to the Projects task force: CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap?). Returns the new project ID. Use for goals that outlast one chat — the Commander pursues them 24/7 and shares this memory."),
@@ -121,6 +129,11 @@ namespace Omnipotent.Services.KliveAgent
                 maxMemories: 4,
                 maxShortcuts: 3,
                 maxTokens: KliveAgentContextBudget.MemoryBudget);
+
+            // Cross-system knowledge (KliveRAG) recall, overlapped with memory + repo map. Fail-soft:
+            // returns "" if the service is absent/cold/slow so it never blocks or breaks the prompt build.
+            var knowledgeTask = agentService.SearchKnowledgeForPromptAsync(
+                userMessage, KliveAgentContextBudget.KnowledgeBudget);
 
             // Build token-budgeted, task-personalised repo map (only when the task has code signals).
             var repoMap = string.Empty;
@@ -305,6 +318,15 @@ namespace Omnipotent.Services.KliveAgent
                 sb.Append(memoriesSection);
             }
 
+            // Cross-system knowledge block — task-volatile, below the cache breakpoint alongside memories.
+            var knowledgeSection = string.Empty;
+            try { knowledgeSection = await knowledgeTask; } catch { /* best-effort */ }
+            if (!string.IsNullOrWhiteSpace(knowledgeSection))
+            {
+                sb.AppendLine();
+                sb.Append(knowledgeSection);
+            }
+
             // No hard truncation here: the system prompt is composed of bounded, deliberate
             // sections (slim personality + short rule block + tool names + budgeted repo map
             // + budgeted memories). A blanket truncate would silently cut tools or memories,
@@ -437,7 +459,7 @@ namespace Omnipotent.Services.KliveAgent
         /// Combined with MemoryToolNames in IsNonScriptTool.</summary>
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
-            "grep", "read_file", "list_directory", "get_global_path"
+            "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch"
         };
 
         /// <summary>Computer-use ("host control") tools: dispatched outside Roslyn to HostControlManager,
@@ -472,7 +494,8 @@ namespace Omnipotent.Services.KliveAgent
         private static bool IsParallelSafeNativeTool(string name) => name switch
         {
             "grep" or "read_file" or "list_directory" or "get_global_path"
-                or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts" => true,
+                or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
+                or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch" => true,
             _ => false
         };
 
@@ -588,6 +611,38 @@ namespace Omnipotent.Services.KliveAgent
                 Tool("delete_memory",
                     "Forget a memory by its id (or short-id prefix shown in recalls). Use to curate noise/duplicates/outdated beliefs.",
                     new { type = "object", properties = new { id = new { type = "string", description = "The memory id or short-id prefix." } }, required = new[] { "id" } }),
+
+                Tool("search_knowledge",
+                    "Semantic + keyword search across Klives' WHOLE knowledge base — past Projects (their decisions/outcomes), your own conversations & memories, Omniscience person facts, repo docs, and cached web pages. " +
+                    "Use this for cross-system questions that memory alone won't answer (\"what did project X conclude\", \"have we solved this before\", \"what do we know about <person/topic>\"). " +
+                    "Returns cited snippets with a doc:<id> for each; call read_knowledge_doc to open one in full.",
+                    new { type = "object", properties = new {
+                        query = new { type = "string", description = "Free-text search query." },
+                        maxResults = new { type = "integer", description = "Max hits to return (default 8)." },
+                        includeMessages = new { type = "boolean", description = "Also search Omniscience's raw message corpus (default true)." }
+                    }, required = new[] { "query" } }),
+
+                Tool("read_knowledge_doc",
+                    "Open the FULL text of a knowledge document by the doc:<id> shown in a search_knowledge result (e.g. a whole conversation, a repo doc, a project digest). This also opens web pages indexed by web_search/web_fetch.",
+                    new { type = "object", properties = new {
+                        docId = new { type = "string", description = "The document id (the doc:... value from a search result)." },
+                        maxTokens = new { type = "integer", description = "Max tokens of document text to return (default 1500, max 3000)." }
+                    }, required = new[] { "docId" } }),
+
+                Tool("web_search",
+                    "Search the LIVE web (self-hosted SearXNG, no API key). Use for current/external information the knowledge base won't have. Returns titled results with URLs and snippets; set fetchTop>0 to also download+index the top pages so you can read them in full via read_knowledge_doc. Requires Docker running; if it isn't, you'll get an actionable error and internal search still works.",
+                    new { type = "object", properties = new {
+                        query = new { type = "string", description = "The web search query." },
+                        maxResults = new { type = "integer", description = "Max results (default 6)." },
+                        fetchTop = new { type = "integer", description = "Download+index the top N result pages for full-text follow-up (0-3, default 2)." },
+                        timeRange = new { type = "string", description = "Optional recency filter: day|week|month|year." }
+                    }, required = new[] { "query" } }),
+
+                Tool("web_fetch",
+                    "Download ONE web page by URL, extract its readable text, index it, and return the text. Use to read a specific page (e.g. a result URL, a doc link).",
+                    new { type = "object", properties = new {
+                        url = new { type = "string", description = "The absolute http(s) URL to fetch." }
+                    }, required = new[] { "url" } }),
 
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
@@ -740,6 +795,30 @@ namespace Omnipotent.Services.KliveAgent
                     var key = Str("key");
                     if (string.IsNullOrWhiteSpace(key)) return "Error: 'key' is required.";
                     return globals.GetGlobalPath(key);
+                }
+                case "search_knowledge":
+                {
+                    var query = Str("query");
+                    if (string.IsNullOrWhiteSpace(query)) return "Error: 'query' is required.";
+                    return await globals.SearchKnowledge(query, IntOr("maxResults", 8), BoolOr("includeMessages", true));
+                }
+                case "read_knowledge_doc":
+                {
+                    var docId = Str("docId") ?? Str("id");
+                    if (string.IsNullOrWhiteSpace(docId)) return "Error: 'docId' is required.";
+                    return globals.ReadKnowledgeDoc(docId, IntOr("maxTokens", 1500));
+                }
+                case "web_search":
+                {
+                    var query = Str("query");
+                    if (string.IsNullOrWhiteSpace(query)) return "Error: 'query' is required.";
+                    return await globals.WebSearch(query, IntOr("maxResults", 6), IntOr("fetchTop", 2), Str("timeRange"));
+                }
+                case "web_fetch":
+                {
+                    var url = Str("url");
+                    if (string.IsNullOrWhiteSpace(url)) return "Error: 'url' is required.";
+                    return await globals.WebFetch(url);
                 }
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));
@@ -2009,6 +2088,13 @@ namespace Omnipotent.Services.KliveAgent
                     + "save_shortcut(title, content, tags?); get_shortcuts(); delete_memory(id).");
             else
                 AppendToolNames(sb, "Memory", MemoryTools);
+
+            // Cross-system knowledge retrieval (always surfaced): reaches other Projects, Omniscience,
+            // repo docs and cached web that plain memory/codebase search can't.
+            if (toolCallingMode)
+                sb.AppendLine("Knowledge (NATIVE TOOLS): search_knowledge(query, maxResults?, includeMessages?) — semantic search across Projects history, your memories/conversations, Omniscience facts, repo docs & cached web; read_knowledge_doc(docId, maxTokens?) — open a full result document; web_search(query, maxResults?, fetchTop?, timeRange?) — LIVE web search; web_fetch(url) — read one web page.");
+            else
+                AppendToolNames(sb, "Knowledge", KnowledgeTools);
 
             // Projects delegation is always surfaced (small set) — the interactive assistant can hand
             // long-running goals to the autonomous task force it shares memory with.

@@ -127,6 +127,19 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                 Tool("save_memory", "Save a durable fact to Klives' shared memory so it persists across wakes, projects, and KliveAgent. Save learnings, preferences, and important outcomes — not transient state.",
                     Obj(new { content = Str("The fact to remember."), tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, "content")),
 
+                // ── cross-system knowledge + live web (KliveRAG) ──
+                Tool("search_knowledge", "Search Klives' whole knowledge base — OTHER projects' decisions/outcomes, KliveAgent conversations/memories, Omniscience person facts, repo docs, cached web. Use this before spawning a research sub-agent: the answer may already exist. Returns cited snippets with doc ids.",
+                    Obj(new { query = Str("Free-text search query."), max = Num("Max results (default 8).") }, "query")),
+
+                Tool("read_knowledge_doc", "Open the FULL text of a knowledge document by the doc:<id> from a search_knowledge result (a whole conversation, a repo doc, another project's digest, a web page).",
+                    Obj(new { docId = Str("The document id (doc:... value)."), maxTokens = Num("Max tokens (default 1500).") }, "docId")),
+
+                Tool("web_search", "Search the LIVE web (self-hosted SearXNG, no API key). Use for current/external info. Returns titled results + URLs + snippets; fetchTop>0 also indexes the top pages for full-text follow-up via read_knowledge_doc. Prefer this over spawning a research sub-agent for a quick lookup.",
+                    Obj(new { query = Str("The web search query."), maxResults = Num("Max results (default 6)."), fetchTop = Num("Index the top N result pages (0-3, default 2)."), timeRange = Str("Optional recency: day|week|month|year.") }, "query")),
+
+                Tool("web_fetch", "Download ONE web page by URL, extract its text, index it, and return the text.",
+                    Obj(new { url = Str("Absolute http(s) URL.") }, "url")),
+
                 // ── work tools (text tier and up) ──
                 Tool("run_script", "Run a C# script IN-PROCESS INSIDE Omnipotent (the host platform this project runs on). Use it for general script writing — computation, parsing, API orchestration — but know it is NOT sandboxed to that: the Omnipotent assembly is referenced, so through its namespaces/types the script can reach and control all of Omnipotent itself (live services, state, host resources). Globals: Http (HttpClient), Output(value), ReadFile/WriteFile/ListFiles (project volume). The script's return value and Output() lines come back to you. The escalation bar applies to what a script DOES, exactly as it would to any other action.",
                     Obj(new { code = Str("C# script body. End with an expression or use Output(...).") }, "code")),

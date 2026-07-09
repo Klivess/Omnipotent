@@ -32,6 +32,7 @@ namespace Omnipotent.Services.Projects
             "vault_save", "vault_list", "request_human",
             "update_plan", "report_progress",
             "recall_memories", "save_memory",
+            "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
         };
 
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>

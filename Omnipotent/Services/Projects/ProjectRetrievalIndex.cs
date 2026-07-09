@@ -5,9 +5,10 @@ namespace Omnipotent.Services.Projects
     /// <summary>
     /// Minimal in-memory BM25 index over a project's event log, for the retrieval leg of
     /// rehydrate-on-wake (§7: "recent events + retrieval (BM25/semantic) into the full log").
-    /// V1 is lexical BM25 only — no embeddings infra exists in the repo, and at 10-project
-    /// scale an in-memory inverted index rebuilt lazily from the JSONL is plenty. Semantic
-    /// retrieval is a flagged P7 upgrade if this proves insufficient.
+    /// This is the per-project LEXICAL leg over the project's OWN log — deliberately cheap and
+    /// rebuilt lazily from the JSONL. Cross-project + semantic recall (other projects, KliveAgent
+    /// memory, Omniscience, docs, web) is provided separately by the KliveRAG service, injected into
+    /// the wake seed as a RELEVANT KNOWLEDGE block and available as the search_knowledge tool.
     ///
     /// Freshness: the index tails the event log via <see cref="EnsureFresh"/> (pull), and the
     /// service also wires <see cref="ProjectEventLogStore.EventAppended"/> to <see cref="Ingest"/>

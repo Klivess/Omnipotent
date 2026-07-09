@@ -18,6 +18,13 @@ namespace Omnipotent.Services.Projects
         /// <summary>BM25 retrieval hits pulled from the deep log for the triggering stimulus.</summary>
         public const int RetrievalBudget = 1500;
 
+        /// <summary>Cross-system knowledge (KliveRAG) injected into a Commander wake — other projects,
+        /// KliveAgent memory, Omniscience facts, repo docs. Agents can search_knowledge for more.</summary>
+        public const int KnowledgeBudget = 900;
+
+        /// <summary>Thinner knowledge budget for sub-agent wakes (their seed is deliberately lean).</summary>
+        public const int SubAgentKnowledgeBudget = 400;
+
         /// <summary>The triggering stimulus payload + verdict itself.</summary>
         public const int StimulusBudget = 800;
 

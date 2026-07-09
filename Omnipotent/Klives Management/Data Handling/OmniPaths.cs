@@ -178,6 +178,11 @@ namespace Omnipotent.Data_Handling
             public static string KliveMailDbFile = $"{KliveMailDirectory}/klivemail.db";
             public static string KliveMailAttachmentsDirectory = $"{KliveMailDirectory}/Attachments";
 
+            //KliveRAG (cross-system retrieval-augmented knowledge index)
+            public static string KliveRAGDirectory = $"{SavedDataDirectory}/KliveRAG";
+            public static string KliveRAGDbFile = $"{KliveRAGDirectory}/kliverag.db";
+            public static string KliveRAGSearxngDirectory = $"{KliveRAGDirectory}/searxng";
+
             //KliveGames (game server deployment & management)
             public static string KliveGamesDirectory = $"{SavedDataDirectory}/KliveGames";
             public static string KliveGamesInstancesDirectory = $"{KliveGamesDirectory}/Instances";

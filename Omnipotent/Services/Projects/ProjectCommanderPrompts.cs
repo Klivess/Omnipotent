@@ -26,7 +26,8 @@ namespace Omnipotent.Services.Projects
             ProjectDigest digest,
             List<ProjectEvent> recentEvents,
             List<ProjectRetrievalIndex.RetrievalHit> retrievalHits,
-            string triggerDescription)
+            string triggerDescription,
+            List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledgeHits = null)
         {
             var sb = new StringBuilder();
 
@@ -39,6 +40,20 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine("── STANDING DIGEST ──");
             string digestBlock = ComposeDigestBlock(digest);
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digestBlock, ProjectsContextBudget.DigestBudget));
+
+            // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The
+            // Commander's own log is deliberately NOT here — that's the RETRIEVED-FROM-LOG leg below.
+            if (knowledgeHits is { Count: > 0 })
+            {
+                sb.AppendLine("── RELEVANT KNOWLEDGE (Klives' knowledge base: other projects, KliveAgent memory, Omniscience, docs) ──");
+                var fitted = ProjectsContextBudget.FitItemsInBudget(
+                    knowledgeHits,
+                    ProjectsContextBudget.KnowledgeBudget,
+                    h => h.Text,
+                    h => h.Score);
+                foreach (var h in fitted)
+                    sb.AppendLine($"[{h.Source}{(string.IsNullOrEmpty(h.Title) ? "" : " · " + h.Title)}] {ProjectsContextBudget.TruncateToTokens(h.Text, 200)} (doc:{h.DocId})");
+            }
 
             if (retrievalHits.Count > 0)
             {

@@ -121,7 +121,7 @@ namespace Omnipotent.Services.Projects
 
                 string sessionId = $"projects-agent-{projectID}-{agent.AgentID}-{wakeID}";
                 llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent));
-                llm.AppendUserMessageToToolSession(sessionId, BuildWakeSeed(project, agent, trigger));
+                llm.AppendUserMessageToToolSession(sessionId, await BuildWakeSeed(project, agent, trigger));
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
                 int toolCalls = 0;
@@ -261,12 +261,31 @@ RULES:
 - If blocked, report the blocker rather than spinning. If an action needs approval or spends money, that's the commander's call — report it as a recommendation.
 - Be concise and factual. Everything you do is on a timeline Klives watches.";
 
-        private string BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger)
+        private async Task<string> BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
             var sb = new StringBuilder();
             sb.AppendLine("── PROJECT PLAN (commander's, for context) ──");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digest.CurrentPlan is { Length: > 0 } p ? p : "(none)", 400));
+
+            // Thin cross-system knowledge leg (KliveRAG), keyed by role + task; own project excluded.
+            if (parent.WakeCycle.KnowledgeSearchAsync != null)
+            {
+                try
+                {
+                    string kq = $"{agent.Role} {ProjectsContextBudget.TruncateToTokens(trigger, 200)}";
+                    var kHits = await parent.WakeCycle.KnowledgeSearchAsync(kq, project.ProjectID);
+                    if (kHits is { Count: > 0 })
+                    {
+                        sb.AppendLine("── RELEVANT KNOWLEDGE (Klives' knowledge base) ──");
+                        var fitted = ProjectsContextBudget.FitItemsInBudget(
+                            kHits, ProjectsContextBudget.SubAgentKnowledgeBudget, h => h.Text, h => h.Score);
+                        foreach (var h in fitted)
+                            sb.AppendLine($"[{h.Source}] {ProjectsContextBudget.TruncateToTokens(h.Text, 160)} (doc:{h.DocId})");
+                    }
+                }
+                catch { /* best-effort */ }
+            }
 
             // This agent's own recent activity, so consecutive wakes have continuity.
             var mine = parent.EventLog.ReadTail(project.ProjectID, 400)

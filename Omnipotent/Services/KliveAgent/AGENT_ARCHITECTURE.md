@@ -132,3 +132,26 @@ killable (process-isolated) script sandbox — a timed-out Roslyn script is aban
   nudge and 100% force-finalise; brain-level retry of a transient LLM turn; background-task
   restore-or-orphan on restart; shared-memory dedup-on-save + recency ranking + one-pass document
   frequency. Deliberately still open: a process-isolated, force-killable script sandbox.
+
+## KliveRAG — cross-system knowledge (shared with Projects)
+
+`Services/KliveRAG` is a separate `OmniService` that gives both KliveAgent and the Projects task
+force semantic + lexical recall across **all** of Klives' systems, plus live web. It is local and
+free: MiniLM ONNX embeddings (the same `ReplicaEmbedder` Omniscience uses), a SQLite store with an
+FTS5 lexical leg and BLOB vectors, brute-force cosine, and a self-hosted SearXNG container for web
+search (no API keys).
+
+- **Sources (connectors, incremental via watermarks/hashes):** Projects event logs + digests
+  (live via `EventAppended`, cross-project), KliveAgent conversations + memories (turn-pair chunks),
+  Omniscience distilled knowledge (person facts / Q&A / hypotheses / profiles), repo `*.md` docs, and
+  cached web pages (TTL'd). Omniscience's raw-message corpus is **federated at query time** (not
+  re-embedded) through its existing `MessageEmbeddingIndex`.
+- **Retrieval:** embed + FTS5 in parallel → Reciprocal Rank Fusion → recency boost → per-doc
+  diversity cap. `SearchForPromptAsync` races a ~300–400 ms timeout and fails soft (returns "").
+- **Delivery:** a budgeted `[Relevant Knowledge]` block auto-injected into KliveAgent's system prompt
+  (below the cache breakpoint, `KnowledgeBudget`) and into Projects wake seeds (a `RELEVANT KNOWLEDGE`
+  section, own-project events excluded), **plus** the native tools `search_knowledge`,
+  `read_knowledge_doc`, `web_search`, `web_fetch` on both agents.
+- **Jobs:** background embed queue, live/periodic connector scans, and a nightly 04:15 sweep
+  (`KliveRAGScheduler` — after Omniscience's 03:30) that reconciles connectors and evicts expired web
+  docs. HTTP surface under `/kliverag/*` (`search`, `doc`, `stats`, `sources`, `reindex`, `websearch`).

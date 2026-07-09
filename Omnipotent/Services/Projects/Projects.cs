@@ -85,6 +85,14 @@ namespace Omnipotent.Services.Projects
             Retrieval = new ProjectRetrievalIndex(EventLog);
             EventLog.EventAppended += Retrieval.Ingest;
             WakeCycle = new ProjectWakeCycle(EventLog, Digests, Retrieval);
+            // Cross-system knowledge leg for wake seeds (KliveRAG). Excludes the project's own log
+            // (already covered by the BM25 retrieval leg). Fails soft — no KliveRAG → no block.
+            WakeCycle.KnowledgeSearchAsync = async (query, excludeProjectId) =>
+            {
+                var rag = GetRagService();
+                if (rag == null) return new List<Omnipotent.Services.KliveRAG.KnowledgeHit>();
+                return await rag.SearchKnowledgeHitsAsync(query, 6, TimeSpan.FromMilliseconds(400), excludeProjectId);
+            };
 
             // Phase 3: orchestration subsystems.
             Settings = new ProjectSettingsStore();
@@ -405,8 +413,48 @@ namespace Omnipotent.Services.Projects
                 DisposeAgentDesktopAsync = agentID => DisposeAgentDesktopAsync(project.ProjectID, agentID),
                 RecallMemoriesAsync = RecallKliveAgentMemoriesAsync,
                 SaveMemoryAsync = SaveKliveAgentMemoryAsync,
+                SearchKnowledgeAsync = RagSearchKnowledgeAsync,
+                ReadKnowledgeDocAsync = RagReadKnowledgeDocAsync,
+                WebSearchAsync = RagWebSearchAsync,
+                WebFetchAsync = RagWebFetchAsync,
             };
             return await tools.DispatchAsync(toolName, argsJson, ct);
+        }
+
+        // ── KliveRAG bridge (cross-system knowledge + live web for the Commander & sub-agents) ──
+
+        private Omnipotent.Services.KliveRAG.KliveRAG? GetRagService()
+            => GetActiveServices().OfType<Omnipotent.Services.KliveRAG.KliveRAG>().FirstOrDefault(s => s.IsServiceActive());
+
+        private async Task<string> RagSearchKnowledgeAsync(string query, int max)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Knowledge service unavailable.";
+            try { return await rag.FormatSearchForToolAsync(query, max, null, includeMessages: true, maxTokens: ProjectsContextBudget.ToolResultBudget); }
+            catch (Exception ex) { return $"Knowledge search failed: {ex.Message}"; }
+        }
+
+        private Task<string> RagReadKnowledgeDocAsync(string docId, int maxTokens)
+        {
+            var rag = GetRagService();
+            if (rag == null) return Task.FromResult("Knowledge service unavailable.");
+            return Task.FromResult(rag.GetDoc(docId, maxTokens) ?? $"No document with id '{docId}'.");
+        }
+
+        private async Task<string> RagWebSearchAsync(string query, int maxResults, int fetchTop, string? timeRange)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Web search unavailable (KliveRAG not running).";
+            try { return await rag.WebSearchAsync(query, maxResults, fetchTop, timeRange); }
+            catch (Exception ex) { return $"Web search failed: {ex.Message}"; }
+        }
+
+        private async Task<string> RagWebFetchAsync(string url)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Web fetch unavailable (KliveRAG not running).";
+            try { return await rag.WebFetchAsync(url); }
+            catch (Exception ex) { return $"Web fetch failed: {ex.Message}"; }
         }
 
         private async Task<CommanderToolResult> DispatchComputerToolAsync(

@@ -144,7 +144,7 @@ namespace Omnipotent.Services.Projects
 
                 string sessionId = $"projects-commander-{projectID}-{wakeID}";
                 llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
-                llm.AppendUserMessageToToolSession(sessionId, parent.WakeCycle.BuildWakeSeed(project, triggerDescription));
+                llm.AppendUserMessageToToolSession(sessionId, await parent.WakeCycle.BuildWakeSeed(project, triggerDescription));
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
                 int toolCalls = 0;

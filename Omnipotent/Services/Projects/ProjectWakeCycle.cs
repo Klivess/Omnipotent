@@ -21,11 +21,17 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
+        /// Optional cross-system knowledge leg (KliveRAG): (query, excludeProjectId) → hits. Set by the
+        /// Projects service in ServiceMain; null when KliveRAG isn't present. Fails soft (returns []).
+        /// </summary>
+        public Func<string, string?, Task<List<Omnipotent.Services.KliveRAG.KnowledgeHit>>>? KnowledgeSearchAsync;
+
+        /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
         /// </summary>
-        public string BuildWakeSeed(Project project, string triggerDescription)
+        public async Task<string> BuildWakeSeed(Project project, string triggerDescription)
         {
             var digest = digests.GetDigest(project.ProjectID);
 
@@ -41,7 +47,18 @@ namespace Omnipotent.Services.Projects
                 .Where(h => recent.Count == 0 || h.Sequence < recent[0].Sequence)
                 .ToList();
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription);
+            // Cross-system knowledge, excluding THIS project's own events/digests (covered by the log leg).
+            List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledge = null;
+            if (KnowledgeSearchAsync != null)
+            {
+                string query = $"{project.Goal} {Truncate(triggerDescription, 300)}";
+                try { knowledge = await KnowledgeSearchAsync(query, project.ProjectID); } catch { knowledge = null; }
+            }
+
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge);
         }
+
+        private static string Truncate(string s, int max) =>
+            string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s.Substring(0, max));
     }
 }

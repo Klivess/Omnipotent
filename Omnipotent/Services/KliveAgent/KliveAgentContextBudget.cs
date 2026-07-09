@@ -24,6 +24,10 @@ namespace Omnipotent.Services.KliveAgent
         /// Agent can always call RecallMemories(query) for deeper retrieval.</summary>
         public const int MemoryBudget = 600;
 
+        /// <summary>Soft cap on the cross-system knowledge (KliveRAG) block injected up-front.
+        /// Agent can always call search_knowledge(query) / read_knowledge_doc(docId) for more.</summary>
+        public const int KnowledgeBudget = 700;
+
         /// <summary>Soft cap on conversation history selected into the per-turn prompt.
         /// Higher = more conversational persistence at the cost of input tokens.</summary>
         public const int HistoryBudget = 4000;

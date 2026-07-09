@@ -100,7 +100,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void WakeSeed_ContainsDigestRecentEventsAndTrigger()
+        public async Task WakeSeed_ContainsDigestRecentEventsAndTrigger()
         {
             string pid = NewProjectId();
             var log = new ProjectEventLogStore(_ => { });
@@ -114,7 +114,7 @@ namespace Omnipotent.Tests.Projects
             digests.SaveDigest(d);
             log.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.CommanderMessage, Author = "commander", Text = "shortlisted supplier Acme" });
 
-            string seed = wake.BuildWakeSeed(project, "Email from Acme: quote attached");
+            string seed = await wake.BuildWakeSeed(project, "Email from Acme: quote attached");
 
             Assert.Contains("Run a successful dropshipping store", seed);
             Assert.Contains("validate suppliers", seed);
@@ -123,7 +123,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void WakeSeed_RetrievalReachesPastTheRecentWindow()
+        public async Task WakeSeed_RetrievalReachesPastTheRecentWindow()
         {
             string pid = NewProjectId();
             var log = new ProjectEventLogStore(_ => { });
@@ -142,7 +142,7 @@ namespace Omnipotent.Tests.Projects
             d.LastDigestedSequence = 5;
             digests.SaveDigest(d);
 
-            string seed = wake.BuildWakeSeed(project, "need the warehouse zebra credentials");
+            string seed = await wake.BuildWakeSeed(project, "need the warehouse zebra credentials");
             Assert.Contains("RETRIEVED FROM THE FULL LOG", seed);
             Assert.Contains("zebra", seed);
         }

@@ -97,6 +97,54 @@ namespace Omnipotent.Services.KliveAgent
             return projects.DescribeProjectStatus(projectID) ?? $"No project with ID {projectID}.";
         }
 
+        // ── KliveRAG bridge (cross-system knowledge retrieval + live web) ──
+        // KliveRAG indexes Projects history, KliveAgent conversations/memories, Omniscience facts, repo
+        // docs and cached web pages. These give the agent semantic recall across all of them, plus live web.
+
+        private Omnipotent.Services.KliveRAG.KliveRAG? GetRagService()
+            => agentService?.GetActiveServices()
+                .OfType<Omnipotent.Services.KliveRAG.KliveRAG>()
+                .FirstOrDefault(s => s.IsServiceActive());
+
+        /// <summary>Semantic + lexical search across Klives' whole knowledge base (Projects, KliveAgent memory,
+        /// Omniscience, repo docs, cached web). Returns cited results; follow up with ReadKnowledgeDoc(docId).
+        /// Set includeMessages to also search Omniscience's raw message corpus.</summary>
+        public async Task<string> SearchKnowledge(string query, int maxResults = 8, bool includeMessages = true)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Knowledge service (KliveRAG) is not available.";
+            try { return await rag.FormatSearchForToolAsync(query, maxResults, null, includeMessages, 800); }
+            catch (Exception ex) { return $"Knowledge search failed: {ex.Message}"; }
+        }
+
+        /// <summary>Fetch the full text of a knowledge document by its doc id (the "doc:..." shown in search results).</summary>
+        public string ReadKnowledgeDoc(string docId, int maxTokens = 1500)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Knowledge service (KliveRAG) is not available.";
+            try { return rag.GetDoc(docId, Math.Clamp(maxTokens, 200, 3000)) ?? $"No document with id '{docId}'."; }
+            catch (Exception ex) { return $"Read failed: {ex.Message}"; }
+        }
+
+        /// <summary>Search the LIVE web via the self-hosted SearXNG engine (no API key). Set fetchTop &gt; 0 to
+        /// also download+index the top N pages so their full text is searchable via ReadKnowledgeDoc.</summary>
+        public async Task<string> WebSearch(string query, int maxResults = 6, int fetchTop = 2, string? timeRange = null)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Knowledge service (KliveRAG) is not available.";
+            try { return await rag.WebSearchAsync(query, maxResults, fetchTop, timeRange); }
+            catch (Exception ex) { return $"Web search failed: {ex.Message}"; }
+        }
+
+        /// <summary>Fetch one web page, extract its readable text, index it, and return the text.</summary>
+        public async Task<string> WebFetch(string url)
+        {
+            var rag = GetRagService();
+            if (rag == null) return "Knowledge service (KliveRAG) is not available.";
+            try { return await rag.WebFetchAsync(url); }
+            catch (Exception ex) { return $"Web fetch failed: {ex.Message}"; }
+        }
+
         // Reflection-derived schemas are immutable for the process lifetime, so memoize them across ALL
         // sessions (static). GetTypeSchema is called repeatedly across a task's iterations and across tasks;
         // this skips the reflection walk after the first lookup for a given type name.
