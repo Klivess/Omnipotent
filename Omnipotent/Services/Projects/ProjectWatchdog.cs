@@ -64,7 +64,7 @@ namespace Omnipotent.Services.Projects
         {
             foreach (var project in parent.Store.ListProjects())
             {
-                if (project.Status != ProjectStatus.Active) { escalations.TryRemove(project.ProjectID, out _); continue; }
+                if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) { escalations.TryRemove(project.ProjectID, out _); continue; }
 
                 var diagnosis = Diagnose(project);
                 if (diagnosis == null)
@@ -88,7 +88,7 @@ namespace Omnipotent.Services.Projects
             // 1. Heartbeat staleness: no wake within MaxWakeGap, on a project that has some history
             //    (so a brand-new idle project isn't flagged before it has ever run). A keepalive
             //    timer hook should fire at least this often; its absence is the "no stimuli" stall.
-            var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
+            var lastWake = parent.EventLog.GetLastOfType(project.ProjectID, ProjectEventTypes.CommanderWake);
             // A never-woken project is measured from creation, not flagged instantly — the
             // init event makes the tail non-empty the moment the project is created, which
             // used to produce "stalled (last: never)" seconds after creation.

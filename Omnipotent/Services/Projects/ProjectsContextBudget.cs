@@ -28,6 +28,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>Current observable values (the live dashboard agents maintain for Klives).</summary>
         public const int ObservablesBudget = 300;
 
+        /// <summary>The approved Grand Plan summary (the standing north star) rendered into each wake seed.</summary>
+        public const int GrandPlanBudget = 600;
+
+        /// <summary>Known accounts from the global shared registry (reuse before creating duplicates).</summary>
+        public const int AccountsBudget = 250;
+
         /// <summary>The triggering stimulus payload + verdict itself.</summary>
         public const int StimulusBudget = 800;
 

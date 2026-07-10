@@ -156,6 +156,7 @@ namespace Omnipotent.Services.Projects.Discord
                 // Discuss keeps the gate open and just posts to the channel; Approve/Deny resolve it.
                 if (m.decision == GateDecision.Discuss)
                 {
+                    parent.Gates.BeginDiscussion(m.projectID, m.gateID, "Discussion requested via Discord.");
                     await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource,
                         new DiscordInteractionResponseBuilder().WithContent("Reply in this channel to discuss with the Commander; the gate stays open."));
                     return;
@@ -193,7 +194,7 @@ namespace Omnipotent.Services.Projects.Discord
                     Author = "klives",
                     Text = e.Message.Content,
                 });
-                if (project.Status == ProjectStatus.Active)
+                if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
                 {
                     // Steer: injected into the live wake if one is running (fast steering, item 5).
                     parent.CommanderRunner.Steer(project, e.Message.Content);

@@ -62,6 +62,23 @@ namespace Omnipotent.Services.KliveAgent
             catch { return string.Empty; }
         }
 
+        /// <summary>
+        /// Fetches a budgeted block of accounts from the global shared registry for the system prompt,
+        /// so the agent reuses existing accounts instead of creating duplicates. Resolves the service
+        /// lazily and fails soft — returns "" if the registry is absent/down.
+        /// </summary>
+        public Task<string> DescribeAccountsForPromptAsync(int maxTokens)
+        {
+            try
+            {
+                var reg = GetActiveServices()
+                    .OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>()
+                    .FirstOrDefault(s => s.IsServiceActive());
+                return Task.FromResult(reg?.DescribeForPrompt("KliveAgent", maxTokens) ?? string.Empty);
+            }
+            catch { return Task.FromResult(string.Empty); }
+        }
+
         protected override async void ServiceMain()
         {
             var enabled = await GetBoolOmniSetting("KliveAgent_Enabled", defaultValue: true);

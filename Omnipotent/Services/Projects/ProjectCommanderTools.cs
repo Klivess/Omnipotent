@@ -5,6 +5,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects.Stimulus;
 using Omnipotent.Services.ComputerControl;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Omnipotent.Services.Projects
@@ -62,6 +63,10 @@ namespace Omnipotent.Services.Projects
         public Func<Task>? RenameDiscordChannelAsync { get; set; }
         /// <summary>Disposes a retired agent's own desktop container (frees ~1 GB immediately, not at project end).</summary>
         public Func<string, Task>? DisposeAgentDesktopAsync { get; set; }
+        /// <summary>Immediately starts a newly-created agent on its assigned objective.</summary>
+        public Func<ProjectAgentRecord, string, Task>? StartAgentAsync { get; set; }
+        /// <summary>Cancels a retiring agent's in-flight wake before its resources are released.</summary>
+        public Func<string, bool>? CancelAgentWake { get; set; }
         /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max) → formatted results.</summary>
         public Func<string, int, Task<string>>? RecallMemoriesAsync { get; set; }
         /// <summary>Save to KliveAgent's shared memory: (content, tags) → confirmation.</summary>
@@ -74,6 +79,14 @@ namespace Omnipotent.Services.Projects
         public Func<string, int, int, string?, Task<string>>? WebSearchAsync { get; set; }
         /// <summary>Fetch+index one web page: (url) → extracted text.</summary>
         public Func<string, Task<string>>? WebFetchAsync { get; set; }
+        /// <summary>Runs an adversarial council synchronously: (topic, briefing, roles, urgency, purpose) → formatted verdict.</summary>
+        public Func<string, string, string[]?, string, string, CancellationToken, Task<string>>? ConveneCouncilAsync { get; set; }
+        /// <summary>Versioned Grand Plan store — the strategic north star Klives approves before work begins.</summary>
+        public ProjectGrandPlanStore? GrandPlans { get; set; }
+        /// <summary>Global shared account registry (accounts across all projects + KliveAgent). Null when the service is down.</summary>
+        public Omnipotent.Services.AccountRegistry.AccountRegistry? Accounts { get; set; }
+        /// <summary>Flips a Planning project to Active once its Grand Plan is approved (also lifts the in-wake tool gate).</summary>
+        public Func<Task>? ActivateProjectAsync { get; set; }
 
         private static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
 
@@ -94,11 +107,25 @@ namespace Omnipotent.Services.Projects
             this.wakeID = wakeID;
         }
 
+        /// <summary>Execution tools locked while a project is in the PLANNING phase (awaiting Grand Plan approval).
+        /// Research, memory, planning, councils, observables and messaging Klives stay available.</summary>
+        private static readonly HashSet<string> PlanningBlockedTools = new(StringComparer.Ordinal)
+        {
+            "spawn_sub_agent", "run_script", "run_powershell", "run_bash",
+            "record_money_spend", "complete_project", "write_file",
+        };
+
         public async Task<CommanderToolResult> DispatchAsync(string tool, string argsJson, CancellationToken ct)
         {
             JObject a;
             try { a = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson); }
             catch { a = new JObject(); }
+
+            if (project.Status == ProjectStatus.Planning && PlanningBlockedTools.Contains(tool))
+                return new CommanderToolResult(
+                    "This project is in the PLANNING phase — execution tools unlock once Klives approves your Grand Plan " +
+                    "(submit_grand_plan). Available now: research (web_search/search_knowledge/recall_memories), councils " +
+                    "(convene_council), planning (update_plan), observables, and messaging Klives.");
 
             switch (tool)
             {
@@ -227,13 +254,22 @@ namespace Omnipotent.Services.Projects
                     string role = (string?)a["role"] ?? "worker";
                     string tierStr = (string?)a["tier"] ?? "Text";
                     string objective = (string?)a["objective"] ?? "";
+                    if (string.IsNullOrWhiteSpace(objective))
+                        return new CommanderToolResult("Provide a concrete non-empty objective for the new agent.");
                     if (!Enum.TryParse<ProjectAgentTier>(tierStr, ignoreCase: true, out var tier))
                         return new CommanderToolResult($"Unknown tier '{tierStr}'. Use Text, TextImage, TextImageVideo, or TextImageVideoAudio.");
                     try
                     {
                         var agent = subAgents.Spawn(project.ProjectID, actingAgentID, tier, role);
-                        eventLog.Append(Evt(ProjectEventTypes.Status, "commander", $"Objective for {agent.AgentID}: {objective}"));
-                        return new CommanderToolResult($"Spawned {tier} agent '{role}' with ID {agent.AgentID}.");
+                        eventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID, WakeID = wakeID, AgentID = agent.AgentID,
+                            Type = ProjectEventTypes.Status,
+                            Author = actingAgentID == "commander" ? "commander" : "agent",
+                            Text = $"Objective assigned to {agent.AgentID}: {objective}",
+                        });
+                        if (StartAgentAsync != null) await StartAgentAsync(agent, objective);
+                        return new CommanderToolResult($"Spawned and started {tier} agent '{role}' with ID {agent.AgentID}.");
                     }
                     catch (InvalidOperationException ex) { return new CommanderToolResult(ex.Message); }
                 }
@@ -241,6 +277,7 @@ namespace Omnipotent.Services.Projects
                 case "retire_sub_agent":
                 {
                     string id = (string?)a["agentID"] ?? "";
+                    CancelAgentWake?.Invoke(id);
                     bool ok = subAgents.Retire(project.ProjectID, id);
                     // Free the retired agent's own desktop immediately rather than leaking it until
                     // the project completes.
@@ -279,6 +316,10 @@ namespace Omnipotent.Services.Projects
                 {
                     string kind = (string?)a["kind"] ?? "tokens";
                     double amount = (double?)a["amount"] ?? 0;
+                    kind = kind.Trim().ToLowerInvariant();
+                    if (kind is not ("tokens" or "money" or "agents") || !double.IsFinite(amount) || amount <= 0 ||
+                        (kind == "agents" && amount != Math.Truncate(amount)))
+                        return new CommanderToolResult("Use kind tokens, money, or agents with a positive finite limit (agents must be an integer).");
                     var gate = new ProjectGate
                     {
                         ProjectID = project.ProjectID,
@@ -295,13 +336,24 @@ namespace Omnipotent.Services.Projects
                         var p = projectStore.GetProject(project.ProjectID);
                         if (p != null)
                         {
-                            switch (kind.ToLowerInvariant())
+                            switch (kind)
                             {
-                                case "tokens": p.TokenBudgetUsd = amount; if (p.Status == ProjectStatus.BudgetPaused) p.Status = ProjectStatus.Active; break;
+                                case "tokens":
+                                    p.TokenBudgetUsd = amount;
+                                    projectStore.SaveProject(p);
+                                    if (p.Status == ProjectStatus.BudgetPaused && budget.NotifyBudgetChanged(p.ProjectID))
+                                    {
+                                        // Resume to where it left off: a project that never finished planning
+                                        // returns to Planning (the Grand Plan gate still stands), not straight to work.
+                                        p.Status = (GrandPlans?.HasApprovedPlan(p.ProjectID) ?? true)
+                                            ? ProjectStatus.Active : ProjectStatus.Planning;
+                                        projectStore.SaveProject(p);
+                                    }
+                                    break;
                                 case "money": p.MoneyBudgetUsd = amount; break;
                                 case "agents": p.SubAgentCap = (int)amount; break;
                             }
-                            projectStore.SaveProject(p);
+                            if (kind != "tokens") projectStore.SaveProject(p);
                         }
                     }
                     return new CommanderToolResult($"Klives {res.Decision}: {res.Comment}");
@@ -311,7 +363,8 @@ namespace Omnipotent.Services.Projects
                 {
                     double amount = (double?)a["amount"] ?? 0;
                     string description = (string?)a["description"] ?? "";
-                    if (amount <= 0) return new CommanderToolResult("Provide a positive 'amount' in USD.");
+                    if (!double.IsFinite(amount) || amount <= 0)
+                        return new CommanderToolResult("Provide a positive finite 'amount' in USD.");
                     if (string.IsNullOrWhiteSpace(description)) return new CommanderToolResult("Provide a 'description' of the spend.");
 
                     // Autonomous (within per-action threshold and remaining budget) → record now.
@@ -362,6 +415,55 @@ namespace Omnipotent.Services.Projects
                     if (RequestHumanAsync != null) await RequestHumanAsync(what);
                     eventLog.Append(Evt(ProjectEventTypes.Status, "commander", $"Human assistance requested: {what}"));
                     return new CommanderToolResult("Requested human assistance (surfaced to Klives).");
+                }
+
+                // ── Shared account registry (global across all projects + KliveAgent) ──
+                case "account_register":
+                {
+                    if (Accounts == null) return new CommanderToolResult("Account registry unavailable.");
+                    string service = (string?)a["service"] ?? "";
+                    string username = (string?)a["username"] ?? "";
+                    string? email = (string?)a["email"];
+                    string? description = (string?)a["description"];
+                    bool allowDuplicate = (bool?)a["allowDuplicate"] ?? false;
+                    string? reason = (string?)a["reason"];
+                    var secrets = new Dictionary<string, string>();
+                    if (a["secrets"] is Newtonsoft.Json.Linq.JObject so)
+                        foreach (var prop in so.Properties())
+                            secrets[prop.Name] = (string?)prop.Value ?? "";
+                    string result = await Accounts.RegisterAccountAsync(
+                        service, username, email, secrets, description,
+                        createdBy: "project:" + project.ProjectID, owner: "project:" + project.ProjectID,
+                        allowDuplicate, reason);
+                    AppendAccountEvent(service, username, allowDuplicate ? "register-duplicate" : "register");
+                    return new CommanderToolResult(result);
+                }
+
+                case "account_list":
+                {
+                    if (Accounts == null) return new CommanderToolResult("Account registry unavailable.");
+                    string? service = (string?)a["service"];
+                    return new CommanderToolResult(await Accounts.DescribeAccountsAsync("project:" + project.ProjectID, service));
+                }
+
+                case "account_update":
+                {
+                    if (Accounts == null) return new CommanderToolResult("Account registry unavailable.");
+                    string accountID = (string?)a["accountID"] ?? "";
+                    if (string.IsNullOrWhiteSpace(accountID)) return new CommanderToolResult("Provide accountID (from account_list).");
+                    if (Accounts.Get(accountID) == null) return new CommanderToolResult($"No account with id '{accountID}'.");
+                    var done = new List<string>();
+                    if (a["status"] != null && Enum.TryParse<Omnipotent.Services.AccountRegistry.AccountStatus>((string?)a["status"], true, out var st))
+                    { Accounts.UpdateStatus(accountID, st); done.Add($"status={st}"); }
+                    if (a["notes"] != null) { Accounts.UpdateNotes(accountID, (string?)a["notes"]); done.Add("notes"); }
+                    string? secretName = (string?)a["addSecretName"];
+                    string? secretValue = (string?)a["addSecretValue"];
+                    if (!string.IsNullOrWhiteSpace(secretName) && secretValue != null)
+                    { Accounts.AddSecret(accountID, secretName, secretValue); done.Add($"secret '{secretName}'"); }
+                    if ((bool?)a["claim"] == true)
+                    { if (Accounts.ClaimForOwner(accountID, "project:" + project.ProjectID)) done.Add("claimed"); }
+                    AppendAccountEvent(Accounts.Get(accountID)?.ServiceKey ?? "", Accounts.Get(accountID)?.Username ?? "", "update");
+                    return new CommanderToolResult(done.Count == 0 ? "Nothing to update (provide status, notes, addSecretName+addSecretValue, or claim)." : "Updated: " + string.Join(", ", done) + ".");
                 }
 
                 // ── KliveAgent shared memory (Projects is part of KliveAgent — memory transfers) ──
@@ -473,6 +575,8 @@ namespace Omnipotent.Services.Projects
                 {
                     string code = (string?)a["code"] ?? "";
                     if (string.IsNullOrWhiteSpace(code)) return new CommanderToolResult("Provide 'code' — a C# script body.");
+                    var approval = await ApproveHostExecutionAsync("C#", code, ct);
+                    if (approval != null) return approval;
                     return await RunScriptAsync(code, ct);
                 }
 
@@ -480,6 +584,8 @@ namespace Omnipotent.Services.Projects
                 {
                     string ps = (string?)a["script"] ?? "";
                     if (string.IsNullOrWhiteSpace(ps)) return new CommanderToolResult("Provide 'script' — a PowerShell script body.");
+                    var approval = await ApproveHostExecutionAsync("PowerShell", ps, ct);
+                    if (approval != null) return approval;
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var r = await HostShell.RunPowerShellAsync(ps, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
@@ -489,6 +595,8 @@ namespace Omnipotent.Services.Projects
                 {
                     string bash = (string?)a["script"] ?? "";
                     if (string.IsNullOrWhiteSpace(bash)) return new CommanderToolResult("Provide 'script' — a bash script body.");
+                    var approval = await ApproveHostExecutionAsync("Bash", bash, ct);
+                    if (approval != null) return approval;
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var r = await HostShell.RunBashAsync(bash, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
@@ -499,7 +607,7 @@ namespace Omnipotent.Services.Projects
                 case "create_stimulus_hook":
                 {
                     if (HookStore == null) return new CommanderToolResult("Hook store unavailable.");
-                    string sourceKind = (string?)a["sourceKind"] ?? "";
+                    string sourceKind = ((string?)a["sourceKind"] ?? "").Trim().ToLowerInvariant();
                     if (string.IsNullOrWhiteSpace(sourceKind)) return new CommanderToolResult("Provide 'sourceKind' (timer | webhook | file-watch | screen-diff | script).");
                     var hook = HookStore.Create(new StimulusHookRecord
                     {
@@ -512,7 +620,10 @@ namespace Omnipotent.Services.Projects
                         Durability = sourceKind == "screen-diff" ? StimulusDurability.SupersedingByKey : StimulusDurability.Standard,
                     });
                     RearmAdapters?.Invoke();
-                    return new CommanderToolResult($"Hook {hook.HookID} created ({sourceKind} → {hook.DestinationAgentID}).");
+                    string tokenNote = sourceKind == "webhook"
+                        ? $" Ingress token (store it now): {hook.IngressToken}"
+                        : "";
+                    return new CommanderToolResult($"Hook {hook.HookID} created ({sourceKind} → {hook.DestinationAgentID}).{tokenNote}");
                 }
 
                 case "list_stimulus_hooks":
@@ -536,6 +647,66 @@ namespace Omnipotent.Services.Projects
                     bool ok = HookStore.Delete(project.ProjectID, (string?)a["hookID"] ?? "");
                     RearmAdapters?.Invoke();
                     return new CommanderToolResult(ok ? "Hook deleted." : "No such hook.");
+                }
+
+                // ── strategy: councils + the Grand Plan ──
+
+                case "convene_council":
+                {
+                    if (ConveneCouncilAsync == null) return new CommanderToolResult("Councils are unavailable.");
+                    string topic = ((string?)a["topic"] ?? "").Trim();
+                    string briefing = ((string?)a["briefing"] ?? "").Trim();
+                    if (topic.Length == 0) return new CommanderToolResult("Provide 'topic' — the decision the council must weigh.");
+                    if (briefing.Length == 0)
+                        return new CommanderToolResult("Provide 'briefing' — the panel sees ONLY what you put here, so include everything they need to reason well.");
+                    string[]? roles = (a["roles"] as JArray)?.Select(t => (string?)t ?? "").Where(s => s.Length > 0).ToArray();
+                    string urgency = (string?)a["urgency"] ?? "routine";
+                    string purpose = (string?)a["purpose"] ?? "decision";
+                    string verdict = await ConveneCouncilAsync(topic, briefing, roles, urgency, purpose, ct);
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(verdict, 2000));
+                }
+
+                case "submit_grand_plan":
+                {
+                    if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
+                    string planMd = ((string?)a["plan"] ?? "").Trim();
+                    string summary = ((string?)a["summary"] ?? "").Trim();
+                    if (planMd.Length == 0) return new CommanderToolResult("Provide 'plan' — the full Grand Plan in markdown.");
+                    if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary for the approval card and wake seeds.");
+                    return await SubmitPlanForApprovalAsync(planMd, summary, changeNote: null, isAmendment: false, ct);
+                }
+
+                case "amend_grand_plan":
+                {
+                    if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
+                    if (!GrandPlans.HasApprovedPlan(project.ProjectID))
+                        return new CommanderToolResult("No approved Grand Plan to amend yet. Use submit_grand_plan first.");
+                    string planMd = ((string?)a["plan"] ?? "").Trim();
+                    string summary = ((string?)a["summary"] ?? "").Trim();
+                    string changeNote = ((string?)a["changeNote"] ?? "").Trim();
+                    if (planMd.Length == 0) return new CommanderToolResult("Provide 'plan' — the full revised Grand Plan in markdown.");
+                    if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary of the revised plan.");
+                    bool material = ParseBool((string?)a["material"], defaultValue: false);
+                    if (!material)
+                    {
+                        var v = GrandPlans.SubmitVersion(project.ProjectID, planMd, summary, changeNote, material: false, wakeID);
+                        var evt = Evt(ProjectEventTypes.GrandPlanAmended, "commander",
+                            $"Grand Plan amended (v{v.Version}, non-material): {Trunc(changeNote.Length > 0 ? changeNote : summary, 200)}");
+                        evt.PayloadJson = JsonConvert.SerializeObject(new { version = v.Version, material = false, summary });
+                        eventLog.Append(evt);
+                        return new CommanderToolResult($"Grand Plan amended to v{v.Version} (non-material, applied immediately). It seeds your next wake.");
+                    }
+                    return await SubmitPlanForApprovalAsync(planMd, summary, changeNote, isAmendment: true, ct);
+                }
+
+                case "get_grand_plan":
+                {
+                    if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
+                    var v = GrandPlans.GetCurrentApproved(project.ProjectID);
+                    if (v == null) return new CommanderToolResult("No approved Grand Plan yet.");
+                    return new CommanderToolResult(
+                        $"GRAND PLAN v{v.Version} (approved {(v.ResolvedAt ?? v.SubmittedAt):MM-dd}):\n\n"
+                        + ProjectsContextBudget.TruncateToTokens(v.Markdown, 2500));
                 }
 
                 case "complete_project":
@@ -563,6 +734,62 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>
+        /// Stores a material Grand Plan version and opens a "plan" approval gate, blocking until Klives
+        /// resolves it (exactly like request_user_approval). On approval the version is marked approved
+        /// and — if the project is still Planning — activated. On denial the version is rejected and the
+        /// Commander is told to revise and resubmit within this same wake.
+        /// </summary>
+        private async Task<CommanderToolResult> SubmitPlanForApprovalAsync(string planMd, string summary, string? changeNote, bool isAmendment, CancellationToken ct)
+        {
+            var version = GrandPlans!.SubmitVersion(project.ProjectID, planMd, summary, changeNote, material: true, wakeID);
+            var submittedEvt = Evt(ProjectEventTypes.GrandPlanSubmitted, "commander",
+                $"Grand Plan v{version.Version} submitted for approval: {Trunc(summary, 200)}");
+            submittedEvt.PayloadJson = JsonConvert.SerializeObject(new { version = version.Version, isAmendment, summary });
+            eventLog.Append(submittedEvt);
+
+            var gate = new ProjectGate
+            {
+                ProjectID = project.ProjectID,
+                WakeID = wakeID,
+                AgentID = actingAgentID,
+                Kind = "plan",
+                Title = isAmendment
+                    ? $"Grand Plan v{version.Version} amendment — approve to apply"
+                    : $"Grand Plan v{version.Version} — approve to begin work",
+                Description = summary,
+                Rationale = changeNote ?? "Klives approves the strategic plan before the fleet executes it.",
+                ProposalJson = JsonConvert.SerializeObject(new { version = version.Version, markdown = planMd }),
+            };
+            var res = await gates.OpenGateAndWaitAsync(gate, ct);
+
+            if (res.Decision == GateDecision.Approve)
+            {
+                GrandPlans.MarkApproved(project.ProjectID, version.Version, gate.GateID, res.Comment);
+                var approvedEvt = Evt(ProjectEventTypes.GrandPlanApproved, "klives",
+                    $"Grand Plan v{version.Version} approved by Klives.{(string.IsNullOrWhiteSpace(res.Comment) ? "" : $" \"{Trunc(res.Comment, 160)}\"")}");
+                approvedEvt.PayloadJson = JsonConvert.SerializeObject(new { version = version.Version });
+                eventLog.Append(approvedEvt);
+
+                if (project.Status == ProjectStatus.Planning && ActivateProjectAsync != null)
+                {
+                    await ActivateProjectAsync();
+                    return new CommanderToolResult(
+                        $"Grand Plan v{version.Version} approved — the project is now ACTIVE. Execute it: create the hooks you need and take the first concrete steps.");
+                }
+                return new CommanderToolResult($"Grand Plan v{version.Version} approved and in effect.");
+            }
+
+            GrandPlans.MarkRejected(project.ProjectID, version.Version, gate.GateID, res.Comment);
+            eventLog.Append(Evt(ProjectEventTypes.GrandPlanRevisionRequested, "klives",
+                $"Klives {res.Decision} Grand Plan v{version.Version}: {res.Comment}"));
+            return new CommanderToolResult(
+                $"Klives {res.Decision}: {res.Comment} — revise the plan accordingly and resubmit ({(isAmendment ? "amend_grand_plan" : "submit_grand_plan")}).");
+        }
+
+        private static bool ParseBool(string? v, bool defaultValue) =>
+            string.IsNullOrWhiteSpace(v) ? defaultValue : v.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
+
         // ── script execution (narrow Roslyn surface, same philosophy as KliveAgent) ──
 
         /// <summary>Globals a Commander work-script can use: HTTP, project-volume file IO, output buffer.</summary>
@@ -589,7 +816,7 @@ namespace Omnipotent.Services.Projects
             private string Scoped(string relative)
             {
                 string full = Path.GetFullPath(Path.Combine(volumeRoot, relative ?? ""));
-                if (!full.StartsWith(volumeRoot, StringComparison.OrdinalIgnoreCase))
+                if (!IsWithinRoot(volumeRoot, full))
                     throw new UnauthorizedAccessException("Path escapes the project volume.");
                 return full;
             }
@@ -632,6 +859,26 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        private async Task<CommanderToolResult?> ApproveHostExecutionAsync(string language, string code, CancellationToken ct)
+        {
+            string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(code))).ToLowerInvariant();
+            string preview = code.Length <= 1200 ? code : code[..1200] + "\n[truncated]";
+            var gate = new ProjectGate
+            {
+                ProjectID = project.ProjectID,
+                WakeID = wakeID,
+                AgentID = actingAgentID,
+                Kind = "host-execution",
+                Title = $"Run {language} on the Omnipotent host?",
+                Description = $"Exact script SHA-256: {hash}\n\n{preview}",
+                Rationale = "Host scripts inherit Omnipotent's security context and are outside the desktop-container sandbox.",
+            };
+            var resolution = await gates.OpenGateAndWaitAsync(gate, ct);
+            return resolution.Decision == GateDecision.Approve
+                ? null
+                : new CommanderToolResult($"Host execution not approved ({resolution.Decision}): {resolution.Comment}");
+        }
+
         private string VolumeRoot()
         {
             string dir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsVolumesDirectory), project.ProjectID);
@@ -643,9 +890,18 @@ namespace Omnipotent.Services.Projects
         {
             if (relative == null) return (null, "Provide 'path' (relative to the project volume).");
             string full = Path.GetFullPath(Path.Combine(VolumeRoot(), relative));
-            if (!full.StartsWith(VolumeRoot(), StringComparison.OrdinalIgnoreCase))
+            if (!IsWithinRoot(VolumeRoot(), full))
                 return (null, "Path escapes the project volume — use a relative path inside it.");
             return (full, null);
+        }
+
+        private static bool IsWithinRoot(string root, string candidate)
+        {
+            string relative = Path.GetRelativePath(root, candidate);
+            return relative != ".." &&
+                   !relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) &&
+                   !relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal) &&
+                   !Path.IsPathRooted(relative);
         }
 
         private ProjectEvent Evt(string type, string author, string text) => new()
@@ -679,6 +935,16 @@ namespace Omnipotent.Services.Projects
                 previous = change?.PreviousDisplay,
                 current = change?.NewDisplay,
             });
+            eventLog.Append(evt);
+        }
+
+        /// <summary>Logs an account-registry mutation to the timeline (never any secret value).</summary>
+        private void AppendAccountEvent(string service, string username, string op)
+        {
+            string author = actingAgentID == "commander" ? "commander" : "agent";
+            string serviceKey = Omnipotent.Services.AccountRegistry.AccountRegistryStore.NormalizeService(service);
+            var evt = Evt(ProjectEventTypes.AccountChanged, author, $"account {op}: {serviceKey} · {username}");
+            evt.PayloadJson = JsonConvert.SerializeObject(new { serviceKey, username, op });
             eventLog.Append(evt);
         }
 

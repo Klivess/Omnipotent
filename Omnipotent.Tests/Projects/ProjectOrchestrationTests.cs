@@ -102,6 +102,8 @@ namespace Omnipotent.Tests.Projects
             Assert.False(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click"));
             Assert.False(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_click"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImageVideo, "computer_click"));
+            Assert.False(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_terminal"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImageVideo, "computer_terminal"));
         }
 
         [Fact]

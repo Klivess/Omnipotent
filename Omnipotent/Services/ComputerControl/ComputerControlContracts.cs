@@ -27,6 +27,9 @@ namespace Omnipotent.Services.ComputerControl
         public bool SupportsBrowserControl { get; init; }
         public bool SupportsClipboard { get; init; }
         public bool SupportsAppLaunch { get; init; }
+        /// <summary>Target can run a bounded command in its own isolated terminal environment.
+        /// False for the real host desktop; true only for Project desktop containers.</summary>
+        public bool SupportsTerminalExecution { get; init; }
         public bool SupportsRelativeMouse { get; init; }
         public bool SupportsHumanization { get; init; }
         public bool SupportsMotionFrames { get; init; }
@@ -80,7 +83,10 @@ namespace Omnipotent.Services.ComputerControl
     {
         private static readonly HashSet<string> SensitiveFields = new(StringComparer.OrdinalIgnoreCase)
         {
-            "text", "value", "password", "secret", "token", "authorization", "cookie", "clipboard"
+            "text", "value", "password", "secret", "token", "authorization", "cookie", "clipboard",
+            // Terminal input can contain inline credentials. Its exact body belongs neither in
+            // the event log nor the audit summary (vault placeholders are not resolved here).
+            "command"
         };
 
         public static string Describe(string toolName, string? argumentsJson, int max = 220)
@@ -276,6 +282,15 @@ namespace Omnipotent.Services.ComputerControl
                 Tool("computer_clipboard_get", "Read clipboard text where supported.", Obj(new { })),
                 Tool("computer_clipboard_set", "Set clipboard text where supported.", Obj(new { text = Str("clipboard text") }, "text")),
             };
+            if (capabilities.SupportsTerminalExecution && capabilities.Supports("computer_terminal"))
+                all.Add(Tool("computer_terminal",
+                    "Run a Bash command INSIDE your isolated Linux desktop container, as its agent user - never on the Omnipotent host. Prefer this over typing commands into XFCE Terminal: it is reliable even when screenshots are temporarily unavailable, returns bounded stdout/stderr, and can install container software with sudo. The default working directory is persistent /project. Vault/account placeholders are intentionally NOT available because arbitrary command output could reveal them; use computer_type for secret entry.",
+                    Obj(new
+                    {
+                        command = Str("Bash command to run inside the desktop container."),
+                        workingDirectory = Str("Optional absolute directory under /project or /home/agent; default /project."),
+                        timeoutSeconds = Num("Timeout from 1 to 900 seconds; default 120."),
+                    }, "command")));
             return all.Where(t => capabilities.Supports(t.function.name)).ToList();
         }
     }

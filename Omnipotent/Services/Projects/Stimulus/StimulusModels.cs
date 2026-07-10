@@ -36,6 +36,9 @@ namespace Omnipotent.Services.Projects.Stimulus
         public string RecognitionCriterion { get; set; } = "";
         /// <summary>Agent the confirmed stimulus is delivered to (its wake trigger). "commander" by default.</summary>
         public string DestinationAgentID { get; set; } = "commander";
+        /// <summary>Opaque bearer token required by webhook ingress. Returned only on Klives-only
+        /// hook-management surfaces and never written to the event log.</summary>
+        public string IngressToken { get; set; } = "";
         public int Priority { get; set; } = 0;
         public StimulusDurability Durability { get; set; } = StimulusDurability.Standard;
         public bool Enabled { get; set; } = true;

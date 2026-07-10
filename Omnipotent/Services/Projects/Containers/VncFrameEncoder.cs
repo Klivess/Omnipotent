@@ -17,12 +17,22 @@ namespace Omnipotent.Services.Projects.Containers
     {
         public static byte[] EncodeJpeg(byte[] bgra, int width, int height, int maxWidth = 1280, long quality = 70)
         {
-            using var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+            ArgumentNullException.ThrowIfNull(bgra);
+            if (width <= 0 || height <= 0)
+                throw new ArgumentOutOfRangeException(nameof(width), $"Invalid framebuffer geometry {width}x{height}.");
+            int requiredBytes = checked(width * height * 4);
+            if (bgra.Length < requiredBytes)
+                throw new ArgumentException($"Framebuffer has {bgra.Length} bytes; {requiredBytes} are required for {width}x{height} BGRA.", nameof(bgra));
+
+            // RFB's fourth byte is padding (BGRX), not a meaningful alpha channel. Treating it as
+            // ARGB made servers that emit X=0 look transparent and could encode as black/white
+            // blocks. Format32bppRgb consumes the same B,G,R,X byte order but forces opaque pixels.
+            using var bmp = new Bitmap(width, height, PixelFormat.Format32bppRgb);
             var rect = new Rectangle(0, 0, width, height);
-            var data = bmp.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+            var data = bmp.LockBits(rect, ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
             try
             {
-                // BGRA framebuffer matches Format32bppArgb's byte order on little-endian; copy
+                // BGRX framebuffer matches Format32bppRgb's byte order on little-endian; copy
                 // row by row to honour the bitmap's stride.
                 int rowBytes = width * 4;
                 for (int y = 0; y < height; y++)

@@ -8,6 +8,8 @@ namespace Omnipotent.Services.Projects
         BudgetPaused,    // hit 100% of token budget; waiting on a budget conversation
         Completed,
         Archived,
+        // NOTE: persisted as an int by ProjectStore — new values MUST be appended, never inserted.
+        Planning,        // newly created: forming a Grand Plan for Klives' approval before any execution work
     }
 
     /// <summary>
@@ -106,6 +108,14 @@ namespace Omnipotent.Services.Projects
         public const string HookChanged = "hook-changed";              // stimulus hook CRUD is itself an event (§5.1)
         public const string ObservableChanged = "observable-changed";  // a named live value shown to Klives was created/updated/deleted
         public const string WatchdogEscalation = "watchdog-escalation";
+        public const string CouncilConvened = "council-convened";      // Commander raised an adversarial council on a topic
+        public const string CouncilStatement = "council-statement";    // one panelist's opening/rebuttal, or the Chair's synthesis
+        public const string CouncilVerdict = "council-verdict";        // the council's synthesized recommendation
+        public const string GrandPlanSubmitted = "grand-plan-submitted";            // Commander submitted a Grand Plan version for approval
+        public const string GrandPlanApproved = "grand-plan-approved";              // Klives approved a Grand Plan version
+        public const string GrandPlanRevisionRequested = "grand-plan-revision-requested"; // Klives denied/deferred; revise & resubmit
+        public const string GrandPlanAmended = "grand-plan-amended";                // a non-material amendment applied without a gate
+        public const string AccountChanged = "account-changed";        // a shared-registry account was registered/updated (metadata only, never secrets)
         public const string Status = "status";                         // generic progress note
     }
 

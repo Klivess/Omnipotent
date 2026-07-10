@@ -28,6 +28,7 @@ namespace Omnipotent.Services.Projects.Stimulus
         public StimulusHookRecord Create(StimulusHookRecord hook)
         {
             if (string.IsNullOrWhiteSpace(hook.HookID)) hook.HookID = Guid.NewGuid().ToString("N");
+            EnsureIngressToken(hook);
             lock (LockFor(hook.ProjectID))
             {
                 var hooks = LoadLocked(hook.ProjectID);
@@ -95,9 +96,43 @@ namespace Omnipotent.Services.Projects.Stimulus
         {
             string path = HooksPath(projectID);
             if (!File.Exists(path)) return new();
-            try { return JsonConvert.DeserializeObject<List<StimulusHookRecord>>(File.ReadAllText(path)) ?? new(); }
+            try
+            {
+                var hooks = JsonConvert.DeserializeObject<List<StimulusHookRecord>>(File.ReadAllText(path)) ?? new();
+                bool changed = false;
+                foreach (var hook in hooks)
+                    if (hook.SourceKind == "webhook" && string.IsNullOrWhiteSpace(hook.IngressToken))
+                    {
+                        EnsureIngressToken(hook);
+                        changed = true;
+                    }
+                if (changed) SaveLocked(projectID, hooks);
+                return hooks;
+            }
             catch { return new(); }
         }
+
+        public string RotateIngressToken(string projectID, string hookID)
+        {
+            lock (LockFor(projectID))
+            {
+                var hooks = LoadLocked(projectID);
+                var hook = hooks.FirstOrDefault(h => h.HookID == hookID && h.SourceKind == "webhook")
+                    ?? throw new InvalidOperationException("webhook hook not found");
+                hook.IngressToken = NewIngressToken();
+                SaveLocked(projectID, hooks);
+                return hook.IngressToken;
+            }
+        }
+
+        private static void EnsureIngressToken(StimulusHookRecord hook)
+        {
+            if (hook.SourceKind == "webhook" && string.IsNullOrWhiteSpace(hook.IngressToken))
+                hook.IngressToken = NewIngressToken();
+        }
+
+        private static string NewIngressToken() =>
+            Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
 
         private void SaveLocked(string projectID, List<StimulusHookRecord> hooks)
         {

@@ -24,6 +24,7 @@ namespace Omnipotent.Services.Projects.Containers
         // Captures and input must observe one coherent desktop state.  VncTransport serialises
         // socket writes, but this gate serialises the whole observe → act → settle transaction.
         private readonly ConcurrentDictionary<string, SemaphoreSlim> actionGates = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> provisioningGates = new(StringComparer.Ordinal);
         private readonly string vncHost;
 
         public ContainerRegistry Registry => registry;
@@ -44,7 +45,20 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
-        public Task ReconcileAsync(CancellationToken ct = default) => orchestrator.ReconcileAsync(ct);
+        public async Task ReconcileAsync(CancellationToken ct = default)
+        {
+            await orchestrator.ReconcileAsync(ct);
+            // Docker may assign a new ephemeral host port when a stopped container restarts.
+            // Never leave the pooled VNC client dialing its persisted, now-stale endpoint.
+            var records = registry.All()
+                .GroupBy(r => r.ContainerID, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
+            foreach (var pair in transports.ToArray())
+            {
+                if (!records.TryGetValue(pair.Key, out var record) || record.Lost || pair.Value.Port != record.VncHostPort)
+                    if (transports.TryRemove(new KeyValuePair<string, VncTransport>(pair.Key, pair.Value))) pair.Value.Dispose();
+            }
+        }
 
         /// <summary>Probes the Docker daemon; null when healthy, else a human-readable reason.</summary>
         public Task<string?> ProbeDaemonAsync(CancellationToken ct = default) => orchestrator.ProbeDaemonAsync(ct);
@@ -83,9 +97,10 @@ namespace Omnipotent.Services.Projects.Containers
             Project project, string agentID,
             Func<string, Task<string>>? resolveSecretsAsync = null,
             int actionSettleMs = 350, int typingDelayMs = 18,
+            bool requireVisualReady = true,
             CancellationToken ct = default)
         {
-            var record = await EnsureDesktopAsync(project, agentID, ct);
+            var record = await EnsureDesktopAsync(project, agentID, requireVisualReady, ct);
             var transport = GetTransport(record);
             bool shared = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock;
             return new ContainerToolAdapter(
@@ -93,6 +108,8 @@ namespace Omnipotent.Services.Projects.Containers
                 actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1)),
                 inputLock: shared ? inputLock : null,
                 dockerControlAsync: (command, argument, token) => orchestrator.ExecuteDesktopControlAsync(record.ContainerID, command, argument, token),
+                terminalAsync: (command, workingDirectory, timeoutSeconds, token) =>
+                    orchestrator.ExecuteDesktopShellAsync(record.ContainerID, command, workingDirectory, timeoutSeconds, token),
                 resolveSecretsAsync: resolveSecretsAsync,
                 actionSettleMs: actionSettleMs,
                 typingDelayMs: typingDelayMs);
@@ -101,26 +118,48 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>Creates (or resolves) the desktop record an agent should use. A freshly created
         /// container is probed until its desktop server answers, so the first computer_* tool doesn't
         /// race the container's boot (x11vnc/Xvfb take a few seconds to come up).</summary>
-        public async Task<DesktopContainerRecord> EnsureDesktopAsync(Project project, string agentID, CancellationToken ct = default)
+        public async Task<DesktopContainerRecord> EnsureDesktopAsync(Project project, string agentID,
+            bool requireVisualReady = true, CancellationToken ct = default)
         {
-            if (project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock)
+            bool sharedAllocation = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock;
+            string ownerKey = sharedAllocation ? $"{project.ProjectID}/shared" : $"{project.ProjectID}/{agentID}";
+            var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
+            DesktopContainerRecord record;
+            bool created = false;
+            await provisionGate.WaitAsync(ct);
+            try
             {
-                var shared = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == null);
-                if (shared != null) return shared;
-                shared = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
-                await WaitForDesktopReadyAsync(shared, ct);
-                return shared;
+                if (sharedAllocation)
+                {
+                    var existing = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == null);
+                    if (existing != null) record = existing;
+                    else
+                    {
+                        record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
+                        created = true;
+                    }
+                }
+                else
+                {
+                    var existing = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == agentID);
+                    if (existing != null) record = existing;
+                    else
+                    {
+                        record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
+                        created = true;
+                    }
+                }
             }
+            finally { provisionGate.Release(); }
 
-            var mine = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == agentID);
-            if (mine != null) return mine;
-            mine = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
-            await WaitForDesktopReadyAsync(mine, ct);
-            return mine;
+            // Readiness probing is deliberately outside the provisioning lock: a terminal call
+            // may use the newly started container while a visual caller waits for Xvfb/x11vnc.
+            if (created && requireVisualReady) await WaitForDesktopReadyAsync(record, ct);
+            return record;
         }
 
         /// <summary>
-        /// Blocks until a freshly created container's desktop server accepts an RFB handshake, or a
+        /// Blocks until a freshly created container returns a complete framebuffer, or a
         /// bounded budget elapses. Each connect attempt already fails fast (VncTransport's handshake
         /// timeout), so this is a short retry loop, not an open-ended wait. Never throws — if the
         /// desktop never comes up, the first tool call surfaces the clear per-connect error instead.
@@ -131,7 +170,12 @@ namespace Omnipotent.Services.Projects.Containers
             var transport = GetTransport(record);
             for (int attempt = 1; DateTime.UtcNow < deadline; attempt++)
             {
-                try { await transport.ConnectAsync(ct); log($"Desktop {record.ContainerID[..12]} ready after {attempt} probe(s)."); return; }
+                try
+                {
+                    await transport.CaptureFrameAsync(ct);
+                    log($"Desktop {record.ContainerID[..12]} returned its first frame after {attempt} probe(s).");
+                    return;
+                }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
                 catch (Exception ex)
                 {
@@ -151,6 +195,8 @@ namespace Omnipotent.Services.Projects.Containers
 
         private VncTransport GetTransport(DesktopContainerRecord record)
         {
+            if (transports.TryGetValue(record.ContainerID, out var existing) && existing.Port != record.VncHostPort)
+                if (transports.TryRemove(new KeyValuePair<string, VncTransport>(record.ContainerID, existing))) existing.Dispose();
             return transports.GetOrAdd(record.ContainerID,
                 _ => new VncTransport(vncHost, record.VncHostPort, log));
         }
@@ -158,8 +204,16 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>Tears down a container and its transport (agent retired / project completed).</summary>
         public async Task DisposeDesktopAsync(string containerID, CancellationToken ct = default)
         {
+            var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID);
             if (transports.TryRemove(containerID, out var t)) t.Dispose();
             if (actionGates.TryRemove(containerID, out var gate)) gate.Dispose();
+            if (record != null)
+            {
+                string ownerKey = record.AgentID == null
+                    ? $"{record.ProjectID}/shared"
+                    : $"{record.ProjectID}/{record.AgentID}";
+                if (provisioningGates.TryRemove(ownerKey, out var provisioningGate)) provisioningGate.Dispose();
+            }
             await orchestrator.StopContainerAsync(containerID, ct);
         }
 
@@ -170,7 +224,7 @@ namespace Omnipotent.Services.Projects.Containers
             foreach (var record in registry.ForProject(projectID))
             {
                 inputLock.Release(record.ContainerID, agentID);
-                if (transports.TryGetValue(record.ContainerID, out var transport))
+                if (transports.TryGetValue(record.ContainerID, out var transport) && transport.Connected)
                     try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
             }
         }

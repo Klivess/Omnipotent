@@ -843,6 +843,20 @@ namespace Omnipotent.Services.HostControl
 
             var raw = Str(a, "text") ?? string.Empty;
             var (resolved, used) = await substituter.ResolveAsync(raw);
+
+            // Also resolve {account:<service>/<field>} refs from the global shared account registry.
+            // An ambiguous/unknown ref fails the tool loudly rather than typing a literal token into a
+            // login form. Account names join `used` so typo-simulation stays hard-off below.
+            var registry = GetActiveServices()
+                .OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>()
+                .FirstOrDefault(s => s.IsServiceActive());
+            if (registry != null)
+            {
+                var acct = registry.TryResolveForTyping(resolved, "KliveAgent");
+                if (acct.Error != null) return ComputerToolResult.Fail($"type failed: {acct.Error}");
+                if (acct.Used.Count > 0) { resolved = acct.Text; used.AddRange(acct.Used.Select(n => "account:" + n)); }
+            }
+
             var redacted = substituter.Redact(raw);
 
             var prof = Human();

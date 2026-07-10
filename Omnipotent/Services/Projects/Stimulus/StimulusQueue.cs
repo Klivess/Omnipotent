@@ -35,10 +35,20 @@ namespace Omnipotent.Services.Projects.Stimulus
 
         // Pending (undelivered) supersession slots: "projectID|sourceKey" → envelope ID currently pending.
         private readonly ConcurrentDictionary<string, string> supersedePending = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, (bool succeeded, DateTime at)> earlyWakeOutcomes = new(StringComparer.Ordinal);
         private readonly object fileGate = new();
 
         /// <summary>Delivers a confirmed stimulus to its destination agent (its wake trigger). Set by the service.</summary>
+        public const string DiscardReceipt = "__discard__";
+
+        /// <summary>Legacy delivery callback retained for non-runner consumers/tests. Completion
+        /// acknowledges the envelope immediately.</summary>
         public Func<StimulusEnvelope, Task>? OnDeliver { get; set; }
+
+        /// <summary>Returns the durable wake ID that claimed the envelope, null when the
+        /// destination is temporarily unavailable, or <see cref="DiscardReceipt"/> when the
+        /// envelope can be permanently discarded.</summary>
+        public Func<StimulusEnvelope, Task<string?>>? OnClaim { get; set; }
 
         public StimulusQueue(Action<string> log)
         {
@@ -56,6 +66,7 @@ namespace Omnipotent.Services.Projects.Stimulus
             public StimulusEnvelope Envelope { get; set; } = new();
             public string DestinationAgentID { get; set; } = "commander";
             public bool Delivered { get; set; }
+            public string? ClaimedWakeID { get; set; }
         }
 
         /// <summary>
@@ -110,7 +121,7 @@ namespace Omnipotent.Services.Projects.Stimulus
                 if (string.IsNullOrWhiteSpace(lines[i])) continue;
                 QueueLine? ql = null;
                 try { ql = JsonConvert.DeserializeObject<QueueLine>(lines[i]); } catch { }
-                if (ql != null && !ql.Delivered && ql.Envelope.EnvelopeID == oldEnvelopeId)
+                if (ql != null && !ql.Delivered && string.IsNullOrEmpty(ql.ClaimedWakeID) && ql.Envelope.EnvelopeID == oldEnvelopeId)
                 {
                     lines[i] = JsonConvert.SerializeObject(new QueueLine { Envelope = newEnv, DestinationAgentID = dest, Delivered = false });
                     replaced = true;
@@ -134,7 +145,12 @@ namespace Omnipotent.Services.Projects.Stimulus
             string key = DestKey(projectID, agentID);
             return channels.GetOrAdd(key, _ =>
             {
-                var ch = Channel.CreateUnbounded<StimulusEnvelope>(new UnboundedChannelOptions { SingleReader = true });
+                var ch = Channel.CreateBounded<StimulusEnvelope>(new BoundedChannelOptions(256)
+                {
+                    SingleReader = true,
+                    SingleWriter = false,
+                    FullMode = BoundedChannelFullMode.Wait,
+                });
                 readers[key] = Task.Run(() => ReaderLoopAsync(projectID, agentID, ch));
                 return ch;
             });
@@ -153,9 +169,26 @@ namespace Omnipotent.Services.Projects.Stimulus
                         ClearSupersedePending(env);
                         continue;
                     }
-                    if (OnDeliver != null) await OnDeliver(env);
-                    MarkDelivered(env);
-                    ClearSupersedePending(env);
+                    string? receipt;
+                    if (OnClaim != null) receipt = await OnClaim(env);
+                    else if (OnDeliver != null) { await OnDeliver(env); receipt = DiscardReceipt; }
+                    else receipt = null;
+                    if (receipt == DiscardReceipt)
+                    {
+                        MarkDelivered(env);
+                        ClearSupersedePending(env);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(receipt))
+                    {
+                        MarkClaimed(env, receipt);
+                    }
+                    else
+                    {
+                        // Paused projects and busy agents retain the durable queue record. Requeue
+                        // with a small delay rather than acknowledging or spinning hot.
+                        await Task.Delay(TimeSpan.FromSeconds(2));
+                        await DispatchAsync(env, agentID);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -206,6 +239,93 @@ namespace Omnipotent.Services.Projects.Stimulus
             }
         }
 
+        private void MarkClaimed(StimulusEnvelope env, string wakeID)
+        {
+            string path = QueuePath(env.ProjectID, env.HookID);
+            lock (fileGate)
+            {
+                if (!File.Exists(path)) return;
+                var lines = File.ReadAllLines(path).ToList();
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    QueueLine? ql = null;
+                    try { ql = JsonConvert.DeserializeObject<QueueLine>(lines[i]); } catch { }
+                    if (ql?.Envelope.EnvelopeID != env.EnvelopeID) continue;
+                    ql.ClaimedWakeID = wakeID;
+                    lines[i] = JsonConvert.SerializeObject(ql);
+                    break;
+                }
+                string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                File.WriteAllLines(tmp, lines);
+                File.Move(tmp, path, overwrite: true);
+            }
+            // A very fast wake can finish between OnDeliver returning and this claim hitting disk.
+            // Reconcile any outcome that arrived in that narrow window.
+            if (earlyWakeOutcomes.TryGetValue(wakeID, out var outcome))
+                AcknowledgeWake(wakeID, outcome.succeeded);
+        }
+
+        /// <summary>Completes every stimulus claimed by a wake. Successful wakes remove their
+        /// queue records; failed/cancelled wakes clear the claim and redispatch them.</summary>
+        public void AcknowledgeWake(string wakeID, bool succeeded)
+        {
+            if (string.IsNullOrWhiteSpace(wakeID) || !Directory.Exists(dir)) return;
+            earlyWakeOutcomes[wakeID] = (succeeded, DateTime.UtcNow);
+            bool matched = false;
+            var retry = new List<(StimulusEnvelope env, string dest)>();
+            var completed = new List<StimulusEnvelope>();
+            lock (fileGate)
+            {
+                foreach (var path in Directory.EnumerateFiles(dir, "*.queue.jsonl"))
+                {
+                    bool changed = false;
+                    var kept = new List<string>();
+                    foreach (var raw in File.ReadAllLines(path))
+                    {
+                        QueueLine? ql = null;
+                        try { ql = JsonConvert.DeserializeObject<QueueLine>(raw); } catch { }
+                        if (ql == null) { changed = true; continue; }
+                        if (!string.Equals(ql.ClaimedWakeID, wakeID, StringComparison.Ordinal))
+                        {
+                            kept.Add(raw);
+                            continue;
+                        }
+
+                        matched = true;
+                        changed = true;
+                        if (succeeded)
+                        {
+                            completed.Add(ql.Envelope);
+                            continue;
+                        }
+
+                        ql.ClaimedWakeID = null;
+                        kept.Add(JsonConvert.SerializeObject(ql));
+                        retry.Add((ql.Envelope, ql.DestinationAgentID));
+                    }
+                    if (!changed) continue;
+                    if (kept.Count == 0) { try { File.Delete(path); } catch { } continue; }
+                    string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    File.WriteAllLines(tmp, kept);
+                    File.Move(tmp, path, overwrite: true);
+                }
+            }
+
+            foreach (var env in completed) ClearSupersedePending(env);
+            foreach (var item in retry) _ = DispatchAsync(item.env, item.dest);
+            if (matched) earlyWakeOutcomes.TryRemove(wakeID, out _);
+            else
+            {
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(10));
+                    if (earlyWakeOutcomes.TryGetValue(wakeID, out var pending) &&
+                        DateTime.UtcNow - pending.at >= TimeSpan.FromSeconds(10))
+                        earlyWakeOutcomes.TryRemove(wakeID, out _);
+                });
+            }
+        }
+
         /// <summary>
         /// Boot replay: re-dispatch every undelivered envelope from disk into its destination
         /// channel before normal operation resumes — the "replayed across restarts" guarantee.
@@ -224,6 +344,9 @@ namespace Omnipotent.Services.Projects.Stimulus
                     QueueLine? ql = null;
                     try { ql = JsonConvert.DeserializeObject<QueueLine>(raw); } catch { }
                     if (ql == null || ql.Delivered) continue;
+                    // A process restart means any claimed wake was interrupted. Clear the claim
+                    // by redispatching; the next successful wake will replace it and acknowledge.
+                    ql.ClaimedWakeID = null;
                     if (ql.Envelope.ExpiresAt.HasValue && ql.Envelope.ExpiresAt.Value < DateTime.UtcNow) continue; // stale
                     if (ql.Envelope.Durability == StimulusDurability.SupersedingByKey && !string.IsNullOrEmpty(ql.Envelope.SupersessionKey))
                         supersedePending[SupersedeKey(ql.Envelope.ProjectID, ql.Envelope.SupersessionKey)] = ql.Envelope.EnvelopeID;

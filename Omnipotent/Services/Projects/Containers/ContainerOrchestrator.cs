@@ -97,10 +97,10 @@ namespace Omnipotent.Services.Projects.Containers
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr >/dev/null 2>&1 &" },
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Firefox >/dev/null 2>&1 || (DISPLAY=:1 firefox-esr >/tmp/firefox.log 2>&1 &)" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr --new-window \"$1\" >/dev/null 2>&1 &", "desktop-control", uri.AbsoluteUri },
+                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr --new-tab \"$1\" >/tmp/firefox.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
                 ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
@@ -125,6 +125,69 @@ namespace Omnipotent.Services.Projects.Containers
             var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, ct);
             if (inspected.ExitCode != 0)
                 throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+        }
+
+        /// <summary>
+        /// Executes a shell command inside an already-owned desktop container. This is the
+        /// reliable counterpart to opening XFCE Terminal and typing the same command through
+        /// VNC: it runs as the container's unprivileged <c>agent</c> user, never on the host,
+        /// and receives no Docker socket or extra capability. The image intentionally grants
+        /// that user passwordless sudo, matching the authority it already has in the GUI.
+        /// </summary>
+        public async Task<ContainerShellResult> ExecuteDesktopShellAsync(
+            string containerID, string command, string? workingDirectory, int timeoutSeconds,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                throw new ArgumentException("Provide a non-empty command.", nameof(command));
+            if (command.Length > 65536)
+                throw new ArgumentException("Command is too large (maximum 65,536 characters).", nameof(command));
+
+            string workDir = ContainerShellResult.NormalizeWorkingDirectory(workingDirectory);
+            int seconds = Math.Clamp(timeoutSeconds, 1, 900);
+            using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            operationTimeout.CancelAfter(TimeSpan.FromSeconds(seconds + 15));
+            CancellationToken execCt = operationTimeout.Token;
+            try
+            {
+                var docker = await GetClientAsync();
+                var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Tty = false,
+                    User = "agent",
+                    WorkingDir = workDir,
+                    Env = new List<string> { "DISPLAY=:1" },
+                    // Keep the command as one argv value rather than interpolating it into a host-side
+                    // shell. GNU timeout owns a process group, so descendants do not outlive the bound.
+                    Cmd = new[]
+                    {
+                        "timeout", "--signal=TERM", "--kill-after=5s", $"{seconds}s",
+                        "bash", "-lc",
+                        "if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; exec bash -lc \"$1\"",
+                        "desktop-terminal", command,
+                    },
+                }, execCt);
+
+                using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                using var stdout = new BoundedCaptureStream(64 * 1024);
+                using var stderr = new BoundedCaptureStream(64 * 1024);
+                await output.CopyOutputToAsync(Stream.Null, stdout, stderr, execCt);
+                var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, execCt);
+                long exitCode = inspected.ExitCode;
+                return new ContainerShellResult(
+                    exitCode,
+                    stdout.GetText(),
+                    stderr.GetText(),
+                    TimedOut: exitCode == 124 || exitCode == 137,
+                    OutputTruncated: stdout.Truncated || stderr.Truncated);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested && operationTimeout.IsCancellationRequested)
+            {
+                return new ContainerShellResult(124, "", "Docker exec exceeded its bounded command window.",
+                    TimedOut: true, OutputTruncated: false);
+            }
         }
 
         /// <summary>True when <paramref name="imageTag"/> exists locally.</summary>

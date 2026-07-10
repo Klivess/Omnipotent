@@ -1,150 +1,211 @@
-using System.Collections.Concurrent;
+using Microsoft.Data.Sqlite;
+using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Services.Projects
 {
     /// <summary>
-    /// Minimal in-memory BM25 index over a project's event log, for the retrieval leg of
-    /// rehydrate-on-wake (§7: "recent events + retrieval (BM25/semantic) into the full log").
-    /// This is the per-project LEXICAL leg over the project's OWN log — deliberately cheap and
-    /// rebuilt lazily from the JSONL. Cross-project + semantic recall (other projects, KliveAgent
-    /// memory, Omniscience, docs, web) is provided separately by the KliveRAG service, injected into
-    /// the wake seed as a RELEVANT KNOWLEDGE block and available as the search_knowledge tool.
-    ///
-    /// Freshness: the index tails the event log via <see cref="EnsureFresh"/> (pull), and the
-    /// service also wires <see cref="ProjectEventLogStore.EventAppended"/> to <see cref="Ingest"/>
-    /// (push) so searches between wakes stay current without a rescan.
+    /// Disk-backed FTS5 retrieval over each project's complete event log. JSONL remains the
+    /// authoritative audit log; this SQLite database is a rebuildable search projection. Keeping
+    /// the projection on disk avoids retaining one object and term dictionary per event forever.
+    /// A contiguous per-project cursor makes out-of-order push delivery safe.
     /// </summary>
     public class ProjectRetrievalIndex
     {
-        private const double K1 = 1.2;
-        private const double B = 0.75;
-        /// <summary>Snippet stored per event for hydration into prompts; full text stays in the log.</summary>
         private const int SnippetChars = 400;
-
-        private sealed class Doc
-        {
-            public long Sequence;
-            public string EventID = "";
-            public string Type = "";
-            public DateTime Timestamp;
-            public string Snippet = "";
-            public Dictionary<string, int> TermFreqs = new(StringComparer.Ordinal);
-            public int Length;
-        }
-
-        private sealed class ProjectIndex
-        {
-            public readonly object Gate = new();
-            public long LastIngestedSequence;
-            public List<Doc> Docs = new();
-            public Dictionary<string, int> DocFreqs = new(StringComparer.Ordinal);
-            public long TotalLength;
-        }
-
         private readonly ProjectEventLogStore eventLog;
-        private readonly ConcurrentDictionary<string, ProjectIndex> indexes = new(StringComparer.Ordinal);
+        private readonly string connectionString;
+        private readonly object gate = new();
+
+        public record RetrievalHit(long Sequence, string EventID, string Type, DateTime Timestamp, string Snippet, double Score);
 
         public ProjectRetrievalIndex(ProjectEventLogStore eventLog)
         {
             this.eventLog = eventLog;
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "retrieval.sqlite");
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = path,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                Cache = SqliteCacheMode.Shared,
+            }.ToString();
+            EnsureSchema();
         }
 
-        /// <summary>A search hit: enough to render into a wake prompt without re-reading the log.</summary>
-        public record RetrievalHit(long Sequence, string EventID, string Type, DateTime Timestamp, string Snippet, double Score);
-
-        /// <summary>Pushes a single freshly-appended event into the index (wired to EventAppended).</summary>
         public void Ingest(ProjectEvent evt)
         {
-            var idx = indexes.GetOrAdd(evt.ProjectID, _ => new ProjectIndex());
-            lock (idx.Gate)
+            if (evt == null || string.IsNullOrWhiteSpace(evt.ProjectID) || evt.Sequence <= 0) return;
+            lock (gate)
             {
-                if (evt.Sequence <= idx.LastIngestedSequence) return;
-                IngestLocked(idx, evt);
+                using var conn = Open();
+                using var tx = conn.BeginTransaction();
+                Insert(conn, tx, evt);
+                AdvanceContiguousCursor(conn, tx, evt.ProjectID);
+                tx.Commit();
             }
         }
 
-        /// <summary>Tails any events appended since the last ingest (used before each search).</summary>
         public void EnsureFresh(string projectID)
         {
-            var idx = indexes.GetOrAdd(projectID, _ => new ProjectIndex());
-            lock (idx.Gate)
+            lock (gate)
             {
-                // Page through the log so a very long backlog doesn't get silently capped.
                 while (true)
                 {
-                    var newer = eventLog.ReadSince(projectID, idx.LastIngestedSequence, max: 2000);
+                    long cursor;
+                    using (var conn = Open()) cursor = GetCursor(conn, projectID);
+                    var newer = eventLog.ReadSince(projectID, cursor, max: 2000);
                     if (newer.Count == 0) break;
-                    foreach (var e in newer) IngestLocked(idx, e);
+
+                    using var write = Open();
+                    using var tx = write.BeginTransaction();
+                    foreach (var evt in newer) Insert(write, tx, evt);
+                    AdvanceContiguousCursor(write, tx, projectID);
+                    tx.Commit();
+                    if (newer.Count < 2000) break;
                 }
             }
         }
 
-        /// <summary>BM25 search over the project's ingested events, best-first.</summary>
         public List<RetrievalHit> Search(string projectID, string query, int topK = 12)
         {
             EnsureFresh(projectID);
-            var idx = indexes.GetOrAdd(projectID, _ => new ProjectIndex());
-            var queryTerms = Tokenize(query).Distinct().ToList();
-            if (queryTerms.Count == 0) return new List<RetrievalHit>();
+            var terms = Tokenize(query).Distinct(StringComparer.Ordinal).Take(24).ToList();
+            if (terms.Count == 0) return new();
+            string ftsQuery = string.Join(" OR ", terms.Select(t => $"\"{t.Replace("\"", "\"\"")}\""));
 
-            lock (idx.Gate)
+            lock (gate)
             {
-                int n = idx.Docs.Count;
-                if (n == 0) return new List<RetrievalHit>();
-                double avgLen = (double)idx.TotalLength / n;
-
-                var scored = new List<(Doc doc, double score)>();
-                foreach (var doc in idx.Docs)
+                using var conn = Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+SELECT e.sequence, e.event_id, e.type, e.timestamp_utc, e.snippet, bm25(project_event_fts) AS rank
+FROM project_event_fts
+JOIN project_events e ON e.id = project_event_fts.rowid
+WHERE project_event_fts MATCH $query AND e.project_id = $project
+ORDER BY rank
+LIMIT $limit;";
+                cmd.Parameters.AddWithValue("$query", ftsQuery);
+                cmd.Parameters.AddWithValue("$project", projectID);
+                cmd.Parameters.AddWithValue("$limit", Math.Clamp(topK, 1, 100));
+                using var reader = cmd.ExecuteReader();
+                var hits = new List<RetrievalHit>();
+                while (reader.Read())
                 {
-                    double score = 0;
-                    foreach (var term in queryTerms)
-                    {
-                        if (!doc.TermFreqs.TryGetValue(term, out int tf)) continue;
-                        idx.DocFreqs.TryGetValue(term, out int df);
-                        double idf = Math.Log(1 + (n - df + 0.5) / (df + 0.5));
-                        double denom = tf + K1 * (1 - B + B * doc.Length / Math.Max(1.0, avgLen));
-                        score += idf * (tf * (K1 + 1)) / denom;
-                    }
-                    if (score > 0) scored.Add((doc, score));
+                    double rank = reader.IsDBNull(5) ? 0 : reader.GetDouble(5);
+                    hits.Add(new RetrievalHit(
+                        reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
+                        DateTime.Parse(reader.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                        reader.GetString(4), -rank));
                 }
-
-                return scored
-                    .OrderByDescending(s => s.score)
-                    .Take(topK)
-                    .Select(s => new RetrievalHit(s.doc.Sequence, s.doc.EventID, s.doc.Type, s.doc.Timestamp, s.doc.Snippet, s.score))
-                    .ToList();
+                return hits;
             }
         }
 
-        private static void IngestLocked(ProjectIndex idx, ProjectEvent evt)
+        private SqliteConnection Open()
         {
-            string text = ComposeText(evt);
-            var tokens = Tokenize(text);
-            var doc = new Doc
+            var conn = new SqliteConnection(connectionString);
+            conn.Open();
+            return conn;
+        }
+
+        private void EnsureSchema()
+        {
+            lock (gate)
             {
-                Sequence = evt.Sequence,
-                EventID = evt.EventID,
-                Type = evt.Type,
-                Timestamp = evt.Timestamp,
-                Snippet = text.Length <= SnippetChars ? text : text[..SnippetChars] + "…",
-                Length = tokens.Count,
-            };
-            foreach (var t in tokens)
-                doc.TermFreqs[t] = doc.TermFreqs.TryGetValue(t, out int c) ? c + 1 : 1;
-            foreach (var term in doc.TermFreqs.Keys)
-                idx.DocFreqs[term] = idx.DocFreqs.TryGetValue(term, out int df) ? df + 1 : 1;
-            idx.Docs.Add(doc);
-            idx.TotalLength += doc.Length;
-            idx.LastIngestedSequence = evt.Sequence;
+                using var conn = Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS project_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    timestamp_utc TEXT NOT NULL,
+    body TEXT NOT NULL,
+    snippet TEXT NOT NULL,
+    UNIQUE(project_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS ix_project_events_sequence ON project_events(project_id, sequence);
+CREATE TABLE IF NOT EXISTS project_retrieval_cursors (
+    project_id TEXT PRIMARY KEY,
+    contiguous_sequence INTEGER NOT NULL DEFAULT 0
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS project_event_fts USING fts5(body, content='project_events', content_rowid='id');
+CREATE TRIGGER IF NOT EXISTS project_events_ai AFTER INSERT ON project_events BEGIN
+    INSERT INTO project_event_fts(rowid, body) VALUES (new.id, new.body);
+END;
+CREATE TRIGGER IF NOT EXISTS project_events_ad AFTER DELETE ON project_events BEGIN
+    INSERT INTO project_event_fts(project_event_fts, rowid, body) VALUES ('delete', old.id, old.body);
+END;";
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        private static void Insert(SqliteConnection conn, SqliteTransaction tx, ProjectEvent evt)
+        {
+            string body = ComposeText(evt);
+            string snippet = body.Length <= SnippetChars ? body : body[..SnippetChars] + "…";
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
+            cmd.CommandText = @"
+INSERT OR IGNORE INTO project_events(project_id, sequence, event_id, type, timestamp_utc, body, snippet)
+VALUES($project, $sequence, $event, $type, $timestamp, $body, $snippet);";
+            cmd.Parameters.AddWithValue("$project", evt.ProjectID);
+            cmd.Parameters.AddWithValue("$sequence", evt.Sequence);
+            cmd.Parameters.AddWithValue("$event", string.IsNullOrWhiteSpace(evt.EventID) ? $"seq-{evt.Sequence}" : evt.EventID);
+            cmd.Parameters.AddWithValue("$type", evt.Type ?? "");
+            cmd.Parameters.AddWithValue("$timestamp", evt.Timestamp.ToString("O"));
+            cmd.Parameters.AddWithValue("$body", body);
+            cmd.Parameters.AddWithValue("$snippet", snippet);
+            cmd.ExecuteNonQuery();
+        }
+
+        private static long GetCursor(SqliteConnection conn, string projectID)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT contiguous_sequence FROM project_retrieval_cursors WHERE project_id=$project;";
+            cmd.Parameters.AddWithValue("$project", projectID);
+            return cmd.ExecuteScalar() is long value ? value : 0;
+        }
+
+        private static void AdvanceContiguousCursor(SqliteConnection conn, SqliteTransaction tx, string projectID)
+        {
+            long cursor;
+            using (var get = conn.CreateCommand())
+            {
+                get.Transaction = tx;
+                get.CommandText = "SELECT contiguous_sequence FROM project_retrieval_cursors WHERE project_id=$project;";
+                get.Parameters.AddWithValue("$project", projectID);
+                cursor = get.ExecuteScalar() is long value ? value : 0;
+            }
+            while (true)
+            {
+                using var exists = conn.CreateCommand();
+                exists.Transaction = tx;
+                exists.CommandText = "SELECT 1 FROM project_events WHERE project_id=$project AND sequence=$sequence LIMIT 1;";
+                exists.Parameters.AddWithValue("$project", projectID);
+                exists.Parameters.AddWithValue("$sequence", cursor + 1);
+                if (exists.ExecuteScalar() == null) break;
+                cursor++;
+            }
+            using var upsert = conn.CreateCommand();
+            upsert.Transaction = tx;
+            upsert.CommandText = @"
+INSERT INTO project_retrieval_cursors(project_id, contiguous_sequence) VALUES($project, $cursor)
+ON CONFLICT(project_id) DO UPDATE SET contiguous_sequence=excluded.contiguous_sequence;";
+            upsert.Parameters.AddWithValue("$project", projectID);
+            upsert.Parameters.AddWithValue("$cursor", cursor);
+            upsert.ExecuteNonQuery();
         }
 
         private static string ComposeText(ProjectEvent evt)
         {
-            // Index what a human would search for: type, author, prose, tool name and a slice of payload.
             var parts = new List<string> { evt.Type, evt.Author, evt.Text };
             if (!string.IsNullOrWhiteSpace(evt.ToolName)) parts.Add(evt.ToolName);
             if (!string.IsNullOrWhiteSpace(evt.PayloadJson))
-                parts.Add(evt.PayloadJson.Length > 600 ? evt.PayloadJson[..600] : evt.PayloadJson);
+                parts.Add(evt.PayloadJson!.Length > 600 ? evt.PayloadJson[..600] : evt.PayloadJson);
             return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
         }
 
@@ -156,9 +217,9 @@ namespace Omnipotent.Services.Projects
             foreach (char c in text)
             {
                 if (char.IsLetterOrDigit(c)) current.Append(char.ToLowerInvariant(c));
-                else if (current.Length > 0) { Flush(); }
+                else Flush();
             }
-            if (current.Length > 0) Flush();
+            Flush();
             return tokens;
 
             void Flush()

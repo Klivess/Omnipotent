@@ -282,7 +282,11 @@ namespace Omnipotent.Services.Projects
             for (int attempt = 0; ; attempt++)
             {
                 try { File.Move(tmp, path, overwrite: true); break; }
-                catch (IOException) when (attempt < 5) { Thread.Sleep(15); }
+                catch (Exception ex) when (attempt < 5 &&
+                    (ex is IOException || ex is UnauthorizedAccessException))
+                {
+                    Thread.Sleep(15 * (attempt + 1));
+                }
             }
         }
     }

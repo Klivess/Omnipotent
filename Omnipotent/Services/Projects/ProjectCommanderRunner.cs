@@ -36,6 +36,10 @@ namespace Omnipotent.Services.Projects
         // The live wake's cancellation source per project, so Klives can halt an in-flight wake
         // (pause/archive) instead of waiting for it to run itself out.
         private readonly ConcurrentDictionary<string, CancellationTokenSource> activeWakeCts = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, object> wakeGates = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, bool> cancelBeforeStart = new(StringComparer.Ordinal);
+
+        private object WakeGate(string projectID) => wakeGates.GetOrAdd(projectID, _ => new object());
 
         public ProjectCommanderRunner(Projects parent)
         {
@@ -72,6 +76,14 @@ namespace Omnipotent.Services.Projects
             {
                 try { cts.Cancel(); return true; } catch { return false; }
             }
+            lock (WakeGate(projectID))
+            {
+                if (!string.IsNullOrWhiteSpace(parent.Digests.GetDigest(projectID).ActiveWakeID))
+                {
+                    cancelBeforeStart[projectID] = true;
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -81,14 +93,26 @@ namespace Omnipotent.Services.Projects
         /// project, the trigger is queued and re-wakes the Commander when the active wake ends
         /// (returns null) — one wake at a time, per §7, but no stimulus is ever dropped.
         /// </summary>
-        public string? Wake(Project project, string triggerDescription)
+        public string? Wake(Project project, string triggerDescription, bool queueIfBusy = true)
+        {
+            // Planning projects wake too (to draft the Grand Plan and field Klives' messages);
+            // execution tools stay gated until the plan is approved and the project flips Active.
+            if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return null;
+            lock (WakeGate(project.ProjectID))
+                return WakeLocked(project, triggerDescription, queueIfBusy);
+        }
+
+        private string? WakeLocked(Project project, string triggerDescription, bool queueIfBusy)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
             if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID))
             {
+                if (queueIfBusy)
+                {
                 var q = pendingTriggers.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<string>());
                 if (q.Count < MaxPendingTriggers && !q.Contains(triggerDescription))
                     q.Enqueue(triggerDescription);
+                }
                 return null; // already awake — queued for the follow-up wake
             }
 
@@ -124,6 +148,7 @@ namespace Omnipotent.Services.Projects
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
             using var cts = new CancellationTokenSource();
             activeWakeCts[projectID] = cts; // registered so Klives can halt this wake
+            if (cancelBeforeStart.TryRemove(projectID, out _)) cts.Cancel();
 
             try
             {
@@ -159,10 +184,10 @@ namespace Omnipotent.Services.Projects
                     // turn boundary so the pause actually stops the loop BEFORE the next (costly) LLM call
                     // — otherwise the in-flight wake overshoots the budget to natural completion.
                     var freshStatus = parent.Store.GetProject(projectID)?.Status;
-                    if (freshStatus == ProjectStatus.BudgetPaused)
+                    if (freshStatus is not (ProjectStatus.Active or ProjectStatus.Planning))
                     {
-                        outcomeText = "Wake stopped — token budget exhausted (project paused pending a budget increase).";
-                        goto done;
+                        outcomeText = $"Wake stopped because project status is {freshStatus?.ToString() ?? "missing"}.";
+                        break;
                     }
 
                     // Fast steering: fold in any Klives messages that arrived since the last turn so
@@ -179,7 +204,16 @@ namespace Omnipotent.Services.Projects
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake} calls). Stop calling tools and reply with a concise status: what you did this wake and what the next wake should do.");
 
-                    var resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
+                    var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
+                    if (budgetLease == null)
+                    {
+                        outcomeText = "Wake stopped before the next model call because no token budget remained.";
+                        goto done;
+                    }
+                    KliveLLM.KliveLLM.KliveLLMResponse resp;
+                    try
+                    {
+                    resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
@@ -193,6 +227,9 @@ namespace Omnipotent.Services.Projects
                         wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
                         await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                     }
+
+                    }
+                    finally { await budgetLease.DisposeAsync(); }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
@@ -282,10 +319,13 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     // Record stuck-loop trips into the digest for the watchdog (P7), clear the active wake.
-                    var digest = parent.Digests.GetDigest(projectID);
-                    digest.RecentStuckLoopTrips = stuckTrips;
-                    if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
-                    parent.Digests.SaveDigest(digest);
+                    lock (WakeGate(projectID))
+                    {
+                        var digest = parent.Digests.GetDigest(projectID);
+                        digest.RecentStuckLoopTrips = stuckTrips;
+                        if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
+                        parent.Digests.SaveDigest(digest);
+                    }
 
                     // Per-wake cost attribution: the ledger is cumulative, so stamp this wake's own
                     // token spend + cost onto its closing event for the timeline/reports. wakeCostUsd is
@@ -308,6 +348,7 @@ namespace Omnipotent.Services.Projects
 
                 // Deregister this wake's cancellation source (only if it's still ours).
                 activeWakeCts.TryRemove(new KeyValuePair<string, CancellationTokenSource>(projectID, cts));
+                parent.StimulusQueue.AcknowledgeWake(wakeID, outcome == ProjectEventTypes.WakeCompleted);
                 DrainPendingTriggers(projectID);
             }
         }
@@ -325,7 +366,7 @@ namespace Omnipotent.Services.Projects
                 pendingTriggers.TryRemove(projectID, out var queued);
                 steerQueue.TryRemove(projectID, out var leftoverSteers);
                 var refreshed = parent.Store.GetProject(projectID);
-                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return; // halted/archived: drop, events stay logged
+                if (refreshed == null || refreshed.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return; // halted/archived: drop, events stay logged
 
                 var missed = new List<string>();
                 if (queued != null) missed.AddRange(queued);
@@ -355,9 +396,13 @@ namespace Omnipotent.Services.Projects
             {
                 try { oldCts.Cancel(); } catch { }
             }
-            var digest = parent.Digests.GetDigest(project.ProjectID);
-            digest.ActiveWakeID = null; // abandon the presumed-stuck wake's marker
-            parent.Digests.SaveDigest(digest);
+            lock (WakeGate(project.ProjectID))
+            {
+                var digest = parent.Digests.GetDigest(project.ProjectID);
+                digest.ActiveWakeID = null;
+                parent.Digests.SaveDigest(digest);
+                activeWakeCts.TryRemove(project.ProjectID, out _);
+            }
             string wakeID = Wake(project, $"[watchdog force-wake] {reason}") ?? "";
             return wakeID;
         }

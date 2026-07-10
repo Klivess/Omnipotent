@@ -98,6 +98,30 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task PlanningProject_BlockedOnPlanGate_IsNotDiagnosedAsNoProgress()
+        {
+            // A project in PLANNING that has submitted its Grand Plan and is waiting on Klives shows
+            // no tool calls across recent wakes — but that's "waiting on Klives", not a stall, so the
+            // watchdog must not force-wake it (which would cancel the plan gate).
+            var (svc, pid) = NewProjectService();
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.Gates))!
+                .SetValue(svc, new ProjectGateManager(svc.EventLog, _ => { }));
+            var p = svc.Store.GetProject(pid)!;
+            p.Status = ProjectStatus.Planning;
+            svc.Store.SaveProject(p);
+            for (int i = 0; i < 3; i++) Wake(svc, pid, DateTime.UtcNow.AddMinutes(-3 + i));
+
+            // Open a pending "plan" gate (never resolved) — the Commander is blocked here.
+            _ = svc.Gates.OpenGateAndWaitAsync(
+                new ProjectGate { ProjectID = pid, Kind = "plan", Title = "Grand Plan v1" }, CancellationToken.None);
+            await Task.Delay(20);
+
+            var wd = new ProjectWatchdog(svc, _ => { });
+            var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
+            if (diag != null) Assert.DoesNotContain("No progress", diag);
+        }
+
+        [Fact]
         public void StuckLoopTrips_AreDiagnosedAsStall()
         {
             var (svc, pid) = NewProjectService();

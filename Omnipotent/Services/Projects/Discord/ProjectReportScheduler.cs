@@ -52,7 +52,7 @@ namespace Omnipotent.Services.Projects.Discord
 
             foreach (var project in parent.Store.ListProjects())
             {
-                if (project.Status != ProjectStatus.Active || project.DiscordChannelID == 0) continue;
+                if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning) || project.DiscordChannelID == 0) continue;
 
                 if (now.Hour == MorningHourUtc && (!lastMorning.TryGetValue(project.ProjectID, out var m) || m != today))
                 {

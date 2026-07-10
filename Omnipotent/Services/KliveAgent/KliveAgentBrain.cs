@@ -136,6 +136,10 @@ namespace Omnipotent.Services.KliveAgent
             var knowledgeTask = agentService.SearchKnowledgeForPromptAsync(
                 userMessage, KliveAgentContextBudget.KnowledgeBudget);
 
+            // Known accounts from the global shared registry, so you reuse them before creating
+            // duplicates. Fail-soft (returns "" if the registry is absent).
+            var accountsTask = agentService.DescribeAccountsForPromptAsync(KliveAgentContextBudget.KnownAccountsBudget);
+
             // Build token-budgeted, task-personalised repo map (only when the task has code signals).
             var repoMap = string.Empty;
             try
@@ -289,6 +293,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
                 sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
                 sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
+                sb.AppendLine("- ACCOUNTS ON EXTERNAL SERVICES: use the GLOBAL shared account registry, not encrypted-memory. Call account_list BEFORE signing up anywhere — an account may already exist (created by a Project). After creating one, account_register it (service, username, email, secrets); prefer a dedicated <x>@klive.dev address (KliveMail is catch-all, so verification/reset mail arrives there). Type its secrets as {account:<service>/<field>} (or {account:<service>/<username>/<field>} if several exist); the harness substitutes at keystroke time and you never see the value.");
                 sb.AppendLine("- WAITING is not hanging: computer_navigate already waits for load; for other slow steps use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");
                 sb.AppendLine("- HUMAN-LIKE INPUT IS AUTOMATIC: the cursor already moves in natural curved, eased paths and typing has a realistic cadence — you don't manage any of that, just give target coordinates and text normally. This lowers (not eliminates) bot-detection: if a real captcha / verification still appears, call request_human — don't try to defeat it by hammering retries.");
                 sb.AppendLine("- GAMES: you CAN play them. Keys are sent as hardware scan codes, so games (Spelunky 2, emulators, etc.) DO receive them — use computer_key for menus/taps (e.g. computer_key({key:\"down\", repeats:3}) to move a menu cursor, computer_key({key:\"enter\"}) to confirm; raise holdMs to ~120 if a press doesn't take). HOLD movement with computer_key_down(\"right\")/…(\"z\"), screenshot to see the result, then computer_key_up — don't expect a single tap to walk far. For 3D/FPS look/aim use computer_mouse_move_relative({dx,dy}) (absolute computer_move won't turn the camera). FOCUS the game window first (computer_focus_window), and prefer BORDERLESS/windowed mode — true exclusive-fullscreen can capture as black and won't take background input. Read the on-screen control hints; if a game truly needs a gamepad it can't be driven yet — say so.");
@@ -326,6 +331,16 @@ namespace Omnipotent.Services.KliveAgent
             {
                 sb.AppendLine();
                 sb.Append(knowledgeSection);
+            }
+
+            // Known accounts (global shared registry) — task-volatile, below the cache breakpoint.
+            var accountsSection = string.Empty;
+            try { accountsSection = await accountsTask; } catch { /* best-effort */ }
+            if (!string.IsNullOrWhiteSpace(accountsSection))
+            {
+                sb.AppendLine();
+                sb.AppendLine("[Known Accounts] (global shared registry — account_list for full details, account_register before any new signup)");
+                sb.Append(accountsSection);
             }
 
             // No hard truncation here: the system prompt is composed of bounded, deliberate
@@ -460,7 +475,8 @@ namespace Omnipotent.Services.KliveAgent
         /// Combined with MemoryToolNames in IsNonScriptTool.</summary>
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
-            "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch"
+            "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
+            "account_list", "account_register"
         };
 
         /// <summary>Computer-use ("host control") tools: dispatched outside Roslyn to HostControlManager,
@@ -497,7 +513,8 @@ namespace Omnipotent.Services.KliveAgent
         {
             "grep" or "read_file" or "list_directory" or "get_global_path"
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
-                or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch" => true,
+                or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch"
+                or "account_list" => true,
             _ => false
         };
 
@@ -645,6 +662,24 @@ namespace Omnipotent.Services.KliveAgent
                     new { type = "object", properties = new {
                         url = new { type = "string", description = "The absolute http(s) URL to fetch." }
                     }, required = new[] { "url" } }),
+
+                Tool("account_list",
+                    "List accounts in the GLOBAL shared registry (every Project and you share it). ALWAYS call this before signing up on ANY external service — an account may already exist (created by another project). Shows service, username, email, status, owners, and the {account:...} refs to type its secrets. Secret values are never shown.",
+                    new { type = "object", properties = new {
+                        service = new { type = "string", description = "Optional service filter, e.g. \"github.com\"." }
+                    }, required = Array.Empty<string>() }),
+
+                Tool("account_register",
+                    "Record an account you created on an external service into the GLOBAL shared registry so no project re-creates it. Prefer a dedicated <something>@klive.dev email (KliveMail is catch-all; verification/reset mail arrives there). Secrets are stored encrypted and NEVER shown back — type them as {account:<service>/<field>}. If the service already has an account this returns it and registers nothing unless allowDuplicate=true with a reason.",
+                    new { type = "object", properties = new {
+                        service = new { type = "string", description = "Service name or URL, e.g. \"github.com\"." },
+                        username = new { type = "string", description = "The account's username/login." },
+                        email = new { type = "string", description = "Email used, ideally a dedicated <x>@klive.dev address." },
+                        description = new { type = "string", description = "What this account is for." },
+                        secrets = new { type = "object", description = "Named secrets to store encrypted, e.g. {\"password\":\"…\",\"apiKey\":\"…\"}.", additionalProperties = new { type = "string" } },
+                        allowDuplicate = new { type = "boolean", description = "Set true ONLY to intentionally create a second account for a service that already has one." },
+                        reason = new { type = "string", description = "Required when allowDuplicate=true: why a separate account is needed." }
+                    }, required = new[] { "service", "username" } }),
 
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
@@ -839,6 +874,19 @@ namespace Omnipotent.Services.KliveAgent
                     var url = Str("url");
                     if (string.IsNullOrWhiteSpace(url)) return "Error: 'url' is required.";
                     return await globals.WebFetch(url);
+                }
+                case "account_list":
+                    return await globals.ListAccounts(Str("service"));
+                case "account_register":
+                {
+                    var service = Str("service"); var username = Str("username");
+                    if (string.IsNullOrWhiteSpace(service) || string.IsNullOrWhiteSpace(username))
+                        return "Error: 'service' and 'username' are both required.";
+                    var secrets = new Dictionary<string, string>();
+                    if (hasArgs && root.TryGetProperty("secrets", out var se) && se.ValueKind == System.Text.Json.JsonValueKind.Object)
+                        foreach (var p in se.EnumerateObject())
+                            secrets[p.Name] = p.Value.ValueKind == System.Text.Json.JsonValueKind.String ? (p.Value.GetString() ?? "") : p.Value.ToString();
+                    return await globals.RegisterAccount(service, username, Str("email"), secrets, Str("description"), BoolOr("allowDuplicate", false), Str("reason"));
                 }
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));

@@ -62,6 +62,10 @@ namespace Omnipotent.Tests.Projects
             var digests = new ProjectDigestStore(_ => { });
             var subAgents = new ProjectSubAgentManager(store, log);
             var gates = new ProjectGateManager(log, _ => { });
+            gates.GateOpened += gate => gates.ResolveGate(
+                gate.ProjectID,
+                gate.GateID,
+                new GateResolution(GateDecision.Approve, "Approved by the work-tool test fixture.", "test"));
             var fetcher = new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { });
             var budget = new ProjectBudgetLedger(store, log, fetcher, _ => { });
             var vault = new ProjectVault(_ => { });

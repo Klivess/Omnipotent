@@ -32,6 +32,7 @@ namespace Omnipotent.Services.Projects
             "vault_save", "vault_list", "request_human",
             "update_plan", "report_progress",
             "update_observable", "list_observables",
+            "account_register", "account_list", "account_update",
             "recall_memories", "save_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
         };
@@ -40,6 +41,10 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
             "complete_project", "request_budget_increase",
+            // Councils and the Grand Plan are the Commander's strategic instruments — sub-agents
+            // execute under the plan, they don't set or revise it. (These are also absent from
+            // TextTierTools, so IsToolAllowed already blocks them; this makes the intent explicit.)
+            "convene_council", "submit_grand_plan", "amend_grand_plan", "get_grand_plan",
         };
 
         /// <summary>The full set of computer-use tools; require a container desktop (video tier).</summary>
@@ -50,6 +55,7 @@ namespace Omnipotent.Services.Projects
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
             "computer_wait", "computer_open_browser", "computer_navigate", "computer_focus_window", "computer_launch_app",
+            "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };
 

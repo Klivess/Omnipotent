@@ -106,6 +106,34 @@ namespace Omnipotent.Services.KliveAgent
                 .OfType<Omnipotent.Services.KliveRAG.KliveRAG>()
                 .FirstOrDefault(s => s.IsServiceActive());
 
+        private Omnipotent.Services.AccountRegistry.AccountRegistry? GetAccountRegistry()
+            => agentService?.GetActiveServices()
+                .OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>()
+                .FirstOrDefault(s => s.IsServiceActive());
+
+        /// <summary>List accounts in the GLOBAL shared registry (all projects + KliveAgent). ALWAYS call
+        /// before signing up on any service — an account may already exist. Metadata + {account:...} refs
+        /// only; secret values are never shown.</summary>
+        public async Task<string> ListAccounts(string? service = null)
+        {
+            var reg = GetAccountRegistry();
+            if (reg == null) return "Account registry unavailable.";
+            try { return await reg.DescribeAccountsAsync("KliveAgent", service); }
+            catch (Exception ex) { return $"Account list failed: {ex.Message}"; }
+        }
+
+        /// <summary>Record an account you created on an external service into the GLOBAL shared registry so
+        /// no project re-creates it. Secrets are encrypted and never shown back; reference them as
+        /// {account:&lt;service&gt;/&lt;field&gt;}. Duplicate on a service is refused unless allowDuplicate=true + reason.</summary>
+        public async Task<string> RegisterAccount(string service, string username, string? email,
+            Dictionary<string, string>? secrets, string? description = null, bool allowDuplicate = false, string? reason = null)
+        {
+            var reg = GetAccountRegistry();
+            if (reg == null) return "Account registry unavailable.";
+            try { return await reg.RegisterAccountAsync(service, username, email, secrets, description, "KliveAgent", "KliveAgent", allowDuplicate, reason); }
+            catch (Exception ex) { return $"Account register failed: {ex.Message}"; }
+        }
+
         /// <summary>Semantic + lexical search across Klives' whole knowledge base (Projects, KliveAgent memory,
         /// Omniscience, repo docs, cached web). Returns cited results; follow up with ReadKnowledgeDoc(docId).
         /// Set includeMessages to also search Omniscience's raw message corpus.</summary>

@@ -1,7 +1,10 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using Omnipotent.Services.Projects.Stimulus;
+using System.Collections.Concurrent;
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using static Omnipotent.Profiles.KMProfileManager;
 
 namespace Omnipotent.Services.Projects
@@ -18,6 +21,9 @@ namespace Omnipotent.Services.Projects
     public class ProjectsRoutes
     {
         private readonly Projects parent;
+        private readonly ConcurrentDictionary<string, Queue<DateTime>> webhookRateWindows = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, DateTime> webhookDeliveryIds = new(StringComparer.Ordinal);
+        private const int WebhookRequestsPerMinute = 60;
 
         private static readonly JsonSerializerSettings CamelCase = new()
         {
@@ -69,6 +75,13 @@ namespace Omnipotent.Services.Projects
                         return;
                     }
 
+                    if (!double.IsFinite(tokenBudget) || !double.IsFinite(moneyBudget) || !double.IsFinite(moneyThreshold) ||
+                        moneyBudget < 0 || moneyThreshold < 0 || agentCap < 1)
+                    {
+                        await req.ReturnResponse("budgets must be finite/non-negative and subAgentCap must be at least 1", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
                     // Optional per-project settings configured on the new-project page (model routing,
                     // vision/containers, desktop image), applied at creation before the first wake.
                     Dictionary<string, string>? settingsPatch = null;
@@ -104,6 +117,7 @@ namespace Omnipotent.Services.Projects
                     // Halt the in-flight wake too, so "pause" stops work promptly rather than only
                     // preventing the NEXT wake (item 1: halt progression).
                     bool halted = parent.CommanderRunner.CancelActiveWake(project.ProjectID);
+                    parent.SubAgentRunner.CancelProject(project.ProjectID);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -125,6 +139,7 @@ namespace Omnipotent.Services.Projects
                     project!.Status = ProjectStatus.Archived;
                     parent.Store.SaveProject(project);
                     parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
+                    parent.SubAgentRunner.CancelProject(project.ProjectID);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -214,9 +229,12 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("tokenBudgetUsd must be > 0 — a Project is a goal AND a budget", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    if (moneyBudget is < 0 || moneyThreshold is < 0 || agentCap is < 1)
+                    if ((tokenBudget.HasValue && !double.IsFinite(tokenBudget.Value)) ||
+                        (moneyBudget.HasValue && !double.IsFinite(moneyBudget.Value)) ||
+                        (moneyThreshold.HasValue && !double.IsFinite(moneyThreshold.Value)) ||
+                        moneyBudget is < 0 || moneyThreshold is < 0 || agentCap is < 1)
                     {
-                        await req.ReturnResponse("moneyBudgetUsd/moneyAutonomousThresholdUsd must be ≥ 0 and subAgentCap ≥ 1", code: HttpStatusCode.BadRequest);
+                        await req.ReturnResponse("budgets must be finite, tokenBudgetUsd must be > 0, money limits must be ≥ 0, and subAgentCap ≥ 1", code: HttpStatusCode.BadRequest);
                         return;
                     }
 
@@ -237,7 +255,9 @@ namespace Omnipotent.Services.Projects
                     bool withinBudget = parent.Budget.NotifyBudgetChanged(project!.ProjectID);
                     if (project.Status == ProjectStatus.BudgetPaused && withinBudget && tokenBudget.HasValue)
                     {
-                        project.Status = ProjectStatus.Active;
+                        // Return to where it was paused — a never-approved plan resumes to Planning.
+                        project.Status = parent.GrandPlans.HasApprovedPlan(project.ProjectID)
+                            ? ProjectStatus.Active : ProjectStatus.Planning;
                         parent.Store.SaveProject(project);
                         changes.Add("project resumed from budget-pause");
                     }
@@ -260,7 +280,24 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    project!.Status = ProjectStatus.Active;
+                    if (project!.Status == ProjectStatus.Completed)
+                    {
+                        await req.ReturnResponse("completed projects cannot be resumed", code: HttpStatusCode.Conflict);
+                        return;
+                    }
+                    if (project.Status == ProjectStatus.Archived)
+                    {
+                        await req.ReturnResponse("unarchive the project before resuming it", code: HttpStatusCode.Conflict);
+                        return;
+                    }
+                    if (project.Status == ProjectStatus.BudgetPaused && !parent.Budget.IsWithinTokenBudget(project.ProjectID))
+                    {
+                        await req.ReturnResponse("raise the token budget above current spend before resuming", code: HttpStatusCode.Conflict);
+                        return;
+                    }
+                    // A project paused mid-planning resumes to Planning (the Grand Plan gate still stands).
+                    bool wasPlanning = !parent.GrandPlans.HasApprovedPlan(project.ProjectID);
+                    project!.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
                     parent.Store.SaveProject(project);
                     parent.EventLog.Append(new ProjectEvent
                     {
@@ -269,6 +306,9 @@ namespace Omnipotent.Services.Projects
                         Author = "klives",
                         Text = "Project resumed by Klives.",
                     });
+                    parent.CommanderRunner.Wake(project, wasPlanning
+                        ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
+                        : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -401,6 +441,75 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // ── Councils (adversarial deliberation transcripts) ──
+            await parent.CreateAPIRoute("/projects/councils", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var list = parent.Councils.List(project!.ProjectID).Select(c => new
+                    {
+                        c.CouncilID,
+                        c.Topic,
+                        c.Purpose,
+                        c.Urgency,
+                        Status = c.Status.ToString(),
+                        c.Roles,
+                        c.Model,
+                        StatementCount = c.Statements.Count,
+                        c.TotalCostUsd,
+                        c.CreatedAt,
+                        c.CompletedAt,
+                        c.Error,
+                        VerdictExcerpt = string.IsNullOrEmpty(c.VerdictText) ? "" :
+                            (c.VerdictText.Length <= 300 ? c.VerdictText : c.VerdictText[..300] + "…"),
+                    }).ToList();
+                    await req.ReturnResponse(Json(list));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/councils/get", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string councilID = req.userParameters?.Get("councilID") ?? "";
+                    var council = parent.Councils.Get(project!.ProjectID, councilID);
+                    if (council == null) { await req.ReturnResponse("no such council", code: HttpStatusCode.NotFound); return; }
+                    await req.ReturnResponse(Json(council));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // ── Grand Plan (the approved strategic north star + version history) ──
+            await parent.CreateAPIRoute("/projects/grandplan", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var doc = parent.GrandPlans.Get(project!.ProjectID);
+                    var current = parent.GrandPlans.GetCurrentApproved(project.ProjectID);
+                    await req.ReturnResponse(Json(new
+                    {
+                        current,
+                        versions = doc.Versions.OrderByDescending(v => v.Version).Select(v => new
+                        {
+                            v.Version,
+                            v.Markdown,
+                            v.Summary,
+                            v.ChangeNote,
+                            v.Material,
+                            Status = v.Status.ToString(),
+                            v.KlivesComment,
+                            v.SubmittedAt,
+                            v.ResolvedAt,
+                        }).ToList(),
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
             await parent.CreateAPIRoute("/projects/containers", async req =>
             {
@@ -526,6 +635,21 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("decision must be Approve, Deny, or Discuss", code: HttpStatusCode.BadRequest);
                         return;
                     }
+                    if (decision == GateDecision.Discuss)
+                    {
+                        string discussion = string.IsNullOrWhiteSpace(comment)
+                            ? $"I want to discuss the pending approval: {gateID}."
+                            : comment;
+                        bool opened = parent.Gates.BeginDiscussion(project!.ProjectID, gateID, discussion);
+                        if (!opened)
+                        {
+                            await req.ReturnResponse(Json(new { ok = false, pending = false }));
+                            return;
+                        }
+                        parent.MessageProject(project!.ProjectID, discussion);
+                        await req.ReturnResponse(Json(new { ok = true, pending = true }));
+                        return;
+                    }
                     bool ok = parent.Gates.ResolveGate(project!.ProjectID, gateID, new GateResolution(decision, comment, "klives"));
                     await req.ReturnResponse(Json(new { ok }));
                 }
@@ -550,6 +674,7 @@ namespace Omnipotent.Services.Projects
                             h.SourceSpecJson,
                             h.RecognitionCriterion,
                             h.DestinationAgentID,
+                            IngressToken = h.SourceKind == "webhook" ? h.IngressToken : null,
                             h.Priority,
                             h.Durability,
                             h.Enabled,
@@ -595,6 +720,24 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            await parent.CreateAPIRoute("/projects/hooks/token/rotate", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string hookID = req.userParameters?.Get("hookID") ?? "";
+                    if (string.IsNullOrWhiteSpace(hookID) && !string.IsNullOrWhiteSpace(req.userMessageContent))
+                    {
+                        try { hookID = (string?)Newtonsoft.Json.Linq.JObject.Parse(req.userMessageContent)["hookID"] ?? ""; }
+                        catch { }
+                    }
+                    string token = parent.Hooks.RotateIngressToken(project!.ProjectID, hookID);
+                    await req.ReturnResponse(Json(new { hookID, ingressToken = token }));
+                }
+                catch (InvalidOperationException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.NotFound); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // ── Artifacts (screenshots/clips referenced by timeline events) ──
             await parent.CreateAPIRoute("/projects/artifacts/get", async req =>
             {
@@ -633,11 +776,65 @@ namespace Omnipotent.Services.Projects
                 {
                     string projectID = req.userParameters?.Get("projectID") ?? "";
                     string hookID = req.userParameters?.Get("hookID") ?? "";
+                    var hook = parent.Hooks.Get(projectID, hookID);
+                    if (hook == null || hook.SourceKind != "webhook")
+                    {
+                        await req.ReturnResponse("unknown webhook", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    string suppliedToken = req.req?.Headers?["X-Project-Hook-Token"]
+                        ?? req.userParameters?.Get("token") ?? "";
+                    if (!SecureEquals(suppliedToken, hook.IngressToken))
+                    {
+                        await req.ReturnResponse("invalid webhook token", code: HttpStatusCode.Unauthorized);
+                        return;
+                    }
+                    if (!AllowWebhookRequest(projectID + "/" + hookID))
+                    {
+                        await req.ReturnResponse("webhook rate limit exceeded", code: HttpStatusCode.TooManyRequests);
+                        return;
+                    }
+                    string? deliveryID = req.req?.Headers?["X-Webhook-Delivery"];
+                    if (!string.IsNullOrWhiteSpace(deliveryID) && !AcceptDeliveryID(projectID, hookID, deliveryID))
+                    {
+                        await req.ReturnResponse(Json(new { accepted = true, duplicate = true }));
+                        return;
+                    }
                     await parent.Adapters.IngestForHookAsync(projectID, hookID, req.userMessageContent ?? "");
                     await req.ReturnResponse(Json(new { accepted = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Guest);
+        }
+
+        private bool AllowWebhookRequest(string key)
+        {
+            var queue = webhookRateWindows.GetOrAdd(key, _ => new Queue<DateTime>());
+            lock (queue)
+            {
+                DateTime cutoff = DateTime.UtcNow.AddMinutes(-1);
+                while (queue.Count > 0 && queue.Peek() < cutoff) queue.Dequeue();
+                if (queue.Count >= WebhookRequestsPerMinute) return false;
+                queue.Enqueue(DateTime.UtcNow);
+                return true;
+            }
+        }
+
+        private bool AcceptDeliveryID(string projectID, string hookID, string deliveryID)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (webhookDeliveryIds.Count > 5000)
+                foreach (var old in webhookDeliveryIds.Where(kv => now - kv.Value > TimeSpan.FromHours(24)).Take(1000))
+                    webhookDeliveryIds.TryRemove(old.Key, out _);
+            return webhookDeliveryIds.TryAdd($"{projectID}/{hookID}/{deliveryID}", now);
+        }
+
+        private static bool SecureEquals(string supplied, string expected)
+        {
+            if (string.IsNullOrEmpty(supplied) || string.IsNullOrEmpty(expected)) return false;
+            byte[] a = SHA256.HashData(Encoding.UTF8.GetBytes(supplied));
+            byte[] b = SHA256.HashData(Encoding.UTF8.GetBytes(expected));
+            return CryptographicOperations.FixedTimeEquals(a, b);
         }
 
         private bool RequireProject(Services.KliveAPI.KliveAPI.UserRequest req, out Project? project)

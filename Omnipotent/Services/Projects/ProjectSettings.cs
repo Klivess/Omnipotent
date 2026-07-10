@@ -17,6 +17,9 @@ namespace Omnipotent.Services.Projects
         public string CommanderModel { get; set; } = Defaults.CommanderModel;
         /// <summary>Cheap model for utility work (digest compaction, reports, triage fallback).</summary>
         public string UtilityModel { get; set; } = Defaults.UtilityModel;
+        /// <summary>Model for adversarial council panelists + Chair. Defaults to the Commander's model —
+        /// councils fire rarely and only at high-stakes moments, so a weak panel defeats the purpose.</summary>
+        public string CouncilModel { get; set; } = Defaults.CouncilModel;
         /// <summary>Tier → model map (§6.1). The tier list doubles as a price list.</summary>
         public string TierTextModel { get; set; } = Defaults.TierTextModel;
         public string TierTextImageModel { get; set; } = Defaults.TierTextImageModel;
@@ -41,6 +44,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>Delay between VNC text keystrokes; slower values help fragile web UIs.</summary>
         public int ComputerTypingDelayMs { get; set; } = Defaults.ComputerTypingDelayMs;
 
+        // ── councils ──
+        /// <summary>Max adversarial councils the Commander may convene per calendar day (cost guardrail).</summary>
+        public int CouncilMaxPerDay { get; set; } = Defaults.CouncilMaxPerDay;
+        /// <summary>Max councils per single Commander wake — blocks a council-happy loop.</summary>
+        public int CouncilMaxPerWake { get; set; } = Defaults.CouncilMaxPerWake;
+
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
         public string ModelForTier(ProjectAgentTier tier) => tier switch
@@ -59,6 +68,9 @@ namespace Omnipotent.Services.Projects
             {
                 case "commandermodel": CommanderModel = value; break;
                 case "utilitymodel": UtilityModel = value; break;
+                case "councilmodel": CouncilModel = value; break;
+                case "councilmaxperday": CouncilMaxPerDay = Math.Clamp(ParseInt(value, Defaults.CouncilMaxPerDay), 0, 24); break;
+                case "councilmaxperwake": CouncilMaxPerWake = Math.Clamp(ParseInt(value, Defaults.CouncilMaxPerWake), 0, 5); break;
                 case "tiertextmodel": TierTextModel = value; break;
                 case "tiertextimagemodel": TierTextImageModel = value; break;
                 case "tiertextimagevideomodel": TierTextImageVideoModel = value; break;
@@ -82,6 +94,9 @@ namespace Omnipotent.Services.Projects
         {
             public const string CommanderModel = "anthropic/claude-sonnet-4.5";
             public const string UtilityModel = "openai/gpt-4.1-mini";
+            public const string CouncilModel = CommanderModel;
+            public const int CouncilMaxPerDay = 6;
+            public const int CouncilMaxPerWake = 2;
             public const string TierTextModel = "openai/gpt-4.1-mini";
             public const string TierTextImageModel = "openai/gpt-4.1";
             public const string TierTextImageVideoModel = "anthropic/claude-sonnet-4.5";

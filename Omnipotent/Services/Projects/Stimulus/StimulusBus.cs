@@ -16,7 +16,7 @@ namespace Omnipotent.Services.Projects.Stimulus
         private readonly Action<string> log;
 
         /// <summary>Delivers a confirmed stimulus to its destination. Set by the service to wake the Commander.</summary>
-        public Func<StimulusEnvelope, Task>? DeliverToAgent { get; set; }
+        public Func<StimulusEnvelope, Task<string?>>? DeliverToAgent { get; set; }
 
         public StimulusBus(
             StimulusHookStore hooks, StimulusQueue queue, StimulusAgent triageAgent,
@@ -29,7 +29,7 @@ namespace Omnipotent.Services.Projects.Stimulus
             this.projectStore = projectStore;
             this.log = log ?? (_ => { });
 
-            queue.OnDeliver = HandleDeliveryAsync;
+            queue.OnClaim = HandleDeliveryAsync;
         }
 
         /// <summary>
@@ -64,19 +64,12 @@ namespace Omnipotent.Services.Projects.Stimulus
                 return;
             }
             env.Verdict = triage.Verdict;
-            await queue.EnqueueAsync(env, hook.DestinationAgentID);
-        }
-
-        /// <summary>Called by the queue reader when a confirmed envelope reaches the front for its agent.</summary>
-        private async Task HandleDeliveryAsync(StimulusEnvelope env)
-        {
-            // Directed inter-agent messages are already logged as AgentMessage events by the sender.
             if (env.SourceKind != "inter-agent")
             {
                 eventLog.Append(new ProjectEvent
                 {
                     ProjectID = env.ProjectID,
-                    AgentID = env.DestinationAgentID,
+                    AgentID = hook.DestinationAgentID,
                     Type = ProjectEventTypes.Stimulus,
                     Author = "stimulus",
                     Text = $"[{env.SourceKind}] {env.Verdict}\n{Truncate(env.Payload, 1000)}",
@@ -84,8 +77,13 @@ namespace Omnipotent.Services.Projects.Stimulus
                     ArtifactIDs = env.ArtifactIDs,
                 });
             }
+            await queue.EnqueueAsync(env, hook.DestinationAgentID);
+        }
 
-            if (DeliverToAgent != null) await DeliverToAgent(env);
+        /// <summary>Called by the queue reader when a confirmed envelope reaches the front for its agent.</summary>
+        private async Task<string?> HandleDeliveryAsync(StimulusEnvelope env)
+        {
+            return DeliverToAgent == null ? null : await DeliverToAgent(env);
         }
 
         /// <summary>Boot: replay durable undelivered envelopes so nothing is lost across a restart.</summary>

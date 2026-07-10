@@ -45,6 +45,9 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>Raised when a gate opens, so a surface (Discord P5) can present it alongside the website.</summary>
         public event Action<ProjectGate>? GateOpened;
+        /// <summary>Raised after a persisted first-wins resolution, including resolutions of gates
+        /// whose original in-memory waiter was lost in a restart.</summary>
+        public event Action<ProjectGate, GateResolution>? GateResolved;
 
         public ProjectGateManager(ProjectEventLogStore eventLog, Action<string> log)
         {
@@ -64,6 +67,8 @@ namespace Omnipotent.Services.Projects
         public async Task<GateResolution> OpenGateAndWaitAsync(ProjectGate gate, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(gate.GateID)) gate.GateID = Guid.NewGuid().ToString("N");
+            var tcs = new TaskCompletionSource<GateResolution>(TaskCreationOptions.RunContinuationsAsynchronously);
+            waiters[gate.GateID] = tcs;
             Persist(gate);
 
             eventLog.Append(new ProjectEvent
@@ -78,17 +83,33 @@ namespace Omnipotent.Services.Projects
                 PayloadJson = gate.ProposalJson,
             });
 
-            var tcs = new TaskCompletionSource<GateResolution>(TaskCreationOptions.RunContinuationsAsynchronously);
-            waiters[gate.GateID] = tcs;
-            using var reg = ct.Register(() => tcs.TrySetCanceled());
+            using var reg = ct.Register(() =>
+            {
+                waiters.TryRemove(gate.GateID, out _);
+                tcs.TrySetCanceled(ct);
+            });
             try { GateOpened?.Invoke(gate); } catch { /* surfaces must not break the gate */ }
-            var resolution = await tcs.Task;
+            return await tcs.Task;
+        }
 
-            gate.Resolved = true;
-            gate.Decision = resolution.Decision.ToString();
-            gate.Comment = resolution.Comment;
-            gate.ResolvedAt = DateTime.UtcNow;
-            Persist(gate);
+        /// <summary>Resolves a pending gate (called from the website route or Discord bridge). First wins.</summary>
+        public bool ResolveGate(string projectID, string gateID, GateResolution resolution)
+        {
+            if (resolution.Decision == GateDecision.Discuss) return false;
+
+            ProjectGate? gate;
+            lock (LockFor(projectID))
+            {
+                var gates = LoadLocked(projectID);
+                gate = gates.FirstOrDefault(g => g.GateID == gateID);
+                if (gate == null || gate.Resolved) return false;
+                gate.Resolved = true;
+                gate.Decision = resolution.Decision.ToString();
+                gate.Comment = resolution.Comment;
+                gate.ResolvedAt = DateTime.UtcNow;
+                SaveLocked(projectID, gates);
+            }
+
             eventLog.Append(new ProjectEvent
             {
                 ProjectID = gate.ProjectID,
@@ -99,14 +120,35 @@ namespace Omnipotent.Services.Projects
                 Text = $"{resolution.Decision}: {resolution.Comment}",
                 GateID = gate.GateID,
             });
-            return resolution;
+
+            if (waiters.TryRemove(gateID, out var tcs)) tcs.TrySetResult(resolution);
+            try { GateResolved?.Invoke(gate, resolution); } catch { }
+            return true;
         }
 
-        /// <summary>Resolves a pending gate (called from the website route or Discord bridge). First wins.</summary>
-        public bool ResolveGate(string projectID, string gateID, GateResolution resolution)
+        /// <summary>Releases a live agent to discuss without resolving the persisted approval.
+        /// The consequential action remains blocked; a later Approve/Deny is still first-wins.</summary>
+        public bool BeginDiscussion(string projectID, string gateID, string comment)
         {
-            if (!waiters.TryRemove(gateID, out var tcs)) return false;
-            return tcs.TrySetResult(resolution);
+            ProjectGate? gate;
+            lock (LockFor(projectID))
+            {
+                gate = LoadLocked(projectID).FirstOrDefault(g => g.GateID == gateID && !g.Resolved);
+                if (gate == null) return false;
+            }
+            var resolution = new GateResolution(GateDecision.Discuss, comment, "klives");
+            if (waiters.TryRemove(gateID, out var tcs)) tcs.TrySetResult(resolution);
+            eventLog.Append(new ProjectEvent
+            {
+                ProjectID = projectID,
+                WakeID = gate.WakeID,
+                AgentID = gate.AgentID,
+                Type = ProjectEventTypes.KlivesMessage,
+                Author = "klives",
+                Text = $"Discussion requested for approval '{gate.Title}': {comment}",
+                GateID = gateID,
+            });
+            return true;
         }
 
         public List<ProjectGate> ListPending(string projectID)

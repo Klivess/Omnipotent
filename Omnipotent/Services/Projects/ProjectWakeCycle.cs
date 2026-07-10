@@ -33,6 +33,19 @@ namespace Omnipotent.Services.Projects
         public Func<string, string>? DescribeObservables;
 
         /// <summary>
+        /// Optional Grand Plan leg: projectID → the approved plan's summary line (the standing north
+        /// star). Set by the Projects service in ServiceMain (ProjectGrandPlanStore.DescribeForSeed).
+        /// </summary>
+        public Func<string, string>? DescribeGrandPlan;
+
+        /// <summary>
+        /// Optional shared-accounts leg: projectID → a block of accounts in the GLOBAL registry so
+        /// agents reuse them instead of creating duplicates. Set by the Projects service in
+        /// ServiceMain (AccountRegistry.DescribeForPrompt).
+        /// </summary>
+        public Func<string, string>? DescribeAccounts;
+
+        /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
@@ -67,7 +80,19 @@ namespace Omnipotent.Services.Projects
                 try { observables = DescribeObservables(project.ProjectID); } catch { observables = null; }
             }
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables);
+            string? grandPlan = null;
+            if (DescribeGrandPlan != null)
+            {
+                try { grandPlan = DescribeGrandPlan(project.ProjectID); } catch { grandPlan = null; }
+            }
+
+            string? accounts = null;
+            if (DescribeAccounts != null)
+            {
+                try { accounts = DescribeAccounts(project.ProjectID); } catch { accounts = null; }
+            }
+
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables, grandPlan, accounts);
         }
 
         private static string Truncate(string s, int max) =>

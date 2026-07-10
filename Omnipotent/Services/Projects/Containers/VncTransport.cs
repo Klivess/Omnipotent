@@ -8,7 +8,7 @@ namespace Omnipotent.Services.Projects.Containers
     /// transport. Speaks exactly the subset the platform needs: security type None (the port is
     /// loopback-bound on the Docker host; isolation is the auth boundary), Raw encoding into an
     /// in-memory BGRA framebuffer, PointerEvent/KeyEvent for input. Existing .NET VNC libraries
-    /// are viewer-oriented WinForms relics; ~400 focused lines beat adapting one.
+    /// are viewer-oriented WinForms relics; this focused transport keeps the protocol surface small.
     ///
     /// Concurrency: one receive loop owns the socket reads; senders serialise on
     /// <see cref="sendGate"/>. <see cref="CaptureFrameAsync"/> requests an update and awaits
@@ -26,15 +26,31 @@ namespace Omnipotent.Services.Projects.Containers
         private CancellationTokenSource? loopCts;
         private readonly SemaphoreSlim sendGate = new(1, 1);
         private readonly SemaphoreSlim connectGate = new(1, 1);
+        private readonly object connectionLock = new();
+        private bool connected;
+        private int connectionGeneration;
+        // RFB update requests have no request ID.  More than one in flight means the first
+        // FramebufferUpdate can satisfy the wrong caller, leaving the displaced caller to time
+        // out.  The website live view and screen-diff hook share this transport with tool calls,
+        // so this is not merely defensive: without a capture gate they routinely overwrite one
+        // another's waiter.
+        private readonly SemaphoreSlim captureGate = new(1, 1);
 
         private readonly object fbLock = new();
         private byte[] framebuffer = Array.Empty<byte>(); // BGRA, Width*Height*4
+        private int framebufferGeneration = -1;
         private TaskCompletionSource<bool>? frameWaiter;
+        private bool frameRequestIsFull;
+        private bool hasCompleteFrame;
+        private long frameVersion;
+        private static readonly TimeSpan IncrementalFreshnessWait = TimeSpan.FromMilliseconds(120);
+        private static readonly TimeSpan InitialFramebufferTimeout = TimeSpan.FromSeconds(5);
 
         public int Width { get; private set; }
         public int Height { get; private set; }
+        public int Port => port;
         public string DesktopName { get; private set; } = "";
-        public bool Connected => tcp?.Connected == true;
+        public bool Connected { get { lock (connectionLock) return connected; } }
 
         // Pointer state: RFB PointerEvent always carries the full button mask.
         private byte buttonMask;
@@ -62,51 +78,58 @@ namespace Omnipotent.Services.Projects.Containers
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
             linked.CancelAfter(HandshakeTimeout);
             var hct = linked.Token;
+            TcpClient? newTcp = null;
+            NetworkStream? newStream = null;
             try
             {
                 if (Connected) return;
                 DisposeConnection();
 
-                tcp = new TcpClient { NoDelay = true };
-                await tcp.ConnectAsync(host, port, hct);
-                stream = tcp.GetStream();
+                // Keep the candidate socket local until the complete handshake succeeds. The old
+                // receive loop can therefore never switch mid-read to a replacement NetworkStream.
+                newTcp = new TcpClient { NoDelay = true };
+                await newTcp.ConnectAsync(host, port, hct);
+                newStream = newTcp.GetStream();
 
                 // ProtocolVersion handshake: server sends 12 bytes, we answer 3.8.
-                byte[] version = await ReadExactAsync(12, hct);
+                byte[] version = await ReadExactAsync(newStream, 12, hct);
                 string serverVersion = System.Text.Encoding.ASCII.GetString(version);
                 if (!serverVersion.StartsWith("RFB ")) throw new InvalidOperationException($"Not an RFB server: '{serverVersion}'");
-                await stream.WriteAsync(System.Text.Encoding.ASCII.GetBytes("RFB 003.008\n"), hct);
+                await newStream.WriteAsync(System.Text.Encoding.ASCII.GetBytes("RFB 003.008\n"), hct);
 
                 // Security: server lists types; we require None (1).
-                byte nTypes = (await ReadExactAsync(1, hct))[0];
+                byte nTypes = (await ReadExactAsync(newStream, 1, hct))[0];
                 if (nTypes == 0)
                 {
-                    string reason = await ReadReasonStringAsync(hct);
+                    string reason = await ReadReasonStringAsync(newStream, hct);
                     throw new InvalidOperationException($"RFB handshake refused: {reason}");
                 }
-                byte[] types = await ReadExactAsync(nTypes, hct);
+                byte[] types = await ReadExactAsync(newStream, nTypes, hct);
                 if (!types.Contains((byte)1))
                     throw new InvalidOperationException("RFB server does not offer security type None — desktop containers must run x11vnc -nopw on a loopback-bound port.");
-                await stream.WriteAsync(new byte[] { 1 }, hct);
+                await newStream.WriteAsync(new byte[] { 1 }, hct);
 
                 // SecurityResult (3.8 sends it for None too).
-                byte[] secResult = await ReadExactAsync(4, hct);
+                byte[] secResult = await ReadExactAsync(newStream, 4, hct);
                 if (BinaryPrimitives.ReadUInt32BigEndian(secResult) != 0)
                 {
-                    string reason = await ReadReasonStringAsync(hct);
+                    string reason = await ReadReasonStringAsync(newStream, hct);
                     throw new InvalidOperationException($"RFB security failed: {reason}");
                 }
 
                 // ClientInit: shared = 1 (the website's live view coexists with the agent).
-                await stream.WriteAsync(new byte[] { 1 }, hct);
+                await newStream.WriteAsync(new byte[] { 1 }, hct);
 
                 // ServerInit: geometry + pixel format + name.
-                byte[] init = await ReadExactAsync(24, hct);
-                Width = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(0));
-                Height = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(2));
+                byte[] init = await ReadExactAsync(newStream, 24, hct);
+                int width = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(0));
+                int height = BinaryPrimitives.ReadUInt16BigEndian(init.AsSpan(2));
+                if (width <= 0 || height <= 0 || (long)width * height * 4 > int.MaxValue)
+                    throw new InvalidOperationException($"RFB server announced invalid geometry {width}x{height}.");
                 uint nameLen = BinaryPrimitives.ReadUInt32BigEndian(init.AsSpan(20));
-                DesktopName = System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)nameLen, hct));
-                lock (fbLock) framebuffer = new byte[Width * Height * 4];
+                if (nameLen > 1024 * 1024)
+                    throw new InvalidOperationException($"RFB server announced an invalid desktop-name length ({nameLen} bytes).");
+                string desktopName = System.Text.Encoding.UTF8.GetString(await ReadExactAsync(newStream, (int)nameLen, hct));
 
                 // SetPixelFormat: 32bpp true-colour, little-endian, BGRA layout (blue shift 0).
                 var spf = new byte[20];
@@ -117,17 +140,51 @@ namespace Omnipotent.Services.Projects.Containers
                 BinaryPrimitives.WriteUInt16BigEndian(spf.AsSpan(10), 255);  // green max
                 BinaryPrimitives.WriteUInt16BigEndian(spf.AsSpan(12), 255);  // blue max
                 spf[14] = 16; spf[15] = 8; spf[16] = 0;      // red/green/blue shifts → BGRA in memory
-                await stream.WriteAsync(spf, hct);
+                await newStream.WriteAsync(spf, hct);
 
                 // SetEncodings: Raw only (loopback bandwidth is free; simplicity wins).
                 var se = new byte[8];
                 se[0] = 2;
                 BinaryPrimitives.WriteUInt16BigEndian(se.AsSpan(2), 1);
                 BinaryPrimitives.WriteInt32BigEndian(se.AsSpan(4), 0); // Raw
-                await stream.WriteAsync(se, hct);
+                await newStream.WriteAsync(se, hct);
 
-                loopCts = new CancellationTokenSource();
-                receiveLoop = Task.Run(() => ReceiveLoopAsync(loopCts.Token));
+                var establishedTcp = newTcp;
+                var establishedStream = newStream;
+                var newLoopCts = new CancellationTokenSource();
+                int generation;
+                Width = width;
+                Height = height;
+                DesktopName = desktopName;
+                lock (fbLock)
+                {
+                    framebuffer = new byte[width * height * 4];
+                    framebufferGeneration = -1;
+                    frameWaiter = null;
+                    frameRequestIsFull = false;
+                    hasCompleteFrame = false;
+                    frameVersion = 0;
+                }
+                lock (connectionLock)
+                {
+                    tcp = establishedTcp;
+                    stream = establishedStream;
+                    loopCts = newLoopCts;
+                    generation = ++connectionGeneration;
+                    connected = false;
+                }
+                lock (fbLock) framebufferGeneration = generation;
+                lock (connectionLock)
+                {
+                    if (connectionGeneration != generation || !ReferenceEquals(stream, establishedStream))
+                        throw new IOException("VNC connection was disposed while its handshake completed.");
+                    connected = true;
+                }
+                receiveLoop = Task.Run(() => ReceiveLoopAsync(
+                    establishedStream, generation, width, height, newLoopCts.Token));
+                // The published connection now owns these resources.
+                newTcp = null;
+                newStream = null;
                 log($"VNC connected to {host}:{port} — '{DesktopName}' {Width}x{Height}.");
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -137,32 +194,120 @@ namespace Omnipotent.Services.Projects.Containers
                 DisposeConnection();
                 throw new TimeoutException($"VNC handshake to {host}:{port} did not complete within {HandshakeTimeout.TotalSeconds:0}s — the container's desktop server (x11vnc) is not responding yet or has failed to start.");
             }
-            finally { connectGate.Release(); }
+            finally
+            {
+                try { newStream?.Dispose(); } catch { }
+                try { newTcp?.Dispose(); } catch { }
+                connectGate.Release();
+            }
         }
 
         // ── capture ──
 
         /// <summary>
-        /// Requests a (non-incremental) framebuffer update and returns a copy of the framebuffer
-        /// once it lands: one settled full frame, the container analog of ScreenCapturer's
-        /// settled-frame capture.
+        /// Gets a current framebuffer without allowing overlapping RFB requests. The first capture
+        /// requests a complete frame. Later captures use one outstanding incremental request and
+        /// briefly wait for changed rectangles; a static desktop returns the known-complete cached
+        /// frame instead of transferring four megabytes on every live-view tick.
         /// </summary>
         public async Task<(byte[] bgra, int width, int height)> CaptureFrameAsync(CancellationToken ct = default)
         {
-            if (!Connected) await ConnectAsync(ct);
-            TaskCompletionSource<bool> tcs;
+            var frame = await CaptureFrameWithVersionAsync(ct);
+            return (frame.bgra, frame.width, frame.height);
+        }
+
+        /// <summary>Capture variant used by the website stream so unchanged frames can reuse the
+        /// last JPEG instead of encoding the same desktop several times per second.</summary>
+        public async Task<(byte[] bgra, int width, int height, long version)> CaptureFrameWithVersionAsync(
+            CancellationToken ct = default)
+        {
+            await captureGate.WaitAsync(ct);
+            TaskCompletionSource<bool>? tcs = null;
+            bool createdRequest = false;
+            bool requestIsFull = false;
+            int requestGeneration = -1;
+            try
+            {
+                if (!Connected) await ConnectAsync(ct);
+                lock (connectionLock)
+                {
+                    if (!connected) throw new IOException("VNC disconnected before the framebuffer request.");
+                    requestGeneration = connectionGeneration;
+                }
+                lock (fbLock)
+                {
+                    if (frameWaiter == null)
+                    {
+                        tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        frameWaiter = tcs;
+                        frameRequestIsFull = !hasCompleteFrame;
+                        createdRequest = true;
+                    }
+                    else
+                    {
+                        tcs = frameWaiter;
+                    }
+                    requestIsFull = frameRequestIsFull;
+                }
+
+                if (createdRequest)
+                {
+                    try { await SendFramebufferUpdateRequestAsync(incremental: !requestIsFull, ct); }
+                    catch
+                    {
+                        // If the request was not completely written its eventual response ordering
+                        // is unknowable. Reconnect rather than poisoning the next capture.
+                        AbandonFrameRequest(tcs, requestGeneration);
+                        throw;
+                    }
+                }
+
+                bool completeFrame;
+                lock (fbLock) completeFrame = hasCompleteFrame;
+                if (!completeFrame || requestIsFull)
+                {
+                    try { await tcs.Task.WaitAsync(InitialFramebufferTimeout, ct); }
+                    catch (TimeoutException)
+                    {
+                        AbandonFrameRequest(tcs, requestGeneration);
+                        throw new TimeoutException("No initial framebuffer update within 5s; the VNC connection was reset before retrying.");
+                    }
+                }
+                else
+                {
+                    // An incremental request may legitimately remain unanswered while nothing on
+                    // screen changes. Keep it pending so the next change is captured, but do not
+                    // freeze screenshots or the live viewer waiting for a static desktop.
+                    Task freshnessDelay = Task.Delay(IncrementalFreshnessWait, ct);
+                    Task completed = await Task.WhenAny(tcs.Task, freshnessDelay);
+                    if (completed == tcs.Task) await tcs.Task;
+                    else ct.ThrowIfCancellationRequested();
+                }
+
+                lock (fbLock)
+                {
+                    if (!hasCompleteFrame)
+                        throw new IOException("VNC update did not produce a complete framebuffer.");
+                    return ((byte[])framebuffer.Clone(), Width, Height, frameVersion);
+                }
+            }
+            finally
+            {
+                captureGate.Release();
+            }
+        }
+
+        private void AbandonFrameRequest(TaskCompletionSource<bool> waiter, int requestGeneration)
+        {
             lock (fbLock)
             {
-                tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                frameWaiter = tcs;
+                if (ReferenceEquals(frameWaiter, waiter)) frameWaiter = null;
+                frameRequestIsFull = false;
             }
-            await SendFramebufferUpdateRequestAsync(incremental: false, ct);
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            timeout.CancelAfter(TimeSpan.FromSeconds(10));
-            await using (timeout.Token.Register(() => tcs.TrySetException(new TimeoutException("No framebuffer update within 10s."))))
-                await tcs.Task;
-            lock (fbLock)
-                return ((byte[])framebuffer.Clone(), Width, Height);
+            // Keep an abandoned waiter from becoming an unobserved fault when the connection is
+            // torn down.  The public caller receives the original cancellation/timeout instead.
+            waiter.TrySetCanceled();
+            DisposeConnection(requestGeneration);
         }
 
         // ── input ──
@@ -264,6 +409,9 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>Releases every held button/modifier — the container analog of computer_release_all.</summary>
         public async Task ReleaseAllAsync(CancellationToken ct = default)
         {
+            // A disconnected RFB session cannot retain input, and reconnecting solely to release
+            // keys would make terminal-only wakes depend on a healthy framebuffer server.
+            if (!Connected) { buttonMask = 0; return; }
             await SendPointerAsync(pointerX, pointerY, 0, ct);
             foreach (var mod in new[] { VncKeysyms.ShiftL, VncKeysyms.ControlL, VncKeysyms.AltL, VncKeysyms.SuperL })
                 await SendKeyAsync(mod, false, ct);
@@ -273,8 +421,11 @@ namespace Omnipotent.Services.Projects.Containers
         /// no shell command is involved.</summary>
         public async Task SetClipboardTextAsync(string text, CancellationToken ct = default)
         {
+            if (!Connected) await ConnectAsync(ct);
             text ??= string.Empty;
             byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
+            if (bytes.Length > 1024 * 1024)
+                throw new ArgumentException("Clipboard text is too large (maximum 1 MiB UTF-8).", nameof(text));
             var msg = new byte[8 + bytes.Length];
             msg[0] = 6;
             BinaryPrimitives.WriteUInt32BigEndian(msg.AsSpan(4), (uint)bytes.Length);
@@ -332,30 +483,55 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task SendAsync(byte[] payload, CancellationToken ct)
         {
-            var s = stream ?? throw new InvalidOperationException("VNC not connected.");
             await sendGate.WaitAsync(ct);
-            try { await s.WriteAsync(payload, ct); }
+            try
+            {
+                NetworkStream s;
+                int generation;
+                lock (connectionLock)
+                {
+                    if (!connected || stream == null)
+                        throw new InvalidOperationException("VNC not connected.");
+                    s = stream;
+                    generation = connectionGeneration;
+                }
+
+                try { await s.WriteAsync(payload, ct); }
+                catch
+                {
+                    // A cancelled or failed write can leave a partial RFB message on the wire.
+                    // Never reuse that byte stream for a later action.
+                    DisposeConnection(generation);
+                    throw;
+                }
+            }
             finally { sendGate.Release(); }
         }
 
         // ── receive loop ──
 
-        private async Task ReceiveLoopAsync(CancellationToken ct)
+        private async Task ReceiveLoopAsync(NetworkStream ownedStream, int generation,
+            int ownedWidth, int ownedHeight, CancellationToken ct)
         {
             try
             {
                 while (!ct.IsCancellationRequested)
                 {
-                    byte msgType = (await ReadExactAsync(1, ct))[0];
+                    byte msgType = (await ReadExactAsync(ownedStream, 1, ct))[0];
+                    if (!IsCurrentConnection(ownedStream, generation)) return;
                     switch (msgType)
                     {
                         case 0: // FramebufferUpdate
                         {
-                            await ReadExactAsync(1, ct); // padding
-                            int nRects = BinaryPrimitives.ReadUInt16BigEndian(await ReadExactAsync(2, ct));
+                            await ReadExactAsync(ownedStream, 1, ct); // padding
+                            int nRects = BinaryPrimitives.ReadUInt16BigEndian(await ReadExactAsync(ownedStream, 2, ct));
+                            bool completingFullRequest;
+                            lock (fbLock) completingFullRequest = frameRequestIsFull;
+                            if (completingFullRequest && nRects == 0)
+                                throw new InvalidDataException("RFB server returned an empty response to a full-frame request.");
                             for (int r = 0; r < nRects; r++)
                             {
-                                byte[] head = await ReadExactAsync(12, ct);
+                                byte[] head = await ReadExactAsync(ownedStream, 12, ct);
                                 int rx = BinaryPrimitives.ReadUInt16BigEndian(head.AsSpan(0));
                                 int ry = BinaryPrimitives.ReadUInt16BigEndian(head.AsSpan(2));
                                 int rw = BinaryPrimitives.ReadUInt16BigEndian(head.AsSpan(4));
@@ -363,37 +539,57 @@ namespace Omnipotent.Services.Projects.Containers
                                 int encoding = BinaryPrimitives.ReadInt32BigEndian(head.AsSpan(8));
                                 if (encoding != 0)
                                     throw new InvalidOperationException($"Server sent unsupported encoding {encoding} despite Raw-only SetEncodings.");
-                                byte[] pixels = await ReadExactAsync(rw * rh * 4, ct);
+                                // A malformed/out-of-date rectangle must never wrap into the next
+                                // scanline. The previous flattened-length check allowed exactly that,
+                                // leaving black/white blocks while keeping the connection apparently up.
+                                if (rw <= 0 || rh <= 0 || rx + rw > ownedWidth || ry + rh > ownedHeight)
+                                    throw new InvalidDataException($"RFB rectangle ({rx},{ry}) {rw}x{rh} is outside framebuffer {ownedWidth}x{ownedHeight}.");
+                                long pixelBytes = (long)rw * rh * 4;
+                                if (pixelBytes > int.MaxValue)
+                                    throw new InvalidDataException($"RFB rectangle {rw}x{rh} is too large.");
+                                byte[] pixels = await ReadExactAsync(ownedStream, (int)pixelBytes, ct);
                                 lock (fbLock)
                                 {
+                                    if (framebufferGeneration != generation) return;
                                     for (int row = 0; row < rh; row++)
                                     {
                                         int src = row * rw * 4;
-                                        int dst = ((ry + row) * Width + rx) * 4;
-                                        if (dst + rw * 4 <= framebuffer.Length)
-                                            Buffer.BlockCopy(pixels, src, framebuffer, dst, rw * 4);
+                                        int dst = ((ry + row) * ownedWidth + rx) * 4;
+                                        Buffer.BlockCopy(pixels, src, framebuffer, dst, rw * 4);
                                     }
                                 }
                             }
-                            lock (fbLock) { frameWaiter?.TrySetResult(true); frameWaiter = null; }
+                            TaskCompletionSource<bool>? completedWaiter;
+                            lock (fbLock)
+                            {
+                                if (framebufferGeneration != generation) return;
+                                if (frameRequestIsFull) hasCompleteFrame = true;
+                                if (nRects > 0) frameVersion++;
+                                completedWaiter = frameWaiter;
+                                frameWaiter = null;
+                                frameRequestIsFull = false;
+                            }
+                            completedWaiter?.TrySetResult(true);
                             break;
                         }
                         case 1: // SetColourMapEntries — impossible in true-colour, but consume it
                         {
-                            await ReadExactAsync(1, ct);
-                            await ReadExactAsync(2, ct);
-                            int nColours = BinaryPrimitives.ReadUInt16BigEndian(await ReadExactAsync(2, ct));
-                            await ReadExactAsync(nColours * 6, ct);
+                            await ReadExactAsync(ownedStream, 1, ct);
+                            await ReadExactAsync(ownedStream, 2, ct);
+                            int nColours = BinaryPrimitives.ReadUInt16BigEndian(await ReadExactAsync(ownedStream, 2, ct));
+                            await ReadExactAsync(ownedStream, nColours * 6, ct);
                             break;
                         }
                         case 2: // Bell
                             break;
                         case 3: // ServerCutText
                         {
-                            await ReadExactAsync(3, ct);
-                            uint len = BinaryPrimitives.ReadUInt32BigEndian(await ReadExactAsync(4, ct));
-                            clipboardText = System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)Math.Min(len, 1024 * 1024), ct));
-                            if (len > 1024 * 1024) await ReadExactAsync((int)(len - 1024 * 1024), ct);
+                            await ReadExactAsync(ownedStream, 3, ct);
+                            uint len = BinaryPrimitives.ReadUInt32BigEndian(await ReadExactAsync(ownedStream, 4, ct));
+                            if (len > 16 * 1024 * 1024)
+                                throw new InvalidDataException($"RFB clipboard announcement is too large ({len} bytes).");
+                            string announced = System.Text.Encoding.UTF8.GetString(await ReadExactAsync(ownedStream, (int)len, ct));
+                            if (IsCurrentConnection(ownedStream, generation)) clipboardText = announced;
                             break;
                         }
                         default:
@@ -404,38 +600,71 @@ namespace Omnipotent.Services.Projects.Containers
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 log($"VNC receive loop ended: {ex.Message}");
-                lock (fbLock) { frameWaiter?.TrySetException(new IOException("VNC connection lost.", ex)); frameWaiter = null; }
-                DisposeConnection();
+                DisposeConnection(generation, new IOException("VNC connection lost.", ex));
             }
         }
 
-        private async Task<byte[]> ReadExactAsync(int count, CancellationToken ct)
+        private bool IsCurrentConnection(NetworkStream candidate, int generation)
         {
-            var s = stream ?? throw new InvalidOperationException("VNC not connected.");
+            lock (connectionLock)
+                return connected && connectionGeneration == generation && ReferenceEquals(stream, candidate);
+        }
+
+        private static async Task<byte[]> ReadExactAsync(NetworkStream source, int count, CancellationToken ct)
+        {
             var buf = new byte[count];
             int read = 0;
             while (read < count)
             {
-                int n = await s.ReadAsync(buf.AsMemory(read, count - read), ct);
+                int n = await source.ReadAsync(buf.AsMemory(read, count - read), ct);
                 if (n == 0) throw new IOException("VNC connection closed by server.");
                 read += n;
             }
             return buf;
         }
 
-        private async Task<string> ReadReasonStringAsync(CancellationToken ct)
+        private static async Task<string> ReadReasonStringAsync(NetworkStream source, CancellationToken ct)
         {
-            uint len = BinaryPrimitives.ReadUInt32BigEndian(await ReadExactAsync(4, ct));
-            return System.Text.Encoding.UTF8.GetString(await ReadExactAsync((int)Math.Min(len, 4096), ct));
+            uint len = BinaryPrimitives.ReadUInt32BigEndian(await ReadExactAsync(source, 4, ct));
+            return System.Text.Encoding.UTF8.GetString(await ReadExactAsync(source, (int)Math.Min(len, 4096), ct));
         }
 
-        private void DisposeConnection()
+        private void DisposeConnection(int? expectedGeneration = null, Exception? pendingError = null)
         {
-            try { loopCts?.Cancel(); } catch { }
-            try { stream?.Dispose(); } catch { }
-            try { tcp?.Dispose(); } catch { }
-            stream = null;
-            tcp = null;
+            CancellationTokenSource? oldCts;
+            NetworkStream? oldStream;
+            TcpClient? oldTcp;
+            lock (connectionLock)
+            {
+                // A receive loop owns exactly the stream/generation it was started with. A late
+                // failure from an abandoned loop must not tear down a successful reconnect.
+                if (expectedGeneration.HasValue && expectedGeneration.Value != connectionGeneration)
+                    return;
+                connected = false;
+                connectionGeneration++;
+                oldCts = loopCts;
+                oldStream = stream;
+                oldTcp = tcp;
+                loopCts = null;
+                stream = null;
+                tcp = null;
+                receiveLoop = null;
+            }
+
+            TaskCompletionSource<bool>? waiter;
+            lock (fbLock)
+            {
+                waiter = frameWaiter;
+                frameWaiter = null;
+                frameRequestIsFull = false;
+            }
+            if (pendingError != null) waiter?.TrySetException(pendingError);
+            else waiter?.TrySetCanceled();
+
+            try { oldCts?.Cancel(); } catch { }
+            try { oldStream?.Dispose(); } catch { }
+            try { oldTcp?.Dispose(); } catch { }
+            try { oldCts?.Dispose(); } catch { }
             buttonMask = 0;
         }
 
@@ -444,6 +673,7 @@ namespace Omnipotent.Services.Projects.Containers
             DisposeConnection();
             sendGate.Dispose();
             connectGate.Dispose();
+            captureGate.Dispose();
         }
     }
 }

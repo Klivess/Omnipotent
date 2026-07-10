@@ -169,6 +169,8 @@ namespace Omnipotent.Data_Handling
             public static string ProjectsContainersFile = $"{ProjectsDirectory}/containers.json";
             public static string ProjectsVolumesDirectory = $"{ProjectsDirectory}/Volumes";
             public static string ProjectsObservablesDirectory = $"{ProjectsDirectory}/Observables";
+            public static string ProjectsCouncilsDirectory = $"{ProjectsDirectory}/Councils";
+            public static string ProjectsGrandPlansDirectory = $"{ProjectsDirectory}/GrandPlans";
 
             //KAPI Reachability Monitor
             public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";
@@ -178,6 +180,11 @@ namespace Omnipotent.Data_Handling
             public static string KliveMailDirectory = $"{SavedDataDirectory}/KliveMail";
             public static string KliveMailDbFile = $"{KliveMailDirectory}/klivemail.db";
             public static string KliveMailAttachmentsDirectory = $"{KliveMailDirectory}/Attachments";
+
+            //AccountRegistry (global shared account registry for AI agents)
+            public static string AccountRegistryDirectory = $"{SavedDataDirectory}/AccountRegistry";
+            public static string AccountRegistryIndexFile = $"{AccountRegistryDirectory}/accounts.json";
+            public static string AccountRegistryRootKeyFile = $"{AccountRegistryDirectory}/root.key";
 
             //KliveRAG (cross-system retrieval-augmented knowledge index)
             public static string KliveRAGDirectory = $"{SavedDataDirectory}/KliveRAG";

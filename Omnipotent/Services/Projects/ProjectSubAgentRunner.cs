@@ -17,7 +17,7 @@ namespace Omnipotent.Services.Projects
     public class ProjectSubAgentRunner
     {
         private readonly Projects parent;
-        private readonly ConcurrentDictionary<string, bool> activeWakes = new(StringComparer.Ordinal); // key: projectID/agentID
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> activeWakes = new(StringComparer.Ordinal); // key: projectID/agentID
 
         // Triggers/messages that arrived for a sub-agent while it was already awake. Parity with the
         // Commander: a directed stimulus to a busy sub-agent must not vanish. Drained at each tool-loop
@@ -43,13 +43,19 @@ namespace Omnipotent.Services.Projects
         /// that, a follow-up wake fires — no directed message is dropped. Returns the wake ID, or null
         /// if it was queued onto an active wake.
         /// </summary>
-        public string? Wake(Project project, ProjectAgentRecord agent, string trigger)
+        public string? Wake(Project project, ProjectAgentRecord agent, string trigger, bool queueIfBusy = true)
         {
+            if (project.Status != ProjectStatus.Active || agent.Retired) return null;
             string key = Key(project.ProjectID, agent.AgentID);
-            if (!activeWakes.TryAdd(key, true))
+            var cts = new CancellationTokenSource();
+            if (!activeWakes.TryAdd(key, cts))
             {
+                cts.Dispose();
+                if (queueIfBusy)
+                {
                 var q = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
                 if (q.Count < MaxPendingTriggers && !q.Contains(trigger)) q.Enqueue(trigger);
+                }
                 return null; // already awake — folded into the live wake / a follow-up
             }
 
@@ -65,10 +71,11 @@ namespace Omnipotent.Services.Projects
             });
             _ = Task.Run(async () =>
             {
-                try { await ExecuteWakeAsync(project, agent, wakeID, trigger); }
+                try { await ExecuteWakeAsync(project, agent, wakeID, trigger, cts); }
                 finally
                 {
-                    activeWakes.TryRemove(key, out _);
+                    activeWakes.TryRemove(new KeyValuePair<string, CancellationTokenSource>(key, cts));
+                    cts.Dispose();
                     DrainPendingSteers(project, agent);
                 }
             });
@@ -91,15 +98,33 @@ namespace Omnipotent.Services.Projects
             catch { /* never mask the wake outcome */ }
         }
 
-        private async Task ExecuteWakeAsync(Project project, ProjectAgentRecord agent, string wakeID, string trigger)
+        public int CancelProject(string projectID)
+        {
+            int cancelled = 0;
+            string prefix = projectID + "/";
+            foreach (var kv in activeWakes.Where(kv => kv.Key.StartsWith(prefix, StringComparison.Ordinal)))
+            {
+                try { kv.Value.Cancel(); cancelled++; } catch { }
+                steerQueue.TryRemove(kv.Key, out _);
+            }
+            return cancelled;
+        }
+
+        public bool CancelAgent(string projectID, string agentID)
+        {
+            string key = Key(projectID, agentID);
+            steerQueue.TryRemove(key, out _);
+            if (!activeWakes.TryGetValue(key, out var cts)) return false;
+            try { cts.Cancel(); return true; } catch { return false; }
+        }
+
+        private async Task ExecuteWakeAsync(Project project, ProjectAgentRecord agent, string wakeID, string trigger, CancellationTokenSource cts)
         {
             string projectID = project.ProjectID;
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = $"Agent {agent.AgentID} finished its wake.";
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
-            using var cts = new CancellationTokenSource();
-
             try
             {
                 var llmServices = await parent.GetServicesByType<KliveLLM.KliveLLM>();
@@ -135,7 +160,8 @@ namespace Omnipotent.Services.Projects
 
                     // Budget guardrail (parity with the Commander): stop this sub-agent wake if the project
                     // was paused (e.g. token budget exhausted) since the last turn, before the next LLM call.
-                    if (parent.Store.GetProject(projectID)?.Status == ProjectStatus.BudgetPaused)
+                    if (parent.Store.GetProject(projectID)?.Status != ProjectStatus.Active ||
+                        parent.SubAgents.ListActive(projectID).All(a => a.AgentID != agent.AgentID))
                     {
                         outcomeText = $"Agent {agent.AgentID} stopped — project budget paused.";
                         break;
@@ -151,7 +177,16 @@ namespace Omnipotent.Services.Projects
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake}). Stop and report your status to the commander via send_agent_message, then reply with a one-line summary.");
 
-                    var resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
+                    var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
+                    if (budgetLease == null)
+                    {
+                        outcomeText = $"Agent {agent.AgentID} stopped before the next model call because no token budget remained.";
+                        break;
+                    }
+                    KliveLLM.KliveLLM.KliveLLMResponse resp;
+                    try
+                    {
+                    resp = await llm.QueryToolSessionAsync(sessionId, toolDefs, modelOverride: model, cancellationToken: cts.Token);
                     if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
@@ -161,6 +196,9 @@ namespace Omnipotent.Services.Projects
                         wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
                         await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                     }
+
+                    }
+                    finally { await budgetLease.DisposeAsync(); }
 
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
@@ -241,6 +279,11 @@ namespace Omnipotent.Services.Projects
                 }
                 done: ;
             }
+            catch (OperationCanceledException)
+            {
+                outcome = ProjectEventTypes.WakeFailed;
+                outcomeText = $"Agent {agent.AgentID} wake cancelled because the project or agent was stopped.";
+            }
             catch (Exception ex)
             {
                 outcome = ProjectEventTypes.WakeFailed;
@@ -253,6 +296,7 @@ namespace Omnipotent.Services.Projects
                     outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
                 try { parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, outcome, outcomeText)); }
                 catch { }
+                parent.StimulusQueue.AcknowledgeWake(wakeID, outcome == ProjectEventTypes.WakeCompleted);
             }
         }
 
@@ -261,7 +305,7 @@ namespace Omnipotent.Services.Projects
             // Only video-tier sub-agents actually get a desktop container; entice them to live on it.
             string desktopNote = ProjectTierRouter.TierGetsDesktop(agent.Tier)
                 ? @"
-- YOUR DESKTOP is a real computer that's yours — use it, don't just poke at it. Open a browser and actually browse, install and use the right GUI app for the task (you have passwordless sudo: `sudo apt-get update && sudo apt-get install <package>` in the terminal), organise your work into real files and folders, and keep the machine tidy — even personalise it (yes, the wallpaper) if it helps you own it. The GUI is often the shortest, most reliable path, since so many tools and sites are built for a human at a screen — which is exactly what you are equipped to be. Anything that must outlive the machine goes in /project."
+- YOUR DESKTOP is a real computer that's yours — use it, don't just poke at it. Open a browser and actually browse, install and use the right GUI app for the task, organise your work into real files and folders, and keep the machine tidy. Use computer_terminal for commands inside your isolated Linux desktop (`sudo apt-get ...`, pip/venv, git, tests) rather than typing shell commands through VNC; it defaults to persistent /project and works even during a visual-frame outage. Use computer_type only for actual GUI fields. Anything that must outlive the machine goes in /project."
                 : "";
 
             return
@@ -292,6 +336,15 @@ RULES:
             {
                 sb.AppendLine("── OBSERVABLES (live values shown to Klives; keep yours current via update_observable) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observables, ProjectsContextBudget.ObservablesBudget));
+            }
+
+            // Shared account registry — same block the Commander sees; reuse before creating duplicates.
+            string accounts = "";
+            try { accounts = parent.WakeCycle.DescribeAccounts?.Invoke(project.ProjectID) ?? ""; } catch { }
+            if (!string.IsNullOrWhiteSpace(accounts))
+            {
+                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account_list for details) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accounts, ProjectsContextBudget.AccountsBudget));
             }
 
             // Thin cross-system knowledge leg (KliveRAG), keyed by role + task; own project excluded.

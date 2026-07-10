@@ -28,7 +28,9 @@ namespace Omnipotent.Services.Projects
             List<ProjectRetrievalIndex.RetrievalHit> retrievalHits,
             string triggerDescription,
             List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledgeHits = null,
-            string? observablesBlock = null)
+            string? observablesBlock = null,
+            string? grandPlanBlock = null,
+            string? accountsBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -37,6 +39,14 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"Goal: {project.Goal}");
             sb.AppendLine($"Status: {project.Status}");
             sb.AppendLine($"Budgets: tokens ${project.TokenBudgetUsd:0.##} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
+
+            // The approved Grand Plan is the standing north star — surfaced right under the header so
+            // every wake anchors on it. Read it in full with get_grand_plan; revise via amend_grand_plan.
+            if (!string.IsNullOrWhiteSpace(grandPlanBlock))
+            {
+                sb.AppendLine("── GRAND PLAN (approved north star — amend via amend_grand_plan) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
+            }
 
             sb.AppendLine("── STANDING DIGEST ──");
             string digestBlock = ComposeDigestBlock(digest);
@@ -48,6 +58,14 @@ namespace Omnipotent.Services.Projects
             {
                 sb.AppendLine("── OBSERVABLES (live values you maintain for Klives via update_observable) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observablesBlock, ProjectsContextBudget.ObservablesBudget));
+            }
+
+            // Shared account registry (global across every project + KliveAgent). Reuse before
+            // creating a duplicate; account_list for details, account_register after any signup.
+            if (!string.IsNullOrWhiteSpace(accountsBlock))
+            {
+                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account_list for details) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
             }
 
             // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The

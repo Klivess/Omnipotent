@@ -28,6 +28,10 @@ namespace Omnipotent.Services.KliveAgent
         /// Agent can always call search_knowledge(query) / read_knowledge_doc(docId) for more.</summary>
         public const int KnowledgeBudget = 700;
 
+        /// <summary>Soft cap on the known-accounts block (global shared registry) injected up-front,
+        /// so the agent reuses accounts. Agent can always call account_list for the full set.</summary>
+        public const int KnownAccountsBudget = 300;
+
         /// <summary>Soft cap on conversation history selected into the per-turn prompt.
         /// Higher = more conversational persistence at the cost of input tokens.</summary>
         public const int HistoryBudget = 4000;

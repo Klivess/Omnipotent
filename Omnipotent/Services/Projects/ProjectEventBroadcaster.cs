@@ -35,7 +35,13 @@ namespace Omnipotent.Services.Projects
             public WebSocket Socket { get; init; } = null!;
             /// <summary>null = fleet firehose; otherwise the single project this client follows.</summary>
             public string? ProjectID { get; init; }
-            public Channel<string> Outbox { get; } = Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true });
+            public Channel<string> Outbox { get; } = Channel.CreateBounded<string>(new BoundedChannelOptions(512)
+            {
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+            });
+            public int NeedsResync;
         }
 
         private readonly ConcurrentDictionary<Guid, Subscriber> subscribers = new();
@@ -57,12 +63,12 @@ namespace Omnipotent.Services.Projects
                 if (s.ProjectID == null)
                 {
                     fleetMsg ??= JsonConvert.SerializeObject(new { kind = "project-event", projectID = e.ProjectID, type = e.Type });
-                    s.Outbox.Writer.TryWrite(fleetMsg);
+                    if (!s.Outbox.Writer.TryWrite(fleetMsg)) Interlocked.Exchange(ref s.NeedsResync, 1);
                 }
                 else if (string.Equals(s.ProjectID, e.ProjectID, StringComparison.Ordinal))
                 {
                     perProjectMsg ??= JsonConvert.SerializeObject(new { kind = "event", @event = e }, CamelCase);
-                    s.Outbox.Writer.TryWrite(perProjectMsg);
+                    if (!s.Outbox.Writer.TryWrite(perProjectMsg)) Interlocked.Exchange(ref s.NeedsResync, 1);
                 }
             }
         }
@@ -85,11 +91,11 @@ namespace Omnipotent.Services.Projects
             subscribers[sub.Id] = sub;
             try
             {
+                var send = SendLoopAsync(sub);
                 if (sub.ProjectID != null)
                     foreach (var e in replay(sub.ProjectID, since))
-                        sub.Outbox.Writer.TryWrite(JsonConvert.SerializeObject(new { kind = "event", @event = e }, CamelCase));
+                        await sub.Outbox.Writer.WriteAsync(JsonConvert.SerializeObject(new { kind = "event", @event = e }, CamelCase));
 
-                var send = SendLoopAsync(sub);
                 var recv = ReceiveUntilCloseAsync(socket);
                 await Task.WhenAny(send, recv);
             }
@@ -120,6 +126,8 @@ namespace Omnipotent.Services.Projects
                 try { msg = await read; }
                 catch (ChannelClosedException) { break; }
                 await SendTextAsync(sub.Socket, msg);
+                if (Interlocked.Exchange(ref sub.NeedsResync, 0) == 1)
+                    await SendTextAsync(sub.Socket, "{\"kind\":\"resync\",\"reason\":\"client-fell-behind\"}");
             }
         }
 

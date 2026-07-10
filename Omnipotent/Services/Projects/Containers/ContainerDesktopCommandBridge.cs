@@ -4,9 +4,9 @@ namespace Omnipotent.Services.Projects.Containers
 
     /// <summary>
     /// Narrow application-control bridge for an isolated XFCE desktop.  It deliberately uses the
-    /// desktop's launcher and VNC input instead of exposing a generic command-execution tool:
-    /// agents can start the browser or terminal they need, but cannot smuggle arbitrary host or
-    /// container commands through the computer-control API.
+    /// desktop's launcher and VNC input. This bridge accepts only fixed browser/terminal window
+    /// operations; bounded container-local shell execution is a separate adapter capability, and
+    /// neither path can execute a command on the Omnipotent host.
     /// </summary>
     public sealed class ContainerDesktopCommandBridge
     {
@@ -67,10 +67,9 @@ namespace Omnipotent.Services.Projects.Containers
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
                 (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
                 throw new InvalidOperationException("computer_navigate requires an absolute http(s) URL.");
-            await LaunchAsync("browser", null, ct);
-            await transport.KeyChordAsync("ctrl+l", ct: ct);
-            await transport.TypeTextAsync(uri.AbsoluteUri, ct: ct);
-            await transport.KeyChordAsync("enter", ct: ct);
+            // Pass the validated URL as one Docker-exec argv value. This focuses/opens Firefox in
+            // one operation and avoids a fragile launch -> focus -> address-bar typing sequence.
+            await LaunchAsync("browser", uri.AbsoluteUri, ct);
         }
 
         public Task FocusAsync(string? titleContains, string? processName, CancellationToken ct)

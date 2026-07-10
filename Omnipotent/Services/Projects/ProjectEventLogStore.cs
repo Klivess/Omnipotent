@@ -22,9 +22,12 @@ namespace Omnipotent.Services.Projects
         private readonly Action<string> log;
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, long> seqCache = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, List<(long sequence, long offset)>> sparseOffsets = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, Dictionary<string, ProjectEvent>> lastByType = new(StringComparer.Ordinal);
+        private const int SparseStride = 128;
 
         /// <summary>Raised after an event is durably appended. Used by the retrieval index
-        /// and (later) the website's live feed. Fired outside the project lock.</summary>
+        /// and (later) the website's live feed. Fired in sequence order.</summary>
         public event Action<ProjectEvent>? EventAppended;
 
         private const int MaxPayloadBytes = 32 * 1024;
@@ -53,10 +56,17 @@ namespace Omnipotent.Services.Projects
                 if (evt.PayloadJson != null && System.Text.Encoding.UTF8.GetByteCount(evt.PayloadJson) > MaxPayloadBytes)
                     evt.PayloadJson = TruncateUtf8(evt.PayloadJson, MaxPayloadBytes - 64) + "…(truncated)";
 
-                File.AppendAllText(LogPath(evt.ProjectID), JsonConvert.SerializeObject(evt) + Environment.NewLine);
+                string path = LogPath(evt.ProjectID);
+                long offset = File.Exists(path) ? new FileInfo(path).Length : 0;
+                File.AppendAllText(path, JsonConvert.SerializeObject(evt) + Environment.NewLine);
                 seqCache[evt.ProjectID] = next;
+                var offsets = sparseOffsets.GetOrAdd(evt.ProjectID, _ => new());
+                if ((next - 1) % SparseStride == 0) offsets.Add((next, offset));
+                lastByType.GetOrAdd(evt.ProjectID, _ => new(StringComparer.Ordinal))[evt.Type] = evt;
+                // Publish while holding the per-project append lock so concurrent writers cannot
+                // deliver sequence N+1 to retrieval/WebSocket subscribers before sequence N.
+                try { EventAppended?.Invoke(evt); } catch { }
             }
-            try { EventAppended?.Invoke(evt); } catch { /* subscribers must not break appends */ }
             return evt;
         }
 
@@ -68,7 +78,16 @@ namespace Omnipotent.Services.Projects
             {
                 string path = LogPath(projectID);
                 if (!File.Exists(path)) return results;
+                EnsureIndexLocked(projectID);
+                long offset = 0;
+                if (sparseOffsets.TryGetValue(projectID, out var offsets))
+                    foreach (var item in offsets)
+                    {
+                        if (item.sequence > sinceExclusive + 1) break;
+                        offset = item.offset;
+                    }
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                fs.Seek(offset, SeekOrigin.Begin);
                 using var sr = new StreamReader(fs);
                 string? line;
                 while ((line = sr.ReadLine()) != null && results.Count < max)
@@ -94,6 +113,16 @@ namespace Omnipotent.Services.Projects
             lock (LockFor(projectID)) return GetLastSequenceLocked(projectID);
         }
 
+        public ProjectEvent? GetLastOfType(string projectID, string type)
+        {
+            lock (LockFor(projectID))
+            {
+                EnsureIndexLocked(projectID);
+                return lastByType.TryGetValue(projectID, out var byType) && byType.TryGetValue(type, out var evt)
+                    ? evt : null;
+            }
+        }
+
         /// <summary>All project IDs that have an event log on disk.</summary>
         public List<string> AllProjectIDsWithLogs()
         {
@@ -105,27 +134,50 @@ namespace Omnipotent.Services.Projects
 
         private long GetLastSequenceLocked(string projectID)
         {
-            if (seqCache.TryGetValue(projectID, out var cached)) return cached;
+            EnsureIndexLocked(projectID);
+            return seqCache.TryGetValue(projectID, out var cached) ? cached : 0;
+        }
+
+        private void EnsureIndexLocked(string projectID)
+        {
+            if (sparseOffsets.ContainsKey(projectID) && seqCache.ContainsKey(projectID)) return;
             long last = 0;
             string path = LogPath(projectID);
+            var offsets = new List<(long sequence, long offset)>();
+            var types = new Dictionary<string, ProjectEvent>(StringComparer.Ordinal);
             if (File.Exists(path))
             {
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var sr = new StreamReader(fs);
-                string? line;
-                while ((line = sr.ReadLine()) != null)
+                long lineOffset = 0;
+                var bytes = new List<byte>(4096);
+                int value;
+                while ((value = fs.ReadByte()) >= 0)
                 {
-                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    if (value != '\n') { bytes.Add((byte)value); continue; }
+                    IndexLine(bytes, lineOffset);
+                    bytes.Clear();
+                    lineOffset = fs.Position;
+                }
+                if (bytes.Count > 0) IndexLine(bytes, lineOffset);
+
+                void IndexLine(List<byte> lineBytes, long offset)
+                {
                     try
                     {
+                        string line = System.Text.Encoding.UTF8.GetString(lineBytes.ToArray()).TrimEnd('\r').TrimStart('\uFEFF');
+                        if (string.IsNullOrWhiteSpace(line)) return;
                         var e = JsonConvert.DeserializeObject<ProjectEvent>(line);
-                        if (e != null && e.Sequence > last) last = e.Sequence;
+                        if (e == null) return;
+                        if ((e.Sequence - 1) % SparseStride == 0) offsets.Add((e.Sequence, offset));
+                        if (e.Sequence > last) last = e.Sequence;
+                        types[e.Type] = e;
                     }
                     catch { }
                 }
             }
             seqCache[projectID] = last;
-            return last;
+            sparseOffsets[projectID] = offsets;
+            lastByType[projectID] = types;
         }
 
         private static string TruncateUtf8(string s, int maxBytes)

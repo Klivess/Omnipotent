@@ -24,6 +24,7 @@ namespace Omnipotent.Services.Projects
         private readonly OpenRouterCostFetcher costFetcher;
         private readonly Action<string> log;
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> llmTurnGates = new(StringComparer.Ordinal);
 
         // Provisional per-million-token USD estimate, used until the real cost reconciles.
         // Same yardstick style as KliveAgentStats; the real OpenRouter figure supersedes it.
@@ -66,6 +67,52 @@ namespace Omnipotent.Services.Projects
         public Ledger GetLedger(string projectID)
         {
             lock (LockFor(projectID)) return LoadLocked(projectID);
+        }
+
+        private sealed class LlmTurnLease : IAsyncDisposable
+        {
+            private SemaphoreSlim? gate;
+            public LlmTurnLease(SemaphoreSlim gate) => this.gate = gate;
+            public ValueTask DisposeAsync()
+            {
+                Interlocked.Exchange(ref gate, null)?.Release();
+                return ValueTask.CompletedTask;
+            }
+        }
+
+        /// <summary>
+        /// Serializes the check -> provider call -> ledger booking boundary for one project.
+        /// This prevents several concurrent agents from all starting against the same final few
+        /// cents and overshooting the cap as a group. The caller holds the lease until it has
+        /// recorded the response usage.
+        /// </summary>
+        public async Task<IAsyncDisposable?> TryAcquireLlmTurnAsync(string projectID, CancellationToken ct = default)
+        {
+            var gate = llmTurnGates.GetOrAdd(projectID, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(ct);
+            var project = projectStore.GetProject(projectID);
+            bool allowed;
+            lock (LockFor(projectID))
+            {
+                var ledger = LoadLocked(projectID);
+                // Planning projects spend too (research + planning councils draft the Grand Plan).
+                allowed = (project?.Status is ProjectStatus.Active or ProjectStatus.Planning) && project!.TokenBudgetUsd > 0 &&
+                          ledger.TokenSpendUsd < project.TokenBudgetUsd;
+            }
+            if (!allowed)
+            {
+                gate.Release();
+                CheckTokenThresholds(projectID);
+                return null;
+            }
+            return new LlmTurnLease(gate);
+        }
+
+        public bool IsWithinTokenBudget(string projectID)
+        {
+            var project = projectStore.GetProject(projectID);
+            if (project == null || project.TokenBudgetUsd <= 0) return false;
+            lock (LockFor(projectID)) return LoadLocked(projectID).TokenSpendUsd < project.TokenBudgetUsd;
         }
 
         /// <summary>
@@ -132,6 +179,7 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public bool IsMoneySpendAutonomous(string projectID, double amountUsd)
         {
+            if (!double.IsFinite(amountUsd) || amountUsd <= 0) return false;
             var project = projectStore.GetProject(projectID);
             if (project == null) return false;
             if (amountUsd > project.MoneyAutonomousThresholdUsd) return false;
@@ -145,6 +193,8 @@ namespace Omnipotent.Services.Projects
         /// <summary>Records a real-money spend against the ledger (after it happened / was approved).</summary>
         public void RecordMoneySpend(string projectID, double amountUsd, string description)
         {
+            if (!double.IsFinite(amountUsd) || amountUsd <= 0)
+                throw new ArgumentOutOfRangeException(nameof(amountUsd), "Money spend must be positive and finite.");
             lock (LockFor(projectID))
             {
                 var ledger = LoadLocked(projectID);
@@ -169,7 +219,7 @@ namespace Omnipotent.Services.Projects
             lock (LockFor(projectID)) ledger = LoadLocked(projectID);
             double fraction = ledger.TokenSpendUsd / project.TokenBudgetUsd;
 
-            if (fraction >= 1.0 && project.Status == ProjectStatus.Active)
+            if (fraction >= 1.0 && project.Status is ProjectStatus.Active or ProjectStatus.Planning)
             {
                 project.Status = ProjectStatus.BudgetPaused;
                 projectStore.SaveProject(project);
