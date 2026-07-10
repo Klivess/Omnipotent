@@ -341,6 +341,66 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            // Observables (the agents' live dashboard for this project). History is trimmed to the
+            // last N samples server-side so the 1s-debounced refresh stays cheap; ?history=0 = values only.
+            await parent.CreateAPIRoute("/projects/observables", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    int history = 120;
+                    if (int.TryParse(req.userParameters?.Get("history"), out var h))
+                        history = Math.Clamp(h, 0, ProjectObservableStore.MaxHistorySamples);
+                    var list = parent.Observables.List(project!.ProjectID).Select(o => new
+                    {
+                        o.ObservableID,
+                        o.Name,
+                        Type = o.Type.ToString(),
+                        Format = o.Format.ToString(),
+                        o.Unit,
+                        o.Description,
+                        o.NumericValue,
+                        o.TextValue,
+                        DisplayValue = ProjectObservableStore.FormatValue(o),
+                        o.CreatedBy,
+                        o.UpdatedBy,
+                        o.CreatedAt,
+                        o.UpdatedAt,
+                        History = history <= 0
+                            ? new List<ObservableSample>()
+                            : o.History.Skip(Math.Max(0, o.History.Count - history)).ToList(),
+                    }).ToList();
+                    await req.ReturnResponse(Json(list));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Manual cleanup of an agent-created observable (agents own the values; Klives can only prune).
+            await parent.CreateAPIRoute("/projects/observables/delete", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string name = req.userParameters?.Get("name") ?? "";
+                    if (string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(req.userMessageContent))
+                    {
+                        try { name = (string?)Newtonsoft.Json.Linq.JObject.Parse(req.userMessageContent)["name"] ?? ""; }
+                        catch { /* body isn't a JSON object with name */ }
+                    }
+                    bool deleted = parent.Observables.Delete(project!.ProjectID, name);
+                    if (deleted)
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            Type = ProjectEventTypes.ObservableChanged,
+                            Author = "klives",
+                            Text = $"{name}: deleted by Klives",
+                        });
+                    await req.ReturnResponse(Json(new { deleted }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
             await parent.CreateAPIRoute("/projects/containers", async req =>
             {
