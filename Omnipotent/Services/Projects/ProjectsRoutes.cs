@@ -496,6 +496,7 @@ namespace Omnipotent.Services.Projects
                         versions = doc.Versions.OrderByDescending(v => v.Version).Select(v => new
                         {
                             v.Version,
+                            v.Content,
                             v.Markdown,
                             v.Summary,
                             v.ChangeNote,

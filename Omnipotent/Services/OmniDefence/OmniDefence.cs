@@ -393,6 +393,9 @@ namespace Omnipotent.Services.OmniDefence
                     }
                 }
 
+                // Alert bookkeeping mutated the record; ensure it survives the next flush.
+                if (first || escalation.HasValue) tracker.MarkDirty(rec.Ip);
+
                 if (first)
                 {
                     var builder = KliveBotDiscord.MakeSimpleEmbed(

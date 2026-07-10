@@ -159,7 +159,7 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"The project's goal: {project.Goal}");
             sb.AppendLine();
             sb.AppendLine($"Output EXACTLY five sections with these exact headers, nothing before the first header:");
-            sb.AppendLine($"{PlanHeader} — the current plan of attack (≤120 words).");
+            sb.AppendLine($"{PlanHeader} — the tactical plan: a 'Focus:' line (one sentence on what's being driven at now) then a 'Next:' list of concrete next steps as bullets (a handful). ≤120 words.");
             sb.AppendLine($"{OrgHeader} — which agents exist, their tier/role, what each is doing (≤80 words).");
             sb.AppendLine($"{BudgetHeader} — spend vs budget and burn trend, as stated in events (≤40 words).");
             sb.AppendLine($"{OpenHeader} — unresolved questions, pending approvals, blockers (≤80 words).");
@@ -167,7 +167,7 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine("Keep decisions, requirements, verified outcomes and open issues. Drop tool mechanics and superseded states.");
             sb.AppendLine();
             sb.AppendLine("EXISTING DIGEST:");
-            sb.AppendLine($"{PlanHeader}\n{OrNone(existing.CurrentPlan)}");
+            sb.AppendLine($"{PlanHeader}\n{OrNone(DescribeExistingPlan(existing))}");
             sb.AppendLine($"{OrgHeader}\n{OrNone(existing.OrgChart)}");
             sb.AppendLine($"{BudgetHeader}\n{OrNone(existing.BudgetState)}");
             sb.AppendLine($"{OpenHeader}\n{OrNone(existing.OpenThreads)}");
@@ -191,6 +191,8 @@ namespace Omnipotent.Services.Projects
             {
                 ProjectID = existing.ProjectID,
                 CurrentPlan = existing.CurrentPlan,
+                CurrentFocus = existing.CurrentFocus,
+                NextSteps = new List<string>(existing.NextSteps),
                 OrgChart = existing.OrgChart,
                 BudgetState = existing.BudgetState,
                 OpenThreads = existing.OpenThreads,
@@ -204,12 +206,63 @@ namespace Omnipotent.Services.Projects
                 result.RollingSummary = response.Trim();
                 return result;
             }
-            if (sections.TryGetValue(PlanHeader, out var plan)) result.CurrentPlan = plan;
+            if (sections.TryGetValue(PlanHeader, out var plan)) ApplyPlanSection(result, plan);
             if (sections.TryGetValue(OrgHeader, out var org)) result.OrgChart = org;
             if (sections.TryGetValue(BudgetHeader, out var budget)) result.BudgetState = budget;
             if (sections.TryGetValue(OpenHeader, out var open)) result.OpenThreads = open;
             if (sections.TryGetValue(SummaryHeader, out var summary)) result.RollingSummary = summary;
             return result;
+        }
+
+        /// <summary>Renders the existing tactical plan (focus + next steps) for echoing back into the rebuild prompt.</summary>
+        private static string DescribeExistingPlan(ProjectDigest d)
+        {
+            if (string.IsNullOrWhiteSpace(d.CurrentFocus) && d.NextSteps.Count == 0)
+                return d.CurrentPlan;
+            var sb = new StringBuilder();
+            if (!string.IsNullOrWhiteSpace(d.CurrentFocus)) sb.AppendLine($"Focus: {d.CurrentFocus}");
+            if (d.NextSteps.Count > 0)
+            {
+                sb.AppendLine("Next:");
+                foreach (var s in d.NextSteps) sb.AppendLine($"- {s}");
+            }
+            return sb.ToString().Trim();
+        }
+
+        /// <summary>Parses the ## PLAN section into CurrentFocus + NextSteps, keeping the raw text in CurrentPlan.</summary>
+        private static void ApplyPlanSection(ProjectDigest result, string plan)
+        {
+            result.CurrentPlan = plan.Trim();
+            string focus = "";
+            var steps = new List<string>();
+            bool inNext = false;
+            foreach (var raw in plan.Split('\n'))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0) continue;
+                if (line.StartsWith("Focus:", StringComparison.OrdinalIgnoreCase))
+                {
+                    focus = line[6..].Trim();
+                    inNext = false;
+                }
+                else if (line.StartsWith("Next:", StringComparison.OrdinalIgnoreCase))
+                {
+                    inNext = true;
+                    var rest = line[5..].Trim();
+                    if (rest.Length > 0) steps.Add(rest);
+                }
+                else if (line.StartsWith('-') || line.StartsWith('*') || line.StartsWith('•'))
+                {
+                    steps.Add(line.TrimStart('-', '*', '•', ' ').Trim());
+                }
+                else if (inNext)
+                {
+                    steps.Add(line);
+                }
+            }
+            if (focus.Length > 0) result.CurrentFocus = focus;
+            steps = steps.Where(s => s.Length > 0).ToList();
+            if (steps.Count > 0) result.NextSteps = steps;
         }
 
         private static Dictionary<string, string> SplitSections(string response)

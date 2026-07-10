@@ -126,6 +126,41 @@ namespace Omnipotent.Tests.Projects
             long remainingLines = File.Exists(file) ? File.ReadAllLines(file).Count(l => !string.IsNullOrWhiteSpace(l)) : 0;
             Assert.Equal(0, remainingLines);
         }
+
+        [Fact]
+        public async Task LateSecondClaim_ForCompletedLiveWake_IsAlsoAcknowledged()
+        {
+            string pid = NewPid();
+            const string hook = "inter-agent";
+            const string wake = "shared-live-wake";
+            var q = new StimulusQueue(_ => { });
+            int claims = 0;
+            var firstClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var secondClaim = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            q.OnClaim = _ =>
+            {
+                int n = Interlocked.Increment(ref claims);
+                if (n == 1) firstClaim.TrySetResult();
+                if (n == 2) secondClaim.TrySetResult();
+                return Task.FromResult<string?>(wake);
+            };
+
+            await q.EnqueueAsync(Env(pid, hook, "first"), "agentA");
+            await firstClaim.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Delay(100); // let the first claim reach disk
+            q.AcknowledgeWake(wake, succeeded: true);
+
+            // The same live wake accepts another message just after completing. Its retained
+            // outcome must reconcile this late claim too; otherwise it remains stuck until boot.
+            await q.EnqueueAsync(Env(pid, hook, "second"), "agentA");
+            await secondClaim.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await Task.Delay(150);
+
+            string file = Path.Combine(
+                OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsStimulusDirectory),
+                $"{pid}__{hook}.queue.jsonl");
+            Assert.False(File.Exists(file));
+        }
     }
 
     public class StimulusAgentTests

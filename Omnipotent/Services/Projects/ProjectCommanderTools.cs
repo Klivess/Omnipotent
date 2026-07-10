@@ -5,7 +5,6 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects.Stimulus;
 using Omnipotent.Services.ComputerControl;
-using System.Security.Cryptography;
 using System.Text;
 
 namespace Omnipotent.Services.Projects
@@ -131,11 +130,19 @@ namespace Omnipotent.Services.Projects
             {
                 case "update_plan":
                 {
-                    string plan = (string?)a["plan"] ?? "";
+                    string focus = ((string?)a["focus"] ?? "").Trim();
+                    var steps = ((a["nextSteps"] as JArray) ?? new JArray())
+                        .Select(t => ((string?)t ?? "").Trim()).Where(s => s.Length > 0).ToList();
+                    string plan = ((string?)a["plan"] ?? "").Trim();
                     var digest = digests.GetDigest(project.ProjectID);
-                    digest.CurrentPlan = plan;
+                    if (focus.Length > 0) digest.CurrentFocus = focus;
+                    if (steps.Count > 0) digest.NextSteps = steps;
+                    // Keep CurrentPlan populated for legacy display / wake seeds.
+                    if (plan.Length > 0) digest.CurrentPlan = plan;
+                    else if (focus.Length > 0 || steps.Count > 0) digest.CurrentPlan = ComposePlanText(focus, steps);
                     digests.SaveDigest(digest);
-                    eventLog.Append(Evt(ProjectEventTypes.Status, "commander", $"Plan updated: {Trunc(plan, 200)}"));
+                    string logMsg = plan.Length > 0 ? plan : ComposePlanText(focus, steps);
+                    eventLog.Append(Evt(ProjectEventTypes.Status, "commander", $"Plan updated: {Trunc(logMsg, 200)}"));
                     return new CommanderToolResult("Plan updated.");
                 }
 
@@ -288,11 +295,27 @@ namespace Omnipotent.Services.Projects
 
                 case "send_agent_message":
                 {
-                    string toId = (string?)a["agentID"] ?? "";
-                    string message = (string?)a["message"] ?? "";
-                    if (SendAgentMessageAsync != null) await SendAgentMessageAsync(project.ProjectID, actingAgentID, toId, message);
-                    else eventLog.Append(new ProjectEvent { ProjectID = project.ProjectID, WakeID = wakeID, AgentID = toId, Type = ProjectEventTypes.AgentMessage, Author = "commander", Text = $"→{toId}: {message}" });
-                    return new CommanderToolResult($"Message sent to {toId}.");
+                    string target = ((string?)a["agentID"] ?? "").Trim();
+                    string message = ((string?)a["message"] ?? "").Trim();
+                    if (message.Length == 0)
+                        return new CommanderToolResult("Message not sent: provide a non-empty message.");
+                    if (!subAgents.TryResolveActiveTarget(project.ProjectID, target, out var recipient, out var error))
+                        return new CommanderToolResult($"Message not sent: {error}");
+
+                    string toId = recipient!.AgentID;
+                    if (SendAgentMessageAsync != null)
+                        await SendAgentMessageAsync(project.ProjectID, actingAgentID, toId, message);
+                    else
+                        eventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            WakeID = wakeID,
+                            AgentID = toId,
+                            Type = ProjectEventTypes.AgentMessage,
+                            Author = actingAgentID == "commander" ? "commander" : "agent",
+                            Text = $"{actingAgentID} → {toId}: {message}",
+                        });
+                    return new CommanderToolResult($"Message sent to {recipient.Role} (agent ID {toId}).");
                 }
 
                 case "request_user_approval":
@@ -571,12 +594,14 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult(string.Join("\n", entries) is { Length: > 0 } s ? s : "(empty)");
                 }
 
+                // Host script execution is UNGATED (Klives' explicit call: approvals are for plans,
+                // money, and the escalation bar — not routine work). Every script is still fully
+                // visible after the fact: the ToolCall event carries the complete args payload on
+                // the timeline. The prompt's escalation bar owns judgment for consequential scripts.
                 case "run_script":
                 {
                     string code = (string?)a["code"] ?? "";
                     if (string.IsNullOrWhiteSpace(code)) return new CommanderToolResult("Provide 'code' — a C# script body.");
-                    var approval = await ApproveHostExecutionAsync("C#", code, ct);
-                    if (approval != null) return approval;
                     return await RunScriptAsync(code, ct);
                 }
 
@@ -584,8 +609,6 @@ namespace Omnipotent.Services.Projects
                 {
                     string ps = (string?)a["script"] ?? "";
                     if (string.IsNullOrWhiteSpace(ps)) return new CommanderToolResult("Provide 'script' — a PowerShell script body.");
-                    var approval = await ApproveHostExecutionAsync("PowerShell", ps, ct);
-                    if (approval != null) return approval;
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var r = await HostShell.RunPowerShellAsync(ps, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
@@ -595,8 +618,6 @@ namespace Omnipotent.Services.Projects
                 {
                     string bash = (string?)a["script"] ?? "";
                     if (string.IsNullOrWhiteSpace(bash)) return new CommanderToolResult("Provide 'script' — a bash script body.");
-                    var approval = await ApproveHostExecutionAsync("Bash", bash, ct);
-                    if (approval != null) return approval;
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var r = await HostShell.RunBashAsync(bash, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: VolumeRoot(), ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget));
@@ -669,11 +690,11 @@ namespace Omnipotent.Services.Projects
                 case "submit_grand_plan":
                 {
                     if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
-                    string planMd = ((string?)a["plan"] ?? "").Trim();
+                    var content = ParsePlanContent(a);
                     string summary = ((string?)a["summary"] ?? "").Trim();
-                    if (planMd.Length == 0) return new CommanderToolResult("Provide 'plan' — the full Grand Plan in markdown.");
+                    if (content.Mission.Length == 0) return new CommanderToolResult("Provide 'mission' — the plan needs a mission statement.");
                     if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary for the approval card and wake seeds.");
-                    return await SubmitPlanForApprovalAsync(planMd, summary, changeNote: null, isAmendment: false, ct);
+                    return await SubmitPlanForApprovalAsync(content, summary, changeNote: null, isAmendment: false, ct);
                 }
 
                 case "amend_grand_plan":
@@ -681,22 +702,48 @@ namespace Omnipotent.Services.Projects
                     if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
                     if (!GrandPlans.HasApprovedPlan(project.ProjectID))
                         return new CommanderToolResult("No approved Grand Plan to amend yet. Use submit_grand_plan first.");
-                    string planMd = ((string?)a["plan"] ?? "").Trim();
+                    var content = ParsePlanContent(a);
                     string summary = ((string?)a["summary"] ?? "").Trim();
                     string changeNote = ((string?)a["changeNote"] ?? "").Trim();
-                    if (planMd.Length == 0) return new CommanderToolResult("Provide 'plan' — the full revised Grand Plan in markdown.");
+                    if (content.Mission.Length == 0) return new CommanderToolResult("Provide 'mission' — the revised plan needs a mission statement.");
                     if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary of the revised plan.");
                     bool material = ParseBool((string?)a["material"], defaultValue: false);
                     if (!material)
                     {
-                        var v = GrandPlans.SubmitVersion(project.ProjectID, planMd, summary, changeNote, material: false, wakeID);
+                        var v = GrandPlans.SubmitVersion(project.ProjectID, content, summary, changeNote, material: false, wakeID);
                         var evt = Evt(ProjectEventTypes.GrandPlanAmended, "commander",
                             $"Grand Plan amended (v{v.Version}, non-material): {Trunc(changeNote.Length > 0 ? changeNote : summary, 200)}");
                         evt.PayloadJson = JsonConvert.SerializeObject(new { version = v.Version, material = false, summary });
                         eventLog.Append(evt);
                         return new CommanderToolResult($"Grand Plan amended to v{v.Version} (non-material, applied immediately). It seeds your next wake.");
                     }
-                    return await SubmitPlanForApprovalAsync(planMd, summary, changeNote, isAmendment: true, ct);
+                    return await SubmitPlanForApprovalAsync(content, summary, changeNote, isAmendment: true, ct);
+                }
+
+                case "update_plan_progress":
+                {
+                    if (GrandPlans == null) return new CommanderToolResult("Grand Plan store unavailable.");
+                    if (!GrandPlans.HasApprovedPlan(project.ProjectID))
+                        return new CommanderToolResult("No approved Grand Plan yet — nothing to progress. Submit one and get it approved first (submit_grand_plan).");
+                    var results = new List<string>();
+                    string mRef = ((string?)a["milestoneId"] ?? "").Trim();
+                    if (mRef.Length > 0)
+                    {
+                        var m = GrandPlans.UpdateMilestoneStatus(project.ProjectID, mRef, ParseMilestoneStatus((string?)a["milestoneStatus"]));
+                        results.Add(m == null ? $"No milestone matched '{mRef}'." : $"Milestone '{Trunc(m.Title, 60)}' → {m.Status}.");
+                    }
+                    string cRef = ((string?)a["criterionId"] ?? "").Trim();
+                    if (cRef.Length > 0)
+                    {
+                        var cc = GrandPlans.SetCriterionMet(project.ProjectID, cRef, ParseBool((string?)a["criterionMet"], defaultValue: true));
+                        results.Add(cc == null ? $"No success criterion matched '{cRef}'." : $"Criterion '{Trunc(cc.Text, 60)}' → {(cc.Met ? "met" : "unmet")}.");
+                    }
+                    if (results.Count == 0)
+                        return new CommanderToolResult("Provide milestoneId (+milestoneStatus) and/or criterionId (+criterionMet).");
+                    string note = ((string?)a["note"] ?? "").Trim();
+                    string msg = string.Join(" ", results);
+                    eventLog.Append(Evt(ProjectEventTypes.GrandPlanProgress, "commander", note.Length > 0 ? $"{msg} {note}" : msg));
+                    return new CommanderToolResult(msg);
                 }
 
                 case "get_grand_plan":
@@ -706,7 +753,7 @@ namespace Omnipotent.Services.Projects
                     if (v == null) return new CommanderToolResult("No approved Grand Plan yet.");
                     return new CommanderToolResult(
                         $"GRAND PLAN v{v.Version} (approved {(v.ResolvedAt ?? v.SubmittedAt):MM-dd}):\n\n"
-                        + ProjectsContextBudget.TruncateToTokens(v.Markdown, 2500));
+                        + ProjectsContextBudget.TruncateToTokens(DescribeGrandPlanForModel(v), 2500));
                 }
 
                 case "complete_project":
@@ -740,9 +787,9 @@ namespace Omnipotent.Services.Projects
         /// and — if the project is still Planning — activated. On denial the version is rejected and the
         /// Commander is told to revise and resubmit within this same wake.
         /// </summary>
-        private async Task<CommanderToolResult> SubmitPlanForApprovalAsync(string planMd, string summary, string? changeNote, bool isAmendment, CancellationToken ct)
+        private async Task<CommanderToolResult> SubmitPlanForApprovalAsync(GrandPlanContent content, string summary, string? changeNote, bool isAmendment, CancellationToken ct)
         {
-            var version = GrandPlans!.SubmitVersion(project.ProjectID, planMd, summary, changeNote, material: true, wakeID);
+            var version = GrandPlans!.SubmitVersion(project.ProjectID, content, summary, changeNote, material: true, wakeID);
             var submittedEvt = Evt(ProjectEventTypes.GrandPlanSubmitted, "commander",
                 $"Grand Plan v{version.Version} submitted for approval: {Trunc(summary, 200)}");
             submittedEvt.PayloadJson = JsonConvert.SerializeObject(new { version = version.Version, isAmendment, summary });
@@ -759,7 +806,7 @@ namespace Omnipotent.Services.Projects
                     : $"Grand Plan v{version.Version} — approve to begin work",
                 Description = summary,
                 Rationale = changeNote ?? "Klives approves the strategic plan before the fleet executes it.",
-                ProposalJson = JsonConvert.SerializeObject(new { version = version.Version, markdown = planMd }),
+                ProposalJson = JsonConvert.SerializeObject(new { version = version.Version, markdown = version.Markdown, content = version.Content }),
             };
             var res = await gates.OpenGateAndWaitAsync(gate, ct);
 
@@ -789,6 +836,119 @@ namespace Omnipotent.Services.Projects
 
         private static bool ParseBool(string? v, bool defaultValue) =>
             string.IsNullOrWhiteSpace(v) ? defaultValue : v.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
+
+        private static MilestoneStatus ParseMilestoneStatus(string? s) =>
+            (s ?? "").Trim().ToLowerInvariant().Replace('-', '_').Replace(' ', '_') switch
+            {
+                "in_progress" or "inprogress" or "started" or "wip" => MilestoneStatus.InProgress,
+                "done" or "complete" or "completed" or "finished" => MilestoneStatus.Done,
+                "blocked" or "stuck" => MilestoneStatus.Blocked,
+                _ => MilestoneStatus.Pending,
+            };
+
+        private static RiskSeverity ParseSeverity(string? s) =>
+            (s ?? "").Trim().ToLowerInvariant() switch
+            {
+                "high" or "critical" or "severe" => RiskSeverity.High,
+                "low" or "minor" => RiskSeverity.Low,
+                _ => RiskSeverity.Medium,
+            };
+
+        /// <summary>Composes a compact tactical-plan text from focus + next steps (kept in the digest for legacy display/seeds).</summary>
+        private static string ComposePlanText(string focus, List<string> steps)
+        {
+            var sb = new StringBuilder();
+            if (focus.Length > 0) sb.Append("Focus: ").Append(focus);
+            if (steps.Count > 0)
+            {
+                if (sb.Length > 0) sb.Append('\n');
+                sb.Append("Next: ").Append(string.Join("; ", steps));
+            }
+            return sb.ToString();
+        }
+
+        /// <summary>Parses the structured Grand Plan tool arguments (submit/amend) into a <see cref="GrandPlanContent"/>.</summary>
+        private static GrandPlanContent ParsePlanContent(JObject a)
+        {
+            var c = new GrandPlanContent
+            {
+                Mission = ((string?)a["mission"] ?? "").Trim(),
+                BudgetPlan = ((string?)a["budgetPlan"] ?? "").Trim(),
+            };
+            foreach (var w in (a["workstreams"] as JArray) ?? new JArray())
+            {
+                string name = ((string?)w?["name"] ?? "").Trim();
+                if (name.Length == 0) continue;
+                c.Workstreams.Add(new PlanWorkstream { Name = name, Description = ((string?)w?["description"] ?? "").Trim() });
+            }
+            foreach (var m in (a["milestones"] as JArray) ?? new JArray())
+            {
+                string title = ((string?)m?["title"] ?? "").Trim();
+                if (title.Length == 0) continue;
+                string target = ((string?)m?["target"] ?? "").Trim();
+                c.Milestones.Add(new PlanMilestone
+                {
+                    Title = title,
+                    Detail = ((string?)m?["detail"] ?? "").Trim(),
+                    Target = target.Length == 0 ? null : target,
+                    Status = ParseMilestoneStatus((string?)m?["status"]),
+                });
+            }
+            foreach (var r in (a["risks"] as JArray) ?? new JArray())
+            {
+                string desc = ((string?)r?["description"] ?? "").Trim();
+                if (desc.Length == 0) continue;
+                c.Risks.Add(new PlanRisk { Description = desc, Severity = ParseSeverity((string?)r?["severity"]), Mitigation = ((string?)r?["mitigation"] ?? "").Trim() });
+            }
+            foreach (var x in (a["successCriteria"] as JArray) ?? new JArray())
+            {
+                // Accept an object {text, met} or a bare string.
+                string text; bool met = false;
+                if (x is JObject xo) { text = ((string?)xo["text"] ?? "").Trim(); met = ParseBool((string?)xo["met"], defaultValue: false); }
+                else { text = ((string?)x ?? "").Trim(); }
+                if (text.Length == 0) continue;
+                c.SuccessCriteria.Add(new PlanCriterion { Text = text, Met = met });
+            }
+            return c;
+        }
+
+        /// <summary>Renders an approved plan for the model with stable ids and live status inline (for get_grand_plan).</summary>
+        private static string DescribeGrandPlanForModel(GrandPlanVersion v)
+        {
+            var c = v.Content;
+            if (c == null) return v.Markdown; // legacy version
+            var sb = new StringBuilder();
+            sb.Append("MISSION: ").AppendLine(c.Mission).AppendLine();
+            if (c.Workstreams.Count > 0)
+            {
+                sb.AppendLine("WORKSTREAMS:");
+                foreach (var w in c.Workstreams) sb.AppendLine($"- {w.Name}: {w.Description}");
+                sb.AppendLine();
+            }
+            if (c.Milestones.Count > 0)
+            {
+                sb.AppendLine("MILESTONES (id · status · title):");
+                foreach (var m in c.Milestones)
+                    sb.AppendLine($"- {m.ID} · {m.Status} · {m.Title}"
+                        + (string.IsNullOrWhiteSpace(m.Detail) ? "" : $" — {m.Detail}")
+                        + (string.IsNullOrWhiteSpace(m.Target) ? "" : $" (target: {m.Target})"));
+                sb.AppendLine();
+            }
+            if (c.Risks.Count > 0)
+            {
+                sb.AppendLine("RISKS:");
+                foreach (var r in c.Risks) sb.AppendLine($"- [{r.Severity}] {r.Description}" + (string.IsNullOrWhiteSpace(r.Mitigation) ? "" : $" → {r.Mitigation}"));
+                sb.AppendLine();
+            }
+            if (c.SuccessCriteria.Count > 0)
+            {
+                sb.AppendLine("SUCCESS CRITERIA (id · met · text):");
+                foreach (var x in c.SuccessCriteria) sb.AppendLine($"- {x.ID} · {(x.Met ? "MET" : "unmet")} · {x.Text}");
+                sb.AppendLine();
+            }
+            if (!string.IsNullOrWhiteSpace(c.BudgetPlan)) sb.Append("BUDGET PLAN: ").AppendLine(c.BudgetPlan);
+            return sb.ToString().TrimEnd();
+        }
 
         // ── script execution (narrow Roslyn surface, same philosophy as KliveAgent) ──
 
@@ -857,26 +1017,6 @@ namespace Omnipotent.Services.Projects
             {
                 return new CommanderToolResult($"Script threw {ex.GetType().Name}: {ex.Message}");
             }
-        }
-
-        private async Task<CommanderToolResult?> ApproveHostExecutionAsync(string language, string code, CancellationToken ct)
-        {
-            string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(code))).ToLowerInvariant();
-            string preview = code.Length <= 1200 ? code : code[..1200] + "\n[truncated]";
-            var gate = new ProjectGate
-            {
-                ProjectID = project.ProjectID,
-                WakeID = wakeID,
-                AgentID = actingAgentID,
-                Kind = "host-execution",
-                Title = $"Run {language} on the Omnipotent host?",
-                Description = $"Exact script SHA-256: {hash}\n\n{preview}",
-                Rationale = "Host scripts inherit Omnipotent's security context and are outside the desktop-container sandbox.",
-            };
-            var resolution = await gates.OpenGateAndWaitAsync(gate, ct);
-            return resolution.Decision == GateDecision.Approve
-                ? null
-                : new CommanderToolResult($"Host execution not approved ({resolution.Decision}): {resolution.Comment}");
         }
 
         private string VolumeRoot()

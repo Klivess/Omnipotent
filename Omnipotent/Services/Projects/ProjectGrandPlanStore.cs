@@ -9,6 +9,77 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum GrandPlanVersionStatus { PendingApproval, Approved, Rejected, Superseded }
 
+    /// <summary>Live status of a plan milestone. Advanced in place via update_plan_progress (non-material).</summary>
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum MilestoneStatus { Pending, InProgress, Done, Blocked }
+
+    /// <summary>Assessed severity of a plan risk.</summary>
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum RiskSeverity { Low, Medium, High }
+
+    /// <summary>A parallel track of work within the plan.</summary>
+    public class PlanWorkstream
+    {
+        /// <summary>Store-assigned stable id (w1, w2, …) for the lifetime of this version.</summary>
+        public string ID { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string Description { get; set; } = "";
+    }
+
+    /// <summary>A concrete, trackable milestone. Its <see cref="Status"/> is the living part of the plan.</summary>
+    public class PlanMilestone
+    {
+        /// <summary>Store-assigned stable id (m1, m2, …), referenced by update_plan_progress.</summary>
+        public string ID { get; set; } = "";
+        public string Title { get; set; } = "";
+        public string Detail { get; set; } = "";
+        public MilestoneStatus Status { get; set; } = MilestoneStatus.Pending;
+        /// <summary>Optional target date or condition, free text (e.g. "by end of week", "after data feed").</summary>
+        public string? Target { get; set; }
+        /// <summary>Display order within the plan.</summary>
+        public int Order { get; set; }
+        /// <summary>When the status was last changed.</summary>
+        public DateTime? UpdatedAt { get; set; }
+    }
+
+    /// <summary>A definition-of-done criterion. <see cref="Met"/> is ticked in place as it is achieved.</summary>
+    public class PlanCriterion
+    {
+        /// <summary>Store-assigned stable id (c1, c2, …), referenced by update_plan_progress.</summary>
+        public string ID { get; set; } = "";
+        public string Text { get; set; } = "";
+        public bool Met { get; set; }
+        public DateTime? UpdatedAt { get; set; }
+    }
+
+    /// <summary>A known risk and its mitigation.</summary>
+    public class PlanRisk
+    {
+        /// <summary>Store-assigned stable id (r1, r2, …).</summary>
+        public string ID { get; set; } = "";
+        public string Description { get; set; } = "";
+        public RiskSeverity Severity { get; set; } = RiskSeverity.Medium;
+        public string Mitigation { get; set; } = "";
+    }
+
+    /// <summary>
+    /// The structured content of a Grand Plan version — the analytical, trackable form of the plan.
+    /// Authored whole on submit/amend; milestone statuses and criterion ticks are then updated in
+    /// place on the current approved version (non-material progress, not a new version). The store
+    /// also renders this to canonical markdown so text consumers (wake seeds, Discord report,
+    /// get_grand_plan) keep working unchanged.
+    /// </summary>
+    public class GrandPlanContent
+    {
+        public string Mission { get; set; } = "";
+        public List<PlanWorkstream> Workstreams { get; set; } = new();
+        public List<PlanMilestone> Milestones { get; set; } = new();
+        public List<PlanRisk> Risks { get; set; } = new();
+        public List<PlanCriterion> SuccessCriteria { get; set; } = new();
+        /// <summary>Prose budget plan; live actuals come from the ProjectBudgetLedger, not here.</summary>
+        public string BudgetPlan { get; set; } = "";
+    }
+
     /// <summary>
     /// One version of a project's Grand Plan — the strategic north star Klives approves before work
     /// begins. Versions are append-only and monotonically numbered; approving a new version
@@ -18,7 +89,9 @@ namespace Omnipotent.Services.Projects
     public class GrandPlanVersion
     {
         public int Version { get; set; }
-        /// <summary>The full plan: mission, workstreams, milestones, risks, budget plan, success criteria.</summary>
+        /// <summary>Structured, analytical plan content. Null on legacy versions authored before the structured model.</summary>
+        public GrandPlanContent? Content { get; set; }
+        /// <summary>Canonical markdown, rendered from <see cref="Content"/> on submit. Kept for text consumers and legacy versions.</summary>
         public string Markdown { get; set; } = "";
         /// <summary>Commander-authored ≤150-word summary used in wake seeds and the gate card.</summary>
         public string Summary { get; set; } = "";
@@ -66,15 +139,17 @@ namespace Omnipotent.Services.Projects
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".grandplan.json");
 
         /// <summary>
-        /// Appends a new version (auto-numbered). A material version enters PendingApproval; a
-        /// non-material amendment is stored Approved immediately and supersedes the current one.
-        /// Returns a clone of the created version.
+        /// Appends a new version (auto-numbered) from structured content. A material version enters
+        /// PendingApproval; a non-material amendment is stored Approved immediately and supersedes the
+        /// current one. Stable ids are assigned to milestones/criteria/risks/workstreams, and a
+        /// canonical markdown mirror is rendered for text consumers. Returns a clone of the created version.
         /// </summary>
-        public GrandPlanVersion SubmitVersion(string projectID, string markdown, string summary,
+        public GrandPlanVersion SubmitVersion(string projectID, GrandPlanContent content, string summary,
             string? changeNote, bool material, string? wakeID)
         {
-            if (string.IsNullOrWhiteSpace(markdown))
-                throw new InvalidOperationException("Grand Plan markdown cannot be empty.");
+            if (content == null || string.IsNullOrWhiteSpace(content.Mission))
+                throw new InvalidOperationException("Grand Plan must have a mission.");
+            AssignIds(content);
             lock (LockFor(projectID))
             {
                 var doc = LoadLocked(projectID);
@@ -82,7 +157,8 @@ namespace Omnipotent.Services.Projects
                 var version = new GrandPlanVersion
                 {
                     Version = next,
-                    Markdown = markdown,
+                    Content = content,
+                    Markdown = RenderMarkdown(content),
                     Summary = Trim(summary ?? "", MaxSummaryLength),
                     ChangeNote = string.IsNullOrWhiteSpace(changeNote) ? null : changeNote.Trim(),
                     Material = material,
@@ -135,6 +211,49 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>
+        /// Sets a milestone's status on the current approved version, in place (non-material progress —
+        /// no new version, no gate). Matches by id first, then case-insensitively by title. Returns the
+        /// updated milestone, or null if there is no approved plan / no match.
+        /// </summary>
+        public PlanMilestone? UpdateMilestoneStatus(string projectID, string milestoneRef, MilestoneStatus status)
+        {
+            lock (LockFor(projectID))
+            {
+                var doc = LoadLocked(projectID);
+                var v = CurrentApprovedLocked(doc);
+                var m = v?.Content?.Milestones.FirstOrDefault(x =>
+                    string.Equals(x.ID, milestoneRef, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(x.Title, milestoneRef, StringComparison.OrdinalIgnoreCase));
+                if (m == null) return null;
+                m.Status = status;
+                m.UpdatedAt = DateTime.UtcNow;
+                SaveLocked(projectID, doc);
+                return CloneJson(m);
+            }
+        }
+
+        /// <summary>
+        /// Marks a success criterion met/unmet on the current approved version, in place. Matches by id
+        /// first, then case-insensitively by text. Returns the updated criterion, or null if no match.
+        /// </summary>
+        public PlanCriterion? SetCriterionMet(string projectID, string criterionRef, bool met)
+        {
+            lock (LockFor(projectID))
+            {
+                var doc = LoadLocked(projectID);
+                var v = CurrentApprovedLocked(doc);
+                var c = v?.Content?.SuccessCriteria.FirstOrDefault(x =>
+                    string.Equals(x.ID, criterionRef, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(x.Text, criterionRef, StringComparison.OrdinalIgnoreCase));
+                if (c == null) return null;
+                c.Met = met;
+                c.UpdatedAt = DateTime.UtcNow;
+                SaveLocked(projectID, doc);
+                return CloneJson(c);
+            }
+        }
+
         public GrandPlanVersion? GetCurrentApproved(string projectID)
         {
             lock (LockFor(projectID))
@@ -156,18 +275,94 @@ namespace Omnipotent.Services.Projects
             }
         }
 
-        /// <summary>One-line summary for wake seeds: "GRAND PLAN v3 (approved 07-08): …" or "" when none.</summary>
+        /// <summary>One-line summary for wake seeds: "GRAND PLAN v3 (approved 07-08): … (progress: 3/6 milestones, 2/4 criteria)" or "" when none.</summary>
         public string DescribeForSeed(string projectID)
         {
             var v = GetCurrentApproved(projectID);
             if (v == null) return "";
             string when = (v.ResolvedAt ?? v.SubmittedAt).ToString("MM-dd");
-            return $"GRAND PLAN v{v.Version} (approved {when}): {v.Summary}";
+            return $"GRAND PLAN v{v.Version} (approved {when}): {v.Summary}{DescribeProgress(v.Content)}";
+        }
+
+        /// <summary>" (progress: 3/6 milestones, 2/4 criteria)" or "" when there's nothing to count.</summary>
+        public static string DescribeProgress(GrandPlanContent? c)
+        {
+            if (c == null) return "";
+            var parts = new List<string>();
+            if (c.Milestones.Count > 0)
+                parts.Add($"{c.Milestones.Count(m => m.Status == MilestoneStatus.Done)}/{c.Milestones.Count} milestones");
+            if (c.SuccessCriteria.Count > 0)
+                parts.Add($"{c.SuccessCriteria.Count(x => x.Met)}/{c.SuccessCriteria.Count} criteria");
+            return parts.Count == 0 ? "" : $" (progress: {string.Join(", ", parts)})";
         }
 
         // ── internals ──
 
         private static string Trim(string s, int max) => s.Length <= max ? s : s[..max];
+
+        private static GrandPlanVersion? CurrentApprovedLocked(GrandPlanDocument doc)
+            => doc.Versions.Where(v => v.Status == GrandPlanVersionStatus.Approved)
+                           .OrderByDescending(v => v.Version).FirstOrDefault();
+
+        /// <summary>Assigns stable per-version ids (m1.., c1.., r1.., w1..) and milestone display order.</summary>
+        private static void AssignIds(GrandPlanContent c)
+        {
+            for (int i = 0; i < c.Workstreams.Count; i++) c.Workstreams[i].ID = "w" + (i + 1);
+            for (int i = 0; i < c.Milestones.Count; i++) { c.Milestones[i].ID = "m" + (i + 1); c.Milestones[i].Order = i; }
+            for (int i = 0; i < c.Risks.Count; i++) c.Risks[i].ID = "r" + (i + 1);
+            for (int i = 0; i < c.SuccessCriteria.Count; i++) c.SuccessCriteria[i].ID = "c" + (i + 1);
+        }
+
+        /// <summary>Renders structured content to canonical markdown for text consumers (wake seeds, Discord, get_grand_plan).</summary>
+        public static string RenderMarkdown(GrandPlanContent c)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("## Mission").AppendLine(c.Mission.Trim()).AppendLine();
+            if (c.Workstreams.Count > 0)
+            {
+                sb.AppendLine("## Workstreams");
+                foreach (var w in c.Workstreams)
+                    sb.AppendLine($"- **{w.Name}** — {w.Description}".TrimEnd(' ', '—'));
+                sb.AppendLine();
+            }
+            if (c.Milestones.Count > 0)
+            {
+                sb.AppendLine("## Milestones");
+                foreach (var m in c.Milestones)
+                {
+                    string box = m.Status switch
+                    {
+                        MilestoneStatus.Done => "[x]",
+                        MilestoneStatus.InProgress => "[~]",
+                        MilestoneStatus.Blocked => "[!]",
+                        _ => "[ ]",
+                    };
+                    string tail = string.IsNullOrWhiteSpace(m.Detail) ? "" : $" — {m.Detail}";
+                    string target = string.IsNullOrWhiteSpace(m.Target) ? "" : $" (target: {m.Target})";
+                    sb.AppendLine($"- {box} **{m.Title}**{tail}{target}");
+                }
+                sb.AppendLine();
+            }
+            if (c.Risks.Count > 0)
+            {
+                sb.AppendLine("## Risks");
+                foreach (var r in c.Risks)
+                    sb.AppendLine($"- **[{r.Severity}]** {r.Description}" + (string.IsNullOrWhiteSpace(r.Mitigation) ? "" : $" → {r.Mitigation}"));
+                sb.AppendLine();
+            }
+            if (c.SuccessCriteria.Count > 0)
+            {
+                sb.AppendLine("## Success criteria");
+                foreach (var x in c.SuccessCriteria)
+                    sb.AppendLine($"- {(x.Met ? "[x]" : "[ ]")} {x.Text}");
+                sb.AppendLine();
+            }
+            if (!string.IsNullOrWhiteSpace(c.BudgetPlan))
+                sb.AppendLine("## Budget plan").AppendLine(c.BudgetPlan.Trim());
+            return sb.ToString().TrimEnd();
+        }
+
+        private static T CloneJson<T>(T v) => JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(v))!;
 
         private static GrandPlanVersion Clone(GrandPlanVersion v)
             => JsonConvert.DeserializeObject<GrandPlanVersion>(JsonConvert.SerializeObject(v))!;

@@ -143,13 +143,61 @@ namespace Omnipotent.Services.Projects
             lock (LockFor(projectID)) return LoadLocked(projectID).Where(a => !a.Retired).ToList();
         }
 
+        /// <summary>
+        /// Resolves a messaging target to an active agent. Agent IDs are canonical, but a unique
+        /// role is accepted as a human/model-friendly alias. This keeps a stale or guessed target
+        /// from being logged as "sent" and then disappearing into an undeliverable bus envelope.
+        /// </summary>
+        public bool TryResolveActiveTarget(string projectID, string target,
+            out ProjectAgentRecord? agent, out string error)
+        {
+            agent = null;
+            target = (target ?? "").Trim();
+            if (target.Length == 0)
+            {
+                error = "Provide an agent ID or role.";
+                return false;
+            }
+
+            var active = ListActive(projectID);
+            agent = active.FirstOrDefault(a =>
+                string.Equals(a.AgentID, target, StringComparison.OrdinalIgnoreCase));
+            if (agent != null)
+            {
+                error = "";
+                return true;
+            }
+
+            var roleMatches = active.Where(a =>
+                string.Equals(a.Role, target, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (roleMatches.Count == 1)
+            {
+                agent = roleMatches[0];
+                error = "";
+                return true;
+            }
+            if (roleMatches.Count > 1)
+            {
+                error = $"Role '{target}' is ambiguous. Use one of these agent IDs: " +
+                        string.Join(", ", roleMatches.Select(a => a.AgentID)) + ".";
+                return false;
+            }
+
+            string available = active.Count == 0
+                ? "none"
+                : string.Join(", ", active.Select(a => $"{a.Role} (id: {a.AgentID})"));
+            error = $"No active agent matches '{target}'. Available agents: {available}.";
+            return false;
+        }
+
         /// <summary>Compact org-chart string for the standing digest / wake seed.</summary>
         public string DescribeOrgChart(string projectID)
         {
             var active = ListActive(projectID);
             if (active.Count == 0) return "(no agents yet)";
             return string.Join("; ", active.Select(a =>
-                $"{a.Role}[{a.Tier}]{(a.ParentAgentID == null ? "" : $"←{a.ParentAgentID}")}"));
+                $"{a.Role}[id={a.AgentID}, tier={a.Tier}]" +
+                (a.ParentAgentID == null ? "" : $"←{a.ParentAgentID}")));
         }
 
         private List<ProjectAgentRecord> LoadLocked(string projectID)

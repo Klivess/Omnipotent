@@ -59,7 +59,13 @@ namespace Omnipotent.Tests.Projects
         public async Task SubmitGrandPlan_Approved_ActivatesProject()
         {
             var s = NewSetup(ProjectStatus.Planning);
-            string args = JsonConvert.SerializeObject(new { plan = "# Mission\nDo it well.", summary = "Do it well" });
+            string args = JsonConvert.SerializeObject(new
+            {
+                mission = "Do it well.",
+                milestones = new[] { new { title = "Stand up the pipeline" } },
+                successCriteria = new[] { new { text = "Pipeline green" } },
+                summary = "Do it well",
+            });
             var task = s.Tools.DispatchAsync("submit_grand_plan", args, CancellationToken.None);
 
             var gate = await WaitForGateAsync(s.Gates, s.Project.ProjectID);
@@ -78,7 +84,7 @@ namespace Omnipotent.Tests.Projects
         public async Task SubmitGrandPlan_Denied_NoActivation_VersionRejected()
         {
             var s = NewSetup(ProjectStatus.Planning);
-            string args = JsonConvert.SerializeObject(new { plan = "plan", summary = "sum" });
+            string args = JsonConvert.SerializeObject(new { mission = "plan", summary = "sum" });
             var task = s.Tools.DispatchAsync("submit_grand_plan", args, CancellationToken.None);
 
             var gate = await WaitForGateAsync(s.Gates, s.Project.ProjectID);
@@ -96,16 +102,40 @@ namespace Omnipotent.Tests.Projects
         public async Task NonMaterialAmendment_NeedsNoGate()
         {
             var s = NewSetup(ProjectStatus.Active);
-            s.GrandPlans.SubmitVersion(s.Project.ProjectID, "v1", "s1", null, material: true, "w0");
+            s.GrandPlans.SubmitVersion(s.Project.ProjectID, new GrandPlanContent { Mission = "v1" }, "s1", null, material: true, "w0");
             s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
 
-            string args = JsonConvert.SerializeObject(new { plan = "v2 tactical", summary = "s2", changeNote = "tweak", material = "false" });
+            string args = JsonConvert.SerializeObject(new { mission = "v2 tactical", summary = "s2", changeNote = "tweak", material = "false" });
             var result = await s.Tools.DispatchAsync("amend_grand_plan", args, CancellationToken.None);
 
             Assert.Contains("non-material", result.ResultText, StringComparison.OrdinalIgnoreCase);
             Assert.Empty(s.Gates.ListPending(s.Project.ProjectID));
             Assert.Equal(2, s.GrandPlans.GetCurrentApproved(s.Project.ProjectID)!.Version);
             Assert.Contains(s.Log.ReadSince(s.Project.ProjectID, 0), e => e.Type == ProjectEventTypes.GrandPlanAmended);
+        }
+
+        [Fact]
+        public async Task UpdatePlanProgress_TicksMilestoneAndCriterion_NoNewVersion()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            s.GrandPlans.SubmitVersion(s.Project.ProjectID, new GrandPlanContent
+            {
+                Mission = "Win",
+                Milestones = { new PlanMilestone { Title = "Alpha" } },
+                SuccessCriteria = { new PlanCriterion { Text = "PnL>0" } },
+            }, "s1", null, material: true, "w0");
+            s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
+
+            var r = await s.Tools.DispatchAsync("update_plan_progress",
+                JsonConvert.SerializeObject(new { milestoneId = "m1", milestoneStatus = "done", criterionId = "c1", criterionMet = "true" }),
+                CancellationToken.None);
+
+            Assert.Contains("Alpha", r.ResultText);
+            var cur = s.GrandPlans.GetCurrentApproved(s.Project.ProjectID)!.Content!;
+            Assert.Equal(MilestoneStatus.Done, cur.Milestones[0].Status);
+            Assert.True(cur.SuccessCriteria[0].Met);
+            Assert.Single(s.GrandPlans.Get(s.Project.ProjectID).Versions); // in place — no new version
+            Assert.Contains(s.Log.ReadSince(s.Project.ProjectID, 0), e => e.Type == ProjectEventTypes.GrandPlanProgress);
         }
 
         [Fact]

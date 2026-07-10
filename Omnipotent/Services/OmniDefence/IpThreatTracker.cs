@@ -28,6 +28,10 @@ namespace Omnipotent.Services.OmniDefence
         private readonly OmniDefenceStore store;
         private readonly ConcurrentDictionary<string, IpRecord> cache = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, ConcurrentQueue<long>> recentAuthFailures = new(StringComparer.OrdinalIgnoreCase);
+        // IPs whose in-memory record has changed since the last persist. Only these get
+        // written back on flush, so a large mostly-idle cache no longer re-persists every
+        // record on every startup/flush (which used to hold the DB lock for many minutes).
+        private readonly ConcurrentDictionary<string, byte> dirty = new(StringComparer.OrdinalIgnoreCase);
 
         // Tunables (overridable from OmniDefence service via Set* methods).
         public int AutoWatchScore { get; set; } = 50;
@@ -52,13 +56,24 @@ namespace Omnipotent.Services.OmniDefence
 
         public IpRecord GetOrCreate(string ip)
         {
-            return cache.GetOrAdd(ip, key => new IpRecord
+            return cache.GetOrAdd(ip, key =>
             {
-                Ip = key,
-                FirstSeen = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                LastSeen = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                Status = nameof(IpStatus.Normal)
+                // A brand-new IP must be persisted at least once.
+                MarkDirty(key);
+                return new IpRecord
+                {
+                    Ip = key,
+                    FirstSeen = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    LastSeen = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                    Status = nameof(IpStatus.Normal)
+                };
             });
+        }
+
+        /// <summary>Flags an IP's record as needing to be written back on the next flush.</summary>
+        public void MarkDirty(string? ip)
+        {
+            if (!string.IsNullOrEmpty(ip)) dirty[ip] = 0;
         }
 
         public IpRecord? Get(string ip) => cache.TryGetValue(ip, out var r) ? r : null;
@@ -169,17 +184,42 @@ namespace Omnipotent.Services.OmniDefence
                     }
                 }
             }
+            MarkDirty(ip);
             return rec;
         }
 
-        public Task PersistAsync(IpRecord rec) => store.UpsertIpRecordAsync(rec);
+        public Task PersistAsync(IpRecord rec)
+        {
+            // This record is being written now, so it no longer needs a flush.
+            if (rec != null) dirty.TryRemove(rec.Ip, out _);
+            return store.UpsertIpRecordAsync(rec);
+        }
 
         public async Task PersistAllDirtyAsync()
         {
-            // Naive: persist all cached records. Could add dirty tracking later.
-            foreach (var r in cache.Values)
+            // Snapshot and clear the dirty set up front so records mutated during the
+            // write get re-flagged for the next flush rather than lost.
+            var dirtyIps = dirty.Keys.ToArray();
+            if (dirtyIps.Length == 0) return;
+            foreach (var ip in dirtyIps) dirty.TryRemove(ip, out _);
+
+            var toPersist = new List<IpRecord>(dirtyIps.Length);
+            foreach (var ip in dirtyIps)
             {
-                await store.UpsertIpRecordAsync(r);
+                if (cache.TryGetValue(ip, out var rec)) toPersist.Add(rec);
+            }
+            if (toPersist.Count == 0) return;
+
+            try
+            {
+                // One transaction for the whole batch instead of one per record.
+                await store.UpsertIpRecordsAsync(toPersist);
+            }
+            catch
+            {
+                // Re-flag so a failed batch is retried on the next flush rather than dropped.
+                foreach (var rec in toPersist) MarkDirty(rec.Ip);
+                throw;
             }
         }
 
@@ -191,12 +231,14 @@ namespace Omnipotent.Services.OmniDefence
                 rec.Status = status.ToString();
                 if (status == IpStatus.Blocked) rec.LastBlockReason = reason;
             }
+            MarkDirty(ip);
         }
 
         public void SetNotes(string ip, string? notes)
         {
             var rec = GetOrCreate(ip);
             lock (rec) { rec.Notes = notes; }
+            MarkDirty(ip);
         }
 
         public void LinkProfile(IpRecord rec, string? profileId, string? profileName, int? profileRank, long seenUtc)
@@ -212,6 +254,7 @@ namespace Omnipotent.Services.OmniDefence
                 rec.AssociatedProfileRank = profileRank;
                 rec.AssociatedProfileLastSeenUtc = seenUtc;
             }
+            MarkDirty(rec.Ip);
         }
 
         public bool IsLinkedToKlives(string ip)

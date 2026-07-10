@@ -81,7 +81,55 @@ namespace Omnipotent.Tests.Projects
             var wd = new ProjectWatchdog(svc, _ => { });
             var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
             Assert.NotNull(diag);
-            Assert.Contains("No Commander wake", diag);
+            Assert.Contains("No Commander activity", diag);
+        }
+
+        [Fact]
+        public void LongRunningWake_StillEmittingToolCalls_IsHealthy()
+        {
+            // One wake started hours ago but the Commander is visibly working (tool calls flowing).
+            // The old heartbeat only counted wake STARTS, so a long wake (or one blocked briefly)
+            // read as "stalled" while mid-work — the exact false-positive Klives kept getting pinged for.
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, AgentID = "commander", Type = ProjectEventTypes.ToolCall, Author = "commander", Text = "still working", Timestamp = DateTime.UtcNow.AddMinutes(-1) });
+            var wd = new ProjectWatchdog(svc, _ => { });
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public async Task PendingGate_SuppressesAllStallDiagnosis()
+        {
+            // A wake blocked on an unanswered approval gate is waiting on KLIVES — diagnosing it
+            // as a heartbeat stall (and force-waking, which cancels the gate wait) is wrong.
+            var (svc, pid) = NewProjectService();
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.Gates))!
+                .SetValue(svc, new ProjectGateManager(svc.EventLog, _ => { }));
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2)); // stale by the heartbeat rule
+            _ = svc.Gates.OpenGateAndWaitAsync(
+                new ProjectGate { ProjectID = pid, Kind = "money", Title = "Spend $50" }, CancellationToken.None);
+            await Task.Delay(20);
+            var wd = new ProjectWatchdog(svc, _ => { });
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public void WedgedSubAgent_IsDiagnosed_OnlyWhenSilent()
+        {
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddMinutes(-2)); // commander itself is healthy
+            string agentWakeID = Guid.NewGuid().ToString("N");
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, WakeID = agentWakeID, AgentID = "agent-1", Type = ProjectEventTypes.AgentWake, Author = "system", Text = "woke", Timestamp = DateTime.UtcNow.AddMinutes(-45) });
+            var wd = new ProjectWatchdog(svc, _ => { });
+
+            // Silent for 45 minutes with no completion → wedged.
+            var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
+            Assert.NotNull(diag);
+            Assert.Contains("agent-1", diag);
+
+            // But a slow worker that is still emitting activity is left alone.
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, WakeID = agentWakeID, AgentID = "agent-1", Type = ProjectEventTypes.ToolCall, Author = "agent", Text = "slow but alive", Timestamp = DateTime.UtcNow.AddMinutes(-5) });
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
         }
 
         [Fact]

@@ -264,17 +264,29 @@ namespace Omnipotent.Services.Projects
                 : $"[{env.SourceKind}] {env.Verdict}\n{env.Payload}";
             if (string.IsNullOrEmpty(env.DestinationAgentID) || env.DestinationAgentID == "commander")
             {
+                if (env.SourceKind == "inter-agent")
+                    return Task.FromResult(CommanderRunner.DeliverAgentMessage(project, trigger));
                 return Task.FromResult(CommanderRunner.Wake(project, trigger, queueIfBusy: false));
             }
 
-            var agent = SubAgents.ListActive(project.ProjectID).FirstOrDefault(a => a.AgentID == env.DestinationAgentID);
+            var agent = SubAgents.ListActive(project.ProjectID)
+                .FirstOrDefault(a => string.Equals(a.AgentID, env.DestinationAgentID, StringComparison.OrdinalIgnoreCase));
+            // Recover envelopes produced by older Commander wakes that addressed a worker by its
+            // visible role (the old org chart did not expose IDs). Unique roles are safe aliases.
+            if (agent == null && env.SourceKind == "inter-agent" &&
+                SubAgents.TryResolveActiveTarget(project.ProjectID, env.DestinationAgentID, out var resolved, out _))
+                agent = resolved;
             if (agent == null)
             {
                 // Target retired/unknown — surface to the Commander instead of dropping.
                 return Task.FromResult(CommanderRunner.Wake(project,
                     $"[undeliverable stimulus for {env.DestinationAgentID}] {trigger}", queueIfBusy: false));
             }
-            return Task.FromResult(SubAgentRunner.Wake(project, agent, trigger, queueIfBusy: false));
+            // Directed messages are live steering: if the worker is already running, fold the
+            // message into that wake and return its receipt so the durable envelope is claimed.
+            // Other stimulus kinds remain queued until they can start their own bounded wake.
+            return Task.FromResult(SubAgentRunner.Wake(project, agent, trigger,
+                queueIfBusy: env.SourceKind == "inter-agent"));
         }
 
         /// <summary>

@@ -394,6 +394,117 @@ namespace Omnipotent.Services.OmniDefence
             await cmd.ExecuteNonQueryAsync();
         });
 
+        /// <summary>
+        /// Upserts many IP records inside a single transaction, reusing one prepared
+        /// command. This is dramatically faster than calling <see cref="UpsertIpRecordAsync"/>
+        /// per record — each of those is its own transaction (and WAL fsync), so persisting
+        /// a large IP cache one row at a time took many minutes and starved every other
+        /// writer of the shared connection lock (notably login auditing on startup).
+        /// </summary>
+        public Task UpsertIpRecordsAsync(IReadOnlyCollection<IpRecord> records) => WithLockAsync(async conn =>
+        {
+            if (records == null || records.Count == 0) return;
+
+            using var transaction = (SqliteTransaction)await conn.BeginTransactionAsync();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"INSERT INTO ip_records
+                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, city, region, isp, org, latitude, longitude, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
+                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$city,$region,$isp,$org,$lat,$lon,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
+                ON CONFLICT(ip) DO UPDATE SET
+                    last_seen=excluded.last_seen,
+                    total_requests=excluded.total_requests,
+                    successful_requests=excluded.successful_requests,
+                    unauth_attempts=excluded.unauth_attempts,
+                    deny_count=excluded.deny_count,
+                    threat_score=excluded.threat_score,
+                    status=excluded.status,
+                    country=COALESCE(excluded.country, ip_records.country),
+                    asn=COALESCE(excluded.asn, ip_records.asn),
+                    city=COALESCE(excluded.city, ip_records.city),
+                    region=COALESCE(excluded.region, ip_records.region),
+                    isp=COALESCE(excluded.isp, ip_records.isp),
+                    org=COALESCE(excluded.org, ip_records.org),
+                    latitude=COALESCE(excluded.latitude, ip_records.latitude),
+                    longitude=COALESCE(excluded.longitude, ip_records.longitude),
+                    notes=excluded.notes,
+                    associated_profile_id=COALESCE(excluded.associated_profile_id, ip_records.associated_profile_id),
+                    associated_profile_name=COALESCE(excluded.associated_profile_name, ip_records.associated_profile_name),
+                    associated_profile_rank=COALESCE(excluded.associated_profile_rank, ip_records.associated_profile_rank),
+                    associated_profile_last_seen_utc=COALESCE(excluded.associated_profile_last_seen_utc, ip_records.associated_profile_last_seen_utc),
+                    first_alerted_utc=COALESCE(excluded.first_alerted_utc, ip_records.first_alerted_utc),
+                    last_alerted_utc=excluded.last_alerted_utc,
+                    escalation_level=excluded.escalation_level,
+                    last_block_reason=excluded.last_block_reason,
+                    last_scanned_utc=COALESCE(excluded.last_scanned_utc, ip_records.last_scanned_utc)";
+
+            var pIp = cmd.Parameters.Add("$ip", SqliteType.Text);
+            var pFs = cmd.Parameters.Add("$fs", SqliteType.Integer);
+            var pLs = cmd.Parameters.Add("$ls", SqliteType.Integer);
+            var pTot = cmd.Parameters.Add("$tot", SqliteType.Integer);
+            var pSucc = cmd.Parameters.Add("$succ", SqliteType.Integer);
+            var pUa = cmd.Parameters.Add("$ua", SqliteType.Integer);
+            var pDc = cmd.Parameters.Add("$dc", SqliteType.Integer);
+            var pTs = cmd.Parameters.Add("$ts", SqliteType.Real);
+            var pSt = cmd.Parameters.Add("$st", SqliteType.Text);
+            var pCo = cmd.Parameters.Add("$co", SqliteType.Text);
+            var pAsn = cmd.Parameters.Add("$asn", SqliteType.Text);
+            var pCity = cmd.Parameters.Add("$city", SqliteType.Text);
+            var pRegion = cmd.Parameters.Add("$region", SqliteType.Text);
+            var pIsp = cmd.Parameters.Add("$isp", SqliteType.Text);
+            var pOrg = cmd.Parameters.Add("$org", SqliteType.Text);
+            var pLat = cmd.Parameters.Add("$lat", SqliteType.Real);
+            var pLon = cmd.Parameters.Add("$lon", SqliteType.Real);
+            var pNt = cmd.Parameters.Add("$nt", SqliteType.Text);
+            var pApid = cmd.Parameters.Add("$apid", SqliteType.Text);
+            var pApname = cmd.Parameters.Add("$apname", SqliteType.Text);
+            var pAprank = cmd.Parameters.Add("$aprank", SqliteType.Integer);
+            var pAplast = cmd.Parameters.Add("$aplast", SqliteType.Integer);
+            var pFa = cmd.Parameters.Add("$fa", SqliteType.Integer);
+            var pLa = cmd.Parameters.Add("$la", SqliteType.Integer);
+            var pEl = cmd.Parameters.Add("$el", SqliteType.Integer);
+            var pLbr = cmd.Parameters.Add("$lbr", SqliteType.Text);
+            var pLsc = cmd.Parameters.Add("$lsc", SqliteType.Integer);
+
+            foreach (var rec in records)
+            {
+                if (rec == null || string.IsNullOrEmpty(rec.Ip)) continue;
+                lock (rec)
+                {
+                    pIp.Value = rec.Ip;
+                    pFs.Value = rec.FirstSeen;
+                    pLs.Value = rec.LastSeen;
+                    pTot.Value = rec.TotalRequests;
+                    pSucc.Value = rec.SuccessfulRequests;
+                    pUa.Value = rec.UnauthAttempts;
+                    pDc.Value = rec.DenyCount;
+                    pTs.Value = rec.ThreatScore;
+                    pSt.Value = (object?)rec.Status ?? DBNull.Value;
+                    pCo.Value = (object?)rec.Country ?? DBNull.Value;
+                    pAsn.Value = (object?)rec.Asn ?? DBNull.Value;
+                    pCity.Value = (object?)rec.City ?? DBNull.Value;
+                    pRegion.Value = (object?)rec.Region ?? DBNull.Value;
+                    pIsp.Value = (object?)rec.Isp ?? DBNull.Value;
+                    pOrg.Value = (object?)rec.Org ?? DBNull.Value;
+                    pLat.Value = (object?)rec.Latitude ?? DBNull.Value;
+                    pLon.Value = (object?)rec.Longitude ?? DBNull.Value;
+                    pNt.Value = (object?)rec.Notes ?? DBNull.Value;
+                    pApid.Value = (object?)rec.AssociatedProfileId ?? DBNull.Value;
+                    pApname.Value = (object?)rec.AssociatedProfileName ?? DBNull.Value;
+                    pAprank.Value = (object?)rec.AssociatedProfileRank ?? DBNull.Value;
+                    pAplast.Value = (object?)rec.AssociatedProfileLastSeenUtc ?? DBNull.Value;
+                    pFa.Value = (object?)rec.FirstAlertedUtc ?? DBNull.Value;
+                    pLa.Value = (object?)rec.LastAlertedUtc ?? DBNull.Value;
+                    pEl.Value = rec.EscalationLevel;
+                    pLbr.Value = (object?)rec.LastBlockReason ?? DBNull.Value;
+                    pLsc.Value = (object?)rec.LastScannedUtc ?? DBNull.Value;
+                }
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            await transaction.CommitAsync();
+        });
+
         public Task<IpRecord?> GetIpRecordAsync(string ip) => WithLockAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();

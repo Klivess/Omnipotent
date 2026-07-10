@@ -115,6 +115,7 @@ namespace Omnipotent.Services.Projects
         public const string GrandPlanApproved = "grand-plan-approved";              // Klives approved a Grand Plan version
         public const string GrandPlanRevisionRequested = "grand-plan-revision-requested"; // Klives denied/deferred; revise & resubmit
         public const string GrandPlanAmended = "grand-plan-amended";                // a non-material amendment applied without a gate
+        public const string GrandPlanProgress = "grand-plan-progress";              // a milestone status / success-criterion tick (live progress, no gate)
         public const string AccountChanged = "account-changed";        // a shared-registry account was registered/updated (metadata only, never secrets)
         public const string Status = "status";                         // generic progress note
     }
@@ -159,8 +160,12 @@ namespace Omnipotent.Services.Projects
     public class ProjectDigest
     {
         public string ProjectID { get; set; } = "";
-        /// <summary>The Commander's current plan, maintained by digest rebuilds.</summary>
+        /// <summary>The Commander's current plan, maintained by digest rebuilds. Legacy free-text; prefer CurrentFocus + NextSteps.</summary>
         public string CurrentPlan { get; set; } = "";
+        /// <summary>The Commander's one-line current focus (tactical), shown in Klives' side rail.</summary>
+        public string CurrentFocus { get; set; } = "";
+        /// <summary>The near-term concrete next steps (tactical), shown in Klives' side rail.</summary>
+        public List<string> NextSteps { get; set; } = new();
         /// <summary>Who exists, their tiers/roles, what each is doing.</summary>
         public string OrgChart { get; set; } = "";
         /// <summary>Spend vs budget, burn rate — refreshed from the ledger at rebuild time.</summary>

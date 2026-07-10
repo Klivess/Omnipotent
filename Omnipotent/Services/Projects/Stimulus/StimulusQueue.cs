@@ -271,7 +271,6 @@ namespace Omnipotent.Services.Projects.Stimulus
         {
             if (string.IsNullOrWhiteSpace(wakeID) || !Directory.Exists(dir)) return;
             earlyWakeOutcomes[wakeID] = (succeeded, DateTime.UtcNow);
-            bool matched = false;
             var retry = new List<(StimulusEnvelope env, string dest)>();
             var completed = new List<StimulusEnvelope>();
             lock (fileGate)
@@ -291,7 +290,6 @@ namespace Omnipotent.Services.Projects.Stimulus
                             continue;
                         }
 
-                        matched = true;
                         changed = true;
                         if (succeeded)
                         {
@@ -313,17 +311,17 @@ namespace Omnipotent.Services.Projects.Stimulus
 
             foreach (var env in completed) ClearSupersedePending(env);
             foreach (var item in retry) _ = DispatchAsync(item.env, item.dest);
-            if (matched) earlyWakeOutcomes.TryRemove(wakeID, out _);
-            else
+            // Keep the outcome briefly even after a match. More than one directed message can be
+            // accepted by the same live wake, and a second MarkClaimed can land just after that
+            // wake acknowledged its first envelope. The grace record lets every late claim
+            // reconcile instead of remaining stuck against an already-finished wake until restart.
+            _ = Task.Run(async () =>
             {
-                _ = Task.Run(async () =>
-                {
-                    await Task.Delay(TimeSpan.FromSeconds(10));
-                    if (earlyWakeOutcomes.TryGetValue(wakeID, out var pending) &&
-                        DateTime.UtcNow - pending.at >= TimeSpan.FromSeconds(10))
-                        earlyWakeOutcomes.TryRemove(wakeID, out _);
-                });
-            }
+                await Task.Delay(TimeSpan.FromSeconds(10));
+                if (earlyWakeOutcomes.TryGetValue(wakeID, out var pending) &&
+                    DateTime.UtcNow - pending.at >= TimeSpan.FromSeconds(10))
+                    earlyWakeOutcomes.TryRemove(wakeID, out _);
+            });
         }
 
         /// <summary>

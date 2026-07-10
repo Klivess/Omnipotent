@@ -182,6 +182,57 @@ namespace Omnipotent.Tests.Projects
             var b = mgr.Spawn(pid, "commander", ProjectAgentTier.Text, "b"); // slot freed
             Assert.NotNull(b);
         }
+
+        [Fact]
+        public void OrgChart_ExposesRoutableIds_AndUniqueRolesResolve()
+        {
+            var (mgr, _, pid) = NewSetup();
+            var worker = mgr.Spawn(pid, "commander", ProjectAgentTier.Text, "market-researcher");
+
+            string chart = mgr.DescribeOrgChart(pid);
+            Assert.Contains($"id={worker.AgentID}", chart);
+            Assert.True(mgr.TryResolveActiveTarget(pid, "market-researcher", out var resolved, out var error));
+            Assert.Equal("", error);
+            Assert.Equal(worker.AgentID, resolved!.AgentID);
+        }
+
+        [Fact]
+        public async Task SendAgentMessage_ResolvesRole_AndRejectsUnknownTarget()
+        {
+            var store = new ProjectStore(_ => { });
+            var log = new ProjectEventLogStore(_ => { });
+            var project = store.CreateProject("messaging", "goal", 100, 100, 10, 3);
+            var subAgents = new ProjectSubAgentManager(store, log);
+            subAgents.EnsureCommander(project.ProjectID);
+            var worker = subAgents.Spawn(project.ProjectID, "commander", ProjectAgentTier.Text, "researcher");
+            var digests = new ProjectDigestStore(_ => { });
+            var gates = new ProjectGateManager(log, _ => { });
+            var fetcher = new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { });
+            var budget = new ProjectBudgetLedger(store, log, fetcher, _ => { });
+            var tools = new ProjectCommanderTools(project, log, digests, subAgents, gates, budget,
+                new ProjectVault(_ => { }), store, "commander", "wake1");
+
+            string? deliveredTo = null;
+            tools.SendAgentMessageAsync = (pid, from, to, message) =>
+            {
+                deliveredTo = to;
+                return Task.CompletedTask;
+            };
+
+            var sent = await tools.DispatchAsync("send_agent_message",
+                Newtonsoft.Json.JsonConvert.SerializeObject(new { agentID = "researcher", message = "status?" }),
+                CancellationToken.None);
+            Assert.Equal(worker.AgentID, deliveredTo);
+            Assert.Contains(worker.AgentID, sent.ResultText);
+
+            deliveredTo = null;
+            var rejected = await tools.DispatchAsync("send_agent_message",
+                Newtonsoft.Json.JsonConvert.SerializeObject(new { agentID = "not-an-agent", message = "status?" }),
+                CancellationToken.None);
+            Assert.Null(deliveredTo);
+            Assert.Contains("not sent", rejected.ResultText, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Available agents", rejected.ResultText);
+        }
     }
 
     [Collection("ProjectsSerial")]

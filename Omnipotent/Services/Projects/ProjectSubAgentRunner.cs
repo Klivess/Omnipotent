@@ -17,7 +17,9 @@ namespace Omnipotent.Services.Projects
     public class ProjectSubAgentRunner
     {
         private readonly Projects parent;
-        private readonly ConcurrentDictionary<string, CancellationTokenSource> activeWakes = new(StringComparer.Ordinal); // key: projectID/agentID
+        private sealed record ActiveWake(string WakeID, CancellationTokenSource Cancellation);
+        private readonly ConcurrentDictionary<string, ActiveWake> activeWakes = new(StringComparer.Ordinal); // key: projectID/agentID
+        private readonly ConcurrentDictionary<string, object> wakeGates = new(StringComparer.Ordinal);
 
         // Triggers/messages that arrived for a sub-agent while it was already awake. Parity with the
         // Commander: a directed stimulus to a busy sub-agent must not vanish. Drained at each tool-loop
@@ -25,10 +27,15 @@ namespace Omnipotent.Services.Projects
         // finish/enqueue race, folded into a follow-up wake. Keyed by projectID/agentID.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> steerQueue = new(StringComparer.Ordinal);
 
-        private const int MaxToolCallsPerWake = 30; // sub-agents do focused legwork, not strategy
+        private const int MaxToolCallsPerWake = 60; // sub-agents do focused legwork, not strategy
         private const int StuckIdenticalCallThreshold = 3;
         private const int RecentEventsForSeed = 30;
         private const int MaxPendingTriggers = 12;
+        // Parity with the Commander: a worker cut off by its tool budget mid-task chains straight
+        // into a continuation wake instead of sitting dead until the Commander notices. The cap
+        // paces a never-converging task; natural completion resets the streak.
+        private const int MaxConsecutiveContinuations = 4;
+        private readonly ConcurrentDictionary<string, int> consecutiveContinuations = new(StringComparer.Ordinal);
 
         public ProjectSubAgentRunner(Projects parent)
         {
@@ -36,64 +43,98 @@ namespace Omnipotent.Services.Projects
         }
 
         private static string Key(string projectID, string agentID) => $"{projectID}/{agentID}";
+        private object WakeGate(string key) => wakeGates.GetOrAdd(key, _ => new object());
 
         /// <summary>
         /// Wakes a sub-agent for a directed stimulus. If it is already awake, the trigger is queued
         /// (deduped, capped) so the running wake picks it up at its next turn boundary and, failing
-        /// that, a follow-up wake fires — no directed message is dropped. Returns the wake ID, or null
-        /// if it was queued onto an active wake.
+        /// that, a follow-up wake fires — no directed message is dropped. Returns the wake ID that
+        /// accepted the trigger (including the current wake when live steering accepted it), or null
+        /// when the agent is unavailable or its bounded steering queue is full.
         /// </summary>
         public string? Wake(Project project, ProjectAgentRecord agent, string trigger, bool queueIfBusy = true)
         {
             if (project.Status != ProjectStatus.Active || agent.Retired) return null;
             string key = Key(project.ProjectID, agent.AgentID);
-            var cts = new CancellationTokenSource();
-            if (!activeWakes.TryAdd(key, cts))
+            ActiveWake active;
+            lock (WakeGate(key))
             {
-                cts.Dispose();
-                if (queueIfBusy)
+                if (activeWakes.TryGetValue(key, out var current))
                 {
-                var q = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
-                if (q.Count < MaxPendingTriggers && !q.Contains(trigger)) q.Enqueue(trigger);
+                    if (!queueIfBusy) return null;
+                    var q = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
+                    if (q.Contains(trigger)) return current.WakeID;
+                    if (q.Count >= MaxPendingTriggers) return null;
+                    q.Enqueue(trigger);
+                    return current.WakeID;
                 }
-                return null; // already awake — folded into the live wake / a follow-up
+
+                active = new ActiveWake(Guid.NewGuid().ToString("N"), new CancellationTokenSource());
+                activeWakes[key] = active;
             }
 
-            string wakeID = Guid.NewGuid().ToString("N");
-            parent.EventLog.Append(new ProjectEvent
-            {
-                ProjectID = project.ProjectID,
-                WakeID = wakeID,
-                AgentID = agent.AgentID,
-                Type = ProjectEventTypes.AgentWake,
-                Author = "system",
-                Text = $"Agent {agent.AgentID} ({agent.Role}) woke. Trigger: {Trunc(trigger, 200)}",
-            });
-            _ = Task.Run(async () =>
-            {
-                try { await ExecuteWakeAsync(project, agent, wakeID, trigger, cts); }
-                finally
-                {
-                    activeWakes.TryRemove(new KeyValuePair<string, CancellationTokenSource>(key, cts));
-                    cts.Dispose();
-                    DrainPendingSteers(project, agent);
-                }
-            });
-            return wakeID;
-        }
-
-        /// <summary>Re-wakes the sub-agent with any steers stranded by the finish/enqueue race.</summary>
-        private void DrainPendingSteers(Project project, ProjectAgentRecord agent)
-        {
             try
             {
-                if (!steerQueue.TryRemove(Key(project.ProjectID, agent.AgentID), out var q) || q.IsEmpty) return;
+                parent.EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = project.ProjectID,
+                    WakeID = active.WakeID,
+                    AgentID = agent.AgentID,
+                    Type = ProjectEventTypes.AgentWake,
+                    Author = "system",
+                    Text = $"Agent {agent.AgentID} ({agent.Role}) woke. Trigger: {Trunc(trigger, 200)}",
+                });
+            }
+            catch
+            {
+                lock (WakeGate(key))
+                    activeWakes.TryRemove(new KeyValuePair<string, ActiveWake>(key, active));
+                active.Cancellation.Dispose();
+                throw;
+            }
+            _ = Task.Run(async () =>
+            {
+                bool continueAfterBudget = false;
+                try { continueAfterBudget = await ExecuteWakeAsync(project, agent, active.WakeID, trigger, active.Cancellation); }
+                finally { FinishWake(project, agent, key, active, continueAfterBudget); }
+            });
+            return active.WakeID;
+        }
+
+        /// <summary>Atomically closes the active slot and captures any steering that missed the
+        /// final model-turn boundary, then starts one follow-up wake for it. A budget-capped wake
+        /// with nothing queued chains into an immediate continuation (momentum must not wait for
+        /// the Commander to notice the worker went quiet).</summary>
+        private void FinishWake(Project project, ProjectAgentRecord agent, string key, ActiveWake active, bool continueAfterBudget)
+        {
+            ConcurrentQueue<string>? pending = null;
+            try
+            {
+                lock (WakeGate(key))
+                {
+                    activeWakes.TryRemove(new KeyValuePair<string, ActiveWake>(key, active));
+                    steerQueue.TryRemove(key, out pending);
+                }
+                active.Cancellation.Dispose();
+                if (!continueAfterBudget) consecutiveContinuations.TryRemove(key, out _);
+
                 var refreshed = parent.Store.GetProject(project.ProjectID);
                 if (refreshed == null || refreshed.Status != ProjectStatus.Active) return;
-                var missed = q.ToList().Distinct().ToList();
-                if (missed.Count == 0) return;
-                Wake(refreshed, agent, missed.Count == 1 ? missed[0]
-                    : "Messages that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
+
+                var missed = pending == null ? new List<string>() : pending.ToList().Distinct().ToList();
+                if (missed.Count > 0)
+                {
+                    Wake(refreshed, agent, missed.Count == 1 ? missed[0]
+                        : "Messages that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
+                    return;
+                }
+
+                if (!continueAfterBudget) return;
+                int streak = consecutiveContinuations.AddOrUpdate(key, 1, (_, n) => n + 1);
+                if (streak > MaxConsecutiveContinuations) return; // the Commander picks it up from the report
+                Wake(refreshed, agent,
+                    "Continuation: your previous wake ended at its tool-call budget mid-task, not because the work was done. " +
+                    "Resume immediately from your recent activity, finish the task, and report to the commander with send_agent_message.");
             }
             catch { /* never mask the wake outcome */ }
         }
@@ -104,7 +145,7 @@ namespace Omnipotent.Services.Projects
             string prefix = projectID + "/";
             foreach (var kv in activeWakes.Where(kv => kv.Key.StartsWith(prefix, StringComparison.Ordinal)))
             {
-                try { kv.Value.Cancel(); cancelled++; } catch { }
+                try { kv.Value.Cancellation.Cancel(); cancelled++; } catch { }
                 steerQueue.TryRemove(kv.Key, out _);
             }
             return cancelled;
@@ -114,15 +155,18 @@ namespace Omnipotent.Services.Projects
         {
             string key = Key(projectID, agentID);
             steerQueue.TryRemove(key, out _);
-            if (!activeWakes.TryGetValue(key, out var cts)) return false;
-            try { cts.Cancel(); return true; } catch { return false; }
+            if (!activeWakes.TryGetValue(key, out var active)) return false;
+            try { active.Cancellation.Cancel(); return true; } catch { return false; }
         }
 
-        private async Task ExecuteWakeAsync(Project project, ProjectAgentRecord agent, string wakeID, string trigger, CancellationTokenSource cts)
+        /// <summary>Runs one bounded wake. Returns true when the wake ended at its tool budget
+        /// mid-task (and completed cleanly) — the signal for FinishWake to chain a continuation.</summary>
+        private async Task<bool> ExecuteWakeAsync(Project project, ProjectAgentRecord agent, string wakeID, string trigger, CancellationTokenSource cts)
         {
             string projectID = project.ProjectID;
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = $"Agent {agent.AgentID} finished its wake.";
+            bool endedAtToolBudget = false;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
             try
@@ -175,7 +219,7 @@ namespace Omnipotent.Services.Projects
 
                     if (toolCalls >= MaxToolCallsPerWake)
                         llm.AppendUserMessageToToolSession(sessionId,
-                            $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake}). Stop and report your status to the commander via send_agent_message, then reply with a one-line summary.");
+                            $"WAKE TOOL BUDGET REACHED ({MaxToolCallsPerWake}). Stop and report your status to the commander via send_agent_message, then reply with a one-line summary of exactly where you stopped. A continuation wake follows automatically if the task is unfinished.");
 
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
@@ -203,6 +247,7 @@ namespace Omnipotent.Services.Projects
                     bool overBudget = toolCalls >= MaxToolCallsPerWake;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || overBudget)
                     {
+                        endedAtToolBudget = overBudget;
                         string final = string.IsNullOrWhiteSpace(resp.Response) ? "(no closing summary)" : resp.Response.Trim();
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentMessage, final));
                         break;
@@ -298,6 +343,7 @@ namespace Omnipotent.Services.Projects
                 catch { }
                 parent.StimulusQueue.AcknowledgeWake(wakeID, outcome == ProjectEventTypes.WakeCompleted);
             }
+            return endedAtToolBudget && outcome == ProjectEventTypes.WakeCompleted;
         }
 
         private static string BuildSystemPrompt(Project project, ProjectAgentRecord agent)

@@ -40,6 +40,17 @@ namespace Omnipotent.Profiles
             }
             catch { }
         }
+
+        // Fire-and-forget Discord "so-and-so logged in" notification that swallows its own
+        // errors, so a slow/booting Discord bot can never delay the login response.
+        private async Task SafeNotifyLogin(string profileName)
+        {
+            try
+            {
+                await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{profileName} has logged into Klives Management.");
+            }
+            catch { }
+        }
         protected override async void ServiceMain()
         {
             await LoadAllProfiles();
@@ -367,15 +378,15 @@ namespace Omnipotent.Profiles
                         var profile = await GetProfileByPassword(password);
                         if (profile.CanLogin == true)
                         {
-                            try
+                            // Login notification and audit logging are side effects — never make the
+                            // user wait on them. Both hit other services (Discord, OmniDefence's shared
+                            // SQLite lock) that can be busy right after startup; awaiting them here is
+                            // what used to hang AttemptLogin for many minutes. Fire-and-forget instead.
+                            if (profile.KlivesManagementRank != KMPermissions.Klives)
                             {
-                                if (profile.KlivesManagementRank != KMPermissions.Klives)
-                                {
-                                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{profile.Name} has logged into Klives Management.");
-                                }
+                                _ = SafeNotifyLogin(profile.Name);
                             }
-                            catch (Exception e) { }
-                            await AuditAction(profile, "Auth", "Login");
+                            _ = AuditAction(profile, "Auth", "Login");
                             await request.ReturnResponse("true", "application/json");
                         }
                         else
