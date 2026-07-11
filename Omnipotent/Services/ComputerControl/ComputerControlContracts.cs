@@ -188,31 +188,209 @@ namespace Omnipotent.Services.ComputerControl
             catch { return 255; }
         }
 
-        public static async Task<IReadOnlyList<ComputerTextMatch>> FindTextAsync(byte[] jpeg, string text, CancellationToken ct = default)
+        /// <summary>
+        /// Locates on-screen text and returns clickable centres, ordered top-to-bottom / left-to-right.
+        /// The reliability of the old path was poor for three compounding reasons, all fixed here:
+        ///   1. Small UI glyphs on a compressed frame — the frame is greyscaled and upscaled so
+        ///      Tesseract sees text near the ~30px it recognises best, and read losslessly.
+        ///   2. Tesseract's default block layout dropping isolated buttons/labels — sparse-text
+        ///      segmentation plus our own row grouping rebuilds phrases from scattered tokens.
+        ///   3. Exact whole-line substring matching — a single misread or extra space missed
+        ///      everything.  Matching is now whitespace-insensitive with a small edit-distance
+        ///      fallback, so "Slgn ln" still resolves "Sign in".
+        /// Input pixels are the framebuffer space callers click in; match boxes are mapped back to it.
+        /// </summary>
+        public static async Task<IReadOnlyList<ComputerTextMatch>> FindTextAsync(byte[] imageBytes, string text, CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(text) || jpeg == null || jpeg.Length == 0) return Array.Empty<ComputerTextMatch>();
+            if (imageBytes == null || imageBytes.Length == 0) return Array.Empty<ComputerTextMatch>();
+            string needle = CompactText(text);
+            if (needle.Length == 0) return Array.Empty<ComputerTextMatch>();
             var engine = await GetOcrEngineAsync(ct);
             if (engine == null) return Array.Empty<ComputerTextMatch>();
             await OcrGate.WaitAsync(ct);
             try
             {
-                using var pix = Pix.LoadFromMemory(jpeg);
-                using var page = engine.Process(pix);
-                using var iter = page.GetIterator();
-                var matches = new List<ComputerTextMatch>();
-                iter.Begin();
-                do
+                byte[] prepared = PreprocessForOcr(imageBytes, out double scale);
+                var words = new List<OcrWord>();
+                using (var pix = Pix.LoadFromMemory(prepared))
+                using (var page = engine.Process(pix, PageSegMode.SparseText))
+                using (var iter = page.GetIterator())
                 {
-                    string? line = iter.GetText(PageIteratorLevel.TextLine)?.Trim();
-                    if (string.IsNullOrWhiteSpace(line) || !line.Contains(text, StringComparison.OrdinalIgnoreCase)) continue;
-                    if (!iter.TryGetBoundingBox(PageIteratorLevel.TextLine, out var box)) continue;
-                    matches.Add(new ComputerTextMatch(line, box.X1, box.Y1, box.Width, box.Height,
-                        iter.GetConfidence(PageIteratorLevel.TextLine)));
-                } while (iter.Next(PageIteratorLevel.TextLine));
-                return matches;
+                    iter.Begin();
+                    do
+                    {
+                        string? word = iter.GetText(PageIteratorLevel.Word)?.Trim();
+                        string compact = CompactText(word ?? string.Empty);
+                        if (compact.Length == 0 || !iter.TryGetBoundingBox(PageIteratorLevel.Word, out var box)) continue;
+                        // Map boxes out of the upscaled OCR space back into input (framebuffer) pixels.
+                        words.Add(new OcrWord(word!.Trim(), compact,
+                            (int)Math.Round(box.X1 / scale), (int)Math.Round(box.Y1 / scale),
+                            (int)Math.Round(box.Width / scale), (int)Math.Round(box.Height / scale),
+                            iter.GetConfidence(PageIteratorLevel.Word)));
+                    } while (iter.Next(PageIteratorLevel.Word));
+                }
+                return MatchWords(words, needle);
             }
             catch { return Array.Empty<ComputerTextMatch>(); }
             finally { OcrGate.Release(); }
+        }
+
+        private readonly record struct OcrWord(string Text, string Compact, int X, int Y, int W, int H, float Confidence)
+        {
+            public int CenterY => Y + H / 2;
+        }
+
+        /// <summary>Greyscale + upscale a screen frame and re-encode losslessly for OCR.  Returns the
+        /// scale factor so match boxes can be mapped back to input-image pixels.</summary>
+        private static byte[] PreprocessForOcr(byte[] imageBytes, out double scale)
+        {
+            using var input = new MemoryStream(imageBytes);
+            using var source = (Bitmap)Image.FromStream(input);
+            // Aim for a ~1800px longest edge: 12-16px UI text lands near Tesseract's comfort zone
+            // without ballooning already-large desktops or blurring tiny ones past recognition.
+            int longest = Math.Max(source.Width, source.Height);
+            scale = Math.Clamp(1800.0 / Math.Max(1, longest), 1.0, 3.0);
+            int w = Math.Max(1, (int)Math.Round(source.Width * scale));
+            int h = Math.Max(1, (int)Math.Round(source.Height * scale));
+
+            using var scaled = new Bitmap(w, h, PixelFormat.Format24bppRgb);
+            using (var g = Graphics.FromImage(scaled))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                var greyscale = new ColorMatrix(new[]
+                {
+                    new[] { 0.299f, 0.299f, 0.299f, 0f, 0f },
+                    new[] { 0.587f, 0.587f, 0.587f, 0f, 0f },
+                    new[] { 0.114f, 0.114f, 0.114f, 0f, 0f },
+                    new[] { 0f, 0f, 0f, 1f, 0f },
+                    new[] { 0f, 0f, 0f, 0f, 1f },
+                });
+                using var attrs = new ImageAttributes();
+                attrs.SetColorMatrix(greyscale);
+                g.DrawImage(source, new Rectangle(0, 0, w, h), 0, 0, source.Width, source.Height, GraphicsUnit.Pixel, attrs);
+            }
+            using var ms = new MemoryStream();
+            scaled.Save(ms, System.Drawing.Imaging.ImageFormat.Png);
+            return ms.ToArray();
+        }
+
+        private static IReadOnlyList<ComputerTextMatch> MatchWords(List<OcrWord> words, string needle)
+        {
+            if (words.Count == 0) return Array.Empty<ComputerTextMatch>();
+            int tolerance = Math.Max(1, (int)Math.Ceiling(needle.Length * 0.2));
+            var exact = new List<ComputerTextMatch>();
+            var fuzzy = new List<(ComputerTextMatch Match, int Distance)>();
+
+            foreach (var row in GroupRows(words))
+            {
+                // Concatenate the row's tokens so a phrase matches regardless of spacing/word splits.
+                string joined = string.Concat(row.Select(x => x.Compact));
+                for (int idx = joined.IndexOf(needle, StringComparison.Ordinal); idx >= 0;
+                     idx = idx + 1 <= joined.Length - needle.Length ? joined.IndexOf(needle, idx + 1, StringComparison.Ordinal) : -1)
+                {
+                    var span = SpanWords(row, idx, needle.Length);
+                    if (span != null) exact.Add(BuildMatch(span));
+                }
+
+                // Slide a window of consecutive tokens and accept a small edit distance so isolated
+                // misreads don't zero out the search.  Used only when nothing matched exactly.
+                for (int i = 0; i < row.Count; i++)
+                {
+                    string acc = string.Empty;
+                    for (int j = i; j < row.Count && j - i < 8; j++)
+                    {
+                        acc += row[j].Compact;
+                        if (acc.Length < needle.Length - tolerance) continue;
+                        if (acc.Length > needle.Length + tolerance) break;
+                        int d = Levenshtein(acc, needle, tolerance);
+                        if (d <= tolerance) fuzzy.Add((BuildMatch(row.GetRange(i, j - i + 1)), d));
+                    }
+                }
+            }
+
+            IEnumerable<ComputerTextMatch> results = exact.Count > 0
+                ? exact
+                : fuzzy.OrderBy(f => f.Distance).Select(f => f.Match);
+            return results.OrderBy(m => m.Y).ThenBy(m => m.X).ToList();
+        }
+
+        /// <summary>Buckets words into visual rows (sorted top-to-bottom, then left-to-right within
+        /// a row) so a phrase split into sparse tokens can be reassembled.</summary>
+        private static List<List<OcrWord>> GroupRows(List<OcrWord> words)
+        {
+            var rows = new List<List<OcrWord>>();
+            List<OcrWord>? current = null;
+            int anchorY = 0, anchorH = 0;
+            foreach (var w in words.OrderBy(x => x.CenterY))
+            {
+                if (current == null || Math.Abs(w.CenterY - anchorY) > Math.Max(anchorH, w.H) * 0.5)
+                {
+                    current = new List<OcrWord>();
+                    rows.Add(current);
+                    anchorY = w.CenterY;
+                    anchorH = w.H;
+                }
+                current.Add(w);
+            }
+            foreach (var r in rows) r.Sort((a, b) => a.X.CompareTo(b.X));
+            return rows;
+        }
+
+        /// <summary>Maps a character span in a row's concatenated text back to the words covering it.</summary>
+        private static List<OcrWord>? SpanWords(List<OcrWord> row, int start, int length)
+        {
+            int end = start + length, pos = 0, s = -1, e = -1;
+            for (int i = 0; i < row.Count; i++)
+            {
+                int wStart = pos, wEnd = pos + row[i].Compact.Length;
+                if (wEnd > start && wStart < end) { if (s < 0) s = i; e = i; }
+                pos = wEnd;
+            }
+            return s < 0 ? null : row.GetRange(s, e - s + 1);
+        }
+
+        private static ComputerTextMatch BuildMatch(List<OcrWord> span)
+        {
+            int x1 = span.Min(w => w.X), y1 = span.Min(w => w.Y);
+            int x2 = span.Max(w => w.X + w.W), y2 = span.Max(w => w.Y + w.H);
+            return new ComputerTextMatch(string.Join(" ", span.Select(w => w.Text)),
+                x1, y1, x2 - x1, y2 - y1, span.Average(w => w.Confidence));
+        }
+
+        private static string CompactText(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return string.Empty;
+            var chars = new char[s.Length];
+            int n = 0;
+            foreach (char c in s) if (!char.IsWhiteSpace(c)) chars[n++] = char.ToLowerInvariant(c);
+            return new string(chars, 0, n);
+        }
+
+        /// <summary>Bounded Levenshtein distance; returns <paramref name="max"/>+1 as soon as the
+        /// edit distance is known to exceed the threshold, so long non-matches stay cheap.</summary>
+        private static int Levenshtein(string a, string b, int max)
+        {
+            int n = a.Length, m = b.Length;
+            if (Math.Abs(n - m) > max) return max + 1;
+            var prev = new int[m + 1];
+            var cur = new int[m + 1];
+            for (int j = 0; j <= m; j++) prev[j] = j;
+            for (int i = 1; i <= n; i++)
+            {
+                cur[0] = i;
+                int rowMin = cur[0];
+                for (int j = 1; j <= m; j++)
+                {
+                    int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+                    cur[j] = Math.Min(Math.Min(prev[j] + 1, cur[j - 1] + 1), prev[j - 1] + cost);
+                    if (cur[j] < rowMin) rowMin = cur[j];
+                }
+                if (rowMin > max) return max + 1;
+                (prev, cur) = (cur, prev);
+            }
+            return prev[m];
         }
 
         private static void DrawLabel(Graphics g, string text, int x, int y, Font font)

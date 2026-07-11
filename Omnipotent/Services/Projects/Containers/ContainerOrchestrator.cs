@@ -348,27 +348,41 @@ namespace Omnipotent.Services.Projects.Containers
                 },
             }, ct);
 
-            await docker.Containers.StartContainerAsync(create.ID, new ContainerStartParameters(), ct);
-
-            // Docker Desktop's WSL2 backend often returns from StartContainerAsync before the
-            // ephemeral host port is wired into the port proxy, so a single inspect races and
-            // sees no binding. Poll until Docker reports it (usually well under a second).
-            int hostPort = await WaitForHostPortAsync(docker, create.ID, ct)
-                ?? throw new InvalidOperationException(
-                    $"Container {create.ID[..12]} started but no host port was bound for VNC after waiting " +
-                    $"(container state: {await DescribeStateAsync(docker, create.ID, ct)}).");
-
-            var record = new DesktopContainerRecord
+            DesktopContainerRecord record;
+            try
             {
-                ContainerID = create.ID,
-                ProjectID = projectID,
-                AgentID = agentID,
-                VncHostPort = hostPort,
-                Width = resolvedWidth,
-                Height = resolvedHeight,
-            };
-            registry.Add(record);
-            log($"Created desktop container {create.ID[..12]} for project {projectID}{(agentID == null ? " (shared)" : $" agent {agentID}")} on 127.0.0.1:{hostPort}.");
+                await docker.Containers.StartContainerAsync(create.ID, new ContainerStartParameters(), ct);
+
+                // Docker Desktop's WSL2 backend often returns from StartContainerAsync before the
+                // ephemeral host port is wired into the port proxy, so a single inspect races and
+                // sees no binding. Poll until Docker reports it (usually well under a second).
+                int hostPort = await WaitForHostPortAsync(docker, create.ID, ct)
+                    ?? throw new InvalidOperationException(
+                        $"Container {create.ID[..12]} started but no host port was bound for VNC after waiting " +
+                        $"(container state: {await DescribeStateAsync(docker, create.ID, ct)}).");
+
+                record = new DesktopContainerRecord
+                {
+                    ContainerID = create.ID,
+                    ProjectID = projectID,
+                    AgentID = agentID,
+                    VncHostPort = hostPort,
+                    Width = resolvedWidth,
+                    Height = resolvedHeight,
+                };
+                registry.Add(record);
+            }
+            catch
+            {
+                // The container was created (and possibly started) but never made it into the
+                // registry — with restart=unless-stopped it would otherwise run and hold ~2 GB
+                // forever, invisible to the registry-driven reap. Tear it down before rethrowing.
+                // Uses CancellationToken.None so a cancelled create still cleans up after itself.
+                try { await docker.Containers.RemoveContainerAsync(create.ID, new ContainerRemoveParameters { Force = true }, CancellationToken.None); }
+                catch (Exception cleanupEx) { log($"Failed to remove container {create.ID[..12]} after a failed create: {cleanupEx.Message}"); }
+                throw;
+            }
+            log($"Created desktop container {create.ID[..12]} for project {projectID}{(agentID == null ? " (shared)" : $" agent {agentID}")} on 127.0.0.1:{record.VncHostPort}.");
             return record;
         }
 
@@ -382,6 +396,43 @@ namespace Omnipotent.Services.Projects.Containers
             catch (DockerContainerNotFoundException) { }
             registry.Remove(containerID);
             log($"Stopped and removed desktop container {containerID[..Math.Min(12, containerID.Length)]}.");
+        }
+
+        /// <summary>
+        /// Safety-net reap of desktop containers Docker still runs but the registry has no record
+        /// for — orphans left by a create that failed after start, a registry reset/corruption, or
+        /// any other drift. Because our containers carry restart=unless-stopped, an untracked one
+        /// would otherwise run (holding ~2 GB) forever, invisible to the registry-driven reap.
+        /// Only containers older than <paramref name="minAge"/> are removed, so a container that is
+        /// mid-provision (started, not yet in the registry) is never killed out from under itself.
+        /// Returns the number reaped.
+        /// </summary>
+        public async Task<int> ReapOrphansAsync(TimeSpan minAge, CancellationToken ct = default)
+        {
+            IList<ContainerListResponse> live;
+            try { live = await ListRunningAsync(ct); }
+            catch (Exception ex)
+            {
+                log($"ContainerOrchestrator: Docker unreachable during orphan reap ({ex.Message}).");
+                return 0;
+            }
+
+            var tracked = new HashSet<string>(registry.All().Select(r => r.ContainerID), StringComparer.Ordinal);
+            var cutoff = DateTime.UtcNow - minAge;
+            int reaped = 0;
+            foreach (var c in live)
+            {
+                if (tracked.Contains(c.ID)) continue;
+                if (c.Created > cutoff) continue; // too young — may be an in-flight provision
+                try
+                {
+                    await StopContainerAsync(c.ID, ct);
+                    reaped++;
+                    log($"Reaped orphaned desktop container {c.ID[..Math.Min(12, c.ID.Length)]} (no registry record; created {c.Created:u}).");
+                }
+                catch (Exception ex) { log($"Failed to reap orphaned container {c.ID[..Math.Min(12, c.ID.Length)]}: {ex.Message}"); }
+            }
+            return reaped;
         }
 
         /// <summary>All live Docker containers carrying our owner label.</summary>

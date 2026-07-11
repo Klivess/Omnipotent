@@ -18,6 +18,10 @@ namespace Omnipotent.Services.Projects.Containers
         public int Width { get; set; } = 1920;
         public int Height { get; set; } = 1080;
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        /// <summary>Last time an agent actually acquired this desktop (stamped on desktop
+        /// acquisition, persisted lazily). Drives idle-desktop reaping independent of overall
+        /// project activity, so a busy text-tier project doesn't pin an unused desktop forever.</summary>
+        public DateTime LastUsedAt { get; set; } = DateTime.UtcNow;
         /// <summary>Set when the container was found missing/dead during reconciliation.</summary>
         public bool Lost { get; set; }
     }

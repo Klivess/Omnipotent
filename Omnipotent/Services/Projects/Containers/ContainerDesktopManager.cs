@@ -152,6 +152,16 @@ namespace Omnipotent.Services.Projects.Containers
             }
             finally { provisionGate.Release(); }
 
+            // Stamp desktop usage so the reaper can retire desktops agents have stopped touching,
+            // independent of overall project activity. The registry write is whole-file, so persist
+            // lazily — only when the stamp advances materially — to keep continuous use from churning
+            // the file on every action. A freshly created record is already stamped at construction.
+            if (!created && DateTime.UtcNow - record.LastUsedAt > TimeSpan.FromMinutes(5))
+            {
+                record.LastUsedAt = DateTime.UtcNow;
+                registry.Update(record);
+            }
+
             // Readiness probing is deliberately outside the provisioning lock: a terminal call
             // may use the newly started container while a visual caller waits for Xvfb/x11vnc.
             if (created && requireVisualReady) await WaitForDesktopReadyAsync(record, ct);

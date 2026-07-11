@@ -2,6 +2,8 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using Omnipotent.Services.Projects.Stimulus;
 using System.Collections.Concurrent;
+using System.Collections.Specialized;
+using System.Globalization;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -344,6 +346,60 @@ namespace Omnipotent.Services.Projects
                         events,
                         lastSequence = parent.EventLog.GetLastSequence(project.ProjectID),
                     }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Lossless CSV export of the whole event log over a timeframe — the website's
+            // "Download history" button. Every stored field is a column, so nothing is lost
+            // relative to the on-disk JSONL (PayloadJson keeps its 32 KB write-time truncation;
+            // media is referenced by artifact ID exactly as the log stores it).
+            //   GET /projects/events/export?projectID=..&from=<ISO8601>&to=<ISO8601>
+            // from/to are optional and open-ended when omitted; both are treated as UTC.
+            await parent.CreateAPIRoute("/projects/events/export", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    DateTime? from = ParseTimestamp(req.userParameters?.Get("from"));
+                    DateTime? to = ParseTimestamp(req.userParameters?.Get("to"));
+
+                    var sb = new StringBuilder();
+                    sb.Append("sequence,eventID,timestampUtc,type,author,agentID,wakeID,toolName,toolCallId,gateID,stimulusID,artifactIDs,text,payloadJson\r\n");
+                    long count = 0;
+                    foreach (var e in parent.EventLog.EnumerateRange(project!.ProjectID, from, to))
+                    {
+                        sb.Append(Csv(e.Sequence.ToString(CultureInfo.InvariantCulture))).Append(',');
+                        sb.Append(Csv(e.EventID)).Append(',');
+                        sb.Append(Csv(e.Timestamp.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture))).Append(',');
+                        sb.Append(Csv(e.Type)).Append(',');
+                        sb.Append(Csv(e.Author)).Append(',');
+                        sb.Append(Csv(e.AgentID)).Append(',');
+                        sb.Append(Csv(e.WakeID)).Append(',');
+                        sb.Append(Csv(e.ToolName)).Append(',');
+                        sb.Append(Csv(e.ToolCallId)).Append(',');
+                        sb.Append(Csv(e.GateID)).Append(',');
+                        sb.Append(Csv(e.StimulusID)).Append(',');
+                        sb.Append(Csv(e.ArtifactIDs != null ? string.Join(";", e.ArtifactIDs) : "")).Append(',');
+                        sb.Append(Csv(e.Text)).Append(',');
+                        sb.Append(Csv(e.PayloadJson)).Append("\r\n");
+                        count++;
+                    }
+
+                    string fileName = $"project-{Sanitize(project.Name)}-history-{DateTime.UtcNow:yyyyMMdd-HHmmss}.csv";
+                    var headers = new NameValueCollection
+                    {
+                        ["Content-Disposition"] = $"attachment; filename=\"{fileName}\"",
+                        ["X-Content-Type-Options"] = "nosniff",
+                        ["X-Export-Event-Count"] = count.ToString(CultureInfo.InvariantCulture),
+                    };
+                    // Lead with a UTF-8 BOM so Excel opens non-ASCII text (emoji, accents) correctly.
+                    byte[] bom = { 0xEF, 0xBB, 0xBF };
+                    byte[] body = Encoding.UTF8.GetBytes(sb.ToString());
+                    byte[] payload = new byte[bom.Length + body.Length];
+                    Buffer.BlockCopy(bom, 0, payload, 0, bom.Length);
+                    Buffer.BlockCopy(body, 0, payload, bom.Length, body.Length);
+                    await req.ReturnBinaryResponse(payload, "text/csv; charset=utf-8", headers: headers);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -887,6 +943,34 @@ namespace Omnipotent.Services.Projects
         private static async Task Err(Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)
         {
             await req.ReturnResponse(ex.Message, code: HttpStatusCode.InternalServerError);
+        }
+
+        // RFC 4180 CSV field: quote when the value contains a comma, quote, CR or LF; escape
+        // inner quotes by doubling them. Null/empty becomes an empty (unquoted) field.
+        private static string Csv(string? field)
+        {
+            if (string.IsNullOrEmpty(field)) return "";
+            bool mustQuote = field.IndexOfAny(new[] { ',', '"', '\n', '\r' }) >= 0;
+            return mustQuote ? "\"" + field.Replace("\"", "\"\"") + "\"" : field;
+        }
+
+        // Parses an ISO-8601 export bound as UTC; unparseable/empty means "open-ended".
+        private static DateTime? ParseTimestamp(string? raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            return DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto)
+                ? dto.UtcDateTime : null;
+        }
+
+        // Reduces a project name to a filesystem-safe slug for the Content-Disposition filename.
+        private static string Sanitize(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "project";
+            var chars = name.Trim().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray();
+            string slug = new string(chars).Trim('-');
+            while (slug.Contains("--")) slug = slug.Replace("--", "-");
+            return string.IsNullOrEmpty(slug) ? "project" : (slug.Length > 60 ? slug[..60] : slug);
         }
     }
 }

@@ -531,10 +531,7 @@ namespace Omnipotent.Services.KliveAPI
                 apiStatistics = new KliveApiStatisticsStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPIStatisticsFile));
                 await apiStatistics.InitializeAsync();
 
-                listener = new();
-                //listener.Prefixes.Add($"https://+:{apiPORT}/");
-                listener.Prefixes.Add($"http://+:{apiHTTPPORT}/");
-                listener.Prefixes.Add($"https://+:{apiPORT}/");
+                listener = CreateConfiguredListener();
 
                 ServiceQuitRequest += KliveAPI_ServiceQuitRequest;
 
@@ -542,7 +539,7 @@ namespace Omnipotent.Services.KliveAPI
                 await CheckForSSLCertificate();
                 await LinkSSLCertificate(certInstaller.rootAuthorityPfxPath);
 
-                listener.Start();
+                await StartListenerWithRetry();
 
                 ServiceLog($"Listening on: {string.Join(", ", listener.Prefixes)}");
 
@@ -571,6 +568,60 @@ namespace Omnipotent.Services.KliveAPI
             {
                 ServiceLogError(ex, "KliveAPI Failed!");
                 await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "KliveAPI Failed to start! Error Info: " + new ErrorInformation(ex).FullFormattedMessage);
+            }
+        }
+
+        /// <summary>
+        /// Builds a fresh <see cref="HttpListener"/> with KliveAPI's HTTP + HTTPS prefixes.
+        /// Kept in one place so <see cref="StartListenerWithRetry"/> can rebuild an identical
+        /// listener after disposing a stale one.
+        /// </summary>
+        private HttpListener CreateConfiguredListener()
+        {
+            var l = new HttpListener();
+            //l.Prefixes.Add($"https://+:{apiPORT}/");
+            l.Prefixes.Add($"http://+:{apiHTTPPORT}/");
+            l.Prefixes.Add($"https://+:{apiPORT}/");
+            return l;
+        }
+
+        /// <summary>
+        /// Starts <see cref="listener"/>, tolerating the http.sys "conflicts with an existing
+        /// registration on the machine" failure (Win32 ERROR_ALREADY_EXISTS / ERROR_SHARING_VIOLATION).
+        /// That conflict is almost always a previous KliveAPI listener whose "https://+:443/" URL
+        /// registration has not been released yet — after a crash-restart of this Critical service or
+        /// an ungraceful process exit. Each retry fully disposes the stale listener (Close() releases
+        /// the http.sys URL group; a bare Stop() does not) and rebuilds a fresh one, with a short
+        /// backoff to give http.sys time to drop the old registration. Non-conflict failures
+        /// (e.g. ERROR_ACCESS_DENIED) are rethrown immediately since retrying cannot fix them.
+        /// </summary>
+        private async Task StartListenerWithRetry()
+        {
+            const int maxAttempts = 6;
+            const int backoffMs = 2500;
+
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    listener.Start();
+                    return;
+                }
+                catch (HttpListenerException ex) when (
+                    ex.NativeErrorCode == 183 /* ERROR_ALREADY_EXISTS */ ||
+                    ex.NativeErrorCode == 32  /* ERROR_SHARING_VIOLATION */)
+                {
+                    await ServiceLogError(ex, $"HttpListener.Start() failed — a prefix conflicts with an existing " +
+                        $"registration (attempt {attempt}/{maxAttempts}). A previous listener has likely not released " +
+                        $"the URL yet; disposing it and retrying in {backoffMs}ms.");
+
+                    try { listener.Close(); } catch { }
+
+                    if (attempt >= maxAttempts) throw;
+
+                    await Task.Delay(backoffMs);
+                    listener = CreateConfiguredListener();
+                }
             }
         }
 
@@ -907,7 +958,11 @@ namespace Omnipotent.Services.KliveAPI
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             ContinueListenLoop = false;
-            listener.Stop();
+            // Close() (not just Stop()) so http.sys fully releases the URL group. A bare Stop()
+            // can leave the "https://+:443/" registration lingering, which then makes the next
+            // start (e.g. a crash-restart of this Critical service) fail with
+            // "conflicts with an existing registration on the machine".
+            try { listener.Close(); } catch { }
         }
 
         private async Task CheckForSSLCertificate()

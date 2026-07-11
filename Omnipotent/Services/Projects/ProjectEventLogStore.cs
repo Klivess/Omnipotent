@@ -118,6 +118,36 @@ namespace Omnipotent.Services.Projects
             return ReadSince(projectID, Math.Max(0, last - count), max: count);
         }
 
+        /// <summary>
+        /// Streams every event whose timestamp falls within [<paramref name="fromUtc"/>, <paramref name="toUtc"/>]
+        /// (inclusive; null bounds are open-ended), ascending by sequence — the lossless export read.
+        /// Unlike <see cref="ReadSince"/> this is uncapped and reads the append-only file directly
+        /// (FileShare.ReadWrite, no append lock held) so a large export never stalls the fleet's
+        /// concurrent event writes; a partially written trailing line is skipped rather than throwing.
+        /// </summary>
+        public IEnumerable<ProjectEvent> EnumerateRange(string projectID, DateTime? fromUtc, DateTime? toUtc)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            string path = LogPath(projectID);
+            if (!File.Exists(path)) yield break;
+            DateTime? from = fromUtc?.ToUniversalTime();
+            DateTime? to = toUtc?.ToUniversalTime();
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                ProjectEvent? e = null;
+                try { e = JsonConvert.DeserializeObject<ProjectEvent>(line); } catch { /* skip partial/corrupt line */ }
+                if (e == null) continue;
+                DateTime ts = e.Timestamp.ToUniversalTime();
+                if (from.HasValue && ts < from.Value) continue;
+                if (to.HasValue && ts > to.Value) continue;
+                yield return e;
+            }
+        }
+
         public long GetLastSequence(string projectID)
         {
             CacheDeps.NoteRead(CacheKey(projectID));

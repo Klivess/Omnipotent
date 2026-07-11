@@ -222,11 +222,14 @@ namespace Omnipotent.Services.Projects.Containers
         {
             string needle = Str(a, "text") ?? string.Empty;
             if (string.IsNullOrWhiteSpace(needle)) return ContainerToolResult.Fail("Provide visible 'text' to locate.");
-            var raw = await CaptureRawAsync(ct);
+            var frame = await CaptureFrameWithRetryAsync(ct);
+            var raw = EncodeAndCacheDisplayFrame(frame);
             var shot = BuildScreenshotResult("OCR searched the desktop.", raw.jpeg, raw.width, raw.height);
-            // OCR the clean raw frame.  Running Tesseract over the coordinate grid adds artificial
-            // lines/labels and can both hide real text and manufacture false matches.
-            var matches = await ComputerVision.FindTextAsync(raw.jpeg, needle, ct);
+            // OCR the clean framebuffer, never the coordinate grid (its lines/labels both hide real
+            // text and manufacture false matches).  Feed a lossless PNG rather than the quality-70
+            // display JPEG so small UI glyphs survive to Tesseract.
+            byte[] ocrImage = VncFrameEncoder.EncodePng(frame.bgra, frame.width, frame.height);
+            var matches = await ComputerVision.FindTextAsync(ocrImage, needle, ct);
             int occurrence = Math.Max(0, Int(a, "occurrence", 0));
             if (matches.Count <= occurrence)
                 return shot with { Text = $"No visible OCR match for '{ComputerAudit.Truncate(needle, 80)}' at occurrence {occurrence}. " + shot.Text };
@@ -449,19 +452,24 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         private async Task<(byte[] jpeg, int width, int height)> CaptureRawAsync(CancellationToken ct)
+            => EncodeAndCacheDisplayFrame(await CaptureFrameWithRetryAsync(ct));
+
+        private async Task<(byte[] bgra, int width, int height)> CaptureFrameWithRetryAsync(CancellationToken ct)
         {
-            (byte[] bgra, int width, int height) frame;
             try
             {
-                frame = await transport.CaptureFrameAsync(ct);
+                return await transport.CaptureFrameAsync(ct);
             }
             catch (Exception) when (!ct.IsCancellationRequested)
             {
                 // VncTransport drops its connection on receive-loop failure. One immediate retry
                 // repairs transient docker-proxy/x11vnc disconnects without masking a real outage.
-                frame = await transport.CaptureFrameAsync(ct);
+                return await transport.CaptureFrameAsync(ct);
             }
+        }
 
+        private (byte[] jpeg, int width, int height) EncodeAndCacheDisplayFrame((byte[] bgra, int width, int height) frame)
+        {
             // Tool coordinates are image pixels.  Preserve the framebuffer dimensions here even
             // if a project provisions a desktop wider than 1280px; only the website stream may
             // downscale independently.

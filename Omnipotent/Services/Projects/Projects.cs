@@ -817,11 +817,14 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// Hourly container reap (§ resource hygiene): prunes orphaned Lost registry records and
-        /// tears down desktops that are no longer needed — those owned by a retired agent, belonging
-        /// to a finished project, or on a project idle beyond the reap window (recreated on next use).
-        /// Never touches a project with a live wake. Idle window via Projects_ContainerIdleReapHours
-        /// (host-global resource policy; 0 disables idle reaping).
+        /// Hourly container reap (§ resource hygiene): prunes orphaned Lost registry records, reaps
+        /// desktop containers Docker still runs but the registry lost track of (create-failure /
+        /// registry-drift orphans that would otherwise leak ~2 GB each forever), and tears down
+        /// desktops that are no longer needed — those owned by a retired agent, belonging to a
+        /// finished project, on a project idle beyond the reap window, or whose desktop itself has
+        /// gone unused (all recreated transparently on next use). Never touches a project with a
+        /// live wake. Windows via Projects_ContainerIdleReapHours (project activity) and
+        /// Projects_DesktopIdleReapHours (per-desktop use); host-global policy, 0 disables that lane.
         /// </summary>
         private async Task ReapContainersAsync()
         {
@@ -833,7 +836,19 @@ namespace Omnipotent.Services.Projects
                 foreach (var lost in reg.All().Where(r => r.Lost))
                     reg.Remove(lost.ContainerID);
 
+                // 1b. Reap desktop containers Docker still runs but the registry lost track of
+                // (a create that failed after start, a registry reset, etc.). These carry
+                // restart=unless-stopped and would otherwise leak ~2 GB each forever, invisible to
+                // the per-project reap below. Grace period avoids racing an in-flight provision.
+                try { await Desktops.Orchestrator.ReapOrphansAsync(TimeSpan.FromMinutes(10)); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: orphan container reap failed"); }
+
                 int idleHours = await GetIntOmniSetting("Projects_ContainerIdleReapHours", 6);
+                // A desktop unused this long is reaped even while the project stays busy on
+                // text-tier work — the project-idle window above never fires for such a project
+                // (keepalive wakes keep emitting events), so an unused desktop would pin ~2 GB
+                // indefinitely without this. Recreated transparently on the next computer tool.
+                int desktopIdleHours = await GetIntOmniSetting("Projects_DesktopIdleReapHours", 3);
                 foreach (var project in Store.ListProjects())
                 {
                     var containers = reg.ForProject(project.ProjectID);
@@ -852,7 +867,9 @@ namespace Omnipotent.Services.Projects
                     foreach (var c in containers)
                     {
                         bool ownerRetired = c.AgentID != null && !activeIDs.Contains(c.AgentID);
-                        if (finished || idle || ownerRetired)
+                        bool desktopIdle = desktopIdleHours > 0 &&
+                                           DateTime.UtcNow - c.LastUsedAt > TimeSpan.FromHours(desktopIdleHours);
+                        if (finished || idle || ownerRetired || desktopIdle)
                         {
                             try { await Desktops.DisposeDesktopAsync(c.ContainerID); }
                             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap dispose failed"); }

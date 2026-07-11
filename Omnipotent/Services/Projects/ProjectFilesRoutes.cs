@@ -125,7 +125,11 @@ public sealed class ProjectFilesRoutes
                 contentType, req.RequestBodyStream, actor);
             await Ok(req, new
             {
-                item,
+                item.UploadFileID,
+                item.Path,
+                item.ReceivedSize,
+                item.ExpectedSize,
+                item.MimeType,
                 complete = item.ReceivedSize == item.ExpectedSize,
                 nextOffset = item.ReceivedSize,
             });
