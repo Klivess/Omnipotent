@@ -786,6 +786,14 @@ namespace Omnipotent.Services.KliveLLM
         private const int RemoteInferenceMaxAttempts = 3;
         private const int RemoteInferenceBaseDelayMs = 800;
 
+        // Upstream rate-limits / anti-abuse blocks (which OpenRouter frequently WRAPS as a top-level 400 —
+        // see IsUpstreamRateLimitBody) clear after a short cool-off, so they warrant more attempts and a
+        // longer wait than an ordinary blip. The per-try wait is capped so a single wake is never blocked
+        // for minutes; if it still can't get through, the wake fails gracefully as before.
+        private const int RateLimitMaxAttempts = 5;
+        private const int RateLimitBaseDelayMs = 3000;
+        private const int RateLimitMaxDelayMs = 20000;
+
         private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
@@ -1196,7 +1204,8 @@ namespace Omnipotent.Services.KliveLLM
             string payloadJson = JsonConvert.SerializeObject(payload);
 
             Exception lastError = null;
-            for (int attempt = 1; attempt <= RemoteInferenceMaxAttempts; attempt++)
+            int maxAttempts = RemoteInferenceMaxAttempts; // raised to RateLimitMaxAttempts if we hit a rate-limit
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
                 HttpResponseMessage response;
                 string responseContent;
@@ -1259,15 +1268,23 @@ namespace Omnipotent.Services.KliveLLM
                     if (!response.IsSuccessStatusCode)
                     {
                         int status = (int)response.StatusCode;
-                        bool transient = status == 408 || status == 429 || status >= 500;
+                        // OpenRouter often surfaces an UPSTREAM rate-limit / anti-abuse block as a top-level
+                        // 400 whose body carries the real code (a 429 "temporarily rate-limited upstream", or
+                        // Xiaomi/MiMo's 441 "risk_control" for high-frequency requests). A naive status check
+                        // treats that 400 as a permanent client error and fails the whole wake; in reality it's
+                        // transient and clears after a cool-off, so we retry it with a longer, gentler backoff.
+                        bool rateLimited = status == 429 || IsUpstreamRateLimitBody(responseContent);
+                        bool transient = status == 408 || status >= 500 || rateLimited;
+                        if (rateLimited) maxAttempts = Math.Max(maxAttempts, RateLimitMaxAttempts);
+
                         var httpEx = new HttpRequestException(
                             $"{remoteProvider.DisplayName} request failed with status {status} ({response.ReasonPhrase}). Body: {responseContent}");
 
-                        if (transient && attempt < RemoteInferenceMaxAttempts)
+                        if (transient && attempt < maxAttempts)
                         {
                             lastError = httpEx;
-                            try { await ServiceLog($"Remote LLM transient {status} (attempt {attempt}/{RemoteInferenceMaxAttempts}). Retrying."); } catch { }
-                            await DelayBeforeRetryAsync(attempt, response, cancellationToken);
+                            try { await ServiceLog($"Remote LLM {(rateLimited ? "rate-limit" : "transient")} {status} (attempt {attempt}/{maxAttempts}). Retrying."); } catch { }
+                            await DelayBeforeRetryAsync(attempt, response, cancellationToken, rateLimited);
                             continue;
                         }
                         throw httpEx; // non-transient (4xx) or out of attempts
@@ -1300,7 +1317,7 @@ namespace Omnipotent.Services.KliveLLM
             || ex is System.IO.IOException
             || ex is System.Net.Sockets.SocketException;
 
-        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response, CancellationToken cancellationToken = default)
+        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response, CancellationToken cancellationToken = default, bool rateLimited = false)
         {
             TimeSpan delay;
             if (response?.Headers?.RetryAfter?.Delta is TimeSpan retryAfter && retryAfter > TimeSpan.Zero)
@@ -1309,10 +1326,37 @@ namespace Omnipotent.Services.KliveLLM
             }
             else
             {
-                double ms = RemoteInferenceBaseDelayMs * Math.Pow(2, attempt - 1);
+                double baseMs = rateLimited ? RateLimitBaseDelayMs : RemoteInferenceBaseDelayMs;
+                double ms = baseMs * Math.Pow(2, attempt - 1);
+                if (rateLimited) ms = Math.Min(ms, RateLimitMaxDelayMs); // cap so a wake isn't blocked for minutes
                 delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
             await Task.Delay(delay, cancellationToken);
+        }
+
+        // OpenRouter routes a request across multiple upstream providers and, when they're all throttling a
+        // (usually free/cheap) model, commonly returns a TOP-LEVEL 400 whose body STILL reveals the real
+        // upstream condition: a 429 ("temporarily rate-limited upstream"), or Xiaomi/MiMo's 441 "risk_control"
+        // ("Detected high-frequency non-compliant requests"). We only see this on an error body, so matching on
+        // these markers lets the retry policy treat the wrapped 400 as the transient condition it actually is.
+        private static bool IsUpstreamRateLimitBody(string? body)
+        {
+            if (string.IsNullOrEmpty(body)) return false;
+            if (body.Contains("risk_control", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("rate-limited", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("rate limited", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("too many requests", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Whitespace-insensitive check for an upstream code the top-level status hid (429 = rate limit,
+            // 441 = MiMo/Xiaomi risk-control). Both appear as numbers or quoted strings across providers.
+            string compact = body.Replace(" ", string.Empty).Replace("\n", string.Empty)
+                                  .Replace("\r", string.Empty).Replace("\t", string.Empty).Replace("\\n", string.Empty);
+            return compact.Contains("\"code\":429", StringComparison.OrdinalIgnoreCase)
+                || compact.Contains("\"code\":\"429\"", StringComparison.OrdinalIgnoreCase)
+                || compact.Contains("\"code\":441", StringComparison.OrdinalIgnoreCase)
+                || compact.Contains("\"code\":\"441\"", StringComparison.OrdinalIgnoreCase);
         }
         private async Task EnsureModelDownloadedAsync()
         {
