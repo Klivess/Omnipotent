@@ -1,10 +1,12 @@
 using Microsoft.Data.Sqlite;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
 {
     public sealed class FillRepository
     {
+        private const string CacheKey = "omnitrader:fills";
         private readonly OmniTraderDb db;
 
         public FillRepository(OmniTraderDb db) { this.db = db; }
@@ -21,10 +23,12 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$fc", fill.FeeCurrency);
             cmd.Parameters.AddWithValue("$u", fill.FilledUtc.ToString("o"));
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public async Task<List<FillRecord>> ListByOrderAsync(string orderId, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM fills WHERE order_id=$o ORDER BY filled_utc ASC";
@@ -37,6 +41,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<FillRecord>> ListByDeploymentAsync(string deploymentId, int limit = 500, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"SELECT f.* FROM fills f

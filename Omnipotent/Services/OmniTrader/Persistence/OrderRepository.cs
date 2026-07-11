@@ -1,10 +1,14 @@
 using Microsoft.Data.Sqlite;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
 {
     public sealed class OrderRepository
     {
+        // Coarse per-table key (order writes carry only the order id, not always the
+        // deployment): safe over-invalidation, never staleness.
+        private const string CacheKey = "omnitrader:orders";
         private readonly OmniTraderDb db;
 
         public OrderRepository(OmniTraderDb db) { this.db = db; }
@@ -29,6 +33,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$eo", (object?)intent.ExchangeOrderId ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$err", (object?)intent.Error ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task UpdateStatusAsync(string id, OrderStatus status, string? exchangeOrderId = null, string? error = null, CancellationToken ct = default)
@@ -41,10 +46,12 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$err", (object?)error ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public async Task<List<OrderRecord>> ListByDeploymentAsync(string deploymentId, int limit = 200, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM orders WHERE deployment_id=$d ORDER BY placed_utc DESC LIMIT $l";
@@ -58,6 +65,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<OrderRecord>> ListOpenAsync(string deploymentId, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM orders WHERE deployment_id=$d AND status IN ('Pending','Open','PartiallyFilled')";

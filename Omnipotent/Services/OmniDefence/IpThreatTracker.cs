@@ -161,6 +161,7 @@ namespace Omnipotent.Services.OmniDefence
                         rec.ThreatScore += 0.5;
                         break;
                     case RequestOutcome.ServerError:
+                    case RequestOutcome.ClientError:
                         // not the IP's fault
                         break;
                     case RequestOutcome.PreBlocked:
@@ -275,6 +276,8 @@ namespace Omnipotent.Services.OmniDefence
         IncorrectMethod,
         NotFound,
         ServerError,
-        PreBlocked
+        PreBlocked,
+        /// <summary>A normal 4xx client error (validation, conflict, payload limit); no threat score.</summary>
+        ClientError
     }
 }

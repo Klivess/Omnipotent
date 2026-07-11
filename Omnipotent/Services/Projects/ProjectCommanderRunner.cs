@@ -310,7 +310,7 @@ namespace Omnipotent.Services.Projects
                             ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
                             Type = ProjectEventTypes.ToolCall, Author = "commander",
                             Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
-                            PayloadJson = toolName.StartsWith("computer_", StringComparison.Ordinal) ? null : argsJson,
+                            PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
                         });
 
                         var result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);

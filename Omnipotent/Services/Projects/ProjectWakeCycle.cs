@@ -46,6 +46,13 @@ namespace Omnipotent.Services.Projects
         public Func<string, string>? DescribeAccounts;
 
         /// <summary>
+        /// Optional shared-files leg: projectID → a compact description of the project's shared
+        /// filesystem, including important inputs/assets, recent changes and provenance. Set by the
+        /// Projects service from the project file store; agents can use list_files/stat_file for more.
+        /// </summary>
+        public Func<string, string>? DescribeFiles;
+
+        /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
@@ -92,7 +99,13 @@ namespace Omnipotent.Services.Projects
                 try { accounts = DescribeAccounts(project.ProjectID); } catch { accounts = null; }
             }
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables, grandPlan, accounts);
+            string? files = null;
+            if (DescribeFiles != null)
+            {
+                try { files = DescribeFiles(project.ProjectID); } catch { files = null; }
+            }
+
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables, grandPlan, accounts, files);
         }
 
         private static string Truncate(string s, int max) =>

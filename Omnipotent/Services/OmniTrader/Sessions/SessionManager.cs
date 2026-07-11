@@ -1,3 +1,4 @@
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Execution;
 using Omnipotent.Services.OmniTrader.MarketData;
@@ -9,6 +10,11 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 {
     public sealed class SessionManager
     {
+        // In-memory live/armed state that deployment routes read alongside the tracked
+        // repos. Bumped on every create/arm/pause/resume/kill so a cached deployment
+        // list can never serve a stale Armed flag or active-set.
+        private const string CacheKey = "omnitrader:sessions";
+
         private readonly MarketDataRouter marketData;
         private readonly StrategyRegistry registry;
         private readonly DeploymentRepository deploymentRepo;
@@ -46,8 +52,14 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             this.err = err;
         }
 
-        public IReadOnlyCollection<string> ActiveDeploymentIds =>
-            paperSessions.Keys.Concat(liveSessions.Keys).Concat(multiSessions.Keys).ToList();
+        public IReadOnlyCollection<string> ActiveDeploymentIds
+        {
+            get
+            {
+                CacheDeps.NoteRead(CacheKey);
+                return paperSessions.Keys.Concat(liveSessions.Keys).Concat(multiSessions.Keys).ToList();
+            }
+        }
 
         private static DeploymentConfig WithSymbol(DeploymentConfig c, string symbol) => new()
         {
@@ -149,6 +161,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     await session.StartAsync(ct);
             }
 
+            CacheDeps.Bump(CacheKey);
             return id;
         }
 
@@ -158,6 +171,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             else if (multiSessions.TryGetValue(id, out var multi) && multi.Mode == SessionMode.Live) multi.Arm();
             else return false;
             await deploymentRepo.SetArmedLiveAsync(id, DateTime.UtcNow, ct);
+            CacheDeps.Bump(CacheKey);
             return true;
         }
 
@@ -168,6 +182,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 live.Disarm();
                 try { await live.FlattenAsync(ct); } catch { }
                 await deploymentRepo.SetPausedAsync(id, DateTime.UtcNow, ct);
+                CacheDeps.Bump(CacheKey);
                 return true;
             }
             if (multiSessions.TryGetValue(id, out var multi))
@@ -175,12 +190,14 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 if (multi.Mode == SessionMode.Live) multi.Disarm();
                 else { multiSessions.TryRemove(id, out _); await multi.StopAsync(); }
                 await deploymentRepo.SetPausedAsync(id, DateTime.UtcNow, ct);
+                CacheDeps.Bump(CacheKey);
                 return true;
             }
             if (paperSessions.TryRemove(id, out var paper))
             {
                 await paper.StopAsync();
                 await deploymentRepo.SetPausedAsync(id, DateTime.UtcNow, ct);
+                CacheDeps.Bump(CacheKey);
                 return true;
             }
             return false;
@@ -201,6 +218,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     universeProvider, null, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
                     startingQuote: row.EquityCurrent);
                 if (multiSessions.TryAdd(id, session)) { await session.StartAsync(ct); await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Running, ct: ct); }
+                CacheDeps.Bump(CacheKey);
                 return true;
             }
             var paper = new PaperSession(id, row.Config, strategy, marketData,
@@ -211,6 +229,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 await paper.StartAsync(ct);
                 await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Running, ct: ct);
             }
+            CacheDeps.Bump(CacheKey);
             return true;
         }
 
@@ -239,7 +258,10 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 killed = true;
             }
             if (killed)
+            {
                 await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Stopped, ct: ct);
+                CacheDeps.Bump(CacheKey);
+            }
             return killed;
         }
 
@@ -320,11 +342,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     try { await deploymentRepo.UpdateStatusAsync(row.Id, DeploymentStatus.Errored, ex.Message, ct); } catch { }
                 }
             }
+            CacheDeps.Bump(CacheKey);
         }
 
         /// <summary>Whether a live deployment (single- or multi-asset) is currently armed for real orders.</summary>
         public bool IsDeploymentArmed(string id)
         {
+            CacheDeps.NoteRead(CacheKey);
             if (liveSessions.TryGetValue(id, out var live)) return live.IsArmed;
             if (multiSessions.TryGetValue(id, out var multi)) return multi.Mode == SessionMode.Live && multi.IsArmed;
             return false;

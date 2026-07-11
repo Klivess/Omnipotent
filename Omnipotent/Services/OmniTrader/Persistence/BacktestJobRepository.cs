@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Contracts;
 
@@ -26,6 +27,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
     public sealed class BacktestJobRepository
     {
+        private const string CacheKey = "omnitrader:backtests";
         private readonly OmniTraderDb db;
 
         public BacktestJobRepository(OmniTraderDb db) { this.db = db; }
@@ -50,6 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$f", (object?)row.FinishedUtc?.ToString("o") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$cr", row.CancellationRequested ? 1 : 0);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task UpdateStatusAsync(string id, BacktestJobStatus status, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -59,6 +62,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$s", status.ToString().ToLowerInvariant());
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task UpdateProgressAsync(string id, double progressPct, int candlesDone, int candlesTotal, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -70,6 +74,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$ct", candlesTotal);
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task StartAsync(string id, DateTime startedUtc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -79,6 +84,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$t", startedUtc.ToString("o"));
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task CompleteAsync(string id, BacktestJobStatus status, BacktestResult? result, string? error, DateTime finishedUtc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -93,6 +99,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$f", finishedUtc.ToString("o"));
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task RequestCancelAsync(string id, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -101,6 +108,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.CommandText = "UPDATE backtest_jobs SET cancellation_requested=1 WHERE id=$id";
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public async Task<bool> IsCancellationRequestedAsync(string id, CancellationToken ct = default)
@@ -120,10 +128,12 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$e", error);
             cmd.Parameters.AddWithValue("$f", DateTime.UtcNow.ToString("o"));
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public async Task<BacktestJobRow?> GetAsync(string id, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM backtest_jobs WHERE id=$id";
@@ -135,6 +145,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<BacktestJobRow>> ListRecentAsync(int limit = 50, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM backtest_jobs ORDER BY queued_utc DESC LIMIT $l";
@@ -147,6 +158,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<BacktestJobRow>> ListQueuedAsync(CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM backtest_jobs WHERE status='queued' ORDER BY queued_utc ASC";

@@ -30,7 +30,8 @@ namespace Omnipotent.Services.Projects
             List<Omnipotent.Services.KliveRAG.KnowledgeHit>? knowledgeHits = null,
             string? observablesBlock = null,
             string? grandPlanBlock = null,
-            string? accountsBlock = null)
+            string? accountsBlock = null,
+            string? filesBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -66,6 +67,14 @@ namespace Omnipotent.Services.Projects
             {
                 sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account_list for details) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
+            }
+
+            // Persistent project volume shared by Klive, the Commander and every worker. The
+            // summary is intentionally small; list_files/stat_file provide paged detail on demand.
+            if (!string.IsNullOrWhiteSpace(filesBlock))
+            {
+                sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files/stat_file for more) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(filesBlock, ProjectsContextBudget.SharedFilesBudget));
             }
 
             // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The

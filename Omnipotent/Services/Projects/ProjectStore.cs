@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -11,6 +12,7 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public class ProjectStore
     {
+        private const string CacheKey = "projects:index";
         private readonly string indexPath;
         private readonly Action<string> log;
         private readonly object gate = new();
@@ -60,11 +62,11 @@ namespace Omnipotent.Services.Projects
         }
 
         public Project CreateProject(string name, string goal, double tokenBudgetUsd, double moneyBudgetUsd,
-            double moneyAutonomousThresholdUsd, int subAgentCap)
+            double moneyAutonomousThresholdUsd, int subAgentCap, string? projectID = null)
         {
             var p = new Project
             {
-                ProjectID = Guid.NewGuid().ToString("N"),
+                ProjectID = string.IsNullOrWhiteSpace(projectID) ? Guid.NewGuid().ToString("N") : projectID,
                 Name = name,
                 Goal = goal,
                 TokenBudgetUsd = tokenBudgetUsd,
@@ -76,17 +78,36 @@ namespace Omnipotent.Services.Projects
             {
                 projects.Add(p);
                 SaveLocked();
+                CacheDeps.Bump(CacheKey);
             }
             return p;
         }
 
+        /// <summary>Removes a just-created project during transactional initialisation rollback.
+        /// Normal lifecycle uses Completed/Archived and never calls this.</summary>
+        public bool RemoveProject(string projectID)
+        {
+            lock (gate)
+            {
+                int removed = projects.RemoveAll(p => p.ProjectID == projectID);
+                if (removed > 0)
+                {
+                    SaveLocked();
+                    CacheDeps.Bump(CacheKey);
+                }
+                return removed > 0;
+            }
+        }
+
         public Project? GetProject(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey);
             lock (gate) return projects.FirstOrDefault(p => p.ProjectID == projectID);
         }
 
         public List<Project> ListProjects()
         {
+            CacheDeps.NoteRead(CacheKey);
             lock (gate) return projects.ToList();
         }
 
@@ -99,6 +120,7 @@ namespace Omnipotent.Services.Projects
                 if (idx < 0) throw new InvalidOperationException($"Unknown project {project.ProjectID}");
                 projects[idx] = project;
                 SaveLocked();
+                CacheDeps.Bump(CacheKey);
             }
         }
     }

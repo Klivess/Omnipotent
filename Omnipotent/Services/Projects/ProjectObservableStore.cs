@@ -3,6 +3,7 @@ using System.Globalization;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -80,13 +81,18 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".observables.json");
 
+        // Response-cache dependency key: per project, bumped on any mutation.
+        private static string CacheKey(string projectID) => "projects:observables:" + projectID;
+
         public List<ProjectObservable> List(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID)) return LoadLocked(projectID).Select(Clone).ToList();
         }
 
         public ProjectObservable? Get(string projectID, string name)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID))
             {
                 var o = FindLocked(LoadLocked(projectID), name);
@@ -148,6 +154,7 @@ namespace Omnipotent.Services.Projects
                 Touch(o, actingAgentID);
 
                 SaveLocked(projectID, all);
+                CacheDeps.Bump(CacheKey(projectID));
                 return new ObservableChange(Clone(o), previousDisplay, FormatValue(o));
             }
         }
@@ -186,6 +193,7 @@ namespace Omnipotent.Services.Projects
                 Touch(o, actingAgentID);
 
                 SaveLocked(projectID, all);
+                CacheDeps.Bump(CacheKey(projectID));
                 return new ObservableChange(Clone(o), previousDisplay, FormatValue(o));
             }
         }
@@ -200,6 +208,7 @@ namespace Omnipotent.Services.Projects
                 if (o == null) return false;
                 all.Remove(o);
                 SaveLocked(projectID, all);
+                CacheDeps.Bump(CacheKey(projectID));
                 return true;
             }
         }

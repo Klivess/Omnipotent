@@ -5,6 +5,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects.Stimulus;
 using Omnipotent.Services.ComputerControl;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace Omnipotent.Services.Projects
@@ -54,6 +55,8 @@ namespace Omnipotent.Services.Projects
         public Func<string, HookArmInfo?>? GetHookArmInfo { get; set; }
         /// <summary>Artifact storage for files the agent wants kept on the timeline.</summary>
         public ProjectArtifactStore? Artifacts { get; set; }
+        /// <summary>Managed shared filesystem (the same bytes mounted at /project in every container).</summary>
+        public ProjectFileStore? Files { get; set; }
         /// <summary>Named live values the agents maintain for Klives' at-a-glance dashboard.</summary>
         public ProjectObservableStore? Observables { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
@@ -89,6 +92,26 @@ namespace Omnipotent.Services.Projects
 
         private static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
 
+        /// <summary>Returns the durable audit form of tool arguments. File contents are deliberately
+        /// omitted: their path/hash/size belong in the project-file audit, not duplicated into JSONL.</summary>
+        public static string? AuditPayload(string toolName, string argsJson)
+        {
+            if (toolName.StartsWith("computer_", StringComparison.Ordinal)) return null;
+            if (!string.Equals(toolName, "write_file", StringComparison.Ordinal)) return argsJson;
+            try
+            {
+                var args = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+                if (args["content"] is JToken content)
+                {
+                    string value = content.Type == JTokenType.String ? content.Value<string>() ?? "" : content.ToString(Formatting.None);
+                    string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+                    args["content"] = $"[omitted {value.Length} chars; sha256={hash}]";
+                }
+                return args.ToString(Formatting.None);
+            }
+            catch { return "{\"content\":\"[omitted: invalid arguments]\"}"; }
+        }
+
         public ProjectCommanderTools(
             Project project, ProjectEventLogStore eventLog, ProjectDigestStore digests,
             ProjectSubAgentManager subAgents, ProjectGateManager gates, ProjectBudgetLedger budget,
@@ -111,7 +134,12 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> PlanningBlockedTools = new(StringComparer.Ordinal)
         {
             "spawn_sub_agent", "run_script", "run_powershell", "run_bash",
-            "record_money_spend", "complete_project", "write_file",
+            "record_money_spend", "complete_project", "write_file", "make_directory",
+            "move_file", "copy_file", "delete_file", "mark_file_important",
+        };
+        private static readonly HashSet<string> FileMutationTools = new(StringComparer.Ordinal)
+        {
+            "write_file", "make_directory", "move_file", "copy_file", "delete_file", "mark_file_important",
         };
 
         public async Task<CommanderToolResult> DispatchAsync(string tool, string argsJson, CancellationToken ct)
@@ -119,6 +147,9 @@ namespace Omnipotent.Services.Projects
             JObject a;
             try { a = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson); }
             catch { a = new JObject(); }
+
+            if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived && FileMutationTools.Contains(tool))
+                return new CommanderToolResult("This project's shared filesystem is browse-only after completion or archive.");
 
             if (project.Status == ProjectStatus.Planning && PlanningBlockedTools.Contains(tool))
                 return new CommanderToolResult(
@@ -567,31 +598,190 @@ namespace Omnipotent.Services.Projects
 
                 case "read_file":
                 {
-                    var (path, err) = ResolveVolumePath((string?)a["path"]);
-                    if (err != null) return new CommanderToolResult(err);
-                    if (!File.Exists(path)) return new CommanderToolResult($"No file at {a["path"]}.");
-                    string text = await File.ReadAllTextAsync(path!, ct);
-                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(text, ProjectsContextBudget.ToolResultBudget));
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    if (Files == null)
+                    {
+                        var (physical, error) = ResolveVolumePath(path);
+                        if (error != null) return new CommanderToolResult(error);
+                        if (!File.Exists(physical)) return new CommanderToolResult($"No file at {path}.");
+                        string fallbackText = await File.ReadAllTextAsync(physical!, ct);
+                        return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(fallbackText, ProjectsContextBudget.ToolResultBudget));
+                    }
+                    try
+                    {
+                        string text = await Files.ReadTextAsync(project.ProjectID, path, 2 * 1024 * 1024, ct);
+                        return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(text, ProjectsContextBudget.ToolResultBudget));
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
                 }
 
                 case "write_file":
                 {
-                    var (path, err) = ResolveVolumePath((string?)a["path"]);
-                    if (err != null) return new CommanderToolResult(err);
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
                     string content = (string?)a["content"] ?? "";
-                    Directory.CreateDirectory(Path.GetDirectoryName(path!)!);
-                    await File.WriteAllTextAsync(path!, content, ct);
-                    return new CommanderToolResult($"Wrote {content.Length} chars to {a["path"]}.");
+                    if (Files == null)
+                    {
+                        var (physical, error) = ResolveVolumePath(path);
+                        if (error != null) return new CommanderToolResult(error);
+                        Directory.CreateDirectory(Path.GetDirectoryName(physical!)!);
+                        await File.WriteAllTextAsync(physical!, content, ct);
+                        return new CommanderToolResult($"Wrote {content.Length} chars to {path}.");
+                    }
+                    try
+                    {
+                        var actor = FileActor();
+                        var entry = await Files.WriteTextAsync(project.ProjectID, path, content, actor, ct);
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Write,
+                            [entry.Path], entry.Size, wakeID: wakeID);
+                        return new CommanderToolResult($"Wrote {entry.Size} bytes to {entry.Path}; the shared-file index and provenance were updated.");
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
                 }
 
                 case "list_files":
                 {
-                    var (path, err) = ResolveVolumePath((string?)a["path"] ?? ".");
-                    if (err != null) return new CommanderToolResult(err);
-                    if (!Directory.Exists(path)) return new CommanderToolResult("Directory does not exist (the volume starts empty — write_file creates paths).");
-                    var entries = Directory.EnumerateFileSystemEntries(path!).Take(200)
-                        .Select(e => (Directory.Exists(e) ? "[dir] " : "") + Path.GetRelativePath(VolumeRoot(), e));
-                    return new CommanderToolResult(string.Join("\n", entries) is { Length: > 0 } s ? s : "(empty)");
+                    if (Files == null)
+                    {
+                        var (physical, error) = ResolveVolumePath((string?)a["path"] ?? ".");
+                        if (error != null) return new CommanderToolResult(error);
+                        if (!Directory.Exists(physical)) return new CommanderToolResult("Directory does not exist (the volume starts empty — write_file creates paths).");
+                        var fallbackEntries = Directory.EnumerateFileSystemEntries(physical!).Take(200)
+                            .Select(e => (Directory.Exists(e) ? "[dir] " : "") + Path.GetRelativePath(VolumeRoot(), e));
+                        return new CommanderToolResult(string.Join("\n", fallbackEntries) is { Length: > 0 } fallback ? fallback : "(empty)");
+                    }
+                    try
+                    {
+                        int limit = Math.Clamp((int?)a["limit"] ?? 100, 1, 500);
+                        int offset = DecodeFileCursor((string?)a["cursor"]);
+                        string directory = ((string?)a["path"] ?? "").Trim();
+                        if (directory == ".") directory = "";
+                        var result = Files.List(project.ProjectID, new ProjectFileListRequest
+                        {
+                            Directory = directory,
+                            Recursive = (bool?)a["recursive"] ?? false,
+                            Search = (string?)a["query"],
+                            Glob = (string?)a["glob"],
+                            Offset = offset,
+                            Limit = limit,
+                        });
+                        if (result.Entries.Count == 0)
+                            return new CommanderToolResult(result.Total == 0 ? "(empty)" : $"No entries on this page (total {result.Total}).");
+                        var lines = result.Entries.Select(e => FormatFileEntry(e)).ToList();
+                        int next = result.Offset + result.Entries.Count;
+                        lines.Add(next < result.Total
+                            ? $"-- showing {result.Offset + 1}-{next} of {result.Total}; next cursor: {EncodeFileCursor(next)}"
+                            : $"-- showing {result.Offset + 1}-{next} of {result.Total}; end of results");
+                        return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(
+                            string.Join("\n", lines), ProjectsContextBudget.ToolResultBudget));
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "stat_file":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    try
+                    {
+                        var entry = Files.Stat(project.ProjectID, path);
+                        return entry == null ? new CommanderToolResult($"No file or directory at '{path}'.")
+                            : new CommanderToolResult(FormatFileEntry(entry, detailed: true));
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "make_directory":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    try
+                    {
+                        var existing = Files.Stat(project.ProjectID, path);
+                        if (existing?.Kind == ProjectFileKind.Directory)
+                            return new CommanderToolResult($"Directory already exists at {existing.Path}.");
+                        var actor = FileActor();
+                        var entry = Files.CreateDirectory(project.ProjectID, path, actor);
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.CreateDirectory,
+                            [entry.Path], wakeID: wakeID);
+                        return new CommanderToolResult($"Directory ready at {entry.Path}.");
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "move_file":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string source = ((string?)a["path"] ?? "").Trim();
+                    string destination = ((string?)a["destination"] ?? "").Trim();
+                    if (source.Length == 0 || destination.Length == 0) return new CommanderToolResult("Provide 'path' and 'destination'.");
+                    try
+                    {
+                        var actor = FileActor();
+                        var entry = Files.Move(project.ProjectID, source, destination, actor);
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Move,
+                            [entry.Path], entry.Size, previousPath: source, wakeID: wakeID);
+                        return new CommanderToolResult($"Moved {source} to {entry.Path}.");
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "copy_file":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string source = ((string?)a["path"] ?? "").Trim();
+                    string destination = ((string?)a["destination"] ?? "").Trim();
+                    if (source.Length == 0 || destination.Length == 0) return new CommanderToolResult("Provide 'path' and 'destination'.");
+                    try
+                    {
+                        var actor = FileActor();
+                        var entry = Files.Copy(project.ProjectID, source, destination, actor);
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Copy,
+                            [entry.Path], entry.Size, previousPath: source, wakeID: wakeID);
+                        return new CommanderToolResult($"Copied {source} to {entry.Path}.");
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "delete_file":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    try
+                    {
+                        var actor = FileActor();
+                        string normalized = Files.NormalizeRelativePath(path);
+                        bool deleted = Files.Delete(project.ProjectID, normalized, (bool?)a["recursive"] ?? false, actor);
+                        if (!deleted) return new CommanderToolResult($"Nothing exists at {normalized}.");
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Delete,
+                            [normalized], wakeID: wakeID);
+                        return new CommanderToolResult($"Deleted {normalized}; its provenance remains in the shared-file audit.");
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
+                case "mark_file_important":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    try
+                    {
+                        var actor = FileActor();
+                        bool important = (bool?)a["important"] ?? true;
+                        string? description = a.TryGetValue("description", out JToken? descriptionToken)
+                            ? (descriptionToken.Type == JTokenType.Null ? "" : (string?)descriptionToken ?? "") : null;
+                        var entry = Files.SetMetadata(project.ProjectID, path, important, description, actor);
+                        ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Metadata,
+                            [entry.Path], wakeID: wakeID);
+                        return new CommanderToolResult($"Updated {entry.Path}: important={entry.Important}" +
+                            (string.IsNullOrWhiteSpace(entry.Description) ? "." : $", description='{entry.Description}'."));
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
                 }
 
                 // Host script execution is UNGATED (Klives' explicit call: approvals are for plans,
@@ -950,6 +1140,60 @@ namespace Omnipotent.Services.Projects
             return sb.ToString().TrimEnd();
         }
 
+        private ProjectFileActor FileActor()
+        {
+            if (string.Equals(actingAgentID, "commander", StringComparison.OrdinalIgnoreCase))
+                return new ProjectFileActor(ProjectFileActorType.Commander, "commander", "Commander");
+            var record = subAgents.ListActive(project.ProjectID)
+                .FirstOrDefault(x => string.Equals(x.AgentID, actingAgentID, StringComparison.OrdinalIgnoreCase));
+            string display = record == null || string.IsNullOrWhiteSpace(record.Role)
+                ? $"Agent {actingAgentID}" : $"{record.Role} ({actingAgentID})";
+            return new ProjectFileActor(ProjectFileActorType.Agent, actingAgentID, display);
+        }
+
+        private static CommanderToolResult FileToolError(Exception ex) => ex switch
+        {
+            FileNotFoundException => new CommanderToolResult("Shared file not found: " + ex.Message),
+            ProjectFileConflictException => new CommanderToolResult("Shared-file conflict: " + ex.Message),
+            ProjectFileException or UnauthorizedAccessException or IOException =>
+                new CommanderToolResult("Shared-file operation failed: " + ex.Message),
+            _ => new CommanderToolResult($"Shared-file operation failed ({ex.GetType().Name}): {ex.Message}"),
+        };
+
+        private static string FormatFileEntry(ProjectFileEntry entry, bool detailed = false)
+        {
+            string kind = entry.Kind == ProjectFileKind.Directory ? "[dir]" : ProjectFileTimeline.FormatBytes(entry.Size);
+            string important = entry.Important ? " ★" : "";
+            string createdBy = entry.CreatedBy.Type == ProjectFileActorType.Unknown
+                ? "Unknown" : entry.CreatedBy.DisplayName;
+            string summary = $"{kind} {entry.Path}{important} | added {entry.CreatedUtc:yyyy-MM-dd HH:mm}Z by {createdBy}";
+            string modifiedBy = entry.ModifiedBy.Type == ProjectFileActorType.Unknown
+                ? "Unknown" : entry.ModifiedBy.DisplayName;
+            if (entry.ModifiedUtc - entry.CreatedUtc > TimeSpan.FromSeconds(1) || entry.ModifiedBy != entry.CreatedBy)
+                summary += $" | changed {entry.ModifiedUtc:yyyy-MM-dd HH:mm}Z by {modifiedBy}";
+            if (!detailed)
+                return summary + (string.IsNullOrWhiteSpace(entry.Description) ? "" : $" | {entry.Description}");
+            return summary +
+                $"\nkind={entry.Kind}; MIME={entry.MimeType}; origin={entry.Origin}; modified={entry.ModifiedUtc:O} by {modifiedBy}" +
+                (string.IsNullOrWhiteSpace(entry.Sha256) ? "" : $"\nsha256={entry.Sha256}") +
+                (string.IsNullOrWhiteSpace(entry.Description) ? "" : $"\ndescription={entry.Description}");
+        }
+
+        private static int DecodeFileCursor(string? cursor)
+        {
+            if (string.IsNullOrWhiteSpace(cursor)) return 0;
+            try
+            {
+                string value = Encoding.UTF8.GetString(Convert.FromBase64String(cursor));
+                if (int.TryParse(value, out int offset) && offset >= 0) return offset;
+            }
+            catch { }
+            throw new ProjectFileException("Invalid file-list cursor.");
+        }
+
+        private static string EncodeFileCursor(int offset) => Convert.ToBase64String(
+            Encoding.UTF8.GetBytes(offset.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+
         // ── script execution (narrow Roslyn surface, same philosophy as KliveAgent) ──
 
         /// <summary>Globals a Commander work-script can use: HTTP, project-volume file IO, output buffer.</summary>
@@ -957,21 +1201,52 @@ namespace Omnipotent.Services.Projects
         {
             private readonly StringBuilder buffer = new();
             private readonly string volumeRoot;
+            private readonly ProjectFileStore? files;
+            private readonly string? projectID;
+            private readonly ProjectFileActor actor;
+            private readonly Action<ProjectFileEntry>? onWritten;
             public HttpClient Http { get; }
             public CancellationToken CancellationToken { get; init; }
 
-            public WorkScriptGlobals(string volumeRoot, HttpClient http) { this.volumeRoot = volumeRoot; Http = http; }
+            public WorkScriptGlobals(string volumeRoot, HttpClient http, ProjectFileStore? files = null,
+                string? projectID = null, ProjectFileActor? actor = null, Action<ProjectFileEntry>? onWritten = null)
+            {
+                this.volumeRoot = volumeRoot;
+                Http = http;
+                this.files = files;
+                this.projectID = projectID;
+                this.actor = actor ?? ProjectFileActor.Unknown;
+                this.onWritten = onWritten;
+            }
 
             public void Output(object? value) => buffer.AppendLine(value?.ToString() ?? "null");
-            public string ReadFile(string relative) => File.ReadAllText(Scoped(relative));
+            public string ReadFile(string relative) => files != null && projectID != null
+                ? files.ReadTextAsync(projectID, relative, 8 * 1024 * 1024, CancellationToken).GetAwaiter().GetResult()
+                : File.ReadAllText(Scoped(relative));
             public void WriteFile(string relative, string content)
             {
-                string p = Scoped(relative);
-                Directory.CreateDirectory(Path.GetDirectoryName(p)!);
-                File.WriteAllText(p, content);
+                if (files != null && projectID != null)
+                {
+                    var entry = files.WriteTextAsync(projectID, relative, content, actor, CancellationToken).GetAwaiter().GetResult();
+                    onWritten?.Invoke(entry);
+                    return;
+                }
+                string physical = Scoped(relative);
+                Directory.CreateDirectory(Path.GetDirectoryName(physical)!);
+                File.WriteAllText(physical, content);
             }
-            public string[] ListFiles(string relative = ".") =>
-                Directory.Exists(Scoped(relative)) ? Directory.GetFileSystemEntries(Scoped(relative)) : Array.Empty<string>();
+            public string[] ListFiles(string relative = ".")
+            {
+                if (files != null && projectID != null)
+                {
+                    string directory = string.IsNullOrWhiteSpace(relative) || relative == "." ? "" : relative;
+                    return files.List(projectID, new ProjectFileListRequest
+                    {
+                        Directory = directory, Limit = 500,
+                    }).Entries.Select(x => x.Path).ToArray();
+                }
+                return Directory.Exists(Scoped(relative)) ? Directory.GetFileSystemEntries(Scoped(relative)) : Array.Empty<string>();
+            }
 
             private string Scoped(string relative)
             {
@@ -998,7 +1273,10 @@ namespace Omnipotent.Services.Projects
 
         private async Task<CommanderToolResult> RunScriptAsync(string code, CancellationToken ct)
         {
-            var globals = new WorkScriptGlobals(VolumeRoot(), http) { CancellationToken = ct };
+            var actor = FileActor();
+            var globals = new WorkScriptGlobals(VolumeRoot(), http, Files, project.ProjectID, actor,
+                entry => ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Write,
+                    [entry.Path], entry.Size, wakeID: wakeID)) { CancellationToken = ct };
             try
             {
                 var result = await CSharpScript.EvaluateAsync<object>(code, ScriptOpts, globals, typeof(WorkScriptGlobals), ct);

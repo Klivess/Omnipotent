@@ -15,8 +15,8 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY=:1 \
-    DISPLAY_WIDTH=1280 \
-    DISPLAY_HEIGHT=800
+    DISPLAY_WIDTH=1920 \
+    DISPLAY_HEIGHT=1080
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb x11vnc xfce4 xfce4-terminal dbus-x11 \

@@ -15,8 +15,8 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>Host port (bound to 127.0.0.1) where the container's VNC server is reachable.</summary>
         public int VncHostPort { get; set; }
         /// <summary>Framebuffer geometry requested at creation.</summary>
-        public int Width { get; set; } = 1280;
-        public int Height { get; set; } = 800;
+        public int Width { get; set; } = 1920;
+        public int Height { get; set; } = 1080;
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         /// <summary>Set when the container was found missing/dead during reconciliation.</summary>
         public bool Lost { get; set; }

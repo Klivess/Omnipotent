@@ -28,8 +28,10 @@ using Org.BouncyCastle.Asn1.IsisMtt.Ocsp;
 using Org.BouncyCastle.Asn1.Ocsp;
 using Org.BouncyCastle.Crypto;
 using Microsoft.PowerShell.Commands;
+using System.Security.Cryptography;
 using OmniDefenceService = Omnipotent.Services.OmniDefence.OmniDefence;
 using Omnipotent.Services.OmniDefence;
+using Omnipotent.Services.KliveAPI.Caching;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -104,12 +106,20 @@ namespace Omnipotent.Services.KliveAPI
         private bool ContinueListenLoop = true;
         private Task<HttpListenerContext> getContextTask;
 
+        public enum RequestBodyMode
+        {
+            Buffered = 0,
+            Streaming = 1
+        }
+
         public struct RouteInfo
         {
             public Func<UserRequest, Task> action;
             public KMProfileManager.KMPermissions authenticationLevelRequired;
             public HttpMethod method;
             public string normalizedMethod;
+            public RequestBodyMode requestBodyMode;
+            public long? maxBodyBytes;
         }
         public struct WebSocketRouteInfo
         {
@@ -128,6 +138,79 @@ namespace Omnipotent.Services.KliveAPI
             public NameValueCollection Headers = new();
             public byte[] Body = Array.Empty<byte>();
             public bool Completed;
+            // Which response helper produced this, so a batch fill stored in the shared
+            // cache carries the same binary/text semantics a direct GET would.
+            public bool IsBinary;
+        }
+
+        /// <summary>
+        /// Mutable request-body telemetry shared by every copy of a UserRequest.
+        /// Streaming handlers can report a length/hash explicitly; otherwise the
+        /// streaming wrapper reports them automatically when the body is consumed.
+        /// </summary>
+        public sealed class RequestBodyAuditState
+        {
+            private readonly object sync = new();
+            private long bodyLength;
+            private string? bodySha256;
+            private bool explicitlyReported;
+            private bool oversized;
+
+            internal RequestBodyAuditState(long defaultBodyLength)
+            {
+                bodyLength = Math.Max(0, defaultBodyLength);
+            }
+
+            public long BodyLength
+            {
+                get { lock (sync) return bodyLength; }
+            }
+
+            public string? BodySha256
+            {
+                get { lock (sync) return bodySha256; }
+            }
+
+            /// <summary>
+            /// Overrides the automatically observed body telemetry. This is useful
+            /// when a handler delegates consumption to another component.
+            /// </summary>
+            public void Report(long length, string? sha256)
+            {
+                if (length < 0) throw new ArgumentOutOfRangeException(nameof(length));
+                lock (sync)
+                {
+                    if (oversized) return;
+                    bodyLength = length;
+                    bodySha256 = string.IsNullOrWhiteSpace(sha256)
+                        ? null
+                        : sha256.Trim().ToUpperInvariant();
+                    explicitlyReported = true;
+                }
+            }
+
+            internal void ReportAutomatically(long length, string? sha256)
+            {
+                lock (sync)
+                {
+                    if (explicitlyReported || oversized) return;
+                    bodyLength = Math.Max(0, length);
+                    bodySha256 = string.IsNullOrWhiteSpace(sha256) ? null : sha256;
+                }
+            }
+
+            internal void ReportOversized(long minimumObservedLength)
+            {
+                lock (sync)
+                {
+                    oversized = true;
+                    bodyLength = Math.Max(bodyLength, minimumObservedLength);
+                    bodySha256 = null;
+                    // A later limit violation is authoritative and cannot be hidden by
+                    // telemetry a handler reported before it attempted the next read.
+                    explicitlyReported = false;
+                }
+            }
         }
 
         public struct UserRequest
@@ -146,6 +229,38 @@ namespace Omnipotent.Services.KliveAPI
             internal Stopwatch? requestTimer;
             [JsonIgnore]
             internal CapturedResponse? capture;
+            // Tee target for the response cache: set during a cache-miss fill so
+            // ReturnResponse/ReturnBinaryResponse additionally record what they emit,
+            // without diverting the real socket write. Reference type, shared across
+            // struct copies just like capture/requestTimer.
+            [JsonIgnore]
+            internal Caching.ResponseRecording? recording;
+            [JsonIgnore]
+            internal Stream? streamingRequestBody;
+            [JsonIgnore]
+            internal RequestBodyAuditState? requestBodyAudit;
+
+            /// <summary>
+            /// The unread, bounded request body for a streaming route. Buffered
+            /// routes continue to use userMessageBytes/userMessageContent.
+            /// </summary>
+            [JsonIgnore]
+            public Stream RequestBodyStream => streamingRequestBody ?? Stream.Null;
+
+            /// <summary>
+            /// Shared request-body telemetry used by the OmniDefence request audit.
+            /// </summary>
+            [JsonIgnore]
+            public RequestBodyAuditState? RequestBodyAudit => requestBodyAudit;
+
+            public void ReportRequestBodyAudit(long bodyLength, string? sha256)
+            {
+                if (requestBodyAudit == null)
+                {
+                    throw new InvalidOperationException("Request body audit state is only available on streaming routes.");
+                }
+                requestBodyAudit.Report(bodyLength, sha256);
+            }
 
             [JsonIgnore]
             public KliveAPI ParentService;
@@ -170,6 +285,7 @@ namespace Omnipotent.Services.KliveAPI
                         if (headers != null) capture.Headers.Add(headers);
                         capture.Body = Encoding.UTF8.GetBytes(response);
                         capture.Completed = true;
+                        capture.IsBinary = false;
                         return;
                     }
 
@@ -193,6 +309,13 @@ namespace Omnipotent.Services.KliveAPI
                     SetTimingHeaders(resp);
 
                     byte[] buffer = Encoding.UTF8.GetBytes(response);
+
+                    // Cache tee: record the uncompressed response before the ETag/304
+                    // and compression branches run, so a fill that answers 304 to its
+                    // own client still stores the full body. buffer is a fresh array
+                    // that is never mutated below (compression reassigns the local), so
+                    // the recording can hold the reference without copying.
+                    recording?.Record((int)code, contentType, headers, buffer, isBinary: false);
 
                     // ETag / If-None-Match => 304 for successful GETs. Weak tag over the
                     // uncompressed bytes (one tag covers every Content-Encoding), checked
@@ -227,6 +350,7 @@ namespace Omnipotent.Services.KliveAPI
                                 {
                                     buffer = compressed;
                                     resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
+                                    recording?.RecordCompressedVariant(encoding, compressed);
                                 }
                             }
                         }
@@ -275,6 +399,7 @@ namespace Omnipotent.Services.KliveAPI
                         if (headers != null) capture.Headers.Add(headers);
                         capture.Body = data;
                         capture.Completed = true;
+                        capture.IsBinary = true;
                         return;
                     }
 
@@ -293,6 +418,10 @@ namespace Omnipotent.Services.KliveAPI
                     SetTimingHeaders(resp);
 
                     byte[] buffer = data;
+
+                    // Cache tee: binary bodies are caller-owned, so defensively copy.
+                    recording?.Record((int)code, contentType, headers, (byte[])(data ?? Array.Empty<byte>()).Clone(), isBinary: true);
+
                     // Same negotiated compression as ReturnResponse; the content-type
                     // allowlist naturally skips already-compressed media/archives.
                     if (HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
@@ -308,6 +437,7 @@ namespace Omnipotent.Services.KliveAPI
                                 {
                                     buffer = compressed;
                                     resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
+                                    recording?.RecordCompressedVariant(encoding, compressed);
                                 }
                             }
                         }
@@ -329,6 +459,9 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     throw new NotSupportedException("Streaming routes cannot run inside /batch.");
                 }
+                // A streaming response can't be captured for the cache; mark the fill
+                // so it is never stored (the socket write below proceeds normally).
+                recording?.MarkStreaming();
                 HttpListenerResponse resp = context.Response;
                 resp.ContentType = contentType;
                 resp.StatusCode = (int)code;
@@ -374,6 +507,11 @@ namespace Omnipotent.Services.KliveAPI
 
         private KMProfileManager profileManager;
         private KliveApiStatisticsStore? apiStatistics;
+
+        // ── Transparent response cache (dependency-versioned, never stale) ──
+        private readonly ResponseCache responseCache = new();
+        private volatile bool cacheEnabled;
+        private volatile string[] cacheDenylistPrefixes = Array.Empty<string>();
 
         private CertificateInstaller certInstaller;
         public KliveAPI()
@@ -427,6 +565,7 @@ namespace Omnipotent.Services.KliveAPI
                 CreateMetaKLIVEAPIRoutes();
 
                 StartWatchdog();
+                StartResponseCacheConfigWatcher();
             }
             catch (Exception ex)
             {
@@ -460,7 +599,7 @@ namespace Omnipotent.Services.KliveAPI
             // One round-trip for what used to be N parallel dashboard GETs.
             // Guest (not Anybody) so a stale-cookie call fails once at pipeline
             // level (smart-tarpit fast-fail) instead of N per-item 401s.
-            await CreateRoute("/batch", HandleBatchRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Guest);
+            await CreateBufferedRoute("/batch", HandleBatchRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Guest, 64 * 1024);
             await CreateRoute("/KliveAPI/Statistics", async (req) =>
             {
                 await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary() ?? new
@@ -489,6 +628,24 @@ namespace Omnipotent.Services.KliveAPI
                     slowestRoutes = Array.Empty<object>()
                 }), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+
+            // Response-cache observability + manual controls (Klives-only). The stats
+            // route reads no tracked store, so it is never itself cached.
+            await CreateRoute("/KliveAPI/cache/stats", async (req) =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    enabled = cacheEnabled,
+                    denylistPrefixes = cacheDenylistPrefixes,
+                    cache = responseCache.GetStatsSnapshot()
+                }), "application/json");
+            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+
+            await CreateRoute("/KliveAPI/cache/clear", async (req) =>
+            {
+                responseCache.Clear();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { cleared = true }), "application/json");
+            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
         }
 
         /// <summary>
@@ -506,7 +663,7 @@ namespace Omnipotent.Services.KliveAPI
 
             if ((req.userMessageBytes?.Length ?? 0) > MaxBodyBytes)
             {
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { error = "Batch body too large." }), "application/json", null, HttpStatusCode.BadRequest);
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { error = "Batch body too large." }), "application/json", null, (HttpStatusCode)413);
                 return;
             }
 
@@ -579,6 +736,8 @@ namespace Omnipotent.Services.KliveAPI
 
                 if (!ControllerLookup.TryGetValue(normalized, out RouteInfo routeInfo))
                     return BatchError(result, 404, "Route not found.");
+                if (routeInfo.requestBodyMode == RequestBodyMode.Streaming)
+                    return BatchError(result, 400, "Streaming routes cannot run inside /batch.");
                 if (routeInfo.normalizedMethod != "GET")
                     return BatchError(result, 405, "Only GET routes may be batched.");
 
@@ -588,18 +747,47 @@ namespace Omnipotent.Services.KliveAPI
                     || (batchReq.user != null && batchReq.user.CanLogin && batchReq.user.KlivesManagementRank >= required);
                 if (!allowed) return BatchError(result, 401, "Insufficient permission.");
 
+                NameValueCollection subParams = string.IsNullOrEmpty(queryPart)
+                    ? new NameValueCollection()
+                    : HttpUtility.ParseQueryString(queryPart);
+
+                // Batch sub-requests share the direct-GET cache: a hit skips execution
+                // entirely (collapsing to a dictionary lookup), and a fill warmed by
+                // one path accelerates the other.
+                bool cacheable = cacheEnabled && !IsRouteDenylisted(normalized);
+                string? cacheKey = cacheable
+                    ? ResponseCache.BuildKey(normalized, subParams, batchReq.user?.UserID)
+                    : null;
+                if (cacheKey != null)
+                {
+                    CacheEntry? hit = responseCache.TryGetValid(cacheKey);
+                    if (hit != null)
+                    {
+                        responseCache.RecordHit(normalized);
+                        apiStatistics?.RecordRequest(normalized, "GET", hit.StatusCode, TimeSpan.Zero, true);
+                        return BuildBatchResultFromParts(result, hit.StatusCode, hit.ContentType, hit.RawBody);
+                    }
+                    responseCache.RecordMiss(normalized);
+                }
+
                 // Sub-request is a copy of the batch request writing into a capture buffer.
                 UserRequest sub = batchReq;
                 sub.route = normalized;
-                sub.userParameters = string.IsNullOrEmpty(queryPart)
-                    ? new NameValueCollection()
-                    : HttpUtility.ParseQueryString(queryPart);
+                sub.userParameters = subParams;
                 sub.userMessageBytes = Array.Empty<byte>();
                 sub.userMessageContent = string.Empty;
                 sub.capture = new CapturedResponse();
 
                 var itemStopwatch = Stopwatch.StartNew();
-                await routeInfo.action(sub);
+                DependencyScope? scope = cacheable ? CacheDeps.OpenScope() : null;
+                try
+                {
+                    await routeInfo.action(sub);
+                }
+                finally
+                {
+                    if (scope != null) CacheDeps.Seal(scope);
+                }
                 itemStopwatch.Stop();
 
                 if (!sub.capture.Completed)
@@ -610,26 +798,41 @@ namespace Omnipotent.Services.KliveAPI
 
                 apiStatistics?.RecordRequest(normalized, "GET", sub.capture.StatusCode, itemStopwatch.Elapsed, true);
 
-                result["status"] = sub.capture.StatusCode;
-                result["ok"] = sub.capture.StatusCode is >= 200 and < 300;
-                result["contentType"] = sub.capture.ContentType;
-                string text = Encoding.UTF8.GetString(sub.capture.Body);
-                if (sub.capture.ContentType != null
-                    && sub.capture.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase)
-                    && OmniPaths.IsValidJson(text))
+                if (cacheKey != null && scope != null)
                 {
-                    result["body"] = new JRaw(text);
+                    try
+                    {
+                        responseCache.TryStoreFromParts(cacheKey, sub.capture.StatusCode, sub.capture.ContentType,
+                            sub.capture.Headers, sub.capture.Body, sub.capture.IsBinary, scope);
+                    }
+                    catch { /* storing must never affect the batch response */ }
                 }
-                else
-                {
-                    result["body"] = text;
-                }
-                return result;
+
+                return BuildBatchResultFromParts(result, sub.capture.StatusCode, sub.capture.ContentType, sub.capture.Body);
             }
             catch (Exception ex)
             {
                 return BatchError(result, 500, ex.Message);
             }
+        }
+
+        private static JObject BuildBatchResultFromParts(JObject result, int status, string contentType, byte[] body)
+        {
+            result["status"] = status;
+            result["ok"] = status is >= 200 and < 300;
+            result["contentType"] = contentType;
+            string text = Encoding.UTF8.GetString(body ?? Array.Empty<byte>());
+            if (contentType != null
+                && contentType.Contains("application/json", StringComparison.OrdinalIgnoreCase)
+                && OmniPaths.IsValidJson(text))
+            {
+                result["body"] = new JRaw(text);
+            }
+            else
+            {
+                result["body"] = text;
+            }
+            return result;
         }
 
         private static JObject BatchError(JObject result, int status, string message)
@@ -791,18 +994,59 @@ namespace Omnipotent.Services.KliveAPI
         //      await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10));
         //  };
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
-        public async Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
+        public Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
         {
+            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Buffered, null);
+        }
+
+        /// <summary>
+        /// Creates a conventional buffered route with an enforced request-body limit.
+        /// Existing CreateRoute callers remain unlimited for backwards compatibility.
+        /// </summary>
+        public Task CreateBufferedRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, long maxBodyBytes)
+        {
+            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Buffered, ValidateBodyLimit(maxBodyBytes));
+        }
+
+        /// <summary>
+        /// Creates a route whose handler consumes UserRequest.RequestBodyStream
+        /// directly, without populating userMessageBytes or userMessageContent.
+        /// </summary>
+        public Task CreateStreamingRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, long maxBodyBytes)
+        {
+            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Streaming, ValidateBodyLimit(maxBodyBytes));
+        }
+
+        private Task CreateRouteCore(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, RequestBodyMode requestBodyMode, long? maxBodyBytes)
+        {
+            ArgumentNullException.ThrowIfNull(handler);
+            ArgumentNullException.ThrowIfNull(method);
             route = NormalizeRoute(route);
-            RouteInfo routeInfo = new();
-            routeInfo.action = handler;
-            routeInfo.authenticationLevelRequired = authenticationLevelRequired;
-            routeInfo.method = method;
-            routeInfo.normalizedMethod = NormalizeMethod(method.Method);
+            RouteInfo routeInfo = new()
+            {
+                action = handler,
+                authenticationLevelRequired = authenticationLevelRequired,
+                method = method,
+                normalizedMethod = NormalizeMethod(method.Method),
+                requestBodyMode = requestBodyMode,
+                maxBodyBytes = maxBodyBytes
+            };
             if (ControllerLookup.TryAdd(route, routeInfo))
             {
-                ServiceLog($"New {method.ToString().ToUpper()} route created: " + route);
+                string bodyMode = requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "buffered";
+                string limit = maxBodyBytes.HasValue ? $", max body {maxBodyBytes.Value} bytes" : string.Empty;
+                ServiceLog($"New {method.ToString().ToUpper()} route created: {route} ({bodyMode}{limit})");
             }
+            return Task.CompletedTask;
+        }
+
+        private static long ValidateBodyLimit(long maxBodyBytes)
+        {
+            if (maxBodyBytes < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxBodyBytes), "The maximum request body size cannot be negative.");
+            }
+            return maxBodyBytes;
         }
 
         public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, KMProfileManager.KMPermissions authenticationLevelRequired)
@@ -935,11 +1179,232 @@ namespace Omnipotent.Services.KliveAPI
             return (truncated, true);
         }
 
-        private async Task<(byte[] BodyBytes, string BodyText)> ReadRequestBodyAsync(HttpListenerRequest req)
+        internal sealed class RequestBodyTooLargeException : IOException
+        {
+            public long MaxBodyBytes { get; }
+
+            public RequestBodyTooLargeException(long maxBodyBytes)
+                : base($"Request body exceeds the route limit of {maxBodyBytes} bytes.")
+            {
+                MaxBodyBytes = maxBodyBytes;
+            }
+        }
+
+        /// <summary>
+        /// Read-only wrapper that keeps the HttpListener request stream unread until
+        /// the route handler consumes it, while enforcing the route limit and hashing
+        /// the bytes that are successfully delivered to the handler.
+        /// </summary>
+        internal sealed class AuditedRequestBodyStream : Stream
+        {
+            private readonly Stream inner;
+            private readonly long? maxBodyBytes;
+            private readonly long declaredLength;
+            private readonly RequestBodyAuditState audit;
+            private readonly IncrementalHash hasher = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            private long bytesRead;
+            private bool sawEndOfStream;
+            private bool finished;
+
+            public AuditedRequestBodyStream(Stream inner, long? maxBodyBytes, long declaredLength, RequestBodyAuditState audit)
+            {
+                this.inner = inner ?? throw new ArgumentNullException(nameof(inner));
+                this.maxBodyBytes = maxBodyBytes;
+                this.declaredLength = declaredLength;
+                this.audit = audit ?? throw new ArgumentNullException(nameof(audit));
+            }
+
+            public override bool CanRead => !finished && inner.CanRead;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => bytesRead;
+                set => throw new NotSupportedException();
+            }
+
+            public override void Flush() { }
+            public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                EnsureReadable();
+                ArgumentNullException.ThrowIfNull(buffer);
+                if ((uint)offset > buffer.Length || (uint)count > buffer.Length - offset)
+                    throw new ArgumentOutOfRangeException();
+                if (count == 0) return 0;
+                if (IsAtLimit) return ProbeForOverflow();
+                int allowedCount = GetAllowedReadCount(count);
+                int read = inner.Read(buffer, offset, allowedCount);
+                return ProcessRead(buffer.AsSpan(offset, read));
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                EnsureReadable();
+                if (buffer.IsEmpty) return 0;
+                if (IsAtLimit) return ProbeForOverflow();
+                int allowedCount = GetAllowedReadCount(buffer.Length);
+                int read = inner.Read(buffer[..allowedCount]);
+                return ProcessRead(buffer[..read]);
+            }
+
+            public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                EnsureReadable();
+                ArgumentNullException.ThrowIfNull(buffer);
+                if ((uint)offset > buffer.Length || (uint)count > buffer.Length - offset)
+                    throw new ArgumentOutOfRangeException();
+                if (count == 0) return 0;
+                if (IsAtLimit) return await ProbeForOverflowAsync(cancellationToken);
+                int allowedCount = GetAllowedReadCount(count);
+                int read = await inner.ReadAsync(buffer, offset, allowedCount, cancellationToken);
+                return ProcessRead(buffer.AsSpan(offset, read));
+            }
+
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                EnsureReadable();
+                if (buffer.IsEmpty) return 0;
+                if (IsAtLimit) return await ProbeForOverflowAsync(cancellationToken);
+                int allowedCount = GetAllowedReadCount(buffer.Length);
+                int read = await inner.ReadAsync(buffer[..allowedCount], cancellationToken);
+                return ProcessRead(buffer.Span[..read]);
+            }
+
+            public override int ReadByte()
+            {
+                Span<byte> oneByte = stackalloc byte[1];
+                return Read(oneByte) == 0 ? -1 : oneByte[0];
+            }
+
+            private bool IsAtLimit => maxBodyBytes.HasValue && bytesRead == maxBodyBytes.Value;
+
+            public bool CompleteBody => sawEndOfStream || (declaredLength >= 0 && bytesRead == declaredLength);
+
+            private void EnsureReadable()
+            {
+                if (finished) throw new ObjectDisposedException(nameof(AuditedRequestBodyStream));
+            }
+
+            private int GetAllowedReadCount(int requestedCount)
+            {
+                if (requestedCount <= 0) return 0;
+                if (!maxBodyBytes.HasValue) return requestedCount;
+
+                long remaining = maxBodyBytes.Value - bytesRead;
+                if (remaining < 0) throw new RequestBodyTooLargeException(maxBodyBytes.Value);
+                return (int)Math.Min(requestedCount, Math.Min((long)int.MaxValue, remaining));
+            }
+
+            private int ProbeForOverflow()
+            {
+                if (declaredLength >= 0 && declaredLength == bytesRead)
+                {
+                    sawEndOfStream = true;
+                    Finish();
+                    return 0;
+                }
+
+                int extraByte = inner.ReadByte();
+                if (extraByte < 0)
+                {
+                    sawEndOfStream = true;
+                    Finish();
+                    return 0;
+                }
+
+                audit.ReportOversized(bytesRead == long.MaxValue ? long.MaxValue : bytesRead + 1);
+                throw new RequestBodyTooLargeException(maxBodyBytes!.Value);
+            }
+
+            private async ValueTask<int> ProbeForOverflowAsync(CancellationToken cancellationToken)
+            {
+                if (declaredLength >= 0 && declaredLength == bytesRead)
+                {
+                    sawEndOfStream = true;
+                    Finish();
+                    return 0;
+                }
+
+                byte[] probe = new byte[1];
+                int read = await inner.ReadAsync(probe.AsMemory(), cancellationToken);
+                if (read == 0)
+                {
+                    sawEndOfStream = true;
+                    Finish();
+                    return 0;
+                }
+
+                audit.ReportOversized(bytesRead == long.MaxValue ? long.MaxValue : bytesRead + 1);
+                throw new RequestBodyTooLargeException(maxBodyBytes!.Value);
+            }
+
+            private int ProcessRead(ReadOnlySpan<byte> data)
+            {
+                if (data.Length == 0)
+                {
+                    sawEndOfStream = true;
+                    Finish();
+                    return 0;
+                }
+
+                long newLength = checked(bytesRead + data.Length);
+                if (maxBodyBytes.HasValue && newLength > maxBodyBytes.Value)
+                {
+                    audit.ReportOversized(newLength);
+                    throw new RequestBodyTooLargeException(maxBodyBytes.Value);
+                }
+
+                hasher.AppendData(data);
+                bytesRead = newLength;
+                return data.Length;
+            }
+
+            public void Finish()
+            {
+                if (finished) return;
+                finished = true;
+
+                // With a known Content-Length, reading exactly that many bytes is a
+                // complete body even if the handler did not perform one final EOF read.
+                bool completeBody = CompleteBody;
+                if (completeBody)
+                {
+                    string hash = bytesRead == 0 ? string.Empty : Convert.ToHexString(hasher.GetHashAndReset());
+                    audit.ReportAutomatically(bytesRead, hash);
+                }
+                else
+                {
+                    // A handler may intentionally inspect only a prefix. Record what was
+                    // actually observed, but never claim a hash for an incomplete entity.
+                    audit.ReportAutomatically(bytesRead, null);
+                }
+                hasher.Dispose();
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing) Finish();
+                // HttpListener owns the underlying request stream.
+                base.Dispose(disposing);
+            }
+        }
+
+        private async Task<(byte[] BodyBytes, string BodyText)> ReadRequestBodyAsync(HttpListenerRequest req, long? maxBodyBytes = null)
         {
             if (!req.HasEntityBody || !CanRequestCarryBody(req.HttpMethod))
             {
                 return (Array.Empty<byte>(), string.Empty);
+            }
+
+            if (maxBodyBytes.HasValue && req.ContentLength64 > maxBodyBytes.Value)
+            {
+                throw new RequestBodyTooLargeException(maxBodyBytes.Value);
             }
 
             int bodyCapacity = req.ContentLength64 > 0 && req.ContentLength64 <= int.MaxValue
@@ -947,7 +1412,28 @@ namespace Omnipotent.Services.KliveAPI
                 : 0;
 
             using MemoryStream bodyStream = bodyCapacity > 0 ? new MemoryStream(bodyCapacity) : new MemoryStream();
-            await req.InputStream.CopyToAsync(bodyStream);
+            byte[] buffer = new byte[81920];
+            long totalRead = 0;
+            while (true)
+            {
+                int requested = buffer.Length;
+                if (maxBodyBytes.HasValue)
+                {
+                    long remaining = maxBodyBytes.Value - totalRead;
+                    long detectionWindow = remaining == long.MaxValue ? long.MaxValue : remaining + 1;
+                    requested = (int)Math.Min(buffer.Length, detectionWindow);
+                }
+
+                int read = await req.InputStream.ReadAsync(buffer.AsMemory(0, requested));
+                if (read == 0) break;
+
+                totalRead = checked(totalRead + read);
+                if (maxBodyBytes.HasValue && totalRead > maxBodyBytes.Value)
+                {
+                    throw new RequestBodyTooLargeException(maxBodyBytes.Value);
+                }
+                await bodyStream.WriteAsync(buffer.AsMemory(0, read));
+            }
             byte[] bodyBytes = bodyStream.ToArray();
             string bodyText = bodyBytes.Length == 0
                 ? string.Empty
@@ -988,6 +1474,117 @@ namespace Omnipotent.Services.KliveAPI
             catch { return null; }
         }
 
+        /// <summary>
+        /// Periodically refreshes the response-cache configuration from OmniSettings
+        /// (registering them so they appear in the settings UI). A 15s cadence gives
+        /// a near-instant kill switch without hooking the settings-changed event,
+        /// mirroring how the watchdog reads its own setting each loop.
+        /// </summary>
+        private async void StartResponseCacheConfigWatcher()
+        {
+            while (ContinueListenLoop)
+            {
+                try
+                {
+                    bool enabled = await GetBoolOmniSetting("KliveAPIResponseCacheEnabled", defaultValue: false);
+                    int maxMB = await GetIntOmniSetting("KliveAPICacheMaxMB", defaultValue: 256);
+                    string denylist = await GetStringOmniSetting("KliveAPICacheDenylistPrefixes", defaultValue: "") ?? "";
+
+                    cacheEnabled = enabled;
+                    cacheDenylistPrefixes = ParseDenylist(denylist);
+                    responseCache.Configure((long)Math.Max(1, maxMB) * 1024 * 1024, 10_000);
+                }
+                catch { /* settings manager may not be ready yet; retry next loop */ }
+
+                try { await Task.Delay(15000, cancellationToken.Token); }
+                catch (TaskCanceledException) { return; }
+                catch (ObjectDisposedException) { return; }
+            }
+        }
+
+        private static string[] ParseDenylist(string csv)
+        {
+            if (string.IsNullOrWhiteSpace(csv)) return Array.Empty<string>();
+            return csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(s => s.ToLowerInvariant())
+                .Where(s => s.Length > 0)
+                .ToArray();
+        }
+
+        private bool IsRouteDenylisted(string route)
+        {
+            string[] list = cacheDenylistPrefixes;
+            if (list.Length == 0) return false;
+            string r = route.ToLowerInvariant();
+            foreach (string prefix in list)
+            {
+                if (r.StartsWith(prefix, StringComparison.Ordinal)) return true;
+            }
+            return false;
+        }
+
+        private static bool ClientRequestedNoCache(HttpListenerRequest req)
+        {
+            string? cc = req.Headers["Cache-Control"];
+            return !string.IsNullOrEmpty(cc) && cc.Contains("no-cache", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// The single dispatch chokepoint for the response cache. On a cache-eligible
+        /// GET it serves a valid stored entry (near-free, incl. 304s), otherwise it
+        /// runs the handler exactly as before while teeing the response and tracking
+        /// the datasets it read, then stores the result if the fill is cacheable.
+        /// Non-GET, disabled, denylisted, or forced-bypass requests run untouched.
+        /// </summary>
+        private async Task DispatchRouteAsync(RouteInfo routeData, UserRequest request, string route)
+        {
+            if (!cacheEnabled
+                || NormalizeMethod(request.req.HttpMethod) != "GET"
+                || IsRouteDenylisted(route))
+            {
+                await routeData.action(request);
+                return;
+            }
+
+            string? userId = request.user?.UserID;
+            string key = ResponseCache.BuildKey(route, request.userParameters, userId);
+
+            bool forceBypass = request.user != null
+                && request.user.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives
+                && ClientRequestedNoCache(request.req);
+
+            if (!forceBypass)
+            {
+                CacheEntry? hit = responseCache.TryGetValid(key);
+                if (hit != null)
+                {
+                    responseCache.RecordHit(route);
+                    await CachedResponseWriter.WriteCachedResponseAsync(request.context, request.req, hit, request.requestTimer);
+                    return;
+                }
+            }
+
+            // Miss (or forced bypass): fill while recording + tracking dependencies.
+            if (forceBypass) responseCache.RecordBypass(route);
+            else responseCache.RecordMiss(route);
+            try { request.context.Response.Headers.Set("X-KliveAPI-Cache", forceBypass ? "BYPASS" : "MISS"); } catch { }
+
+            var recording = new ResponseRecording();
+            request.recording = recording;
+            DependencyScope scope = CacheDeps.OpenScope();
+            try
+            {
+                await routeData.action(request);
+            }
+            finally
+            {
+                CacheDeps.Seal(scope);
+            }
+
+            try { responseCache.TryStoreFromRecording(key, recording, scope); }
+            catch { /* storing must never affect the already-sent response */ }
+        }
+
         private async Task ProcessRequestAsync(HttpListenerContext context)
         {
             Stopwatch requestStopwatch = Stopwatch.StartNew();
@@ -1015,6 +1612,8 @@ namespace Omnipotent.Services.KliveAPI
             string? defenceBodyText = null;
             bool defenceBodyTruncated = false;
             string? defenceHeadersJson = null;
+            RequestBodyAuditState? defenceBodyAudit = null;
+            AuditedRequestBodyStream? streamingBodyStream = null;
             const int MaxStoredBodyBytes = 65536; // 64KB cap for stored body text
 
             try
@@ -1136,6 +1735,22 @@ namespace Omnipotent.Services.KliveAPI
                         return;
                     }
 
+                    if (routeData.requestBodyMode == RequestBodyMode.Streaming)
+                    {
+                        long declaredBodyLength = req.ContentLength64 >= 0 ? req.ContentLength64 : 0;
+                        // Streaming audit records bytes actually observed, not an untrusted
+                        // Content-Length declaration. A known oversize is reported explicitly.
+                        defenceBodyAudit = new RequestBodyAuditState(0);
+                        streamingBodyStream = new AuditedRequestBodyStream(
+                            req.InputStream,
+                            routeData.maxBodyBytes,
+                            req.ContentLength64,
+                            defenceBodyAudit);
+                        request.requestBodyAudit = defenceBodyAudit;
+                        request.streamingRequestBody = streamingBodyStream;
+                        defenceBodyLength = 0;
+                    }
+
                     if (ShouldResolveUser(req, routeData.authenticationLevelRequired))
                     {
                         request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
@@ -1156,12 +1771,25 @@ namespace Omnipotent.Services.KliveAPI
                         defenceRequestOrigin = request.user != null ? "DirectApiProfile" : "DirectApi";
                     }
 
-                    if (CanRequestCarryBody(req.HttpMethod))
+                    async Task PrepareBodyForDispatchAsync()
                     {
-                        (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req);
-                        defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
-                        defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
-                        (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(request.userMessageBytes, request.userMessageContent, MaxStoredBodyBytes);
+                        // Do not reveal a private route's body limit until its permission check
+                        // has passed. Unknown/chunked lengths are enforced while reading.
+                        if (routeData.maxBodyBytes.HasValue && req.HasEntityBody &&
+                            req.ContentLength64 > routeData.maxBodyBytes.Value)
+                        {
+                            defenceBodyLength = req.ContentLength64;
+                            defenceBodyAudit?.ReportOversized(req.ContentLength64);
+                            throw new RequestBodyTooLargeException(routeData.maxBodyBytes.Value);
+                        }
+                        if (routeData.requestBodyMode == RequestBodyMode.Buffered && CanRequestCarryBody(req.HttpMethod))
+                        {
+                            (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req, routeData.maxBodyBytes);
+                            defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
+                            defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
+                            (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(
+                                request.userMessageBytes, request.userMessageContent, MaxStoredBodyBytes);
+                        }
                     }
 
                     bool isUserNull = request.user == null;
@@ -1181,13 +1809,15 @@ namespace Omnipotent.Services.KliveAPI
 
                         if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
                         {
-                            await routeData.action(request);
+                            await PrepareBodyForDispatchAsync();
+                            await DispatchRouteAsync(routeData, request, route);
                             return;
                         }
 
                         if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
                         {
-                            await routeData.action(request);
+                            await PrepareBodyForDispatchAsync();
+                            await DispatchRouteAsync(routeData, request, route);
                             return;
                         }
 
@@ -1212,7 +1842,8 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
                     {
-                        await routeData.action(request);
+                        await PrepareBodyForDispatchAsync();
+                        await DispatchRouteAsync(routeData, request, route);
                     }
                     else
                     {
@@ -1280,6 +1911,13 @@ namespace Omnipotent.Services.KliveAPI
                     await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
             }
+            catch (RequestBodyTooLargeException ex)
+            {
+                defenceDenyReason = "RequestBodyTooLarge";
+                defenceOutcome = RequestOutcome.ClientError;
+                try { context.Response.KeepAlive = false; } catch { }
+                await ReturnPayloadTooLargeAsync(context, ex.MaxBodyBytes);
+            }
             catch (Exception ex)
             {
                 ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
@@ -1307,6 +1945,22 @@ namespace Omnipotent.Services.KliveAPI
             }
             finally
             {
+                if (streamingBodyStream != null && !streamingBodyStream.CompleteBody)
+                {
+                    // Never reuse a connection whose streaming entity was only partially
+                    // consumed; unread bytes must not become the next request.
+                    try { context.Response.KeepAlive = false; } catch { }
+                }
+                streamingBodyStream?.Finish();
+                if (defenceBodyAudit != null)
+                {
+                    defenceBodyLength = defenceBodyAudit.BodyLength;
+                    defenceBodyHash = defenceBodyAudit.BodySha256;
+                    // Streaming bodies are intentionally never retained as audit text.
+                    defenceBodyText = null;
+                    defenceBodyTruncated = false;
+                }
+
                 if (shouldRecordStatistics && apiStatistics != null)
                 {
                     requestStopwatch.Stop();
@@ -1330,7 +1984,7 @@ namespace Omnipotent.Services.KliveAPI
                                                 : statusCode == 403 ? RequestOutcome.InsufficientClearance
                                                 : statusCode == 404 ? RequestOutcome.NotFound
                                                 : statusCode >= 500 ? RequestOutcome.ServerError
-                                                : RequestOutcome.UnauthRoute;
+                                                : RequestOutcome.ClientError;
                             }
                             var row = new RequestRow
                             {
@@ -1371,6 +2025,35 @@ namespace Omnipotent.Services.KliveAPI
             IncorrectHTTPMethod = 3,
             ProfileDisabled = 4
         }
+
+        private static async Task ReturnPayloadTooLargeAsync(HttpListenerContext context, long maxBodyBytes)
+        {
+            try
+            {
+                HttpListenerResponse response = context.Response;
+                if (!response.OutputStream.CanWrite) return;
+
+                byte[] body = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new
+                {
+                    error = "Request body too large.",
+                    maxBodyBytes
+                }));
+                response.StatusCode = 413;
+                response.ContentType = "application/json";
+                response.Headers.Set("Access-Control-Allow-Origin", "*");
+                response.Headers.Set("Access-Control-Expose-Headers", "*");
+                response.ContentLength64 = body.Length;
+                await response.OutputStream.WriteAsync(body);
+                response.Close();
+            }
+            catch
+            {
+                // A handler may already have closed its response before a late read
+                // discovers the overflow. The connection is already safely closed.
+                try { context.Response.Abort(); } catch { }
+            }
+        }
+
         private async Task DenyRequest(UserRequest request, DeniedRequestReason reason, HttpStatusCode code = HttpStatusCode.Unauthorized)
         {
             NameValueCollection headers = new();

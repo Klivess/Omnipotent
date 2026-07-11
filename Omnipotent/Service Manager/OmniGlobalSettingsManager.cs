@@ -1,6 +1,7 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.KliveBot_Discord;
 using System.Collections.Concurrent;
 using System.Net;
@@ -41,6 +42,10 @@ namespace Omnipotent.Service_Manager
     {
         private readonly string settingsDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGlobalSettingsDirectory);
         private readonly string settingsFilePath;
+
+        // Response-cache dependency key: coarse (any setting change invalidates
+        // cached responses that read a setting). Settings rarely change at runtime.
+        private const string CacheKey = "omnisettings";
 
         private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> pendingFulfillmentPromptIds = new(StringComparer.OrdinalIgnoreCase);
@@ -146,6 +151,8 @@ namespace Omnipotent.Service_Manager
                 {
                     File.Move(tempPath, settingsFilePath);
                 }
+                // Settings changed on disk — invalidate cached responses that read one.
+                CacheDeps.Bump(CacheKey);
             }
             catch (Exception ex)
             {
@@ -160,6 +167,7 @@ namespace Omnipotent.Service_Manager
         private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName, IEnumerable<string>? dropdownOptions = null)
         {
             await EnsureSettingsLoadedAsync();
+            CacheDeps.NoteRead(CacheKey);
 
             name = NormalizeSettingName(name);
             parentServiceId = NormalizeParentServiceId(parentServiceId);
@@ -607,7 +615,13 @@ namespace Omnipotent.Service_Manager
 
         private static void MarkSettingUsedThisSession(OmniSetting setting)
         {
-            setting.WasUsedThisSession = true;
+            // WasUsedThisSession is exposed by /List and /Get but never persisted, so
+            // SaveSettings won't fire on the flip — bump directly (once, on false→true).
+            if (!setting.WasUsedThisSession)
+            {
+                setting.WasUsedThisSession = true;
+                CacheDeps.Bump(CacheKey);
+            }
         }
 
         private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
@@ -635,6 +649,7 @@ namespace Omnipotent.Service_Manager
             {
                 try
                 {
+                    CacheDeps.NoteRead(CacheKey);
                     var reveal = req.userParameters?.Get("revealSensitive");
                     bool revealSensitive = false;
                     if (!string.IsNullOrEmpty(reveal) && bool.TryParse(reveal, out var rv)) revealSensitive = rv;
@@ -663,6 +678,7 @@ namespace Omnipotent.Service_Manager
             {
                 try
                 {
+                    CacheDeps.NoteRead(CacheKey);
                     var name = req.userParameters.Get("name");
                     var parentId = req.userParameters.Get("parentServiceId");
 

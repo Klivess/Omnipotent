@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Caching;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -19,6 +20,15 @@ namespace Omnipotent.Data_Handling
         {
             name = "File Handler";
             threadAnteriority = ThreadAnteriority.Critical;
+        }
+
+        // Response-cache dependency key for a file. Every DataUtil-backed service is
+        // covered by this one chokepoint: reads note the file, writes bump it, so a
+        // cached response built from a file is invalidated the moment that file changes.
+        private static string FileKey(string path)
+        {
+            try { return "file:" + Path.GetFullPath(path).ToLowerInvariant(); }
+            catch { return "file:" + (path ?? string.Empty).ToLowerInvariant(); }
         }
 
         private enum ReadWrite
@@ -191,20 +201,24 @@ namespace Omnipotent.Data_Handling
         public async Task WriteToFile(string path, string content, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.Write, content).result.Task;
+            CacheDeps.Bump(FileKey(path));
         }
         public async Task WriteBytesToFile(string path, byte[] content, bool requeueIfFailed = true)
         {
             await CreateNewByteOperation(path, ReadWrite.WriteBytes, content).result.Task;
+            CacheDeps.Bump(FileKey(path));
         }
 
         public async Task DeleteFile(string path, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.DeleteFile).result.Task;
+            CacheDeps.Bump(FileKey(path));
         }
 
         public async Task DeleteDirectory(string path, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.DeleteDirectory).result.Task;
+            CacheDeps.Bump(FileKey(path));
         }
 
         public async Task CreateDirectory(string path, bool requeueIfFailed = true)
@@ -215,16 +229,19 @@ namespace Omnipotent.Data_Handling
         public async Task AppendContentToFile(string path, string content, bool requeueIfFailed = true)
         {
             await CreateNewOperation(path, ReadWrite.AppendToFile, content).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            CacheDeps.Bump(FileKey(path));
         }
 
         public async Task SerialiseObjectToFile(string path, object data, bool requeueIfFailed = true)
         {
             string serialisedData = JsonConvert.SerializeObject(data, settings: new JsonSerializerSettings() { ReferenceLoopHandling = ReferenceLoopHandling.Ignore });
             await CreateNewOperation(path, ReadWrite.Write, serialisedData).result.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            CacheDeps.Bump(FileKey(path));
         }
 
         public async Task<string> ReadDataFromFile(string path, bool NonQueued = false)
         {
+            CacheDeps.NoteRead(FileKey(path));
             if (File.Exists(path))
             {
                 if (NonQueued)
@@ -242,6 +259,7 @@ namespace Omnipotent.Data_Handling
 
         public async Task<byte[]> ReadBytesFromFile(string path, bool NonQueued = false)
         {
+            CacheDeps.NoteRead(FileKey(path));
             if (File.Exists(path))
             {
                 if (NonQueued)
@@ -258,6 +276,7 @@ namespace Omnipotent.Data_Handling
 
         public async Task<dataType> ReadAndDeserialiseDataFromFile<dataType>(string path)
         {
+            CacheDeps.NoteRead(FileKey(path));
             if (File.Exists(path))
             {
                 string data = await CreateNewOperation(path, ReadWrite.Read).result.Task;

@@ -30,6 +30,8 @@ namespace Omnipotent.Services.Projects
     public class Projects : OmniService
     {
         public ProjectStore Store { get; private set; } = null!;
+        /// <summary>Persistent shared bytes, provenance, uploads and audit history for every project.</summary>
+        public ProjectFileStore Files { get; private set; } = null!;
         public ProjectEventLogStore EventLog { get; private set; } = null!;
         /// <summary>Phase 3 server-push: fans the event log out to WebSocket clients (replaces polling).</summary>
         public ProjectEventBroadcaster EventBroadcaster { get; private set; } = null!;
@@ -61,6 +63,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>The desktop-container subsystem (P2). Null when containers are disabled or off-Windows.</summary>
         public ContainerDesktopManager? Desktops { get; private set; }
         private ProjectsRoutes routes = null!;
+        private ProjectFilesRoutes fileRoutes = null!;
 
         /// <summary>Inter-agent messaging over the bus: (projectID, fromAgent, toAgent, message).</summary>
         public Func<string, string, string, string, Task>? SendAgentMessageHook { get; set; }
@@ -87,12 +90,31 @@ namespace Omnipotent.Services.Projects
         protected override async void ServiceMain()
         {
             Store = new ProjectStore(msg => ServiceLog(msg));
+            int maxFileGb = 10, uploadChunkMb = 8, freeReserveGb = 10;
+            try
+            {
+                maxFileGb = Math.Clamp(await GetIntOmniSetting("Projects_FileMaxSizeGb", 10), 1, 1024);
+                uploadChunkMb = Math.Clamp(await GetIntOmniSetting("Projects_FileUploadChunkMb", 8), 1, 64);
+                freeReserveGb = Math.Clamp(await GetIntOmniSetting("Projects_FileFreeReserveGb", 10), 0, 1024);
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: shared-file settings unavailable; using defaults"); }
+            Files = new ProjectFileStore(ProjectFileStore.CreateDefaultOptions(
+                maxFileBytes: maxFileGb * 1024L * 1024 * 1024,
+                maxChunkBytes: uploadChunkMb * 1024 * 1024,
+                minimumFreeDiskBytes: freeReserveGb * 1024L * 1024 * 1024),
+                msg => ServiceLog(msg));
+            foreach (var existing in Store.ListProjects())
+            {
+                try { Files.EnsureProjectScaffold(existing.ProjectID); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: shared-file scaffold failed for {existing.ProjectID}"); }
+            }
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
             EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg));
             Digests = new ProjectDigestStore(msg => ServiceLog(msg));
             Retrieval = new ProjectRetrievalIndex(EventLog);
             EventLog.EventAppended += Retrieval.Ingest;
             WakeCycle = new ProjectWakeCycle(EventLog, Digests, Retrieval);
+            WakeCycle.DescribeFiles = pid => Files.DescribeForPrompt(pid);
             // Cross-system knowledge leg for wake seeds (KliveRAG). Excludes the project's own log
             // (already covered by the BM25 retrieval leg). Fails soft — no KliveRAG → no block.
             WakeCycle.KnowledgeSearchAsync = async (query, excludeProjectId) =>
@@ -176,6 +198,8 @@ namespace Omnipotent.Services.Projects
             {
                 try { Artifacts.RunRetentionSweep(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: artifact retention sweep failed"); }
+                try { Files.CleanupExpiredUploads(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: expired shared-file upload cleanup failed"); }
                 try { await ReapContainersAsync(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
             }, null, TimeSpan.FromMinutes(10), TimeSpan.FromHours(1));
@@ -228,6 +252,8 @@ namespace Omnipotent.Services.Projects
 
             routes = new ProjectsRoutes(this);
             await routes.RegisterRoutes();
+            fileRoutes = new ProjectFilesRoutes(this);
+            await fileRoutes.RegisterRoutes();
             await RegisterWebSocketRoutesAsync();
 
             await InitialiseDesktopsAsync();
@@ -368,7 +394,9 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public async Task<Project> CreateProjectAsync(string name, string goal, double tokenBudgetUsd,
             double moneyBudgetUsd, double moneyAutonomousThresholdUsd, int subAgentCap,
-            IDictionary<string, string>? settingsPatch = null)
+            IDictionary<string, string>? settingsPatch = null,
+            string? initialUploadSessionID = null,
+            ProjectFileActor? creator = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("name required", nameof(name));
             if (string.IsNullOrWhiteSpace(goal)) throw new ArgumentException("goal required", nameof(goal));
@@ -379,11 +407,34 @@ namespace Omnipotent.Services.Projects
                 throw new ArgumentException("budgets must be finite and non-negative");
             if (subAgentCap < 1) throw new ArgumentException("subAgentCap must be at least 1", nameof(subAgentCap));
 
-            var p = Store.CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
-            // A project starts in PLANNING: the Commander drafts a Grand Plan for Klives' approval
-            // before any execution work. Approval flips it to Active (ActivateProjectAsync).
-            p.Status = ProjectStatus.Planning;
-            Store.SaveProject(p);
+            creator ??= new ProjectFileActor(ProjectFileActorType.User, "klives", "Klives");
+            string projectID = Guid.NewGuid().ToString("N");
+            ProjectFileCommitResult? initialFiles = null;
+            Project p;
+            try
+            {
+                p = Store.CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd,
+                    moneyAutonomousThresholdUsd, subAgentCap, projectID);
+                // A project starts in PLANNING: the Commander drafts a Grand Plan for Klives' approval
+                // before any execution work. Approval flips it to Active (ActivateProjectAsync).
+                p.Status = ProjectStatus.Planning;
+                Store.SaveProject(p);
+                Files.EnsureProjectScaffold(projectID);
+                if (!string.IsNullOrWhiteSpace(initialUploadSessionID))
+                {
+                    var session = Files.GetUploadSession(initialUploadSessionID)
+                        ?? throw new ProjectFileException("Unknown initial upload session.");
+                    if (session.Purpose != ProjectUploadPurpose.Initial)
+                        throw new ProjectFileException("Only an initial upload session can initialise a new project.");
+                    initialFiles = Files.CommitUploadSession(initialUploadSessionID, projectID, creator);
+                }
+            }
+            catch
+            {
+                try { Files.RollbackProjectInitialization(projectID); } catch { }
+                try { Store.RemoveProject(projectID); } catch { }
+                throw;
+            }
             var settings = Settings.EnsureCreated(p.ProjectID);
             if (settingsPatch != null)
             {
@@ -405,6 +456,12 @@ namespace Omnipotent.Services.Projects
                 Author = "klives",
                 Text = $"Project initialised. Goal: {goal} — token budget ${tokenBudgetUsd:0.##}, money budget ${moneyBudgetUsd:0.##} (autonomous ≤ ${moneyAutonomousThresholdUsd:0.##}), agent cap {subAgentCap}.",
             });
+            if (initialFiles != null)
+            {
+                ProjectFileTimeline.Append(EventLog, p.ProjectID, creator, ProjectFileOperation.Upload,
+                    initialFiles.Items.Where(x => !x.Skipped && x.CommittedPath != null).Select(x => x.CommittedPath!),
+                    initialFiles.TotalBytes, initialFiles.BatchID);
+            }
             if (DiscordManager != null)
             {
                 try { await DiscordManager.CreateProjectChannelAsync(p); }
@@ -412,10 +469,12 @@ namespace Omnipotent.Services.Projects
             }
             // First wake: the PLANNING phase. The Commander researches, convenes a planning council,
             // and submits a Grand Plan for Klives' approval — no execution until it is approved.
+            string fileNote = initialFiles == null ? "" :
+                $" Klives supplied {initialFiles.Items.Count(x => !x.Skipped)} initial files under /project/inputs; inspect and use them while planning.";
             CommanderRunner.Wake(p,
                 "Project created by Klives just now — you are in the PLANNING phase. Research the goal thoroughly, " +
                 "convene a planning council (convene_council) to stress-test your approach, then draft and submit a " +
-                "Grand Plan (submit_grand_plan) for Klives' approval. No execution work until it is approved.");
+                "Grand Plan (submit_grand_plan) for Klives' approval. No execution work until it is approved." + fileNote);
             return p;
         }
 
@@ -522,6 +581,7 @@ namespace Omnipotent.Services.Projects
                 RearmAdapters = () => Adapters.ArmAll(),
                 GetHookArmInfo = hookID => Adapters.GetArmInfo(hookID),
                 Artifacts = Artifacts,
+                Files = Files,
                 Observables = Observables,
                 Accounts = GetAccountRegistry(),
                 GrandPlans = GrandPlans,
@@ -1108,9 +1168,17 @@ namespace Omnipotent.Services.Projects
             }
             int fps = Math.Clamp(int.TryParse(query["fps"], out var f) ? f : ProjectContainerConfig.DefaultStreamFps, 1, 30);
             int delayMs = Math.Max(33, 1000 / fps);
+            string shortID = containerID.Length >= 12 ? containerID[..12] : containerID;
             long lastVersion = -1;
             byte[]? lastJpeg = null;
             DateTime lastSentUtc = DateTime.MinValue;
+            bool sentFirstFrame = false;
+            // A desktop that never produces a first frame (x11vnc still starting, or a container
+            // wedged in a restart loop) must not leave the viewer spinning on "Waiting for first
+            // frame…" forever. Give the first frame a bounded budget of retries; if it never
+            // arrives, close the socket so the client reconnects cleanly — a fresh connection
+            // re-resolves the container's live host port instead of holding a zombie stream open.
+            var firstFrameDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(90);
             try
             {
                 while (socket.State == WebSocketState.Open)
@@ -1118,7 +1186,10 @@ namespace Omnipotent.Services.Projects
                     byte[] jpeg;
                     try
                     {
-                        var (bgra, w, h, version) = await transport.CaptureFrameWithVersionAsync();
+                        // Bound each capture so a stalled handshake (docker-proxy up but x11vnc
+                        // silent) can't wedge the loop; the loop below just retries on timeout.
+                        using var captureCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                        var (bgra, w, h, version) = await transport.CaptureFrameWithVersionAsync(captureCts.Token);
                         bool heartbeatDue = DateTime.UtcNow - lastSentUtc >= TimeSpan.FromSeconds(2);
                         if (version == lastVersion && lastJpeg != null && !heartbeatDue)
                         {
@@ -1131,8 +1202,22 @@ namespace Omnipotent.Services.Projects
                         lastVersion = version;
                         lastJpeg = jpeg;
                     }
-                    catch { await Task.Delay(delayMs); continue; }
+                    catch
+                    {
+                        if (!sentFirstFrame && DateTime.UtcNow > firstFrameDeadline)
+                        {
+                            ServiceLog($"Projects: container {shortID} produced no first frame within the live-view warm-up window — closing so the viewer reconnects.");
+                            break;
+                        }
+                        await Task.Delay(delayMs);
+                        continue;
+                    }
                     await socket.SendAsync(new ArraySegment<byte>(jpeg), WebSocketMessageType.Binary, true, CancellationToken.None);
+                    if (!sentFirstFrame)
+                    {
+                        sentFirstFrame = true;
+                        ServiceLog($"Projects: container {shortID} live view delivered its first frame.");
+                    }
                     lastSentUtc = DateTime.UtcNow;
                     await Task.Delay(delayMs);
                 }

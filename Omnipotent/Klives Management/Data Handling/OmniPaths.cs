@@ -168,6 +168,9 @@ namespace Omnipotent.Data_Handling
             public static string ProjectsStimulusDirectory = $"{ProjectsDirectory}/Stimulus";
             public static string ProjectsContainersFile = $"{ProjectsDirectory}/containers.json";
             public static string ProjectsVolumesDirectory = $"{ProjectsDirectory}/Volumes";
+            public static string ProjectsFileMetadataDirectory = $"{ProjectsDirectory}/FileMetadata";
+            public static string ProjectsFileMetadataDatabase = $"{ProjectsFileMetadataDirectory}/project-files.db";
+            public static string ProjectsFileStagingDirectory = $"{ProjectsDirectory}/FileStaging";
             public static string ProjectsObservablesDirectory = $"{ProjectsDirectory}/Observables";
             public static string ProjectsCouncilsDirectory = $"{ProjectsDirectory}/Councils";
             public static string ProjectsGrandPlansDirectory = $"{ProjectsDirectory}/GrandPlans";

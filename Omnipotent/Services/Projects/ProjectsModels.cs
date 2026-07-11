@@ -117,6 +117,7 @@ namespace Omnipotent.Services.Projects
         public const string GrandPlanAmended = "grand-plan-amended";                // a non-material amendment applied without a gate
         public const string GrandPlanProgress = "grand-plan-progress";              // a milestone status / success-criterion tick (live progress, no gate)
         public const string AccountChanged = "account-changed";        // a shared-registry account was registered/updated (metadata only, never secrets)
+        public const string ProjectFileChanged = "project-file-changed"; // shared project-volume upload/write/move/delete/metadata batch
         public const string Status = "status";                         // generic progress note
     }
 

@@ -308,8 +308,10 @@ namespace Omnipotent.Services.Projects.Containers
         /// mounted at /project in every container of the project (shared directories, §4).
         /// </summary>
         public async Task<DesktopContainerRecord> CreateDesktopContainerAsync(string projectID, string? agentID,
-            int width = 1280, int height = 800, CancellationToken ct = default)
+            int? width = null, int? height = null, CancellationToken ct = default)
         {
+            int resolvedWidth = width ?? ProjectContainerConfig.ResolveDesktopWidth();
+            int resolvedHeight = height ?? ProjectContainerConfig.ResolveDesktopHeight();
             var docker = await GetClientAsync();
             string image = imageForProject(projectID);
 
@@ -328,8 +330,8 @@ namespace Omnipotent.Services.Projects.Containers
                 },
                 Env = new List<string>
                 {
-                    $"DISPLAY_WIDTH={width}",
-                    $"DISPLAY_HEIGHT={height}",
+                    $"DISPLAY_WIDTH={resolvedWidth}",
+                    $"DISPLAY_HEIGHT={resolvedHeight}",
                 },
                 ExposedPorts = new Dictionary<string, EmptyStruct> { [$"{VncContainerPort}/tcp"] = default },
                 HostConfig = new HostConfig
@@ -358,8 +360,8 @@ namespace Omnipotent.Services.Projects.Containers
                 ProjectID = projectID,
                 AgentID = agentID,
                 VncHostPort = hostPort,
-                Width = width,
-                Height = height,
+                Width = resolvedWidth,
+                Height = resolvedHeight,
             };
             registry.Add(record);
             log($"Created desktop container {create.ID[..12]} for project {projectID}{(agentID == null ? " (shared)" : $" agent {agentID}")} on 127.0.0.1:{hostPort}.");

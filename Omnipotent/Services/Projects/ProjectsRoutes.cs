@@ -63,6 +63,7 @@ namespace Omnipotent.Services.Projects
                     double moneyBudget = (double?)body?.moneyBudgetUsd ?? 0;
                     double moneyThreshold = (double?)body?.moneyAutonomousThresholdUsd ?? 0;
                     int agentCap = (int?)body?.subAgentCap ?? 5;
+                    string? initialUploadSessionID = ((string?)body?.initialUploadSessionID)?.Trim();
 
                     if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(goal))
                     {
@@ -91,9 +92,14 @@ namespace Omnipotent.Services.Projects
                         catch (Exception sex) { _ = parent.ServiceLogError(sex, "Projects: parsing create-time settings failed (using defaults)"); }
                     }
 
-                    var p = await parent.CreateProjectAsync(name, goal, tokenBudget, moneyBudget, moneyThreshold, agentCap, settingsPatch);
+                    var creator = new ProjectFileActor(ProjectFileActorType.User,
+                        req.user!.UserID, req.user.Name ?? "Klives");
+                    var p = await parent.CreateProjectAsync(name, goal, tokenBudget, moneyBudget, moneyThreshold,
+                        agentCap, settingsPatch, initialUploadSessionID, creator);
                     await req.ReturnResponse(Json(p));
                 }
+                catch (ProjectFileConflictException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.Conflict); }
+                catch (ProjectFileException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 

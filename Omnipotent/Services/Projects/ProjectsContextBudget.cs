@@ -34,6 +34,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>Known accounts from the global shared registry (reuse before creating duplicates).</summary>
         public const int AccountsBudget = 250;
 
+        /// <summary>
+        /// Shared project-file summary (important inputs/assets, recent changes and a compact tree).
+        /// The full filesystem remains available through list_files/stat_file and at /project.
+        /// </summary>
+        public const int SharedFilesBudget = 600;
+
         /// <summary>The triggering stimulus payload + verdict itself.</summary>
         public const int StimulusBudget = 800;
 
@@ -112,5 +118,29 @@ namespace Omnipotent.Services.Projects
 
             return recencyScore * 0.6 + keywordScore * 0.4;
         }
+
+        // ── Harness-leak guard (TEMP diagnostic, Jul 2026) ─────────────────────────────────────
+        // Distinctive phrases that only appear in Claude Code / Agent-SDK harness scaffolding, never
+        // in legitimate project context. A seed fragment carrying one is a captured coding-agent
+        // transcript that leaked into a persistent store (KliveRAG, a /project file, the event log);
+        // re-seeding it makes the wake model parrot it back, so such fragments are dropped here.
+        private static readonly string[] HarnessLeakMarkers =
+        {
+            "deferred tools are now available via ToolSearch",
+            "will fail with InputValidationError",
+            "Available agent types for the Agent tool",
+            "available for use with the Skill tool",
+            "require authentication before their tools can be used",
+        };
+
+        /// <summary>True when the text carries Claude-Code/Agent-SDK harness scaffolding that must not
+        /// be re-seeded into a wake prompt.</summary>
+        public static bool LooksLikeHarnessLeak(string? text) =>
+            !string.IsNullOrEmpty(text) && HarnessLeakMarkers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>Returns <paramref name="text"/> unchanged, or <paramref name="ifContaminated"/> when
+        /// it carries harness scaffolding (see <see cref="LooksLikeHarnessLeak"/>).</summary>
+        public static string ScrubHarnessLeak(string? text, string ifContaminated) =>
+            LooksLikeHarnessLeak(text) ? ifContaminated : (text ?? string.Empty);
     }
 }

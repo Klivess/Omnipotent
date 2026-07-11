@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Projects
@@ -42,6 +43,10 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string LogPath(string projectID) => Path.Combine(root, projectID + ".log.jsonl");
 
+        // Response-cache dependency keys: per-project log + the coarse set of logs.
+        private static string CacheKey(string projectID) => "projects:eventlog:" + projectID;
+        private const string CacheKeyAll = "projects:eventlog";
+
         /// <summary>Appends an event, assigning the next sequence number. Returns the stored event.</summary>
         public ProjectEvent Append(ProjectEvent evt)
         {
@@ -63,6 +68,10 @@ namespace Omnipotent.Services.Projects
                 var offsets = sparseOffsets.GetOrAdd(evt.ProjectID, _ => new());
                 if ((next - 1) % SparseStride == 0) offsets.Add((next, offset));
                 lastByType.GetOrAdd(evt.ProjectID, _ => new(StringComparer.Ordinal))[evt.Type] = evt;
+                // Bump under the append lock (write is durably visible above): invalidates
+                // any cached read of this project's log, and the coarse project-set key.
+                CacheDeps.Bump(CacheKey(evt.ProjectID));
+                CacheDeps.Bump(CacheKeyAll);
                 // Publish while holding the per-project append lock so concurrent writers cannot
                 // deliver sequence N+1 to retrieval/WebSocket subscribers before sequence N.
                 try { EventAppended?.Invoke(evt); } catch { }
@@ -73,6 +82,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Reads events with Sequence &gt; <paramref name="sinceExclusive"/>, ascending, capped at <paramref name="max"/>.</summary>
         public List<ProjectEvent> ReadSince(string projectID, long sinceExclusive, int max = 500)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             var results = new List<ProjectEvent>();
             lock (LockFor(projectID))
             {
@@ -110,11 +120,13 @@ namespace Omnipotent.Services.Projects
 
         public long GetLastSequence(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID)) return GetLastSequenceLocked(projectID);
         }
 
         public ProjectEvent? GetLastOfType(string projectID, string type)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID))
             {
                 EnsureIndexLocked(projectID);
@@ -126,6 +138,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>All project IDs that have an event log on disk.</summary>
         public List<string> AllProjectIDsWithLogs()
         {
+            CacheDeps.NoteRead(CacheKeyAll);
             if (!Directory.Exists(root)) return new List<string>();
             return Directory.EnumerateFiles(root, "*.log.jsonl")
                 .Select(f => Path.GetFileName(f).Replace(".log.jsonl", ""))

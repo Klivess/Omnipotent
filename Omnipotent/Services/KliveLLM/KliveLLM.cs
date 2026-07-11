@@ -1147,6 +1147,45 @@ namespace Omnipotent.Services.KliveLLM
             };
         }
 
+        // TEMP DIAGNOSTIC (harness-leak hunt, Jul 2026): distinctive phrases that only occur in Claude
+        // Code / Agent-SDK harness scaffolding — never in legitimate KliveLLM traffic. Used to flag when
+        // that scaffolding leaks into a request/response so the source can be traced. Remove once found.
+        private static readonly string[] HarnessLeakMarkers =
+        {
+            "deferred tools are now available via ToolSearch",
+            "Available agent types for the Agent tool",
+            "available for use with the Skill tool",
+            "require authentication before their tools can be used",
+        };
+
+        private static bool ContainsHarnessLeak(string? text) =>
+            !string.IsNullOrEmpty(text) && HarnessLeakMarkers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase));
+
+        // Writes the full outbound payload + inbound response to a timestamped file under the KliveLLM
+        // data directory so a leaking exchange can be inspected offline. Best-effort; never throws.
+        private async Task DumpHarnessLeakAsync(string model, string payloadJson, string responseContent)
+        {
+            try
+            {
+                string dir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveLLMDirectory), "HarnessLeakDumps");
+                Directory.CreateDirectory(dir);
+                string file = Path.Combine(dir, $"leak_{DateTime.UtcNow:yyyyMMdd_HHmmss_fff}_{Guid.NewGuid():N}.txt");
+                var sb = new StringBuilder();
+                sb.AppendLine($"# Harness-leak capture {DateTime.UtcNow:O}");
+                sb.AppendLine($"# model: {model}");
+                sb.AppendLine($"# outbound(payload) leak: {ContainsHarnessLeak(payloadJson)}   inbound(response) leak: {ContainsHarnessLeak(responseContent)}");
+                sb.AppendLine();
+                sb.AppendLine("=== OUTBOUND PAYLOAD (what we sent the provider) ===");
+                sb.AppendLine(payloadJson);
+                sb.AppendLine();
+                sb.AppendLine("=== INBOUND RESPONSE (what the provider returned) ===");
+                sb.AppendLine(responseContent);
+                await File.WriteAllTextAsync(file, sb.ToString());
+                try { await ServiceLog($"Harness-leak exchange written to {file}"); } catch { }
+            }
+            catch { /* diagnostic only — never affect the request */ }
+        }
+
         private async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
@@ -1193,6 +1232,26 @@ namespace Omnipotent.Services.KliveLLM
                     try { await ServiceLog($"Remote LLM network error (attempt {attempt}/{RemoteInferenceMaxAttempts}): {ex.Message}. Retrying."); } catch { }
                     await DelayBeforeRetryAsync(attempt, null, cancellationToken);
                     continue;
+                }
+
+                // TEMP DIAGNOSTIC (harness-leak hunt, Jul 2026): detect Claude-Code / Agent-SDK harness
+                // scaffolding in this exchange. In the OUTBOUND payload => it was echoed from a poisoned
+                // context store (fix the store). Only in the INBOUND response => the model produced it
+                // fresh (prompt/tool confusion). Either way, dump the full exchange for inspection. Both
+                // calls are internally guarded so this can never affect the request. Remove once source found.
+                bool payloadLeak = ContainsHarnessLeak(payloadJson);
+                bool responseLeak = ContainsHarnessLeak(responseContent);
+                if (payloadLeak || responseLeak)
+                {
+                    try
+                    {
+                        await ServiceLog($"⚠ HARNESS-LEAK detected (model={payload.model}): outbound={payloadLeak}, inbound={responseLeak}. "
+                            + (payloadLeak
+                                ? "Scaffolding is ALREADY in what we send — the source is a poisoned context store, not the model."
+                                : "Model generated it fresh — prompt/tool confusion, not a poisoned store."));
+                    }
+                    catch { }
+                    await DumpHarnessLeakAsync(payload.model, payloadJson, responseContent);
                 }
 
                 using (response)

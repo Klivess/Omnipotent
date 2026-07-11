@@ -12,6 +12,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveAPI;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.SeleniumManager;
 using Org.BouncyCastle.Asn1.X509.Qualified;
 using static Omnipotent.Threading.WindowsInvokes;
@@ -38,7 +39,12 @@ namespace Omnipotent.Service_Manager
             serviceManager = manager;
         }
         public string GetName() { return name; }
-        public TimeSpan GetServiceUptime() { return serviceUptime.Elapsed; }
+        public TimeSpan GetServiceUptime()
+        {
+            // Wall-clock value: a response embedding it can never be safely cached.
+            CacheDeps.MarkUncacheable("uptime");
+            return serviceUptime.Elapsed;
+        }
         public ThreadAnteriority GetThreadAnteriority() { return threadAnteriority; }
         public bool IsServiceActive() { return ServiceActive; }
         public Thread GetThread()
@@ -144,7 +150,11 @@ namespace Omnipotent.Service_Manager
         }
 
         // Service manager internal access helpers
-        public TimeSpan GetManagerUptime() => serviceManager.GetOverallUptime();
+        public TimeSpan GetManagerUptime()
+        {
+            CacheDeps.MarkUncacheable("uptime");
+            return serviceManager.GetOverallUptime();
+        }
         public ref OmniLogging GetLoggerService() => ref serviceManager.GetLogger();
         public ref OmniServiceMonitor GetServiceMonitor() => ref serviceManager.GetMonitor();
         public List<OmniService> GetActiveServices() => serviceManager.activeServices;
@@ -174,6 +184,23 @@ namespace Omnipotent.Service_Manager
         public async Task CreateAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission)
         {
             await ExecuteServiceMethod<KliveAPI>("CreateRoute", path, handler, method, permission);
+        }
+
+        /// <summary>
+        /// Creates an API route that consumes the unread request body through
+        /// UserRequest.RequestBodyStream instead of buffering it in memory.
+        /// </summary>
+        public async Task CreateStreamingAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        {
+            await ExecuteServiceMethod<KliveAPI>("CreateStreamingRoute", path, handler, method, permission, maxBodyBytes);
+        }
+
+        /// <summary>
+        /// Creates a buffered API route with a pipeline-enforced body limit.
+        /// </summary>
+        public async Task CreateBufferedAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        {
+            await ExecuteServiceMethod<KliveAPI>("CreateBufferedRoute", path, handler, method, permission, maxBodyBytes);
         }
 
         // Typed shortcuts to get omni settings from the global settings manager

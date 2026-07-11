@@ -1,5 +1,6 @@
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
@@ -21,6 +22,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
     public sealed class DeploymentRepository
     {
+        private const string CacheKey = "omnitrader:deployments";
         private readonly OmniTraderDb db;
 
         public DeploymentRepository(OmniTraderDb db) { this.db = db; }
@@ -43,6 +45,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$ec", (double)row.EquityCurrent);
             cmd.Parameters.AddWithValue("$e", (object?)row.Error ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task UpdateStatusAsync(string id, DeploymentStatus status, string? error = null, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -53,6 +56,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$e", (object?)error ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task UpdateEquityAsync(string id, decimal equity, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -62,6 +66,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$e", (double)equity);
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task SetArmedLiveAsync(string id, DateTime utc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -71,6 +76,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$t", utc.ToString("o"));
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task SetPausedAsync(string id, DateTime utc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -80,6 +86,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$t", utc.ToString("o"));
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task DeleteAsync(string id, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
@@ -88,10 +95,12 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.CommandText = "DELETE FROM deployments WHERE id=$id";
             cmd.Parameters.AddWithValue("$id", id);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey);
         }, ct);
 
         public async Task<DeploymentRow?> GetAsync(string id, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM deployments WHERE id=$id";
@@ -103,6 +112,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<DeploymentRow>> ListAllAsync(CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM deployments ORDER BY created_utc DESC";
@@ -115,6 +125,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public async Task<List<DeploymentRow>> ListRunnableAsync(CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM deployments WHERE status IN ('running','paused')";

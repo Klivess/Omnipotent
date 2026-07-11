@@ -1,3 +1,4 @@
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Persistence;
 using System.Collections.Concurrent;
@@ -19,6 +20,8 @@ namespace Omnipotent.Services.OmniTrader.MarketData
 
         public async Task<IReadOnlyList<OHLCCandle>> GetHistoricalCandlesAsync(string symbol, TimeInterval interval, int count, CancellationToken ct = default)
         {
+            // Live market data — chart/tick responses must never be frozen by the cache.
+            CacheDeps.MarkUncacheable("market-data");
             // 1. Try cache.
             var cached = await cache.GetLastAsync(symbol, interval, count, ct);
             if (cached.Count >= count) return cached;
@@ -43,6 +46,7 @@ namespace Omnipotent.Services.OmniTrader.MarketData
         /// <summary>Latest live price for a symbol (Binance ticker), falling back to the last cached close.</summary>
         public async Task<decimal> GetLatestPriceAsync(string symbol, CancellationToken ct = default)
         {
+            CacheDeps.MarkUncacheable("market-data");
             try
             {
                 decimal p = await binance.GetLatestPriceAsync(symbol, ct);

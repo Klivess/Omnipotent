@@ -1,10 +1,13 @@
 using Microsoft.Data.Sqlite;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Contracts;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
 {
     public sealed class EquityRepository
     {
+        // Per-deployment: only that deployment's equity series is invalidated on a tick.
+        private static string CacheKey(string deploymentId) => "omnitrader:equity:" + deploymentId;
         private readonly OmniTraderDb db;
 
         public EquityRepository(OmniTraderDb db) { this.db = db; }
@@ -21,10 +24,12 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$b", (double)point.BaseBalance);
             cmd.Parameters.AddWithValue("$e", (double)point.Equity);
             await cmd.ExecuteNonQueryAsync(ct);
+            CacheDeps.Bump(CacheKey(deploymentId));
         }, ct);
 
         public async Task<List<EquityPoint>> GetSeriesAsync(string deploymentId, DateTime? from = null, DateTime? to = null, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey(deploymentId));
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             string sql = "SELECT ts, mark_price, quote_balance, base_balance, equity FROM equity_ticks WHERE deployment_id=$d";
