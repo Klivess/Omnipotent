@@ -350,9 +350,13 @@ namespace Omnipotent.Services.Projects.Containers
 
             await docker.Containers.StartContainerAsync(create.ID, new ContainerStartParameters(), ct);
 
-            var inspect = await docker.Containers.InspectContainerAsync(create.ID, ct);
-            int hostPort = ResolveHostPort(inspect)
-                ?? throw new InvalidOperationException($"Container {create.ID} started but no host port was bound for VNC.");
+            // Docker Desktop's WSL2 backend often returns from StartContainerAsync before the
+            // ephemeral host port is wired into the port proxy, so a single inspect races and
+            // sees no binding. Poll until Docker reports it (usually well under a second).
+            int hostPort = await WaitForHostPortAsync(docker, create.ID, ct)
+                ?? throw new InvalidOperationException(
+                    $"Container {create.ID[..12]} started but no host port was bound for VNC after waiting " +
+                    $"(container state: {await DescribeStateAsync(docker, create.ID, ct)}).");
 
             var record = new DesktopContainerRecord
             {
@@ -445,6 +449,42 @@ namespace Omnipotent.Services.Projects.Containers
                 catch (Exception ex) { log($"Reconcile: inspect failed for {record.ContainerID[..12]}: {ex.Message}"); }
             }
             log($"Container reconcile complete: {registry.All().Count(r => !r.Lost)} live desktop(s).");
+        }
+
+        /// <summary>
+        /// Polls the container's inspect until Docker reports the ephemeral VNC host-port binding,
+        /// working around the WSL2 backend race where StartContainerAsync returns early. Returns
+        /// null if the binding never appears within the window, or if the container exits first.
+        /// </summary>
+        private static async Task<int?> WaitForHostPortAsync(DockerClient docker, string containerID, CancellationToken ct)
+        {
+            const int maxAttempts = 20;   // 20 * 250ms = up to ~5s
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                var inspect = await docker.Containers.InspectContainerAsync(containerID, ct);
+                int? port = ResolveHostPort(inspect);
+                if (port.HasValue) return port;
+
+                // The entrypoint crashed and Docker isn't retrying it — no port is ever coming.
+                if (inspect.State is { Running: false, Restarting: false })
+                    return null;
+
+                await Task.Delay(250, ct);
+            }
+            return null;
+        }
+
+        /// <summary>Best-effort container status string for diagnostics; never throws.</summary>
+        private static async Task<string> DescribeStateAsync(DockerClient docker, string containerID, CancellationToken ct)
+        {
+            try
+            {
+                var s = (await docker.Containers.InspectContainerAsync(containerID, ct)).State;
+                if (s == null) return "unknown";
+                string status = s.Status ?? "unknown";
+                return s.ExitCode != 0 ? $"{status}, exit {s.ExitCode}{(string.IsNullOrEmpty(s.Error) ? "" : $": {s.Error}")}" : status;
+            }
+            catch { return "uninspectable"; }
         }
 
         private static int? ResolveHostPort(ContainerInspectResponse inspect)
