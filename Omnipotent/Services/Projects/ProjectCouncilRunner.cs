@@ -35,6 +35,8 @@ namespace Omnipotent.Services.Projects
         public Func<string, string?, string, string, int, CancellationToken, Task<CouncilTurn?>>? QueryAsync { get; set; }
         /// <summary>Continue an existing session (rebuttal round): (sessionId, userMessage, model, maxTokens, ct) → turn.</summary>
         public Func<string, string, string, int, CancellationToken, Task<CouncilTurn?>>? ContinueAsync { get; set; }
+        /// <summary>Reserves budget for a provider turn without serializing the provider call.</summary>
+        public Func<string, CancellationToken, Task<IAsyncDisposable?>>? AcquireTurnAsync { get; set; }
         /// <summary>Books a turn's spend to the ledger: (projectID, prompt, completion, genId, cost).</summary>
         public Func<string, long, long, string?, double?, Task>? RecordSpendAsync { get; set; }
         /// <summary>True when the project auto-paused on budget exhaustion mid-council.</summary>
@@ -43,6 +45,8 @@ namespace Omnipotent.Services.Projects
         public Func<string, string>? DescribeBudget { get; set; }
         /// <summary>Current Grand Plan summary line for the shared context (empty when none).</summary>
         public Func<string, string>? DescribeGrandPlan { get; set; }
+        /// <summary>Optional capability-compatible fallback route for a project's council seats.</summary>
+        public Func<string, string?>? FallbackModelForProject { get; set; }
 
         public ProjectCouncilRunner(ProjectCouncilStore store, ProjectEventLogStore eventLog, Action<string> log)
         {
@@ -127,12 +131,19 @@ namespace Omnipotent.Services.Projects
 
                 // ── Round 3: Chair synthesis ──
                 string chairPrompt = BuildChairPrompt(session);
-                var chair = await QueryAsync($"projects-council-{session.CouncilID}-chair", ChairSystemPrompt(),
-                    chairPrompt, model, ChairMaxTokens, ct);
+                CouncilTurn? chair = null;
+                await using (var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(pid, ct))
+                {
+                    if (AcquireTurnAsync == null || lease != null)
+                        chair = await QueryWithFallbackAsync(session, $"projects-council-{session.CouncilID}-chair",
+                            ChairSystemPrompt(), chairPrompt, model, ChairMaxTokens, ct);
+                    if (chair is { Success: true } && !string.IsNullOrWhiteSpace(chair.Text))
+                        await RecordStatementAsync(session, "Chair", 3, chair);
+                }
                 if (chair is { Success: true } && !string.IsNullOrWhiteSpace(chair.Text))
                 {
-                    RecordStatement(session, "Chair", 3, chair);
                     session.VerdictText = chair.Text.Trim();
+                    session.RecommendationClass = ParseRecommendationClass(session.VerdictText);
                 }
                 else
                 {
@@ -147,7 +158,7 @@ namespace Omnipotent.Services.Projects
 
                 AppendEvent(session, ProjectEventTypes.CouncilVerdict, "commander",
                     $"Council verdict — {Trunc(session.Topic, 100)}: {Trunc(session.VerdictText, 1500)}",
-                    new { councilID = session.CouncilID, totalCostUsd = session.TotalCostUsd });
+                    new { councilID = session.CouncilID, recommendationClass = session.RecommendationClass.ToString(), totalCostUsd = session.TotalCostUsd });
                 return session;
             }
             catch (OperationCanceledException)
@@ -174,7 +185,7 @@ namespace Omnipotent.Services.Projects
         {
             if (session.Status != CouncilStatus.Completed || string.IsNullOrWhiteSpace(session.VerdictText))
                 return session.Error ?? "The council did not reach a verdict.";
-            return $"COUNCIL VERDICT ({session.Roles.Count} seats + Chair, {session.Statements.Count} statements, " +
+            return $"COUNCIL VERDICT [{session.RecommendationClass}] ({session.Roles.Count} seats + Chair, {session.Statements.Count} statements, " +
                    $"${session.TotalCostUsd:0.####} spent):\n\n{session.VerdictText}\n\n" +
                    "(This is advisory — you decide and remain accountable. The full transcript is on the timeline.)";
         }
@@ -190,9 +201,12 @@ namespace Omnipotent.Services.Projects
                 "3. The top risks / failure modes.\n" +
                 "4. What evidence would change your mind.\n" +
                 "Be concrete. Play your seat's perspective hard. ≤400 words.";
-            var turn = await QueryAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", RoleSystemPrompt(role), prompt, model, OpeningMaxTokens, ct);
+            await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
+            if (AcquireTurnAsync != null && lease == null) return null;
+            var turn = await QueryWithFallbackAsync(session, $"projects-council-{session.CouncilID}-{Slug(role)}",
+                RoleSystemPrompt(role), prompt, model, OpeningMaxTokens, ct);
             if (turn is not { Success: true } || string.IsNullOrWhiteSpace(turn.Text)) return null;
-            RecordStatement(session, role, 1, turn);
+            await RecordStatementAsync(session, role, 1, turn);
             return turn.Text.Trim();
         }
 
@@ -204,9 +218,48 @@ namespace Omnipotent.Services.Projects
                 "The other seats gave these opening positions:\n\n" + othersBlock +
                 "\n\nAttack the weakest load-bearing claim in each. Concede the points that survive scrutiny. " +
                 "Then restate your FINAL position in ≤250 words, explicitly noting anything you changed your mind about.";
-            var turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, model, RebuttalMaxTokens, ct);
+            await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
+            if (AcquireTurnAsync != null && lease == null) return;
+            CouncilTurn? turn;
+            try
+            {
+                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, model, RebuttalMaxTokens, ct);
+                if (turn is not { Success: true })
+                {
+                    string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
+                    if (!string.IsNullOrWhiteSpace(fallback) && !string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase))
+                        turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, fallback, RebuttalMaxTokens, ct);
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch
+            {
+                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
+                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) throw;
+                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, fallback, RebuttalMaxTokens, ct);
+            }
             if (turn is { Success: true } && !string.IsNullOrWhiteSpace(turn.Text))
-                RecordStatement(session, role, 2, turn);
+                await RecordStatementAsync(session, role, 2, turn);
+        }
+
+        private async Task<CouncilTurn?> QueryWithFallbackAsync(CouncilSession session, string sessionID,
+            string? systemPrompt, string prompt, string model, int maxTokens, CancellationToken ct)
+        {
+            try
+            {
+                var primary = await QueryAsync!(sessionID, systemPrompt, prompt, model, maxTokens, ct);
+                if (primary is { Success: true }) return primary;
+                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
+                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) return primary;
+                return await QueryAsync!(sessionID, systemPrompt, prompt, fallback, maxTokens, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch
+            {
+                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
+                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) throw;
+                return await QueryAsync!(sessionID, systemPrompt, prompt, fallback, maxTokens, ct);
+            }
         }
 
         private CouncilSession FinishOnBudget(CouncilSession session, Dictionary<string, string> openingByRole)
@@ -222,7 +275,7 @@ namespace Omnipotent.Services.Projects
 
         // ── recording ──
 
-        private void RecordStatement(CouncilSession session, string role, int round, CouncilTurn turn)
+        private async Task RecordStatementAsync(CouncilSession session, string role, int round, CouncilTurn turn)
         {
             var statement = new CouncilStatement
             {
@@ -243,7 +296,7 @@ namespace Omnipotent.Services.Projects
                 store.Update(session);
             }
             if ((turn.PromptTokens > 0 || turn.CompletionTokens > 0) && RecordSpendAsync != null)
-                _ = RecordSpendAsync(session.ProjectID, turn.PromptTokens, turn.CompletionTokens, turn.GenerationId, turn.CostUsd);
+                await RecordSpendAsync(session.ProjectID, turn.PromptTokens, turn.CompletionTokens, turn.GenerationId, turn.CostUsd);
 
             string roundName = round switch { 1 => "opening", 2 => "rebuttal", 3 => "synthesis", _ => "statement" };
             AppendEvent(session, ProjectEventTypes.CouncilStatement, role == "Chair" ? "commander" : "system",
@@ -288,6 +341,7 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine();
             }
             sb.AppendLine("Synthesize the council's verdict. Do NOT vote-count — weigh the arguments. Output these sections:");
+            sb.AppendLine("DECISION CLASS: exactly one of PROCEED | PROCEED_WITH_CONDITIONS | NEEDS_USER_DECISION | HARD_POLICY_BLOCK. HARD_POLICY_BLOCK is only for an actual governing policy constraint; feasibility or strategic disagreement is advisory, not a veto.");
             sb.AppendLine("RECOMMENDATION: the single course of action, stated plainly.");
             sb.AppendLine("KEY RISKS: the risks that survived debate.");
             sb.AppendLine("DISSENTS (preserved): quote any minority view the panel could not resolve, verbatim in spirit.");
@@ -349,6 +403,18 @@ namespace Omnipotent.Services.Projects
         {
             var chars = role.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray();
             return new string(chars).Trim('-');
+        }
+
+        internal static CouncilRecommendationClass ParseRecommendationClass(string? verdict)
+        {
+            if (string.IsNullOrWhiteSpace(verdict)) return CouncilRecommendationClass.Unclassified;
+            string first = verdict.Split('\n').FirstOrDefault(l => l.Contains("DECISION CLASS", StringComparison.OrdinalIgnoreCase)) ?? "";
+            string normalized = first.Replace("-", "_", StringComparison.Ordinal).Replace(" ", "_", StringComparison.Ordinal).ToUpperInvariant();
+            if (normalized.Contains("HARD_POLICY_BLOCK", StringComparison.Ordinal)) return CouncilRecommendationClass.HardPolicyBlock;
+            if (normalized.Contains("NEEDS_USER_DECISION", StringComparison.Ordinal)) return CouncilRecommendationClass.NeedsUserDecision;
+            if (normalized.Contains("PROCEED_WITH_CONDITIONS", StringComparison.Ordinal)) return CouncilRecommendationClass.ProceedWithConditions;
+            if (normalized.Contains("PROCEED", StringComparison.Ordinal)) return CouncilRecommendationClass.Proceed;
+            return CouncilRecommendationClass.Unclassified;
         }
 
         private CouncilSession Refused(string reason) =>

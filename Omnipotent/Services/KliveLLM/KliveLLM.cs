@@ -28,6 +28,61 @@ using System.ServiceModel;
 
 namespace Omnipotent.Services.KliveLLM
 {
+    /// <summary>Stable, machine-readable classification for a remote inference failure.</summary>
+    public enum RemoteLLMFailureKind
+    {
+        Unknown,
+        Network,
+        Timeout,
+        RateLimited,
+        InsufficientProviderCredit,
+        Authentication,
+        InvalidRequest,
+        ModelUnavailable,
+        ProviderUnavailable,
+        EmptyResponse,
+    }
+
+    /// <summary>
+    /// A remote inference failure with enough structure for callers to choose retry, fallback,
+    /// defer, or human-attention behaviour without parsing the human-readable exception text.
+    /// </summary>
+    public sealed class RemoteLLMException : HttpRequestException
+    {
+        public RemoteLLMException(
+            RemoteLLMFailureKind kind,
+            string message,
+            string provider,
+            string model,
+            HttpStatusCode? statusCode = null,
+            int? requestedMaxTokens = null,
+            int? affordableMaxTokens = null,
+            TimeSpan? retryAfter = null,
+            Exception? innerException = null)
+            : base(message, innerException, statusCode)
+        {
+            Kind = kind;
+            Provider = provider;
+            Model = model;
+            RequestedMaxTokens = requestedMaxTokens;
+            AffordableMaxTokens = affordableMaxTokens;
+            RetryAfter = retryAfter;
+        }
+
+        public RemoteLLMFailureKind Kind { get; }
+        public string Provider { get; }
+        public string Model { get; }
+        public int? RequestedMaxTokens { get; }
+        public int? AffordableMaxTokens { get; }
+        public TimeSpan? RetryAfter { get; }
+
+        public bool IsRetryable => Kind is RemoteLLMFailureKind.Network
+            or RemoteLLMFailureKind.Timeout
+            or RemoteLLMFailureKind.RateLimited
+            or RemoteLLMFailureKind.ProviderUnavailable
+            or RemoteLLMFailureKind.EmptyResponse;
+    }
+
     public class KliveLLM : OmniService
     {
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
@@ -55,14 +110,14 @@ namespace Omnipotent.Services.KliveLLM
         internal string thinkingType = "Medium";
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
 
-        private enum LLMProvider
+        internal enum LLMProvider
         {
             Local,
             HuggingFace,
             OpenRouter,
         }
 
-        private sealed class RemoteLLMProviderConfiguration
+        internal sealed class RemoteLLMProviderConfiguration
         {
             public RemoteLLMProviderConfiguration(LLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model, string? serviceTier = null)
             {
@@ -86,6 +141,12 @@ namespace Omnipotent.Services.KliveLLM
         {
             name = "KliveLLM";
             threadAnteriority = ThreadAnteriority.High;
+        }
+
+        /// <summary>Test seam for deterministic provider-response policy tests.</summary>
+        internal KliveLLM(HttpClient httpClient) : this()
+        {
+            client = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
         }
 
         protected override async void ServiceMain()
@@ -380,13 +441,22 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        /// <summary>Append a user turn to a tool-calling session.</summary>
+        // ── temporal grounding ──
+        // Every inbound message (user turn / steering / tool result) is stamped with the wall-clock
+        // at the moment it is appended, so the model can always read WHEN each thing it sees
+        // happened — across long waits, queued deliveries and multi-hour agentic sessions the
+        // stamps are what let it reason about elapsed time. Stamps are fixed at append time, so
+        // provider prefix-caching of earlier turns is unaffected.
+        internal static string StampIncoming(string? content) =>
+            $"[{Data_Handling.TemporalFormat.NowStamp()}] {content ?? string.Empty}";
+
+        /// <summary>Append a user turn to a tool-calling session, stamped with the receipt time.</summary>
         public void AppendUserMessageToToolSession(string sessionId, string content)
         {
             lock (sessions)
             {
                 if (sessions.TryGetValue(sessionId, out var s))
-                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = content ?? string.Empty });
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = StampIncoming(content) });
             }
         }
 
@@ -404,8 +474,8 @@ namespace Omnipotent.Services.KliveLLM
         public void AppendUserContentToToolSession(string sessionId, string text, List<(byte[] data, string mimeType)> images, int keepRecentImages = 3)
         {
             var parts = new List<object>();
-            if (!string.IsNullOrWhiteSpace(text))
-                parts.Add(new HFWrapper.HFTextPart { text = text });
+            // Stamp even image-only turns: the text part carries the capture-receipt time.
+            parts.Add(new HFWrapper.HFTextPart { text = string.IsNullOrWhiteSpace(text) ? StampIncoming(null).TrimEnd() : StampIncoming(text) });
             foreach (var (data, mimeType) in images ?? new List<(byte[], string)>())
             {
                 if (data == null || data.Length == 0) continue;
@@ -477,7 +547,9 @@ namespace Omnipotent.Services.KliveLLM
                         role = "tool",
                         tool_call_id = toolCallId,
                         name = name,
-                        content = content ?? string.Empty
+                        // Completion-time stamp: after a long-running tool (wait_for, a slow script)
+                        // this is how the model knows how much wall-clock the step consumed.
+                        content = StampIncoming(content)
                     });
                     PruneOldToolResults(s, keepRecentFull);
                 }
@@ -668,7 +740,7 @@ namespace Omnipotent.Services.KliveLLM
                     sessions[sessionId] = session;
                 }
             }
-            session.chatHistory.AddMessage(AuthorRole.User, prompt);
+            session.chatHistory.AddMessage(AuthorRole.User, StampIncoming(prompt));
             var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride);
             {
                 // Providers occasionally return an assistant turn with null content. Coalesce to an
@@ -793,6 +865,7 @@ namespace Omnipotent.Services.KliveLLM
         private const int RateLimitMaxAttempts = 5;
         private const int RateLimitBaseDelayMs = 3000;
         private const int RateLimitMaxDelayMs = 20000;
+        private const double AffordableTokenSafetyFraction = 0.90;
 
         private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
         {
@@ -1194,7 +1267,7 @@ namespace Omnipotent.Services.KliveLLM
             catch { /* diagnostic only — never affect the request */ }
         }
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
+        internal async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
             CancellationToken cancellationToken = default)
@@ -1204,6 +1277,7 @@ namespace Omnipotent.Services.KliveLLM
             string payloadJson = JsonConvert.SerializeObject(payload);
 
             Exception lastError = null;
+            bool affordableTokenRetryUsed = false;
             int maxAttempts = RemoteInferenceMaxAttempts; // raised to RateLimitMaxAttempts if we hit a rate-limit
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
@@ -1236,8 +1310,18 @@ namespace Omnipotent.Services.KliveLLM
                 catch (Exception ex) when (IsTransientNetworkError(ex))
                 {
                     // Connection reset / timeout / DNS blip — retry with backoff.
-                    lastError = ex;
-                    if (attempt >= RemoteInferenceMaxAttempts) throw;
+                    var kind = ex is TaskCanceledException
+                        ? RemoteLLMFailureKind.Timeout
+                        : RemoteLLMFailureKind.Network;
+                    var remoteEx = new RemoteLLMException(
+                        kind,
+                        $"{remoteProvider.DisplayName} network request failed: {ex.Message}",
+                        remoteProvider.DisplayName,
+                        payload.model ?? remoteProvider.Model,
+                        requestedMaxTokens: payload.max_tokens,
+                        innerException: ex);
+                    lastError = remoteEx;
+                    if (attempt >= RemoteInferenceMaxAttempts) throw remoteEx;
                     try { await ServiceLog($"Remote LLM network error (attempt {attempt}/{RemoteInferenceMaxAttempts}): {ex.Message}. Retrying."); } catch { }
                     await DelayBeforeRetryAsync(attempt, null, cancellationToken);
                     continue;
@@ -1277,8 +1361,41 @@ namespace Omnipotent.Services.KliveLLM
                         bool transient = status == 408 || status >= 500 || rateLimited;
                         if (rateLimited) maxAttempts = Math.Max(maxAttempts, RateLimitMaxAttempts);
 
-                        var httpEx = new HttpRequestException(
-                            $"{remoteProvider.DisplayName} request failed with status {status} ({response.ReasonPhrase}). Body: {responseContent}");
+                        // OpenRouter's 402 response includes the maximum completion length the current
+                        // account can fund. A missing max_tokens lets a model default to a very large
+                        // value (often 65,536), so retry exactly once with a 10% safety margin. This is
+                        // an adaptation of the rejected request, not a generic retry: the same 402 can
+                        // never loop, and other providers retain fail-fast 402 behaviour.
+                        int? affordableMaxTokens = ParseAffordableMaxTokens(responseContent);
+                        int? affordableRetryMax = remoteProvider.Provider == LLMProvider.OpenRouter && !affordableTokenRetryUsed
+                            ? CalculateAffordableRetryMaxTokens(responseContent, payload.max_tokens)
+                            : null;
+                        if (affordableRetryMax.HasValue)
+                        {
+                            affordableTokenRetryUsed = true;
+                            payload.max_tokens = affordableRetryMax.Value;
+                            payloadJson = JsonConvert.SerializeObject(payload);
+                            maxAttempts = Math.Max(maxAttempts, attempt + 1); // preserve the one adaptive retry even if ordinary attempts were consumed
+                            try
+                            {
+                                await ServiceLog(
+                                    $"OpenRouter could not fund the requested completion size; retrying once with max_tokens={affordableRetryMax.Value} " +
+                                    $"(provider affordability {affordableMaxTokens}).");
+                            }
+                            catch { }
+                            continue;
+                        }
+
+                        var retryAfter = GetBoundedRetryAfter(response);
+                        var httpEx = new RemoteLLMException(
+                            ClassifyRemoteFailure(response.StatusCode, responseContent),
+                            $"{remoteProvider.DisplayName} request failed with status {status} ({response.ReasonPhrase}). Body: {responseContent}",
+                            remoteProvider.DisplayName,
+                            payload.model ?? remoteProvider.Model,
+                            response.StatusCode,
+                            payload.max_tokens,
+                            affordableMaxTokens,
+                            retryAfter);
 
                         if (transient && attempt < maxAttempts)
                         {
@@ -1294,7 +1411,12 @@ namespace Omnipotent.Services.KliveLLM
 
                     if (hfResponse?.choices == null || hfResponse.choices.Count == 0)
                     {
-                        var emptyEx = new InvalidOperationException($"{remoteProvider.DisplayName} returned an empty completion payload.");
+                        var emptyEx = new RemoteLLMException(
+                            RemoteLLMFailureKind.EmptyResponse,
+                            $"{remoteProvider.DisplayName} returned an empty completion payload.",
+                            remoteProvider.DisplayName,
+                            payload.model ?? remoteProvider.Model,
+                            requestedMaxTokens: payload.max_tokens);
                         if (attempt < RemoteInferenceMaxAttempts)
                         {
                             lastError = emptyEx;
@@ -1311,18 +1433,135 @@ namespace Omnipotent.Services.KliveLLM
             throw lastError ?? new InvalidOperationException("Remote inference failed for an unknown reason.");
         }
 
+        /// <summary>
+        /// Extracts OpenRouter's affordable completion-token limit. The top-level structured error
+        /// message is authoritative; named numeric fields and nested messages support compatible
+        /// provider shapes, and raw-text matching is the final fallback.
+        /// </summary>
+        internal static int? ParseAffordableMaxTokens(string? responseContent)
+        {
+            if (string.IsNullOrWhiteSpace(responseContent)) return null;
+
+            try
+            {
+                var root = JToken.Parse(responseContent);
+                var error = (root as JObject)?["error"] ?? root;
+
+                // Prefer a direct structured field when a provider exposes one.
+                if (error is JObject errorObject)
+                {
+                    foreach (var property in errorObject.Properties())
+                    {
+                        if (IsAffordableTokenProperty(property.Name) && TryPositiveInt(property.Value, out int structured))
+                            return structured;
+                    }
+
+                    // OpenRouter's current contract carries the value in error.message.
+                    if (TryParseAffordableTokenText(errorObject["message"]?.ToString(), out int fromMainMessage))
+                        return fromMainMessage;
+                }
+
+                // Be liberal for routed-provider metadata without allowing a requested max_tokens
+                // field to masquerade as an affordable limit.
+                var descendants = root is JContainer container
+                    ? container.Descendants().ToList()
+                    : new List<JToken>();
+                foreach (var property in descendants.OfType<JProperty>())
+                {
+                    if (IsAffordableTokenProperty(property.Name) && TryPositiveInt(property.Value, out int structured))
+                        return structured;
+                }
+                foreach (var value in descendants.OfType<JValue>().Where(v => v.Type == JTokenType.String))
+                {
+                    if (TryParseAffordableTokenText(value.ToString(), out int nestedMessage))
+                        return nestedMessage;
+                }
+            }
+            catch (JsonException)
+            {
+                // Some OpenAI-compatible providers return plain text rather than JSON.
+            }
+
+            return TryParseAffordableTokenText(responseContent, out int raw) ? raw : null;
+        }
+
+        /// <summary>Returns the sole safe 402 retry size, or null when downshifting cannot help.</summary>
+        internal static int? CalculateAffordableRetryMaxTokens(string? responseContent, int? requestedMaxTokens)
+        {
+            int? affordable = ParseAffordableMaxTokens(responseContent);
+            if (!affordable.HasValue) return null;
+
+            long withSafetyMargin = (long)Math.Floor(affordable.Value * AffordableTokenSafetyFraction);
+            if (withSafetyMargin < 1) return null;
+
+            if (requestedMaxTokens.HasValue)
+            {
+                withSafetyMargin = Math.Min(withSafetyMargin, requestedMaxTokens.Value);
+                // A retry must actually reduce the rejected request. If the provider says it can
+                // afford at least the caller's explicit cap, this 402 has a different root cause.
+                if (withSafetyMargin >= requestedMaxTokens.Value) return null;
+            }
+
+            return (int)Math.Min(withSafetyMargin, int.MaxValue);
+        }
+
+        private static bool IsAffordableTokenProperty(string name)
+        {
+            string normalized = new(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+            return normalized.Contains("afford", StringComparison.Ordinal)
+                && normalized.Contains("token", StringComparison.Ordinal);
+        }
+
+        private static bool TryPositiveInt(JToken token, out int value)
+        {
+            value = 0;
+            if (token.Type == JTokenType.Integer)
+            {
+                long n = token.Value<long>();
+                if (n is > 0 and <= int.MaxValue) { value = (int)n; return true; }
+                return false;
+            }
+            return int.TryParse(token.ToString().Replace(",", "", StringComparison.Ordinal), out value) && value > 0;
+        }
+
+        private static bool TryParseAffordableTokenText(string? text, out int value)
+        {
+            value = 0;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            var match = System.Text.RegularExpressions.Regex.Match(
+                text,
+                @"can\s+only\s+afford(?:\s+up\s+to)?\s+([0-9][0-9,]*)",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+            return match.Success
+                && int.TryParse(match.Groups[1].Value.Replace(",", "", StringComparison.Ordinal), out value)
+                && value > 0;
+        }
+
+        internal static RemoteLLMFailureKind ClassifyRemoteFailure(HttpStatusCode status, string? responseContent)
+        {
+            int code = (int)status;
+            if (status == HttpStatusCode.PaymentRequired) return RemoteLLMFailureKind.InsufficientProviderCredit;
+            if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return RemoteLLMFailureKind.Authentication;
+            if (status == HttpStatusCode.NotFound) return RemoteLLMFailureKind.ModelUnavailable;
+            if (status == HttpStatusCode.RequestTimeout) return RemoteLLMFailureKind.Timeout;
+            if (code == 429 || IsUpstreamRateLimitBody(responseContent)) return RemoteLLMFailureKind.RateLimited;
+            if (code >= 500) return RemoteLLMFailureKind.ProviderUnavailable;
+            if (code >= 400) return RemoteLLMFailureKind.InvalidRequest;
+            return RemoteLLMFailureKind.Unknown;
+        }
+
         private static bool IsTransientNetworkError(Exception ex)
             => ex is HttpRequestException
             || ex is TaskCanceledException        // HttpClient timeout surfaces as this (no cancellation token in use)
             || ex is System.IO.IOException
             || ex is System.Net.Sockets.SocketException;
 
-        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage response, CancellationToken cancellationToken = default, bool rateLimited = false)
+        private static async Task DelayBeforeRetryAsync(int attempt, HttpResponseMessage? response, CancellationToken cancellationToken = default, bool rateLimited = false)
         {
             TimeSpan delay;
-            if (response?.Headers?.RetryAfter?.Delta is TimeSpan retryAfter && retryAfter > TimeSpan.Zero)
+            if (GetBoundedRetryAfter(response) is TimeSpan retryAfter && retryAfter > TimeSpan.Zero)
             {
-                delay = retryAfter; // honour provider's Retry-After (common on 429)
+                delay = retryAfter; // honour provider's Retry-After, bounded to the in-wake policy
             }
             else
             {
@@ -1332,6 +1571,23 @@ namespace Omnipotent.Services.KliveLLM
                 delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
             await Task.Delay(delay, cancellationToken);
+        }
+
+        private static TimeSpan? GetBoundedRetryAfter(HttpResponseMessage? response)
+        {
+            if (response?.Headers?.RetryAfter == null) return null;
+            TimeSpan? requested = response.Headers.RetryAfter.Delta;
+            if (!requested.HasValue && response.Headers.RetryAfter.Date.HasValue)
+                requested = response.Headers.RetryAfter.Date.Value - DateTimeOffset.UtcNow;
+            if (!requested.HasValue || requested.Value <= TimeSpan.Zero) return null;
+            return BoundProviderRetryAfter(requested.Value);
+        }
+
+        internal static TimeSpan BoundProviderRetryAfter(TimeSpan requested)
+        {
+            if (requested <= TimeSpan.Zero) return TimeSpan.Zero;
+            var maximum = TimeSpan.FromMilliseconds(RateLimitMaxDelayMs);
+            return requested > maximum ? maximum : requested;
         }
 
         // OpenRouter routes a request across multiple upstream providers and, when they're all throttling a
@@ -1602,7 +1858,7 @@ namespace Omnipotent.Services.KliveLLM
                         }
                     };
 
-                    var chatMsg = new ChatHistory.Message(AuthorRole.User, prompt);
+                    var chatMsg = new ChatHistory.Message(AuthorRole.User, StampIncoming(prompt));
                     StringBuilder sb = new StringBuilder();
                     await foreach (var chunk in session.chatSession.ChatAsync(chatMsg, inferenceParams, cancellationToken))
                     {

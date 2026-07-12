@@ -503,8 +503,11 @@ namespace Omnipotent.Services.AccountRegistry
             File.WriteAllText(tmp, JsonConvert.SerializeObject(all, Formatting.Indented));
             for (int attempt = 0; ; attempt++)
             {
+                // UnauthorizedAccessException included: on Windows a virus scanner / search indexer
+                // briefly holding the freshly-written tmp (or the destination) surfaces as that, not
+                // IOException — same transient cause, same retry.
                 try { File.Move(tmp, indexPath, overwrite: true); break; }
-                catch (IOException) when (attempt < 5) { Thread.Sleep(15); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 5) { Thread.Sleep(15); }
             }
         }
     }

@@ -14,6 +14,9 @@ namespace Omnipotent.Service_Manager
         Bool = 1,
         Int = 2,
         Dropdown = 3,
+        // A dynamic, ordered list of strings. The list is stored JSON-serialized
+        // in Value (e.g. ["a","b"]); entries can be added, edited, and removed.
+        StringList = 4,
     }
 
     public class OmniSetting
@@ -414,6 +417,32 @@ namespace Omnipotent.Service_Manager
             }
         }
 
+        public async Task<List<string>> GetStringListOmniSetting(string name, IEnumerable<string> defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
+            name = NormalizeSettingName(name);
+
+            List<string> fallback = NormalizeStringList(defaultValue);
+
+            if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+            {
+                var callerInfo = GetCallingServiceInfo();
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? callerInfo.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
+            }
+
+            try
+            {
+                var setting = await GetOrCreateSettingAsync(name, OmniSettingType.StringList, SerializeStringList(fallback), sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
+                return DeserializeStringList(setting.Value);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "GetStringListOmniSetting failed");
+                return fallback;
+            }
+        }
+
         // --- Setters ---
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null)
         {
@@ -510,6 +539,42 @@ namespace Omnipotent.Service_Manager
         public Task<bool> SetDropdownOmniSetting(string name, string value, IEnumerable<string> dropdownOptions, string parentServiceId = null, string parentServiceName = null) =>
             SetOmniSetting(name, value, parentServiceId, parentServiceName, OmniSettingType.Dropdown, dropdownOptions: dropdownOptions);
 
+        public Task<bool> SetStringListOmniSetting(string name, IEnumerable<string> values, string parentServiceId = null, string parentServiceName = null) =>
+            SetOmniSetting(name, SerializeStringList(values), parentServiceId, parentServiceName, OmniSettingType.StringList);
+
+        // Appends an entry to a string-list setting (creating the setting if needed) and persists it.
+        public async Task<bool> AddToStringListOmniSetting(string name, string entry, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrWhiteSpace(entry)) return false;
+
+            if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+            {
+                var ci = GetCallingServiceInfo();
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? ci.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? ci.serviceName : parentServiceName;
+            }
+
+            var current = await GetStringListOmniSetting(name, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
+            current.Add(entry.Trim());
+            return await SetStringListOmniSetting(name, current, parentServiceId, parentServiceName);
+        }
+
+        // Removes all entries equal to the given value (case-insensitive) from a string-list setting.
+        public async Task<bool> RemoveFromStringListOmniSetting(string name, string entry, string parentServiceId = null, string parentServiceName = null)
+        {
+            if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
+            {
+                var ci = GetCallingServiceInfo();
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? ci.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? ci.serviceName : parentServiceName;
+            }
+
+            var current = await GetStringListOmniSetting(name, parentServiceId: parentServiceId, parentServiceName: parentServiceName);
+            int removed = current.RemoveAll(x => string.Equals(x?.Trim(), entry?.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (removed == 0) return false;
+            return await SetStringListOmniSetting(name, current, parentServiceId, parentServiceName);
+        }
+
         public OmniSetting? FindExistingSetting(string name, string parentServiceId = null)
         {
             if (string.IsNullOrWhiteSpace(name))
@@ -586,6 +651,41 @@ namespace Omnipotent.Service_Manager
                 .Cast<string>()
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+        }
+
+        // Trims entries and drops null/whitespace-only ones, preserving order and duplicates.
+        private static List<string> NormalizeStringList(IEnumerable<string>? values)
+        {
+            return (values ?? Enumerable.Empty<string>())
+                .Select(value => value?.Trim())
+                .Where(value => string.IsNullOrWhiteSpace(value) == false)
+                .Cast<string>()
+                .ToList();
+        }
+
+        private static string SerializeStringList(IEnumerable<string>? values)
+        {
+            return JsonConvert.SerializeObject(NormalizeStringList(values));
+        }
+
+        // Parses a StringList setting's Value. Handles the normal JSON-array form and
+        // tolerates a legacy plain/newline-separated string so older values don't break.
+        private static List<string> DeserializeStringList(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return new List<string>();
+
+            string trimmed = value.Trim();
+            if (trimmed.StartsWith("["))
+            {
+                try
+                {
+                    var parsed = JsonConvert.DeserializeObject<List<string>>(trimmed);
+                    return NormalizeStringList(parsed);
+                }
+                catch { /* Fall through to legacy handling. */ }
+            }
+
+            return NormalizeStringList(trimmed.Split('\n'));
         }
 
         private static bool DropdownOptionsMatch(IReadOnlyCollection<string>? left, IReadOnlyCollection<string>? right)

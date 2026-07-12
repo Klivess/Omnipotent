@@ -59,6 +59,8 @@ namespace Omnipotent.Services.Projects
         public ProjectFileStore? Files { get; set; }
         /// <summary>Named live values the agents maintain for Klives' at-a-glance dashboard.</summary>
         public ProjectObservableStore? Observables { get; set; }
+        /// <summary>Machine-owned runtime/checkpoint state, separate from model-authored digest prose.</summary>
+        public ProjectRuntimeStateStore? RuntimeState { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
         public Func<Task>? CompleteProjectAsync { get; set; }
         /// <summary>Renames the project's Discord channel to match a new project name (null-safe).</summary>
@@ -69,8 +71,8 @@ namespace Omnipotent.Services.Projects
         public Func<ProjectAgentRecord, string, Task>? StartAgentAsync { get; set; }
         /// <summary>Cancels a retiring agent's in-flight wake before its resources are released.</summary>
         public Func<string, bool>? CancelAgentWake { get; set; }
-        /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max) → formatted results.</summary>
-        public Func<string, int, Task<string>>? RecallMemoriesAsync { get; set; }
+        /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max, sinceUtc, untilUtc) → formatted results.</summary>
+        public Func<string, int, DateTime?, DateTime?, Task<string>>? RecallMemoriesAsync { get; set; }
         /// <summary>Save to KliveAgent's shared memory: (content, tags) → confirmation.</summary>
         public Func<string, string[], Task<string>>? SaveMemoryAsync { get; set; }
         /// <summary>Cross-system knowledge search (KliveRAG): (query, max) → formatted cited results.</summary>
@@ -133,7 +135,7 @@ namespace Omnipotent.Services.Projects
         /// Research, memory, planning, councils, observables and messaging Klives stay available.</summary>
         private static readonly HashSet<string> PlanningBlockedTools = new(StringComparer.Ordinal)
         {
-            "spawn_sub_agent", "run_script", "run_powershell", "run_bash",
+            "spawn_sub_agent", "assign_plan_work", "run_script", "run_powershell", "run_bash",
             "record_money_spend", "complete_project", "write_file", "make_directory",
             "move_file", "copy_file", "delete_file", "mark_file_important",
         };
@@ -184,16 +186,158 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult("Progress recorded.");
                 }
 
+                case "get_checkpoint":
+                {
+                    if (RuntimeState == null) return new CommanderToolResult("Typed checkpoint state is unavailable.");
+                    return new CommanderToolResult(RuntimeState.DescribeForWake(project.ProjectID));
+                }
+
+                case "update_checkpoint":
+                {
+                    if (RuntimeState == null) return new CommanderToolResult("Typed checkpoint state is unavailable.");
+                    string op = ((string?)a["op"] ?? "").Trim().ToLowerInvariant();
+                    string key = ((string?)a["key"] ?? "").Trim();
+                    string summary = ((string?)a["summary"] ?? "").Trim();
+                    var evidence = BuildCheckpointEvidence(a);
+                    ProjectRuntimeMutationResult changed;
+
+                    switch (op)
+                    {
+                        case "set_resume":
+                            if (summary.Length == 0) return new CommanderToolResult("set_resume requires 'summary' with one exact next action.");
+                            changed = RuntimeState.SetResumeAction(project.ProjectID, new ProjectResumeAction
+                            {
+                                Kind = "resume",
+                                Summary = summary,
+                                RecordedBy = actingAgentID,
+                                NotBefore = ParseUtc((string?)a["notBefore"]),
+                                Preconditions = (a["preconditions"] as JArray)?.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).ToList() ?? new(),
+                                Evidence = evidence,
+                            });
+                            break;
+                        case "clear_resume":
+                            changed = RuntimeState.ClearResumeAction(project.ProjectID);
+                            break;
+                        case "upsert_fact":
+                            if (key.Length == 0 || a["value"] == null) return new CommanderToolResult("upsert_fact requires 'key' and 'value'.");
+                            if (evidence.Count == 0) return new CommanderToolResult("upsert_fact requires a stable evidenceReference and/or evidenceEventSequence.");
+                            changed = RuntimeState.UpsertVerifiedFact(project.ProjectID, new ProjectVerifiedFact
+                            {
+                                Key = key,
+                                Value = (string?)a["value"] ?? "",
+                                Description = summary.Length == 0 ? null : summary,
+                                ValidUntil = ParseUtc((string?)a["validUntil"]),
+                                Evidence = evidence,
+                            });
+                            break;
+                        case "invalidate_fact":
+                            if (key.Length == 0) return new CommanderToolResult("invalidate_fact requires fact 'key'.");
+                            changed = RuntimeState.InvalidateVerifiedFact(project.ProjectID, key,
+                                summary.Length == 0 ? "Invalidated by project agent." : summary);
+                            break;
+                        case "register_artifact":
+                        {
+                            if (key.Length == 0) return new CommanderToolResult("register_artifact requires logical role in 'key'.");
+                            string? path = (string?)a["projectPath"];
+                            string? artifactID = (string?)a["artifactID"];
+                            if (string.IsNullOrWhiteSpace(path) && string.IsNullOrWhiteSpace(artifactID))
+                                return new CommanderToolResult("register_artifact requires projectPath and/or artifactID.");
+                            ProjectFileEntry? entry = null;
+                            if (!string.IsNullOrWhiteSpace(path) && Files != null)
+                            {
+                                path = ProjectWorkspaceLocator.NormalizeRelative(path);
+                                entry = Files.Stat(project.ProjectID, path);
+                                if (entry == null) return new CommanderToolResult($"No project file exists at '{path}'; canonical artifacts must be verifiable.");
+                                evidence.Add(new ProjectEvidenceReference { Kind = ProjectEvidenceKind.ProjectFile, Reference = path, ContentHash = entry.Sha256 });
+                            }
+                            string? expectedHash = ((string?)a["contentHash"] ?? "").Trim();
+                            ProjectArtifactStore.ArtifactRecord? timelineArtifact = null;
+                            if (!string.IsNullOrWhiteSpace(artifactID))
+                            {
+                                if (Artifacts == null) return new CommanderToolResult("Artifact store unavailable.");
+                                timelineArtifact = Artifacts.GetRecord(project.ProjectID, artifactID);
+                                if (timelineArtifact == null)
+                                    return new CommanderToolResult($"No timeline artifact exists with id '{artifactID}'.");
+                                bool hashMatches = expectedHash.Length == 0 || string.Equals(expectedHash, timelineArtifact.Sha256, StringComparison.OrdinalIgnoreCase);
+                                timelineArtifact = Artifacts.Validate(project.ProjectID, artifactID, hashMatches,
+                                    hashMatches ? "Validated while registering canonical artifact." : "Expected content hash did not match.");
+                                evidence.Add(new ProjectEvidenceReference
+                                {
+                                    Kind = ProjectEvidenceKind.Artifact,
+                                    Reference = artifactID,
+                                    ContentHash = timelineArtifact?.Sha256,
+                                    Description = timelineArtifact?.ValidationSummary,
+                                });
+                            }
+                            changed = RuntimeState.UpsertCanonicalArtifact(project.ProjectID, new ProjectCanonicalArtifact
+                            {
+                                Role = key,
+                                ProjectPath = path,
+                                ArtifactID = artifactID,
+                                ContentHash = entry?.Sha256 ?? timelineArtifact?.Sha256 ?? (expectedHash.Length == 0 ? null : expectedHash),
+                                ValidationStatus = entry != null && (expectedHash.Length == 0 || string.Equals(expectedHash, entry.Sha256, StringComparison.OrdinalIgnoreCase))
+                                    || timelineArtifact?.State == ProjectArtifactStore.ArtifactLifecycleState.Validated
+                                    ? ProjectArtifactValidationStatus.Valid
+                                    : timelineArtifact?.State == ProjectArtifactStore.ArtifactLifecycleState.Rejected
+                                        ? ProjectArtifactValidationStatus.Invalid : ProjectArtifactValidationStatus.Pending,
+                                ValidatedAt = entry != null || timelineArtifact?.ValidatedAt != null ? DateTime.UtcNow : null,
+                                Evidence = evidence,
+                            });
+                            break;
+                        }
+                        case "remove_artifact":
+                            if (key.Length == 0) return new CommanderToolResult("remove_artifact requires logical role in 'key'.");
+                            changed = RuntimeState.RemoveCanonicalArtifact(project.ProjectID, key);
+                            break;
+                        case "set_blocker":
+                            if (summary.Length == 0) return new CommanderToolResult("set_blocker requires 'summary'.");
+                            changed = RuntimeState.SetBlocker(project.ProjectID, new ProjectRuntimeBlocker
+                            {
+                                Category = ParseBlockerCategory((string?)a["blockerCategory"]),
+                                Code = key.Length == 0 ? "unspecified" : key,
+                                Summary = summary,
+                                Retryable = (bool?)a["retryable"] ?? false,
+                                NextRetryAt = ParseUtc((string?)a["nextRetryAt"]),
+                                Evidence = evidence,
+                            });
+                            break;
+                        case "clear_blocker":
+                            changed = RuntimeState.ClearBlocker(project.ProjectID);
+                            break;
+                        case "set_active_milestones":
+                            changed = RuntimeState.SetActiveMilestones(project.ProjectID, (int?)a["grandPlanVersion"],
+                                (a["milestoneIDs"] as JArray)?.Values<string>() ?? Array.Empty<string>());
+                            break;
+                        case "record_success":
+                            if (summary.Length == 0 || evidence.Count == 0)
+                                return new CommanderToolResult("record_success requires 'summary' and evidence.");
+                            changed = RuntimeState.SetLastSuccessfulAction(project.ProjectID, new ProjectActionCheckpoint
+                            {
+                                Kind = "verified-progress",
+                                Summary = summary,
+                                RecordedBy = actingAgentID,
+                                Evidence = evidence,
+                            });
+                            break;
+                        default:
+                            return new CommanderToolResult($"Unknown checkpoint op '{op}'.");
+                    }
+
+                    if (!changed.Applied) return new CommanderToolResult(changed.Reason ?? "Checkpoint update was rejected.");
+                    var evt = Evt(ProjectEventTypes.CheckpointChanged, actingAgentID == "commander" ? "commander" : "agent",
+                        $"Typed checkpoint updated: {op}" + (key.Length == 0 ? "" : $" ({key})") + ".");
+                    evt.PayloadJson = JsonConvert.SerializeObject(new { op, key, runtimeRevision = changed.State.Revision, checkpointRevision = changed.State.Checkpoint.Revision });
+                    eventLog.Append(evt);
+                    return new CommanderToolResult($"Checkpoint updated ({op}); runtime revision {changed.State.Revision}.");
+                }
+
                 case "list_observables":
                 {
                     if (Observables == null) return new CommanderToolResult("Observables unavailable.");
                     var list = Observables.List(project.ProjectID);
                     if (list.Count == 0)
                         return new CommanderToolResult("No observables yet. Create one with update_observable(op:'set').");
-                    return new CommanderToolResult(string.Join("\n", list.Select(o =>
-                        $"{o.Name} = {ProjectObservableStore.FormatValue(o)}"
-                        + (string.IsNullOrWhiteSpace(o.Description) ? "" : $" — {o.Description}")
-                        + $" (updated {o.UpdatedAt:MM-dd HH:mm}Z by {o.UpdatedBy})")));
+                    return new CommanderToolResult(Observables.DescribeAll(project.ProjectID));
                 }
 
                 case "update_observable":
@@ -219,8 +363,16 @@ namespace Omnipotent.Services.Projects
                                 string? text = (string?)a["textValue"];
                                 ObservableFormat? fmt =
                                     Enum.TryParse<ObservableFormat>((string?)a["format"] ?? "", true, out var f) ? f : null;
+                                DateTime? observedAt = ParseUtc((string?)a["observedAt"]);
+                                TimeSpan? staleAfter = (double?)a["staleAfterSeconds"] is double staleSeconds && staleSeconds > 0
+                                    ? TimeSpan.FromSeconds(staleSeconds) : null;
+                                ObservableValidity validity = Enum.TryParse<ObservableValidity>((string?)a["validity"] ?? "", true, out var parsedValidity)
+                                    ? parsedValidity : ObservableValidity.Unknown;
                                 var change = Observables.Set(project.ProjectID, name, num, text, fmt,
-                                    (string?)a["unit"], (string?)a["description"], actingAgentID);
+                                    (string?)a["unit"], (string?)a["description"], actingAgentID,
+                                    observedAt, staleAfter, ObservableSourceKind.Agent, validity,
+                                    (long?)a["evidenceEventSequence"],
+                                    (a["evidenceArtifactIDs"] as JArray)?.Values<string>());
                                 AppendObservableEvent(change.Observable.Name, op,
                                     $"{change.Observable.Name}: {change.PreviousDisplay ?? "(new)"} → {change.NewDisplay} (set)", change);
                                 return new CommanderToolResult($"Observable '{change.Observable.Name}' = {change.NewDisplay}.");
@@ -298,7 +450,7 @@ namespace Omnipotent.Services.Projects
                         return new CommanderToolResult($"Unknown tier '{tierStr}'. Use Text, TextImage, TextImageVideo, or TextImageVideoAudio.");
                     try
                     {
-                        var agent = subAgents.Spawn(project.ProjectID, actingAgentID, tier, role);
+                        var agent = subAgents.Spawn(project.ProjectID, actingAgentID, tier, role, objective);
                         eventLog.Append(new ProjectEvent
                         {
                             ProjectID = project.ProjectID, WakeID = wakeID, AgentID = agent.AgentID,
@@ -315,13 +467,49 @@ namespace Omnipotent.Services.Projects
                 case "retire_sub_agent":
                 {
                     string id = (string?)a["agentID"] ?? "";
-                    CancelAgentWake?.Invoke(id);
-                    bool ok = subAgents.Retire(project.ProjectID, id);
-                    // Free the retired agent's own desktop immediately rather than leaking it until
-                    // the project completes.
-                    if (ok && DisposeAgentDesktopAsync != null)
-                        try { await DisposeAgentDesktopAsync(id); } catch { }
-                    return new CommanderToolResult(ok ? $"Retired agent {id}." : $"No active agent {id}.");
+                    try
+                    {
+                        CancelAgentWake?.Invoke(id);
+                        bool ok = subAgents.Retire(project.ProjectID, id);
+                        // Free the retired agent's own desktop immediately rather than leaking it until
+                        // the project completes.
+                        if (ok && DisposeAgentDesktopAsync != null)
+                            try { await DisposeAgentDesktopAsync(id); } catch { }
+                        return new CommanderToolResult(ok ? $"Retired agent {id}." : $"No active agent {id}.");
+                    }
+                    catch (InvalidOperationException ex) { return new CommanderToolResult(ex.Message); }
+                }
+
+                case "assign_plan_work":
+                {
+                    if (actingAgentID != "commander") return new CommanderToolResult("Only the Commander assigns Grand Plan work.");
+                    if (GrandPlans == null || !GrandPlans.HasApprovedPlan(project.ProjectID))
+                        return new CommanderToolResult("No approved Grand Plan is available.");
+                    string milestoneRef = ((string?)a["milestoneId"] ?? "").Trim();
+                    string target = ((string?)a["agentID"] ?? "").Trim();
+                    string objective = ((string?)a["objective"] ?? "").Trim();
+                    var deliverables = (a["deliverablePaths"] as JArray)?.Values<string>()
+                        .Where(x => !string.IsNullOrWhiteSpace(x)).Select(ProjectWorkspaceLocator.NormalizeRelative).ToList() ?? new();
+                    var ready = GrandPlans.GetReadyMilestones(project.ProjectID)
+                        .FirstOrDefault(m => string.Equals(m.ID, milestoneRef, StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(m.Title, milestoneRef, StringComparison.OrdinalIgnoreCase));
+                    if (ready == null) return new CommanderToolResult($"Milestone '{milestoneRef}' is not dependency-ready.");
+                    if (!subAgents.TryResolveActiveTarget(project.ProjectID, target, out var worker, out var error)
+                        || worker == null || worker.AgentID == "commander")
+                        return new CommanderToolResult("Work not assigned: " + (error.Length > 0 ? error : "choose an active worker, not the Commander."));
+                    if (!subAgents.AssignObjective(project.ProjectID, worker.AgentID, objective, new[] { ready.ID }, deliverables))
+                        return new CommanderToolResult("Worker became unavailable before assignment.");
+                    GrandPlans.UpdateMilestoneStatus(project.ProjectID, ready.ID, MilestoneStatus.InProgress,
+                        ownerAgentID: worker.AgentID);
+                    RuntimeState?.SetActiveMilestones(project.ProjectID,
+                        GrandPlans.GetCurrentApproved(project.ProjectID)?.Version,
+                        GrandPlans.GetCurrentApproved(project.ProjectID)?.Content?.Milestones
+                            .Where(m => m.Status is MilestoneStatus.InProgress or MilestoneStatus.Blocked).Select(m => m.ID)
+                            ?? Array.Empty<string>());
+                    eventLog.Append(Evt(ProjectEventTypes.GrandPlanProgress, "commander",
+                        $"Assigned dependency-ready milestone {ready.ID} '{ready.Title}' to {worker.Role} ({worker.AgentID})."));
+                    if (StartAgentAsync != null) await StartAgentAsync(worker, objective);
+                    return new CommanderToolResult($"Assigned {ready.ID} '{ready.Title}' to {worker.Role} ({worker.AgentID}); worker started.");
                 }
 
                 case "send_agent_message":
@@ -526,7 +714,60 @@ namespace Omnipotent.Services.Projects
                     if (RecallMemoriesAsync == null) return new CommanderToolResult("Memory unavailable.");
                     string query = (string?)a["query"] ?? "";
                     int max = (int?)a["max"] ?? 8;
-                    return new CommanderToolResult(await RecallMemoriesAsync(query, Math.Clamp(max, 1, 25)));
+                    var nowRecall = DateTime.UtcNow;
+                    DateTime? since = TemporalParse.TryParsePastInstant((string?)a["since"], nowRecall, out var s) ? s : null;
+                    DateTime? until = TemporalParse.TryParsePastInstant((string?)a["until"], nowRecall, out var u) ? u : null;
+                    return new CommanderToolResult(await RecallMemoriesAsync(query, Math.Clamp(max, 1, 25), since, until));
+                }
+
+                case "query_events":
+                {
+                    var now = DateTime.UtcNow;
+                    string? fromText = (string?)a["from"];
+                    string? toText = (string?)a["to"];
+                    DateTime? from = null, to = null;
+                    if (!string.IsNullOrWhiteSpace(fromText))
+                    {
+                        if (!TemporalParse.TryParsePastInstant(fromText, now, out var f))
+                            return new CommanderToolResult($"Could not parse 'from' ('{fromText}'). Use a UTC date-time (\"2026-07-10 06:00\") or a lookback (\"24h\", \"7d\"). Current time: {TemporalFormat.NowStamp()}.");
+                        from = f;
+                    }
+                    if (!string.IsNullOrWhiteSpace(toText))
+                    {
+                        if (!TemporalParse.TryParsePastInstant(toText, now, out var t))
+                            return new CommanderToolResult($"Could not parse 'to' ('{toText}'). Use a UTC date-time or a lookback (\"24h\"). Current time: {TemporalFormat.NowStamp()}.");
+                        to = t;
+                    }
+                    string? contains = (string?)a["contains"];
+                    string? typeFilter = (string?)a["type"];
+                    string? author = (string?)a["author"];
+                    int maxEvents = Math.Clamp((int?)a["max"] ?? 40, 1, 200);
+
+                    // Stream the range, filter, and keep only the newest max — a bounded window over
+                    // an unbounded log, biased toward what happened most recently within it.
+                    var matched = new LinkedList<ProjectEvent>();
+                    long totalMatched = 0;
+                    foreach (var e in eventLog.EnumerateRange(project.ProjectID, from, to))
+                    {
+                        if (!string.IsNullOrWhiteSpace(typeFilter)
+                            && !e.Type.Contains(typeFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.IsNullOrWhiteSpace(author)
+                            && !string.Equals(e.Author, author, StringComparison.OrdinalIgnoreCase)) continue;
+                        if (!string.IsNullOrWhiteSpace(contains)
+                            && (e.Text == null || !e.Text.Contains(contains, StringComparison.OrdinalIgnoreCase))) continue;
+                        totalMatched++;
+                        matched.AddLast(e);
+                        if (matched.Count > maxEvents) matched.RemoveFirst();
+                    }
+                    if (totalMatched == 0)
+                        return new CommanderToolResult(
+                            $"No events matched between {(from.HasValue ? TemporalFormat.Stamp(from.Value) : "log start")} and {(to.HasValue ? TemporalFormat.Stamp(to.Value) : "now")}.");
+                    var sbEvents = new StringBuilder();
+                    sbEvents.AppendLine($"{totalMatched} event(s) between {(from.HasValue ? TemporalFormat.Stamp(from.Value) : "log start")} and {(to.HasValue ? TemporalFormat.Stamp(to.Value) : $"now ({TemporalFormat.NowStamp()})")}"
+                        + (totalMatched > matched.Count ? $"; showing the most recent {matched.Count}:" : ":"));
+                    foreach (var e in matched)
+                        sbEvents.AppendLine(ProjectCommanderPrompts.DescribeEvent(e));
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(sbEvents.ToString().TrimEnd(), ProjectsContextBudget.ToolResultBudget));
                 }
 
                 case "save_memory":
@@ -693,6 +934,30 @@ namespace Omnipotent.Services.Projects
                     catch (Exception ex) { return FileToolError(ex); }
                 }
 
+                case "resolve_project_path":
+                {
+                    if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
+                    string supplied = ((string?)a["path"] ?? "").Trim();
+                    if (supplied.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    try
+                    {
+                        string relative = ProjectWorkspaceLocator.NormalizeRelative(supplied);
+                        string host = ProjectWorkspaceLocator.HostPath(project.ProjectID, relative);
+                        string container = ProjectWorkspaceLocator.ContainerPath(relative);
+                        var entry = relative.Length == 0 ? null : Files.Stat(project.ProjectID, relative);
+                        var sb = new StringBuilder()
+                            .AppendLine($"project_relative={relative}")
+                            .AppendLine($"container_path={container}")
+                            .AppendLine($"host_path={host}")
+                            .AppendLine($"exists={entry != null || Directory.Exists(host)}");
+                        if (entry != null) sb.AppendLine(FormatFileEntry(entry, detailed: true));
+                        else if (Directory.Exists(host)) sb.AppendLine("kind=Directory; project workspace root");
+                        else sb.AppendLine("kind=Missing; create it with write_file or make_directory");
+                        return new CommanderToolResult(sb.ToString().TrimEnd());
+                    }
+                    catch (Exception ex) { return FileToolError(ex); }
+                }
+
                 case "make_directory":
                 {
                     if (Files == null) return new CommanderToolResult("Shared project files are unavailable.");
@@ -848,7 +1113,7 @@ namespace Omnipotent.Services.Projects
                             string armText = h.Enabled
                                 ? (arm == null ? "not armed" : $"{arm.State}: {arm.Detail}")
                                 : "disabled";
-                            return $"{h.HookID}: {h.SourceKind} → {h.DestinationAgentID} [{armText}] criterion: {Trunc(h.RecognitionCriterion, 80)}";
+                            return $"{h.HookID}: {h.SourceKind} → {h.DestinationAgentID} [{armText}] created {Data_Handling.TemporalFormat.StampWithAge(h.CreatedAt)} · criterion: {Trunc(h.RecognitionCriterion, 80)}";
                         })));
                 }
 
@@ -883,6 +1148,8 @@ namespace Omnipotent.Services.Projects
                     var content = ParsePlanContent(a);
                     string summary = ((string?)a["summary"] ?? "").Trim();
                     if (content.Mission.Length == 0) return new CommanderToolResult("Provide 'mission' — the plan needs a mission statement.");
+                    if (content.Milestones.Count == 0) return new CommanderToolResult("Provide at least one concrete milestone; execution is milestone-driven.");
+                    if (content.SuccessCriteria.Count == 0) return new CommanderToolResult("Provide at least one objectively checkable success criterion.");
                     if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary for the approval card and wake seeds.");
                     return await SubmitPlanForApprovalAsync(content, summary, changeNote: null, isAmendment: false, ct);
                 }
@@ -896,6 +1163,8 @@ namespace Omnipotent.Services.Projects
                     string summary = ((string?)a["summary"] ?? "").Trim();
                     string changeNote = ((string?)a["changeNote"] ?? "").Trim();
                     if (content.Mission.Length == 0) return new CommanderToolResult("Provide 'mission' — the revised plan needs a mission statement.");
+                    if (content.Milestones.Count == 0) return new CommanderToolResult("The revised plan must contain at least one milestone.");
+                    if (content.SuccessCriteria.Count == 0) return new CommanderToolResult("The revised plan must contain at least one success criterion.");
                     if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' — a ≤150-word summary of the revised plan.");
                     bool material = ParseBool((string?)a["material"], defaultValue: false);
                     if (!material)
@@ -916,23 +1185,59 @@ namespace Omnipotent.Services.Projects
                     if (!GrandPlans.HasApprovedPlan(project.ProjectID))
                         return new CommanderToolResult("No approved Grand Plan yet — nothing to progress. Submit one and get it approved first (submit_grand_plan).");
                     var results = new List<string>();
+                    string evidenceText = ((string?)a["evidence"] ?? "").Trim();
+                    long? evidenceSequence = (long?)a["evidenceEventSequence"];
+                    var evidenceArtifacts = (a["evidenceArtifactIDs"] as JArray)?.Values<string>()
+                        .Where(x => !string.IsNullOrWhiteSpace(x)).ToList() ?? new();
+                    PlanEvidence? progressEvidence = evidenceText.Length == 0 ? null : new PlanEvidence
+                    {
+                        Summary = evidenceText,
+                        EventSequence = evidenceSequence,
+                        ArtifactIDs = evidenceArtifacts,
+                        RecordedBy = actingAgentID,
+                    };
                     string mRef = ((string?)a["milestoneId"] ?? "").Trim();
+                    string cRef = ((string?)a["criterionId"] ?? "").Trim();
+                    var requestedMilestoneStatus = ParseMilestoneStatus((string?)a["milestoneStatus"]);
+                    bool requestedCriterionMet = ParseBool((string?)a["criterionMet"], defaultValue: true);
+                    string requestedBlockReason = ((string?)a["blockReason"] ?? "").Trim();
+                    if ((mRef.Length > 0 && requestedMilestoneStatus == MilestoneStatus.Done
+                         || cRef.Length > 0 && requestedCriterionMet) && progressEvidence == null)
+                        return new CommanderToolResult("Marking a milestone done or success criterion met requires 'evidence'.");
+                    if (mRef.Length > 0 && requestedMilestoneStatus == MilestoneStatus.Blocked && requestedBlockReason.Length == 0)
+                        return new CommanderToolResult("A blocked milestone requires 'blockReason'.");
                     if (mRef.Length > 0)
                     {
-                        var m = GrandPlans.UpdateMilestoneStatus(project.ProjectID, mRef, ParseMilestoneStatus((string?)a["milestoneStatus"]));
+                        var m = GrandPlans.UpdateMilestoneStatus(project.ProjectID, mRef, requestedMilestoneStatus,
+                            progressEvidence, requestedBlockReason, (string?)a["ownerAgentID"]);
                         results.Add(m == null ? $"No milestone matched '{mRef}'." : $"Milestone '{Trunc(m.Title, 60)}' → {m.Status}.");
                     }
-                    string cRef = ((string?)a["criterionId"] ?? "").Trim();
                     if (cRef.Length > 0)
                     {
-                        var cc = GrandPlans.SetCriterionMet(project.ProjectID, cRef, ParseBool((string?)a["criterionMet"], defaultValue: true));
+                        var cc = GrandPlans.SetCriterionMet(project.ProjectID, cRef, requestedCriterionMet, progressEvidence);
                         results.Add(cc == null ? $"No success criterion matched '{cRef}'." : $"Criterion '{Trunc(cc.Text, 60)}' → {(cc.Met ? "met" : "unmet")}.");
                     }
                     if (results.Count == 0)
                         return new CommanderToolResult("Provide milestoneId (+milestoneStatus) and/or criterionId (+criterionMet).");
                     string note = ((string?)a["note"] ?? "").Trim();
                     string msg = string.Join(" ", results);
-                    eventLog.Append(Evt(ProjectEventTypes.GrandPlanProgress, "commander", note.Length > 0 ? $"{msg} {note}" : msg));
+                    var progressEvent = Evt(ProjectEventTypes.GrandPlanProgress, "commander", note.Length > 0 ? $"{msg} {note}" : msg);
+                    progressEvent.PayloadJson = JsonConvert.SerializeObject(new { evidence = evidenceText, evidenceSequence, evidenceArtifacts });
+                    eventLog.Append(progressEvent);
+                    if (RuntimeState != null)
+                    {
+                        var approved = GrandPlans.GetCurrentApproved(project.ProjectID);
+                        var active = approved?.Content?.Milestones
+                            .Where(m => m.Status is MilestoneStatus.InProgress or MilestoneStatus.Blocked)
+                            .Select(m => m.ID).ToList() ?? new();
+                        if (active.Count == 0)
+                        {
+                            string? next = approved?.Content?.Milestones.OrderBy(m => m.Order)
+                                .FirstOrDefault(m => m.Status == MilestoneStatus.Pending)?.ID;
+                            if (next != null) active.Add(next);
+                        }
+                        RuntimeState.SetActiveMilestones(project.ProjectID, approved?.Version, active);
+                    }
                     return new CommanderToolResult(msg);
                 }
 
@@ -942,12 +1247,20 @@ namespace Omnipotent.Services.Projects
                     var v = GrandPlans.GetCurrentApproved(project.ProjectID);
                     if (v == null) return new CommanderToolResult("No approved Grand Plan yet.");
                     return new CommanderToolResult(
-                        $"GRAND PLAN v{v.Version} (approved {(v.ResolvedAt ?? v.SubmittedAt):MM-dd}):\n\n"
+                        $"GRAND PLAN v{v.Version} (approved {Data_Handling.TemporalFormat.StampWithAge(v.ResolvedAt ?? v.SubmittedAt)}):\n\n"
                         + ProjectsContextBudget.TruncateToTokens(DescribeGrandPlanForModel(v), 2500));
                 }
 
                 case "complete_project":
                 {
+                    if (GrandPlans != null)
+                    {
+                        var issues = GrandPlans.GetCompletionReadinessIssues(project.ProjectID);
+                        if (issues.Count > 0)
+                            return new CommanderToolResult("Project is not ready for completion:\n- " +
+                                string.Join("\n- ", issues.Take(20)) +
+                                "\nUpdate milestones/criteria with evidence before requesting completion.");
+                    }
                     // Completing is consequential and irreversible-ish: gate it.
                     var gate = new ProjectGate
                     {
@@ -1003,6 +1316,20 @@ namespace Omnipotent.Services.Projects
             if (res.Decision == GateDecision.Approve)
             {
                 GrandPlans.MarkApproved(project.ProjectID, version.Version, gate.GateID, res.Comment);
+                if (RuntimeState != null)
+                {
+                    var approved = GrandPlans.GetCurrentApproved(project.ProjectID);
+                    var active = approved?.Content?.Milestones
+                        .Where(m => m.Status is MilestoneStatus.InProgress or MilestoneStatus.Blocked)
+                        .Select(m => m.ID).ToList() ?? new();
+                    if (active.Count == 0)
+                    {
+                        string? first = approved?.Content?.Milestones.OrderBy(m => m.Order)
+                            .FirstOrDefault(m => m.Status == MilestoneStatus.Pending)?.ID;
+                        if (first != null) active.Add(first);
+                    }
+                    RuntimeState.SetActiveMilestones(project.ProjectID, version.Version, active);
+                }
                 var approvedEvt = Evt(ProjectEventTypes.GrandPlanApproved, "klives",
                     $"Grand Plan v{version.Version} approved by Klives.{(string.IsNullOrWhiteSpace(res.Comment) ? "" : $" \"{Trunc(res.Comment, 160)}\"")}");
                 approvedEvt.PayloadJson = JsonConvert.SerializeObject(new { version = version.Version });
@@ -1026,6 +1353,50 @@ namespace Omnipotent.Services.Projects
 
         private static bool ParseBool(string? v, bool defaultValue) =>
             string.IsNullOrWhiteSpace(v) ? defaultValue : v.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
+
+        private static DateTime? ParseUtc(string? value) =>
+            DateTime.TryParse(value, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
+                ? parsed.ToUniversalTime() : null;
+
+        private static List<ProjectEvidenceReference> BuildCheckpointEvidence(JObject a)
+        {
+            string reference = ((string?)a["evidenceReference"] ?? "").Trim();
+            long? sequence = (long?)a["evidenceEventSequence"];
+            if (reference.Length == 0 && !sequence.HasValue) return new();
+            string rawKind = ((string?)a["evidenceKind"] ?? "other").Trim().Replace("_", "", StringComparison.Ordinal).ToLowerInvariant();
+            var kind = rawKind switch
+            {
+                "event" => ProjectEvidenceKind.Event,
+                "artifact" => ProjectEvidenceKind.Artifact,
+                "projectfile" => ProjectEvidenceKind.ProjectFile,
+                "toolresult" => ProjectEvidenceKind.ToolResult,
+                "externalobservation" => ProjectEvidenceKind.ExternalObservation,
+                "userconfirmation" => ProjectEvidenceKind.UserConfirmation,
+                _ => ProjectEvidenceKind.Other,
+            };
+            return new List<ProjectEvidenceReference>
+            {
+                new()
+                {
+                    Kind = kind,
+                    Reference = reference.Length > 0 ? reference : $"event-sequence:{sequence}",
+                    EventSequence = sequence,
+                }
+            };
+        }
+
+        private static ProjectBlockerCategory ParseBlockerCategory(string? value) =>
+            (value ?? "").Trim().Replace("_", "", StringComparison.Ordinal).ToLowerInvariant() switch
+            {
+                "approval" => ProjectBlockerCategory.Approval,
+                "budget" => ProjectBlockerCategory.Budget,
+                "externaldependency" => ProjectBlockerCategory.ExternalDependency,
+                "capacity" => ProjectBlockerCategory.Capacity,
+                "configuration" => ProjectBlockerCategory.Configuration,
+                "manualintervention" => ProjectBlockerCategory.ManualIntervention,
+                "invariantviolation" => ProjectBlockerCategory.InvariantViolation,
+                _ => ProjectBlockerCategory.Unknown,
+            };
 
         private static MilestoneStatus ParseMilestoneStatus(string? s) =>
             (s ?? "").Trim().ToLowerInvariant().Replace('-', '_').Replace(' ', '_') switch
@@ -1082,6 +1453,9 @@ namespace Omnipotent.Services.Projects
                     Detail = ((string?)m?["detail"] ?? "").Trim(),
                     Target = target.Length == 0 ? null : target,
                     Status = ParseMilestoneStatus((string?)m?["status"]),
+                    DependsOn = (m?["dependsOn"] as JArray)?.Values<string>()
+                        .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()).ToList() ?? new(),
+                    OwnerAgentID = string.IsNullOrWhiteSpace((string?)m?["ownerAgentID"]) ? null : ((string?)m?["ownerAgentID"])!.Trim(),
                 });
             }
             foreach (var r in (a["risks"] as JArray) ?? new JArray())
@@ -1299,7 +1673,7 @@ namespace Omnipotent.Services.Projects
 
         private string VolumeRoot()
         {
-            string dir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsVolumesDirectory), project.ProjectID);
+            string dir = ProjectWorkspaceLocator.HostRoot(project.ProjectID);
             Directory.CreateDirectory(dir);
             return Path.GetFullPath(dir);
         }

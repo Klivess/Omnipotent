@@ -88,6 +88,13 @@ namespace Omnipotent.Services.KliveAgent
             new("GetAgentStats", "Return today's KliveAgent run-time stats. Top-level: lifetimeScriptsRun, lifetimeScriptFailures, lifetimeScriptFailureRatePct, todayUtcDate, fullSummary. fullSummary contains nested objects: lifetime{messages,promptTokens,completionTokens,totalTokens,iterations,scripts,scriptFailures,scriptSuccessRatePct,...}, today{messages,promptTokens,completionTokens,totalTokens,scripts,scriptFailures,scriptFailureRatePct,...} (today is null on a fresh day before any activity), and dailyHistory[] with the same per-day shape. Access nested values via JSON serialization or GetObjectMember chains.")
         ];
 
+        private static readonly PromptToolDescriptor[] TemporalTools =
+        [
+            new("ScheduleTask", "PROSPECTIVE MEMORY: ScheduleTask(instruction, dueAt, repeatEvery?) schedules a FULL future agent turn — at dueAt (\"in 2h30m\" or a UTC date-time) your instruction fires with all tools and the outcome goes to Klives. Use for anything that must happen later; never just promise future action in prose."),
+            new("ListScheduledTasks", "List active scheduled tasks (due times + ages) and recent completed/cancelled ones."),
+            new("CancelScheduledTask", "Cancel an active scheduled task by id or short-id prefix.")
+        ];
+
         private static readonly PromptToolDescriptor[] KnowledgeTools =
         [
             new("SearchKnowledge", "Search Klives' whole cross-system knowledge base (past Projects, your conversations & memories, Omniscience facts, repo docs, cached web) by free-text query. Returns cited snippets with doc ids. Use for \"have we done/decided this before\" and \"what do we know about X\" questions."),
@@ -215,6 +222,13 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature, and each FIELD reports its live state: .IsNull (true/false) and .RuntimeType (actual type when it differs from declared). So check m.IsNull BEFORE diving into a field — don't discover nulls via NullReferenceException. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
             sb.AppendLine("- DSharpPlus live objects cache STALE/empty collections (DiscordGuild.Channels, GuildContainingKlives.Channels). For authoritative data use the async accessors: var g = await CallObjectMethod(GetObjectMember(GetService(\"KliveBotDiscord\"),\"Client\"), \"GetGuildAsync\", guildId, (bool?)null); then await CallObjectMethod(g, \"GetChannelsAsync\"). The live client field is 'Client', NOT 'botClient'.");
             sb.AppendLine("- Final answer = a reply that runs NO scripts (no execute_csharp call and no {{{ }}} block). Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
+            sb.AppendLine();
+
+            sb.AppendLine("[Time]");
+            sb.AppendLine("- Every message, tool result and history line you see is stamped [yyyy-MM-dd HH:mm(:ss) UTC] with the moment it happened; the [Now: ...] line at the top of the turn is the current wall-clock. Memories show when they were saved. ALL stamps are UTC.");
+            sb.AppendLine("- USE the stamps: your knowledge cutoff is NOT today's date — today is whatever the newest stamp says. Reason explicitly about elapsed time (how old a memory/error/message is, how long a wait or script took, whether data is stale) instead of assuming everything is current. When saving memories or reporting events, state absolute dates rather than 'today'/'yesterday', so the fact stays true when read later.");
+            sb.AppendLine("- YOU CAN ACT IN THE FUTURE: schedule_task fires a full agent turn (all tools) at a due time — one-shot or recurring — and reports the outcome to Klives; it survives restarts. Any commitment beyond this turn (\"I'll check later\", \"remind Klive tomorrow\", periodic monitoring) MUST become a schedule_task, never a bare promise. wait_for is only for waits WITHIN this turn.");
+            sb.AppendLine("- SEARCH TIME WINDOWS: recall_memories(since:/until:) scopes memory to a period (\"7d\", \"2026-07-01\") — use it for 'what happened/what did I learn in <period>' questions.");
             sb.AppendLine();
 
             sb.AppendLine("[Common Patterns]");
@@ -476,7 +490,8 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
             "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
-            "account_list", "account_register"
+            "account_list", "account_register",
+            "schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"
         };
 
         /// <summary>Computer-use ("host control") tools: dispatched outside Roslyn to HostControlManager,
@@ -514,7 +529,7 @@ namespace Omnipotent.Services.KliveAgent
             "grep" or "read_file" or "list_directory" or "get_global_path"
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
                 or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch"
-                or "account_list" => true,
+                or "account_list" or "list_scheduled_tasks" => true,
             _ => false
         };
 
@@ -607,8 +622,35 @@ namespace Omnipotent.Services.KliveAgent
 
                 Tool("recall_memories",
                     "Search your long-term memory for facts about Klive, his preferences/people/projects/history, " +
-                    "past decisions, or your own prior conclusions. Call this FIRST for any question not purely about the codebase.",
-                    new { type = "object", properties = new { query = new { type = "string", description = "Free-text search query." }, maxResults = new { type = "integer", description = "Max memories to return (default 10)." } }, required = new[] { "query" } }),
+                    "past decisions, or your own prior conclusions. Call this FIRST for any question not purely about the codebase. " +
+                    "For time-window questions (\"what did I learn last week\"), pass since/until; with an empty query they browse the window newest-first.",
+                    new { type = "object", properties = new {
+                        query = new { type = "string", description = "Free-text search query (may be empty when browsing a time window)." },
+                        maxResults = new { type = "integer", description = "Max memories to return (default 10)." },
+                        since = new { type = "string", description = "Optional window start: UTC date-time (\"2026-07-01\") or lookback (\"7d\", \"24h\")." },
+                        until = new { type = "string", description = "Optional window end: UTC date-time or lookback." }
+                    }, required = new[] { "query" } }),
+
+                Tool("schedule_task",
+                    "PROSPECTIVE MEMORY — schedule your future self to ACT. At dueAt, a full agent turn fires with your instruction " +
+                    "and every tool available, and the outcome is reported to Klives. Survives restarts (a missed task fires late, flagged as late). " +
+                    "Use for anything that must happen LATER: reminders, follow-ups, checks, recurring routines. Do NOT use wait_for for waits " +
+                    "beyond this turn, and never just PROMISE future action in prose — schedule it.",
+                    new { type = "object", properties = new {
+                        instruction = new { type = "string", description = "What your future self must do, self-contained (it won't remember this turn unless the task fires in this conversation)." },
+                        dueAt = new { type = "string", description = "When to fire: relative (\"in 2h30m\", \"45m\") or absolute UTC (\"2026-07-15 09:00\"; a bare time like \"09:00\" means the next occurrence)." },
+                        repeatEvery = new { type = "string", description = "Optional recurrence interval (\"1d\", \"2h30m\"); minimum 5m. Omit for one-shot." }
+                    }, required = new[] { "instruction", "dueAt" } }),
+
+                Tool("list_scheduled_tasks",
+                    "List your active scheduled tasks (due times + ages + recurrence) and recent completed/cancelled ones.",
+                    new { type = "object", properties = new { } }),
+
+                Tool("cancel_scheduled_task",
+                    "Cancel an active scheduled task by id (or short-id prefix from list_scheduled_tasks).",
+                    new { type = "object", properties = new {
+                        id = new { type = "string", description = "The task id or short-id prefix." }
+                    }, required = new[] { "id" } }),
 
                 Tool("recall_memories_by_tag",
                     "Return all memories tagged with an exact tag (case-insensitive). Prefer over recall_memories when filtering by a known tag.",
@@ -889,7 +931,7 @@ namespace Omnipotent.Services.KliveAgent
                     return await globals.RegisterAccount(service, username, Str("email"), secrets, Str("description"), BoolOr("allowDuplicate", false), Str("reason"));
                 }
                 case "recall_memories":
-                    return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10)));
+                    return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10), Str("since"), Str("until")));
                 case "recall_memories_by_tag":
                     return FormatMemoriesResult(await globals.RecallMemoriesByTag(Str("tag") ?? string.Empty));
                 case "save_memory":
@@ -897,17 +939,33 @@ namespace Omnipotent.Services.KliveAgent
                     var content = Str("content");
                     if (string.IsNullOrWhiteSpace(content)) return "Error: 'content' is required.";
                     var id = await globals.SaveMemory(content, Strs("tags"), IntOr("importance", 1));
-                    return $"Saved memory {id}.";
+                    return $"Saved memory {id} at {Data_Handling.TemporalFormat.NowStamp()}.";
                 }
                 case "save_shortcut":
                 {
                     var title = Str("title"); var content = Str("content");
                     if (string.IsNullOrWhiteSpace(title) || string.IsNullOrWhiteSpace(content)) return "Error: 'title' and 'content' are both required.";
                     var id = await globals.SaveShortcut(title, content, Strs("tags"));
-                    return $"Saved shortcut {id}.";
+                    return $"Saved shortcut {id} at {Data_Handling.TemporalFormat.NowStamp()}.";
                 }
                 case "get_shortcuts":
                     return await globals.GetShortcuts();
+                case "schedule_task":
+                {
+                    var instruction = Str("instruction");
+                    var dueAt = Str("dueAt") ?? Str("due_at") ?? Str("when");
+                    if (string.IsNullOrWhiteSpace(instruction)) return "Error: 'instruction' is required.";
+                    if (string.IsNullOrWhiteSpace(dueAt)) return "Error: 'dueAt' is required (e.g. \"in 2h\" or \"2026-07-15 09:00\").";
+                    return await globals.ScheduleTask(instruction, dueAt, Str("repeatEvery") ?? Str("repeat_every"));
+                }
+                case "list_scheduled_tasks":
+                    return globals.ListScheduledTasks();
+                case "cancel_scheduled_task":
+                {
+                    var id = Str("id") ?? Str("taskId");
+                    if (string.IsNullOrWhiteSpace(id)) return "Error: 'id' is required.";
+                    return await globals.CancelScheduledTask(id);
+                }
                 case "delete_memory":
                 {
                     var id = Str("id") ?? Str("idOrShortId");
@@ -928,7 +986,7 @@ namespace Omnipotent.Services.KliveAgent
             {
                 var shortId = !string.IsNullOrEmpty(m.Id) && m.Id.Length >= 8 ? m.Id.Substring(0, 8) : m.Id;
                 var tags = m.Tags != null && m.Tags.Count > 0 ? $"  (#{string.Join(" #", m.Tags)})" : string.Empty;
-                sb.AppendLine($"[{shortId}] {m.Content}{tags}");
+                sb.AppendLine($"[{shortId} · saved {Data_Handling.TemporalFormat.StampWithAge(m.CreatedAt)}] {m.Content}{tags}");
             }
             return sb.ToString().TrimEnd();
         }
@@ -1128,6 +1186,10 @@ namespace Omnipotent.Services.KliveAgent
             try
             {
                 var turnStopwatch = System.Diagnostics.Stopwatch.StartNew();
+                // Receipt time of the user's message, captured NOW: a long agentic turn can run for
+                // minutes, and the stored history timestamp should say when Klive spoke, not when
+                // the turn finished.
+                var messageReceivedAtUtc = DateTime.UtcNow;
                 // Accumulates the agent's conversational prose across iterations so the user can be
                 // shown it "talking" (via onProgress) while its scripts are still running.
                 var progressText = new StringBuilder();
@@ -1183,7 +1245,10 @@ namespace Omnipotent.Services.KliveAgent
                 // Thread the per-run cancellation token into ScriptGlobals so a manual Stop or the stall
                 // watchdog also unwinds a script that is mid-execution (ExecuteAsync links this token with
                 // its own per-script timeout).
-                var sharedGlobals = new ScriptGlobals(agentService, cancellationToken);
+                var sharedGlobals = new ScriptGlobals(agentService, cancellationToken)
+                {
+                    ConversationId = conversation.ConversationId,
+                };
                 var scriptSession = scriptEngine.CreateSession(sharedGlobals);
 
                 // Per-script hard timeout. A script that overruns this is abandoned so the agent never
@@ -1323,7 +1388,7 @@ namespace Omnipotent.Services.KliveAgent
                         ? partial + "\n\n_(Run stopped before completion.)_"
                         : "_(Run stopped before completion — no output was produced yet.)_";
                     try { llm.ResetSession(llmSessionId); } catch { }
-                    conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
+                    conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage, Timestamp = messageReceivedAtUtc });
                     conversation.Messages.Add(new AgentMessage
                     {
                         Role = AgentMessageRole.Agent,
@@ -1607,7 +1672,7 @@ namespace Omnipotent.Services.KliveAgent
 
                         llm.ResetSession(llmSessionId);
 
-                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage });
+                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage, Timestamp = messageReceivedAtUtc });
                         conversation.Messages.Add(new AgentMessage
                         {
                             Role = AgentMessageRole.Agent,
@@ -1951,6 +2016,10 @@ namespace Omnipotent.Services.KliveAgent
         {
             var sb = new StringBuilder();
 
+            // Per-turn clock: the one line that anchors "now" for this whole turn. History lines
+            // below carry their own stamps so the model can measure gaps against this.
+            sb.AppendLine($"[Now: {Data_Handling.TemporalFormat.ClockLine()}]");
+
             if (!string.IsNullOrEmpty(senderName))
             {
                 sb.AppendLine($"[Current User: {senderName}]");
@@ -1990,7 +2059,7 @@ namespace Omnipotent.Services.KliveAgent
                     foreach (var msg in historyMessages)
                     {
                         var role = msg.Role == AgentMessageRole.User ? "User" : "KliveAgent";
-                        sb.AppendLine($"{role}: {msg.Content}");
+                        sb.AppendLine($"[{Data_Handling.TemporalFormat.StampMinute(msg.Timestamp)}] {role}: {msg.Content}");
 
                         if (scriptCarryingTurns.Contains(msg))
                         {
@@ -2077,7 +2146,7 @@ namespace Omnipotent.Services.KliveAgent
                 var user = allMessages[i];
                 var agent = (i + 1 < firstRetainedIdx && allMessages[i + 1].Role == AgentMessageRole.Agent)
                     ? allMessages[i + 1] : null;
-                earlierTurns.Add($"- {TruncateForMemory(user.Content ?? string.Empty, 90)}"
+                earlierTurns.Add($"- [{Data_Handling.TemporalFormat.StampMinute(user.Timestamp)}] {TruncateForMemory(user.Content ?? string.Empty, 90)}"
                     + (agent != null ? $" → {TruncateForMemory(agent.Content ?? string.Empty, 90)}" : string.Empty));
             }
             if (earlierTurns.Count == 0) return string.Empty;
@@ -2151,11 +2220,17 @@ namespace Omnipotent.Services.KliveAgent
             // text-protocol fallback it's the ScriptGlobals C# methods.
             if (toolCallingMode)
                 sb.AppendLine("Memory (NATIVE TOOLS — call these directly as tool calls, NEVER via execute_csharp): "
-                    + "recall_memories(query, maxResults?) — search memory (do this FIRST for non-code questions); "
+                    + "recall_memories(query, maxResults?, since?, until?) — search memory (do this FIRST for non-code questions; since/until take \"7d\" or a UTC date for time-window recall); "
                     + "recall_memories_by_tag(tag); save_memory(content, tags?, importance?); "
                     + "save_shortcut(title, content, tags?); get_shortcuts(); delete_memory(id).");
             else
                 AppendToolNames(sb, "Memory", MemoryTools);
+
+            // Prospective memory (always surfaced): the agent's ability to act at a FUTURE time.
+            if (toolCallingMode)
+                sb.AppendLine("Time (NATIVE TOOLS): schedule_task(instruction, dueAt, repeatEvery?) — PROSPECTIVE MEMORY: fires a FULL future agent turn (all tools) at dueAt and reports the outcome to Klives; use it for anything that must happen later (reminders, follow-ups, recurring checks) instead of promising in prose. list_scheduled_tasks(); cancel_scheduled_task(id).");
+            else
+                AppendToolNames(sb, "Time", TemporalTools);
 
             // Cross-system knowledge retrieval (always surfaced): reaches other Projects, Omniscience,
             // repo docs and cached web that plain memory/codebase search can't.

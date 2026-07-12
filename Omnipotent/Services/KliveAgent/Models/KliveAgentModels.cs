@@ -587,6 +587,50 @@ namespace Omnipotent.Services.KliveAgent.Models
         public string ErrorMessage { get; set; }
     }
 
+    /// <summary>
+    /// A future intention — KliveAgent's prospective memory. At the due time the scheduler fires a
+    /// FULL agent turn carrying <see cref="Instruction"/>, so the agent acts (with all its tools)
+    /// rather than merely being reminded. One-shot tasks keep their record after firing (Enabled
+    /// false) as an audit trail; recurring tasks advance DueAtUtc past now after each firing.
+    /// </summary>
+    public class AgentScheduledTask
+    {
+        [JsonProperty("id")]
+        public string Id { get; set; } = Guid.NewGuid().ToString("N");
+
+        /// <summary>What to do when the task fires — phrased as an instruction to the agent's future self.</summary>
+        [JsonProperty("instruction")]
+        public string Instruction { get; set; } = "";
+
+        [JsonProperty("dueAtUtc")]
+        public DateTime DueAtUtc { get; set; }
+
+        /// <summary>Null = one-shot. Otherwise the task re-fires every interval (min 5 minutes).</summary>
+        [JsonProperty("repeatEvery")]
+        public TimeSpan? RepeatEvery { get; set; }
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        /// <summary>Conversation the task was scheduled from; the firing turn runs there for continuity.</summary>
+        [JsonProperty("conversationId")]
+        public string ConversationId { get; set; }
+
+        /// <summary>False once a one-shot has fired or the task was cancelled.</summary>
+        [JsonProperty("enabled")]
+        public bool Enabled { get; set; } = true;
+
+        [JsonProperty("lastFiredAt")]
+        public DateTime? LastFiredAt { get; set; }
+
+        [JsonProperty("firedCount")]
+        public int FiredCount { get; set; }
+
+        /// <summary>Truncated final answer of the most recent firing (or "cancelled").</summary>
+        [JsonProperty("lastOutcome")]
+        public string LastOutcome { get; set; }
+    }
+
     public class AgentMemoryEntry
     {
         [JsonProperty("id")]

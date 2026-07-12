@@ -71,5 +71,13 @@ namespace Omnipotent.Services.Projects.Stimulus
         public string? Verdict { get; set; }
         /// <summary>Agent this envelope is addressed to; stamped by the queue at enqueue time.</summary>
         public string DestinationAgentID { get; set; } = "commander";
+        /// <summary>Machine-readable wake semantics. Payload remains evidence for the model; these
+        /// fields decide whether it is still applicable before any agent sees it.</summary>
+        public ProjectWakeTriggerKind TriggerKind { get; set; } = ProjectWakeTriggerKind.Stimulus;
+        public List<ProjectExecutionDisposition> AllowedDispositions { get; set; } = new();
+        public long? ExpectedCheckpointRevision { get; set; }
+        public int? ExpectedGrandPlanVersion { get; set; }
+        public List<string> RequiredActiveMilestoneIDs { get; set; } = new();
+        public bool DiscardWhenInapplicable { get; set; }
     }
 }

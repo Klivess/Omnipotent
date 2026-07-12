@@ -22,6 +22,10 @@ namespace Omnipotent.Services.KliveAgent
 
         public CancellationToken CancellationToken { get; set; }
 
+        /// <summary>The conversation this turn runs in (set by the brain). Scheduled tasks created
+        /// here fire back into the same conversation so the future turn has its context.</summary>
+        public string? ConversationId { get; set; }
+
         public ScriptGlobals(KliveAgent agentService, CancellationToken cancellationToken = default)
         {
             this.agentService = agentService;
@@ -939,15 +943,43 @@ namespace Omnipotent.Services.KliveAgent
             if (shortcuts.Count == 0) return "No shortcuts saved yet.";
             var sb = new StringBuilder();
             foreach (var sc in shortcuts)
-                sb.AppendLine($"[{sc.Title ?? "Untitled"}] {sc.Content}");
+                sb.AppendLine($"[{sc.Title ?? "Untitled"} · saved {Data_Handling.TemporalFormat.StampWithAge(sc.CreatedAt)}] {sc.Content}");
             return sb.ToString();
         }
 
-        /// <summary>Search persistent memories. Searches both content and tags as text — passing a tag name works.</summary>
-        public async Task<List<AgentMemoryEntry>> RecallMemories(string query, int maxResults = 10)
+        /// <summary>Search persistent memories. Searches both content and tags as text — passing a tag name works.
+        /// Optional since/until narrow the search to a time window: a UTC date-time ("2026-07-01") or a
+        /// lookback duration ("7d", "24h") meaning that long ago.</summary>
+        public async Task<List<AgentMemoryEntry>> RecallMemories(string query, int maxResults = 10, string? since = null, string? until = null)
         {
             agentService.Stats?.RecordMemoryActivity(saves: 0, recalls: 1);
-            return await agentService.Memory.RecallMemoriesAsync(query, maxResults);
+            var now = DateTime.UtcNow;
+            DateTime? sinceUtc = Data_Handling.TemporalParse.TryParsePastInstant(since, now, out var s) ? s : null;
+            DateTime? untilUtc = Data_Handling.TemporalParse.TryParsePastInstant(until, now, out var u) ? u : null;
+            return await agentService.Memory.RecallMemoriesAsync(query, maxResults, sinceUtc, untilUtc);
+        }
+
+        /// <summary>
+        /// PROSPECTIVE MEMORY: schedule your future self to act. At dueAt ("in 2h30m", "45m", or a UTC
+        /// date-time like "2026-07-15 09:00") a FULL agent turn fires with your instruction and every
+        /// tool available; the outcome is reported to Klives. Optional repeatEvery ("1d", "2h") makes it
+        /// recurring. Survives restarts (a missed task fires late with an explicit lateness note).
+        /// Use this — not a promise in prose — whenever work must happen at a later time.
+        /// </summary>
+        public async Task<string> ScheduleTask(string instruction, string dueAt, string? repeatEvery = null)
+        {
+            if (agentService.Scheduler == null) return "Scheduler unavailable.";
+            return await agentService.Scheduler.ScheduleAsync(instruction, dueAt, repeatEvery, ConversationId);
+        }
+
+        /// <summary>List active scheduled tasks (with due times and ages) plus recent completed/cancelled ones.</summary>
+        public string ListScheduledTasks() => agentService.Scheduler?.Describe() ?? "Scheduler unavailable.";
+
+        /// <summary>Cancel an active scheduled task by its id (or short-id prefix from ListScheduledTasks).</summary>
+        public async Task<string> CancelScheduledTask(string idOrPrefix)
+        {
+            if (agentService.Scheduler == null) return "Scheduler unavailable.";
+            return await agentService.Scheduler.CancelAsync(idOrPrefix);
         }
 
         /// <summary>Return all memories whose Tags collection contains the given tag (case-insensitive). Use this for exact tag filtering instead of RecallMemories.</summary>

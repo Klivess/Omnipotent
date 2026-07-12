@@ -52,6 +52,9 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public Func<string, string>? DescribeFiles;
 
+        /// <summary>Machine-owned typed checkpoint/runtime state, seeded ahead of narrative digest.</summary>
+        public Func<string, string>? DescribeRuntimeState;
+
         /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
@@ -105,7 +108,14 @@ namespace Omnipotent.Services.Projects
                 try { files = DescribeFiles(project.ProjectID); } catch { files = null; }
             }
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription, knowledge, observables, grandPlan, accounts, files);
+            string? runtimeState = null;
+            if (DescribeRuntimeState != null)
+            {
+                try { runtimeState = DescribeRuntimeState(project.ProjectID); } catch { runtimeState = null; }
+            }
+
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription,
+                knowledge, observables, grandPlan, accounts, files, runtimeState);
         }
 
         private static string Truncate(string s, int max) =>

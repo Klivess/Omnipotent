@@ -35,7 +35,23 @@ namespace Omnipotent.Services.ComputerControl
         public bool SupportsMotionFrames { get; init; }
         public IReadOnlySet<string> SupportedTools { get; init; } = new HashSet<string>(StringComparer.Ordinal);
 
-        public bool Supports(string toolName) => SupportedTools.Count == 0 || SupportedTools.Contains(toolName);
+        public bool Supports(string toolName)
+        {
+            // A non-empty set is an explicit allow-list. When a controller relies on the
+            // capability flags instead, derive the optional surface from those flags instead
+            // of accidentally advertising every tool.
+            if (SupportedTools.Count > 0) return SupportedTools.Contains(toolName);
+            return toolName switch
+            {
+                "computer_find_text" or "computer_click_text" => SupportsOcr,
+                "computer_open_browser" or "computer_navigate" or "computer_browser_inspect" => SupportsBrowserControl,
+                "computer_focus_window" => SupportsWindowControl,
+                "computer_clipboard_get" or "computer_clipboard_set" => SupportsClipboard,
+                "computer_launch_app" => SupportsAppLaunch,
+                "computer_terminal" => SupportsTerminalExecution,
+                _ => true,
+            };
+        }
     }
 
     public sealed record ComputerActionRequest(string ToolName, string ArgumentsJson = "{}", string? ActorId = null, string? WakeId = null);
@@ -444,8 +460,8 @@ namespace Omnipotent.Services.ComputerControl
                 Tool("computer_move", "Move pointer to screenshot coordinates.", Obj(new { x = Num("X pixel"), y = Num("Y pixel") }, "x", "y")),
                 Tool("computer_click", "Click screenshot coordinates after observing them.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right"), clicks = Num("1 or 2"), modifiers = stringArray }, "x", "y")),
                 Tool("computer_drag", "Drag between screenshot coordinates.", Obj(new { fromX = Num("Start X"), fromY = Num("Start Y"), toX = Num("End X"), toY = Num("End Y"), button = Str("left | middle | right"), modifiers = stringArray }, "fromX", "fromY", "toX", "toY")),
-                Tool("computer_mouse_down", "Press and hold a mouse button.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right") })),
-                Tool("computer_mouse_up", "Release a held mouse button.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right") })),
+                Tool("computer_mouse_down", "Press and hold a mouse button.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right") }, "x", "y")),
+                Tool("computer_mouse_up", "Release a held mouse button.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right") }, "x", "y")),
                 Tool("computer_scroll", "Scroll a pane, then observe its changed state.", Obj(new { direction = Str("up | down | left | right"), amount = Num("notches"), x = Num("optional X"), y = Num("optional Y") })),
                 Tool("computer_type", "Type at current focus. Vault placeholders are resolved only at input time and never returned.", Obj(new { text = Str("Text to type") }, "text")),
                 Tool("computer_key", "Press a key or chord. Supports key/keys, repeats, and holdMs.", Obj(new { key = Str("key or ctrl+l chord"), keys = stringArray, repeats = Num("repeat count"), holdMs = Num("hold duration") })),
@@ -455,6 +471,7 @@ namespace Omnipotent.Services.ComputerControl
                 Tool("computer_wait", "Wait for visual change or a stable UI. maxMs is preferred; ms remains accepted for compatibility.", Obj(new { maxMs = Num("maximum wait milliseconds"), ms = Num("compatibility alias"), untilImageChange = new { type = "boolean" }, untilText = Str("visible text to wait for") })),
                 Tool("computer_open_browser", "Open or focus the real browser and return an observed frame.", Obj(new { url = Str("optional URL") })),
                 Tool("computer_navigate", "Navigate the real browser by URL, wait for the page to settle, then observe.", Obj(new { url = Str("absolute URL") }, "url")),
+                Tool("computer_browser_inspect", "Inspect the isolated browser structurally instead of guessing from pixels. Returns tabs, DOM text/links/forms, accessibility nodes, or recent network resource timings from the live authenticated page.", Obj(new { mode = Str("tabs | dom | accessibility | network (default dom)"), maxItems = Num("Maximum structured items, 1-200; default 80") })),
                 Tool("computer_focus_window", "Focus a window by title or process where supported.", Obj(new { titleContains = Str("title fragment"), processName = Str("process name") })),
                 Tool("computer_launch_app", "Launch an allowlisted GUI application and observe it.", Obj(new { path = Str("application"), shellName = Str("known application"), args = Str("arguments") })),
                 Tool("computer_clipboard_get", "Read clipboard text where supported.", Obj(new { })),

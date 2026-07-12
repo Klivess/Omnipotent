@@ -84,7 +84,13 @@ namespace Omnipotent.Tests.Projects
         public async Task SubmitGrandPlan_Denied_NoActivation_VersionRejected()
         {
             var s = NewSetup(ProjectStatus.Planning);
-            string args = JsonConvert.SerializeObject(new { mission = "plan", summary = "sum" });
+            string args = JsonConvert.SerializeObject(new
+            {
+                mission = "plan",
+                milestones = new[] { new { title = "Deliver the result" } },
+                successCriteria = new[] { new { text = "Result verified" } },
+                summary = "sum"
+            });
             var task = s.Tools.DispatchAsync("submit_grand_plan", args, CancellationToken.None);
 
             var gate = await WaitForGateAsync(s.Gates, s.Project.ProjectID);
@@ -105,7 +111,15 @@ namespace Omnipotent.Tests.Projects
             s.GrandPlans.SubmitVersion(s.Project.ProjectID, new GrandPlanContent { Mission = "v1" }, "s1", null, material: true, "w0");
             s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
 
-            string args = JsonConvert.SerializeObject(new { mission = "v2 tactical", summary = "s2", changeNote = "tweak", material = "false" });
+            string args = JsonConvert.SerializeObject(new
+            {
+                mission = "v2 tactical",
+                milestones = new[] { new { title = "Tactical delivery" } },
+                successCriteria = new[] { new { text = "Delivery verified" } },
+                summary = "s2",
+                changeNote = "tweak",
+                material = "false"
+            });
             var result = await s.Tools.DispatchAsync("amend_grand_plan", args, CancellationToken.None);
 
             Assert.Contains("non-material", result.ResultText, StringComparison.OrdinalIgnoreCase);
@@ -127,7 +141,15 @@ namespace Omnipotent.Tests.Projects
             s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
 
             var r = await s.Tools.DispatchAsync("update_plan_progress",
-                JsonConvert.SerializeObject(new { milestoneId = "m1", milestoneStatus = "done", criterionId = "c1", criterionMet = "true" }),
+                JsonConvert.SerializeObject(new
+                {
+                    milestoneId = "m1",
+                    milestoneStatus = "done",
+                    criterionId = "c1",
+                    criterionMet = "true",
+                    evidence = "Verified by project test result event 42",
+                    evidenceEventSequence = 42,
+                }),
                 CancellationToken.None);
 
             Assert.Contains("Alpha", r.ResultText);

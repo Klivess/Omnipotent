@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using System.Net;
@@ -363,6 +364,30 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 catch (Exception ex)
                 {
+                    // A client that hung up mid-response surfaces as HttpListenerException
+                    // ("nonexistent network connection"), IOException, or a disposed/socket
+                    // error. That's the caller's doing, not a server fault: the connection
+                    // is already gone, so log it quietly (no stack-trace spam) and don't
+                    // attempt the doomed 500 write. Keeping it distinct stops benign
+                    // disconnects from masking real errors in the log.
+                    bool clientGone = ex is HttpListenerException
+                        || ex is System.IO.IOException
+                        || ex is ObjectDisposedException
+                        || ex is System.Net.Sockets.SocketException;
+
+                    if (clientGone)
+                    {
+                        _ = ParentService.ServiceLog($"Client disconnected before response completed for route: " +
+                            $"{context.Request?.RawUrl} ({ex.GetType().Name}: {ex.Message})");
+                        if (capture != null)
+                        {
+                            capture.StatusCode = (int)HttpStatusCode.InternalServerError;
+                            capture.Body = Encoding.UTF8.GetBytes("Client disconnected.");
+                            capture.Completed = true;
+                        }
+                        return;
+                    }
+
                     ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
                     if (capture != null)
                     {
@@ -513,6 +538,22 @@ namespace Omnipotent.Services.KliveAPI
         private volatile bool cacheEnabled;
         private volatile string[] cacheDenylistPrefixes = Array.Empty<string>();
 
+        // ── Watchdog diagnostics ──
+        // Temporary instrumentation to find why /ping can cross the watchdog's 10s
+        // timeout while the rest of the process keeps logging. These are cheap, lock-free
+        // signals sampled when a ping fails so the failure category is unambiguous:
+        //   • _pingsServed advancing during a failed window  => server answered, the
+        //     watchdog's own continuation was starved (thread-pool), not the API.
+        //   • _pingsServed flat + stale last-accept          => listen loop wedged / listener down.
+        //   • high _inFlightRequests + slow-request logs      => a real handler is hogging the pipeline.
+        private long _pingsServed;
+        private int _inFlightRequests;
+        private long _lastContextAcceptedUtcTicks;
+        private long _lastRequestCompletedUtcTicks;
+        // Requests slower than this get a one-line log with a runtime-health snapshot.
+        private const int SlowRequestLogThresholdMs = 3000;
+        private Thread? _healthHeartbeatThread;
+
         private CertificateInstaller certInstaller;
         public KliveAPI()
         {
@@ -563,6 +604,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 StartWatchdog();
                 StartResponseCacheConfigWatcher();
+                StartHealthHeartbeat();
             }
             catch (Exception ex)
             {
@@ -635,6 +677,10 @@ namespace Omnipotent.Services.KliveAPI
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
             await CreateRoute("/ping", async (req) =>
             {
+                // Counts pings the handler actually served — the watchdog compares this
+                // across a failed ping to tell "server answered but client starved" apart
+                // from "server never processed it".
+                Interlocked.Increment(ref _pingsServed);
                 await req.ReturnResponse("Pong", "text/html");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
             await CreateRoute("/", async (req) =>
@@ -924,6 +970,7 @@ namespace Omnipotent.Services.KliveAPI
                     continue;
                 }
 
+                long pingsBefore = Interlocked.Read(ref _pingsServed);
                 try
                 {
                     var response = await client.GetAsync($"http://127.0.0.1:{apiHTTPPORT}/ping");
@@ -935,7 +982,9 @@ namespace Omnipotent.Services.KliveAPI
                     if (!ContinueListenLoop) return;
 
                     consecutiveFailures++;
-                    await ServiceLogError(ex, $"Watchdog ping failed ({consecutiveFailures}/{FailureThresholdBeforeRestart}). API may be busy.");
+                    long pingsDuring = Interlocked.Read(ref _pingsServed) - pingsBefore;
+                    await ServiceLogError(ex, $"Watchdog ping failed ({consecutiveFailures}/{FailureThresholdBeforeRestart}). " +
+                        $"pingsServedDuringFailedWindow={pingsDuring}. {CaptureRuntimeHealth()}");
 
                     if (consecutiveFailures >= FailureThresholdBeforeRestart)
                     {
@@ -951,6 +1000,72 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 catch (TaskCanceledException) { return; }
                 catch (ObjectDisposedException) { return; }
+            }
+        }
+
+        /// <summary>
+        /// Emits a health snapshot once a minute from a DEDICATED OS thread (never the
+        /// thread pool), so it keeps logging even when the pool is fully starved — the
+        /// prime suspect for "API stops responding after a while". The trajectory of
+        /// inFlight / worker-threads-available / heapMB across the minutes leading up to
+        /// the failure is what pins the cause. Guarded so a graceful restart reuses the
+        /// single long-lived thread instead of spawning duplicates.
+        /// </summary>
+        private void StartHealthHeartbeat()
+        {
+            if (_healthHeartbeatThread is { IsAlive: true }) return;
+            _healthHeartbeatThread = new Thread(() =>
+            {
+                while (ContinueListenLoop)
+                {
+                    try { _ = ServiceLog($"[watchdog-diag heartbeat] {CaptureRuntimeHealth()}"); }
+                    catch { }
+                    try { Thread.Sleep(60000); }
+                    catch (ThreadInterruptedException) { return; }
+                }
+            })
+            { IsBackground = true, Name = "KliveAPI_HealthHeartbeat" };
+            _healthHeartbeatThread.Start();
+        }
+
+        /// <summary>
+        /// Cheap, lock-free snapshot of process/runtime health formatted for a single log
+        /// line. The three watchdog hypotheses read straight off it:
+        ///   • workerThreadsAvail near 0 + high pendingWorkItems => thread-pool starvation
+        ///     (the watchdog's own GetAsync continuation can't run; the API may be fine).
+        ///   • sinceLastAccept large + listening=true            => listen loop wedged.
+        ///   • high inFlight + coincident slow-request logs       => a handler hogging the pipeline.
+        /// </summary>
+        private string CaptureRuntimeHealth()
+        {
+            try
+            {
+                ThreadPool.GetAvailableThreads(out int availWorker, out int availIo);
+                ThreadPool.GetMaxThreads(out int maxWorker, out int maxIo);
+                long pending = ThreadPool.PendingWorkItemCount;
+                int poolThreads = ThreadPool.ThreadCount;
+                int inFlight = Volatile.Read(ref _inFlightRequests);
+
+                long acceptTicks = Interlocked.Read(ref _lastContextAcceptedUtcTicks);
+                long completeTicks = Interlocked.Read(ref _lastRequestCompletedUtcTicks);
+                string sinceAccept = acceptTicks == 0 ? "n/a"
+                    : $"{(DateTime.UtcNow - new DateTime(acceptTicks, DateTimeKind.Utc)).TotalMilliseconds:F0}ms";
+                string sinceComplete = completeTicks == 0 ? "n/a"
+                    : $"{(DateTime.UtcNow - new DateTime(completeTicks, DateTimeKind.Utc)).TotalMilliseconds:F0}ms";
+
+                bool listening = false;
+                try { listening = listener?.IsListening ?? false; } catch { }
+
+                return $"[health] inFlight={inFlight}, poolThreads={poolThreads}, "
+                    + $"workerThreadsAvail={availWorker}/{maxWorker}, ioThreadsAvail={availIo}/{maxIo}, "
+                    + $"pendingWorkItems={pending}, sinceLastAccept={sinceAccept}, "
+                    + $"sinceLastRequestDone={sinceComplete}, listening={listening}, "
+                    + $"gc(g0={GC.CollectionCount(0)},g1={GC.CollectionCount(1)},g2={GC.CollectionCount(2)}), "
+                    + $"heapMB={GC.GetTotalMemory(false) / (1024 * 1024)}";
+            }
+            catch (Exception ex)
+            {
+                return $"[health-unavailable: {ex.Message}]";
             }
         }
 
@@ -1504,6 +1619,10 @@ namespace Omnipotent.Services.KliveAPI
                 try
                 {
                     HttpListenerContext context = await listener.GetContextAsync();
+                    // Timestamp every accept: a stale value while pings fail means the
+                    // listen loop is wedged (not dequeuing from http.sys) rather than a
+                    // slow handler downstream.
+                    Interlocked.Exchange(ref _lastContextAcceptedUtcTicks, DateTime.UtcNow.Ticks);
                     _ = ProcessRequestAsync(context);
                 }
                 catch (Exception ioe)
@@ -1643,6 +1762,7 @@ namespace Omnipotent.Services.KliveAPI
         private async Task ProcessRequestAsync(HttpListenerContext context)
         {
             Stopwatch requestStopwatch = Stopwatch.StartNew();
+            Interlocked.Increment(ref _inFlightRequests);
             bool matchedRoute = false;
             bool shouldRecordStatistics = true;
             string statsRoute = context?.Request?.Url?.AbsolutePath ?? context?.Request?.RawUrl ?? "/";
@@ -2000,6 +2120,24 @@ namespace Omnipotent.Services.KliveAPI
             }
             finally
             {
+                Interlocked.Decrement(ref _inFlightRequests);
+                Interlocked.Exchange(ref _lastRequestCompletedUtcTicks, DateTime.UtcNow.Ticks);
+
+                // Surface any request that itself ran slowly (as opposed to the process
+                // being globally starved). If /ping timeouts coincide with these, a real
+                // handler is hogging the pipeline; if they don't, the stall is elsewhere.
+                try
+                {
+                    double elapsedMs = requestStopwatch.Elapsed.TotalMilliseconds;
+                    if (elapsedMs >= SlowRequestLogThresholdMs)
+                    {
+                        int statusForLog = context?.Response?.StatusCode ?? 0;
+                        _ = ServiceLog($"[watchdog-diag] Slow request: {statsMethod} {statsRoute} " +
+                            $"took {elapsedMs:F0}ms (status {statusForLog}). {CaptureRuntimeHealth()}");
+                    }
+                }
+                catch { /* diagnostics must never affect the response */ }
+
                 if (streamingBodyStream != null && !streamingBodyStream.CompleteBody)
                 {
                     // Never reuse a connection whose streaming entity was only partially

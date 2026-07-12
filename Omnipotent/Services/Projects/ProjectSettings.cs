@@ -1,3 +1,5 @@
+using Newtonsoft.Json;
+
 namespace Omnipotent.Services.Projects
 {
     /// <summary>
@@ -31,6 +33,53 @@ namespace Omnipotent.Services.Projects
         public string StimulusFreeModel { get; set; } = Defaults.StimulusFreeModel;
         /// <summary>Cheap paid model that steps in when the free tier throttles.</summary>
         public string StimulusFallbackModel { get; set; } = Defaults.StimulusFallbackModel;
+
+        // ── bounded project turns / fallback routing ──
+        /// <summary>
+        /// Explicit output caps for Projects calls. Project agents must never inherit the global
+        /// provider maximum: a global 64K setting can turn a routine wake into an unaffordable
+        /// request even while the project's own budget is healthy.
+        /// </summary>
+        public int CommanderMaxOutputTokens { get; set; } = Defaults.CommanderMaxOutputTokens;
+        public int SubAgentMaxOutputTokens { get; set; } = Defaults.SubAgentMaxOutputTokens;
+        public int UtilityMaxOutputTokens { get; set; } = Defaults.UtilityMaxOutputTokens;
+        /// <summary>Optional capability-compatible fallback used after the primary route fails. Empty disables fallback.</summary>
+        public string CommanderFallbackModel { get; set; } = Defaults.CommanderFallbackModel;
+        /// <summary>Optional capability-compatible fallback for worker tiers.</summary>
+        public string SubAgentFallbackModel { get; set; } = Defaults.SubAgentFallbackModel;
+        /// <summary>Optional utility-model fallback. Empty disables fallback.</summary>
+        public string UtilityFallbackModel { get; set; } = Defaults.UtilityFallbackModel;
+        public string CouncilFallbackModel { get; set; } = Defaults.CouncilFallbackModel;
+
+        // ── wake convergence guardrails ──
+        /// <summary>Context-rollover boundary, not a work limit. Productive work automatically
+        /// continues in a fresh wake with a durable resume checkpoint.</summary>
+        public int WorkSliceToolCalls { get; set; } = Defaults.WorkSliceToolCalls;
+        /// <summary>Model-turn boundary for refreshing context, not a lifetime/wake cap.</summary>
+        public int WorkSliceModelTurns { get; set; } = Defaults.WorkSliceModelTurns;
+        /// <summary>Only convergence failures are bounded: repeated identical actions must change
+        /// strategy instead of consuming an unlimited budget. Novel productive work is unlimited.</summary>
+        public int MaxConvergenceTripsPerSlice { get; set; } = Defaults.MaxConvergenceTripsPerSlice;
+
+        // Read old persisted setting documents without re-emitting retired hard-cap fields.
+        [JsonProperty("MaxToolCallsPerWake", NullValueHandling = NullValueHandling.Ignore)]
+        private int? LegacyMaxToolCallsPerWake
+        {
+            get => null;
+            set { if (value.HasValue) WorkSliceToolCalls = Math.Clamp(value.Value, 5, 200); }
+        }
+        [JsonProperty("MaxModelTurnsPerWake", NullValueHandling = NullValueHandling.Ignore)]
+        private int? LegacyMaxModelTurnsPerWake
+        {
+            get => null;
+            set { if (value.HasValue) WorkSliceModelTurns = Math.Clamp(value.Value, 2, 100); }
+        }
+        [JsonProperty("MaxLoopTripsPerWake", NullValueHandling = NullValueHandling.Ignore)]
+        private int? LegacyMaxLoopTripsPerWake
+        {
+            get => null;
+            set { if (value.HasValue) MaxConvergenceTripsPerSlice = Math.Clamp(value.Value, 1, 20); }
+        }
 
         // ── behavior ──
         /// <summary>Whether video-tier agents get screenshots fed back to the model.</summary>
@@ -77,6 +126,23 @@ namespace Omnipotent.Services.Projects
                 case "tiertextimagevideoaudiomodel": TierTextImageVideoAudioModel = value; break;
                 case "stimulusfreemodel": StimulusFreeModel = value; break;
                 case "stimulusfallbackmodel": StimulusFallbackModel = value; break;
+                case "commandermaxoutputtokens": CommanderMaxOutputTokens = Math.Clamp(ParseInt(value, Defaults.CommanderMaxOutputTokens), 512, 32768); break;
+                case "subagentmaxoutputtokens": SubAgentMaxOutputTokens = Math.Clamp(ParseInt(value, Defaults.SubAgentMaxOutputTokens), 512, 32768); break;
+                case "utilitymaxoutputtokens": UtilityMaxOutputTokens = Math.Clamp(ParseInt(value, Defaults.UtilityMaxOutputTokens), 256, 8192); break;
+                case "commanderfallbackmodel": CommanderFallbackModel = value.Trim(); break;
+                case "subagentfallbackmodel": SubAgentFallbackModel = value.Trim(); break;
+                case "utilityfallbackmodel": UtilityFallbackModel = value.Trim(); break;
+                case "councilfallbackmodel": CouncilFallbackModel = value.Trim(); break;
+                case "workslicetoolcalls":
+                case "maxtoolcallsperwake": // legacy setting name: now interpreted as a rollover boundary
+                    WorkSliceToolCalls = Math.Clamp(ParseInt(value, Defaults.WorkSliceToolCalls), 5, 200); break;
+                case "workslicemodelturns":
+                case "maxmodelturnsperwake": // legacy setting name: now interpreted as a rollover boundary
+                    WorkSliceModelTurns = Math.Clamp(ParseInt(value, Defaults.WorkSliceModelTurns), 2, 100); break;
+                case "maxconvergencetripsperslice":
+                case "maxlooptripsperwake":
+                    MaxConvergenceTripsPerSlice = Math.Clamp(ParseInt(value, Defaults.MaxConvergenceTripsPerSlice), 1, 20); break;
+                case "maxconsecutivecontinuations": break; // retired: productive continuations are intentionally unlimited
                 case "visionenabled": VisionEnabled = ParseBool(value); break;
                 case "containersenabled": ContainersEnabled = ParseBool(value); break;
                 case "desktopimage": DesktopImage = value; break;
@@ -103,6 +169,16 @@ namespace Omnipotent.Services.Projects
             public const string TierTextImageVideoAudioModel = "google/gemini-2.5-pro";
             public const string StimulusFreeModel = "openai/gpt-4.1-mini";
             public const string StimulusFallbackModel = "openai/gpt-4.1-mini";
+            public const int CommanderMaxOutputTokens = 8192;
+            public const int SubAgentMaxOutputTokens = 6144;
+            public const int UtilityMaxOutputTokens = 1800;
+            public const string CommanderFallbackModel = "";
+            public const string SubAgentFallbackModel = "";
+            public const string UtilityFallbackModel = "";
+            public const string CouncilFallbackModel = "";
+            public const int WorkSliceToolCalls = 40;
+            public const int WorkSliceModelTurns = 24;
+            public const int MaxConvergenceTripsPerSlice = 5;
             public const string DesktopImage = "omnipotent/projects-desktop:latest";
             public const int ComputerActionSettleMs = 350;
             public const int ComputerTypingDelayMs = 18;

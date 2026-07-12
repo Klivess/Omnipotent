@@ -76,7 +76,13 @@ namespace Omnipotent.Tests.Projects
             // Second instance (a "restart"): replay must re-dispatch the undelivered envelope.
             var q2 = new StimulusQueue(_ => { });
             var redelivered = new TaskCompletionSource<string>();
-            q2.OnDeliver = e => { redelivered.TrySetResult(e.Payload); return Task.CompletedTask; };
+            q2.OnDeliver = e =>
+            {
+                // Replay scans the durable global inbox, which can include unrelated envelopes
+                // left by another concurrently running or previously interrupted test.
+                if (e.ProjectID == pid) redelivered.TrySetResult(e.Payload);
+                return Task.CompletedTask;
+            };
             q2.ReplayUndelivered();
             string got = await redelivered.Task.WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal("durable-payload", got);
@@ -118,11 +124,12 @@ namespace Omnipotent.Tests.Projects
             // Wait until all are delivered.
             for (int i = 0; i < 50 && delivered < 5; i++) await Task.Delay(50);
             Assert.Equal(5, delivered);
-            await Task.Delay(100); // let the final compaction settle
+            await Task.Delay(100); // give the first compaction attempt a chance to settle
 
             // The queue file must NOT retain a line per delivered envelope — compaction drops them
             // (the file is deleted once nothing undelivered remains).
             var file = Path.Combine(dir, $"{pid}__hookC.queue.jsonl");
+            for (int i = 0; i < 40 && File.Exists(file); i++) await Task.Delay(50);
             long remainingLines = File.Exists(file) ? File.ReadAllLines(file).Count(l => !string.IsNullOrWhiteSpace(l)) : 0;
             Assert.Equal(0, remainingLines);
         }

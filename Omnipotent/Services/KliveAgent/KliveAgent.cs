@@ -16,6 +16,7 @@ namespace Omnipotent.Services.KliveAgent
 
         public KliveAgentMemory Memory { get; private set; }
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
+        public KliveAgentScheduler Scheduler { get; private set; }
         public KliveAgentCapabilityRegistry Capabilities { get; private set; }
         public KliveAgentStats Stats { get; private set; } = null!;
 
@@ -139,6 +140,10 @@ namespace Omnipotent.Services.KliveAgent
                 BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
                 await BackgroundTasks.InitializeAsync();
 
+                // Prospective memory: durable future intentions that fire as full agent turns.
+                Scheduler = new KliveAgentScheduler(this);
+                await Scheduler.InitializeAsync();
+
                 Capabilities = new KliveAgentCapabilityRegistry(this);
 
                 // Initialize codebase intelligence (spec Ch. 3, 4, 7) — the slowest part of warmup.
@@ -169,6 +174,10 @@ namespace Omnipotent.Services.KliveAgent
 
                 // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
                 _ = RunPendingRunWatchdogAsync();
+
+                // Fire scheduled tasks only once the agent can actually take messages; tasks that
+                // came due while offline fire on the first tick with an explicit lateness note.
+                Scheduler.StartLoop();
 
                 await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
             }
@@ -573,6 +582,7 @@ namespace Omnipotent.Services.KliveAgent
                 OmniPaths.GlobalPaths.KliveAgentMemoriesDirectory,
                 OmniPaths.GlobalPaths.KliveAgentConversationsDirectory,
                 OmniPaths.GlobalPaths.KliveAgentBackgroundTasksDirectory,
+                OmniPaths.GlobalPaths.KliveAgentScheduledTasksDirectory,
                 OmniPaths.GlobalPaths.KliveAgentScriptLogsDirectory,
             };
 

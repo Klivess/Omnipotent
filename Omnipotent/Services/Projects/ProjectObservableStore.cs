@@ -14,6 +14,12 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum ObservableFormat { Raw, Currency, Percent, Count }
 
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum ObservableSourceKind { Agent, System, Derived, External }
+
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum ObservableValidity { Unknown, Valid, Invalid }
+
     /// <summary>One timestamped point in an observable's bounded history.</summary>
     public class ObservableSample
     {
@@ -45,6 +51,13 @@ namespace Omnipotent.Services.Projects
         public string UpdatedBy { get; set; } = "";
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+        /// <summary>When the represented value was actually observed (distinct from when it was written).</summary>
+        public DateTime ObservedAt { get; set; } = DateTime.UtcNow;
+        public TimeSpan? StaleAfter { get; set; }
+        public ObservableSourceKind SourceKind { get; set; } = ObservableSourceKind.Agent;
+        public ObservableValidity Validity { get; set; } = ObservableValidity.Unknown;
+        public long? EvidenceEventSequence { get; set; }
+        public List<string> EvidenceArtifactIDs { get; set; } = new();
         public List<ObservableSample> History { get; set; } = new();
     }
 
@@ -106,7 +119,11 @@ namespace Omnipotent.Services.Projects
         /// Metadata (format/unit/description) is applied when provided and retained otherwise.
         /// </summary>
         public ObservableChange Set(string projectID, string name, double? numericValue, string? textValue,
-            ObservableFormat? format, string? unit, string? description, string actingAgentID)
+            ObservableFormat? format, string? unit, string? description, string actingAgentID,
+            DateTime? observedAt = null, TimeSpan? staleAfter = null,
+            ObservableSourceKind sourceKind = ObservableSourceKind.Agent,
+            ObservableValidity validity = ObservableValidity.Unknown,
+            long? evidenceEventSequence = null, IEnumerable<string>? evidenceArtifactIDs = null)
         {
             name = NormalizeName(name);
             if (numericValue == null && textValue == null)
@@ -151,6 +168,13 @@ namespace Omnipotent.Services.Projects
                 if (format != null) o.Format = format.Value;
                 if (!string.IsNullOrWhiteSpace(unit)) o.Unit = unit.Trim();
                 if (!string.IsNullOrWhiteSpace(description)) o.Description = Trim(description.Trim(), MaxDescriptionLength);
+                o.ObservedAt = (observedAt ?? DateTime.UtcNow).ToUniversalTime();
+                if (staleAfter.HasValue) o.StaleAfter = staleAfter;
+                o.SourceKind = sourceKind;
+                o.Validity = validity;
+                o.EvidenceEventSequence = evidenceEventSequence;
+                if (evidenceArtifactIDs != null)
+                    o.EvidenceArtifactIDs = evidenceArtifactIDs.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
                 Touch(o, actingAgentID);
 
                 SaveLocked(projectID, all);
@@ -190,6 +214,8 @@ namespace Omnipotent.Services.Projects
 
                 string previousDisplay = FormatValue(o);
                 o.NumericValue = result;
+                o.ObservedAt = DateTime.UtcNow;
+                o.SourceKind = ObservableSourceKind.Agent;
                 Touch(o, actingAgentID);
 
                 SaveLocked(projectID, all);
@@ -218,8 +244,42 @@ namespace Omnipotent.Services.Projects
         {
             var list = List(projectID);
             if (list.Count == 0) return "";
+            DateTime now = DateTime.UtcNow;
             return string.Join("\n", list.Select(o =>
-                $"{o.Name} = {FormatValue(o)}{(string.IsNullOrWhiteSpace(o.Description) ? "" : $" — {o.Description}")}"));
+            {
+                TimeSpan age = now - o.ObservedAt;
+                bool stale = o.StaleAfter.HasValue && age > o.StaleAfter.Value;
+                string health = o.Validity == ObservableValidity.Invalid ? " [INVALID]"
+                    : stale ? " [STALE]" : o.Validity == ObservableValidity.Valid ? " [valid]" : "";
+                string evidence = o.EvidenceEventSequence.HasValue || o.EvidenceArtifactIDs.Count > 0
+                    ? $"; evidence={(o.EvidenceEventSequence.HasValue ? "event#" + o.EvidenceEventSequence : "")}{(o.EvidenceArtifactIDs.Count > 0 ? string.Join(",", o.EvidenceArtifactIDs) : "")}" : "";
+                return $"{o.Name} = {FormatValue(o)}{health}{DescribeTrend(o, now)} — observed {Data_Handling.TemporalFormat.StampMinute(o.ObservedAt)} ({FormatAge(age)} ago); source={o.SourceKind}{evidence}" +
+                    (string.IsNullOrWhiteSpace(o.Description) ? "" : $" — {o.Description}");
+            }));
+        }
+
+        /// <summary>
+        /// Trend perception: renders where a numeric observable is HEADING, not just where it is —
+        /// " (Δ +12.4 over 22h ↑)". The baseline is the newest history sample at least
+        /// <paramref name="window"/> old (default 24h), falling back to the oldest sample when the
+        /// whole history is younger. Empty for text observables, single-sample histories, or a flat value.
+        /// </summary>
+        internal static string DescribeTrend(ProjectObservable o, DateTime nowUtc, TimeSpan? window = null)
+        {
+            if (o.Type != ObservableType.Numeric || o.NumericValue == null) return "";
+            var numeric = o.History?.Where(s => s.NumericValue.HasValue).OrderBy(s => s.Timestamp).ToList();
+            if (numeric == null || numeric.Count < 2) return "";
+
+            var cutoff = nowUtc - (window ?? TimeSpan.FromHours(24));
+            var baseline = numeric.LastOrDefault(s => s.Timestamp <= cutoff) ?? numeric[0];
+            // The baseline must genuinely precede the current value — the last sample IS the current value.
+            if (baseline == numeric[^1]) baseline = numeric[^2];
+
+            double delta = o.NumericValue.Value - baseline.NumericValue!.Value;
+            if (Math.Abs(delta) < 1e-9) return "";
+            var span = nowUtc - baseline.Timestamp;
+            string arrow = delta > 0 ? "↑" : "↓";
+            return $" (Δ {(delta > 0 ? "+" : "")}{delta.ToString("0.##", CultureInfo.InvariantCulture)} over {Data_Handling.TemporalFormat.Span(span)} {arrow})";
         }
 
         /// <summary>Renders the current value per the display hint ($10,250.50 / 12.4% / 1,284 / raw+unit / text).</summary>
@@ -263,6 +323,10 @@ namespace Omnipotent.Services.Projects
         }
 
         private static string Trim(string s, int max) => s.Length <= max ? s : s[..max];
+
+        private static string FormatAge(TimeSpan age) => age.TotalDays >= 1 ? $"{age.TotalDays:0.#}d"
+            : age.TotalHours >= 1 ? $"{age.TotalHours:0.#}h"
+            : age.TotalMinutes >= 1 ? $"{age.TotalMinutes:0.#}m" : $"{Math.Max(0, age.TotalSeconds):0}s";
 
         private static ProjectObservable? FindLocked(List<ProjectObservable> all, string name)
             => all.FirstOrDefault(o => string.Equals(o.Name, name, StringComparison.OrdinalIgnoreCase));

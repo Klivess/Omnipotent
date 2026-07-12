@@ -187,5 +187,57 @@ namespace Omnipotent.Tests.Projects
             Assert.Throws<InvalidOperationException>(() =>
                 NewStore().SubmitVersion(NewProjectId(), new GrandPlanContent { Mission = "  " }, "s", null, material: true, "w"));
         }
+
+        [Fact]
+        public void ReadyMilestones_RespectDependencies()
+        {
+            var store = NewStore();
+            string pid = NewProjectId();
+            store.SubmitVersion(pid, new GrandPlanContent
+            {
+                Mission = "Ship",
+                Milestones =
+                {
+                    new PlanMilestone { Title = "Foundation" },
+                    new PlanMilestone { Title = "Integration", DependsOn = { "Foundation" } },
+                },
+            }, "dependency plan", null, material: true, "w1");
+            store.MarkApproved(pid, 1, "g1", null);
+
+            Assert.Equal("Foundation", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Throws<InvalidOperationException>(() =>
+                store.UpdateMilestoneStatus(pid, "Integration", MilestoneStatus.InProgress));
+            store.UpdateMilestoneStatus(pid, "Foundation", MilestoneStatus.Done,
+                new PlanEvidence { Summary = "verified", RecordedBy = "test" });
+            Assert.Equal("Integration", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Contains("Ready now", store.DescribeForSeed(pid));
+        }
+
+        [Fact]
+        public void Submit_RejectsCyclicOrUnknownDependencies()
+        {
+            var store = NewStore();
+            var cyclic = new GrandPlanContent
+            {
+                Mission = "Ship",
+                Milestones =
+                {
+                    new PlanMilestone { Title = "A", DependsOn = { "B" } },
+                    new PlanMilestone { Title = "B", DependsOn = { "A" } },
+                },
+            };
+            Assert.Contains("cycle", Assert.Throws<InvalidOperationException>(() =>
+                store.SubmitVersion(NewProjectId(), cyclic, "cyclic", null, true, "w")).Message,
+                StringComparison.OrdinalIgnoreCase);
+
+            var unknown = new GrandPlanContent
+            {
+                Mission = "Ship",
+                Milestones = { new PlanMilestone { Title = "A", DependsOn = { "missing" } } },
+            };
+            Assert.Contains("unknown", Assert.Throws<InvalidOperationException>(() =>
+                store.SubmitVersion(NewProjectId(), unknown, "bad", null, true, "w")).Message,
+                StringComparison.OrdinalIgnoreCase);
+        }
     }
 }

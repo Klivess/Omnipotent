@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 
@@ -14,6 +15,7 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public class ProjectArtifactStore
     {
+        public enum ArtifactLifecycleState { Captured, Validated, Rejected, Degraded }
         private readonly string root;
         private readonly Action<string> log;
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
@@ -31,12 +33,24 @@ namespace Omnipotent.Services.Projects
             public DateTime CapturedAt { get; set; } = DateTime.UtcNow;
             /// <summary>True once the raw binary has been deleted by retention; only the description remains.</summary>
             public bool Degraded { get; set; }
+            public ArtifactLifecycleState State { get; set; } = ArtifactLifecycleState.Captured;
+            public long SizeBytes { get; set; }
+            public string Sha256 { get; set; } = "";
+            public string? WakeID { get; set; }
+            public string? AgentID { get; set; }
+            public string? ToolCallID { get; set; }
+            public long? SourceEventSequence { get; set; }
+            public string? SupersedesArtifactID { get; set; }
+            public DateTime? ValidatedAt { get; set; }
+            public string? ValidationSummary { get; set; }
         }
 
-        public ProjectArtifactStore(Action<string> log)
+        public ProjectArtifactStore(Action<string> log, string? rootOverride = null)
         {
             this.log = log ?? (_ => { });
-            root = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "Artifacts");
+            root = string.IsNullOrWhiteSpace(rootOverride)
+                ? Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "Artifacts")
+                : Path.GetFullPath(rootOverride);
             Directory.CreateDirectory(root);
         }
 
@@ -54,8 +68,11 @@ namespace Omnipotent.Services.Projects
         };
 
         /// <summary>Stores a binary with its capture-time description; returns the artifact ID.</summary>
-        public ArtifactRecord Save(string projectID, byte[] bytes, string contentType, string description, string fileName = "")
+        public ArtifactRecord Save(string projectID, byte[] bytes, string contentType, string description, string fileName = "",
+            string? sourceWakeID = null, string? agentID = null, string? toolCallID = null,
+            long? sourceEventSequence = null, string? supersedesArtifactID = null)
         {
+            ArgumentNullException.ThrowIfNull(bytes);
             var record = new ArtifactRecord
             {
                 ArtifactID = Guid.NewGuid().ToString("N"),
@@ -63,16 +80,65 @@ namespace Omnipotent.Services.Projects
                 ContentType = contentType,
                 FileName = fileName,
                 Description = description ?? "",
+                SizeBytes = bytes.LongLength,
+                Sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(),
+                WakeID = sourceWakeID,
+                AgentID = agentID,
+                ToolCallID = toolCallID,
+                SourceEventSequence = sourceEventSequence,
+                SupersedesArtifactID = supersedesArtifactID,
             };
             lock (LockFor(projectID))
             {
                 Directory.CreateDirectory(ProjectDir(projectID));
-                File.WriteAllBytes(BlobPath(record), bytes);
-                var index = LoadLocked(projectID);
-                index.Add(record);
-                SaveLocked(projectID, index);
+                string blob = BlobPath(record);
+                string tmp = blob + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                try
+                {
+                    File.WriteAllBytes(tmp, bytes);
+                    File.Move(tmp, blob, overwrite: false);
+                    var index = LoadLocked(projectID);
+                    index.Add(record);
+                    SaveLocked(projectID, index);
+                }
+                catch
+                {
+                    try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                    try { if (File.Exists(blob)) File.Delete(blob); } catch { }
+                    throw;
+                }
             }
             return record;
+        }
+
+        public ArtifactRecord? Validate(string projectID, string artifactID, bool valid, string summary)
+        {
+            lock (LockFor(projectID))
+            {
+                var index = LoadLocked(projectID);
+                var record = index.FirstOrDefault(a => a.ArtifactID == artifactID);
+                if (record == null) return null;
+                if (!record.Degraded)
+                {
+                    string path = BlobPath(record);
+                    if (!File.Exists(path)) valid = false;
+                    else
+                    {
+                        using var stream = File.OpenRead(path);
+                        string hash = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+                        if (!string.Equals(hash, record.Sha256, StringComparison.OrdinalIgnoreCase))
+                        {
+                            valid = false;
+                            summary = $"Content hash mismatch. {summary}".Trim();
+                        }
+                    }
+                }
+                record.State = valid ? ArtifactLifecycleState.Validated : ArtifactLifecycleState.Rejected;
+                record.ValidatedAt = DateTime.UtcNow;
+                record.ValidationSummary = summary?.Trim();
+                SaveLocked(projectID, index);
+                return record;
+            }
         }
 
         public ArtifactRecord? GetRecord(string projectID, string artifactID)
@@ -117,6 +183,7 @@ namespace Omnipotent.Services.Projects
                     {
                         try { File.Delete(BlobPath(a)); } catch { }
                         a.Degraded = true;
+                        a.State = ArtifactLifecycleState.Degraded;
                         changed = true;
                         degraded++;
                     }

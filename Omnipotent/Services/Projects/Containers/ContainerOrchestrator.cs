@@ -1,6 +1,7 @@
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.Projects;
 
 namespace Omnipotent.Services.Projects.Containers
 {
@@ -97,14 +98,14 @@ namespace Omnipotent.Services.Projects.Containers
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Firefox >/dev/null 2>&1 || (DISPLAY=:1 firefox-esr >/tmp/firefox.log 2>&1 &)" },
+                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 wmctrl -a Chromium >/dev/null 2>&1 || (DISPLAY=:1 chromium --no-sandbox --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 &)" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 firefox-esr --new-tab \"$1\" >/tmp/firefox.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
+                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 chromium --no-sandbox --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
                 ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Firefox" },
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Chromium" },
                 ContainerDesktopControlCommand.FocusTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Terminal" },
                 _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
@@ -315,8 +316,12 @@ namespace Omnipotent.Services.Projects.Containers
             var docker = await GetClientAsync();
             string image = imageForProject(projectID);
 
-            string volumeHostDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsVolumesDirectory), projectID);
+            string volumeHostDir = ProjectWorkspaceLocator.HostRoot(projectID);
             Directory.CreateDirectory(volumeHostDir);
+            string profileSegment = string.Concat((agentID ?? "shared").Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_'));
+            if (string.IsNullOrWhiteSpace(profileSegment)) profileSegment = "shared";
+            string profileHostDir = Path.Combine(volumeHostDir, ".klive", "browser-profiles", profileSegment);
+            Directory.CreateDirectory(profileHostDir);
 
             var create = await docker.Containers.CreateContainerAsync(new CreateContainerParameters
             {
@@ -332,6 +337,7 @@ namespace Omnipotent.Services.Projects.Containers
                 {
                     $"DISPLAY_WIDTH={resolvedWidth}",
                     $"DISPLAY_HEIGHT={resolvedHeight}",
+                    $"OMNIPOTENT_BROWSER_PROFILE=/project/.klive/browser-profiles/{profileSegment}",
                 },
                 ExposedPorts = new Dictionary<string, EmptyStruct> { [$"{VncContainerPort}/tcp"] = default },
                 HostConfig = new HostConfig

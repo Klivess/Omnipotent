@@ -17,6 +17,16 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum RiskSeverity { Low, Medium, High }
 
+    /// <summary>Evidence supporting a milestone/criterion transition; references remain stable in the event/file/artifact stores.</summary>
+    public class PlanEvidence
+    {
+        public string Summary { get; set; } = "";
+        public long? EventSequence { get; set; }
+        public List<string> ArtifactIDs { get; set; } = new();
+        public string RecordedBy { get; set; } = "";
+        public DateTime RecordedAt { get; set; } = DateTime.UtcNow;
+    }
+
     /// <summary>A parallel track of work within the plan.</summary>
     public class PlanWorkstream
     {
@@ -40,6 +50,10 @@ namespace Omnipotent.Services.Projects
         public int Order { get; set; }
         /// <summary>When the status was last changed.</summary>
         public DateTime? UpdatedAt { get; set; }
+        public List<string> DependsOn { get; set; } = new();
+        public string? OwnerAgentID { get; set; }
+        public string? BlockReason { get; set; }
+        public List<PlanEvidence> Evidence { get; set; } = new();
     }
 
     /// <summary>A definition-of-done criterion. <see cref="Met"/> is ticked in place as it is achieved.</summary>
@@ -50,6 +64,7 @@ namespace Omnipotent.Services.Projects
         public string Text { get; set; } = "";
         public bool Met { get; set; }
         public DateTime? UpdatedAt { get; set; }
+        public List<PlanEvidence> Evidence { get; set; } = new();
     }
 
     /// <summary>A known risk and its mitigation.</summary>
@@ -149,10 +164,11 @@ namespace Omnipotent.Services.Projects
         {
             if (content == null || string.IsNullOrWhiteSpace(content.Mission))
                 throw new InvalidOperationException("Grand Plan must have a mission.");
-            AssignIds(content);
             lock (LockFor(projectID))
             {
                 var doc = LoadLocked(projectID);
+                AssignIds(content, CurrentApprovedLocked(doc)?.Content);
+                ValidateDependencyGraph(content);
                 int next = doc.Versions.Count == 0 ? 1 : doc.Versions.Max(v => v.Version) + 1;
                 var version = new GrandPlanVersion
                 {
@@ -216,7 +232,8 @@ namespace Omnipotent.Services.Projects
         /// no new version, no gate). Matches by id first, then case-insensitively by title. Returns the
         /// updated milestone, or null if there is no approved plan / no match.
         /// </summary>
-        public PlanMilestone? UpdateMilestoneStatus(string projectID, string milestoneRef, MilestoneStatus status)
+        public PlanMilestone? UpdateMilestoneStatus(string projectID, string milestoneRef, MilestoneStatus status,
+            PlanEvidence? evidence = null, string? blockReason = null, string? ownerAgentID = null)
         {
             lock (LockFor(projectID))
             {
@@ -226,7 +243,19 @@ namespace Omnipotent.Services.Projects
                     string.Equals(x.ID, milestoneRef, StringComparison.OrdinalIgnoreCase)
                     || string.Equals(x.Title, milestoneRef, StringComparison.OrdinalIgnoreCase));
                 if (m == null) return null;
+                if (status is MilestoneStatus.InProgress or MilestoneStatus.Done)
+                {
+                    var unmet = m.DependsOn.Where(dep => v!.Content!.Milestones
+                        .FirstOrDefault(x => string.Equals(x.ID, dep, StringComparison.OrdinalIgnoreCase))?.Status != MilestoneStatus.Done).ToList();
+                    if (unmet.Count > 0)
+                        throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance until dependencies are done: {string.Join(", ", unmet)}.");
+                }
+                if (status == MilestoneStatus.Blocked && string.IsNullOrWhiteSpace(blockReason))
+                    throw new InvalidOperationException("A blocked milestone requires a block reason.");
                 m.Status = status;
+                m.BlockReason = status == MilestoneStatus.Blocked ? blockReason!.Trim() : null;
+                if (!string.IsNullOrWhiteSpace(ownerAgentID)) m.OwnerAgentID = ownerAgentID.Trim();
+                if (evidence != null) m.Evidence.Add(CloneJson(evidence));
                 m.UpdatedAt = DateTime.UtcNow;
                 SaveLocked(projectID, doc);
                 return CloneJson(m);
@@ -237,7 +266,7 @@ namespace Omnipotent.Services.Projects
         /// Marks a success criterion met/unmet on the current approved version, in place. Matches by id
         /// first, then case-insensitively by text. Returns the updated criterion, or null if no match.
         /// </summary>
-        public PlanCriterion? SetCriterionMet(string projectID, string criterionRef, bool met)
+        public PlanCriterion? SetCriterionMet(string projectID, string criterionRef, bool met, PlanEvidence? evidence = null)
         {
             lock (LockFor(projectID))
             {
@@ -248,6 +277,7 @@ namespace Omnipotent.Services.Projects
                     || string.Equals(x.Text, criterionRef, StringComparison.OrdinalIgnoreCase));
                 if (c == null) return null;
                 c.Met = met;
+                if (evidence != null) c.Evidence.Add(CloneJson(evidence));
                 c.UpdatedAt = DateTime.UtcNow;
                 SaveLocked(projectID, doc);
                 return CloneJson(c);
@@ -280,8 +310,24 @@ namespace Omnipotent.Services.Projects
         {
             var v = GetCurrentApproved(projectID);
             if (v == null) return "";
-            string when = (v.ResolvedAt ?? v.SubmittedAt).ToString("MM-dd");
-            return $"GRAND PLAN v{v.Version} (approved {when}): {v.Summary}{DescribeProgress(v.Content)}";
+            string when = Data_Handling.TemporalFormat.StampWithAge(v.ResolvedAt ?? v.SubmittedAt);
+            var ready = GetReadyMilestones(projectID);
+            string readyText = ready.Count == 0 ? "" : $" Ready now: {string.Join(", ", ready.Take(5).Select(m => $"{m.ID} {m.Title}"))}.";
+            return $"GRAND PLAN v{v.Version} (approved {when}): {v.Summary}{DescribeProgress(v.Content)}{readyText}";
+        }
+
+        /// <summary>Dependency-aware runnable frontier. Pending work is ready only when every
+        /// predecessor is done; in-progress work remains ready for its current owner.</summary>
+        public List<PlanMilestone> GetReadyMilestones(string projectID)
+        {
+            var v = GetCurrentApproved(projectID);
+            if (v?.Content == null) return new();
+            var byId = v.Content.Milestones.ToDictionary(m => m.ID, StringComparer.OrdinalIgnoreCase);
+            return v.Content.Milestones
+                .Where(m => m.Status is MilestoneStatus.Pending or MilestoneStatus.InProgress)
+                .Where(m => m.DependsOn.All(dep => byId.TryGetValue(dep, out var prerequisite)
+                    && prerequisite.Status == MilestoneStatus.Done))
+                .OrderBy(m => m.Order).Select(CloneJson).ToList();
         }
 
         /// <summary>" (progress: 3/6 milestones, 2/4 criteria)" or "" when there's nothing to count.</summary>
@@ -296,6 +342,24 @@ namespace Omnipotent.Services.Projects
             return parts.Count == 0 ? "" : $" (progress: {string.Join(", ", parts)})";
         }
 
+        /// <summary>Machine-checkable completion readiness. Legacy plans without structured content
+        /// remain user-reviewable, while structured plans must have every milestone and criterion done.</summary>
+        public List<string> GetCompletionReadinessIssues(string projectID)
+        {
+            var v = GetCurrentApproved(projectID);
+            if (v?.Content == null) return new List<string>();
+            var issues = new List<string>();
+            issues.AddRange(v.Content.Milestones.Where(m => m.Status != MilestoneStatus.Done)
+                .Select(m => $"milestone {m.ID} '{m.Title}' is {m.Status}"));
+            issues.AddRange(v.Content.SuccessCriteria.Where(c => !c.Met)
+                .Select(c => $"criterion {c.ID} '{c.Text}' is unmet"));
+            issues.AddRange(v.Content.Milestones.Where(m => m.Status == MilestoneStatus.Done && m.Evidence.Count == 0)
+                .Select(m => $"milestone {m.ID} '{m.Title}' has no completion evidence"));
+            issues.AddRange(v.Content.SuccessCriteria.Where(c => c.Met && c.Evidence.Count == 0)
+                .Select(c => $"criterion {c.ID} '{c.Text}' has no evidence"));
+            return issues;
+        }
+
         // ── internals ──
 
         private static string Trim(string s, int max) => s.Length <= max ? s : s[..max];
@@ -305,12 +369,85 @@ namespace Omnipotent.Services.Projects
                            .OrderByDescending(v => v.Version).FirstOrDefault();
 
         /// <summary>Assigns stable per-version ids (m1.., c1.., r1.., w1..) and milestone display order.</summary>
-        private static void AssignIds(GrandPlanContent c)
+        private static void AssignIds(GrandPlanContent c, GrandPlanContent? previous)
         {
-            for (int i = 0; i < c.Workstreams.Count; i++) c.Workstreams[i].ID = "w" + (i + 1);
-            for (int i = 0; i < c.Milestones.Count; i++) { c.Milestones[i].ID = "m" + (i + 1); c.Milestones[i].Order = i; }
-            for (int i = 0; i < c.Risks.Count; i++) c.Risks[i].ID = "r" + (i + 1);
-            for (int i = 0; i < c.SuccessCriteria.Count; i++) c.SuccessCriteria[i].ID = "c" + (i + 1);
+            int nextW = NextId(previous?.Workstreams.Select(x => x.ID), "w");
+            int nextM = NextId(previous?.Milestones.Select(x => x.ID), "m");
+            int nextR = NextId(previous?.Risks.Select(x => x.ID), "r");
+            int nextC = NextId(previous?.SuccessCriteria.Select(x => x.ID), "c");
+            foreach (var w in c.Workstreams)
+                w.ID = previous?.Workstreams.FirstOrDefault(x => string.Equals(x.Name, w.Name, StringComparison.OrdinalIgnoreCase))?.ID ?? "w" + nextW++;
+            for (int i = 0; i < c.Milestones.Count; i++)
+            {
+                var old = previous?.Milestones.FirstOrDefault(x => string.Equals(x.Title, c.Milestones[i].Title, StringComparison.OrdinalIgnoreCase));
+                c.Milestones[i].ID = old?.ID ?? "m" + nextM++;
+                c.Milestones[i].Order = i;
+                if (old != null)
+                {
+                    if (c.Milestones[i].Status == MilestoneStatus.Pending) c.Milestones[i].Status = old.Status;
+                    if (c.Milestones[i].Evidence.Count == 0) c.Milestones[i].Evidence = CloneJson(old.Evidence);
+                    c.Milestones[i].OwnerAgentID ??= old.OwnerAgentID;
+                    c.Milestones[i].BlockReason ??= old.BlockReason;
+                }
+            }
+            foreach (var milestone in c.Milestones)
+                milestone.DependsOn = milestone.DependsOn.Select(dep =>
+                    c.Milestones.FirstOrDefault(x => string.Equals(x.ID, dep, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(x.Title, dep, StringComparison.OrdinalIgnoreCase))?.ID
+                    ?? previous?.Milestones.FirstOrDefault(x => string.Equals(x.ID, dep, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(x.Title, dep, StringComparison.OrdinalIgnoreCase))?.ID
+                    ?? dep).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            foreach (var r in c.Risks)
+                r.ID = previous?.Risks.FirstOrDefault(x => string.Equals(x.Description, r.Description, StringComparison.OrdinalIgnoreCase))?.ID ?? "r" + nextR++;
+            foreach (var criterion in c.SuccessCriteria)
+            {
+                var old = previous?.SuccessCriteria.FirstOrDefault(x => string.Equals(x.Text, criterion.Text, StringComparison.OrdinalIgnoreCase));
+                criterion.ID = old?.ID ?? "c" + nextC++;
+                if (old != null)
+                {
+                    criterion.Met |= old.Met;
+                    if (criterion.Evidence.Count == 0) criterion.Evidence = CloneJson(old.Evidence);
+                }
+            }
+        }
+
+        private static int NextId(IEnumerable<string>? ids, string prefix)
+        {
+            int max = 0;
+            foreach (var id in ids ?? Array.Empty<string>())
+                if (id.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(id[prefix.Length..], out int n)) max = Math.Max(max, n);
+            return max + 1;
+        }
+
+        private static void ValidateDependencyGraph(GrandPlanContent content)
+        {
+            var byId = content.Milestones.ToDictionary(m => m.ID, StringComparer.OrdinalIgnoreCase);
+            foreach (var milestone in content.Milestones)
+            {
+                foreach (string dependency in milestone.DependsOn)
+                {
+                    if (!byId.ContainsKey(dependency))
+                        throw new InvalidOperationException($"Milestone '{milestone.Title}' depends on unknown milestone '{dependency}'.");
+                    if (string.Equals(milestone.ID, dependency, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException($"Milestone '{milestone.Title}' cannot depend on itself.");
+                }
+            }
+
+            var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool Visit(string id)
+            {
+                if (visited.Contains(id)) return false;
+                if (!visiting.Add(id)) return true;
+                foreach (string dependency in byId[id].DependsOn)
+                    if (Visit(dependency)) return true;
+                visiting.Remove(id);
+                visited.Add(id);
+                return false;
+            }
+            if (byId.Keys.Any(Visit))
+                throw new InvalidOperationException("Grand Plan milestone dependencies contain a cycle.");
         }
 
         /// <summary>Renders structured content to canonical markdown for text consumers (wake seeds, Discord, get_grand_plan).</summary>
@@ -339,7 +476,11 @@ namespace Omnipotent.Services.Projects
                     };
                     string tail = string.IsNullOrWhiteSpace(m.Detail) ? "" : $" — {m.Detail}";
                     string target = string.IsNullOrWhiteSpace(m.Target) ? "" : $" (target: {m.Target})";
-                    sb.AppendLine($"- {box} **{m.Title}**{tail}{target}");
+                    string owner = string.IsNullOrWhiteSpace(m.OwnerAgentID) ? "" : $" (owner: {m.OwnerAgentID})";
+                    string blocked = string.IsNullOrWhiteSpace(m.BlockReason) ? "" : $" — BLOCKER: {m.BlockReason}";
+                    string deps = m.DependsOn.Count == 0 ? "" : $" (depends on: {string.Join(", ", m.DependsOn)})";
+                    sb.AppendLine($"- {box} **{m.Title}**{tail}{target}{owner}{deps}{blocked}" +
+                        (m.Evidence.Count > 0 ? $" [evidence: {m.Evidence.Count}]" : ""));
                 }
                 sb.AppendLine();
             }

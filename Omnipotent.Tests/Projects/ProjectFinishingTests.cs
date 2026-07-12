@@ -50,6 +50,29 @@ namespace Omnipotent.Tests.Projects
             store.RunRetentionSweep();
             Assert.NotNull(store.GetBytes(pid, art.ArtifactID));
         }
+
+        [Fact]
+        public void ArtifactLifecycle_HashesValidatesAndPersistsProvenance()
+        {
+            string root = Path.Combine(Path.GetTempPath(), "omnipotent-artifact-tests", Guid.NewGuid().ToString("N"));
+            try
+            {
+                var store = new ProjectArtifactStore(_ => { }, root);
+                var art = store.Save("p", new byte[] { 1, 2, 3 }, "application/octet-stream", "result",
+                    sourceWakeID: "wake-1", agentID: "agent-a", toolCallID: "call-9");
+
+                Assert.Equal(3, art.SizeBytes);
+                Assert.Equal(64, art.Sha256.Length);
+                Assert.Equal(ProjectArtifactStore.ArtifactLifecycleState.Captured, art.State);
+                var validated = store.Validate("p", art.ArtifactID, true, "checked");
+                Assert.Equal(ProjectArtifactStore.ArtifactLifecycleState.Validated, validated!.State);
+                Assert.Equal("wake-1", new ProjectArtifactStore(_ => { }, root).GetRecord("p", art.ArtifactID)!.WakeID);
+            }
+            finally
+            {
+                if (Directory.Exists(root)) Directory.Delete(root, recursive: true);
+            }
+        }
     }
 
     [Collection("ProjectsSerial")]

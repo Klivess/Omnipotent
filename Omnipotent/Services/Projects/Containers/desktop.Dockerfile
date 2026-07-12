@@ -20,10 +20,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb x11vnc xfce4 xfce4-terminal dbus-x11 \
-        firefox-esr \
+        firefox-esr chromium \
         xdotool wmctrl xclip x11-utils \
         curl ca-certificates fonts-dejavu \
-        python3 python3-pip python3-venv \
+        python3 python3-pip python3-venv python3-websocket \
         sudo \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -35,7 +35,8 @@ RUN useradd -m -s /bin/bash agent && mkdir -p /project && chown agent:agent /pro
     && echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent && chmod 0440 /etc/sudoers.d/agent
 
 COPY desktop-entrypoint.sh /usr/local/bin/desktop-entrypoint.sh
-RUN chmod +x /usr/local/bin/desktop-entrypoint.sh
+COPY browser-inspect.py /usr/local/bin/browser-inspect.py
+RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py
 
 USER agent
 WORKDIR /home/agent

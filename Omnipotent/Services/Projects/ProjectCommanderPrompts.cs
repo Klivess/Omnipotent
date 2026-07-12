@@ -31,14 +31,16 @@ namespace Omnipotent.Services.Projects
             string? observablesBlock = null,
             string? grandPlanBlock = null,
             string? accountsBlock = null,
-            string? filesBlock = null)
+            string? filesBlock = null,
+            string? runtimeStateBlock = null)
         {
             var sb = new StringBuilder();
 
             sb.AppendLine("── PROJECT ──");
+            sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — every timestamp in this seed and in your messages is UTC; measure staleness and elapsed time against this clock.");
             sb.AppendLine($"Name: {project.Name}");
             sb.AppendLine($"Goal: {project.Goal}");
-            sb.AppendLine($"Status: {project.Status}");
+            sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampWithAge(project.CreatedAt)}");
             sb.AppendLine($"Budgets: tokens ${project.TokenBudgetUsd:0.##} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
 
             // The approved Grand Plan is the standing north star — surfaced right under the header so
@@ -49,7 +51,15 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
             }
 
-            sb.AppendLine("── STANDING DIGEST ──");
+            // Typed state is authoritative for blockers, verified facts, canonical artifacts and
+            // resume actions. It precedes model-authored digest prose so a stale summary cannot win.
+            if (!string.IsNullOrWhiteSpace(runtimeStateBlock))
+            {
+                sb.AppendLine("── TYPED EXECUTION STATE (authoritative; update with checkpoint tools) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(runtimeStateBlock, ProjectsContextBudget.DigestBudget));
+            }
+
+            sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampWithAge(digest.UpdatedAt)}) ──");
             string digestBlock = ComposeDigestBlock(digest);
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digestBlock, ProjectsContextBudget.DigestBudget));
 
@@ -100,7 +110,7 @@ namespace Omnipotent.Services.Projects
                     h => h.Snippet,
                     h => h.Score);
                 foreach (var hit in fitted.OrderBy(h => h.Sequence))
-                    sb.AppendLine($"[#{hit.Sequence} {hit.Timestamp:MM-dd HH:mm} {hit.Type}] {hit.Snippet}");
+                    sb.AppendLine($"[#{hit.Sequence} {hit.Timestamp:yyyy-MM-dd HH:mm} {hit.Type}] {hit.Snippet}");
             }
 
             if (recentEvents.Count > 0)
@@ -135,7 +145,7 @@ namespace Omnipotent.Services.Projects
             string body = e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ToolResult
                 ? $"{e.ToolName}: {Truncate(e.Text, 200)}"
                 : Truncate(e.Text, 400);
-            return $"[#{e.Sequence} {e.Timestamp:MM-dd HH:mm} {e.Type}] {who}: {body}";
+            return $"[#{e.Sequence} {e.Timestamp:yyyy-MM-dd HH:mm} {e.Type}] {who}: {body}";
         }
 
         private static string ComposeDigestBlock(ProjectDigest d)
@@ -165,6 +175,7 @@ namespace Omnipotent.Services.Projects
         {
             var sb = new StringBuilder();
             sb.AppendLine("You maintain the standing digest of a long-running autonomous project. Merge the existing digest with the new events below.");
+            sb.AppendLine($"Current time: {Data_Handling.TemporalFormat.ClockLine()}. Event stamps are UTC. When the digest mentions time, use ABSOLUTE dates (e.g. '2026-07-12'), never 'today'/'yesterday' — the digest is read days later.");
             sb.AppendLine($"The project's goal: {project.Goal}");
             sb.AppendLine();
             sb.AppendLine($"Output EXACTLY five sections with these exact headers, nothing before the first header:");

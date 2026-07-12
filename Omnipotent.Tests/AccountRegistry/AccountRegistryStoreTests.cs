@@ -9,6 +9,7 @@ namespace Omnipotent.Tests.AccountRegistry
     /// The registry is a SINGLE global index, so tests isolate by using a unique random service key /
     /// secret value per test and asserting only on their own records.
     /// </summary>
+    [Collection("AccountRegistrySerial")]
     public class AccountRegistryStoreTests
     {
         private static AccountRegistryStore NewStore() => new(_ => { });

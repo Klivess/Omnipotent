@@ -125,18 +125,30 @@ namespace Omnipotent.Services.KliveAgent
             return System.Text.RegularExpressions.Regex.Replace(content.Trim().ToLowerInvariant(), @"\s+", " ");
         }
 
-        public async Task<List<AgentMemoryEntry>> RecallMemoriesAsync(string query, int maxResults = 10)
+        public async Task<List<AgentMemoryEntry>> RecallMemoriesAsync(string query, int maxResults = 10, DateTime? sinceUtc = null, DateTime? untilUtc = null)
         {
             if (!cacheLoaded) await LoadCacheAsync();
 
             await cacheLock.WaitAsync();
             try
             {
+                // Time-window leg of temporal recall: restrict the candidate set BEFORE scoring so
+                // "what did I learn last week" ranks within the window instead of being outranked
+                // by older high-importance memories.
+                var candidates = cachedMemories;
+                if (sinceUtc.HasValue || untilUtc.HasValue)
+                    candidates = cachedMemories
+                        .Where(m => (!sinceUtc.HasValue || m.CreatedAt >= sinceUtc.Value)
+                                 && (!untilUtc.HasValue || m.CreatedAt <= untilUtc.Value))
+                        .ToList();
+
                 if (string.IsNullOrWhiteSpace(query))
                 {
-                    return cachedMemories
-                        .OrderByDescending(m => m.Importance)
-                        .ThenByDescending(m => m.CreatedAt)
+                    // Windowed browse orders by time (newest first) — the caller asked "what's from
+                    // this period", not "what's most important overall".
+                    return (sinceUtc.HasValue || untilUtc.HasValue
+                            ? candidates.OrderByDescending(m => m.CreatedAt)
+                            : candidates.OrderByDescending(m => m.Importance).ThenByDescending(m => m.CreatedAt))
                         .Take(maxResults)
                         .ToList();
                 }
@@ -144,13 +156,13 @@ namespace Omnipotent.Services.KliveAgent
                 var queryTerms = query.ToLowerInvariant()
                     .Split(new[] { ' ', ',', '.', ';', ':', '?' }, StringSplitOptions.RemoveEmptyEntries)
                     .Where(t => t.Length >= 2).ToList();
-                var corpus = cachedMemories.Select(m =>
+                var corpus = candidates.Select(m =>
                     ((m.Content ?? "") + " " + string.Join(" ", m.Tags ?? new List<string>())).ToLowerInvariant()).ToList();
                 double avgLen = corpus.Count == 0 ? 1 : corpus.Average(c => c.Length);
                 int N = corpus.Count;
                 var df = BuildDocFrequencies(queryTerms, corpus);
 
-                return cachedMemories
+                return candidates
                     .Select((m, i) =>
                     {
                         var doc = corpus[i];
@@ -275,13 +287,13 @@ namespace Omnipotent.Services.KliveAgent
             {
                 var title = string.IsNullOrEmpty(sc.Title) ? string.Empty : $"{TruncateForPrompt(sc.Title, 80)}: ";
                 var idTag = ShortId(sc.Id);
-                allItems.Add(($"[Shortcut id={idTag}] {title}{TruncateForPrompt(sc.Content, 220)}", sc.Importance + 1.5));
+                allItems.Add(($"[Shortcut id={idTag} · saved {TemporalFormat.StampWithAge(sc.CreatedAt)}] {title}{TruncateForPrompt(sc.Content, 220)}", sc.Importance + 1.5));
             }
             foreach (var mem in regularMemories)
             {
                 var tagStr = mem.Tags.Count > 0 ? $" [{string.Join(", ", mem.Tags)}]" : "";
                 var idTag = ShortId(mem.Id);
-                allItems.Add(($"[Memory id={idTag}] {TruncateForPrompt(mem.Content, 200)}{tagStr}", mem.Importance));
+                allItems.Add(($"[Memory id={idTag} · saved {TemporalFormat.StampWithAge(mem.CreatedAt)}] {TruncateForPrompt(mem.Content, 200)}{tagStr}", mem.Importance));
             }
 
             if (allItems.Count == 0) return string.Empty;

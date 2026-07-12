@@ -26,22 +26,24 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> TextTierTools = new(StringComparer.Ordinal)
         {
             "run_script", "run_powershell", "run_bash", "http_request",
-            "read_file", "write_file", "list_files", "stat_file", "make_directory", "move_file", "copy_file", "delete_file", "mark_file_important",
-            "send_agent_message", "spawn_sub_agent", "retire_sub_agent",
+            "read_file", "write_file", "list_files", "stat_file", "resolve_project_path", "make_directory", "move_file", "copy_file", "delete_file", "mark_file_important",
+            "send_agent_message", "spawn_sub_agent",
             "create_stimulus_hook", "list_stimulus_hooks", "delete_stimulus_hook",
             "request_user_approval", "request_budget_increase", "record_money_spend",
             "vault_save", "vault_list", "request_human",
             "update_plan", "report_progress",
             "update_observable", "list_observables",
+            "update_checkpoint", "get_checkpoint",
             "account_register", "account_list", "account_update",
             "recall_memories", "save_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
+            "query_events",
         };
 
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
-            "complete_project", "request_budget_increase",
+            "complete_project", "request_budget_increase", "retire_sub_agent", "assign_plan_work", "record_money_spend",
             // Councils and the Grand Plan are the Commander's strategic instruments — sub-agents
             // execute under the plan, they don't set or revise it. (These are also absent from
             // TextTierTools, so IsToolAllowed already blocks them; this makes the intent explicit.)
@@ -55,7 +57,7 @@ namespace Omnipotent.Services.Projects
             "computer_move", "computer_click", "computer_drag",
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
-            "computer_wait", "computer_open_browser", "computer_navigate", "computer_focus_window", "computer_launch_app",
+            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };

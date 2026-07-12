@@ -32,13 +32,15 @@ THE GOAL: {project.Goal}
 
 HOW YOU OPERATE:
 - You wake in response to a stimulus (an event, a message from Klives, a sub-agent report, a timer, or a watchdog nudge). Each wake you are handed a fresh rehydrated context: the standing digest (plan, org chart, budget, open threads), recent events, and retrieved history. There is no persistent conversation — the event log is your memory. Trust the digest and retrieved facts over any half-memory.
-- Each wake is a bounded round of thinking and acting: assess what changed, take the next concrete steps with your tools, then finish with a short status and go back to sleep. Do not try to finish the whole project in one wake — but never idle either: if you hit the wake's tool budget mid-task, a continuation wake follows immediately, so close with a precise resume point rather than winding the task down.
+- Work for as long as the project needs. The harness refreshes context in renewable work slices; a slice boundary is never a reason to wind down. At rollover, record verified status and one exact resume action, then continue immediately. Stop only when the assignment is actually complete, cancelled, budget-paused, blocked on a real dependency/approval/human action, or machine-detected as non-converging.
 - Sleep is for WAITING, not for pacing. End a wake only when you're blocked on something external — a sub-agent working, a hook you expect to fire, a reply from Klives — or nothing more can usefully be done right now. If your closing status would list actions you could take immediately, that status is wrong: take them this wake instead of deferring them to a future one.
 - You distribute work aggressively — you are a commander, not a lone worker. Whenever a task has separable parts, can run in parallel, or wants focused/specialised effort, spawn sub-agents rather than grinding through it yourself wake by wake: they run concurrently, each with its own fresh context, so fanning work out to a small team is usually both faster and cheaper on your own context than doing it serially. Spawn in the cheapest capability tier whose tools the job needs (text < image < video < audio — the tier list is a price list), keep them busy, and retire them the moment they're done to free slots against your cap. If the agent cap is the only thing blocking useful parallelism, make the case with request_budget_increase. Sub-agents may spawn short-lived helpers ONE level deep; no deeper.
 - Keep your tactical plan current with update_plan (your current focus + concrete next steps) and report_progress; and as milestones land and success criteria are met, tick them with update_plan_progress so the Grand Plan dashboard reflects reality.
 - Maintain a small dashboard of Observables (update_observable): live named values — counters, balances, status lines — shown to Klives at the top of the project page. Keep them few, current, and honest; they are how he tracks measured progress at a glance.
 - Shape what wakes you: maintain stimulus hooks (create_stimulus_hook) so real events wake you — a timer for periodic checks, webhooks for external services, screen-diff or script polls for things you monitor. A system keepalive nudges you every ~15 minutes as a fallback, but a well-hooked project reacts to its world instead of polling it.
 - When your wake was triggered by a message from Klives, your closing status IS your reply — it is delivered to him on Discord and the website. Answer his message directly in it.
+- TIME: you live on a real clock. Every message you receive, every tool result and every event line carries a UTC timestamp, and the wake seed's 'Now:' line is the current wall-clock — trust those stamps over any date you think you know (your training cutoff is NOT today). Reason about elapsed time explicitly: how long a worker has been silent, how stale an observable or verified fact is, how long since Klives replied, whether a queued stimulus is old news by the time you read it. When you write plans, reports, memories or observables, use absolute dates ('2026-07-12'), never 'today'/'tomorrow' — your words are read on later wakes when 'today' has moved.
+- TIME INSTRUMENTS: query_events is the time-indexed read of your own history — use it for 'what happened overnight / since X / on the 10th' instead of guessing from the seed window. recall_memories takes since/until for time-scoped memory. Observables show a Δ trend (direction + rate), so read trajectories, not just values. To act at a FUTURE time, create a timer stimulus hook (create_stimulus_hook, sourceKind 'timer') — a plan that says 'later' without a hook or a worker owning it will simply never happen.
 
 STRATEGY — RUN THIS LIKE A CORPORATION (Grand Plan + Councils):
 - Your GRAND PLAN is the project's north star: the mission, workstreams, milestones, risks, budget strategy and success criteria that Klives approved before work began. It is seeded into every wake as a summary (with live progress); read it in full — with milestone/criterion ids and status — via get_grand_plan. update_plan is your TACTICAL plan — the near-term moves that serve the Grand Plan — not a replacement for it. As you deliver, mark milestones done/in-progress/blocked and tick success criteria with update_plan_progress: a non-material progress update that keeps Klives' live dashboard honest without re-opening approval.
@@ -112,6 +114,32 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                 Tool("report_progress", "Record a progress note against the goal for the timeline and reports.",
                     Obj(new { note = Str("What advanced, what was verified, what's next.") }, "note")),
 
+                Tool("update_checkpoint", "Update the machine-owned project handoff state. Use this whenever you verify a durable fact, establish the canonical artifact for a role, hit/clear a blocker, or need a later wake to resume at one exact action. Unlike digest prose, checkpoints survive compaction without reinterpretation. Ops: set_resume, clear_resume, upsert_fact, invalidate_fact, register_artifact, remove_artifact, set_blocker, clear_blocker, set_active_milestones, record_success.",
+                    Obj(new
+                    {
+                        op = new { type = "string", @enum = new[] { "set_resume", "clear_resume", "upsert_fact", "invalidate_fact", "register_artifact", "remove_artifact", "set_blocker", "clear_blocker", "set_active_milestones", "record_success" }, description = "Checkpoint mutation." },
+                        key = Str("Fact key, artifact role, or blocker code depending on op."),
+                        value = Str("Verified fact value."),
+                        summary = Str("Exact resume action, blocker summary, or successful-action summary."),
+                        evidenceReference = Str("Stable evidence reference: event ID/sequence, tool-call ID, project path, artifact ID, URL, or user confirmation."),
+                        evidenceKind = Str("event | artifact | project_file | tool_result | external_observation | user_confirmation | other"),
+                        evidenceEventSequence = Num("Optional project event sequence supporting the claim."),
+                        validUntil = Str("Optional ISO-8601 expiry for a verified fact."),
+                        notBefore = Str("Optional ISO-8601 earliest time for a resume action."),
+                        preconditions = Arr(Str("A concrete precondition."), "Resume preconditions."),
+                        projectPath = Str("Canonical path relative to /project (or /project/...)."),
+                        artifactID = Str("Timeline artifact ID when the canonical item is not a project file."),
+                        contentHash = Str("Expected content hash when known."),
+                        blockerCategory = Str("approval | budget | external_dependency | capacity | configuration | manual_intervention | invariant_violation | unknown"),
+                        retryable = Bool("Whether the blocker can clear without a user/configuration change."),
+                        nextRetryAt = Str("Optional ISO-8601 retry time."),
+                        grandPlanVersion = Num("Approved Grand Plan version for active milestone state."),
+                        milestoneIDs = Arr(Str("Stable milestone ID."), "Currently active milestone IDs."),
+                    }, "op")),
+
+                Tool("get_checkpoint", "Read the authoritative typed runtime/checkpoint state: blocker/circuit, exact resume action, active milestones, fresh verified facts and canonical artifacts.",
+                    Obj(new { }, Array.Empty<string>())),
+
                 Tool("update_observable", "Create/set, arithmetically adjust, or delete a named Observable — a live variable shown to Klives at the top of this project's page (e.g. 'updates made' = 42, 'paper trading balance' = 10250.50, 'current phase' = 'backtesting'). Every change is timestamped into a bounded history so Klives sees trends. Ops: 'set' creates or overwrites (numeric via 'value' or text via 'textValue'); 'add'/'subtract'/'multiply'/'divide' adjust an existing numeric one by 'value'; 'delete' removes it. Maintain a few high-signal observables and keep them current — they are Klives' at-a-glance dashboard for this project.",
                     Obj(new
                     {
@@ -122,6 +150,11 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         format = Str("Optional display hint for numeric observables: raw, currency, percent, count."),
                         unit = Str("Optional unit label shown after raw values, e.g. 'USD', 'items'."),
                         description = Str("Optional one-line description of what this measures (usually set once at creation)."),
+                        observedAt = Str("Optional ISO-8601 time the value was actually observed; defaults to now."),
+                        staleAfterSeconds = Num("Optional freshness window. Seeds mark the value STALE after this many seconds."),
+                        validity = Str("Optional: unknown | valid | invalid."),
+                        evidenceEventSequence = Num("Optional project event sequence supporting this value."),
+                        evidenceArtifactIDs = Arr(Str("Supporting artifact ID."), "Optional evidence artifacts."),
                     }, "name", "op")),
 
                 Tool("list_observables", "List this project's Observables with current values, descriptions and last-updated times.",
@@ -141,6 +174,15 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         tier = Str("One of: Text, TextImage, TextImageVideo, TextImageVideoAudio."),
                         objective = Str("What this agent should accomplish."),
                     }, "role", "tier", "objective")),
+
+                Tool("assign_plan_work", "Assign a dependency-ready Grand Plan milestone to an existing worker. The harness verifies the dependency frontier, records ownership, updates the worker objective/deliverables, and wakes it atomically.",
+                    Obj(new
+                    {
+                        milestoneId = Str("Dependency-ready milestone ID or exact title."),
+                        agentID = Str("Active worker agent ID or unique role."),
+                        objective = Str("Bounded objective that completes this milestone."),
+                        deliverablePaths = Arr(Str("Expected project-relative output path."), "Expected deliverables."),
+                    }, "milestoneId", "agentID", "objective")),
 
                 Tool("retire_sub_agent", "Retire a sub-agent that has finished its work, freeing a slot against the cap.",
                     Obj(new { agentID = Str("The agent's ID.") }, "agentID")),
@@ -208,8 +250,19 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                     Obj(new { what = Str("What the human needs to do.") }, "what")),
 
                 // ── KliveAgent shared memory (this project is part of Klives' assistant — memory transfers across projects) ──
-                Tool("recall_memories", "Recall relevant facts from Klives' shared memory (spans all projects and KliveAgent). Use before assuming; Klives' preferences, credentials-context, and past learnings live here.",
-                    Obj(new { query = Str("What you're trying to remember."), max = Num("Max results (default 8).") }, "query")),
+                Tool("recall_memories", "Recall relevant facts from Klives' shared memory (spans all projects and KliveAgent). Use before assuming; Klives' preferences, credentials-context, and past learnings live here. Optional since/until scope to a time window (UTC date-time or a lookback like \"7d\").",
+                    Obj(new { query = Str("What you're trying to remember."), max = Num("Max results (default 8)."), since = Str("Optional window start: UTC date-time or lookback (\"7d\", \"24h\")."), until = Str("Optional window end: UTC date-time or lookback.") }, "query")),
+
+                Tool("query_events", "Query YOUR OWN project timeline by TIME WINDOW — the time-indexed read of the event log. Use for questions like \"what happened overnight\", \"everything since the last report\", \"what did agent X do on the 10th\". Returns matching events (full UTC stamps), newest-biased when over max.",
+                    Obj(new
+                    {
+                        from = Str("Window start: UTC date-time (\"2026-07-10 06:00\") or lookback (\"24h\", \"7d\"). Omit for open start."),
+                        to = Str("Window end: UTC date-time or lookback. Omit for now."),
+                        contains = Str("Optional case-insensitive text filter on event text."),
+                        type = Str("Optional event-type filter, exact or substring (e.g. \"commander-message\", \"tool-call\", \"wake\")."),
+                        author = Str("Optional author filter: commander | agent | klives | system | stimulus."),
+                        max = Num("Max events to return (default 40, cap 200)."),
+                    }, Array.Empty<string>())),
 
                 Tool("save_memory", "Save a durable fact to Klives' shared memory so it persists across wakes, projects, and KliveAgent. Save learnings, preferences, and important outcomes — not transient state.",
                     Obj(new { content = Str("The fact to remember."), tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, "content")),
@@ -265,6 +318,9 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
 
                 Tool("stat_file", "Inspect one shared file or directory, including type, size, timestamps, provenance, description and important status.",
                     Obj(new { path = Str("Path relative to /project.") }, "path")),
+
+                Tool("resolve_project_path", "Resolve one shared-project path across execution environments. Returns the canonical project-relative path, the container path under /project, the host path, existence/type/hash and provenance. Use this instead of searching host disks or guessing volume mounts.",
+                    Obj(new { path = Str("A project-relative path or a /project/... container path.") }, "path")),
 
                 Tool("make_directory", "Create a directory in the shared project filesystem, including missing parent directories.",
                     Obj(new { path = Str("Directory path relative to /project.") }, "path")),
@@ -333,7 +389,7 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         mission = Str("The mission: one or two sentences on what winning looks like."),
                         workstreams = Arr(Obj(new { name = Str("Workstream name."), description = Str("What this track covers.") }, "name"),
                             "Parallel tracks of work."),
-                        milestones = Arr(Obj(new { title = Str("Milestone title — a concrete, checkable outcome."), detail = Str("Optional detail."), target = Str("Optional target date or condition."), status = Str("Optional: pending | in_progress | done | blocked (default pending).") }, "title"),
+                        milestones = Arr(Obj(new { title = Str("Milestone title — a concrete, checkable outcome."), detail = Str("Optional detail."), target = Str("Optional target date or condition."), status = Str("Optional: pending | in_progress | done | blocked (default pending)."), dependsOn = Arr(Str("Earlier milestone title or stable ID."), "Dependencies that must be done first."), ownerAgentID = Str("Optional responsible agent ID.") }, "title"),
                             "Ordered milestones toward the mission."),
                         risks = Arr(Obj(new { description = Str("The risk."), severity = Str("low | medium | high."), mitigation = Str("How you'll mitigate it.") }, "description"),
                             "Known risks and their mitigations."),
@@ -341,21 +397,21 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                             "The criteria that define the goal as achieved."),
                         budgetPlan = Str("Prose plan for how you'll spend the token/money budget."),
                         summary = Str("A ≤150-word summary shown on the approval card and seeded into every future wake."),
-                    }, "mission", "summary")),
+                    }, "mission", "milestones", "successCriteria", "summary")),
 
                 Tool("amend_grand_plan", "Revise the approved Grand Plan as reality changes — re-author the full structured plan. Set material=true for changes to mission, success criteria, or budget strategy — these re-open an approval gate with Klives. Set material=false for tactical refinements — applied immediately and noted on the timeline. Carry forward status/met on items already achieved. Convene a council before a material amendment.",
                     Obj(new
                     {
                         mission = Str("The (possibly revised) mission."),
                         workstreams = Arr(Obj(new { name = Str("Workstream name."), description = Str("What this track covers.") }, "name"), "Parallel tracks of work."),
-                        milestones = Arr(Obj(new { title = Str("Milestone title."), detail = Str("Optional detail."), target = Str("Optional target."), status = Str("pending | in_progress | done | blocked — carry forward completed ones.") }, "title"), "Ordered milestones."),
+                        milestones = Arr(Obj(new { title = Str("Milestone title."), detail = Str("Optional detail."), target = Str("Optional target."), status = Str("pending | in_progress | done | blocked — carry forward completed ones."), dependsOn = Arr(Str("Milestone title or stable ID."), "Dependencies."), ownerAgentID = Str("Optional responsible agent ID.") }, "title"), "Ordered milestones."),
                         risks = Arr(Obj(new { description = Str("The risk."), severity = Str("low | medium | high."), mitigation = Str("Mitigation.") }, "description"), "Risks."),
                         successCriteria = Arr(Obj(new { text = Str("Criterion."), met = Str("'true' if met — carry forward.") }, "text"), "Success criteria."),
                         budgetPlan = Str("Prose budget plan."),
                         summary = Str("A ≤150-word summary of the revised plan."),
                         changeNote = Str("What changed versus the current plan, and why."),
                         material = Str("'true' if this materially changes mission/success-criteria/budget-strategy (needs approval); 'false' for a tactical refinement."),
-                    }, "mission", "summary", "changeNote")),
+                    }, "mission", "milestones", "successCriteria", "summary", "changeNote")),
 
                 Tool("update_plan_progress", "Record progress against the approved Grand Plan WITHOUT re-opening approval: set a milestone's status, or mark a success criterion met/unmet. Use it as work actually advances so Klives' live Plan dashboard stays honest. Reference items by the ids shown in get_grand_plan (or by their exact title/text).",
                     Obj(new
@@ -365,6 +421,11 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         criterionId = Str("The success criterion to update (id like 'c1', or its exact text). Omit if updating a milestone."),
                         criterionMet = Str("'true' or 'false'."),
                         note = Str("Optional short note for the timeline."),
+                        evidence = Str("Required when marking a milestone done or criterion met: concise verification and a stable event/artifact/project-file/tool-result reference."),
+                        evidenceEventSequence = Num("Optional supporting project event sequence."),
+                        evidenceArtifactIDs = Arr(Str("Supporting timeline artifact ID."), "Evidence artifacts."),
+                        blockReason = Str("Required when setting a milestone blocked."),
+                        ownerAgentID = Str("Optional active agent responsible for this milestone."),
                     }, Array.Empty<string>())),
 
                 Tool("get_grand_plan", "Read your current approved Grand Plan in full, including milestone/criterion ids and their live status (the north star seeded into your wakes shows only a summary).",

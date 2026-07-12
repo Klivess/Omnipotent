@@ -48,6 +48,8 @@ namespace Omnipotent.Services.Projects
                     ParentAgentID = null,
                     Tier = ProjectAgentTier.TextImageVideo, // Commander perceives desktops
                     Role = CommanderRole,
+                    Objective = "Coordinate the project to its approved goal.",
+                    WorkStatus = ProjectAgentWorkStatus.Running,
                 };
                 agents.Add(commander);
                 SaveLocked(projectID, agents);
@@ -60,7 +62,7 @@ namespace Omnipotent.Services.Projects
         /// one-level delegation depth. Throws InvalidOperationException with a message the
         /// Commander can read and act on (it becomes the tool result).
         /// </summary>
-        public ProjectAgentRecord Spawn(string projectID, string parentAgentID, ProjectAgentTier tier, string role)
+        public ProjectAgentRecord Spawn(string projectID, string parentAgentID, ProjectAgentTier tier, string role, string objective = "")
         {
             var project = projectStore.GetProject(projectID)
                 ?? throw new InvalidOperationException("Unknown project.");
@@ -86,6 +88,8 @@ namespace Omnipotent.Services.Projects
                     ParentAgentID = parentAgentID,
                     Tier = tier,
                     Role = role,
+                    Objective = objective.Trim(),
+                    WorkStatus = ProjectAgentWorkStatus.Assigned,
                 };
                 agents.Add(agent);
                 SaveLocked(projectID, agents);
@@ -123,6 +127,12 @@ namespace Omnipotent.Services.Projects
                 var agents = LoadLocked(projectID);
                 var agent = agents.FirstOrDefault(a => a.AgentID == agentID && !a.Retired);
                 if (agent == null) return false;
+                if (string.Equals(agent.AgentID, "commander", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(agent.Role, CommanderRole, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("The Commander cannot be retired through the sub-agent lifecycle tool.");
+                var activeChildren = agents.Where(a => !a.Retired && a.ParentAgentID == agent.AgentID).ToList();
+                if (activeChildren.Count > 0)
+                    throw new InvalidOperationException($"Retire or reassign this agent's active children first: {string.Join(", ", activeChildren.Select(a => a.AgentID))}.");
                 agent.Retired = true;
                 agent.RetiredAt = DateTime.UtcNow;
                 SaveLocked(projectID, agents);
@@ -141,6 +151,47 @@ namespace Omnipotent.Services.Projects
         public List<ProjectAgentRecord> ListActive(string projectID)
         {
             lock (LockFor(projectID)) return LoadLocked(projectID).Where(a => !a.Retired).ToList();
+        }
+
+        public bool UpdateWorkState(string projectID, string agentID, ProjectAgentWorkStatus status,
+            string? lastReport = null, IEnumerable<string>? deliverablePaths = null)
+        {
+            lock (LockFor(projectID))
+            {
+                var agents = LoadLocked(projectID);
+                var agent = agents.FirstOrDefault(a => a.AgentID == agentID && !a.Retired);
+                if (agent == null) return false;
+                agent.WorkStatus = status;
+                if (!string.IsNullOrWhiteSpace(lastReport))
+                {
+                    agent.LastReport = lastReport.Trim();
+                    agent.LastReportAt = DateTime.UtcNow;
+                }
+                if (deliverablePaths != null)
+                    agent.DeliverablePaths = deliverablePaths.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+                SaveLocked(projectID, agents);
+                return true;
+            }
+        }
+
+        public bool AssignObjective(string projectID, string agentID, string objective,
+            IEnumerable<string> milestoneIDs, IEnumerable<string>? deliverablePaths = null)
+        {
+            if (string.IsNullOrWhiteSpace(objective)) throw new ArgumentException("objective required", nameof(objective));
+            lock (LockFor(projectID))
+            {
+                var agents = LoadLocked(projectID);
+                var agent = agents.FirstOrDefault(a => a.AgentID == agentID && !a.Retired && a.AgentID != "commander");
+                if (agent == null) return false;
+                agent.Objective = objective.Trim();
+                agent.ActiveMilestoneIDs = milestoneIDs.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+                agent.DeliverablePaths = (deliverablePaths ?? Array.Empty<string>()).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+                agent.WorkStatus = ProjectAgentWorkStatus.Assigned;
+                agent.LastReport = null;
+                agent.LastReportAt = null;
+                SaveLocked(projectID, agents);
+                return true;
+            }
         }
 
         /// <summary>
@@ -196,7 +247,7 @@ namespace Omnipotent.Services.Projects
             var active = ListActive(projectID);
             if (active.Count == 0) return "(no agents yet)";
             return string.Join("; ", active.Select(a =>
-                $"{a.Role}[id={a.AgentID}, tier={a.Tier}]" +
+                $"{a.Role}[id={a.AgentID}, tier={a.Tier}, status={a.WorkStatus}, objective={a.Objective}]" +
                 (a.ParentAgentID == null ? "" : $"←{a.ParentAgentID}")));
         }
 

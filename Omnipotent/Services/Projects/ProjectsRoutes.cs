@@ -115,6 +115,22 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            await parent.CreateAPIRoute("/projects/state", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    await req.ReturnResponse(Json(new
+                    {
+                        Project = project,
+                        Runtime = parent.RuntimeState.Get(project!.ProjectID),
+                        GrandPlan = parent.GrandPlans.GetCurrentApproved(project.ProjectID),
+                        Budget = parent.Budget.GetLedger(project.ProjectID),
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             await parent.CreateAPIRoute("/projects/pause", async req =>
             {
                 try
@@ -122,6 +138,7 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     project!.Status = ProjectStatus.Paused;
                     parent.Store.SaveProject(project);
+                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
                     // Halt the in-flight wake too, so "pause" stops work promptly rather than only
                     // preventing the NEXT wake (item 1: halt progression).
                     bool halted = parent.CommanderRunner.CancelActiveWake(project.ProjectID);
@@ -146,6 +163,7 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     project!.Status = ProjectStatus.Archived;
                     parent.Store.SaveProject(project);
+                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Archived);
                     parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
                     parent.SubAgentRunner.CancelProject(project.ProjectID);
                     parent.EventLog.Append(new ProjectEvent
@@ -169,6 +187,7 @@ namespace Omnipotent.Services.Projects
                     // unshelving never silently sets the fleet back to work.
                     project!.Status = ProjectStatus.Paused;
                     parent.Store.SaveProject(project);
+                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Paused);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -245,6 +264,16 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("budgets must be finite, tokenBudgetUsd must be > 0, money limits must be ≥ 0, and subAgentCap ≥ 1", code: HttpStatusCode.BadRequest);
                         return;
                     }
+                    if (agentCap.HasValue)
+                    {
+                        int activeAgents = parent.SubAgents.ListActive(project!.ProjectID).Count;
+                        if (agentCap.Value < activeAgents)
+                        {
+                            await req.ReturnResponse($"subAgentCap cannot be lowered below the active roster ({activeAgents}); retire agents first",
+                                code: HttpStatusCode.Conflict);
+                            return;
+                        }
+                    }
 
                     var changes = new List<string>();
                     if (tokenBudget.HasValue && tokenBudget.Value != project!.TokenBudgetUsd)
@@ -267,6 +296,8 @@ namespace Omnipotent.Services.Projects
                         project.Status = parent.GrandPlans.HasApprovedPlan(project.ProjectID)
                             ? ProjectStatus.Active : ProjectStatus.Planning;
                         parent.Store.SaveProject(project);
+                        parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
+                        parent.RuntimeState.ClearBlocker(project.ProjectID);
                         changes.Add("project resumed from budget-pause");
                     }
 
@@ -306,11 +337,17 @@ namespace Omnipotent.Services.Projects
                     // A project paused mid-planning resumes to Planning (the Grand Plan gate still stands).
                     bool wasPlanning = !parent.GrandPlans.HasApprovedPlan(project.ProjectID);
                     project!.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
+                    bool wasBlocked = project.BlockedAt.HasValue || !string.IsNullOrWhiteSpace(project.BlockedReason);
+                    project.BlockedAt = null;
+                    project.BlockedReason = null;
                     parent.Store.SaveProject(project);
+                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
+                    parent.RuntimeState.ClearBlocker(project.ProjectID);
+                    parent.RuntimeState.CloseCircuit(project.ProjectID);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
-                        Type = ProjectEventTypes.Status,
+                        Type = wasBlocked ? ProjectEventTypes.ProjectUnblocked : ProjectEventTypes.Status,
                         Author = "klives",
                         Text = "Project resumed by Klives.",
                     });
@@ -923,6 +960,7 @@ namespace Omnipotent.Services.Projects
         private object ToSummary(Project p)
         {
             var ledger = parent.Budget.GetLedger(p.ProjectID);
+            var runtime = parent.RuntimeState.Get(p.ProjectID);
             return new
             {
                 p.ProjectID,
@@ -936,6 +974,12 @@ namespace Omnipotent.Services.Projects
                 TokenSpendUsd = ledger.TokenSpendUsd,
                 MoneySpendUsd = ledger.MoneySpendUsd,
                 PendingApprovals = parent.Gates.ListPending(p.ProjectID).Count,
+                ExecutionDisposition = runtime.Disposition.ToString(),
+                ExecutionHealth = runtime.Health.Status.ToString(),
+                Blocker = runtime.Blocker?.Summary ?? p.BlockedReason,
+                NextRetryAt = runtime.Health.Circuit.RetryAt ?? runtime.Blocker?.NextRetryAt,
+                ActiveMilestoneIDs = runtime.Checkpoint.ActiveMilestoneIDs,
+                CheckpointRevision = runtime.Checkpoint.Revision,
                 lastSequence = parent.EventLog.GetLastSequence(p.ProjectID),
             };
         }

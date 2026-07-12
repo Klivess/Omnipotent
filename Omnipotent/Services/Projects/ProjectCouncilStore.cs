@@ -9,6 +9,10 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum CouncilStatus { Running, Completed, Failed, Cancelled }
 
+    /// <summary>Decision semantics are explicit: a council advises unless it identifies a genuine policy gate.</summary>
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum CouncilRecommendationClass { Unclassified, Proceed, ProceedWithConditions, NeedsUserDecision, HardPolicyBlock }
+
     /// <summary>One panelist turn (or the Chair's synthesis) in a council deliberation.</summary>
     public class CouncilStatement
     {
@@ -51,6 +55,7 @@ namespace Omnipotent.Services.Projects
         public List<CouncilStatement> Statements { get; set; } = new();
         /// <summary>The Chair's synthesis, verbatim — the product returned to the Commander.</summary>
         public string? VerdictText { get; set; }
+        public CouncilRecommendationClass RecommendationClass { get; set; } = CouncilRecommendationClass.Unclassified;
         public double TotalCostUsd { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? CompletedAt { get; set; }

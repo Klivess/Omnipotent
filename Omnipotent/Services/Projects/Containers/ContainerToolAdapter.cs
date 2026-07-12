@@ -45,7 +45,7 @@ namespace Omnipotent.Services.Projects.Containers
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
             "computer_move", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
             "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all", "computer_wait",
-            "computer_open_browser", "computer_navigate", "computer_focus_window", "computer_launch_app",
+            "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };
@@ -127,7 +127,7 @@ namespace Omnipotent.Services.Projects.Containers
 
             // Container-local shell execution does not read or inject VNC state. Let it remain
             // usable while a live viewer or a degraded framebuffer has a visual action queued.
-            bool usesVisualGate = tool != "computer_terminal";
+            bool usesVisualGate = tool is not ("computer_terminal" or "computer_browser_inspect");
             if (usesVisualGate) await actionGate.WaitAsync(ct);
             try
             {
@@ -204,6 +204,8 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Browser opened.", () => desktop.LaunchAsync("browser", Str(a, "url"), ct), ct, settleMs: 800);
                 case "computer_navigate":
                     return await MutateAsync("Browser navigated.", () => desktop.NavigateAsync(Str(a, "url") ?? throw new ArgumentException("Provide 'url'."), ct), ct, settleMs: 1000);
+                case "computer_browser_inspect":
+                    return await BrowserInspectAsync(a, ct);
                 case "computer_focus_window":
                     return await MutateAsync("Desktop application focused.", () => desktop.FocusAsync(Str(a, "titleContains"), Str(a, "processName"), ct), ct);
                 case "computer_launch_app":
@@ -216,6 +218,19 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Clipboard set.", () => transport.SetClipboardTextAsync(Str(a, "text") ?? string.Empty, ct), ct);
                 default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.");
             }
+        }
+
+        private async Task<ContainerToolResult> BrowserInspectAsync(JsonElement a, CancellationToken ct)
+        {
+            if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop.");
+            string mode = (Str(a, "mode") ?? "dom").Trim().ToLowerInvariant();
+            if (mode is not ("tabs" or "dom" or "accessibility" or "network"))
+                return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.");
+            int maxItems = Math.Clamp(Int(a, "maxItems", 80), 1, 200);
+            var shell = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems}", "/project", 30, ct);
+            if (!shell.Success)
+                return ContainerToolResult.Fail("Browser inspection failed: " + ComputerAudit.Truncate(shell.Stderr, 1200));
+            return ContainerToolResult.Ok(ComputerAudit.Truncate(shell.Stdout, 24000));
         }
 
         private async Task<ContainerToolResult> FindTextAsync(JsonElement a, CancellationToken ct, bool click)

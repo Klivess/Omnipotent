@@ -72,6 +72,54 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void CapabilityFlags_DoNotAdvertiseUnsupportedOptionalTools()
+        {
+            var names = VisualComputerToolCatalog.Build(new ComputerCapabilities
+            {
+                SupportsOcr = false,
+                SupportsBrowserControl = false,
+                SupportsClipboard = false,
+                SupportsAppLaunch = false,
+                SupportsWindowControl = false,
+            }).Select(t => t.function.name).ToHashSet();
+
+            Assert.DoesNotContain("computer_find_text", names);
+            Assert.DoesNotContain("computer_open_browser", names);
+            Assert.DoesNotContain("computer_clipboard_get", names);
+            Assert.DoesNotContain("computer_launch_app", names);
+            Assert.DoesNotContain("computer_focus_window", names);
+            Assert.Contains("computer_screenshot", names);
+        }
+
+        [Fact]
+        public void BrowserCapability_AdvertisesStructuredInspection()
+        {
+            var names = VisualComputerToolCatalog.Build(new ComputerCapabilities
+            {
+                SupportsBrowserControl = true,
+            }).Select(t => t.function.name).ToHashSet();
+
+            Assert.Contains("computer_browser_inspect", names);
+            string scriptPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+                "..", "..", "..", "..", "Omnipotent", "Services", "Projects", "Containers", "browser-inspect.py"));
+            string script = File.ReadAllText(scriptPath);
+            Assert.Contains("Accessibility.getFullAXTree", script);
+            Assert.Contains("performance.getEntriesByType", script);
+        }
+
+        [Fact]
+        public void HeldMouseTools_RequireCoordinates()
+        {
+            var tools = VisualComputerToolCatalog.Build(new ComputerCapabilities());
+            foreach (string name in new[] { "computer_mouse_down", "computer_mouse_up" })
+            {
+                var tool = tools.Single(t => t.function.name == name);
+                string schema = System.Text.Json.JsonSerializer.Serialize(tool.function.parameters);
+                Assert.Contains("\"required\":[\"x\",\"y\"]", schema);
+            }
+        }
+
+        [Fact]
         public void ProjectSettings_ClampVisualControlPacing()
         {
             var settings = new ProjectSettings();
@@ -81,6 +129,31 @@ namespace Omnipotent.Tests.Projects
 
             Assert.Equal(5000, settings.ComputerActionSettleMs);
             Assert.Equal(0, settings.ComputerTypingDelayMs);
+        }
+
+        [Fact]
+        public void ProjectSettings_UseRenewableWorkSlices_AndRetireContinuationCap()
+        {
+            var settings = new ProjectSettings();
+            Assert.True(settings.TrySet("workSliceToolCalls", "80"));
+            Assert.True(settings.TrySet("workSliceModelTurns", "50"));
+            Assert.True(settings.TrySet("maxConsecutiveContinuations", "0")); // accepted legacy no-op
+
+            Assert.Equal(80, settings.WorkSliceToolCalls);
+            Assert.Equal(50, settings.WorkSliceModelTurns);
+            Assert.Null(typeof(ProjectSettings).GetProperty("MaxConsecutiveContinuations"));
+        }
+
+        [Fact]
+        public void LegacyHardCapSettings_MigrateToRolloverBoundaries()
+        {
+            var settings = Newtonsoft.Json.JsonConvert.DeserializeObject<ProjectSettings>(
+                "{\"MaxToolCallsPerWake\":73,\"MaxModelTurnsPerWake\":31,\"MaxLoopTripsPerWake\":4}")!;
+
+            Assert.Equal(73, settings.WorkSliceToolCalls);
+            Assert.Equal(31, settings.WorkSliceModelTurns);
+            Assert.Equal(4, settings.MaxConvergenceTripsPerSlice);
+            Assert.DoesNotContain("MaxToolCallsPerWake", Newtonsoft.Json.JsonConvert.SerializeObject(settings));
         }
     }
 }

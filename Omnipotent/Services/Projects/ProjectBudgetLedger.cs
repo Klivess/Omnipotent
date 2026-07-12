@@ -25,6 +25,7 @@ namespace Omnipotent.Services.Projects
         private readonly Action<string> log;
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, SemaphoreSlim> llmTurnGates = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, double> llmTurnReservations = new(StringComparer.Ordinal);
 
         // Provisional per-million-token USD estimate, used until the real cost reconciles.
         // Same yardstick style as KliveAgentStats; the real OpenRouter figure supersedes it.
@@ -32,6 +33,7 @@ namespace Omnipotent.Services.Projects
         private const double ProvisionalCompletionPerMillion = 15.0;
 
         private const double WarnFraction = 0.80;
+        private const double DefaultTurnReservationUsd = 0.05;
 
         /// <summary>Raised (projectID) when a project crosses 100% and is auto-paused, so a surface can alert Klives.</summary>
         public event Action<string>? BudgetPausedRaised;
@@ -71,41 +73,71 @@ namespace Omnipotent.Services.Projects
 
         private sealed class LlmTurnLease : IAsyncDisposable
         {
-            private SemaphoreSlim? gate;
-            public LlmTurnLease(SemaphoreSlim gate) => this.gate = gate;
+            private ProjectBudgetLedger? owner;
+            private readonly string projectID;
+            private readonly double reservedUsd;
+
+            public LlmTurnLease(ProjectBudgetLedger owner, string projectID, double reservedUsd)
+            {
+                this.owner = owner;
+                this.projectID = projectID;
+                this.reservedUsd = reservedUsd;
+            }
+
             public ValueTask DisposeAsync()
             {
-                Interlocked.Exchange(ref gate, null)?.Release();
+                Interlocked.Exchange(ref owner, null)?.ReleaseReservation(projectID, reservedUsd);
                 return ValueTask.CompletedTask;
             }
         }
 
         /// <summary>
-        /// Serializes the check -> provider call -> ledger booking boundary for one project.
-        /// This prevents several concurrent agents from all starting against the same final few
-        /// cents and overshooting the cap as a group. The caller holds the lease until it has
-        /// recorded the response usage.
+        /// Reserves a conservative slice of the remaining project budget for one provider turn.
+        /// The per-project gate is held only while checking and reserving, never across the HTTP
+        /// call. This preserves multi-agent concurrency while preventing a burst of callers from
+        /// all observing the same uncommitted final cents. Reservations are process-local because
+        /// provider calls cannot survive a process restart.
         /// </summary>
         public async Task<IAsyncDisposable?> TryAcquireLlmTurnAsync(string projectID, CancellationToken ct = default)
         {
             var gate = llmTurnGates.GetOrAdd(projectID, _ => new SemaphoreSlim(1, 1));
             await gate.WaitAsync(ct);
-            var project = projectStore.GetProject(projectID);
-            bool allowed;
-            lock (LockFor(projectID))
+            try
             {
-                var ledger = LoadLocked(projectID);
-                // Planning projects spend too (research + planning councils draft the Grand Plan).
-                allowed = (project?.Status is ProjectStatus.Active or ProjectStatus.Planning) && project!.TokenBudgetUsd > 0 &&
-                          ledger.TokenSpendUsd < project.TokenBudgetUsd;
+                var project = projectStore.GetProject(projectID);
+                double reservation = 0;
+                lock (LockFor(projectID))
+                {
+                    var ledger = LoadLocked(projectID);
+                    llmTurnReservations.TryGetValue(projectID, out double alreadyReserved);
+                    bool runnable = project?.Status is ProjectStatus.Active or ProjectStatus.Planning;
+                    double remaining = project == null ? 0 : project.TokenBudgetUsd - ledger.TokenSpendUsd - alreadyReserved;
+                    if (runnable && project!.TokenBudgetUsd > 0 && remaining > 0)
+                    {
+                        reservation = Math.Min(DefaultTurnReservationUsd, remaining);
+                        llmTurnReservations[projectID] = alreadyReserved + reservation;
+                    }
+                }
+                if (reservation > 0)
+                    return new LlmTurnLease(this, projectID, reservation);
             }
-            if (!allowed)
+            finally
             {
                 gate.Release();
-                CheckTokenThresholds(projectID);
-                return null;
             }
-            return new LlmTurnLease(gate);
+            CheckTokenThresholds(projectID);
+            return null;
+        }
+
+        private void ReleaseReservation(string projectID, double amountUsd)
+        {
+            lock (LockFor(projectID))
+            {
+                llmTurnReservations.TryGetValue(projectID, out double reserved);
+                double remaining = Math.Max(0, reserved - amountUsd);
+                if (remaining <= 0.0000001) llmTurnReservations.TryRemove(projectID, out _);
+                else llmTurnReservations[projectID] = remaining;
+            }
         }
 
         public bool IsWithinTokenBudget(string projectID)

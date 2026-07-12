@@ -15,9 +15,10 @@ namespace Omnipotent.Services.Projects.Containers
 
         private static readonly Dictionary<string, string> Apps = new(StringComparer.OrdinalIgnoreCase)
         {
-            ["browser"] = "firefox-esr",
-            ["firefox"] = "firefox-esr",
-            ["firefox-esr"] = "firefox-esr",
+            ["browser"] = "chromium",
+            ["chromium"] = "chromium",
+            ["firefox"] = "chromium",
+            ["firefox-esr"] = "chromium",
             ["terminal"] = "xfce4-terminal",
             ["xfce4-terminal"] = "xfce4-terminal",
         };
@@ -41,7 +42,7 @@ namespace Omnipotent.Services.Projects.Containers
             string command = app;
             if (!string.IsNullOrWhiteSpace(args))
             {
-                if (app != "firefox-esr" || !Uri.TryCreate(args, UriKind.Absolute, out var uri) ||
+                if (app != "chromium" || !Uri.TryCreate(args, UriKind.Absolute, out var uri) ||
                     (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
                     throw new InvalidOperationException("Only an absolute http(s) URL may be passed to the browser launcher.");
                 command += " " + uri.AbsoluteUri;
@@ -49,8 +50,8 @@ namespace Omnipotent.Services.Projects.Containers
 
             if (dockerControlAsync != null)
             {
-                await dockerControlAsync(app == "firefox-esr" ? ContainerDesktopControlCommand.LaunchBrowser : ContainerDesktopControlCommand.LaunchTerminal,
-                    app == "firefox-esr" ? args : null, ct);
+                await dockerControlAsync(app == "chromium" ? ContainerDesktopControlCommand.LaunchBrowser : ContainerDesktopControlCommand.LaunchTerminal,
+                    app == "chromium" ? args : null, ct);
                 await Task.Delay(500, ct);
                 return;
             }

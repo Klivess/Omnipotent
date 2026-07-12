@@ -249,6 +249,30 @@ namespace Omnipotent.Service_Manager
             return res as string ?? defaultValue;
         }
 
+        public async Task<List<string>> GetStringListOmniSetting(string name, IEnumerable<string> defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("GetStringListOmniSetting", name, defaultValue, sensitive, askKlivesForFulfillment, this.serviceID, this.name);
+            return res as List<string> ?? (defaultValue?.ToList() ?? new List<string>());
+        }
+
+        public async Task<bool> SetStringListOmniSetting(string name, IEnumerable<string> values)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("SetStringListOmniSetting", name, values, this.serviceID, this.name);
+            return res is bool b && b;
+        }
+
+        public async Task<bool> AddToStringListOmniSetting(string name, string entry)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("AddToStringListOmniSetting", name, entry, this.serviceID, this.name);
+            return res is bool b && b;
+        }
+
+        public async Task<bool> RemoveFromStringListOmniSetting(string name, string entry)
+        {
+            var res = await ExecuteServiceMethod<OmniGlobalSettingsManager>("RemoveFromStringListOmniSetting", name, entry, this.serviceID, this.name);
+            return res is bool b && b;
+        }
+
         // Backwards-compatible generic getter that returns string representation
         public async Task<string> GetOmniSetting(string name, OmniSettingType type, bool sensitive = false, bool askKlivesForFulfillment = false)
         {

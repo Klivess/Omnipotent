@@ -102,13 +102,29 @@ namespace Omnipotent.Services.Projects
             // here so direct callers of Diagnose get the same answer).
             if ((parent.Gates?.ListPending(project.ProjectID).Count ?? 0) > 0) return (null, null);
 
+            ProjectRuntimeState? runtime = null;
+            try { runtime = parent.RuntimeState?.Get(project.ProjectID); } catch { }
+            if (runtime != null)
+            {
+                if (runtime.Disposition is ProjectExecutionDisposition.Paused or ProjectExecutionDisposition.Pausing
+                    or ProjectExecutionDisposition.Blocked or ProjectExecutionDisposition.Completed or ProjectExecutionDisposition.Archived)
+                    return (null, null);
+                if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open
+                    && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > now))
+                    return (null, null); // typed provider/dependency circuit owns recovery timing
+            }
+
             // 1. Heartbeat staleness — measured on COMMANDER ACTIVITY, not just wake starts. A
             //    single long wake emits tool calls and thoughts for hours without a new
             //    CommanderWake event, and must not read as stalled while it is visibly working.
             //    The keepalive guarantees a wake at least every ~15 min when healthy, so a 30-min
             //    activity gap really does mean the wake pipeline is wedged.
             var lastActivity = tail.Where(e => IsCommanderActivity(e)).Select(e => (DateTime?)e.Timestamp).Max();
-            var lastBeat = lastActivity ?? project.CreatedAt;
+            var leaseBeat = runtime?.ActiveWakeLease?.LastHeartbeatAt;
+            DateTime? workerBeat = runtime?.ActiveAgentWakeLeases.Values.Select(x => (DateTime?)x.LastHeartbeatAt).Max();
+            var verifiedBeat = runtime?.Health.LastVerifiedProgressAt;
+            var lastBeat = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat }.Where(x => x.HasValue).Select(x => x!.Value)
+                .DefaultIfEmpty(project.CreatedAt).Max();
             if (tail.Count > 0 && now - lastBeat > MaxWakeGap)
                 return ($"No Commander activity in over {MaxWakeGap.TotalMinutes:0} minutes (last: {(lastActivity == null ? "never" : lastActivity.Value.ToString("u"))}).", null);
 
@@ -118,12 +134,13 @@ namespace Omnipotent.Services.Projects
             if (recentWakeStarts.Count >= ZeroProgressWakes)
             {
                 long firstWakeSeq = recentWakeStarts[0].Sequence;
-                bool anyProgress = tail.Any(e => e.Sequence >= firstWakeSeq &&
-                    (e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ArtifactAdded
-                        or ProjectEventTypes.AgentSpawned or ProjectEventTypes.MoneySpent
-                        or ProjectEventTypes.AgentWake or ProjectEventTypes.AgentMessage or ProjectEventTypes.AgentThought));
+                bool typedProgress = runtime?.Health.LastVerifiedProgressSequence >= firstWakeSeq;
+                bool anyProgress = typedProgress || tail.Any(e => e.Sequence >= firstWakeSeq &&
+                    (e.Type is ProjectEventTypes.ArtifactAdded or ProjectEventTypes.ProjectFileChanged
+                        or ProjectEventTypes.CheckpointChanged or ProjectEventTypes.GrandPlanProgress
+                        or ProjectEventTypes.AgentSpawned or ProjectEventTypes.MoneySpent));
                 if (!anyProgress)
-                    return ($"No progress across the last {ZeroProgressWakes} wakes (no tool calls, artifacts, spawns, or sub-agent activity).", null);
+                    return ($"No verified progress across the last {ZeroProgressWakes} wakes (no artifacts, file/checkpoint/plan changes, spawns, or spend).", null);
             }
 
             // 3. Repeated-action loops: the last wake tripped the stuck-loop guard heavily.
@@ -133,6 +150,11 @@ namespace Omnipotent.Services.Projects
             // 4. Wedged sub-agent: it woke, never finished within MaxWakeGap, AND has gone silent
             //    (a live worker emits tool calls constantly — silence, not duration, is the wedge
             //    signal, so a slow-but-working desktop agent is left alone).
+            var staleLease = runtime?.ActiveAgentWakeLeases
+                .FirstOrDefault(x => now - x.Value.LastHeartbeatAt > MaxWakeGap);
+            if (staleLease.HasValue && !string.IsNullOrWhiteSpace(staleLease.Value.Key))
+                return ($"Sub-agent {staleLease.Value.Key} has a fenced wake lease with no heartbeat for over {MaxWakeGap.TotalMinutes:0} minutes.", staleLease.Value.Key);
+
             var staleAgentWake = tail
                 .Where(e => e.Type == ProjectEventTypes.AgentWake && now - e.Timestamp > MaxWakeGap)
                 .FirstOrDefault(w => !tail.Any(e => e.WakeID == w.WakeID &&

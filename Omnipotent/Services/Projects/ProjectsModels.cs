@@ -10,6 +10,7 @@ namespace Omnipotent.Services.Projects
         Archived,
         // NOTE: persisted as an int by ProjectStore — new values MUST be appended, never inserted.
         Planning,        // newly created: forming a Grand Plan for Klives' approval before any execution work
+        Blocked,         // action-required dependency/configuration failure; resume explicitly after remediation
     }
 
     /// <summary>
@@ -24,6 +25,8 @@ namespace Omnipotent.Services.Projects
         TextImageVideo = 2,
         TextImageVideoAudio = 3,
     }
+
+    public enum ProjectAgentWorkStatus { Idle, Assigned, Running, Blocked, Completed }
 
     /// <summary>How desktops are allocated within a project (Commander's call, §4).</summary>
     public enum DesktopAllocationMode
@@ -60,6 +63,9 @@ namespace Omnipotent.Services.Projects
         /// <summary>Discord #project channel; 0 until Phase 5 creates it.</summary>
         public ulong DiscordChannelID { get; set; }
         public DateTime? CompletedAt { get; set; }
+        /// <summary>Machine-owned reason for an action-required block. Narrative observables must not override it.</summary>
+        public string? BlockedReason { get; set; }
+        public DateTime? BlockedAt { get; set; }
     }
 
     /// <summary>One agent in a project's org chart (Commander included, with a null parent).</summary>
@@ -72,6 +78,12 @@ namespace Omnipotent.Services.Projects
         public ProjectAgentTier Tier { get; set; } = ProjectAgentTier.Text;
         /// <summary>Free-text role, e.g. "commander", "market-researcher".</summary>
         public string Role { get; set; } = "";
+        public string Objective { get; set; } = "";
+        public ProjectAgentWorkStatus WorkStatus { get; set; } = ProjectAgentWorkStatus.Idle;
+        public List<string> ActiveMilestoneIDs { get; set; } = new();
+        public List<string> DeliverablePaths { get; set; } = new();
+        public string? LastReport { get; set; }
+        public DateTime? LastReportAt { get; set; }
         public bool Retired { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? RetiredAt { get; set; }
@@ -89,6 +101,8 @@ namespace Omnipotent.Services.Projects
         public const string AgentWake = "agent-wake";                  // a sub-agent wake began
         public const string WakeCompleted = "wake-completed";
         public const string WakeFailed = "wake-failed";
+        public const string WakeCancelled = "wake-cancelled";          // deliberate pause/archive/recovery cancellation; not a provider failure
+        public const string WakeDeferred = "wake-deferred";            // retryable infrastructure circuit is open until a typed retry time
         public const string CommanderThought = "commander-thought";    // intermediate prose during a wake
         public const string AgentThought = "agent-thought";            // sub-agent intermediate prose during a wake
         public const string CommanderMessage = "commander-message";    // prose addressed to Klives
@@ -119,6 +133,9 @@ namespace Omnipotent.Services.Projects
         public const string AccountChanged = "account-changed";        // a shared-registry account was registered/updated (metadata only, never secrets)
         public const string ProjectFileChanged = "project-file-changed"; // shared project-volume upload/write/move/delete/metadata batch
         public const string Status = "status";                         // generic progress note
+        public const string ProjectBlocked = "project-blocked";        // action-required blocker changed lifecycle to Blocked
+        public const string ProjectUnblocked = "project-unblocked";    // Klives resumed after remediation
+        public const string CheckpointChanged = "checkpoint-changed";  // typed execution checkpoint/fact/artifact/blocker mutation
     }
 
     /// <summary>

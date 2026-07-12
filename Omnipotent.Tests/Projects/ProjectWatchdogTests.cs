@@ -142,7 +142,7 @@ namespace Omnipotent.Tests.Projects
             var wd = new ProjectWatchdog(svc, _ => { });
             var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
             Assert.NotNull(diag);
-            Assert.Contains("No progress", diag);
+            Assert.Contains("No verified progress", diag);
         }
 
         [Fact]
@@ -166,7 +166,7 @@ namespace Omnipotent.Tests.Projects
 
             var wd = new ProjectWatchdog(svc, _ => { });
             var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
-            if (diag != null) Assert.DoesNotContain("No progress", diag);
+            if (diag != null) Assert.DoesNotContain("No verified progress", diag);
         }
 
         [Fact]

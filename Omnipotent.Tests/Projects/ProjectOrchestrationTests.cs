@@ -197,6 +197,20 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void AssignObjective_RecordsMilestoneOwnershipAndDeliverables()
+        {
+            var (mgr, _, pid) = NewSetup();
+            var worker = mgr.Spawn(pid, "commander", ProjectAgentTier.Text, "builder");
+
+            Assert.True(mgr.AssignObjective(pid, worker.AgentID, "Complete integration", new[] { "m2" }, new[] { "out/report.json" }));
+            var assigned = mgr.ListActive(pid).Single(a => a.AgentID == worker.AgentID);
+            Assert.Equal(ProjectAgentWorkStatus.Assigned, assigned.WorkStatus);
+            Assert.Equal("Complete integration", assigned.Objective);
+            Assert.Equal(new[] { "m2" }, assigned.ActiveMilestoneIDs);
+            Assert.Equal(new[] { "out/report.json" }, assigned.DeliverablePaths);
+        }
+
+        [Fact]
         public async Task SendAgentMessage_ResolvesRole_AndRejectsUnknownTarget()
         {
             var store = new ProjectStore(_ => { });
@@ -318,6 +332,20 @@ namespace Omnipotent.Tests.Projects
             await ledger.RecordTokenSpendAsync(pid, 0, 6_000_000); // +$90 → past 80% of $100
             int warningsAfter = log.ReadSince(pid, 0).Count(e => e.Type == ProjectEventTypes.BudgetWarning);
             Assert.Equal(warningsBefore + 1, warningsAfter);
+        }
+
+        [Fact]
+        public async Task TurnReservations_AllowConcurrencyWithoutOversubscribingRemainingBudget()
+        {
+            var (ledger, _, _, pid) = NewSetup(tokenBudget: 0.08);
+
+            await using var first = await ledger.TryAcquireLlmTurnAsync(pid);
+            await using var second = await ledger.TryAcquireLlmTurnAsync(pid);
+            var third = await ledger.TryAcquireLlmTurnAsync(pid);
+
+            Assert.NotNull(first);
+            Assert.NotNull(second); // no provider-call-wide project lock
+            Assert.Null(third);     // the remaining budget is already reserved
         }
     }
 

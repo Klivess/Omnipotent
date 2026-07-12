@@ -7,6 +7,7 @@ namespace Omnipotent.Tests.AccountRegistry
     /// host-side secret injection path. Each test uses a unique service key so the single global
     /// index stays isolated.
     /// </summary>
+    [Collection("AccountRegistrySerial")]
     public class AccountRegistryResolveTests
     {
         private static AccountRegistryStore NewStore() => new(_ => { });
