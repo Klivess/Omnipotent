@@ -865,6 +865,115 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult(await WebFetchAsync(url));
                 }
 
+                // ── KliveMail: first-class inbox tools (in-process; NO HTTP call, NO auth header,
+                //    NO service reflection — resolve the live service and drive its repository). ──
+
+                case "klivemail_create_mailbox":
+                {
+                    var repo = GetKliveMailRepo(out var kmErr);
+                    if (repo == null) return new CommanderToolResult(kmErr!);
+                    string address = ((string?)a["address"] ?? "").Trim();
+                    if (address.Length == 0)
+                        return new CommanderToolResult("Provide an 'address'. KliveMail is catch-all on @klive.dev; the domain is added if you omit it (e.g. 'tiktok.memesquad' → tiktok.memesquad@klive.dev).");
+                    string? displayName = (string?)a["displayName"];
+                    string normalized = Omnipotent.Services.KliveMail.Persistence.KliveMailRepository.NormalizeAddress(address);
+                    if (!normalized.EndsWith("@" + Omnipotent.Services.KliveMail.Persistence.KliveMailRepository.MailDomain, StringComparison.OrdinalIgnoreCase))
+                        return new CommanderToolResult($"'{normalized}' isn't a KliveMail address — KliveMail only accepts its own @{Omnipotent.Services.KliveMail.Persistence.KliveMailRepository.MailDomain} domain.");
+                    try
+                    {
+                        bool created = await repo.CreateMailboxAsync(normalized, displayName, ct);
+                        return new CommanderToolResult(created
+                            ? $"Created mailbox {normalized}. It receives mail immediately (catch-all). Poll it with klivemail_list_messages, or block for a code with klivemail_wait_for_code."
+                            : $"Mailbox {normalized} already exists and is ready to receive. Use it directly.");
+                    }
+                    catch (Exception ex) { return new CommanderToolResult($"klivemail_create_mailbox failed: {ex.Message}"); }
+                }
+
+                case "klivemail_list_messages":
+                {
+                    var repo = GetKliveMailRepo(out var kmErr);
+                    if (repo == null) return new CommanderToolResult(kmErr!);
+                    string mailbox = ((string?)a["mailbox"] ?? "").Trim();
+                    int limit = Math.Clamp((int?)a["limit"] ?? 20, 1, 100);
+                    bool unreadOnly = (bool?)a["unreadOnly"] ?? false;
+                    try
+                    {
+                        string? mb = mailbox.Length == 0 ? null : Omnipotent.Services.KliveMail.Persistence.KliveMailRepository.NormalizeAddress(mailbox);
+                        var msgs = await repo.ListMessagesAsync(mb, unreadOnly, false, false, 1, limit, ct);
+                        if (msgs.Count == 0)
+                            return new CommanderToolResult(mb == null ? "No messages in KliveMail." : $"No messages for {mb} yet.");
+                        var sb = new StringBuilder();
+                        sb.AppendLine($"{msgs.Count} message(s){(mb == null ? "" : " for " + mb)} (newest first):");
+                        foreach (var m in msgs)
+                            sb.AppendLine($"- id={m.Id} | {m.ReceivedUtc:yyyy-MM-dd HH:mm}Z | from {m.FromAddress} → {m.ToAddress} | {(m.IsRead ? "" : "[unread] ")}{Trunc(m.Subject ?? "(no subject)", 80)} — {Trunc(m.Snippet ?? "", 100)}");
+                        return new CommanderToolResult(sb.ToString().TrimEnd());
+                    }
+                    catch (Exception ex) { return new CommanderToolResult($"klivemail_list_messages failed: {ex.Message}"); }
+                }
+
+                case "klivemail_get_message":
+                {
+                    var repo = GetKliveMailRepo(out var kmErr);
+                    if (repo == null) return new CommanderToolResult(kmErr!);
+                    string id = ((string?)a["id"] ?? "").Trim();
+                    if (id.Length == 0) return new CommanderToolResult("Provide the message 'id' (from klivemail_list_messages).");
+                    try
+                    {
+                        var m = await repo.GetMessageAsync(id, ct);
+                        if (m == null) return new CommanderToolResult($"No message with id '{id}'.");
+                        string bodyText = !string.IsNullOrWhiteSpace(m.BodyText) ? m.BodyText : (StripHtml(m.BodyHtml) ?? "");
+                        var sb = new StringBuilder();
+                        sb.AppendLine($"From: {m.FromName} <{m.FromAddress}>");
+                        sb.AppendLine($"To: {m.ToAddress}");
+                        sb.AppendLine($"Date: {m.ReceivedUtc:yyyy-MM-dd HH:mm}Z");
+                        sb.AppendLine($"Subject: {m.Subject}");
+                        if (m.HasAttachments) sb.AppendLine($"Attachments: {m.Attachments.Count}");
+                        sb.AppendLine();
+                        sb.Append(bodyText);
+                        return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(sb.ToString(), ProjectsContextBudget.ToolResultBudget));
+                    }
+                    catch (Exception ex) { return new CommanderToolResult($"klivemail_get_message failed: {ex.Message}"); }
+                }
+
+                case "klivemail_wait_for_code":
+                {
+                    var repo = GetKliveMailRepo(out var kmErr);
+                    if (repo == null) return new CommanderToolResult(kmErr!);
+                    string mailbox = ((string?)a["mailbox"] ?? "").Trim();
+                    if (mailbox.Length == 0) return new CommanderToolResult("Provide the 'mailbox' to watch (the signup email).");
+                    string senderContains = ((string?)a["senderContains"] ?? "").Trim();
+                    int timeoutSeconds = Math.Clamp((int?)a["timeoutSeconds"] ?? 180, 5, 600);
+                    string mb = Omnipotent.Services.KliveMail.Persistence.KliveMailRepository.NormalizeAddress(mailbox);
+                    // Only accept mail that lands from now on (minus a small clock-skew grace), so a
+                    // stale code from an earlier attempt can't be mistaken for the fresh one.
+                    DateTime floor = DateTime.UtcNow.AddMinutes(-2);
+                    DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+                    try
+                    {
+                        while (DateTime.UtcNow < deadline)
+                        {
+                            var msgs = await repo.ListMessagesAsync(mb, false, false, false, 1, 20, ct);
+                            foreach (var summary in msgs)
+                            {
+                                if (summary.ReceivedUtc < floor) continue;
+                                if (senderContains.Length > 0
+                                    && !((summary.FromAddress ?? "").Contains(senderContains, StringComparison.OrdinalIgnoreCase)
+                                         || (summary.Subject ?? "").Contains(senderContains, StringComparison.OrdinalIgnoreCase)))
+                                    continue;
+                                var full = await repo.GetMessageAsync(summary.Id, ct);
+                                string haystack = (full?.Subject ?? "") + "\n" + (!string.IsNullOrWhiteSpace(full?.BodyText) ? full!.BodyText : (StripHtml(full?.BodyHtml) ?? ""));
+                                string? code = ExtractVerificationCode(haystack);
+                                if (code != null)
+                                    return new CommanderToolResult($"Verification code {code} (from {summary.FromAddress}, subject \"{Trunc(summary.Subject ?? "", 80)}\", message id={summary.Id}).");
+                            }
+                            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                        }
+                        return new CommanderToolResult($"No verification code arrived at {mb} within {timeoutSeconds}s. It may still be en route — retry klivemail_wait_for_code, or inspect klivemail_list_messages. If the sending site never delivered, that's an external failure (not KliveMail); consider a create_stimulus_hook (email) so a later arrival wakes you.");
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex) { return new CommanderToolResult($"klivemail_wait_for_code failed: {ex.Message}"); }
+                }
+
                 // ── work tools: scripts / HTTP / files on the project volume ──
 
                 case "http_request":
@@ -1876,5 +1985,44 @@ namespace Omnipotent.Services.Projects
         }
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
+
+        /// <summary>Resolves the live KliveMail repository through the shared KliveAgent service graph
+        /// (the in-process handle the klivemail_* tools drive), or returns null with an actionable
+        /// message. This is deliberately NOT reflection/HTTP — it's the same service the SMTP server
+        /// writes into, so a mailbox created here receives real mail.</summary>
+        private Omnipotent.Services.KliveMail.Persistence.KliveMailRepository? GetKliveMailRepo(out string? error)
+        {
+            error = null;
+            if (KliveAgentService == null) { error = "KliveMail is unavailable (the KliveAgent service bridge is down on this host)."; return null; }
+            var svc = KliveAgentService.GetActiveServices()
+                .OfType<Omnipotent.Services.KliveMail.KliveMail>()
+                .FirstOrDefault(s => s.IsServiceActive());
+            if (svc == null) { error = "The KliveMail service is not running on this host."; return null; }
+            var repo = svc.Repo;
+            if (repo == null) { error = "KliveMail is still starting (its store isn't ready). Retry shortly."; return null; }
+            return repo;
+        }
+
+        /// <summary>Pulls a 4–8 digit verification code out of an email, preferring a digit run next to
+        /// a "code/verify/OTP" cue and falling back to the first standalone run.</summary>
+        internal static string? ExtractVerificationCode(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            var cued = System.Text.RegularExpressions.Regex.Match(text,
+                @"(?:code|verification|verify|confirm|otp|one[- ]?time)[^0-9]{0,40}([0-9]{4,8})",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (cued.Success) return cued.Groups[1].Value;
+            var any = System.Text.RegularExpressions.Regex.Match(text, @"(?<![0-9])([0-9]{4,8})(?![0-9])");
+            return any.Success ? any.Groups[1].Value : null;
+        }
+
+        /// <summary>Best-effort plain text from an HTML email body (tags stripped, entities decoded), for
+        /// display and code extraction when a message has no text/plain part.</summary>
+        private static string? StripHtml(string? html)
+        {
+            if (string.IsNullOrEmpty(html)) return html;
+            string noTags = System.Text.RegularExpressions.Regex.Replace(html, "<[^>]+>", " ");
+            return System.Net.WebUtility.HtmlDecode(noTags);
+        }
     }
 }

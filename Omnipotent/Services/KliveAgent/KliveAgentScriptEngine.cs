@@ -34,6 +34,66 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Symbol Discovery ──
 
+        /// <summary>
+        /// A compact, always-accurate reference for the script API a run_script/execute_csharp turn
+        /// sees: a curated preamble of the mistakes that fail most when the signatures are guessed
+        /// (the CS1503/CS0103/CS1061 loops that burned whole wakes), followed by the real signatures
+        /// reflected off <paramref name="globalsType"/> (defaults to this type, but the Projects host
+        /// passes its WorkScriptGlobals so its file/Output helpers show too). Reflection means the
+        /// signatures can never drift from the code; a test asserts every public method is covered.
+        /// </summary>
+        public static string BuildApiReference(Type? globalsType = null)
+        {
+            globalsType ??= typeof(ScriptGlobals);
+
+            var sb = new StringBuilder();
+            sb.AppendLine("SCRIPT API (run_script / execute_csharp) — exact signatures. These are the calls that fail most when guessed:");
+            sb.AppendLine("• GetService(\"KliveMail\") returns the service OBJECT. GetServiceMember takes a STRING type name + member name — GetServiceMember(\"KliveMail\",\"Repo\"), NOT GetServiceMember(svcObject,\"Repo\") (that is CS1503 object→string).");
+            sb.AppendLine("• await RunBash(cmd) / RunPowerShell(cmd) — they return Task<string>; a bare RunBash(cmd) prints the Task object, not its output.");
+            sb.AppendLine("• GetObjectMembers(obj) returns AgentObjectMember with a .Name (there is NO .MemberType). Invoke with CallObjectMethod(obj,\"Method\",args); read a field/prop with GetObjectMember(obj,\"Name\"). Never dot-access on a boxed object.");
+            sb.AppendLine("• Locals do NOT persist across separate run_script blocks unless the prior block COMPILED — chain discovery + action + Output(...) in ONE block.");
+            sb.AppendLine("• Prefer first-class tools over reflecting into services: klivemail_* for email, account_* for logins, ensure_desktop_ready before browser work, http_request, read_file/write_file.");
+            sb.AppendLine("Signatures (one line per method; +N marks additional overloads):");
+
+            var methods = globalsType
+                .GetMethods(BindingFlags.Public | BindingFlags.Instance)
+                .Where(m => m.DeclaringType != typeof(object) && !m.IsSpecialName && !m.Name.StartsWith('<'))
+                .GroupBy(m => m.Name)
+                .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var group in methods)
+            {
+                var best = group.OrderByDescending(m => m.GetParameters().Length).First();
+                string pars = string.Join(", ", best.GetParameters().Select(p => $"{FriendlyTypeName(p.ParameterType)} {p.Name}"));
+                int extra = group.Count() - 1;
+                string overloads = extra > 0 ? $"  (+{extra} overload{(extra > 1 ? "s" : "")})" : "";
+                sb.AppendLine($"  {best.Name}({pars}) -> {FriendlyTypeName(best.ReturnType)}{overloads}");
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>Readable C# type name for the API reference (Task&lt;string&gt;, List&lt;ServiceInfo&gt;, int?, string[]).</summary>
+        private static string FriendlyTypeName(Type t)
+        {
+            if (t == typeof(void)) return "void";
+            if (t == typeof(string)) return "string";
+            if (t == typeof(bool)) return "bool";
+            if (t == typeof(int)) return "int";
+            if (t == typeof(long)) return "long";
+            if (t == typeof(double)) return "double";
+            if (t == typeof(object)) return "object";
+            if (Nullable.GetUnderlyingType(t) is Type underlying) return FriendlyTypeName(underlying) + "?";
+            if (t.IsArray) return FriendlyTypeName(t.GetElementType()!) + "[]";
+            if (t.IsGenericType)
+            {
+                string name = t.Name;
+                int tick = name.IndexOf('`');
+                if (tick >= 0) name = name[..tick];
+                return $"{name}<{string.Join(", ", t.GetGenericArguments().Select(FriendlyTypeName))}>";
+            }
+            return t.Name;
+        }
+
         /// <summary>List all active OmniServices as structured objects. Use TypeName/Name properties directly.</summary>
         public List<ServiceInfo> ListServices()
         {

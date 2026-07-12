@@ -11,6 +11,12 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public static class ProjectCommanderAgent
     {
+        // The exact script-API signatures + the gotchas that burned whole wakes when guessed,
+        // reflected off the project script host so they can never drift. Built once (the surface is
+        // static) and folded into the always-cached system-prompt skeleton.
+        private static readonly Lazy<string> ScriptApiReference = new(() =>
+            Omnipotent.Services.KliveAgent.ScriptGlobals.BuildApiReference(typeof(ProjectCommanderTools.WorkScriptGlobals)));
+
         public static string BuildSystemPrompt(Project project)
         {
             string planning = project.Status == ProjectStatus.Planning ? $@"
@@ -75,6 +81,11 @@ VISUAL CONTROL:
 - Observe with computer_screenshot or computer_find_text, locate by OCR or grid coordinates, take one action, wait for the expected visual state, then observe the final gridded frame. Never retry blind clicks; after two failed attempts change approach or report the blocker.
 - OCR is for ordinary visible controls only. CAPTCHA, 2FA, and verification walls require request_human. Use computer_navigate/open_browser and computer_launch_app rather than brittle manual launcher/address-bar sequences. Typed text and vault substitutions are redacted, so verify success visually.
 - `computer_terminal` is container-local command execution, not visual input and not a host shell. Use it directly for installs, files, diagnostics, and CLI programs; reserve computer_type for actual GUI fields. A broken screenshot is not a blocker to terminal work. Vault/account placeholders are intentionally unavailable in terminal commands because arbitrary stdout could reveal them; enter secrets only through computer_type's one-way substitution.
+- BEFORE the first browser action, call ensure_desktop_ready once — it self-heals Docker, recreates a stale desktop so it has the current baked tools (chromium, firefox, the browser-inspect helper, Playwright at /opt/klive/venv, ffmpeg), and reports exactly what's present. Don't discover a missing browser mid-task. It records a durable 'desktop-ready' fact, so once green you needn't re-check every wake.
+- EMAIL is built in: use the klivemail_* tools (klivemail_create_mailbox / klivemail_list_messages / klivemail_get_message / klivemail_wait_for_code). They drive the live KliveMail service IN-PROCESS — no HTTP call, no auth header, no service reflection. For code you run INSIDE a desktop container (e.g. a Playwright script) reach the same inbox over HTTP at `http://host.docker.internal:5000/klivemail/messages?limit=&offset=` and `/klivemail/messages/detail?id=` with header `Authorization: <Klives profile password>` (these routes require Klives permission — the header is mandatory; without it you get 401 NoProfile).
+- DURABLE ENVIRONMENT FACTS: when you verify something about your environment that a later wake would otherwise re-derive (a service's in-process access path, an API's exact auth, where a tool lives, that the desktop is ready), record it with update_checkpoint op:upsert_fact (with evidence) — NOT in a prose status message. Checkpoint facts are seeded into every wake's TYPED EXECUTION STATE and survive compaction; prose does not. Re-deriving the same facts every wake is how a project burns its budget without progressing.
+
+REFERENCE — {ScriptApiReference.Value}
 
 Be concise and concrete. Report measured facts, not adjectives. Everything you do is on the timeline Klives watches.{planning}";
         }
@@ -247,6 +258,24 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         claim = new { type = "boolean", description = "Set true to add this project as an owner/user of the account." },
                     }, "accountID")),
 
+                // ── KliveMail: built-in catch-all email on @klive.dev (in-process; no HTTP/auth) ──
+                Tool("klivemail_create_mailbox", "Create a KliveMail inbox on the built-in @klive.dev catch-all mail server (runs inside Omnipotent). Use a dedicated address per signup, e.g. 'tiktok.memesquad@klive.dev' (the @klive.dev domain is added if you omit it). The inbox receives real mail immediately — verification/reset emails land here. This drives the live service directly: no HTTP call, no auth header, no reflection.",
+                    Obj(new { address = Str("Mailbox address; @klive.dev is appended if omitted."), displayName = Str("Optional display name.") }, "address")),
+
+                Tool("klivemail_list_messages", "List messages in KliveMail (newest first) with id, time, sender, subject and a snippet. Pass a 'mailbox' to scope to one inbox; omit it to see everything. Use the returned id with klivemail_get_message.",
+                    Obj(new { mailbox = Str("Optional @klive.dev inbox to scope to."), limit = Num("Max messages (default 20, cap 100)."), unreadOnly = Bool("Only unread (default false).") }, Array.Empty<string>())),
+
+                Tool("klivemail_get_message", "Read one KliveMail message in full (headers + body text) by id from klivemail_list_messages.",
+                    Obj(new { id = Str("Message id.") }, "id")),
+
+                Tool("klivemail_wait_for_code", "Block until a verification/OTP email arrives at a KliveMail inbox and return the code. Polls the live inbox for up to timeoutSeconds and extracts the first 4–8 digit code, ignoring mail older than this call. Use it right after clicking a site's 'send code'. If nothing arrives, the sending site likely never delivered (an external failure, not KliveMail).",
+                    Obj(new
+                    {
+                        mailbox = Str("The @klive.dev inbox to watch (the signup email)."),
+                        senderContains = Str("Optional filter: only consider mail whose sender or subject contains this (e.g. 'tiktok')."),
+                        timeoutSeconds = Num("How long to wait (default 180, cap 600)."),
+                    }, "mailbox")),
+
                 Tool("request_human", "Ask a human (Klives) to clear a human-only obstacle such as a captcha or phone verification, surfaced through Discord.",
                     Obj(new { what = Str("What the human needs to do.") }, "what")),
 
@@ -292,6 +321,10 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
 
                 Tool("web_fetch", "Download ONE web page by URL, extract its text, index it, and return the text.",
                     Obj(new { url = Str("Absolute http(s) URL.") }, "url")),
+
+                // ── desktop preflight (call BEFORE browser work) ──
+                Tool("ensure_desktop_ready", "Preflight your desktop container before any browser work. It self-heals Docker, rebuilds/recreates a stale desktop so it picks up the current baked tools, then probes the browser-automation stack (display, chromium, firefox, browser-inspect helper, Playwright at /opt/klive/venv, ffmpeg) and reports exactly what's present. Call this ONCE before the first computer_* browser action (and again if a computer tool reports a missing browser/inspector) instead of discovering a missing tool mid-task. The result is recorded as the durable 'desktop-ready' checkpoint fact, so once it's green you don't need to re-check every wake.",
+                    Obj(new { }, Array.Empty<string>())),
 
                 // ── work tools (text tier and up) ──
                 Tool("execute_csharp", "KliveAgent-compatible alias for run_script. Execute C# in-process against the LIVE Omnipotent service graph. The script exposes the full KliveAgent ScriptGlobals API: ListServices, GetService, GetTypeSchema, GetObjectMembers, CallObjectMethod, ListAgentCapabilities, ExecuteAgentCapabilityAsync, code search/reflection, memory, scheduler, logs/stats, and host/runtime paths, plus Project helpers. Locals persist across successful calls within this wake. Use Output(...) or Log(...) to return observations.",

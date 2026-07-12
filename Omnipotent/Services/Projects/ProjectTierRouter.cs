@@ -36,6 +36,7 @@ namespace Omnipotent.Services.Projects
             "update_observable", "list_observables",
             "update_checkpoint", "get_checkpoint",
             "account_register", "account_list", "account_update",
+            "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_code",
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "query_events",
@@ -62,6 +63,9 @@ namespace Omnipotent.Services.Projects
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
             "computer_confirm_action", "computer_confirm_and_click",
+            // Not a computer_* perception tool, but a desktop-preflight — gate it to the tiers that
+            // actually get a desktop so text/image sub-agents aren't offered a no-op.
+            "ensure_desktop_ready",
         };
 
         /// <summary>

@@ -677,6 +677,13 @@ namespace Omnipotent.Services.Projects
                         "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
                 return await DispatchComputerConfirmationAsync(project, actingAgentID, wakeID, toolName, argsJson, ct);
             }
+            if (toolName is "ensure_desktop_ready")
+            {
+                if (project.Status == ProjectStatus.Planning)
+                    return new CommanderToolResult(
+                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
+                return await DispatchEnsureDesktopReadyAsync(project, actingAgentID, ct);
+            }
             if (toolName.StartsWith("computer_", StringComparison.Ordinal))
             {
                 if (project.Status == ProjectStatus.Planning)
@@ -856,6 +863,70 @@ namespace Omnipotent.Services.Projects
                 return new CommanderToolResult("Desktop control is only wired for the Windows host build.");
             return await DispatchComputerToolWindowsAsync(project, actingAgentID, toolName, argsJson, ct);
         }
+
+        /// <summary>
+        /// Preflight the project's desktop (self-heal Docker + a stale image/container, then probe
+        /// the baked browser-automation stack) and record the outcome as a durable checkpoint fact
+        /// so later wakes don't re-derive the environment. The Commander calls this before browser
+        /// work; the fact it leaves behind is seeded into every subsequent wake.
+        /// </summary>
+        private async Task<CommanderToolResult> DispatchEnsureDesktopReadyAsync(
+            Project project, string actingAgentID, CancellationToken ct)
+        {
+            if (!Settings.Get(project.ProjectID).ContainersEnabled)
+                return new CommanderToolResult("This project has containers disabled (a text-only project). Ask Klives to enable containers in project settings if the goal needs a desktop.");
+            if (Desktops == null)
+                return new CommanderToolResult("Desktop containers are unavailable on this host — the desktop preflight cannot run. Use text-tier tools, or ask Klives to enable containers.");
+            if (!OperatingSystem.IsWindows())
+                return new CommanderToolResult("Desktop control is only wired for the Windows host build.");
+
+            Containers.DesktopReadiness readiness;
+            try
+            {
+                readiness = await EnsureDesktopReadyWindowsAsync(project, actingAgentID, ct);
+            }
+            catch (Exception ex)
+            {
+                // Mirror the computer-tool path: an opaque desktop failure is usually Docker being
+                // down — kick off self-healing and hand back an actionable message.
+                string? daemon = await Desktops!.ProbeDaemonAsync(ct);
+                if (daemon != null)
+                {
+                    _ = Task.Run(async () =>
+                    {
+                        try { await Desktops.TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage); }
+                        catch (Exception bex) { _ = ServiceLogError(bex, "Projects: desktop self-heal (preflight) failed"); }
+                    });
+                    return new CommanderToolResult(
+                        $"ensure_desktop_ready can't run: {daemon} Auto-setup has been kicked off (installing/starting Docker if possible — can take several minutes). Retry in ~5 minutes.");
+                }
+                return new CommanderToolResult($"ensure_desktop_ready failed: {ex.Message}");
+            }
+
+            // Record the readiness as a durable verified fact so it seeds later wakes (the whole
+            // point: the agent stops re-deriving whether its desktop and browser stack are present).
+            try
+            {
+                RuntimeState.UpsertVerifiedFact(project.ProjectID, new ProjectVerifiedFact
+                {
+                    Key = "desktop-ready",
+                    Value = readiness.Summary,
+                    Description = "Desktop preflight (ensure_desktop_ready): browser-automation stack availability.",
+                    VerifiedAt = DateTime.UtcNow,
+                    // A probe of live container state is only trustworthy for a while (a container can
+                    // be recreated/altered), so let it expire rather than mislead a much later wake.
+                    ValidUntil = DateTime.UtcNow.AddHours(6),
+                });
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to record desktop-ready fact"); }
+
+            return new CommanderToolResult(readiness.Summary);
+        }
+
+        [SupportedOSPlatform("windows")]
+        private Task<Containers.DesktopReadiness> EnsureDesktopReadyWindowsAsync(
+            Project project, string actingAgentID, CancellationToken ct) =>
+            Desktops!.EnsureDesktopReadyAsync(project, actingAgentID, ProjectSettings.Defaults.DesktopImage, ct);
 
         [SupportedOSPlatform("windows")]
         private async Task<CommanderToolResult> DispatchComputerToolWindowsAsync(

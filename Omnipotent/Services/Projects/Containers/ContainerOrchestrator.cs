@@ -29,8 +29,10 @@ namespace Omnipotent.Services.Projects.Containers
         // apt-install and run real applications on their machines (§4 revised).
         private const long DefaultMemoryBytes = 2L * 1024 * 1024 * 1024;
         /// <summary>Image label carrying the SHA-256 of the build context, so a changed
-        /// Dockerfile/entrypoint triggers a rebuild instead of being silently ignored.</summary>
-        private const string ContextHashLabel = "omnipotent.projects.context-hash";
+        /// Dockerfile/entrypoint triggers a rebuild instead of being silently ignored. The same key
+        /// is stamped on containers (see <see cref="ContainerLabels.ContextHash"/>) so a container
+        /// can be compared against its image for staleness.</summary>
+        private const string ContextHashLabel = ContainerLabels.ContextHash;
 
         public ContainerOrchestrator(
             ContainerRegistry registry,
@@ -202,6 +204,42 @@ namespace Omnipotent.Services.Projects.Containers
             return images.FirstOrDefault(i => i.RepoTags?.Contains(imageTag) == true);
         }
 
+        /// <summary>The build-context hash the given image was built with, or null when the image
+        /// is missing or unlabelled (a hand-built or pre-labelling image). Used both to stamp new
+        /// containers and to judge existing ones stale.</summary>
+        public async Task<string?> GetImageContextHashAsync(string imageTag, CancellationToken ct = default)
+        {
+            var image = await FindImageAsync(imageTag, ct);
+            if (image?.Labels != null && image.Labels.TryGetValue(ContextHashLabel, out var hash) && !string.IsNullOrWhiteSpace(hash))
+                return hash;
+            return null;
+        }
+
+        /// <summary>
+        /// True when a container is running an out-of-date desktop image — i.e. the project's
+        /// current image was rebuilt from a changed build context (new baked tools) after this
+        /// container was created. Recreating a stale container is how those newer tools reach a
+        /// long-lived project whose desktop predates them. Conservative: when the current image
+        /// carries no context hash (missing/unlabelled), nothing is judged stale, so a host that
+        /// can't rebuild never churns its containers.
+        /// </summary>
+        public async Task<bool> IsRecordStaleAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            string? currentHash = await GetImageContextHashAsync(imageForProject(record.ProjectID), ct);
+            return IsStaleAgainst(record.ImageContextHash, currentHash);
+        }
+
+        /// <summary>Pure staleness comparison (Docker-free, unit-tested): a container is stale when the
+        /// current image has a known context hash that differs from the one stamped on the container.
+        /// An unknown current hash (missing/unlabelled image) is never stale — recreating couldn't help
+        /// and would only churn. An empty stamped hash (a legacy container from before stamping) differs
+        /// from any real current hash, so it is recreated once.</summary>
+        internal static bool IsStaleAgainst(string? recordHash, string? currentImageHash)
+        {
+            if (string.IsNullOrWhiteSpace(currentImageHash)) return false;
+            return !string.Equals(recordHash ?? "", currentImageHash, StringComparison.Ordinal);
+        }
+
         /// <summary>
         /// Builds the desktop image from a shipped build context when it's missing on this host —
         /// the second half of dependency self-healing (daemon install being the first). The image
@@ -315,6 +353,9 @@ namespace Omnipotent.Services.Projects.Containers
             int resolvedHeight = height ?? ProjectContainerConfig.ResolveDesktopHeight();
             var docker = await GetClientAsync();
             string image = imageForProject(projectID);
+            // Stamp the container with the image's build-context hash so a later image rebuild
+            // (new baked tools) makes this container detectably stale and recreatable.
+            string imageContextHash = await GetImageContextHashAsync(image, ct) ?? "";
 
             string volumeHostDir = ProjectWorkspaceLocator.HostRoot(projectID);
             Directory.CreateDirectory(volumeHostDir);
@@ -332,6 +373,7 @@ namespace Omnipotent.Services.Projects.Containers
                     [ContainerLabels.Owner] = "projects",
                     [ContainerLabels.ProjectID] = projectID,
                     [ContainerLabels.AgentID] = agentID ?? "",
+                    [ContainerLabels.ContextHash] = imageContextHash,
                 },
                 Env = new List<string>
                 {
@@ -375,6 +417,7 @@ namespace Omnipotent.Services.Projects.Containers
                     VncHostPort = hostPort,
                     Width = resolvedWidth,
                     Height = resolvedHeight,
+                    ImageContextHash = imageContextHash,
                 };
                 registry.Add(record);
             }

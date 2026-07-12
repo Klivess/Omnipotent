@@ -88,6 +88,96 @@ namespace Omnipotent.Services.Projects.Containers
             return imageProblem; // null = fully ready
         }
 
+        // The capabilities a desktop MUST have before browser work is worth attempting. A missing
+        // one is what stalled the first live project (no browser, no browser-inspect helper, no
+        // playwright), so the preflight treats their absence as "not ready" rather than letting a
+        // computer_* tool discover it mid-task.
+        private static readonly string[] RequiredCapabilities = { "display", "chromium", "browser-inspect", "playwright" };
+
+        // One shell probe of the baked stack. `set +e` so a missing tool yields "no", not a
+        // non-zero exit that would mask the other answers.
+        private const string ReadinessProbeScript =
+            "set +e\n" +
+            "echo \"display=$(xdpyinfo -display :1 >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "echo \"chromium=$(command -v chromium >/dev/null 2>&1 && echo yes || echo no)\"\n" +
+            "echo \"firefox=$(command -v firefox >/dev/null 2>&1 && echo yes || echo no)\"\n" +
+            "echo \"browser-inspect=$([ -f /usr/local/bin/browser-inspect.py ] && echo yes || echo no)\"\n" +
+            "echo \"playwright=$(/opt/klive/venv/bin/python -c 'import playwright' >/dev/null 2>&1 && echo yes || echo no)\"\n" +
+            "echo \"ffmpeg=$(command -v ffmpeg >/dev/null 2>&1 && echo yes || echo no)\"\n" +
+            "echo \"image-version=$(sed -n 's/.*\\\"imageVersion\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p' /etc/klive-desktop.json 2>/dev/null)\"\n";
+
+        /// <summary>
+        /// Preflight a project's desktop before browser work: self-heal Docker + the image
+        /// (rebuilding/recreating a stale container so it picks up the current baked tools), then
+        /// probe the browser-automation stack and report exactly what's present. The result's facts
+        /// are recorded by the caller so later wakes start from known-good state instead of
+        /// re-deriving the environment.
+        /// </summary>
+        public async Task<DesktopReadiness> EnsureDesktopReadyAsync(
+            Project project, string agentID, string defaultImageTag, CancellationToken ct = default)
+        {
+            string? bootstrap = await TryBootstrapAsync(defaultImageTag, ct);
+            if (bootstrap != null)
+                return new DesktopReadiness { Ok = false, Summary = $"Desktop not ready — {bootstrap}" };
+
+            DesktopContainerRecord record;
+            try { record = await EnsureDesktopAsync(project, agentID, requireVisualReady: true, ct); }
+            catch (Exception ex)
+            {
+                return new DesktopReadiness { Ok = false, Summary = $"Desktop provisioning failed: {ex.Message}" };
+            }
+
+            ContainerShellResult probe;
+            try { probe = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, ReadinessProbeScript, "/home/agent", 30, ct); }
+            catch (Exception ex)
+            {
+                return new DesktopReadiness
+                {
+                    Ok = false,
+                    ContainerID = record.ContainerID,
+                    Summary = $"Desktop is up but the readiness probe failed: {ex.Message}",
+                };
+            }
+
+            var caps = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var line in probe.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int eq = line.IndexOf('=');
+                if (eq > 0) caps[line[..eq].Trim()] = line[(eq + 1)..].Trim();
+            }
+            caps.TryGetValue("image-version", out var imageVersion);
+
+            var missing = RequiredCapabilities
+                .Where(c => c == "display"
+                    ? !string.Equals(caps.GetValueOrDefault("display"), "up", StringComparison.Ordinal)
+                    : !string.Equals(caps.GetValueOrDefault(c), "yes", StringComparison.Ordinal))
+                .ToList();
+
+            string capsText = string.Join(", ", new[]
+            {
+                $"display {caps.GetValueOrDefault("display", "?")}",
+                $"chromium {caps.GetValueOrDefault("chromium", "?")}",
+                $"firefox {caps.GetValueOrDefault("firefox", "?")}",
+                $"browser-inspect {caps.GetValueOrDefault("browser-inspect", "?")}",
+                $"playwright {caps.GetValueOrDefault("playwright", "?")}",
+                $"ffmpeg {caps.GetValueOrDefault("ffmpeg", "?")}",
+            });
+
+            bool ok = missing.Count == 0;
+            string summary = ok
+                ? $"Desktop ready (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}. Playwright venv: /opt/klive/venv."
+                : $"Desktop degraded (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}. Missing: {string.Join(", ", missing)} — install them via computer_terminal (sudo apt / the /opt/klive/venv pip) before browser work.";
+
+            return new DesktopReadiness
+            {
+                Ok = ok,
+                ContainerID = record.ContainerID,
+                ImageVersion = imageVersion ?? "",
+                Capabilities = caps,
+                Summary = summary,
+            };
+        }
+
         /// <summary>
         /// Ensures a desktop exists for the given agent under the project's allocation mode and
         /// returns a tool adapter bound to it. PerAgentContainers → a container per agent;
@@ -129,25 +219,38 @@ namespace Omnipotent.Services.Projects.Containers
             await provisionGate.WaitAsync(ct);
             try
             {
-                if (sharedAllocation)
+                string? targetAgent = sharedAllocation ? null : agentID;
+                var existing = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == targetAgent && !r.Lost);
+
+                // A container running a now-stale image (rebuilt with newer baked tools after this
+                // container was created) is recreated so the project's long-lived desktop actually
+                // gets those tools — the /project bind mount (cookies, browser profiles, work files)
+                // survives, so only ephemeral in-container state is lost. Skipped while a *different*
+                // agent holds the shared-desktop input lock, so we never yank a desktop mid-action.
+                if (existing != null && await orchestrator.IsRecordStaleAsync(existing, ct))
                 {
-                    var existing = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == null);
-                    if (existing != null) record = existing;
+                    string? holder = sharedAllocation ? inputLock.CurrentHolder(existing.ContainerID) : null;
+                    if (holder != null && holder != agentID)
+                    {
+                        log($"Desktop {existing.ContainerID[..12]} is stale but agent {holder} holds the input lock — deferring recreation.");
+                    }
                     else
                     {
-                        record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID: null, ct: ct);
-                        created = true;
+                        log($"Desktop {existing.ContainerID[..12]} (project {project.ProjectID}) is running a stale image — recreating so it picks up the current desktop tools.");
+                        // Tear the container down directly rather than via DisposeDesktopAsync — the
+                        // latter also disposes this owner's provisioning gate, which we are holding.
+                        if (transports.TryRemove(existing.ContainerID, out var staleTransport)) staleTransport.Dispose();
+                        if (actionGates.TryRemove(existing.ContainerID, out var staleGate)) staleGate.Dispose();
+                        await orchestrator.StopContainerAsync(existing.ContainerID, ct); // also removes the registry record
+                        existing = null;
                     }
                 }
+
+                if (existing != null) record = existing;
                 else
                 {
-                    var existing = registry.ForProject(project.ProjectID).FirstOrDefault(r => r.AgentID == agentID);
-                    if (existing != null) record = existing;
-                    else
-                    {
-                        record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, agentID, ct: ct);
-                        created = true;
-                    }
+                    record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, targetAgent, ct: ct);
+                    created = true;
                 }
             }
             finally { provisionGate.Release(); }
