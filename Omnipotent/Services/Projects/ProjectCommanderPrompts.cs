@@ -32,7 +32,8 @@ namespace Omnipotent.Services.Projects
             string? grandPlanBlock = null,
             string? accountsBlock = null,
             string? filesBlock = null,
-            string? runtimeStateBlock = null)
+            string? runtimeStateBlock = null,
+            string? kliveAgentContextBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -85,6 +86,15 @@ namespace Omnipotent.Services.Projects
             {
                 sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files/stat_file for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(filesBlock, ProjectsContextBudget.SharedFilesBudget));
+            }
+
+            // The interactive KliveAgent and Project agents share the same live service graph and
+            // operating recipes. Keep this compact and task-independent; source/data detail remains
+            // discoverable through the parity script globals and direct code tools.
+            if (!string.IsNullOrWhiteSpace(kliveAgentContextBlock))
+            {
+                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same service graph/capabilities/recipes available to this agent) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveAgentContextBlock, ProjectsContextBudget.KnowledgeBudget));
             }
 
             // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The

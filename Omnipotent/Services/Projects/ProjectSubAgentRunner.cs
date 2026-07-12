@@ -579,6 +579,9 @@ $@"You are a {agent.Tier}-tier SUB-AGENT (role: {agent.Role}, ID: {agent.AgentID
 
 THE PROJECT'S GOAL (context, not your whole job): {project.Goal}
 
+KLIVEAGENT PARITY:
+- Your run_script and execute_csharp tools execute inside Omnipotent with the same ScriptGlobals API as interactive KliveAgent: service discovery/reflection (ListServices, GetService, GetTypeSchema, GetObjectMembers, CallObjectMethod, ExecuteServiceMethod), registered capabilities, repository search/source reading, runtime paths, shared memory/shortcuts/scheduling, logs/stats and the Projects bridge. Use grep/read_code_file/list_code_directory/get_global_path for direct discovery. Successful script calls in one wake retain locals; await Task-returning calls and use Log/Output. Use native /project tools for durable team artifacts and coordination.
+
 RULES:
 - Do the specific task in your trigger message. Don't expand scope — the commander owns strategy.
 - Work with your tools, verify results, then send your findings to the commander with send_agent_message(agentID: ""commander"", message: ...) BEFORE you finish. An unreported result is a wasted wake.
@@ -630,6 +633,15 @@ RULES:
             {
                 sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files/stat_file for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(files, ProjectsContextBudget.SharedFilesBudget));
+            }
+
+            string kliveContext = "";
+            try { kliveContext = parent.WakeCycle.DescribeKliveAgentContextAsync == null
+                ? "" : await parent.WakeCycle.DescribeKliveAgentContextAsync(project.ProjectID); } catch { }
+            if (!string.IsNullOrWhiteSpace(kliveContext))
+            {
+                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same services/capabilities/shortcuts available to this worker) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveContext, ProjectsContextBudget.KnowledgeBudget));
             }
 
             // Thin cross-system knowledge leg (KliveRAG), keyed by role + task; own project excluded.

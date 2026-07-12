@@ -9,6 +9,10 @@ using System.Net;
 using System.Net.WebSockets;
 using System.Runtime.Versioning;
 
+using System.Text;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
 namespace Omnipotent.Services.Projects
 {
     /// <summary>
@@ -119,6 +123,7 @@ namespace Omnipotent.Services.Projects
             WakeCycle = new ProjectWakeCycle(EventLog, Digests, Retrieval);
             WakeCycle.DescribeFiles = pid => Files.DescribeForPrompt(pid);
             WakeCycle.DescribeRuntimeState = pid => RuntimeState.DescribeForWake(pid);
+            WakeCycle.DescribeKliveAgentContextAsync = DescribeKliveAgentContextAsync;
             // Cross-system knowledge leg for wake seeds (KliveRAG). Excludes the project's own log
             // (already covered by the BM25 retrieval leg). Fails soft — no KliveRAG → no block.
             WakeCycle.KnowledgeSearchAsync = async (query, excludeProjectId) =>
@@ -665,6 +670,13 @@ namespace Omnipotent.Services.Projects
         public async Task<CommanderToolResult> CommanderToolDispatch(
             Project project, string actingAgentID, string wakeID, string toolName, string argsJson, CancellationToken ct)
         {
+            if (toolName is "computer_confirm_action" or "computer_confirm_and_click")
+            {
+                if (project.Status == ProjectStatus.Planning)
+                    return new CommanderToolResult(
+                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
+                return await DispatchComputerConfirmationAsync(project, actingAgentID, wakeID, toolName, argsJson, ct);
+            }
             if (toolName.StartsWith("computer_", StringComparison.Ordinal))
             {
                 if (project.Status == ProjectStatus.Planning)
@@ -689,6 +701,7 @@ namespace Omnipotent.Services.Projects
                 Observables = Observables,
                 RuntimeState = RuntimeState,
                 Accounts = GetAccountRegistry(),
+                KliveAgentService = GetKliveAgentService(),
                 GrandPlans = GrandPlans,
                 ActivateProjectAsync = () => ActivateProjectAsync(project),
                 ConveneCouncilAsync = async (topic, briefing, roles, urgency, purpose, ct2) =>
@@ -717,6 +730,35 @@ namespace Omnipotent.Services.Projects
             return await tools.DispatchAsync(toolName, argsJson, ct);
         }
 
+        private async Task<CommanderToolResult> DispatchComputerConfirmationAsync(
+            Project project, string actingAgentID, string wakeID, string toolName, string argsJson, CancellationToken ct)
+        {
+            JObject args;
+            try { args = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson); }
+            catch { args = new JObject(); }
+            string summary = ((string?)args["summary"] ?? "").Trim();
+            if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' describing the exact irreversible action.");
+
+            var approvalArgs = JsonConvert.SerializeObject(new
+            {
+                title = "Desktop action approval",
+                description = summary,
+                rationale = "This action is irreversible, outward-facing, or financially consequential and must clear Klives' approval gate before input is sent."
+            });
+            var approvalTools = new ProjectCommanderTools(
+                project, EventLog, Digests, SubAgents, Gates, Budget, Vault, Store, actingAgentID, wakeID);
+            var approval = await approvalTools.DispatchAsync("request_user_approval", approvalArgs, ct);
+            if (!approval.ResultText.Contains("Approve", StringComparison.OrdinalIgnoreCase)) return approval;
+            if (toolName == "computer_confirm_action")
+                return new CommanderToolResult("Klives approved. Perform the described non-click action now.");
+
+            // The approval gate is separate from the actual input dispatch. This prevents a
+            // model/tool retry from silently turning an approval into a click without a fresh
+            // explicit call and keeps the computer adapter's normal visual audit path intact.
+            args.Remove("summary");
+            return await DispatchComputerToolAsync(project, actingAgentID, "computer_click", args.ToString(Formatting.None), ct);
+        }
+
         // ── KliveRAG bridge (cross-system knowledge + live web for the Commander & sub-agents) ──
 
         private Omnipotent.Services.KliveRAG.KliveRAG? GetRagService()
@@ -726,6 +768,51 @@ namespace Omnipotent.Services.Projects
 
         private Omnipotent.Services.AccountRegistry.AccountRegistry? GetAccountRegistry()
             => GetActiveServices().OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>().FirstOrDefault(s => s.IsServiceActive());
+
+        private Omnipotent.Services.KliveAgent.KliveAgent? GetKliveAgentService()
+            => GetActiveServices().OfType<Omnipotent.Services.KliveAgent.KliveAgent>().FirstOrDefault(s => s.IsServiceActive());
+
+        private async Task<string> DescribeKliveAgentContextAsync(string projectID)
+        {
+            var agent = GetKliveAgentService();
+            if (agent == null) return "Live KliveAgent bridge unavailable; use the Project-native tools and scripts still exposed in this wake.";
+
+            var globals = new Omnipotent.Services.KliveAgent.ScriptGlobals(agent);
+            var sb = new StringBuilder();
+            try
+            {
+                var services = globals.ListServices();
+                sb.AppendLine("Active services: " + (services.Count == 0
+                    ? "none reported"
+                    : string.Join(", ", services.Take(80).Select(s => $"{s.Name} ({s.TypeName})"))));
+            }
+            catch { sb.AppendLine("Active services: unavailable"); }
+            try
+            {
+                var capabilities = globals.ListAgentCapabilities();
+                sb.AppendLine("Registered agent capabilities: " + (capabilities.Count == 0
+                    ? "none"
+                    : string.Join(", ", capabilities.Take(80).Select(c => c.Name))));
+            }
+            catch { sb.AppendLine("Registered agent capabilities: unavailable"); }
+            try { sb.AppendLine($"Omnipotent uptime: {globals.GetOmnipotentUptime()}"); } catch { }
+            try
+            {
+                string shortcuts = await globals.GetShortcuts();
+                if (!string.IsNullOrWhiteSpace(shortcuts))
+                    sb.AppendLine("Shared shortcuts:\n" + ProjectsContextBudget.TruncateToTokens(shortcuts, 450));
+            }
+            catch { }
+            try
+            {
+                var project = Store.GetProject(projectID);
+                var seeds = Omnipotent.Services.KliveAgent.KliveAgentRepoMap.ExtractSeedsFromText(project?.Goal ?? "");
+                string map = agent.RepoMap?.GetRepoMap(550, seeds) ?? "";
+                if (!string.IsNullOrWhiteSpace(map)) sb.AppendLine(ProjectsContextBudget.TruncateToTokens(map, 550));
+            }
+            catch { }
+            return ProjectsContextBudget.TruncateToTokens(sb.ToString().Trim(), ProjectsContextBudget.KnowledgeBudget);
+        }
 
         private async Task<string> RagSearchKnowledgeAsync(string query, int max)
         {

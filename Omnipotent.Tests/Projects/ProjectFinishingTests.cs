@@ -146,6 +146,31 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task ExecuteCSharpAlias_ChainsLocalsLikeKliveAgent()
+        {
+            var (tools, _) = NewTools();
+            var first = await tools.DispatchAsync("execute_csharp",
+                JsonConvert.SerializeObject(new { code = "var persisted = 40; Output(persisted); persisted + 2" }), CancellationToken.None);
+            Assert.Contains("40", first.ResultText);
+            Assert.Contains("42", first.ResultText);
+
+            var second = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "persisted * 2" }), CancellationToken.None);
+            Assert.Contains("80", second.ResultText);
+        }
+
+        [Fact]
+        public void WorkScripts_ExposeTheFullKliveAgentGlobalsSurface()
+        {
+            var globals = typeof(ProjectCommanderTools.WorkScriptGlobals);
+            Assert.True(typeof(Omnipotent.Services.KliveAgent.ScriptGlobals).IsAssignableFrom(globals));
+            foreach (var method in new[] { "ListServices", "GetService", "GetTypeSchema", "GetObjectMembers", "CallObjectMethod", "ExecuteServiceMethod", "ListAgentCapabilities", "GetGlobalPath", "SearchCode", "RunPowerShell", "SaveMemory", "ScheduleTask" })
+                Assert.NotNull(globals.GetMethod(method));
+            Assert.NotNull(globals.GetMethod("ReadProjectFile"));
+            Assert.NotNull(globals.GetMethod("ReadCodeFile"));
+        }
+
+        [Fact]
         public async Task HookCrudTools_WorkAgainstTheStore()
         {
             var (tools, pid) = NewTools();
@@ -227,6 +252,10 @@ namespace Omnipotent.Tests.Projects
             var names = ProjectCommanderAgent.BuildCoreToolDefinitions().Select(t => t.function.name).ToList();
             Assert.Contains("recall_memories", names);
             Assert.Contains("save_memory", names);
+            Assert.Contains("execute_csharp", names);
+            Assert.Contains("grep", names);
+            Assert.Contains("get_global_path", names);
+            Assert.Contains("save_shortcut", names);
         }
     }
 
@@ -241,6 +270,8 @@ namespace Omnipotent.Tests.Projects
                 .Select(t => t.function.name)
                 .ToList();
             Assert.Contains("run_script", offered);
+            Assert.Contains("execute_csharp", offered);
+            Assert.Contains("grep", offered);
             Assert.Contains("http_request", offered);
             Assert.Contains("send_agent_message", offered);
             Assert.DoesNotContain("complete_project", offered); // strategy stays with the Commander

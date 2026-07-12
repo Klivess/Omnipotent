@@ -55,6 +55,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>Machine-owned typed checkpoint/runtime state, seeded ahead of narrative digest.</summary>
         public Func<string, string>? DescribeRuntimeState;
 
+        /// <summary>Optional live KliveAgent bridge summary: active services, registered capabilities,
+        /// reusable shortcuts and a compact task-relevant repository map. This keeps Project wakes
+        /// grounded in the same operating environment as interactive KliveAgent without copying a
+        /// long-lived conversation into the project log.</summary>
+        public Func<string, Task<string>>? DescribeKliveAgentContextAsync;
+
         /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
@@ -114,8 +120,14 @@ namespace Omnipotent.Services.Projects
                 try { runtimeState = DescribeRuntimeState(project.ProjectID); } catch { runtimeState = null; }
             }
 
+            string? kliveAgentContext = null;
+            if (DescribeKliveAgentContextAsync != null)
+            {
+                try { kliveAgentContext = await DescribeKliveAgentContextAsync(project.ProjectID); } catch { kliveAgentContext = null; }
+            }
+
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription,
-                knowledge, observables, grandPlan, accounts, files, runtimeState);
+                knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext);
         }
 
         private static string Truncate(string s, int max) =>

@@ -5,6 +5,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects.Stimulus;
 using Omnipotent.Services.ComputerControl;
+using Omnipotent.Services.KliveAgent;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -89,10 +90,24 @@ namespace Omnipotent.Services.Projects
         public ProjectGrandPlanStore? GrandPlans { get; set; }
         /// <summary>Global shared account registry (accounts across all projects + KliveAgent). Null when the service is down.</summary>
         public Omnipotent.Services.AccountRegistry.AccountRegistry? Accounts { get; set; }
+        /// <summary>The same live KliveAgent instance used by interactive execute_csharp. When
+        /// present, Project scripts inherit the full ScriptGlobals service-discovery API.</summary>
+        public Omnipotent.Services.KliveAgent.KliveAgent? KliveAgentService { get; set; }
         /// <summary>Flips a Planning project to Active once its Grand Plan is approved (also lifts the in-wake tool gate).</summary>
         public Func<Task>? ActivateProjectAsync { get; set; }
 
         private static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
+        // CommanderToolDispatch constructs a dispatcher per tool call. Keep the Roslyn state in a
+        // bounded wake-scoped table so separate calls in one wake still behave like KliveAgent's
+        // ContinueWithAsync session, without allowing old project wakes to retain live globals forever.
+        private sealed class ScriptSession
+        {
+            public readonly SemaphoreSlim Gate = new(1, 1);
+            public WorkScriptGlobals? Globals;
+            public ScriptState<object>? State;
+            public DateTime LastUsedUtc = DateTime.UtcNow;
+        }
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, ScriptSession> scriptSessions = new(StringComparer.Ordinal);
 
         /// <summary>Returns the durable audit form of tool arguments. File contents are deliberately
         /// omitted: their path/hash/size belong in the project-file audit, not duplicated into JSONL.</summary>
@@ -135,7 +150,7 @@ namespace Omnipotent.Services.Projects
         /// Research, memory, planning, councils, observables and messaging Klives stay available.</summary>
         private static readonly HashSet<string> PlanningBlockedTools = new(StringComparer.Ordinal)
         {
-            "spawn_sub_agent", "assign_plan_work", "run_script", "run_powershell", "run_bash",
+            "spawn_sub_agent", "assign_plan_work", "run_script", "execute_csharp", "run_powershell", "run_bash",
             "record_money_spend", "complete_project", "write_file", "make_directory",
             "move_file", "copy_file", "delete_file", "mark_file_important",
         };
@@ -720,6 +735,15 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult(await RecallMemoriesAsync(query, Math.Clamp(max, 1, 25), since, until));
                 }
 
+                case "recall_memories_by_tag":
+                {
+                    if (KliveAgentService == null) return new CommanderToolResult("Shared KliveAgent memory is unavailable.");
+                    string tag = ((string?)a["tag"] ?? "").Trim();
+                    if (tag.Length == 0) return new CommanderToolResult("Provide 'tag'.");
+                    var memories = await SharedGlobals(ct).RecallMemoriesByTag(tag);
+                    return new CommanderToolResult(FormatMemories(memories));
+                }
+
                 case "query_events":
                 {
                     var now = DateTime.UtcNow;
@@ -777,6 +801,31 @@ namespace Omnipotent.Services.Projects
                     if (string.IsNullOrWhiteSpace(content)) return new CommanderToolResult("Provide 'content' to remember.");
                     var tags = a["tags"] is JArray arr ? arr.Select(t => t.ToString()).ToArray() : Array.Empty<string>();
                     return new CommanderToolResult(await SaveMemoryAsync(content, tags));
+                }
+
+                case "save_shortcut":
+                {
+                    if (KliveAgentService == null) return new CommanderToolResult("Shared KliveAgent memory is unavailable.");
+                    string title = ((string?)a["title"] ?? "").Trim();
+                    string content = ((string?)a["content"] ?? "").Trim();
+                    if (title.Length == 0 || content.Length == 0) return new CommanderToolResult("Provide 'title' and 'content'.");
+                    var tags = a["tags"] is JArray arr ? arr.Select(t => t.ToString()).ToArray() : Array.Empty<string>();
+                    string id = await SharedGlobals(ct).SaveShortcut(title, content, tags);
+                    return new CommanderToolResult($"Saved shared shortcut '{title}' ({ShortId(id)}).");
+                }
+
+                case "get_shortcuts":
+                    return KliveAgentService == null
+                        ? new CommanderToolResult("Shared KliveAgent memory is unavailable.")
+                        : new CommanderToolResult(await SharedGlobals(ct).GetShortcuts());
+
+                case "delete_memory":
+                {
+                    if (KliveAgentService == null) return new CommanderToolResult("Shared KliveAgent memory is unavailable.");
+                    string id = ((string?)a["id"] ?? "").Trim();
+                    if (id.Length == 0) return new CommanderToolResult("Provide 'id'.");
+                    bool deleted = await SharedGlobals(ct).DeleteMemory(id);
+                    return new CommanderToolResult(deleted ? $"Deleted shared memory {id}." : $"No unique shared memory matches '{id}'.");
                 }
 
                 case "search_knowledge":
@@ -1053,11 +1102,43 @@ namespace Omnipotent.Services.Projects
                 // money, and the escalation bar — not routine work). Every script is still fully
                 // visible after the fact: the ToolCall event carries the complete args payload on
                 // the timeline. The prompt's escalation bar owns judgment for consequential scripts.
+                case "execute_csharp":
                 case "run_script":
                 {
                     string code = (string?)a["code"] ?? "";
                     if (string.IsNullOrWhiteSpace(code)) return new CommanderToolResult("Provide 'code' — a C# script body.");
                     return await RunScriptAsync(code, ct);
+                }
+
+                case "grep":
+                {
+                    string pattern = (string?)a["pattern"] ?? "";
+                    if (string.IsNullOrWhiteSpace(pattern)) return new CommanderToolResult("Provide 'pattern'.");
+                    string path = (string?)a["path"] ?? "";
+                    int max = Math.Clamp((int?)a["maxResults"] ?? 30, 1, 200);
+                    string result = (bool?)a["fixedString"] == true
+                        ? SharedGlobals(ct).SearchCode(pattern, path, max)
+                        : SharedGlobals(ct).SearchCodeRegex(pattern, path, max);
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(result, ProjectsContextBudget.ToolResultBudget));
+                }
+
+                case "read_code_file":
+                {
+                    string path = ((string?)a["path"] ?? "").Trim();
+                    if (path.Length == 0) return new CommanderToolResult("Provide 'path'.");
+                    int start = Math.Max(1, (int?)a["startLine"] ?? 1);
+                    int lines = Math.Clamp((int?)a["maxLines"] ?? 200, 1, 1000);
+                    return new CommanderToolResult(SharedGlobals(ct).ReadFile(path, start, lines));
+                }
+
+                case "list_code_directory":
+                    return new CommanderToolResult(SharedGlobals(ct).ListDirectory((string?)a["path"] ?? ""));
+
+                case "get_global_path":
+                {
+                    string key = ((string?)a["key"] ?? "").Trim();
+                    if (key.Length == 0) return new CommanderToolResult("Provide 'key'.");
+                    return new CommanderToolResult(SharedGlobals(ct).GetGlobalPath(key));
                 }
 
                 case "run_powershell":
@@ -1571,7 +1652,7 @@ namespace Omnipotent.Services.Projects
         // ── script execution (narrow Roslyn surface, same philosophy as KliveAgent) ──
 
         /// <summary>Globals a Commander work-script can use: HTTP, project-volume file IO, output buffer.</summary>
-        public sealed class WorkScriptGlobals
+        public sealed class WorkScriptGlobals : ScriptGlobals
         {
             private readonly StringBuilder buffer = new();
             private readonly string volumeRoot;
@@ -1580,10 +1661,10 @@ namespace Omnipotent.Services.Projects
             private readonly ProjectFileActor actor;
             private readonly Action<ProjectFileEntry>? onWritten;
             public HttpClient Http { get; }
-            public CancellationToken CancellationToken { get; init; }
 
-            public WorkScriptGlobals(string volumeRoot, HttpClient http, ProjectFileStore? files = null,
+            public WorkScriptGlobals(Omnipotent.Services.KliveAgent.KliveAgent? kliveAgentService, string volumeRoot, HttpClient http, ProjectFileStore? files = null,
                 string? projectID = null, ProjectFileActor? actor = null, Action<ProjectFileEntry>? onWritten = null)
+                : base(kliveAgentService!, CancellationToken.None)
             {
                 this.volumeRoot = volumeRoot;
                 Http = http;
@@ -1594,9 +1675,14 @@ namespace Omnipotent.Services.Projects
             }
 
             public void Output(object? value) => buffer.AppendLine(value?.ToString() ?? "null");
-            public string ReadFile(string relative) => files != null && projectID != null
+            /// <summary>Project-volume compatibility name. Use ReadCodeFile for repository source.</summary>
+            public string ReadFile(string relative) => ReadProjectFile(relative);
+            public string ReadProjectFile(string relative) => files != null && projectID != null
                 ? files.ReadTextAsync(projectID, relative, 8 * 1024 * 1024, CancellationToken).GetAwaiter().GetResult()
                 : File.ReadAllText(Scoped(relative));
+            public string ReadCodeFile(string repoRelativePath, int startLine = 1, int maxLines = 200) =>
+                base.ReadFile(repoRelativePath, startLine, maxLines);
+            public string ListCodeDirectory(string repoRelativePath = "") => base.ListDirectory(repoRelativePath);
             public void WriteFile(string relative, string content)
             {
                 if (files != null && projectID != null)
@@ -1629,7 +1715,12 @@ namespace Omnipotent.Services.Projects
                     throw new UnauthorizedAccessException("Path escapes the project volume.");
                 return full;
             }
-            public string DrainOutput() => buffer.ToString();
+            public string DrainOutput()
+            {
+                string output = buffer.ToString();
+                buffer.Clear();
+                return output;
+            }
         }
 
         // Roslyn needs the referenced ASSEMBLIES, not just the imported namespaces — otherwise
@@ -1643,19 +1734,27 @@ namespace Omnipotent.Services.Projects
                 typeof(System.Collections.Generic.List<>).Assembly,
                 typeof(WorkScriptGlobals).Assembly)             // Omnipotent (the globals type)
             .WithImports("System", "System.Linq", "System.Collections.Generic", "System.Net.Http",
-                "System.Text", "System.Text.Json", "System.Threading.Tasks");
+                "System.Text", "System.Text.Json", "System.Threading.Tasks",
+                "Omnipotent.Services.KliveAgent", "Omnipotent.Services.KliveAgent.Models",
+                "Omnipotent.Services.Projects");
 
         private async Task<CommanderToolResult> RunScriptAsync(string code, CancellationToken ct)
         {
-            var actor = FileActor();
-            var globals = new WorkScriptGlobals(VolumeRoot(), http, Files, project.ProjectID, actor,
-                entry => ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Write,
-                    [entry.Path], entry.Size, wakeID: wakeID)) { CancellationToken = ct };
+            var session = GetScriptSession();
+            await session.Gate.WaitAsync(ct);
             try
             {
-                var result = await CSharpScript.EvaluateAsync<object>(code, ScriptOpts, globals, typeof(WorkScriptGlobals), ct);
-                string output = globals.DrainOutput();
-                string ret = result?.ToString() ?? "";
+                session.LastUsedUtc = DateTime.UtcNow;
+                var globals = session.Globals ??= CreateScriptGlobals(ct);
+                globals.CancellationToken = ct;
+                globals.ConversationId = $"project:{project.ProjectID}:{actingAgentID}";
+                if (session.State == null)
+                    session.State = await CSharpScript.RunAsync<object>(code, ScriptOpts, globals, typeof(WorkScriptGlobals), ct);
+                else
+                    session.State = await session.State.ContinueWithAsync<object>(code, ScriptOpts, ct);
+                string output = string.Join("\n", new[] { globals.DrainOutput(), globals.TakeOutput() }
+                    .Where(s => !string.IsNullOrWhiteSpace(s)));
+                string ret = session.State.ReturnValue?.ToString() ?? "";
                 string combined = string.Join("\n", new[] { output, ret }.Where(s => !string.IsNullOrWhiteSpace(s)));
                 return new CommanderToolResult(string.IsNullOrWhiteSpace(combined)
                     ? "Script ran with no output. Use Output(...) to report results."
@@ -1669,7 +1768,43 @@ namespace Omnipotent.Services.Projects
             {
                 return new CommanderToolResult($"Script threw {ex.GetType().Name}: {ex.Message}");
             }
+            finally { session.Gate.Release(); }
         }
+
+        private ScriptSession GetScriptSession()
+        {
+            string key = $"{project.ProjectID}:{wakeID}:{actingAgentID}";
+            foreach (var stale in scriptSessions.Where(kv => DateTime.UtcNow - kv.Value.LastUsedUtc > TimeSpan.FromHours(2)).ToList())
+                scriptSessions.TryRemove(stale.Key, out _);
+            return scriptSessions.GetOrAdd(key, _ => new ScriptSession());
+        }
+
+        private WorkScriptGlobals CreateScriptGlobals(CancellationToken ct)
+        {
+            var actor = FileActor();
+            return new WorkScriptGlobals(KliveAgentService, VolumeRoot(), http, Files, project.ProjectID, actor,
+                entry => ProjectFileTimeline.Append(eventLog, project.ProjectID, actor, ProjectFileOperation.Write,
+                    [entry.Path], entry.Size, wakeID: wakeID))
+            {
+                CancellationToken = ct,
+                ConversationId = $"project:{project.ProjectID}:{actingAgentID}",
+            };
+        }
+
+        private ScriptGlobals SharedGlobals(CancellationToken ct) => new(KliveAgentService!, ct)
+        {
+            ConversationId = $"project:{project.ProjectID}:{actingAgentID}",
+        };
+
+        private static string FormatMemories(IEnumerable<Omnipotent.Services.KliveAgent.Models.AgentMemoryEntry> memories)
+        {
+            var list = memories?.ToList() ?? new();
+            if (list.Count == 0) return "No shared memories matched.";
+            return string.Join("\n", list.Select(m =>
+                $"[{ShortId(m.Id)}] {m.Title ?? m.MemoryType} · {m.CreatedAt:yyyy-MM-dd HH:mm}Z · tags={string.Join(",", m.Tags ?? new List<string>())}\n{m.Content}"));
+        }
+
+        private static string ShortId(string? id) => string.IsNullOrWhiteSpace(id) ? "?" : id.Length <= 8 ? id : id[..8];
 
         private string VolumeRoot()
         {

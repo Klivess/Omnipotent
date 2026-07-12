@@ -25,7 +25,8 @@ namespace Omnipotent.Services.Projects
         /// <summary>Tools available to every tier (scripts/HTTP/files/messaging/agent lifecycle).</summary>
         private static readonly HashSet<string> TextTierTools = new(StringComparer.Ordinal)
         {
-            "run_script", "run_powershell", "run_bash", "http_request",
+            "run_script", "execute_csharp", "run_powershell", "run_bash", "http_request",
+            "grep", "read_code_file", "list_code_directory", "get_global_path",
             "read_file", "write_file", "list_files", "stat_file", "resolve_project_path", "make_directory", "move_file", "copy_file", "delete_file", "mark_file_important",
             "send_agent_message", "spawn_sub_agent",
             "create_stimulus_hook", "list_stimulus_hooks", "delete_stimulus_hook",
@@ -35,7 +36,7 @@ namespace Omnipotent.Services.Projects
             "update_observable", "list_observables",
             "update_checkpoint", "get_checkpoint",
             "account_register", "account_list", "account_update",
-            "recall_memories", "save_memory",
+            "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "query_events",
         };
@@ -54,12 +55,13 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> ComputerTools = new(StringComparer.Ordinal)
         {
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
-            "computer_move", "computer_click", "computer_drag",
+            "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag",
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
             "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
+            "computer_confirm_action", "computer_confirm_and_click",
         };
 
         /// <summary>

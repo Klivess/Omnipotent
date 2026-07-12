@@ -314,6 +314,25 @@ namespace Omnipotent.Services.Projects.Containers
 
         public Task MoveMouseAsync(int x, int y, CancellationToken ct = default) => SendPointerAsync(x, y, buttonMask, ct);
 
+        /// <summary>Move from the current pointer position by a relative delta. VNC carries
+        /// absolute coordinates, so the transport interpolates a bounded path from its tracked
+        /// position; this preserves the relative-motion contract for container applications while
+        /// remaining compatible with ordinary VNC servers.</summary>
+        public async Task MoveMouseRelativeAsync(int dx, int dy, int steps = 1, CancellationToken ct = default)
+        {
+            int fromX = pointerX, fromY = pointerY;
+            int toX = Math.Clamp(fromX + dx, 0, Math.Max(0, Width - 1));
+            int toY = Math.Clamp(fromY + dy, 0, Math.Max(0, Height - 1));
+            int count = Math.Clamp(steps, 1, 120);
+            for (int i = 1; i <= count; i++)
+            {
+                int x = fromX + (toX - fromX) * i / count;
+                int y = fromY + (toY - fromY) * i / count;
+                await SendPointerAsync(x, y, buttonMask, ct);
+                if (i < count) await Task.Delay(8, ct);
+            }
+        }
+
         public async Task ClickAsync(int x, int y, int button = 1, int clicks = 1, CancellationToken ct = default)
         {
             byte bit = ButtonBit(button);

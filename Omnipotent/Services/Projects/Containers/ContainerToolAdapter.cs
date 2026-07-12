@@ -43,7 +43,7 @@ namespace Omnipotent.Services.Projects.Containers
         private static readonly HashSet<string> Tools = new(StringComparer.Ordinal)
         {
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
-            "computer_move", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
+            "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
             "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all", "computer_wait",
             "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
@@ -58,6 +58,7 @@ namespace Omnipotent.Services.Projects.Containers
             SupportsClipboard = true,
             SupportsAppLaunch = true,
             SupportsTerminalExecution = true,
+            SupportsRelativeMouse = true,
             SupportsHumanization = true,
             SupportsMotionFrames = true,
             SupportedTools = Tools,
@@ -177,6 +178,8 @@ namespace Omnipotent.Services.Projects.Containers
                 case "computer_click_text": return await FindTextAsync(a, ct, true);
                 case "computer_move":
                     return await MoveAsync(a, ct);
+                case "computer_mouse_move_relative":
+                    return await MoveRelativeAsync(a, ct);
                 case "computer_click":
                     return await ClickAsync(a, ct);
                 case "computer_drag":
@@ -265,6 +268,14 @@ namespace Omnipotent.Services.Projects.Containers
                 var point = await ResolvePointAsync(x, y, ct);
                 await transport.MoveMouseAsync(point.X, point.Y, ct);
             }, ct);
+        }
+
+        private async Task<ContainerToolResult> MoveRelativeAsync(JsonElement a, CancellationToken ct)
+        {
+            int dx = Int(a, "dx", 0), dy = Int(a, "dy", 0);
+            if (dx == 0 && dy == 0) return ContainerToolResult.Ok("Relative pointer delta was zero.");
+            int steps = Math.Clamp(Int(a, "steps", Math.Max(1, Math.Max(Math.Abs(dx), Math.Abs(dy)) / 25)), 1, 120);
+            return await MutateAsync($"Moved pointer by ({dx},{dy}).", () => transport.MoveMouseRelativeAsync(dx, dy, steps, ct), ct);
         }
 
         private async Task<ContainerToolResult> ClickAsync(JsonElement a, CancellationToken ct)
