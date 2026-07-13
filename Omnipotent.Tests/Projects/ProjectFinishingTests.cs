@@ -221,7 +221,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task ExecuteCSharp_IsAvailableForPlanningTimeInspection_WhileExecutionAliasesStayLocked()
+        public async Task AllExecutionAliases_AreAvailableDuringPlanning()
         {
             var (tools, _) = NewTools(ProjectStatus.Planning);
 
@@ -232,14 +232,12 @@ namespace Omnipotent.Tests.Projects
                 }), CancellationToken.None);
             var executionAlias = await tools.DispatchAsync("run_script",
                 JsonConvert.SerializeObject(new { code = "Output(\"must remain gated\");" }), CancellationToken.None);
-            var hostShell = await tools.DispatchAsync("run_bash",
-                JsonConvert.SerializeObject(new { script = "echo must-remain-gated" }), CancellationToken.None);
+            var hostShell = await tools.DispatchAsync("run_powershell",
+                JsonConvert.SerializeObject(new { script = "Write-Output planning-available" }), CancellationToken.None);
 
             Assert.True(inspection.Succeeded, inspection.ResultText);
-            Assert.False(executionAlias.Succeeded);
-            Assert.Contains("PLANNING phase", executionAlias.ResultText);
-            Assert.False(hostShell.Succeeded);
-            Assert.Contains("execute_csharp", hostShell.ResultText);
+            Assert.True(executionAlias.Succeeded, executionAlias.ResultText);
+            Assert.True(hostShell.Succeeded, hostShell.ResultText);
         }
 
         [Fact]

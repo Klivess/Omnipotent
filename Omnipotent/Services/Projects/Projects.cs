@@ -341,8 +341,9 @@ namespace Omnipotent.Services.Projects
         {
             var project = Store.GetProject(env.ProjectID);
             if (project == null) return Task.FromResult<string?>(StimulusQueue.DiscardReceipt);
-            // Active projects run; a Planning project still wakes (so Klives chat and its own
-            // planning stimuli reach the Commander), but execution tools stay gated until approval.
+            // Active and Planning projects both run. Planning is a strategic phase, not a tool
+            // sandbox: the Commander can validate assumptions and make reversible progress while
+            // the Grand Plan is being prepared.
             if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return Task.FromResult<string?>(null);
 
             var runtime = RuntimeState.Get(project.ProjectID);
@@ -559,14 +560,14 @@ namespace Omnipotent.Services.Projects
                 try { await DiscordManager.CreateProjectChannelAsync(p); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: create Discord channel failed"); }
             }
-            // First wake: the PLANNING phase. The Commander researches, convenes a planning council,
-            // and submits a Grand Plan for Klives' approval — no execution until it is approved.
+            // First wake: the PLANNING phase. The Commander researches, validates the real environment,
+            // convenes a planning council, makes reversible progress, and submits a Grand Plan for approval.
             string fileNote = initialFiles == null ? "" :
                 $" Klives supplied {initialFiles.Items.Count(x => !x.Skipped)} initial files under /project/inputs; inspect and use them while planning.";
             CommanderRunner.Wake(p,
                 "Project created by Klives just now — you are in the PLANNING phase. Research the goal thoroughly, " +
                 "convene a planning council (convene_council) to stress-test your approach, then draft and submit a " +
-                "Grand Plan (submit_grand_plan) for Klives' approval. No execution work until it is approved." + fileNote);
+                "Grand Plan (submit_grand_plan) for Klives' approval. Use all available tools to validate assumptions and make reversible progress while planning; keep consequential actions behind their normal approval gates." + fileNote);
             return p;
         }
 
@@ -689,26 +690,11 @@ namespace Omnipotent.Services.Projects
                 return new CommanderToolResult(interactionViolation) { Succeeded = false };
 
             if (toolName is "computer_confirm_action" or "computer_confirm_and_click")
-            {
-                if (project.Status == ProjectStatus.Planning)
-                    return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchComputerConfirmationAsync(project, actingAgentID, wakeID, toolName, argsJson, ct);
-            }
             if (toolName is "ensure_desktop_ready")
-            {
-                if (project.Status == ProjectStatus.Planning)
-                    return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchEnsureDesktopReadyAsync(project, actingAgentID, ct);
-            }
             if (toolName.StartsWith("computer_", StringComparison.Ordinal))
-            {
-                if (project.Status == ProjectStatus.Planning)
-                    return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchComputerToolAsync(project, actingAgentID, toolName, argsJson, ct);
-            }
 
             var tools = new ProjectCommanderTools(
                 project, EventLog, Digests, SubAgents, Gates, Budget, Vault, Store, actingAgentID, wakeID)

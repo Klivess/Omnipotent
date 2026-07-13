@@ -176,13 +176,13 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task PlanningPhase_BlocksExecutionTools_AllowsPlanningTools()
+        public async Task PlanningPhase_AllowsExecutionTools_AlongsidePlanningTools()
         {
             var s = NewSetup(ProjectStatus.Planning);
 
-            var blocked = await s.Tools.DispatchAsync("write_file",
+            var write = await s.Tools.DispatchAsync("write_file",
                 JsonConvert.SerializeObject(new { path = "x.txt", content = "hi" }), CancellationToken.None);
-            Assert.Contains("PLANNING", blocked.ResultText, StringComparison.OrdinalIgnoreCase);
+            Assert.True(write.Succeeded, write.ResultText);
 
             var plan = await s.Tools.DispatchAsync("update_plan",
                 JsonConvert.SerializeObject(new { plan = "tactical steps" }), CancellationToken.None);
@@ -194,12 +194,12 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task ExecutionTools_UnlockOnceActive()
+        public async Task ExecutionToolsRemainAvailableAcrossPlanningAndActive()
         {
             var s = NewSetup(ProjectStatus.Planning);
-            var blocked = await s.Tools.DispatchAsync("write_file",
+            var planning = await s.Tools.DispatchAsync("write_file",
                 JsonConvert.SerializeObject(new { path = "x.txt", content = "hi" }), CancellationToken.None);
-            Assert.Contains("PLANNING", blocked.ResultText, StringComparison.OrdinalIgnoreCase);
+            Assert.True(planning.Succeeded, planning.ResultText);
 
             s.Project.Status = ProjectStatus.Active; // the in-wake snapshot flips on approval
             var ok = await s.Tools.DispatchAsync("write_file",
