@@ -76,6 +76,10 @@ namespace Omnipotent.Services.Projects
         public const int MaxTextValueLength = 400;
         public const int MaxNameLength = 80;
         public const int MaxDescriptionLength = 300;
+        /// <summary>Agent-authored status prose is a snapshot, not durable truth.  A legacy or
+        /// newly-created text observable without an explicit freshness contract is therefore
+        /// treated as stale after this window. System-owned typed bindings may remain timeless.</summary>
+        public static readonly TimeSpan DefaultAgentTextStaleAfter = TimeSpan.FromHours(6);
 
         private readonly Action<string> log;
         private readonly string dir;
@@ -170,6 +174,8 @@ namespace Omnipotent.Services.Projects
                 if (!string.IsNullOrWhiteSpace(description)) o.Description = Trim(description.Trim(), MaxDescriptionLength);
                 o.ObservedAt = (observedAt ?? DateTime.UtcNow).ToUniversalTime();
                 if (staleAfter.HasValue) o.StaleAfter = staleAfter;
+                else if (newType == ObservableType.Text && sourceKind == ObservableSourceKind.Agent && o.StaleAfter == null)
+                    o.StaleAfter = DefaultAgentTextStaleAfter;
                 o.SourceKind = sourceKind;
                 o.Validity = validity;
                 o.EvidenceEventSequence = evidenceEventSequence;
@@ -248,7 +254,10 @@ namespace Omnipotent.Services.Projects
             return string.Join("\n", list.Select(o =>
             {
                 TimeSpan age = now - o.ObservedAt;
-                bool stale = o.StaleAfter.HasValue && age > o.StaleAfter.Value;
+                TimeSpan? freshness = o.StaleAfter ??
+                    (o.Type == ObservableType.Text && o.SourceKind == ObservableSourceKind.Agent
+                        ? DefaultAgentTextStaleAfter : null);
+                bool stale = freshness.HasValue && age > freshness.Value;
                 string health = o.Validity == ObservableValidity.Invalid ? " [INVALID]"
                     : stale ? " [STALE]" : o.Validity == ObservableValidity.Valid ? " [valid]" : "";
                 string evidence = o.EvidenceEventSequence.HasValue || o.EvidenceArtifactIDs.Count > 0

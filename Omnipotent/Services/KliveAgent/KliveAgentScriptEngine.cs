@@ -32,6 +32,9 @@ namespace Omnipotent.Services.KliveAgent
             CancellationToken = cancellationToken;
         }
 
+        /// <summary>Compatibility self-reference for scripts ported from hosts that expose a Globals object.</summary>
+        public dynamic Globals => this;
+
         // ── Symbol Discovery ──
 
         /// <summary>
@@ -49,8 +52,8 @@ namespace Omnipotent.Services.KliveAgent
             var sb = new StringBuilder();
             sb.AppendLine("SCRIPT API (run_script / execute_csharp) — exact signatures. These are the calls that fail most when guessed:");
             sb.AppendLine("• GetService(\"KliveMail\") returns the service OBJECT. GetServiceMember takes a STRING type name + member name — GetServiceMember(\"KliveMail\",\"Repo\"), NOT GetServiceMember(svcObject,\"Repo\") (that is CS1503 object→string).");
-            sb.AppendLine("• await RunBash(cmd) / RunPowerShell(cmd) — they return Task<string>; a bare RunBash(cmd) prints the Task object, not its output.");
-            sb.AppendLine("• GetObjectMembers(obj) returns AgentObjectMember with a .Name (there is NO .MemberType). Invoke with CallObjectMethod(obj,\"Method\",args); read a field/prop with GetObjectMember(obj,\"Name\"). Never dot-access on a boxed object.");
+            sb.AppendLine("• await RunBash(cmd) / RunPowerShell(cmd) — they return Task<string>. In Projects, Output(RunBash(cmd)) is also supported and awaits/unpacks it.");
+            sb.AppendLine("• GetObjectMembers(obj) returns AgentObjectMember with .Name, .Kind/.MemberType and .Type/.TypeName. Invoke with CallObjectMethod(obj,\"Method\",args); read a field/prop with GetObjectMember(obj,\"Name\"). Never dot-access on a boxed object.");
             sb.AppendLine("• Locals do NOT persist across separate run_script blocks unless the prior block COMPILED — chain discovery + action + Output(...) in ONE block.");
             sb.AppendLine("• Prefer first-class tools over reflecting into services: klivemail_* for email, account_* for logins, ensure_desktop_ready before browser work, http_request, read_file/write_file.");
             sb.AppendLine("Signatures (one line per method; +N marks additional overloads):");
@@ -971,6 +974,30 @@ namespace Omnipotent.Services.KliveAgent
             return result.Format();
         }
 
+        /// <summary>Compatibility alias for agents that use the customary Async suffix.</summary>
+        public Task<string> RunBashAsync(string script, int timeoutSeconds = 120) => RunBash(script, timeoutSeconds);
+
+        /// <summary>Compatibility alias for agents that use the customary Async suffix.</summary>
+        public Task<string> RunPowerShellAsync(string script, int timeoutSeconds = 120) => RunPowerShell(script, timeoutSeconds);
+
+        /// <summary>Convert a boxed scalar/result to a predictable string without compile-time casts.</summary>
+        public string AsString(object? value) => value?.ToString() ?? "";
+
+        /// <summary>Cycle-tolerant, size-bounded JSON for diagnostic inspection of reflected objects.</summary>
+        public string ToSafeJson(object? value, bool indented = true, int maxChars = 20_000)
+        {
+            string json = Newtonsoft.Json.JsonConvert.SerializeObject(value,
+                indented ? Newtonsoft.Json.Formatting.Indented : Newtonsoft.Json.Formatting.None,
+                new Newtonsoft.Json.JsonSerializerSettings
+                {
+                    ReferenceLoopHandling = Newtonsoft.Json.ReferenceLoopHandling.Ignore,
+                    Error = (_, args) => args.ErrorContext.Handled = true,
+                    MaxDepth = 8,
+                });
+            int cap = Math.Clamp(maxChars, 256, 100_000);
+            return json.Length <= cap ? json : json[..(cap - 1)] + "…";
+        }
+
         // ── Memory ──
 
         /// <summary>Save a persistent memory entry so you can recall it in future conversations. Returns the memory id.</summary>
@@ -1173,8 +1200,19 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".cs", ".csproj", ".sln", ".json", ".xml", ".config", ".txt", ".md",
-            ".yaml", ".yml", ".props", ".targets", ".razor", ".cshtml"
+            ".yaml", ".yml", ".props", ".targets", ".razor", ".cshtml",
+            ".dockerfile", ".py", ".sh", ".bash", ".ps1", ".js", ".mjs", ".cjs",
+            ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".sql", ".toml",
+            ".ini", ".env", ".gitignore", ".editorconfig"
         };
+        private static bool IsAllowedSourceFile(string path)
+        {
+            string name = Path.GetFileName(path);
+            return AllowedExtensions.Contains(Path.GetExtension(path))
+                || name.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase)
+                || name.StartsWith("Dockerfile.", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("Makefile", StringComparison.OrdinalIgnoreCase);
+        }
         private static readonly Regex NamespaceRegex = new(@"^\s*namespace\s+([A-Za-z0-9_.]+)", RegexOptions.Compiled);
         private static readonly Regex TypeDeclarationRegex = new(@"^\s*(?:public|internal|protected|private)?\s*(?:(?:abstract|sealed|static|partial|readonly|unsafe)\s+)*(class|interface|struct|record|enum)\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.Compiled);
         private static readonly object ProjectClassIndexLock = new();
@@ -1262,7 +1300,7 @@ namespace Omnipotent.Services.KliveAgent
             foreach (var f in Directory.GetFiles(dir).OrderBy(f => f))
             {
                 var ext = Path.GetExtension(f);
-                if (AllowedExtensions.Contains(ext))
+                if (IsAllowedSourceFile(f))
                 {
                     var size = new FileInfo(f).Length;
                     sb.AppendLine($"  [FILE] {Path.GetFileName(f)} ({size:N0} bytes)");
@@ -1338,8 +1376,8 @@ namespace Omnipotent.Services.KliveAgent
             if (!File.Exists(file)) return $"File not found: {relativePath}";
 
             var ext = Path.GetExtension(file);
-            if (!AllowedExtensions.Contains(ext))
-                return $"Cannot read files with extension '{ext}'. Allowed: {string.Join(", ", AllowedExtensions)}";
+            if (!IsAllowedSourceFile(file))
+                return $"Cannot read source file '{Path.GetFileName(file)}' (extension '{ext}'). Allowed: {string.Join(", ", AllowedExtensions)}, Dockerfile, Makefile";
 
             var lines = File.ReadAllLines(file);
             var totalLines = lines.Length;

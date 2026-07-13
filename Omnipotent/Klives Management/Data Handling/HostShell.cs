@@ -9,9 +9,9 @@ namespace Omnipotent.Data_Handling
     /// is running elevated ("as admin"), so do these; this deliberately does NOT trigger a UAC
     /// prompt (that can't work headless) — elevation is a property of how Omnipotent was launched.
     ///
-    /// Scripts are written to a temp file and executed by path (no fragile inline quoting), stdout
-    /// and stderr are captured concurrently (so a chatty script can't deadlock on a full pipe), and
-    /// a timeout kills the whole process tree rather than hanging a wake forever.
+    /// PowerShell scripts use a temporary .ps1; Bash scripts are streamed on stdin so the same path
+    /// works with WSL and Git Bash. Stdout/stderr are captured concurrently, and a timeout kills
+    /// the whole process tree rather than hanging a wake forever.
     /// </summary>
     public static class HostShell
     {
@@ -45,22 +45,45 @@ namespace Omnipotent.Data_Handling
             string exe = ResolveOnPath("pwsh.exe") ?? ResolveOnPath("pwsh") ?? "powershell.exe";
             return RunWithScriptFileAsync(exe,
                 file => $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{file}\"",
-                ".ps1", script, timeout, workingDir, "powershell", ct);
+                ".ps1", WrapPowerShell(script), timeout, workingDir, "powershell", ct);
         }
+
+        /// <summary>PowerShell itself exits zero after many failed native commands. Capture the
+        /// final native exit code and convert terminating PowerShell errors into a process failure,
+        /// while retaining the original stdout/stderr for diagnosis.</summary>
+        private static string WrapPowerShell(string script) =>
+            "$ErrorActionPreference = 'Stop'\n" +
+            "$__omniNativeExit = 0\n" +
+            "try {\n" + (script ?? "").Replace("\r\n", "\n").Replace('\r', '\n') + "\n" +
+            "  if ($null -ne $LASTEXITCODE) { $__omniNativeExit = [int]$LASTEXITCODE }\n" +
+            "} catch {\n" +
+            "  [Console]::Error.WriteLine($_.Exception.ToString())\n" +
+            "  exit 1\n" +
+            "}\n" +
+            "if ($__omniNativeExit -ne 0) { exit $__omniNativeExit }\n";
 
         /// <summary>
         /// Runs a Bash script. Resolves bash from PATH (WSL/Git Bash on Windows). Returns a clear
         /// error result if no bash is installed rather than throwing.
         /// </summary>
-        public static Task<ShellResult> RunBashAsync(string script, TimeSpan? timeout = null, string? workingDir = null, CancellationToken ct = default)
+        public static async Task<ShellResult> RunBashAsync(string script, TimeSpan? timeout = null, string? workingDir = null, CancellationToken ct = default)
         {
             string? bash = ResolveOnPath("bash.exe") ?? ResolveOnPath("bash");
             if (bash == null)
-                return Task.FromResult(new ShellResult(-1, "", "bash is not installed or not on PATH on this host (install WSL or Git Bash, or use PowerShell).", false, "bash"));
-            // Bash needs LF line endings; normalise so a CRLF-authored script doesn't choke.
-            return RunWithScriptFileAsync(bash,
-                file => $"\"{ToBashPath(file)}\"",
-                ".sh", script.Replace("\r\n", "\n"), timeout, workingDir, "bash", ct);
+                return new ShellResult(-1, "", "bash is not installed or not on PATH on this host (install WSL or Git Bash, or use PowerShell).", false, "bash");
+            // Feed the script on stdin. Converting a temp path to /mnt/c works for WSL but not Git
+            // Bash (/c), which was why perfectly valid commands repeatedly exited 1 with no useful
+            // output. Both interpreters accept `bash -s`, so stdin is the portable path.
+            try
+            {
+                return await RunProcessAsync(bash, "--noprofile --norc -s", timeout ?? DefaultTimeout,
+                    workingDir, "bash", ct, script.Replace("\r\n", "\n"));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                return new ShellResult(-1, "", $"Failed to run bash: {ex.Message}", false, "bash");
+            }
         }
 
         private static async Task<ShellResult> RunWithScriptFileAsync(
@@ -73,6 +96,7 @@ namespace Omnipotent.Data_Handling
                 await File.WriteAllTextAsync(tempFile, script, ct);
                 return await RunProcessAsync(exe, argsFor(tempFile), timeout ?? DefaultTimeout, workingDir, label, ct);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 return new ShellResult(-1, "", $"Failed to run {label}: {ex.Message}", false, label);
@@ -83,7 +107,8 @@ namespace Omnipotent.Data_Handling
             }
         }
 
-        private static async Task<ShellResult> RunProcessAsync(string exe, string arguments, TimeSpan timeout, string? workingDir, string label, CancellationToken ct)
+        private static async Task<ShellResult> RunProcessAsync(string exe, string arguments, TimeSpan timeout, string? workingDir, string label, CancellationToken ct,
+            string? standardInput = null)
         {
             var psi = new ProcessStartInfo
             {
@@ -92,6 +117,7 @@ namespace Omnipotent.Data_Handling
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                RedirectStandardInput = standardInput != null,
                 CreateNoWindow = true,
                 WorkingDirectory = string.IsNullOrWhiteSpace(workingDir) || !Directory.Exists(workingDir)
                     ? Path.GetTempPath() : workingDir,
@@ -112,6 +138,12 @@ namespace Omnipotent.Data_Handling
             timeoutCts.CancelAfter(timeout);
             try
             {
+                if (standardInput != null)
+                {
+                    await proc.StandardInput.WriteAsync(standardInput.AsMemory(), timeoutCts.Token);
+                    await proc.StandardInput.FlushAsync(timeoutCts.Token);
+                    proc.StandardInput.Close();
+                }
                 await proc.WaitForExitAsync(timeoutCts.Token);
             }
             catch (OperationCanceledException)
@@ -120,9 +152,10 @@ namespace Omnipotent.Data_Handling
                 // Give the readers a beat to flush what was produced before the kill.
                 try { await Task.Delay(150, CancellationToken.None); } catch { }
                 bool byCaller = ct.IsCancellationRequested;
+                if (byCaller) ct.ThrowIfCancellationRequested();
                 return new ShellResult(-1, stdout.ToString(),
-                    (byCaller ? "Cancelled." : $"Timed out after {timeout.TotalSeconds:0}s.") + "\n" + stderr,
-                    !byCaller, label);
+                    $"Timed out after {timeout.TotalSeconds:0}s.\n" + stderr,
+                    true, label);
             }
             // WaitForExitAsync returns when the process exits, but the async readers may have one
             // more callback queued; a short join ensures the last lines are captured.
@@ -147,14 +180,6 @@ namespace Omnipotent.Data_Handling
             }
             catch { }
             return null;
-        }
-
-        /// <summary>Converts a Windows temp path to the /mnt/c form WSL bash understands (Git Bash also accepts it).</summary>
-        private static string ToBashPath(string windowsPath)
-        {
-            if (windowsPath.Length >= 2 && windowsPath[1] == ':')
-                return "/mnt/" + char.ToLowerInvariant(windowsPath[0]) + windowsPath[2..].Replace('\\', '/');
-            return windowsPath.Replace('\\', '/');
         }
     }
 }

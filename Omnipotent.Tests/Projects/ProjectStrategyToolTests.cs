@@ -22,10 +22,10 @@ namespace Omnipotent.Tests.Projects
             public bool Activated;
         }
 
-        private static Setup NewSetup(ProjectStatus status = ProjectStatus.Planning)
+        private static Setup NewSetup(ProjectStatus status = ProjectStatus.Planning, string goal = "goal")
         {
             var s = new Setup();
-            var p = s.Store.CreateProject("t", "goal", 100, 100, 10, 5);
+            var p = s.Store.CreateProject("t", goal, 100, 100, 10, 5);
             p.Status = status;
             s.Store.SaveProject(p);
             s.Project = p;
@@ -140,19 +140,34 @@ namespace Omnipotent.Tests.Projects
             }, "s1", null, material: true, "w0");
             s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
 
-            var r = await s.Tools.DispatchAsync("update_plan_progress",
+            var evidenceEvent = s.Log.Append(new ProjectEvent
+            {
+                ProjectID = s.Project.ProjectID,
+                Type = ProjectEventTypes.ToolResult,
+                Author = "test",
+                Text = "Verified milestone and criterion through the project test.",
+            });
+            var milestoneResult = await s.Tools.DispatchAsync("update_plan_progress",
                 JsonConvert.SerializeObject(new
                 {
                     milestoneId = "m1",
                     milestoneStatus = "done",
+                    evidence = "Verified by project test result event",
+                    evidenceEventSequence = evidenceEvent.Sequence,
+                }),
+                CancellationToken.None);
+            var criterionResult = await s.Tools.DispatchAsync("update_plan_progress",
+                JsonConvert.SerializeObject(new
+                {
                     criterionId = "c1",
                     criterionMet = "true",
-                    evidence = "Verified by project test result event 42",
-                    evidenceEventSequence = 42,
+                    evidence = "Verified by project test result event",
+                    evidenceEventSequence = evidenceEvent.Sequence,
                 }),
                 CancellationToken.None);
 
-            Assert.Contains("Alpha", r.ResultText);
+            Assert.Contains("Alpha", milestoneResult.ResultText);
+            Assert.Contains("PnL>0", criterionResult.ResultText);
             var cur = s.GrandPlans.GetCurrentApproved(s.Project.ProjectID)!.Content!;
             Assert.Equal(MilestoneStatus.Done, cur.Milestones[0].Status);
             Assert.True(cur.SuccessCriteria[0].Met);
@@ -199,6 +214,119 @@ namespace Omnipotent.Tests.Projects
             var result = await s.Tools.DispatchAsync("convene_council",
                 JsonConvert.SerializeObject(new { topic = "x" }), CancellationToken.None); // no briefing
             Assert.Contains("briefing", result.ResultText, StringComparison.OrdinalIgnoreCase);
+            Assert.False(result.Succeeded);
+        }
+
+        [Fact]
+        public async Task OngoingExternalAccountPlan_RequiresLiveGateDurableCadenceAndFeedbackLoop()
+        {
+            var s = NewSetup(ProjectStatus.Planning, "Run and grow a TikTok account on a posting schedule");
+            var incomplete = await s.Tools.DispatchAsync("submit_grand_plan", JsonConvert.SerializeObject(new
+            {
+                mission = "Create the account and post once.",
+                milestones = new[] { new { title = "Create TikTok account" } },
+                successCriteria = new[] { new { text = "One post exists" } },
+                summary = "Create it"
+            }), CancellationToken.None);
+
+            Assert.False(incomplete.Succeeded);
+            Assert.Contains("EXTERNAL_OPERATION_PLAN_INCOMPLETE", incomplete.ResultText);
+            Assert.Empty(s.Gates.ListPending(s.Project.ProjectID));
+
+            var completeTask = s.Tools.DispatchAsync("submit_grand_plan", JsonConvert.SerializeObject(new
+            {
+                mission = "Operate and improve the TikTok account continuously.",
+                milestones = new[]
+                {
+                    new { title = "Verify signup and mailbox delivery" },
+                    new { title = "Run a durable publishing queue and recurring timer schedule" },
+                    new { title = "Review analytics metrics and feed the next growth experiment" },
+                },
+                preconditions = new[] { new { description = "TikTok signup and email verification are available", verification = "Use the visible browser and confirm a real KliveMail code arrives" } },
+                risks = new[] { new { description = "Platform terms, account eligibility, and media rights", severity = "high", mitigation = "Review live policy and license every asset", blocksExecution = true } },
+                successCriteria = new[] { new { text = "Publishing ledger, recurring cadence, and reach review remain operational" } },
+                summary = "Operate through a verified, policy-aware, measured publishing loop"
+            }), CancellationToken.None);
+
+            var gate = await WaitForGateAsync(s.Gates, s.Project.ProjectID);
+            s.Gates.ResolveGate(s.Project.ProjectID, gate.GateID,
+                new GateResolution(GateDecision.Deny, "test complete", "klives"));
+            var complete = await completeTask;
+            Assert.Contains("test complete", complete.ResultText);
+        }
+
+        [Fact]
+        public async Task IdenticalHumanRequest_IsNotRedeliveredUntilKlivesReplies()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            int deliveries = 0;
+            s.Tools.RequestHumanAsync = _ => { deliveries++; return Task.CompletedTask; };
+            string args = JsonConvert.SerializeObject(new { title = "Captcha", description = "Complete the visible challenge" });
+
+            var first = await s.Tools.DispatchAsync("request_human", args, CancellationToken.None);
+            var duplicate = await s.Tools.DispatchAsync("request_human", args, CancellationToken.None);
+            Assert.True(first.Succeeded);
+            Assert.False(duplicate.Succeeded);
+            Assert.Contains("ALREADY_OPEN", duplicate.ResultText);
+            Assert.Equal(1, deliveries);
+
+            s.Log.Append(new ProjectEvent
+            {
+                ProjectID = s.Project.ProjectID,
+                Type = ProjectEventTypes.KlivesMessage,
+                Author = "klives",
+                Text = "I handled it.",
+            });
+            var followUp = await s.Tools.DispatchAsync("request_human", args, CancellationToken.None);
+            Assert.True(followUp.Succeeded);
+            Assert.Equal(2, deliveries);
+        }
+
+        [Fact]
+        public async Task IndefiniteAccountOperation_CannotBeCompletedAfterInitialSetup()
+        {
+            var s = NewSetup(ProjectStatus.Active, "Run and grow a TikTok account continuously");
+
+            var result = await s.Tools.DispatchAsync("complete_project",
+                JsonConvert.SerializeObject(new { summary = "The account was created and first post uploaded" }),
+                CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("ONGOING_OPERATION_REMAINS_ACTIVE", result.ResultText);
+            Assert.Empty(s.Gates.ListPending(s.Project.ProjectID));
+        }
+
+        [Fact]
+        public async Task NarrativeStatusEvent_CannotProveTerminalPlanProgress()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            s.GrandPlans.SubmitVersion(s.Project.ProjectID, new GrandPlanContent
+            {
+                Mission = "Verify reality",
+                Milestones = { new PlanMilestone { Title = "External outcome" } },
+                SuccessCriteria = { new PlanCriterion { Text = "Outcome verified" } },
+            }, "s1", null, material: true, "w0");
+            s.GrandPlans.MarkApproved(s.Project.ProjectID, 1, "g0", null);
+            var narrative = s.Log.Append(new ProjectEvent
+            {
+                ProjectID = s.Project.ProjectID,
+                Type = ProjectEventTypes.Status,
+                Author = "commander",
+                Text = "I believe the external outcome happened.",
+            });
+
+            var result = await s.Tools.DispatchAsync("update_plan_progress", JsonConvert.SerializeObject(new
+            {
+                milestoneId = "m1",
+                milestoneStatus = "done",
+                evidence = "Commander says it happened",
+                evidenceEventSequence = narrative.Sequence,
+            }), CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("not outcome evidence", result.ResultText);
+            Assert.Equal(MilestoneStatus.Pending,
+                s.GrandPlans.GetCurrentApproved(s.Project.ProjectID)!.Content!.Milestones[0].Status);
         }
     }
 }

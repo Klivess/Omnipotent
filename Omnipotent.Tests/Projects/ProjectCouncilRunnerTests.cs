@@ -184,5 +184,23 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal(CouncilStatus.Failed, session.Status);
             Assert.Contains("daily", session.Error!, StringComparison.OrdinalIgnoreCase);
         }
+
+        [Fact]
+        public async Task DuplicateTopicAndBriefing_IsRefusedBeforeAnotherCouncilIsPersisted()
+        {
+            var h = new Harness();
+            string pid = NewProjectId();
+            var first = await h.Runner.ConveneAsync(NewProject(pid), "w1", "Choose launch path", "Evidence A and B",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+            Assert.Equal(CouncilStatus.Completed, first.Status);
+
+            var duplicate = await h.Runner.ConveneAsync(NewProject(pid), "w2", "  CHOOSE   launch path ", " evidence a AND b ",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Failed, duplicate.Status);
+            Assert.Contains("duplicate", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("new evidence", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Single(h.Store.List(pid));
+        }
     }
 }

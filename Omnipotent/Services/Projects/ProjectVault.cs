@@ -59,6 +59,14 @@ namespace Omnipotent.Services.Projects
             rootKeyPath = Path.Combine(vaultsDir, "root.key");
         }
 
+        internal ProjectVault(Action<string> log, string vaultsDir)
+        {
+            this.log = log ?? (_ => { });
+            this.vaultsDir = Path.GetFullPath(vaultsDir);
+            Directory.CreateDirectory(this.vaultsDir);
+            rootKeyPath = Path.Combine(this.vaultsDir, "root.key");
+        }
+
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string VaultPath(string projectID) => Path.Combine(vaultsDir, projectID + ".vault.json");
 
@@ -70,21 +78,21 @@ namespace Omnipotent.Services.Projects
             lock (rootKeyGate)
             {
                 if (rootKey != null) return rootKey;
-                if (File.Exists(rootKeyPath))
-                {
-                    rootKey = File.ReadAllBytes(rootKeyPath);
-                    if (rootKey.Length != RootKeyBytes)
-                        throw new InvalidOperationException($"Project vault root key is corrupt ({rootKey.Length} bytes).");
-                }
-                else
-                {
-                    rootKey = RandomNumberGenerator.GetBytes(RootKeyBytes);
-                    File.WriteAllBytes(rootKeyPath, rootKey);
-                    RestrictKeyFilePermissions(rootKeyPath);
-                    log("ProjectVault: generated a new root key.");
-                }
+                rootKey = AtomicSecretRootKey.LoadOrCreate(rootKeyPath, RootKeyBytes,
+                    HasEncryptedSecretsOnDisk, RestrictKeyFilePermissions, log, "ProjectVault");
                 return rootKey;
             }
+        }
+
+        private bool HasEncryptedSecretsOnDisk()
+        {
+            foreach (string path in Directory.EnumerateFiles(vaultsDir, "*.vault.json", SearchOption.TopDirectoryOnly))
+            {
+                var file = JsonConvert.DeserializeObject<VaultFile>(File.ReadAllText(path))
+                    ?? new VaultFile();
+                if (file.Entries.Any(e => !string.IsNullOrWhiteSpace(e.CipherB64))) return true;
+            }
+            return false;
         }
 
         /// <summary>HKDF-SHA256(rootKey, info = "projectvault:" + projectID) → a 32-byte per-project key.</summary>

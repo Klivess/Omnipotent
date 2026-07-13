@@ -1,4 +1,5 @@
 using Omnipotent.Data_Handling;
+using System.Text.RegularExpressions;
 
 namespace Omnipotent.Services.Projects;
 
@@ -17,8 +18,10 @@ public static class ProjectWorkspaceLocator
     public static string NormalizeRelative(string? path)
     {
         path = (path ?? "").Trim().Replace('\\', '/');
-        if (path.Equals(ContainerRoot, StringComparison.Ordinal)) return "";
-        if (path.StartsWith(ContainerRoot + "/", StringComparison.Ordinal))
+        var driveProject = Regex.Match(path, "^[A-Za-z]:/project(?:/(.*))?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (driveProject.Success) path = driveProject.Groups[1].Success ? driveProject.Groups[1].Value : "";
+        if (path.Equals(ContainerRoot, StringComparison.OrdinalIgnoreCase)) return "";
+        if (path.StartsWith(ContainerRoot + "/", StringComparison.OrdinalIgnoreCase))
             path = path[(ContainerRoot.Length + 1)..];
         if (path == ".") return "";
         if (Path.IsPathRooted(path) || path.StartsWith('/'))
@@ -26,14 +29,31 @@ public static class ProjectWorkspaceLocator
 
         var parts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Any(p => p is "." or ".."))
-            throw new InvalidOperationException("Project paths cannot contain '.' or '..' segments.");
+            throw new InvalidOperationException(
+                "Path escapes the project volume: project paths cannot contain '.' or '..' segments.");
         return string.Join('/', parts);
+    }
+
+    /// <summary>Also accepts the real host path for this exact project's volume. No other host
+    /// absolute path is translated, so callers get convenience without cross-project access.</summary>
+    public static string NormalizeRelative(string projectID, string? path)
+    {
+        string supplied = (path ?? "").Trim();
+        if (Path.IsPathRooted(supplied))
+        {
+            string root = HostRoot(projectID);
+            string full = Path.GetFullPath(supplied);
+            if (full.Equals(root, StringComparison.OrdinalIgnoreCase)) return "";
+            if (full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                return Path.GetRelativePath(root, full).Replace('\\', '/');
+        }
+        return NormalizeRelative(supplied);
     }
 
     public static string HostPath(string projectID, string? path)
     {
         string root = HostRoot(projectID);
-        string relative = NormalizeRelative(path);
+        string relative = NormalizeRelative(projectID, path);
         string full = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
         if (!full.Equals(root, StringComparison.OrdinalIgnoreCase)
             && !full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))

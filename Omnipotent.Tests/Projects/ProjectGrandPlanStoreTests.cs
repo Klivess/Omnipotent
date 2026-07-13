@@ -138,10 +138,11 @@ namespace Omnipotent.Tests.Projects
             store.MarkApproved(pid, 1, "g1", null);
 
             // Match by id, and by exact title.
-            Assert.NotNull(store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.Done));
+            var evidence = new PlanEvidence { Summary = "verified by event", EventSequence = 1, RecordedBy = "test" };
+            Assert.NotNull(store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.Done, evidence));
             Assert.NotNull(store.UpdateMilestoneStatus(pid, "Beta", MilestoneStatus.InProgress));
             Assert.Null(store.UpdateMilestoneStatus(pid, "nope", MilestoneStatus.Done));
-            Assert.NotNull(store.SetCriterionMet(pid, "c1", true));
+            Assert.NotNull(store.SetCriterionMet(pid, "c1", true, evidence));
 
             var cur = store.GetCurrentApproved(pid)!.Content!;
             Assert.Equal(MilestoneStatus.Done, cur.Milestones[0].Status);
@@ -208,7 +209,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Throws<InvalidOperationException>(() =>
                 store.UpdateMilestoneStatus(pid, "Integration", MilestoneStatus.InProgress));
             store.UpdateMilestoneStatus(pid, "Foundation", MilestoneStatus.Done,
-                new PlanEvidence { Summary = "verified", RecordedBy = "test" });
+                new PlanEvidence { Summary = "verified", EventSequence = 1, RecordedBy = "test" });
             Assert.Equal("Integration", Assert.Single(store.GetReadyMilestones(pid)).Title);
             Assert.Contains("Ready now", store.DescribeForSeed(pid));
         }
@@ -238,6 +239,76 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("unknown", Assert.Throws<InvalidOperationException>(() =>
                 store.SubmitVersion(NewProjectId(), unknown, "bad", null, true, "w")).Message,
                 StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public void EvidenceBackedPreconditions_GateMilestoneExecutionAndCompletion()
+        {
+            var store = NewStore();
+            string pid = NewProjectId();
+            store.SubmitVersion(pid, new GrandPlanContent
+            {
+                Mission = "Operate account",
+                Preconditions =
+                {
+                    new PlanPrecondition
+                    {
+                        Description = "Verification email is deliverable",
+                        Verification = "Send a live message and observe it in the canonical mailbox",
+                    },
+                },
+                Milestones = { new PlanMilestone { Title = "Create account" } },
+                SuccessCriteria = { new PlanCriterion { Text = "Account is verified" } },
+            }, "preconditioned plan", null, true, "w1");
+            store.MarkApproved(pid, 1, "g1", null);
+
+            Assert.Empty(store.GetReadyMilestones(pid));
+            Assert.Throws<InvalidOperationException>(() =>
+                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress));
+            Assert.Contains(store.GetCompletionReadinessIssues(pid), x => x.Contains("precondition p1"));
+
+            var verified = store.SetPreconditionStatus(pid, "p1", PlanPreconditionStatus.Verified,
+                new PlanEvidence { Summary = "message id 123 observed", EventSequence = 123, RecordedBy = "test" });
+
+            Assert.Equal(PlanPreconditionStatus.Verified, verified!.Status);
+            Assert.Equal("Create account", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Contains("1/1 preconditions", store.DescribeForSeed(pid));
+        }
+
+        [Fact]
+        public void BlockingAndHighRisks_MustBeExplicitlyResolvedWithEvidence()
+        {
+            var store = NewStore();
+            string pid = NewProjectId();
+            store.SubmitVersion(pid, new GrandPlanContent
+            {
+                Mission = "Operate responsibly",
+                Risks =
+                {
+                    new PlanRisk
+                    {
+                        Description = "Platform policy permits the planned operation",
+                        Severity = RiskSeverity.High,
+                        BlocksExecution = true,
+                        Mitigation = "Review the current policy and constrain the workflow",
+                    },
+                },
+                Milestones = { new PlanMilestone { Title = "Operate account" } },
+                SuccessCriteria = { new PlanCriterion { Text = "Operation is compliant" } },
+            }, "risk-aware plan", null, true, "w1");
+            store.MarkApproved(pid, 1, "g1", null);
+
+            Assert.Empty(store.GetReadyMilestones(pid));
+            Assert.Throws<InvalidOperationException>(() =>
+                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress));
+            Assert.Contains(store.GetCompletionReadinessIssues(pid), issue => issue.Contains("risk r1"));
+
+            var resolved = store.SetRiskStatus(pid, "r1", PlanRiskStatus.Mitigated,
+                new PlanEvidence { Summary = "policy review event #44", EventSequence = 44, RecordedBy = "test" });
+
+            Assert.Equal(PlanRiskStatus.Mitigated, resolved!.Status);
+            Assert.Equal("Operate account", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.DoesNotContain(store.GetCompletionReadinessIssues(pid), issue => issue.Contains("risk r1"));
         }
     }
 }

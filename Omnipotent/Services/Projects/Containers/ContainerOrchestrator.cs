@@ -2,6 +2,7 @@ using Docker.DotNet;
 using Docker.DotNet.Models;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects;
+using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Projects.Containers
 {
@@ -23,6 +24,18 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly string dockerUri;
         private DockerClient? client;
         private readonly SemaphoreSlim clientGate = new(1, 1);
+        private readonly ConcurrentDictionary<string, ImageBuildFlight> imageBuildFlights = new(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class ImageBuildFlight
+        {
+            public ImageBuildFlight(bool force, Func<Task<string?>> factory)
+            {
+                Force = force;
+                Work = new Lazy<Task<string?>>(factory, LazyThreadSafetyMode.ExecutionAndPublication);
+            }
+            public bool Force { get; }
+            public Lazy<Task<string?>> Work { get; }
+        }
 
         private const int VncContainerPort = 5901;
         // ~2 GB per desktop: XFCE + Firefox alone sit near 1 GB, and agents are expected to
@@ -33,6 +46,11 @@ namespace Omnipotent.Services.Projects.Containers
         /// is stamped on containers (see <see cref="ContainerLabels.ContextHash"/>) so a container
         /// can be compared against its image for staleness.</summary>
         private const string ContextHashLabel = ContainerLabels.ContextHash;
+        private static readonly TimeSpan ImageBuildTimeout = TimeSpan.FromMinutes(30);
+        internal static readonly string[] DesktopBuildContextFiles =
+        {
+            "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py",
+        };
 
         public ContainerOrchestrator(
             ContainerRegistry registry,
@@ -100,16 +118,23 @@ namespace Omnipotent.Services.Projects.Containers
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 wmctrl -a Chromium >/dev/null 2>&1 || (DISPLAY=:1 chromium --no-sandbox --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 &)" },
+                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 wmctrl -a Chromium >/dev/null 2>&1 && DISPLAY=:1 wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || (DISPLAY=:1 chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 &)" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 chromium --no-sandbox --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
+                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
+                ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app
+                    => new[] { "sh", "-lc", "DISPLAY=:1 nohup \"$0\" \"$@\" >/tmp/launched-app.log 2>&1 &", app.Executable }
+                        .Concat(app.Arguments).ToArray(),
                 ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Chromium" },
                 ContainerDesktopControlCommand.FocusTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Terminal" },
+                ContainerDesktopControlCommand.FocusWindow when ParseWindowFocus(argument) is { } focus
+                    => focus.ProcessName is { Length: > 0 }
+                        ? new[] { "sh", "-lc", "pid=$(pgrep -o -f -- \"$1\") || exit 2; wid=$(DISPLAY=:1 wmctrl -lp | awk -v p=\"$pid\" '$3==p {print $1; exit}'); [ -n \"$wid\" ] || exit 3; DISPLAY=:1 wmctrl -ia \"$wid\"", "desktop-control", focus.ProcessName }
+                        : new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a \"$1\"", "desktop-control", focus.TitleContains! },
                 _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
             };
 
@@ -128,6 +153,40 @@ namespace Omnipotent.Services.Projects.Containers
             var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, ct);
             if (inspected.ExitCode != 0)
                 throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+        }
+
+        private sealed record DesktopApplicationRequest(string Executable, string[] Arguments);
+        private sealed record DesktopWindowFocusRequest(string? TitleContains, string? ProcessName);
+
+        private static DesktopApplicationRequest? ParseApplication(string? json)
+        {
+            try
+            {
+                var value = System.Text.Json.JsonSerializer.Deserialize<DesktopApplicationRequest>(json ?? "",
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (value == null || value.Executable.Length is < 1 or > 512
+                    || value.Executable.Any(char.IsControl)
+                    || !value.Executable.All(c => char.IsLetterOrDigit(c) || c is '_' or '-' or '+' or '.' or '/')
+                    || value.Executable.Contains('/') && !value.Executable.StartsWith('/')
+                    || value.Executable is "/" || value.Executable.EndsWith('/') || value.Executable.Contains("//")
+                    || value.Executable.Split('/', StringSplitOptions.RemoveEmptyEntries).Any(segment => segment is "." or "..")
+                    || value.Arguments.Length > 128 || value.Arguments.Any(x => x.Length > 4096 || x.Any(char.IsControl)))
+                    return null;
+                return value;
+            }
+            catch { return null; }
+        }
+
+        private static DesktopWindowFocusRequest? ParseWindowFocus(string? json)
+        {
+            try
+            {
+                var value = System.Text.Json.JsonSerializer.Deserialize<DesktopWindowFocusRequest>(json ?? "",
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                string target = value?.ProcessName ?? value?.TitleContains ?? "";
+                return target.Length is > 0 and <= 256 && !target.Any(char.IsControl) ? value : null;
+            }
+            catch { return null; }
         }
 
         /// <summary>
@@ -250,26 +309,79 @@ namespace Omnipotent.Services.Projects.Containers
         /// so a CRLF git checkout can't produce a container whose entrypoint dies on '\r'. Returns
         /// null on success (or already current), else a human-readable reason.
         /// </summary>
-        public async Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName, CancellationToken ct = default)
+        public Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName, CancellationToken ct = default) =>
+            EnsureImageBuiltAsync(imageTag, contextDir, dockerfileName, forceRebuild: false, ct: ct);
+
+        public async Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName,
+            bool forceRebuild, CancellationToken ct = default)
+        {
+            string key = imageTag.Trim();
+            while (true)
+            {
+                var candidate = new ImageBuildFlight(forceRebuild,
+                    () => RunImageBuildFlightAsync(imageTag, contextDir, dockerfileName, forceRebuild));
+                var flight = imageBuildFlights.GetOrAdd(key, candidate);
+                Task<string?> work = flight.Work.Value;
+                if (ReferenceEquals(flight, candidate))
+                    _ = work.ContinueWith(_ => RemoveImageBuildFlight(key, flight), CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+                string? result = await work.WaitAsync(ct);
+                RemoveImageBuildFlight(key, flight);
+                // A live-capability repair explicitly requested a rebuild. If it happened to join
+                // an ordinary currency check that did not force one, run one forced flight after
+                // that check completes rather than silently treating the join as a repair.
+                if (forceRebuild && !flight.Force) continue;
+                return result;
+            }
+        }
+
+        private void RemoveImageBuildFlight(string key, ImageBuildFlight flight)
+        {
+            if (imageBuildFlights.TryGetValue(key, out var current) && ReferenceEquals(current, flight))
+                imageBuildFlights.TryRemove(key, out _);
+        }
+
+        private async Task<string?> RunImageBuildFlightAsync(string imageTag, string contextDir,
+            string dockerfileName, bool forceRebuild)
+        {
+            using var timeout = new CancellationTokenSource(ImageBuildTimeout);
+            try
+            {
+                return await EnsureImageBuiltCoreAsync(imageTag, contextDir, dockerfileName,
+                    forceRebuild, timeout.Token);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                return $"desktop image build exceeded its {ImageBuildTimeout.TotalMinutes:0}-minute recovery window; " +
+                       "the single-flight build was stopped and a later readiness attempt may retry.";
+            }
+        }
+
+        private async Task<string?> EnsureImageBuiltCoreAsync(string imageTag, string contextDir, string dockerfileName,
+            bool forceRebuild, CancellationToken ct)
         {
             try
             {
-                bool contextAvailable = Directory.Exists(contextDir) && File.Exists(Path.Combine(contextDir, dockerfileName));
+                var missingContextFiles = DesktopBuildContextFiles
+                    .Where(name => !File.Exists(Path.Combine(contextDir, name))).ToList();
+                bool contextAvailable = Directory.Exists(contextDir) && missingContextFiles.Count == 0;
                 var existing = await FindImageAsync(imageTag, ct);
                 if (!contextAvailable)
                 {
-                    // No context shipped on this host: a present image (however old) beats no desktop.
-                    return existing != null ? null
-                        : $"desktop image '{imageTag}' is missing and the build context was not found at {contextDir}.";
+                    return $"desktop build context is incomplete at {contextDir}; missing: {string.Join(", ", missingContextFiles)}. " +
+                           "The application output must contain every desktop asset before browser work can be trusted.";
                 }
 
                 string contextHash = ComputeContextHash(contextDir);
-                if (existing?.Labels != null && existing.Labels.TryGetValue(ContextHashLabel, out var builtHash) && builtHash == contextHash)
+                if (!forceRebuild && existing?.Labels != null && existing.Labels.TryGetValue(ContextHashLabel, out var builtHash) && builtHash == contextHash)
                     return null; // image is current
 
                 log(existing == null
                     ? $"Desktop image '{imageTag}' not found — building it now (first build takes several minutes)…"
-                    : $"Desktop image '{imageTag}' is stale (build context changed) — rebuilding…");
+                    : forceRebuild
+                        ? $"Desktop image '{imageTag}' failed its live capability probe — rebuilding from the verified shipped context…"
+                        : $"Desktop image '{imageTag}' is stale (build context changed) — rebuilding…");
                 var docker = await GetClientAsync();
                 using var context = CreateTarContext(contextDir);
                 string? buildError = null;
@@ -294,19 +406,20 @@ namespace Omnipotent.Services.Projects.Containers
                 log($"Desktop image '{imageTag}' built successfully.");
                 return null;
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 return $"desktop image build failed: {ex.Message}";
             }
         }
 
-        /// <summary>In-process tar of the build-context directory (flat — the context is two small files).</summary>
+        /// <summary>In-process tar of the exact, flat desktop build context.</summary>
         private static MemoryStream CreateTarContext(string contextDir)
         {
             var ms = new MemoryStream();
             using (var writer = new System.Formats.Tar.TarWriter(ms, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
             {
-                foreach (var file in Directory.GetFiles(contextDir))
+                foreach (var file in DesktopBuildContextFiles.Select(name => Path.Combine(contextDir, name)))
                 {
                     var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, Path.GetFileName(file))
                     {
@@ -321,8 +434,8 @@ namespace Omnipotent.Services.Projects.Containers
 
         /// <summary>A context file's bytes as they enter the build: .sh normalised to LF.</summary>
         private static byte[] ReadContextFile(string file) =>
-            file.EndsWith(".sh", StringComparison.OrdinalIgnoreCase)
-                ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n"))
+            file.EndsWith(".sh", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".py", StringComparison.OrdinalIgnoreCase)
+                ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n").Replace('\r', '\n'))
                 : File.ReadAllBytes(file);
 
         /// <summary>SHA-256 over the context's file names + normalised contents (order-stable), so
@@ -331,7 +444,8 @@ namespace Omnipotent.Services.Projects.Containers
         {
             using var sha = System.Security.Cryptography.SHA256.Create();
             using var ms = new MemoryStream();
-            foreach (var file in Directory.GetFiles(contextDir).OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase))
+            foreach (var file in DesktopBuildContextFiles.Select(name => Path.Combine(contextDir, name))
+                         .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase))
             {
                 byte[] name = System.Text.Encoding.UTF8.GetBytes(Path.GetFileName(file) + "\0");
                 ms.Write(name, 0, name.Length);
@@ -363,6 +477,12 @@ namespace Omnipotent.Services.Projects.Containers
             if (string.IsNullOrWhiteSpace(profileSegment)) profileSegment = "shared";
             string profileHostDir = Path.Combine(volumeHostDir, ".klive", "browser-profiles", profileSegment);
             Directory.CreateDirectory(profileHostDir);
+            // Package environments contain platform-specific launchers and native binaries. Keep
+            // them in an owner-specific Linux runtime mount rather than the cross-OS /project tree;
+            // this persists across image/container replacement without allowing one agent's venv
+            // or node_modules to corrupt another's.
+            string runtimeHostDir = Path.Combine(volumeHostDir, ".klive", "agent-runtime", profileSegment);
+            Directory.CreateDirectory(runtimeHostDir);
 
             var create = await docker.Containers.CreateContainerAsync(new CreateContainerParameters
             {
@@ -380,6 +500,7 @@ namespace Omnipotent.Services.Projects.Containers
                     $"DISPLAY_WIDTH={resolvedWidth}",
                     $"DISPLAY_HEIGHT={resolvedHeight}",
                     $"OMNIPOTENT_BROWSER_PROFILE=/project/.klive/browser-profiles/{profileSegment}",
+                    "KLIVE_AGENT_RUNTIME=/agent-runtime",
                 },
                 ExposedPorts = new Dictionary<string, EmptyStruct> { [$"{VncContainerPort}/tcp"] = default },
                 HostConfig = new HostConfig
@@ -390,7 +511,7 @@ namespace Omnipotent.Services.Projects.Containers
                     {
                         [$"{VncContainerPort}/tcp"] = new List<PortBinding> { new() { HostIP = "127.0.0.1", HostPort = "" } },
                     },
-                    Binds = new List<string> { $"{volumeHostDir}:/project" },
+                    Binds = new List<string> { $"{volumeHostDir}:/project", $"{runtimeHostDir}:/agent-runtime" },
                     RestartPolicy = new RestartPolicy { Name = RestartPolicyKind.UnlessStopped },
                     ShmSize = 256 * 1024 * 1024, // browsers crash with the 64MB default /dev/shm
                 },
@@ -547,6 +668,24 @@ namespace Omnipotent.Services.Projects.Containers
                     }
                 }
                 catch (Exception ex) { log($"Reconcile: inspect failed for {record.ContainerID[..12]}: {ex.Message}"); }
+            }
+
+            // Enforce the one-container-per-owner invariant after reality has been reattached.
+            // This also cleans up duplicate records left by a crash between replacement creation
+            // and old-container removal.
+            foreach (var group in registry.All().Where(r => !r.Lost)
+                .GroupBy(r => r.ProjectID + "\0" + (r.AgentID ?? "<shared>"), StringComparer.Ordinal))
+            {
+                var ordered = group.OrderByDescending(r => r.LastUsedAt).ThenByDescending(r => r.CreatedAt).ToList();
+                foreach (var duplicate in ordered.Skip(1))
+                {
+                    try
+                    {
+                        await StopContainerAsync(duplicate.ContainerID, ct);
+                        log($"Reconcile: removed duplicate desktop {duplicate.ContainerID[..12]} for project owner {group.Key.Replace("\0", "/")}.");
+                    }
+                    catch (Exception ex) { log($"Reconcile: failed to remove duplicate {duplicate.ContainerID[..12]}: {ex.Message}"); }
+                }
             }
             log($"Container reconcile complete: {registry.All().Count(r => !r.Lost)} live desktop(s).");
         }

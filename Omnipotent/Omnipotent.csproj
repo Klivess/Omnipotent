@@ -93,6 +93,7 @@
 		     bootstrapper can auto-build the image when it's missing on the host. -->
 		<None Update="Services\Projects\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
 		<None Update="Services\Projects\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Projects\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>

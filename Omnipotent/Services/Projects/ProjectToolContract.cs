@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
@@ -29,18 +30,21 @@ public sealed record ProjectToolContractError(
 /// <summary>The validated, normalized arguments or the error that must be returned to the model.</summary>
 public sealed class ProjectToolContractResult
 {
-    private ProjectToolContractResult(string? normalizedArgumentsJson, ProjectToolContractError? error)
+    private ProjectToolContractResult(string? normalizedArgumentsJson, ProjectToolContractError? error,
+        IReadOnlyList<string>? warnings = null)
     {
         NormalizedArgumentsJson = normalizedArgumentsJson;
         Error = error;
+        Warnings = warnings ?? Array.Empty<string>();
     }
 
     public bool IsValid => Error == null;
     public string? NormalizedArgumentsJson { get; }
     public ProjectToolContractError? Error { get; }
+    public IReadOnlyList<string> Warnings { get; }
     public string? ErrorText => Error?.ToToolResult();
 
-    internal static ProjectToolContractResult Valid(string json) => new(json, null);
+    internal static ProjectToolContractResult Valid(string json, IReadOnlyList<string>? warnings = null) => new(json, null, warnings);
     internal static ProjectToolContractResult Invalid(ProjectToolContractError error) => new(null, error);
 }
 
@@ -61,11 +65,35 @@ public static class ProjectToolContract
     public const string EnumMismatch = "enum_mismatch";
     public const string AliasConflict = "alias_conflict";
 
+    public static CommanderToolResult AttachWarnings(ProjectToolContractResult contract, CommanderToolResult result)
+    {
+        if (contract.Warnings.Count == 0) return result;
+        string prefix = "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", contract.Warnings) + "\n";
+        return result with
+        {
+            ResultText = prefix + result.ResultText,
+            AuditText = prefix + (result.AuditText ?? result.ResultText),
+        };
+    }
+
     private static readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, string>> LegacyAliases =
         new Dictionary<string, IReadOnlyDictionary<string, string>>(StringComparer.Ordinal)
         {
-            ["run_bash"] = new Dictionary<string, string>(StringComparer.Ordinal) { ["command"] = "script" },
-            ["run_powershell"] = new Dictionary<string, string>(StringComparer.Ordinal) { ["command"] = "script" },
+            ["run_bash"] = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["command"] = "script",
+                ["code"] = "script",
+            },
+            ["run_powershell"] = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["command"] = "script",
+                ["code"] = "script",
+            },
+            ["computer_terminal"] = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["script"] = "command",
+                ["code"] = "command",
+            },
         };
 
     /// <summary>Finds <paramref name="toolName"/> in the tools actually offered to the model, then validates its arguments.</summary>
@@ -118,9 +146,13 @@ public static class ProjectToolContract
         var aliasError = ApplyLegacyAliases(toolName, arguments, schema);
         if (aliasError != null) return ProjectToolContractResult.Invalid(aliasError);
 
+        var warnings = new List<string>();
+        ApplyToolSpecificNormalizations(toolName, arguments, warnings);
+        NormalizeSafeScalarTypes(arguments, schema);
+
         var error = ValidateToken(arguments, schema, "$", schemaIsToolRoot: true);
         return error == null
-            ? ProjectToolContractResult.Valid(arguments.ToString(Formatting.None))
+            ? ProjectToolContractResult.Valid(arguments.ToString(Formatting.None), warnings)
             : ProjectToolContractResult.Invalid(error);
     }
 
@@ -133,17 +165,144 @@ public static class ProjectToolContract
             var legacyProperty = arguments.Property(legacy, StringComparison.Ordinal);
             if (legacyProperty == null || schemaProperties?.Property(canonical, StringComparison.Ordinal) == null) continue;
             if (arguments.Property(canonical, StringComparison.Ordinal) != null)
+            {
+                var canonicalProperty = arguments.Property(canonical, StringComparison.Ordinal)!;
+                if (JToken.DeepEquals(canonicalProperty.Value, legacyProperty.Value))
+                {
+                    legacyProperty.Remove();
+                    continue;
+                }
                 return new ProjectToolContractError(
                     AliasConflict,
                     AppendPropertyPath("$", legacy),
                     $"Both legacy argument '{legacy}' and canonical argument '{canonical}' were provided; use only '{canonical}'.",
                     canonical);
+            }
 
             // Preserve the value exactly while emitting only the canonical field to the dispatcher.
             arguments.Add(canonical, legacyProperty.Value.DeepClone());
             legacyProperty.Remove();
         }
         return null;
+    }
+
+    /// <summary>
+    /// Repairs common, unambiguous model serialization variants before schema validation. This is
+    /// deliberately narrow: it never invents business data or guesses between conflicting values.
+    /// </summary>
+    private static void ApplyToolSpecificNormalizations(string toolName, JObject arguments, List<string> warnings)
+    {
+        if (toolName == "read_file" && arguments.Property("run_as_cwd", StringComparison.Ordinal) is { } misplacedExecution)
+        {
+            misplacedExecution.Remove();
+            warnings.Add("Ignored legacy read_file argument 'run_as_cwd': read_file never executes a file. Use run_bash or computer_terminal as a separate tool call if execution is actually intended.");
+        }
+
+        if (toolName == "update_observable" && arguments.Property("op", StringComparison.Ordinal) == null &&
+            (arguments.Property("value", StringComparison.Ordinal) != null ||
+             arguments.Property("textValue", StringComparison.Ordinal) != null))
+            arguments["op"] = "set";
+
+        if (toolName != "update_plan" || arguments["nextSteps"] is not { } supplied) return;
+
+        if (supplied is JObject oneObject)
+            arguments["nextSteps"] = new JArray(NormalizePlanStep(oneObject));
+        else if (supplied is JArray array)
+        {
+            var normalized = new JArray();
+            foreach (var item in array)
+            {
+                if (item.Type == JTokenType.String) normalized.Add(item.DeepClone());
+                else if (item is JObject obj) normalized.Add(NormalizePlanStep(obj));
+                else normalized.Add(item.DeepClone()); // validator will explain genuinely invalid data
+            }
+            arguments["nextSteps"] = normalized;
+        }
+        else if (supplied.Type == JTokenType.String)
+        {
+            string text = supplied.Value<string>() ?? "";
+            if (TryParseStringArray(text, out var parsed)) arguments["nextSteps"] = parsed;
+            else
+            {
+                var steps = Regex.Split(text, "\\r?\\n")
+                    .Select(line => Regex.Replace(line.Trim(), @"^(?:[-*]\s+|\[?\d+[\].):]?\s*)", ""))
+                    .Where(line => !string.IsNullOrWhiteSpace(line));
+                arguments["nextSteps"] = new JArray(steps);
+            }
+        }
+    }
+
+    private static JToken NormalizePlanStep(JObject item)
+    {
+        foreach (string key in new[] { "step", "text", "description", "title" })
+            if (item[key]?.Type == JTokenType.String && !string.IsNullOrWhiteSpace(item[key]!.Value<string>()))
+                return new JValue(item[key]!.Value<string>()!.Trim());
+        // Unknown object shapes remain objects so schema validation rejects them explicitly. Do
+        // not guess that an arbitrary owner/status/value string is the intended plan step.
+        return item.DeepClone();
+    }
+
+    private static bool TryParseStringArray(string text, out JArray array)
+    {
+        array = new JArray();
+        if (!text.TrimStart().StartsWith("[", StringComparison.Ordinal)) return false;
+        try
+        {
+            var parsed = JArray.Parse(text);
+            if (parsed.All(x => x.Type == JTokenType.String))
+            {
+                array = parsed;
+                return true;
+            }
+        }
+        catch (JsonException) { }
+        return false;
+    }
+
+    /// <summary>Tool providers frequently serialize primitive values as JSON strings. Coerce only
+    /// lossless integer/number/boolean strings when the offered schema explicitly asks for that
+    /// primitive; arbitrary strings and objects remain strict.</summary>
+    private static void NormalizeSafeScalarTypes(JToken token, JObject schema)
+    {
+        if (token is JObject obj && schema["properties"] is JObject properties)
+        {
+            foreach (var property in obj.Properties().ToList())
+                if (properties.Property(property.Name, StringComparison.Ordinal)?.Value is JObject childSchema)
+                {
+                    var replacement = CoerceScalar(property.Value, childSchema);
+                    if (!ReferenceEquals(replacement, property.Value)) property.Value = replacement;
+                    NormalizeSafeScalarTypes(property.Value, childSchema);
+                }
+        }
+        else if (token is JArray array && schema["items"] is JObject itemSchema)
+        {
+            for (int i = 0; i < array.Count; i++)
+            {
+                var replacement = CoerceScalar(array[i]!, itemSchema);
+                if (!ReferenceEquals(replacement, array[i])) array[i] = replacement;
+                NormalizeSafeScalarTypes(array[i]!, itemSchema);
+            }
+        }
+    }
+
+    private static JToken CoerceScalar(JToken token, JObject schema)
+    {
+        if (token.Type != JTokenType.String) return token;
+        string value = token.Value<string>()?.Trim() ?? "";
+        var types = ReadDeclaredTypes(schema);
+        if (types.Contains("integer", StringComparer.Ordinal) &&
+            long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out long integer))
+            return new JValue(integer);
+        if (types.Contains("number", StringComparer.Ordinal) &&
+            decimal.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out decimal number))
+            return new JValue(number);
+        if (types.Contains("boolean", StringComparer.Ordinal))
+        {
+            if (bool.TryParse(value, out bool boolean)) return new JValue(boolean);
+            if (value is "1" or "yes" or "on") return new JValue(true);
+            if (value is "0" or "no" or "off") return new JValue(false);
+        }
+        return token;
     }
 
     private static ProjectToolContractError? ValidateToken(JToken token, JObject schema, string path, bool schemaIsToolRoot = false)
@@ -282,6 +441,29 @@ public static class ProjectToolContract
 
     private static JToken ParseJson(string json)
     {
+        try { return ParseJsonCore(json, DuplicatePropertyNameHandling.Error); }
+        catch (JsonException)
+        {
+            // Native tool providers occasionally add one closing delimiter, omit one final
+            // delimiter, or repeat the exact same property. Repair only those mechanically
+            // provable envelope defects. Conflicting duplicate values and incomplete strings
+            // remain hard errors so dispatch never guesses business data.
+            foreach (string candidate in SafeEnvelopeRepairs(json))
+            {
+                try
+                {
+                    var firstWins = ParseJsonCore(candidate, DuplicatePropertyNameHandling.Ignore);
+                    var lastWins = ParseJsonCore(candidate, DuplicatePropertyNameHandling.Replace);
+                    if (JToken.DeepEquals(firstWins, lastWins)) return lastWins;
+                }
+                catch (JsonException) { }
+            }
+            throw;
+        }
+    }
+
+    private static JToken ParseJsonCore(string json, DuplicatePropertyNameHandling duplicateHandling)
+    {
         using var stringReader = new StringReader(json);
         using var reader = new JsonTextReader(stringReader)
         {
@@ -292,12 +474,52 @@ public static class ProjectToolContract
         var token = JToken.ReadFrom(reader, new JsonLoadSettings
         {
             CommentHandling = CommentHandling.Ignore,
-            DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error,
+            DuplicatePropertyNameHandling = duplicateHandling,
         });
         while (reader.Read())
             if (reader.TokenType != JsonToken.Comment)
                 throw new JsonReaderException("Additional content follows the JSON value.");
         return token;
+    }
+
+    private static IEnumerable<string> SafeEnvelopeRepairs(string json)
+    {
+        string text = json.Trim();
+        // The original is useful for accepting equal duplicate properties.
+        yield return text;
+
+        string withoutExtra = text;
+        for (int i = 0; i < 2 && withoutExtra.Length > 0
+             && withoutExtra[^1] is '}' or ']'; i++)
+        {
+            withoutExtra = withoutExtra[..^1].TrimEnd();
+            yield return withoutExtra;
+        }
+
+        var stack = new Stack<char>();
+        bool inString = false, escaped = false, invalidClose = false;
+        foreach (char c in text)
+        {
+            if (inString)
+            {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c is '{' or '[') { stack.Push(c); continue; }
+            if (c is not ('}' or ']')) continue;
+            if (stack.Count == 0 || c == '}' && stack.Peek() != '{' || c == ']' && stack.Peek() != '[')
+            {
+                invalidClose = true;
+                break;
+            }
+            stack.Pop();
+        }
+        if (inString || escaped || invalidClose || stack.Count is 0 or > 2) yield break;
+        var suffix = new string(stack.Select(open => open == '{' ? '}' : ']').ToArray());
+        yield return text + suffix;
     }
 
     private static string DescribeType(JToken token) => token.Type switch

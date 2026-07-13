@@ -250,7 +250,7 @@ namespace Omnipotent.Services.Projects
                 IsBudgetPaused = pid => Store.GetProject(pid)?.Status == ProjectStatus.BudgetPaused,
                 DescribeBudget = pid => Budget.DescribeState(pid),
                 DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid),
-                FallbackModelForProject = pid => Settings.Get(pid).CouncilFallbackModel,
+                FallbackModelForProject = pid => Settings.Get(pid).CouncilFallbackRoute(),
             };
             // The approved Grand Plan summary seeds every wake as the standing north star.
             WakeCycle.DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid);
@@ -620,18 +620,24 @@ namespace Omnipotent.Services.Projects
             await using (lease)
             {
                 var settings = Settings.Get(projectID);
+                string utilityFallback = settings.UtilityFallbackRoute();
+                int utilityMaxTokens = Math.Clamp(settings.UtilityMaxOutputTokens, 256, 8_192);
                 KliveLLM.KliveLLM.KliveLLMResponse resp;
                 try
                 {
                     resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                        maxTokensOverride: settings.UtilityMaxOutputTokens, modelOverride: modelOverride);
+                        maxTokensOverride: utilityMaxTokens, modelOverride: modelOverride);
+                    if (!resp.Success && !string.IsNullOrWhiteSpace(utilityFallback)
+                        && !string.Equals(modelOverride, utilityFallback, StringComparison.OrdinalIgnoreCase))
+                        resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
+                            maxTokensOverride: utilityMaxTokens, modelOverride: utilityFallback);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException
-                    && !string.IsNullOrWhiteSpace(settings.UtilityFallbackModel)
-                    && !string.Equals(modelOverride, settings.UtilityFallbackModel, StringComparison.OrdinalIgnoreCase))
+                    && !string.IsNullOrWhiteSpace(utilityFallback)
+                    && !string.Equals(modelOverride, utilityFallback, StringComparison.OrdinalIgnoreCase))
                 {
                     resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                        maxTokensOverride: settings.UtilityMaxOutputTokens, modelOverride: settings.UtilityFallbackModel);
+                        maxTokensOverride: utilityMaxTokens, modelOverride: utilityFallback);
                 }
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
                     await Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
@@ -664,31 +670,38 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>
         /// Dispatches one Commander/agent tool call. Non-computer tools go to ProjectCommanderTools;
-        /// computer_* tools (video tier only) go to the acting agent's container adapter. Bridges
+        /// computer_* tools go to the acting agent's container adapter, with perception-level
+        /// gating handled by the tier router. Bridges
         /// the runner to the P2 desktop subsystem and P4/P5 hooks without the runner knowing them.
         /// </summary>
         public async Task<CommanderToolResult> CommanderToolDispatch(
             Project project, string actingAgentID, string wakeID, string toolName, string argsJson, CancellationToken ct)
         {
+            var projectSettings = Settings.Get(project.ProjectID);
+            string? interactionViolation = ProjectDesktopInteractionPolicy.FindViolation(
+                projectSettings, toolName, argsJson, ProjectWorkspaceLocator.HostRoot(project.ProjectID));
+            if (interactionViolation != null)
+                return new CommanderToolResult(interactionViolation) { Succeeded = false };
+
             if (toolName is "computer_confirm_action" or "computer_confirm_and_click")
             {
                 if (project.Status == ProjectStatus.Planning)
                     return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
+                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchComputerConfirmationAsync(project, actingAgentID, wakeID, toolName, argsJson, ct);
             }
             if (toolName is "ensure_desktop_ready")
             {
                 if (project.Status == ProjectStatus.Planning)
                     return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
+                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchEnsureDesktopReadyAsync(project, actingAgentID, ct);
             }
             if (toolName.StartsWith("computer_", StringComparison.Ordinal))
             {
                 if (project.Status == ProjectStatus.Planning)
                     return new CommanderToolResult(
-                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).");
+                        "This project is in the PLANNING phase — desktop/execution tools unlock once Klives approves your Grand Plan (submit_grand_plan).") { Succeeded = false };
                 return await DispatchComputerToolAsync(project, actingAgentID, toolName, argsJson, ct);
             }
 
@@ -744,7 +757,7 @@ namespace Omnipotent.Services.Projects
             try { args = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson); }
             catch { args = new JObject(); }
             string summary = ((string?)args["summary"] ?? "").Trim();
-            if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' describing the exact irreversible action.");
+            if (summary.Length == 0) return new CommanderToolResult("Provide 'summary' describing the exact irreversible action.") { Succeeded = false };
 
             var approvalArgs = JsonConvert.SerializeObject(new
             {
@@ -856,35 +869,65 @@ namespace Omnipotent.Services.Projects
             Project project, string actingAgentID, string toolName, string argsJson, CancellationToken ct)
         {
             if (!Settings.Get(project.ProjectID).ContainersEnabled)
-                return new CommanderToolResult("This project has containers disabled (a text-only project). Ask Klives to enable containers in project settings if the goal needs a desktop.");
+                return new CommanderToolResult("This project has containers disabled. Enable containers in project settings before desktop work.") { Succeeded = false };
             if (Desktops == null)
-                return new CommanderToolResult("Desktop containers are unavailable on this host — computer-use tools cannot run. Use text-tier tools, or ask Klives to enable containers.");
+                return new CommanderToolResult("Desktop containers are unavailable on this host — computer-use tools cannot run.") { Succeeded = false };
             if (!OperatingSystem.IsWindows())
-                return new CommanderToolResult("Desktop control is only wired for the Windows host build.");
+                return new CommanderToolResult("Desktop control is only wired for the Windows host build.") { Succeeded = false };
+
+            // The preflight is a harness invariant, not prompt advice. The first visual/browser
+            // operation for each agent automatically proves that its own container is current and
+            // complete. A fresh typed fact avoids rebuilding/probing on every click.
+            if (toolName != "computer_terminal")
+            {
+                string factKey = DesktopReadyFactKey(actingAgentID);
+                bool ready = RuntimeState.GetFreshVerifiedFacts(project.ProjectID)
+                    .Any(f => string.Equals(f.Key, factKey, StringComparison.OrdinalIgnoreCase)
+                           && f.Value.StartsWith("Desktop ready", StringComparison.OrdinalIgnoreCase));
+                if (!ready)
+                {
+                    var preflight = await DispatchEnsureDesktopReadyAsync(project, actingAgentID, ct);
+                    if (!preflight.Succeeded) return preflight;
+                }
+            }
             return await DispatchComputerToolWindowsAsync(project, actingAgentID, toolName, argsJson, ct);
         }
 
         /// <summary>
         /// Preflight the project's desktop (self-heal Docker + a stale image/container, then probe
-        /// the baked browser-automation stack) and record the outcome as a durable checkpoint fact
-        /// so later wakes don't re-derive the environment. The Commander calls this before browser
-        /// work; the fact it leaves behind is seeded into every subsequent wake.
+        /// the baked visible-browser stack) and record the outcome as a durable checkpoint fact
+        /// so later wakes don't re-derive the environment. Dispatch invokes it automatically before
+        /// an agent's first browser/visual action; the fact is seeded into later wakes.
         /// </summary>
         private async Task<CommanderToolResult> DispatchEnsureDesktopReadyAsync(
             Project project, string actingAgentID, CancellationToken ct)
         {
-            if (!Settings.Get(project.ProjectID).ContainersEnabled)
-                return new CommanderToolResult("This project has containers disabled (a text-only project). Ask Klives to enable containers in project settings if the goal needs a desktop.");
+            var settings = Settings.Get(project.ProjectID);
+            if (!settings.ContainersEnabled)
+            {
+                RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                    false, "ContainersDisabled", "Desktop containers are disabled in project settings.");
+                return new CommanderToolResult("This project has containers disabled. Enable containers in project settings before desktop work.") { Succeeded = false };
+            }
             if (Desktops == null)
-                return new CommanderToolResult("Desktop containers are unavailable on this host — the desktop preflight cannot run. Use text-tier tools, or ask Klives to enable containers.");
+            {
+                RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                    false, "DesktopManagerUnavailable", "Desktop containers are unavailable on this host.");
+                return new CommanderToolResult("Desktop containers are unavailable on this host — the desktop preflight cannot run.") { Succeeded = false };
+            }
             if (!OperatingSystem.IsWindows())
-                return new CommanderToolResult("Desktop control is only wired for the Windows host build.");
+            {
+                RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                    false, "UnsupportedHost", "Desktop control is currently wired only for a Windows host.");
+                return new CommanderToolResult("Desktop control is only wired for the Windows host build.") { Succeeded = false };
+            }
 
             Containers.DesktopReadiness readiness;
             try
             {
-                readiness = await EnsureDesktopReadyWindowsAsync(project, actingAgentID, ct);
+                readiness = await EnsureDesktopReadyWindowsAsync(project, actingAgentID, settings.DesktopImage, ct);
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 // Mirror the computer-tool path: an opaque desktop failure is usually Docker being
@@ -892,41 +935,68 @@ namespace Omnipotent.Services.Projects
                 string? daemon = await Desktops!.ProbeDaemonAsync(ct);
                 if (daemon != null)
                 {
+                    RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                        false, "DockerDaemonUnavailable", daemon);
                     _ = Task.Run(async () =>
                     {
-                        try { await Desktops.TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage); }
+                        try { await Desktops.TryBootstrapAsync(settings.DesktopImage); }
                         catch (Exception bex) { _ = ServiceLogError(bex, "Projects: desktop self-heal (preflight) failed"); }
                     });
                     return new CommanderToolResult(
-                        $"ensure_desktop_ready can't run: {daemon} Auto-setup has been kicked off (installing/starting Docker if possible — can take several minutes). Retry in ~5 minutes.");
+                        $"ensure_desktop_ready can't run: {daemon} Auto-setup has been kicked off (installing/starting Docker if possible — can take several minutes). Retry in ~5 minutes.") { Succeeded = false };
                 }
-                return new CommanderToolResult($"ensure_desktop_ready failed: {ex.Message}");
+                RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                    false, ex.GetType().Name, ex.Message);
+                return new CommanderToolResult($"ensure_desktop_ready failed: {ex.Message}") { Succeeded = false };
             }
 
             // Record the readiness as a durable verified fact so it seeds later wakes (the whole
             // point: the agent stops re-deriving whether its desktop and browser stack are present).
             try
             {
-                RuntimeState.UpsertVerifiedFact(project.ProjectID, new ProjectVerifiedFact
+                RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                    readiness.Ok, readiness.Ok ? "Ready" : "ReadinessProbeFailed", readiness.Summary);
+                if (readiness.Ok)
                 {
-                    Key = "desktop-ready",
-                    Value = readiness.Summary,
-                    Description = "Desktop preflight (ensure_desktop_ready): browser-automation stack availability.",
-                    VerifiedAt = DateTime.UtcNow,
-                    // A probe of live container state is only trustworthy for a while (a container can
-                    // be recreated/altered), so let it expire rather than mislead a much later wake.
-                    ValidUntil = DateTime.UtcNow.AddHours(6),
-                });
+                    RuntimeState.UpsertVerifiedFact(project.ProjectID, new ProjectVerifiedFact
+                    {
+                        Key = DesktopReadyFactKey(actingAgentID),
+                        Value = $"Desktop ready; container={readiness.ContainerID ?? "unknown"}; {readiness.Summary}",
+                        Description = "Per-agent live desktop preflight: display, window manager, VNC framebuffer, visible browser and structured inspection.",
+                        VerifiedAt = DateTime.UtcNow,
+                        // Live GUI state changes quickly; container identity is embedded and a short
+                        // TTL prevents a successful wake from trusting a six-hour-old framebuffer.
+                        ValidUntil = DateTime.UtcNow.AddMinutes(5),
+                        Evidence = readiness.ContainerID == null ? new() : new List<ProjectEvidenceReference>
+                        {
+                            new()
+                            {
+                                Kind = ProjectEvidenceKind.ExternalObservation,
+                                Reference = "container:" + readiness.ContainerID,
+                                Description = "Live readiness shell probe plus a usable VNC framebuffer capture.",
+                            },
+                        },
+                        InvalidationKeys = new List<string> { "desktop", "container:" + (readiness.ContainerID ?? "unknown") },
+                    });
+                }
+                else
+                {
+                    RuntimeState.InvalidateVerifiedFact(project.ProjectID, DesktopReadyFactKey(actingAgentID),
+                        "The latest live desktop readiness probe failed.");
+                }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to record desktop-ready fact"); }
 
-            return new CommanderToolResult(readiness.Summary);
+            return new CommanderToolResult(readiness.Summary) { Succeeded = readiness.Ok };
         }
+
+        private static string DesktopReadyFactKey(string actingAgentID) => "desktop-ready/" + actingAgentID;
+        private static string DesktopDependencyKey(string actingAgentID) => "desktop/" + actingAgentID;
 
         [SupportedOSPlatform("windows")]
         private Task<Containers.DesktopReadiness> EnsureDesktopReadyWindowsAsync(
-            Project project, string actingAgentID, CancellationToken ct) =>
-            Desktops!.EnsureDesktopReadyAsync(project, actingAgentID, ProjectSettings.Defaults.DesktopImage, ct);
+            Project project, string actingAgentID, string desktopImage, CancellationToken ct) =>
+            Desktops!.EnsureDesktopReadyAsync(project, actingAgentID, desktopImage, ct);
 
         [SupportedOSPlatform("windows")]
         private async Task<CommanderToolResult> DispatchComputerToolWindowsAsync(
@@ -952,6 +1022,38 @@ namespace Omnipotent.Services.Projects
                     requireVisualReady: toolName is not ("computer_terminal" or "computer_browser_inspect"),
                     ct: ct);
                 var result = await adapter.ExecuteAsync(toolName, argsJson, ct);
+                if (!result.Success)
+                {
+                    bool infrastructureFailure = InvalidatesDesktopReadiness(result);
+                    if (infrastructureFailure)
+                    {
+                        try
+                        {
+                            RuntimeState.InvalidateVerifiedFact(project.ProjectID, DesktopReadyFactKey(actingAgentID),
+                                $"Desktop infrastructure operation {toolName} failed; readiness must be re-proved.");
+                            RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                                false, "DesktopInfrastructureFailed", $"{toolName}: {result.Text}");
+                        }
+                        catch { }
+                    }
+                    else if (result.Jpeg != null)
+                    {
+                        // A fresh captured frame proves the desktop transport remained usable even
+                        // though the requested UI target/command was not successful.
+                        try { RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                            true, "DesktopObserved", $"{toolName} produced a live frame; its requested UI outcome was not found."); }
+                        catch { }
+                    }
+                }
+                else
+                {
+                    try
+                    {
+                        RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                            true, "DesktopToolSucceeded", $"{toolName} completed on the live isolated desktop.");
+                    }
+                    catch { }
+                }
 
                 // The screenshot rides the vision path back to the model AND becomes an artifact
                 // with a capture-time description (the permanent record once the raw JPEG expires).
@@ -962,27 +1064,53 @@ namespace Omnipotent.Services.Projects
                         description: $"Desktop after {toolName} by {actingAgentID}: {result.Text}",
                         sourceWakeID: Digests.GetDigest(project.ProjectID).ActiveWakeID, agentID: actingAgentID);
                     artifactIDs.Add(art.ArtifactID);
-                    // First-class timeline event: the ArtifactAdded type existed but was never appended,
-                    // so desktop work never registered as "progress" for the watchdog. Emit it now.
-                    EventLog.Append(new ProjectEvent
-                    {
-                        ProjectID = project.ProjectID,
-                        AgentID = actingAgentID,
-                        Type = ProjectEventTypes.ArtifactAdded,
-                        Author = actingAgentID == "commander" ? "commander" : "agent",
-                        Text = $"Screenshot after {toolName}",
-                        ArtifactIDs = new List<string> { art.ArtifactID },
-                    });
+                    // A successful visual action is first-class progress. Failed OCR/click attempts
+                    // still retain their diagnostic frame on the ToolResult, but must not renew the
+                    // watchdog merely because another screenshot was captured.
+                    if (result.Success)
+                        EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            AgentID = actingAgentID,
+                            Type = ProjectEventTypes.ArtifactAdded,
+                            Author = actingAgentID == "commander" ? "commander" : "agent",
+                            Text = $"Screenshot after {toolName}",
+                            ArtifactIDs = new List<string> { art.ArtifactID },
+                        });
                 }
                 return new CommanderToolResult(result.Text)
                 {
+                    Succeeded = result.Success,
+                    AuditText = result.Success && toolName is "computer_browser_inspect" or "computer_clipboard_get"
+                        ? $"{toolName} succeeded; live contents were omitted from durable history because they may contain form values, verification codes, or credentials."
+                        : null,
                     Jpeg = result.Jpeg,
                     Frames = result.Frames,
                     ArtifactIDs = artifactIDs
                 };
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                try
+                {
+                    RuntimeState.InvalidateVerifiedFact(project.ProjectID, DesktopReadyFactKey(actingAgentID),
+                        $"Desktop operation {toolName} was cancelled; readiness must be re-proved before the next visual action.");
+                    RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                        false, "DesktopToolCancelled", $"{toolName} was cancelled before readiness could be retained.");
+                }
+                catch { }
+                throw;
+            }
             catch (Exception ex)
             {
+                try
+                {
+                    RuntimeState.InvalidateVerifiedFact(project.ProjectID, DesktopReadyFactKey(actingAgentID),
+                        $"Desktop operation {toolName} failed; readiness must be re-proved before the next visual action.");
+                    RuntimeState.RecordDependencyHealth(project.ProjectID, DesktopDependencyKey(actingAgentID),
+                        false, ex.GetType().Name, $"{toolName}: {ex.Message}");
+                }
+                catch { }
                 // The most common cause of a desktop-tool failure is that Docker isn't running —
                 // which otherwise surfaces as an opaque "The operation has timed out." Diagnose it,
                 // kick off dependency self-healing in the background (single-flight; installs/starts
@@ -994,7 +1122,7 @@ namespace Omnipotent.Services.Projects
                     {
                         try
                         {
-                            string? problem = await Desktops.TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage);
+                            string? problem = await Desktops.TryBootstrapAsync(Settings.Get(project.ProjectID).DesktopImage);
                             ServiceLog(problem == null
                                 ? "Projects: desktop layer self-healed — Docker up and image present."
                                 : $"Projects: desktop self-heal incomplete — {problem}");
@@ -1003,11 +1131,17 @@ namespace Omnipotent.Services.Projects
                     });
                     return new CommanderToolResult(
                         $"{toolName} can't run: {daemon} Auto-setup has been kicked off (installing/starting Docker if possible — can take several minutes). " +
-                        "Continue with text/HTTP/script tools for now and retry a computer_* tool in ~5 minutes; if it still fails, the result will say exactly what's blocking.");
+                        "Continue only non-browser preparation/diagnostics and retry a computer_* tool in ~5 minutes. Do not replace the website task with hidden scripts.")
+                    { Succeeded = false };
                 }
-                return new CommanderToolResult($"{toolName} failed: {ex.Message}");
+                return new CommanderToolResult($"{toolName} failed: {ex.Message}") { Succeeded = false };
             }
         }
+
+        internal static bool InvalidatesDesktopReadiness(Containers.ContainerToolAdapter.ContainerToolResult result) =>
+            !result.Success && result.FailureKind is
+                Containers.ContainerToolAdapter.ContainerToolFailureKind.Infrastructure or
+                Containers.ContainerToolAdapter.ContainerToolFailureKind.Cancelled;
 
         /// <summary>
         /// Completes a project (only reached through the complete_project approval gate):
@@ -1151,28 +1285,9 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
-                var llmServices = await GetServicesByType<KliveLLM.KliveLLM>();
-                if (llmServices == null || llmServices.Length == 0) return;
-                var llm = (KliveLLM.KliveLLM)llmServices[0];
                 string utilityModel = TierRouter.GetUtilityModel(project.ProjectID);
-                var projectSettings = Settings.Get(project.ProjectID);
-
-                await Digests.RebuildDigestAsync(project, EventLog, async prompt =>
-                {
-                    string sid = $"projects-digest-{project.ProjectID}-{Guid.NewGuid():N}";
-                    llm.StartToolSession(sid, null);
-                    llm.AppendUserMessageToToolSession(sid, prompt);
-                    var lease = await Budget.TryAcquireLlmTurnAsync(project.ProjectID);
-                    if (lease == null) return null;
-                    await using (lease)
-                    {
-                        var resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                            maxTokensOverride: projectSettings.UtilityMaxOutputTokens, modelOverride: utilityModel);
-                        if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
-                            await Budget.RecordTokenSpendAsync(project.ProjectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
-                        return resp.Success ? resp.Response : null;
-                    }
-                });
+                await Digests.RebuildDigestAsync(project, EventLog,
+                    prompt => QueryUtilityModelAsync(project.ProjectID, prompt, utilityModel));
 
                 // Keep the budget line in the digest fresh even if the model didn't restate it.
                 var digest = Digests.GetDigest(project.ProjectID);

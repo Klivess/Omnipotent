@@ -127,6 +127,11 @@ namespace Omnipotent.Services.Projects
         public DateTime OccurredAt { get; set; } = DateTime.UtcNow;
         public DateTime? RetryAt { get; set; }
         public string? WakeID { get; set; }
+        public string? Provider { get; set; }
+        public string? Model { get; set; }
+        public int? HttpStatus { get; set; }
+        public int? RequestedMaxTokens { get; set; }
+        public int? AffordableMaxTokens { get; set; }
         public List<ProjectEvidenceReference> Evidence { get; set; } = new();
     }
 
@@ -149,6 +154,33 @@ namespace Omnipotent.Services.Projects
         public DateTime? LastVerifiedProgressAt { get; set; }
         public long? LastVerifiedProgressSequence { get; set; }
         public ProjectCircuitBreakerState Circuit { get; set; } = new();
+        /// <summary>Independent live dependencies. A successful LLM wake must not make the
+        /// project look Healthy while its desktop, mailbox bridge, filesystem, or another
+        /// required subsystem is still known to be degraded.</summary>
+        public Dictionary<string, ProjectDependencyHealth> Dependencies { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Durable watchdog accounting. Keeping this in runtime state prevents recovery
+        /// counters and pacing from resetting whenever Omnipotent restarts.</summary>
+        public ProjectWatchdogHealth Watchdog { get; set; } = new();
+    }
+
+    public sealed class ProjectDependencyHealth
+    {
+        public string Key { get; set; } = "";
+        public bool Healthy { get; set; }
+        public string Code { get; set; } = "";
+        public string Summary { get; set; } = "";
+        public DateTime CheckedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? RetryAt { get; set; }
+    }
+
+    public sealed class ProjectWatchdogHealth
+    {
+        /// <summary>Monotonic lifetime count, used in event text so recovery numbers never regress.</summary>
+        public long RecoveryCount { get; set; }
+        public List<DateTime> RecoveriesUtc { get; set; } = new();
+        public DateTime? LastRecoveryAt { get; set; }
+        public DateTime? LastEscalationAt { get; set; }
+        public List<string> RemindedGateIDs { get; set; } = new();
     }
 
     public sealed class ProjectRuntimeBlocker
@@ -230,6 +262,9 @@ namespace Omnipotent.Services.Projects
         public List<ProjectCanonicalArtifact> CanonicalArtifacts { get; set; } = new();
         public ProjectActionCheckpoint? LastSuccessfulAction { get; set; }
         public Dictionary<string, ProjectActionCheckpoint> AgentLastSuccessfulActions { get; set; } = new(StringComparer.Ordinal);
+        /// <summary>Bounded durable fingerprints prevent A→B→A rediscovery loops from being
+        /// misclassified as fresh progress after a context rollover or process restart.</summary>
+        public Dictionary<string, List<string>> RecentSuccessfulFingerprints { get; set; } = new(StringComparer.Ordinal);
         public ProjectResumeAction? ResumeAction { get; set; }
         public Dictionary<string, ProjectResumeAction> AgentResumeActions { get; set; } = new(StringComparer.Ordinal);
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
@@ -563,8 +598,10 @@ namespace Omnipotent.Services.Projects
             DateTime now = Utc(nowUtc);
             return Mutate(projectID, expectedRevision, state =>
             {
-                state.Health.Status = ProjectExecutionHealthStatus.Healthy;
                 state.Health.ConsecutiveFailures = 0;
+                // Failure history remains in the append-only event log. It must not survive in the
+                // current wake handoff after a verified success and repeatedly look like an active fault.
+                state.Health.LastFailure = null;
                 state.Health.LastSuccessAt = now;
                 if (verifiedProgressSequence.HasValue)
                 {
@@ -572,6 +609,7 @@ namespace Omnipotent.Services.Projects
                     state.Health.LastVerifiedProgressSequence = verifiedProgressSequence;
                 }
                 if (closeCircuit) state.Health.Circuit = new ProjectCircuitBreakerState();
+                RecomputeHealthStatus(state);
                 return new(true, true);
             }, now);
         }
@@ -598,9 +636,82 @@ namespace Omnipotent.Services.Projects
             {
                 state.Health.Circuit.Status = halfOpen ? ProjectCircuitStatus.HalfOpen : ProjectCircuitStatus.Closed;
                 state.Health.Circuit.RetryAt = null;
-                state.Health.Status = halfOpen ? ProjectExecutionHealthStatus.Degraded : ProjectExecutionHealthStatus.Healthy;
+                RecomputeHealthStatus(state);
                 return new(true, true);
             }, nowUtc);
+
+        /// <summary>Records one independently probed dependency without erasing unrelated health.
+        /// Healthy dependencies remain in the map as recent evidence; stale callers can inspect
+        /// CheckedAt, while aggregate status is based on the latest value for each key.</summary>
+        public ProjectRuntimeMutationResult RecordDependencyHealth(string projectID, string key, bool healthy,
+            string code, string summary, DateTime? retryAt = null, long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("dependency key required", nameof(key));
+            DateTime now = Utc(nowUtc);
+            return Mutate(projectID, expectedRevision, state =>
+            {
+                string normalized = key.Trim();
+                state.Health.Dependencies[normalized] = new ProjectDependencyHealth
+                {
+                    Key = normalized,
+                    Healthy = healthy,
+                    Code = (code ?? "").Trim(),
+                    Summary = (summary ?? "").Trim(),
+                    CheckedAt = now,
+                    RetryAt = retryAt,
+                };
+                RecomputeHealthStatus(state);
+                return new(true, true);
+            }, now);
+        }
+
+        public ProjectRuntimeMutationResult ClearDependencyHealth(string projectID, string key,
+            long? expectedRevision = null, DateTime? nowUtc = null) =>
+            Mutate(projectID, expectedRevision, state =>
+            {
+                bool removed = state.Health.Dependencies.Remove(key);
+                RecomputeHealthStatus(state);
+                return new(true, removed);
+            }, nowUtc);
+
+        /// <summary>Atomically records a watchdog recovery and returns the updated durable count.</summary>
+        public ProjectRuntimeMutationResult RecordWatchdogRecovery(string projectID, TimeSpan rollingWindow,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            return Mutate(projectID, expectedRevision, state =>
+            {
+                state.Health.Watchdog.RecoveriesUtc.RemoveAll(t => now - Utc(t) > rollingWindow);
+                state.Health.Watchdog.RecoveriesUtc.Add(now);
+                state.Health.Watchdog.RecoveryCount = checked(state.Health.Watchdog.RecoveryCount + 1);
+                state.Health.Watchdog.LastRecoveryAt = now;
+                return new(true, true);
+            }, now);
+        }
+
+        public ProjectRuntimeMutationResult RecordWatchdogEscalation(string projectID,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            return Mutate(projectID, expectedRevision, state =>
+            {
+                state.Health.Watchdog.LastEscalationAt = now;
+                return new(true, true);
+            }, now);
+        }
+
+        public ProjectRuntimeMutationResult RecordGateReminder(string projectID, string gateID,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            if (string.IsNullOrWhiteSpace(gateID)) throw new ArgumentException("gateID required", nameof(gateID));
+            return Mutate(projectID, expectedRevision, state =>
+            {
+                if (state.Health.Watchdog.RemindedGateIDs.Contains(gateID, StringComparer.Ordinal))
+                    return new(false, false, "Gate reminder was already recorded.");
+                state.Health.Watchdog.RemindedGateIDs.Add(gateID);
+                return new(true, true);
+            }, nowUtc);
+        }
 
         public ProjectRuntimeMutationResult SetBlocker(string projectID, ProjectRuntimeBlocker blocker,
             long? expectedRevision = null, DateTime? nowUtc = null)
@@ -695,6 +806,11 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"runtime revision: {state.Revision}; disposition: {state.Disposition}; health: {state.Health.Status}");
             if (state.Health.Circuit.Status != ProjectCircuitStatus.Closed)
                 sb.AppendLine($"provider circuit: {state.Health.Circuit.Status}; reason={state.Health.Circuit.ReasonCode ?? "unknown"}; retryAt={state.Health.Circuit.RetryAt?.ToString("O") ?? "manual"}");
+            if (state.Health.LastFailure != null)
+                sb.AppendLine($"last execution failure [{state.Health.LastFailure.Category}/{state.Health.LastFailure.Code}]: {state.Health.LastFailure.Summary}");
+            foreach (var dependency in state.Health.Dependencies.Values.Where(x => !x.Healthy).OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase))
+                sb.AppendLine($"dependency degraded [{dependency.Key}/{dependency.Code}]: {dependency.Summary}; checked={dependency.CheckedAt:O}" +
+                    (dependency.RetryAt.HasValue ? $"; retryAt={dependency.RetryAt:O}" : ""));
             if (state.Blocker != null)
                 sb.AppendLine($"blocker [{state.Blocker.Category}/{state.Blocker.Code}]: {state.Blocker.Summary}" +
                     (state.Blocker.NextRetryAt.HasValue ? $"; nextRetry={state.Blocker.NextRetryAt:O}" : ""));
@@ -797,6 +913,37 @@ namespace Omnipotent.Services.Projects
                 if (string.IsNullOrWhiteSpace(copy.ActionID)) copy.ActionID = Guid.NewGuid().ToString("N");
                 if (copy.RecordedAt == default) copy.RecordedAt = now;
                 checkpoint.AgentLastSuccessfulActions[agentID.Trim()] = copy;
+                return new(true, true);
+            }, now);
+        }
+
+        public ProjectRuntimeMutationResult TryRecordNovelSuccessfulAction(string projectID, string actorID,
+            ProjectActionCheckpoint action, int historyLimit = 128, long? expectedRevision = null,
+            DateTime? nowUtc = null)
+        {
+            if (string.IsNullOrWhiteSpace(actorID)) throw new ArgumentException("actorID required", nameof(actorID));
+            ArgumentNullException.ThrowIfNull(action);
+            if (string.IsNullOrWhiteSpace(action.Fingerprint))
+                throw new ArgumentException("A successful-action fingerprint is required.", nameof(action));
+            string actor = actorID.Trim();
+            historyLimit = Math.Clamp(historyLimit, 8, 512);
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, expectedRevision, checkpoint =>
+            {
+                if (!checkpoint.RecentSuccessfulFingerprints.TryGetValue(actor, out var recent))
+                    checkpoint.RecentSuccessfulFingerprints[actor] = recent = new List<string>();
+                if (recent.Contains(action.Fingerprint, StringComparer.Ordinal))
+                    return new(false, false, "This successful tool outcome was already recorded in the recent durable history.");
+
+                recent.Add(action.Fingerprint);
+                if (recent.Count > historyLimit) recent.RemoveRange(0, recent.Count - historyLimit);
+                var copy = Clone(action);
+                if (string.IsNullOrWhiteSpace(copy.ActionID)) copy.ActionID = Guid.NewGuid().ToString("N");
+                if (copy.RecordedAt == default) copy.RecordedAt = now;
+                if (string.Equals(actor, "commander", StringComparison.Ordinal))
+                    checkpoint.LastSuccessfulAction = copy;
+                else
+                    checkpoint.AgentLastSuccessfulActions[actor] = copy;
                 return new(true, true);
             }, now);
         }
@@ -1082,12 +1229,27 @@ namespace Omnipotent.Services.Projects
             state.ProjectID = projectID;
             state.Health ??= new ProjectExecutionHealth();
             state.Health.Circuit ??= new ProjectCircuitBreakerState();
+            state.Health.Dependencies = state.Health.Dependencies == null
+                ? new Dictionary<string, ProjectDependencyHealth>(StringComparer.OrdinalIgnoreCase)
+                : new Dictionary<string, ProjectDependencyHealth>(state.Health.Dependencies, StringComparer.OrdinalIgnoreCase);
+            state.Health.Watchdog ??= new ProjectWatchdogHealth();
+            state.Health.Watchdog.RecoveriesUtc ??= new();
+            state.Health.Watchdog.RemindedGateIDs ??= new();
             state.Checkpoint ??= new ProjectRuntimeCheckpoint();
             state.Checkpoint.ActiveMilestoneIDs ??= new();
             state.Checkpoint.VerifiedFacts ??= new();
             state.Checkpoint.CanonicalArtifacts ??= new();
             state.Checkpoint.AgentResumeActions ??= new(StringComparer.Ordinal);
             state.Checkpoint.AgentLastSuccessfulActions ??= new(StringComparer.Ordinal);
+            state.Checkpoint.RecentSuccessfulFingerprints = state.Checkpoint.RecentSuccessfulFingerprints == null
+                ? new Dictionary<string, List<string>>(StringComparer.Ordinal)
+                : new Dictionary<string, List<string>>(state.Checkpoint.RecentSuccessfulFingerprints, StringComparer.Ordinal);
+            foreach (string actor in state.Checkpoint.RecentSuccessfulFingerprints.Keys.ToList())
+            {
+                var recent = state.Checkpoint.RecentSuccessfulFingerprints[actor] ?? new();
+                state.Checkpoint.RecentSuccessfulFingerprints[actor] = recent
+                    .Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).TakeLast(128).ToList();
+            }
             state.ActiveAgentWakeLeases ??= new(StringComparer.Ordinal);
             state.PendingTriggers ??= new();
             foreach (var f in state.Checkpoint.VerifiedFacts)
@@ -1106,6 +1268,18 @@ namespace Omnipotent.Services.Projects
             if (state.ActiveAgentWakeLeases.Count > 0)
                 state.LastWakeLeaseGeneration = Math.Max(state.LastWakeLeaseGeneration,
                     state.ActiveAgentWakeLeases.Values.Max(x => x.Generation));
+            RecomputeHealthStatus(state);
+        }
+
+        private static void RecomputeHealthStatus(ProjectRuntimeState state)
+        {
+            state.Health.Status = state.Health.Circuit.Status == ProjectCircuitStatus.Open
+                ? ProjectExecutionHealthStatus.CircuitOpen
+                : state.Health.Circuit.Status == ProjectCircuitStatus.HalfOpen
+                  || state.Health.ConsecutiveFailures > 0
+                  || state.Health.Dependencies.Values.Any(x => !x.Healthy)
+                    ? ProjectExecutionHealthStatus.Degraded
+                    : ProjectExecutionHealthStatus.Healthy;
         }
 
         private static bool PurgeStaleLocked(ProjectRuntimeState state, DateTime now)

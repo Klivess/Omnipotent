@@ -207,7 +207,9 @@ namespace Omnipotent.Services.Projects
             long wakeStartSeq = parent.EventLog.GetLastSequence(projectID);
             string outcome = ProjectEventTypes.WakeCompleted;
             string outcomeText = "Wake completed; Commander asleep.";
+            string? outcomePayloadJson = null;
             int stuckTrips = 0;
+            int emptyResponseTrips = 0;
             bool endedAtWorkSlice = false;
             int productiveActions = 0;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
@@ -232,10 +234,12 @@ namespace Omnipotent.Services.Projects
 
                 var settings = parent.Settings.Get(projectID);
                 string model = settings.CommanderModel;
-                string fallbackModel = settings.CommanderFallbackModel;
+                string fallbackModel = settings.CommanderFallbackRoute();
                 bool visionEnabled = settings.VisionEnabled;
                 int sliceToolCalls = settings.WorkSliceToolCalls;
                 int sliceModelTurns = settings.WorkSliceModelTurns;
+                int sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 256_000);
+                int maxOutputTokens = Math.Clamp(settings.CommanderMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
                 parent.SubAgents.EnsureCommander(projectID);
 
@@ -320,22 +324,37 @@ namespace Omnipotent.Services.Projects
                     try
                     {
                         resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: settings.CommanderMaxOutputTokens,
+                            maxTokensOverride: maxOutputTokens,
                             modelOverride: model, cancellationToken: cts.Token);
+                        modelTurns++;
                     }
                     catch (OperationCanceledException) { throw; }
                     catch (Exception primaryError) when (!string.IsNullOrWhiteSpace(fallbackModel)
                         && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
                     {
+                        modelTurns++;
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
-                            $"Commander route '{model}' failed ({Trunc(primaryError.Message, 180)}); trying configured fallback '{fallbackModel}' once."));
+                            $"Commander route '{model}' failed ({ProjectProviderFailure.SafeDetail(primaryError.Message, 180)}); trying fallback '{fallbackModel}' once."));
                         model = fallbackModel;
                         resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: settings.CommanderMaxOutputTokens,
+                            maxTokensOverride: maxOutputTokens,
                             modelOverride: model, cancellationToken: cts.Token);
+                        modelTurns++;
                     }
-                    modelTurns++;
-                    if (!resp.Success) throw new Exception($"LLM query failed: {resp.ErrorMessage}");
+                    if (!resp.Success && !string.IsNullOrWhiteSpace(fallbackModel)
+                        && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
+                    {
+                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
+                            $"Commander route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); trying fallback '{fallbackModel}' once."));
+                        model = fallbackModel;
+                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
+                            maxTokensOverride: maxOutputTokens,
+                            modelOverride: model, cancellationToken: cts.Token);
+                        modelTurns++;
+                    }
+                    if (!resp.Success)
+                        throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model,
+                            maxOutputTokens);
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
                     // the response usage object (resp.CostUsd) — authoritative for whatever model is in
@@ -352,16 +371,64 @@ namespace Omnipotent.Services.Projects
                     }
                     finally { await budgetLease.DisposeAsync(); }
 
-                    bool sliceComplete = toolCalls >= sliceToolCalls || finalModelTurn;
+                    bool tokenSliceComplete = wakePromptTokens + wakeCompletionTokens >= sliceTokenBudget;
+                    bool sliceComplete = toolCalls >= sliceToolCalls || finalModelTurn || tokenSliceComplete;
+                    if (resp.ToolCalls is { Count: > 0 } || !string.IsNullOrWhiteSpace(resp.Response))
+                        emptyResponseTrips = 0;
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || sliceComplete)
                     {
+                        if (!sliceComplete && string.IsNullOrWhiteSpace(resp.Response)
+                            && ++emptyResponseTrips <= 2)
+                        {
+                            parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
+                                $"Model returned an empty response with no tool calls (retry {emptyResponseTrips}/2); the wake remains active."));
+                            llm.AppendUserMessageToToolSession(sessionId,
+                                "Your last turn was empty. Continue with the next evidence-producing tool action, or give a concrete closing status explaining the real external wait/blocker. Do not silently abandon the wake.");
+                            continue;
+                        }
                         endedAtWorkSlice = sliceComplete;
-                        string final = string.IsNullOrWhiteSpace(resp.Response) ? "(no closing status)" : resp.Response.Trim();
+                        string? deferredCall = null;
+                        if (sliceComplete && resp.ToolCalls is { Count: > 0 })
+                        {
+                            foreach (var pending in resp.ToolCalls)
+                            {
+                                string pendingName = pending.function?.name ?? "";
+                                string pendingArgs = pending.function?.arguments ?? "";
+                                var normalized = ProjectToolContract.ValidateAndNormalize(pendingName, pendingArgs, toolDefs);
+                                if (normalized.IsValid) pendingArgs = normalized.NormalizedArgumentsJson!;
+                                deferredCall ??= DescribeCall(pendingName, pendingArgs);
+                                parent.EventLog.Append(new ProjectEvent
+                                {
+                                    ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                    Type = ProjectEventTypes.ToolCall, Author = "commander",
+                                    Text = DescribeCall(pendingName, pendingArgs), ToolName = pendingName,
+                                    ToolCallId = pending.id,
+                                    PayloadJson = ProjectCommanderTools.AuditPayload(pendingName, pendingArgs),
+                                });
+                                string rollover = (normalized.Warnings.Count == 0 ? "" :
+                                    "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", normalized.Warnings) + " ") +
+                                    "WORK_SLICE_ROLLOVER: this requested tool call was recorded but not executed because the context slice ended. Rehydrate and revalidate external state before deciding whether to execute it.";
+                                parent.EventLog.Append(new ProjectEvent
+                                {
+                                    ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                    Type = ProjectEventTypes.ToolResult, Author = "system",
+                                    Text = rollover, ToolName = pendingName, ToolCallId = pending.id,
+                                    PayloadJson = "{\"succeeded\":false}",
+                                });
+                                llm.AppendToolResult(sessionId, pending.id, pendingName, rollover);
+                            }
+                        }
+                        string final = string.IsNullOrWhiteSpace(resp.Response)
+                            ? ProjectWakeStatus.ForCommander(parent.Digests.GetDigest(projectID),
+                                parent.RuntimeState.Get(projectID), deferredCall)
+                            : resp.Response.Trim();
                         if (sliceComplete)
                             parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
                             {
                                 Kind = "work-slice",
-                                Summary = final,
+                                Summary = deferredCall == null
+                                    ? final
+                                    : $"Inspect current external state, then re-evaluate the deferred call: {deferredCall}",
                                 RecordedBy = "commander",
                                 ToolName = "resume",
                             });
@@ -401,19 +468,37 @@ namespace Omnipotent.Services.Projects
                                 ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
                                 Type = ProjectEventTypes.ToolResult, Author = "system",
                                 Text = contract.ErrorText!, ToolName = toolName, ToolCallId = call.id,
+                                PayloadJson = "{\"succeeded\":false}",
                             });
                             llm.AppendToolResult(sessionId, call.id, toolName, contract.ErrorText!);
                             continue;
                         }
                         argsJson = contract.NormalizedArgumentsJson!;
 
+                        // Commit intent before any guard or dispatch. Every subsequent path must
+                        // commit a matching result so restart recovery can detect uncertainty.
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                            Type = ProjectEventTypes.ToolCall, Author = "commander",
+                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
+                            PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
+                        });
+
                         string sig = toolName + "|" + argsJson;
                         recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
                         if (recentSignatures[sig] >= StuckIdenticalCallThreshold)
                         {
                             stuckTrips++;
-                            llm.AppendToolResult(sessionId, call.id, toolName,
-                                $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.");
+                            string loopResult = $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.";
+                            parent.EventLog.Append(new ProjectEvent
+                            {
+                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                Type = ProjectEventTypes.ToolResult, Author = "system",
+                                Text = loopResult, ToolName = toolName, ToolCallId = call.id,
+                                PayloadJson = "{\"succeeded\":false}",
+                            });
+                            llm.AppendToolResult(sessionId, call.id, toolName, loopResult);
                             if (stuckTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated-call loop trips.";
@@ -424,15 +509,34 @@ namespace Omnipotent.Services.Projects
                             continue;
                         }
 
-                        parent.EventLog.Append(new ProjectEvent
+                        CommanderToolResult result;
+                        try
                         {
-                            ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                            Type = ProjectEventTypes.ToolCall, Author = "commander",
-                            Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
-                            PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
-                        });
-
-                        var result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);
+                            result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            string cancelled = $"TOOL_CANCELLED: {toolName} was interrupted before a result could be committed; its external outcome is unknown. Inspect state before retrying.";
+                            parent.EventLog.Append(new ProjectEvent
+                            {
+                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                Type = ProjectEventTypes.ToolResult, Author = "system",
+                                Text = cancelled, ToolName = toolName, ToolCallId = call.id,
+                                PayloadJson = "{\"succeeded\":false}",
+                            });
+                            parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
+                            {
+                                Kind = "interrupted-tool", RecordedBy = "commander", ToolName = toolName,
+                                Summary = $"Inspect external state after interrupted call {DescribeCall(toolName, argsJson)} before any retry.",
+                            });
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            result = new CommanderToolResult($"TOOL_EXECUTION_FAILED: {toolName}: {Trunc(ex.Message, 500)}")
+                            { Succeeded = false };
+                        }
+                        result = ProjectToolContract.AttachWarnings(contract, result);
                         if (ProjectWorkProgress.RecordIfNovel(parent.RuntimeState, projectID, "commander", toolName, argsJson, result))
                             productiveActions++;
 
@@ -440,8 +544,9 @@ namespace Omnipotent.Services.Projects
                         {
                             ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
                             Type = ProjectEventTypes.ToolResult, Author = "commander",
-                            Text = result.ResultText, ToolName = toolName, ToolCallId = call.id,
+                            Text = result.AuditText ?? result.ResultText, ToolName = toolName, ToolCallId = call.id,
                             ArtifactIDs = result.ArtifactIDs,
+                            PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
                         llm.AppendToolResult(sessionId, call.id, toolName, result.ResultText);
 
@@ -470,44 +575,58 @@ namespace Omnipotent.Services.Projects
             }
             catch (RemoteLLMException ex)
             {
-                var failure = FailureFrom(ex, wakeID);
+                var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
+                string providerDetail = ProjectProviderFailure.Describe(ex);
+                outcomePayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
+                var stateBeforeFailure = parent.RuntimeState.Get(projectID);
                 if (ex.IsRetryable)
                 {
                     DateTime retryAt = DateTime.UtcNow + (ex.RetryAfter is { } ra && ra > TimeSpan.Zero
                         ? ra : TimeSpan.FromMinutes(15));
                     failure.RetryAt = retryAt;
                     parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
+                    parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                        healthy: false, ex.Kind.ToString(), providerDetail, retryAt);
                     outcome = ProjectEventTypes.WakeDeferred;
-                    outcomeText = $"Wake deferred by {ex.Kind}; retry after {retryAt:O}.";
+                    outcomeText = $"Wake deferred by provider failure: {providerDetail}; retry after {retryAt:O}.";
                 }
                 else
                 {
                     parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true);
-                    parent.RuntimeState.SetBlocker(projectID, new ProjectRuntimeBlocker
-                    {
-                        Category = ex.Kind switch
+                    parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                        healthy: false, ex.Kind.ToString(), providerDetail);
+                    // A provider/configuration failure is execution health, not permission to erase
+                    // the project's real business blocker (for example an undelivered verification
+                    // email). Install a provider blocker only when no blocker already exists.
+                    if (stateBeforeFailure.Blocker == null)
+                        parent.RuntimeState.SetBlocker(projectID, new ProjectRuntimeBlocker
                         {
-                            RemoteLLMFailureKind.InsufficientProviderCredit => ProjectBlockerCategory.Capacity,
-                            RemoteLLMFailureKind.Authentication => ProjectBlockerCategory.Configuration,
-                            _ => ProjectBlockerCategory.Configuration,
-                        },
-                        Code = ex.Kind.ToString(),
-                        Summary = Trunc(ex.Message, 400),
-                        Retryable = false,
-                    });
+                            Category = ex.Kind switch
+                            {
+                                RemoteLLMFailureKind.InsufficientProviderCredit => ProjectBlockerCategory.Capacity,
+                                RemoteLLMFailureKind.Authentication => ProjectBlockerCategory.Configuration,
+                                _ => ProjectBlockerCategory.Configuration,
+                            },
+                            Code = ex.Kind.ToString(),
+                            Summary = providerDetail,
+                            Retryable = false,
+                        });
                     parent.RuntimeState.SetDisposition(projectID, ProjectExecutionDisposition.Blocked);
                     var blocked = parent.Store.GetProject(projectID);
                     if (blocked != null && blocked.Status is ProjectStatus.Active or ProjectStatus.Planning)
                     {
                         blocked.Status = ProjectStatus.Blocked;
-                        blocked.BlockedReason = $"{ex.Kind}: {Trunc(ex.Message, 300)}";
+                        if (string.IsNullOrWhiteSpace(blocked.BlockedReason))
+                            blocked.BlockedReason = stateBeforeFailure.Blocker?.Summary ?? providerDetail;
                         blocked.BlockedAt = DateTime.UtcNow;
                         parent.Store.SaveProject(blocked);
                     }
-                    parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.ProjectBlocked, "system",
-                        $"Project blocked by action-required provider failure: {ex.Kind}."));
+                    var blockedEvent = WakeEvt(projectID, wakeID, ProjectEventTypes.ProjectBlocked, "system",
+                        $"Execution blocked by action-required provider failure: {providerDetail}.");
+                    blockedEvent.PayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
+                    parent.EventLog.Append(blockedEvent);
                     outcome = ProjectEventTypes.WakeFailed;
-                    outcomeText = $"Wake failed and project blocked: {ex.Kind}.";
+                    outcomeText = $"Wake failed and execution blocked: {providerDetail}.";
                 }
             }
             catch (Exception ex)
@@ -542,7 +661,9 @@ namespace Omnipotent.Services.Projects
                     // the real OpenRouter spend when available, else the provisional estimate.
                     if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
                         outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";
-                    parent.EventLog.Append(WakeEvt(projectID, wakeID, outcome, "system", outcomeText));
+                    var outcomeEvent = WakeEvt(projectID, wakeID, outcome, "system", outcomeText);
+                    outcomeEvent.PayloadJson = outcomePayloadJson;
+                    parent.EventLog.Append(outcomeEvent);
 
                     // A failed Klives-triggered wake must not read as silence either.
                     if (outcome == ProjectEventTypes.WakeFailed && klivesInvolved && parent.DiscordManager != null)
@@ -578,7 +699,10 @@ namespace Omnipotent.Services.Projects
                         .Where(e => e.Type == ProjectEventTypes.ToolResult && e.AgentID == "commander")
                         .Select(e => (long?)e.Sequence).Max();
                 if (outcome == ProjectEventTypes.WakeCompleted)
+                {
+                    parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
                     parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
+                }
                 parent.RuntimeState.ReleaseWakeLease(projectID, wakeID, leaseGeneration);
                 var finalProjectStatus = parent.Store.GetProject(projectID)?.Status;
                 if (finalProjectStatus == ProjectStatus.Paused)
@@ -706,11 +830,14 @@ namespace Omnipotent.Services.Projects
                 if (lease == null) continue; // worker-only leases are recovered by ProjectSubAgentRunner
                 try
                 {
+                    int uncertainCalls = ProjectToolCallJournal.ReconcileInterruptedWake(
+                        parent.EventLog, runtime.ProjectID, lease.WakeID, "commander");
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = runtime.ProjectID, WakeID = lease.WakeID, AgentID = "commander",
                         Type = ProjectEventTypes.WakeCancelled, Author = "system",
-                        Text = "Omnipotent restarted mid-wake. The fenced lease was released and its typed resume action was requeued.",
+                        Text = "Omnipotent restarted mid-wake. The fenced lease was released and its typed resume action was requeued." +
+                            (uncertainCalls > 0 ? $" {uncertainCalls} interrupted tool outcome(s) were marked unknown and require inspection before retry." : ""),
                     });
                     parent.RuntimeState.ReleaseWakeLease(runtime.ProjectID, lease.WakeID, lease.Generation);
                     var legacyDigest = parent.Digests.GetDigest(runtime.ProjectID);
@@ -740,6 +867,8 @@ namespace Omnipotent.Services.Projects
                         parent.Digests.SaveDigest(digest);
                         continue;
                     }
+                    ProjectToolCallJournal.ReconcileInterruptedWake(
+                        parent.EventLog, digest.ProjectID, digest.ActiveWakeID, "commander");
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = digest.ProjectID, WakeID = digest.ActiveWakeID,
@@ -763,7 +892,8 @@ namespace Omnipotent.Services.Projects
             if (toolName.StartsWith("computer_", StringComparison.Ordinal)) return ComputerAudit.Describe(toolName, argsJson);
             try
             {
-                var jo = Newtonsoft.Json.Linq.JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson);
+                string safeArgs = ProjectCommanderTools.AuditPayload(toolName, argsJson) ?? "{}";
+                var jo = Newtonsoft.Json.Linq.JObject.Parse(safeArgs);
                 var bits = jo.Properties().Take(4).Select(p => $"{p.Name}={Trunc(p.Value.ToString(), 60)}");
                 return $"{toolName}({string.Join(", ", bits)})";
             }
@@ -805,23 +935,5 @@ namespace Omnipotent.Services.Projects
             };
         }
 
-        private static ProjectExecutionFailure FailureFrom(RemoteLLMException ex, string wakeID) => new()
-        {
-            Category = ex.Kind switch
-            {
-                RemoteLLMFailureKind.RateLimited => ProjectFailureCategory.RateLimited,
-                RemoteLLMFailureKind.InsufficientProviderCredit => ProjectFailureCategory.Capacity,
-                RemoteLLMFailureKind.Authentication => ProjectFailureCategory.Authentication,
-                RemoteLLMFailureKind.InvalidRequest or RemoteLLMFailureKind.ModelUnavailable => ProjectFailureCategory.Configuration,
-                RemoteLLMFailureKind.EmptyResponse or RemoteLLMFailureKind.Network
-                    or RemoteLLMFailureKind.Timeout or RemoteLLMFailureKind.ProviderUnavailable => ProjectFailureCategory.Transient,
-                _ => ProjectFailureCategory.Unknown,
-            },
-            Code = ex.Kind.ToString(),
-            Summary = Trunc(ex.Message, 400),
-            Retryable = ex.IsRetryable,
-            RetryAt = ex.RetryAfter is { } retry && retry > TimeSpan.Zero ? DateTime.UtcNow + retry : null,
-            WakeID = wakeID,
-        };
     }
 }

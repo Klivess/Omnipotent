@@ -110,6 +110,35 @@ public sealed class ProjectFileStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ContainerAndLegacyProjectPaths_MapToOneWorkspace_AndScriptsUseLf()
+    {
+        await store.WriteTextAsync(ProjectID, "/project/work/job.py", "#!/usr/bin/env python3\r\nprint('ok')\r\n", klives);
+
+        Assert.Equal("#!/usr/bin/env python3\nprint('ok')\n",
+            await store.ReadTextAsync(ProjectID, "D:/project/work/job.py"));
+        string exactHostPath = Path.Combine(root, "volumes", ProjectID, "work", "job.py");
+        Assert.Equal("#!/usr/bin/env python3\nprint('ok')\n",
+            await store.ReadTextAsync(ProjectID, exactHostPath));
+        Assert.Equal("work/job.py", store.Stat(ProjectID, exactHostPath)!.Path);
+        Assert.Contains(store.List(ProjectID, new ProjectFileListRequest
+        {
+            Directory = Path.GetDirectoryName(exactHostPath),
+        }).Entries, entry => entry.Path == "work/job.py");
+        Assert.Equal("work/job.py", store.NormalizeRelativePath("/project/work/job.py"));
+    }
+
+    [Fact]
+    public async Task ManagedMetadata_IsVisibleAndReadable_ButRemainsImmutable()
+    {
+        var listed = store.List(ProjectID, new ProjectFileListRequest { Directory = ".klive", Recursive = true });
+
+        Assert.Contains(listed.Entries, x => x.Path == ".klive/manifest.json");
+        Assert.Contains("Derived metadata", await store.ReadTextAsync(ProjectID, "/project/.klive/manifest.json"));
+        await Assert.ThrowsAsync<ProjectFileException>(() =>
+            store.WriteTextAsync(ProjectID, "/project/.klive/manifest.json", "tampered", klives));
+    }
+
+    [Fact]
     public async Task ManagedOperations_PreserveAudit_AndDirectWritesBecomeUnknown()
     {
         var commander = new ProjectFileActor(ProjectFileActorType.Commander, "commander", "Commander");

@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-
 namespace Omnipotent.Services.Projects
 {
     /// <summary>
@@ -21,17 +19,6 @@ namespace Omnipotent.Services.Projects
         private readonly Projects parent;
         private readonly Action<string> log;
         private CancellationTokenSource? cts;
-
-        // Per-project self-heal state. Recovery attempts are tracked in a rolling window so the
-        // watchdog can tell "one bad wake" (heal silently) from "it keeps happening" (tell Klives).
-        private sealed class HealState
-        {
-            public readonly List<DateTime> ForceWakesUtc = new();
-            public DateTime LastForceWakeUtc = DateTime.MinValue;
-            public DateTime LastEscalationUtc = DateTime.MinValue;
-            public readonly HashSet<string> RemindedGateIDs = new(StringComparer.Ordinal);
-        }
-        private readonly ConcurrentDictionary<string, HealState> heals = new(StringComparer.Ordinal);
 
         // Tunables (could become OmniSettings; kept as constants for V1).
         private static readonly TimeSpan MaxWakeGap = TimeSpan.FromMinutes(30);      // heartbeat staleness
@@ -71,7 +58,7 @@ namespace Omnipotent.Services.Projects
         {
             foreach (var project in parent.Store.ListProjects())
             {
-                if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) { heals.TryRemove(project.ProjectID, out _); continue; }
+                if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
 
                 // A pending approval gate means the project is waiting on Klives, not stalled.
                 // Never force-wake it (that cancels the gate wait); remind him once per aged gate.
@@ -123,10 +110,11 @@ namespace Omnipotent.Services.Projects
             var leaseBeat = runtime?.ActiveWakeLease?.LastHeartbeatAt;
             DateTime? workerBeat = runtime?.ActiveAgentWakeLeases.Values.Select(x => (DateTime?)x.LastHeartbeatAt).Max();
             var verifiedBeat = runtime?.Health.LastVerifiedProgressAt;
-            var lastBeat = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat }.Where(x => x.HasValue).Select(x => x!.Value)
-                .DefaultIfEmpty(project.CreatedAt).Max();
+            var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
+            var lastBeat = observedBeats.DefaultIfEmpty(project.CreatedAt).Max();
             if (tail.Count > 0 && now - lastBeat > MaxWakeGap)
-                return ($"No Commander activity in over {MaxWakeGap.TotalMinutes:0} minutes (last: {(lastActivity == null ? "never" : lastActivity.Value.ToString("u"))}).", null);
+                return ($"No Commander activity or verified worker heartbeat in over {MaxWakeGap.TotalMinutes:0} minutes " +
+                    $"(last heartbeat: {(observedBeats.Count == 0 ? "never" : lastBeat.ToString("u"))}).", null);
 
             // 2. Zero-progress-over-N-wakes: the last N completed wakes produced no tool-call /
             //    artifact / spawn / sub-agent-activity events, and the plan hasn't changed.
@@ -138,7 +126,9 @@ namespace Omnipotent.Services.Projects
                 bool anyProgress = typedProgress || tail.Any(e => e.Sequence >= firstWakeSeq &&
                     (e.Type is ProjectEventTypes.ArtifactAdded or ProjectEventTypes.ProjectFileChanged
                         or ProjectEventTypes.CheckpointChanged or ProjectEventTypes.GrandPlanProgress
-                        or ProjectEventTypes.AgentSpawned or ProjectEventTypes.MoneySpent));
+                        or ProjectEventTypes.ObservableChanged or ProjectEventTypes.HookChanged
+                        or ProjectEventTypes.AccountChanged or ProjectEventTypes.AgentSpawned
+                        or ProjectEventTypes.MoneySpent));
                 if (!anyProgress)
                     return ($"No verified progress across the last {ZeroProgressWakes} wakes (no artifacts, file/checkpoint/plan changes, spawns, or spend).", null);
             }
@@ -158,7 +148,8 @@ namespace Omnipotent.Services.Projects
             var staleAgentWake = tail
                 .Where(e => e.Type == ProjectEventTypes.AgentWake && now - e.Timestamp > MaxWakeGap)
                 .FirstOrDefault(w => !tail.Any(e => e.WakeID == w.WakeID &&
-                        (e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed))
+                        (e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed
+                            or ProjectEventTypes.WakeCancelled or ProjectEventTypes.WakeDeferred))
                     && !tail.Any(e => e.AgentID == w.AgentID && now - e.Timestamp <= MaxWakeGap));
             if (staleAgentWake != null)
                 return ($"Sub-agent {staleAgentWake.AgentID} has been awake without finishing or emitting any activity for over {MaxWakeGap.TotalMinutes:0} minutes.", staleAgentWake.AgentID);
@@ -170,9 +161,13 @@ namespace Omnipotent.Services.Projects
         /// tool activity or wake outcome attributed to the commander.</summary>
         private static bool IsCommanderActivity(ProjectEvent e) =>
             e.Type is ProjectEventTypes.CommanderWake or ProjectEventTypes.CommanderThought or ProjectEventTypes.CommanderMessage
+                or ProjectEventTypes.ProjectFileChanged or ProjectEventTypes.CheckpointChanged
+                or ProjectEventTypes.GrandPlanProgress or ProjectEventTypes.ObservableChanged
+                or ProjectEventTypes.HookChanged or ProjectEventTypes.AccountChanged
             || (e.AgentID == "commander" &&
                 e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ToolResult
-                    or ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed);
+                    or ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed
+                    or ProjectEventTypes.WakeCancelled or ProjectEventTypes.WakeDeferred);
 
         /// <summary>
         /// Recovers a diagnosed stall without involving Klives: cancel a wedged sub-agent if that
@@ -181,25 +176,38 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private async Task SelfHealAsync(Project project, string diagnosis, string? wedgedAgentID)
         {
-            var heal = heals.GetOrAdd(project.ProjectID, _ => new HealState());
             var now = DateTime.UtcNow;
+            var watchdog = parent.RuntimeState.Get(project.ProjectID).Health.Watchdog;
 
             // Provider-outage guard: if wakes themselves keep failing, another force-wake is just
             // another failure — the keepalive's exponential backoff owns retries. Tell Klives
             // (rate-limited) because this is usually a provider/credit problem only he can fix.
             var outcomes = parent.EventLog.ReadTail(project.ProjectID, 40)
-                .Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed).ToList();
+                .Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed
+                    or ProjectEventTypes.WakeCancelled or ProjectEventTypes.WakeDeferred).ToList();
             int consecutiveFailures = 0;
             for (int i = outcomes.Count - 1; i >= 0 && outcomes[i].Type == ProjectEventTypes.WakeFailed; i--) consecutiveFailures++;
             if (consecutiveFailures >= 3)
             {
-                await EscalateAsync(project, heal,
+                await EscalateAsync(project,
                     $"Wakes are failing repeatedly ({consecutiveFailures} in a row — most recent: {Trunc(outcomes[^1].Text, 200)}). " +
                     "This usually means the LLM provider, its credit, or the model configuration is the problem rather than the project itself. Retries continue automatically with backoff.");
                 return;
             }
 
-            if (now - heal.LastForceWakeUtc < ForceWakePacing) return; // healed recently — give it time to land
+            if (watchdog.LastRecoveryAt.HasValue && now - watchdog.LastRecoveryAt.Value < ForceWakePacing)
+                return; // healed recently — give it time to land
+
+            // Diagnosis and lifecycle can change between TickAsync and this method (for example,
+            // a wake completes or Klives pauses the project). Re-read immediately before every
+            // destructive recovery action so a stale watchdog observation cannot cancel useful work.
+            var current = parent.Store.GetProject(project.ProjectID);
+            if (current == null || current.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return;
+            if ((parent.Gates?.ListPending(project.ProjectID).Count ?? 0) > 0) return;
+            var rechecked = DiagnoseCore(current);
+            if (rechecked.diagnosis == null) return;
+            diagnosis = rechecked.diagnosis;
+            wedgedAgentID = rechecked.wedgedAgentID;
 
             // Consume the stuck-loop signal so one bad wake can't re-trigger this diagnosis forever.
             var digest = parent.Digests.GetDigest(project.ProjectID);
@@ -216,39 +224,50 @@ namespace Omnipotent.Services.Projects
                 try { parent.SubAgentRunner.CancelAgent(project.ProjectID, wedgedAgentID); } catch { }
             }
 
-            heal.LastForceWakeUtc = now;
-            heal.ForceWakesUtc.Add(now);
-            heal.ForceWakesUtc.RemoveAll(t => now - t > HealWindow);
+            var recorded = parent.RuntimeState.RecordWatchdogRecovery(project.ProjectID, HealWindow, nowUtc: now);
+            long lifetimeCount = recorded.State.Health.Watchdog.RecoveryCount;
+            int windowCount = recorded.State.Health.Watchdog.RecoveriesUtc.Count;
 
             parent.EventLog.Append(new ProjectEvent
             {
                 ProjectID = project.ProjectID,
-                Type = ProjectEventTypes.WatchdogEscalation,
+                Type = ProjectEventTypes.WatchdogRecovery,
                 Author = "system",
-                Text = $"Watchdog: {diagnosis} Self-healing — force-waking the Commander (recovery {heal.ForceWakesUtc.Count} in the last {HealWindow.TotalHours:0}h; Klives is only pinged if this keeps happening).",
+                AgentID = "commander",
+                Text = $"Watchdog: {diagnosis} Self-healing — force-waking the Commander (recovery #{lifetimeCount} lifetime; {windowCount} in the last {HealWindow.TotalHours:0}h).",
+                PayloadJson = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    diagnosis,
+                    wedgedAgentID,
+                    lifetimeRecoveryCount = lifetimeCount,
+                    rollingRecoveryCount = windowCount,
+                    rollingWindowHours = HealWindow.TotalHours,
+                    initiatedAt = now,
+                }),
             });
             log($"Watchdog self-heal on project {project.ProjectID}: {diagnosis}");
-            parent.CommanderRunner.ForceWake(project,
+            parent.CommanderRunner.ForceWake(current,
                 $"{diagnosis} The watchdog force-woke you to recover. Assess what wedged, avoid repeating it (change approach if you were looping), and continue toward the goal.");
 
-            if (heal.ForceWakesUtc.Count >= HealsBeforeEscalation)
-                await EscalateAsync(project, heal,
-                    $"{diagnosis} I've auto-recovered the Commander {heal.ForceWakesUtc.Count}× in the last {HealWindow.TotalHours:0} hours, but it keeps stalling — it may need your steering.");
+            if (windowCount >= HealsBeforeEscalation)
+                await EscalateAsync(current,
+                    $"{diagnosis} I've auto-recovered the Commander {windowCount}× in the last {HealWindow.TotalHours:0} hours, but it keeps stalling — it may need your steering.");
         }
 
         /// <summary>One aged reminder per unanswered gate — waiting on Klives is his stall, not the project's.</summary>
         private async Task RemindAgedGatesAsync(Project project, List<ProjectGate> pending)
         {
-            var heal = heals.GetOrAdd(project.ProjectID, _ => new HealState());
             foreach (var gate in pending)
             {
                 if (DateTime.UtcNow - gate.CreatedAt < GateReminderAge) continue;
-                if (!heal.RemindedGateIDs.Add(gate.GateID)) continue;
+                var recorded = parent.RuntimeState.RecordGateReminder(project.ProjectID, gate.GateID);
+                if (!recorded.Applied) continue;
                 parent.EventLog.Append(new ProjectEvent
                 {
                     ProjectID = project.ProjectID,
-                    Type = ProjectEventTypes.WatchdogEscalation,
+                    Type = ProjectEventTypes.WatchdogReminder,
                     Author = "system",
+                    GateID = gate.GateID,
                     Text = $"Watchdog: approval '{gate.Title}' has been waiting on Klives for over {GateReminderAge.TotalHours:0}h — reminded him.",
                 });
                 if (parent.DiscordManager != null)
@@ -259,11 +278,12 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>Rate-limited attention ping: at most one per project per cooldown, always with
         /// what the watchdog already tried, so a ping means "I couldn't fix this myself".</summary>
-        private async Task EscalateAsync(Project project, HealState heal, string message)
+        private async Task EscalateAsync(Project project, string message)
         {
             var now = DateTime.UtcNow;
-            if (now - heal.LastEscalationUtc < EscalationCooldown) return;
-            heal.LastEscalationUtc = now;
+            var watchdog = parent.RuntimeState.Get(project.ProjectID).Health.Watchdog;
+            if (watchdog.LastEscalationAt.HasValue && now - watchdog.LastEscalationAt.Value < EscalationCooldown) return;
+            parent.RuntimeState.RecordWatchdogEscalation(project.ProjectID, nowUtc: now);
 
             parent.EventLog.Append(new ProjectEvent
             {

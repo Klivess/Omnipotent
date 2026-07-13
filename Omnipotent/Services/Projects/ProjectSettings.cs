@@ -43,13 +43,20 @@ namespace Omnipotent.Services.Projects
         public int CommanderMaxOutputTokens { get; set; } = Defaults.CommanderMaxOutputTokens;
         public int SubAgentMaxOutputTokens { get; set; } = Defaults.SubAgentMaxOutputTokens;
         public int UtilityMaxOutputTokens { get; set; } = Defaults.UtilityMaxOutputTokens;
-        /// <summary>Optional capability-compatible fallback used after the primary route fails. Empty disables fallback.</summary>
+        /// <summary>Capability-compatible fallback used after the primary route fails.</summary>
         public string CommanderFallbackModel { get; set; } = Defaults.CommanderFallbackModel;
-        /// <summary>Optional capability-compatible fallback for worker tiers.</summary>
+        /// <summary>Capability-compatible fallback for worker tiers.</summary>
         public string SubAgentFallbackModel { get; set; } = Defaults.SubAgentFallbackModel;
-        /// <summary>Optional utility-model fallback. Empty disables fallback.</summary>
+        /// <summary>Utility-model fallback.</summary>
         public string UtilityFallbackModel { get; set; } = Defaults.UtilityFallbackModel;
         public string CouncilFallbackModel { get; set; } = Defaults.CouncilFallbackModel;
+        /// <summary>
+        /// Keeps old settings documents resilient: historical projects persisted empty fallback
+        /// fields, so an unavailable or unaffordable primary model could halt the whole project.
+        /// When enabled, an empty/same-as-primary route is replaced at runtime by another configured
+        /// project model. Set this false to deliberately require only explicitly configured routes.
+        /// </summary>
+        public bool AutomaticModelFallbackEnabled { get; set; } = Defaults.AutomaticModelFallbackEnabled;
 
         // ── wake convergence guardrails ──
         /// <summary>Context-rollover boundary, not a work limit. Productive work automatically
@@ -57,6 +64,10 @@ namespace Omnipotent.Services.Projects
         public int WorkSliceToolCalls { get; set; } = Defaults.WorkSliceToolCalls;
         /// <summary>Model-turn boundary for refreshing context, not a lifetime/wake cap.</summary>
         public int WorkSliceModelTurns { get; set; } = Defaults.WorkSliceModelTurns;
+        /// <summary>Measured prompt+completion-token boundary for refreshing context. This keeps
+        /// repeated full-history requests from turning one wake into a million-token session;
+        /// productive work continues from its typed resume checkpoint in a fresh wake.</summary>
+        public int WorkSliceTokenBudget { get; set; } = Defaults.WorkSliceTokenBudget;
         /// <summary>Only convergence failures are bounded: repeated identical actions must change
         /// strategy instead of consuming an unlimited budget. Novel productive work is unlimited.</summary>
         public int MaxConvergenceTripsPerSlice { get; set; } = Defaults.MaxConvergenceTripsPerSlice;
@@ -84,8 +95,16 @@ namespace Omnipotent.Services.Projects
         // ── behavior ──
         /// <summary>Whether video-tier agents get screenshots fed back to the model.</summary>
         public bool VisionEnabled { get; set; } = true;
-        /// <summary>Whether this project may spin up desktop containers at all (text-only projects: false).</summary>
-        public bool ContainersEnabled { get; set; } = false;
+        /// <summary>Whether this project may spin up desktop containers at all. Projects are
+        /// operators by default, so their computers are enabled unless Klives explicitly creates
+        /// a text-only project.</summary>
+        public bool ContainersEnabled { get; set; } = Defaults.ContainersEnabled;
+        /// <summary>
+        /// Enforces visible, stateful computer_* interaction for websites. Scripts and terminals
+        /// remain available for installs, files, diagnostics and software work, but may not become
+        /// a hidden headless-browser substitute for operating an external account.
+        /// </summary>
+        public bool DesktopFirstWebsiteInteraction { get; set; } = Defaults.DesktopFirstWebsiteInteraction;
         /// <summary>Desktop image for this project's containers.</summary>
         public string DesktopImage { get; set; } = Defaults.DesktopImage;
         /// <summary>Post-action visual settle delay for this project's VNC desktops.</summary>
@@ -110,6 +129,30 @@ namespace Omnipotent.Services.Projects
             _ => TierTextModel,
         };
 
+        public string CommanderFallbackRoute() => ResolveFallback(
+            CommanderFallbackModel, CommanderModel, UtilityModel, TierTextImageModel, TierTextModel);
+
+        public string CouncilFallbackRoute() => ResolveFallback(
+            CouncilFallbackModel, CouncilModel, UtilityModel, TierTextImageModel, TierTextModel);
+
+        public string UtilityFallbackRoute() => ResolveFallback(
+            UtilityFallbackModel, UtilityModel, CommanderModel, TierTextImageModel, TierTextModel);
+
+        public string SubAgentFallbackRoute(ProjectAgentTier tier) => ResolveFallback(
+            SubAgentFallbackModel, ModelForTier(tier), UtilityModel, CommanderModel,
+            TierTextImageModel, TierTextImageVideoModel, TierTextModel);
+
+        private string ResolveFallback(string? configured, string? primary, params string?[] alternatives)
+        {
+            string primaryRoute = (primary ?? "").Trim();
+            string explicitRoute = (configured ?? "").Trim();
+            if (explicitRoute.Length > 0 && !string.Equals(explicitRoute, primaryRoute, StringComparison.OrdinalIgnoreCase))
+                return explicitRoute;
+            if (!AutomaticModelFallbackEnabled) return "";
+            return alternatives.Select(x => (x ?? "").Trim())
+                .FirstOrDefault(x => x.Length > 0 && !string.Equals(x, primaryRoute, StringComparison.OrdinalIgnoreCase)) ?? "";
+        }
+
         /// <summary>Applies a named setting from a string value (Klives/Commander edit). Returns false if unknown.</summary>
         public bool TrySet(string key, string value)
         {
@@ -133,18 +176,22 @@ namespace Omnipotent.Services.Projects
                 case "subagentfallbackmodel": SubAgentFallbackModel = value.Trim(); break;
                 case "utilityfallbackmodel": UtilityFallbackModel = value.Trim(); break;
                 case "councilfallbackmodel": CouncilFallbackModel = value.Trim(); break;
+                case "automaticmodelfallbackenabled": AutomaticModelFallbackEnabled = ParseBool(value); break;
                 case "workslicetoolcalls":
                 case "maxtoolcallsperwake": // legacy setting name: now interpreted as a rollover boundary
                     WorkSliceToolCalls = Math.Clamp(ParseInt(value, Defaults.WorkSliceToolCalls), 5, 200); break;
                 case "workslicemodelturns":
                 case "maxmodelturnsperwake": // legacy setting name: now interpreted as a rollover boundary
                     WorkSliceModelTurns = Math.Clamp(ParseInt(value, Defaults.WorkSliceModelTurns), 2, 100); break;
+                case "workslicetokenbudget":
+                    WorkSliceTokenBudget = Math.Clamp(ParseInt(value, Defaults.WorkSliceTokenBudget), 16_000, 256_000); break;
                 case "maxconvergencetripsperslice":
                 case "maxlooptripsperwake":
                     MaxConvergenceTripsPerSlice = Math.Clamp(ParseInt(value, Defaults.MaxConvergenceTripsPerSlice), 1, 20); break;
                 case "maxconsecutivecontinuations": break; // retired: productive continuations are intentionally unlimited
                 case "visionenabled": VisionEnabled = ParseBool(value); break;
                 case "containersenabled": ContainersEnabled = ParseBool(value); break;
+                case "desktopfirstwebsiteinteraction": DesktopFirstWebsiteInteraction = ParseBool(value); break;
                 case "desktopimage": DesktopImage = value; break;
                 case "computeractionsettlems": ComputerActionSettleMs = Math.Clamp(ParseInt(value, Defaults.ComputerActionSettleMs), 50, 5000); break;
                 case "computertypingdelayms": ComputerTypingDelayMs = Math.Clamp(ParseInt(value, Defaults.ComputerTypingDelayMs), 0, 500); break;
@@ -172,13 +219,17 @@ namespace Omnipotent.Services.Projects
             public const int CommanderMaxOutputTokens = 8192;
             public const int SubAgentMaxOutputTokens = 6144;
             public const int UtilityMaxOutputTokens = 1800;
-            public const string CommanderFallbackModel = "";
-            public const string SubAgentFallbackModel = "";
-            public const string UtilityFallbackModel = "";
-            public const string CouncilFallbackModel = "";
+            public const string CommanderFallbackModel = UtilityModel;
+            public const string SubAgentFallbackModel = UtilityModel;
+            public const string UtilityFallbackModel = CommanderModel;
+            public const string CouncilFallbackModel = UtilityModel;
+            public const bool AutomaticModelFallbackEnabled = true;
             public const int WorkSliceToolCalls = 40;
             public const int WorkSliceModelTurns = 24;
+            public const int WorkSliceTokenBudget = 64_000;
             public const int MaxConvergenceTripsPerSlice = 5;
+            public const bool ContainersEnabled = true;
+            public const bool DesktopFirstWebsiteInteraction = true;
             public const string DesktopImage = "omnipotent/projects-desktop:latest";
             public const int ComputerActionSettleMs = 350;
             public const int ComputerTypingDelayMs = 18;

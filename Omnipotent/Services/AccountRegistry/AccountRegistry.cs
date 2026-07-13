@@ -42,6 +42,13 @@ namespace Omnipotent.Services.AccountRegistry
 
         // ── façade: registration + dedup ──
 
+        public sealed record AccountRegistrationOutcome(
+            bool Created,
+            bool Failed,
+            RegisteredAccount? Account,
+            string Message,
+            string? ErrorCode = null);
+
         /// <summary>
         /// Registers an account (warn-but-allow dedup). Returns an agent-readable result string. When
         /// the service already has account(s) and <paramref name="allowDuplicate"/> is false, creates
@@ -51,13 +58,24 @@ namespace Omnipotent.Services.AccountRegistry
         public async Task<string> RegisterAccountAsync(string service, string username, string? email,
             Dictionary<string, string>? secrets, string? description, string createdBy, string? owner,
             bool allowDuplicate, string? reason)
+            => (await RegisterAccountDetailedAsync(service, username, email, secrets, description,
+                createdBy, owner, allowDuplicate, reason)).Message;
+
+        /// <summary>Typed registration result so callers never infer a mutation from a prose string.</summary>
+        public async Task<AccountRegistrationOutcome> RegisterAccountDetailedAsync(string service, string username, string? email,
+            Dictionary<string, string>? secrets, string? description, string createdBy, string? owner,
+            bool allowDuplicate, string? reason)
         {
             AccountRegistryStore.RegisterResult result;
             try
             {
                 result = Store.Register(service, username, email, secrets, description, createdBy, owner, allowDuplicate, reason);
             }
-            catch (Exception ex) { return $"Could not register account: {ex.Message}"; }
+            catch (Exception ex)
+            {
+                return new AccountRegistrationOutcome(false, true, null,
+                    $"Could not register account: {ex.Message}", ex.GetType().Name);
+            }
 
             if (!result.Created)
             {
@@ -65,16 +83,21 @@ namespace Omnipotent.Services.AccountRegistry
                 sb.AppendLine($"An account for '{AccountRegistryStore.NormalizeService(service)}' already exists — reuse it instead of creating a duplicate:");
                 foreach (var a in result.Existing) sb.AppendLine("  " + FormatAccountLine(a));
                 sb.Append("If you genuinely need a SEPARATE account, call account_register again with allowDuplicate=true and a reason.");
-                return sb.ToString();
+                return new AccountRegistrationOutcome(false, false, null, sb.ToString(), "DuplicatePrevented");
             }
 
-            await EnsureMailboxForAccountAsync(result.Account!);
+            string? mailboxWarning = null;
+            try { await EnsureMailboxForAccountAsync(result.Account!); }
+            catch (Exception ex) { mailboxWarning = ex.Message; }
             var confirm = new StringBuilder();
             confirm.AppendLine($"Registered account: {FormatAccountLine(result.Account!)}");
             if (IsKliveMailAddress(result.Account!.Email))
-                confirm.AppendLine($"KliveMail inbox ensured for {result.Account!.Email} — verification/reset mail will arrive there.");
+                confirm.AppendLine(mailboxWarning == null
+                    ? $"KliveMail inbox ensured for {result.Account!.Email} — verification/reset mail will arrive there."
+                    : $"Account was registered, but its KliveMail inbox could not be ensured: {mailboxWarning}");
             confirm.Append("Reference its secrets when typing as shown above; they are never shown back to you.");
-            return confirm.ToString();
+            return new AccountRegistrationOutcome(true, false, result.Account, confirm.ToString(),
+                mailboxWarning == null ? null : "MailboxEnsureFailed");
         }
 
         // ── façade: listing / description ──

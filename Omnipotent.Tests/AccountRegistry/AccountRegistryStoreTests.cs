@@ -140,5 +140,49 @@ namespace Omnipotent.Tests.AccountRegistry
             Assert.True(store.Delete(id));
             Assert.Null(store.Get(id));
         }
+
+        [Fact]
+        public void ZeroByteRootKey_IsQuarantinedAndRecreated_WhenNoCiphertextExists()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "account-key-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            string index = Path.Combine(dir, "accounts.json");
+            string key = Path.Combine(dir, "root.key");
+            File.WriteAllBytes(key, Array.Empty<byte>());
+            try
+            {
+                var store = new AccountRegistryStore(_ => { }, index, key);
+                store.Register("example.test", "bot", null, new() { ["password"] = "secret" },
+                    null, "test", null, false, null);
+
+                Assert.Equal(32, File.ReadAllBytes(key).Length);
+                Assert.Single(Directory.GetFiles(dir, "root.key.corrupt-*"));
+                Assert.Equal("secret", store.GetDecryptedSecret(store.FindByService("example.test").Single().AccountID, "password"));
+            }
+            finally { Directory.Delete(dir, recursive: true); }
+        }
+
+        [Fact]
+        public void CorruptRootKey_IsPreserved_WhenCiphertextAlreadyExists()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "account-key-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            string index = Path.Combine(dir, "accounts.json");
+            string key = Path.Combine(dir, "root.key");
+            try
+            {
+                new AccountRegistryStore(_ => { }, index, key).Register("first.test", "bot", null,
+                    new() { ["password"] = "secret" }, null, "test", null, false, null);
+                File.WriteAllBytes(key, Array.Empty<byte>());
+                var restarted = new AccountRegistryStore(_ => { }, index, key);
+
+                var error = Assert.Throws<InvalidOperationException>(() => restarted.Register("second.test", "bot", null,
+                    new() { ["password"] = "another" }, null, "test", null, false, null));
+
+                Assert.Contains("encrypted data exists", error.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Empty(File.ReadAllBytes(key));
+            }
+            finally { Directory.Delete(dir, recursive: true); }
+        }
     }
 }

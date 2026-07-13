@@ -155,13 +155,23 @@ namespace Omnipotent.Services.Projects.Stimulus
         {
             var spec = ParseSpec(hook.SourceSpecJson);
             int seconds = spec["intervalSeconds"]?.Value<int?>() ?? 3600;
-            seconds = Math.Max(5, seconds);
-            var timer = new System.Threading.Timer(async _ =>
+            seconds = Math.Clamp(seconds, 5, 365 * 24 * 60 * 60);
+            DateTime firstRunUtc = hook.CreatedAt.ToUniversalTime().AddSeconds(seconds);
+            if (spec["firstRunUtc"] is JToken firstToken)
             {
-                try { await bus.IngestAsync(hook, $"Timer fired ({seconds}s interval)."); }
-                catch (Exception ex) { log($"Timer hook {hook.HookID} ingest failed: {ex.Message}"); }
-            }, null, TimeSpan.FromSeconds(seconds), TimeSpan.FromSeconds(seconds));
-            armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, $"Fires every {seconds}s.");
+                if (firstToken.Type != JTokenType.String
+                    || !DateTimeOffset.TryParse(firstToken.Value<string>(), System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                        out var parsed))
+                    return SetArm(hook, HookArmState.Error,
+                        "timer firstRunUtc must be an ISO-8601 timestamp, e.g. 2026-07-14T09:00:00Z.");
+                firstRunUtc = parsed.UtcDateTime;
+            }
+
+            var timer = new RecurringTimerToken(hook, firstRunUtc, TimeSpan.FromSeconds(seconds),
+                payload => bus.IngestAsync(hook, payload), log, cts.Token);
+            armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed,
+                $"Fires every {seconds}s, anchored at {firstRunUtc:O}; an overdue schedule emits one catch-up event after restart.");
             return timer;
         }
 
@@ -169,20 +179,115 @@ namespace Omnipotent.Services.Projects.Stimulus
         private IDisposable ArmFileWatch(StimulusHookRecord hook)
         {
             var spec = ParseSpec(hook.SourceSpecJson);
-            string path = spec["path"]?.Value<string>() ?? "";
-            if (string.IsNullOrWhiteSpace(path))
+            string requestedPath = spec["path"]?.Value<string>() ?? "";
+            if (string.IsNullOrWhiteSpace(requestedPath))
                 return SetArm(hook, HookArmState.Error, "No 'path' in spec — nothing to watch.");
-            if (!Directory.Exists(path))
-                return SetArm(hook, HookArmState.Error, $"Watched path does not exist: {path}");
-            var watcher = new FileSystemWatcher(path) { EnableRaisingEvents = true, IncludeSubdirectories = true };
+            string path;
+            try { path = ResolveProjectWatchPath(hook.ProjectID, requestedPath); }
+            catch (Exception ex) { return SetArm(hook, HookArmState.Error, ex.Message); }
+            bool isFile = File.Exists(path);
+            if (!isFile && !Directory.Exists(path))
+                return SetArm(hook, HookArmState.Error, $"Watched project path does not exist: {requestedPath}");
+            string watchDirectory = isFile ? Path.GetDirectoryName(path)! : path;
+            var watcher = new FileSystemWatcher(watchDirectory)
+            {
+                Filter = isFile ? Path.GetFileName(path) : "*",
+                EnableRaisingEvents = true,
+                IncludeSubdirectories = !isFile,
+            };
             FileSystemEventHandler handler = async (_, e) =>
             {
-                try { await bus.IngestAsync(hook, $"File {e.ChangeType}: {e.FullPath}"); }
+                string relative = Path.GetRelativePath(ProjectWorkspaceLocator.HostRoot(hook.ProjectID), e.FullPath)
+                    .Replace('\\', '/');
+                try { await bus.IngestAsync(hook, $"File {e.ChangeType}: /project/{relative}"); }
                 catch (Exception ex) { log($"File-watch hook {hook.HookID} ingest failed: {ex.Message}"); }
             };
             watcher.Created += handler; watcher.Changed += handler; watcher.Deleted += handler;
-            armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, $"Watching {path} (recursive).");
+            armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed,
+                $"Watching {requestedPath}{(isFile ? "" : " recursively")} in the shared project workspace.");
             return watcher;
+        }
+
+        private static string ResolveProjectWatchPath(string projectID, string requestedPath)
+        {
+            string root = Path.GetFullPath(ProjectWorkspaceLocator.HostRoot(projectID));
+            string relative = requestedPath.Replace('\\', '/').Trim();
+            if (relative.Equals("/project", StringComparison.Ordinal)) relative = "";
+            else if (relative.StartsWith("/project/", StringComparison.Ordinal)) relative = relative[9..];
+            else if (Path.IsPathRooted(requestedPath))
+                throw new InvalidOperationException("file-watch paths must be relative to /project, not an arbitrary host path.");
+            string full = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar)));
+            string rel = Path.GetRelativePath(root, full);
+            if (Path.IsPathRooted(rel) || rel == ".."
+                || rel.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                throw new InvalidOperationException("file-watch path escapes the shared project workspace.");
+            return full;
+        }
+
+        internal static DateTime NextTimerOccurrence(DateTime anchorUtc, TimeSpan period, DateTime nowUtc)
+        {
+            if (period <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(period));
+            anchorUtc = anchorUtc.ToUniversalTime();
+            nowUtc = nowUtc.ToUniversalTime();
+            if (nowUtc < anchorUtc) return anchorUtc;
+            long periodsElapsed = (nowUtc.Ticks - anchorUtc.Ticks) / period.Ticks + 1;
+            return anchorUtc.AddTicks(checked(period.Ticks * periodsElapsed));
+        }
+
+        /// <summary>Non-overlapping, wall-clock-anchored recurring timer with one catch-up delivery
+        /// after downtime. A durable queue/ledger makes that at-least-once wake idempotent.</summary>
+        private sealed class RecurringTimerToken : IDisposable
+        {
+            private readonly CancellationTokenSource cancellation;
+            private readonly Task loop;
+
+            public RecurringTimerToken(StimulusHookRecord hook, DateTime firstRunUtc, TimeSpan period,
+                Func<string, Task> emit, Action<string> log, CancellationToken parentToken)
+            {
+                cancellation = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+                loop = Task.Run(() => RunAsync(hook, firstRunUtc, period, emit, log, cancellation.Token));
+            }
+
+            private static async Task RunAsync(StimulusHookRecord hook, DateTime anchorUtc, TimeSpan period,
+                Func<string, Task> emit, Action<string> log, CancellationToken ct)
+            {
+                try
+                {
+                    async Task EmitSafely(string payload)
+                    {
+                        try { await emit(payload); }
+                        catch (Exception ex) { log($"Timer hook {hook.HookID} ingest failed: {ex.Message}"); }
+                    }
+
+                    DateTime now = DateTime.UtcNow;
+                    DateTime next = anchorUtc;
+                    if (now >= anchorUtc)
+                    {
+                        next = NextTimerOccurrence(anchorUtc, period, now);
+                        DateTime missedOccurrence = next - period;
+                        await EmitSafely($"Timer catch-up fired for scheduled occurrence {missedOccurrence:O} after startup/downtime (schedule anchor {anchorUtc:O}, interval {period.TotalSeconds:0}s).");
+                    }
+
+                    while (!ct.IsCancellationRequested)
+                    {
+                        TimeSpan delay = next - DateTime.UtcNow;
+                        if (delay > TimeSpan.Zero) await Task.Delay(delay, ct);
+                        DateTime scheduled = next;
+                        await EmitSafely($"Timer fired for scheduled occurrence {scheduled:O} ({period.TotalSeconds:0}s interval).");
+                        next = scheduled.Add(period);
+                        while (next <= DateTime.UtcNow) next = next.Add(period);
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+                catch (Exception ex) { log($"Timer hook {hook.HookID} ingest failed: {ex.Message}"); }
+            }
+
+            public void Dispose()
+            {
+                cancellation.Cancel();
+                cancellation.Dispose();
+                _ = loop.Exception;
+            }
         }
 
         // ── screen-diff (pixel-diff gate over a container desktop, §5.3) ──
@@ -271,7 +376,11 @@ namespace Omnipotent.Services.Projects.Stimulus
                 try
                 {
                     if (!MailMatches(hook, mail)) continue;
-                    string payload = $"Email received.\nTo: {mail.To}\nFrom: {mail.From}\nSubject: {mail.Subject}\n\n{Truncate(mail.BodyPreview, 800)}";
+                    // The durable stimulus exists only to wake the owner. Verification codes and
+                    // reset links stay in KliveMail and are fetched through the live native tools;
+                    // putting a body/subject into the event journal would leak short-lived secrets
+                    // into CSV exports, digests and RAG.
+                    string payload = $"Email received.\nTo: {mail.To}\nFrom: {mail.From}\nSubject/body omitted from durable history; inspect the canonical mailbox with klivemail_list_messages or klivemail_wait_for_code.";
                     await bus.IngestAsync(hook, payload);
                 }
                 catch (Exception ex) { log($"Email hook {hook.HookID} ingest failed: {ex.Message}"); }

@@ -25,6 +25,7 @@ namespace Omnipotent.Services.KliveRAG.Connectors
             ProjectEventTypes.CommanderMessage, ProjectEventTypes.KlivesMessage, ProjectEventTypes.AgentMessage,
             ProjectEventTypes.Status, ProjectEventTypes.ApprovalRequested, ProjectEventTypes.ApprovalResolved,
             ProjectEventTypes.BudgetWarning, ProjectEventTypes.BudgetPaused, ProjectEventTypes.MoneySpent,
+            ProjectEventTypes.WatchdogRecovery, ProjectEventTypes.WatchdogReminder,
             ProjectEventTypes.WatchdogEscalation, ProjectEventTypes.WakeFailed,
         };
 

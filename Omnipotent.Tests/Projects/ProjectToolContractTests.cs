@@ -35,6 +35,133 @@ public class ProjectToolContractTests
     }
 
     [Fact]
+    public void ContainerTerminalScriptAlias_IsNormalizedToCommand()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("computer_terminal",
+            "{\"script\":\"pwd\",\"timeoutSeconds\":\"30\"}",
+            ProjectCommanderAgent.BuildComputerToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var normalized = JObject.Parse(result.NormalizedArgumentsJson!);
+        Assert.Equal("pwd", (string?)normalized["command"]);
+        Assert.Equal(30, (int?)normalized["timeoutSeconds"]);
+        Assert.Null(normalized["script"]);
+    }
+
+    [Fact]
+    public void HostShellCodeAlias_AndWorkingDirectory_AreAccepted()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("run_bash",
+            "{\"code\":\"pwd\",\"workingDirectory\":\"jobs/today\"}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var normalized = JObject.Parse(result.NormalizedArgumentsJson!);
+        Assert.Equal("pwd", (string?)normalized["script"]);
+        Assert.Equal("jobs/today", (string?)normalized["workingDirectory"]);
+    }
+
+    [Fact]
+    public void ReadFile_StringLineNumbers_AreLosslesslyCoerced()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("read_file",
+            "{\"path\":\"ledger.json\",\"startLine\":\"36\",\"maxLines\":\"14\"}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var normalized = JObject.Parse(result.NormalizedArgumentsJson!);
+        Assert.Equal(36, (int?)normalized["startLine"]);
+        Assert.Equal(14, (int?)normalized["maxLines"]);
+    }
+
+    [Fact]
+    public void MisplacedReadFileExecutionHint_IsIgnoredWithAnExplicitWarning()
+    {
+        var contract = ProjectToolContract.ValidateAndNormalize("read_file",
+            "{\"path\":\"signup.py\",\"run_as_cwd\":\"python signup.py\"}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(contract.IsValid, contract.ErrorText);
+        Assert.Single(contract.Warnings);
+        Assert.DoesNotContain("run_as_cwd", contract.NormalizedArgumentsJson);
+        var result = ProjectToolContract.AttachWarnings(contract, new CommanderToolResult("file contents"));
+        Assert.StartsWith("TOOL_ARGUMENT_NORMALIZED", result.ResultText);
+        Assert.Contains("never executes", result.ResultText);
+    }
+
+    [Fact]
+    public void UpdatePlan_ObjectSteps_AreReducedToText()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("update_plan",
+            "{\"focus\":\"publish\",\"nextSteps\":[{\"step\":\"open browser\"},{\"description\":\"upload draft\"}]}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var steps = (JArray)JObject.Parse(result.NormalizedArgumentsJson!)["nextSteps"]!;
+        Assert.Equal(new[] { "open browser", "upload draft" }, steps.Values<string>());
+    }
+
+    [Fact]
+    public void UpdatePlan_UnknownObjectShape_IsRejectedInsteadOfGuessed()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("update_plan",
+            "{\"nextSteps\":[{\"owner\":\"agent-1\",\"status\":\"pending\"}]}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.False(result.IsValid);
+        Assert.Equal(ProjectToolContract.TypeMismatch, result.Error!.Code);
+    }
+
+    [Fact]
+    public void UpdatePlan_NumberedMultilineString_IsSplitIntoSteps()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("update_plan",
+            "{\"nextSteps\":\"1. Inspect inbox\\n2) Enter code\\n- verify profile\"}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var steps = (JArray)JObject.Parse(result.NormalizedArgumentsJson!)["nextSteps"]!;
+        Assert.Equal(new[] { "Inspect inbox", "Enter code", "verify profile" }, steps.Values<string>());
+    }
+
+    [Fact]
+    public void ObservableSetOperation_IsInferredFromValue()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("update_observable",
+            "{\"name\":\"posts published\",\"value\":\"4\"}",
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        var normalized = JObject.Parse(result.NormalizedArgumentsJson!);
+        Assert.Equal("set", (string?)normalized["op"]);
+        Assert.Equal(4d, (double?)normalized["value"]);
+    }
+
+    [Fact]
+    public void PreviouslyMissingCompatibilityToolsAndFields_AreOffered()
+    {
+        var tools = ProjectCommanderAgent.BuildCoreToolDefinitions();
+        Assert.Contains(tools, t => t.function.name == "search_code");
+
+        var human = ProjectToolContract.ValidateAndNormalize("request_human",
+            "{\"title\":\"Captcha\",\"description\":\"Complete the visible challenge\"}", tools);
+        var checkpoint = ProjectToolContract.ValidateAndNormalize("update_checkpoint",
+            "{\"op\":\"set_blocker\",\"blockerSummary\":\"SMS verification required\"}", tools);
+        Assert.True(human.IsValid, human.ErrorText);
+        Assert.True(checkpoint.IsValid, checkpoint.ErrorText);
+    }
+
+    [Fact]
+    public void EqualLegacyAndCanonicalAliases_AreDeduplicated()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("run_bash",
+            "{\"command\":\"pwd\",\"script\":\"pwd\"}", ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        Assert.Equal("{\"script\":\"pwd\"}", result.NormalizedArgumentsJson);
+    }
+
+    [Fact]
     public void LegacyAndCanonicalNamesTogether_AreRejectedWithoutChoosingOne()
     {
         var result = ProjectToolContract.ValidateAndNormalize("run_bash",
@@ -60,6 +187,29 @@ public class ProjectToolContractTests
         Assert.Null(array.NormalizedArgumentsJson);
     }
 
+    [Theory]
+    [InlineData("{\"path\":\"a.txt\"}}")]
+    [InlineData("{\"path\":\"a.txt\"")]
+    [InlineData("{\"path\":\"a.txt\",\"path\":\"a.txt\"}")]
+    public void MechanicallySafeJsonEnvelopeDefects_AreRepaired(string json)
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("read_file", json,
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.True(result.IsValid, result.ErrorText);
+        Assert.Equal("a.txt", (string?)JObject.Parse(result.NormalizedArgumentsJson!)["path"]);
+    }
+
+    [Fact]
+    public void ConflictingDuplicateProperties_RemainRejected()
+    {
+        var result = ProjectToolContract.ValidateAndNormalize("read_file",
+            "{\"path\":\"a.txt\",\"path\":\"b.txt\"}", ProjectCommanderAgent.BuildCoreToolDefinitions());
+
+        Assert.False(result.IsValid);
+        Assert.Equal(ProjectToolContract.InvalidJson, result.Error!.Code);
+    }
+
     [Fact]
     public void RequiredFields_AreValidated()
     {
@@ -75,7 +225,6 @@ public class ProjectToolContractTests
 
     [Theory]
     [InlineData("{\"value\":12}", "string")]
-    [InlineData("{\"value\":\"12\"}", "number")]
     [InlineData("{\"value\":1.5}", "integer")]
     [InlineData("{\"value\":0}", "boolean")]
     [InlineData("{\"value\":{}}", "array")]

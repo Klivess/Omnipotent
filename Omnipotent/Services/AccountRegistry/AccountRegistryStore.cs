@@ -50,6 +50,15 @@ namespace Omnipotent.Services.AccountRegistry
             rootKeyPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.AccountRegistryRootKeyFile);
         }
 
+        internal AccountRegistryStore(Action<string> log, string indexPath, string rootKeyPath)
+        {
+            this.log = log ?? (_ => { });
+            this.indexPath = Path.GetFullPath(indexPath);
+            this.rootKeyPath = Path.GetFullPath(rootKeyPath);
+            Directory.CreateDirectory(Path.GetDirectoryName(this.indexPath)!);
+            Directory.CreateDirectory(Path.GetDirectoryName(this.rootKeyPath)!);
+        }
+
         // ── service normalization / dedup key ──
 
         /// <summary>
@@ -385,21 +394,18 @@ namespace Omnipotent.Services.AccountRegistry
             lock (rootKeyGate)
             {
                 if (rootKey != null) return rootKey;
-                if (File.Exists(rootKeyPath))
-                {
-                    rootKey = File.ReadAllBytes(rootKeyPath);
-                    if (rootKey.Length != RootKeyBytes)
-                        throw new InvalidOperationException($"Account registry root key is corrupt ({rootKey.Length} bytes).");
-                }
-                else
-                {
-                    rootKey = RandomNumberGenerator.GetBytes(RootKeyBytes);
-                    File.WriteAllBytes(rootKeyPath, rootKey);
-                    RestrictKeyFilePermissions(rootKeyPath);
-                    log("AccountRegistry: generated a new root key.");
-                }
+                rootKey = AtomicSecretRootKey.LoadOrCreate(rootKeyPath, RootKeyBytes,
+                    HasEncryptedSecretsOnDisk, RestrictKeyFilePermissions, log, "AccountRegistry");
                 return rootKey;
             }
+        }
+
+        private bool HasEncryptedSecretsOnDisk()
+        {
+            if (!File.Exists(indexPath)) return false;
+            var accounts = JsonConvert.DeserializeObject<List<RegisteredAccount>>(File.ReadAllText(indexPath))
+                ?? new List<RegisteredAccount>();
+            return accounts.Any(a => a.Secrets.Any(s => !string.IsNullOrWhiteSpace(s.CipherB64)));
         }
 
         private byte[] DeriveAccountKey(string accountID)

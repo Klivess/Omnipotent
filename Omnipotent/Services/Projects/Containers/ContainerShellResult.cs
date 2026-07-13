@@ -37,7 +37,7 @@ namespace Omnipotent.Services.Projects.Containers
         {
             string value = string.IsNullOrWhiteSpace(requested) ? "/project" : requested.Trim().Replace('\\', '/');
             if (!value.StartsWith('/'))
-                throw new ArgumentException("workingDirectory must be an absolute path under /project or /home/agent.");
+                throw new ArgumentException("workingDirectory must be an absolute path under /project, /home/agent, or /agent-runtime.");
 
             var parts = new List<string>();
             foreach (string part in value.Split('/', StringSplitOptions.RemoveEmptyEntries))
@@ -55,7 +55,10 @@ namespace Omnipotent.Services.Projects.Containers
             string normalized = "/" + string.Join('/', parts);
             if (normalized != "/project" && !normalized.StartsWith("/project/", StringComparison.Ordinal) &&
                 normalized != "/home/agent" && !normalized.StartsWith("/home/agent/", StringComparison.Ordinal))
-                throw new ArgumentException("workingDirectory must stay under /project or /home/agent.");
+            {
+                if (normalized != "/agent-runtime" && !normalized.StartsWith("/agent-runtime/", StringComparison.Ordinal))
+                    throw new ArgumentException("workingDirectory must stay under /project, /home/agent, or /agent-runtime.");
+            }
             return normalized;
         }
     }

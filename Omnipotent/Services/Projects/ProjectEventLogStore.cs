@@ -62,8 +62,33 @@ namespace Omnipotent.Services.Projects
                     evt.PayloadJson = TruncateUtf8(evt.PayloadJson, MaxPayloadBytes - 64) + "…(truncated)";
 
                 string path = LogPath(evt.ProjectID);
-                long offset = File.Exists(path) ? new FileInfo(path).Length : 0;
-                File.AppendAllText(path, JsonConvert.SerializeObject(evt) + Environment.NewLine);
+                // This is the project's source of truth, including side-effecting tool-call/result
+                // pairs. Flush the complete JSONL record to disk before publishing it so a process
+                // restart cannot acknowledge an event that existed only in an OS write buffer.
+                byte[] record = System.Text.Encoding.UTF8.GetBytes(
+                    JsonConvert.SerializeObject(evt) + Environment.NewLine);
+                long offset;
+                using (var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read,
+                           bufferSize: 4096, FileOptions.WriteThrough))
+                {
+                    long end = fs.Seek(0, SeekOrigin.End);
+                    if (end > 0)
+                    {
+                        fs.Seek(-1, SeekOrigin.End);
+                        int last = fs.ReadByte();
+                        fs.Seek(0, SeekOrigin.End);
+                        if (last != '\n')
+                        {
+                            // A hard stop can leave one incomplete trailing JSON record. Isolate
+                            // it before this append; otherwise both records become one unreadable
+                            // line and the first post-restart event disappears with the tail.
+                            fs.WriteByte((byte)'\n');
+                        }
+                    }
+                    offset = fs.Position;
+                    fs.Write(record, 0, record.Length);
+                    fs.Flush(flushToDisk: true);
+                }
                 seqCache[evt.ProjectID] = next;
                 var offsets = sparseOffsets.GetOrAdd(evt.ProjectID, _ => new());
                 if ((next - 1) % SparseStride == 0) offsets.Add((next, offset));

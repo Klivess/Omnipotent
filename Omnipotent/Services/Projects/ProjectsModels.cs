@@ -59,7 +59,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>Maximum concurrent agents (Commander + sub-agents + one-level helpers).</summary>
         public int SubAgentCap { get; set; } = 5;
 
-        public DesktopAllocationMode DesktopAllocation { get; set; } = DesktopAllocationMode.SharedDesktopWithInputLock;
+        /// <summary>
+        /// Every agent gets its own long-lived browser profile and desktop by default. Shared
+        /// desktops remain available as an explicit resource-saving mode, but are a poor default:
+        /// one worker can otherwise steal focus, cookies, tabs, or keyboard state from another.
+        /// </summary>
+        public DesktopAllocationMode DesktopAllocation { get; set; } = DesktopAllocationMode.PerAgentContainers;
         /// <summary>Discord #project channel; 0 until Phase 5 creates it.</summary>
         public ulong DiscordChannelID { get; set; }
         public DateTime? CompletedAt { get; set; }
@@ -107,6 +112,7 @@ namespace Omnipotent.Services.Projects
         public const string AgentThought = "agent-thought";            // sub-agent intermediate prose during a wake
         public const string CommanderMessage = "commander-message";    // prose addressed to Klives
         public const string KlivesMessage = "klives-message";          // Klives → Commander (website chat or Discord reply)
+        public const string HumanAssistanceRequested = "human-assistance-requested"; // one durable, de-duplicated human-only request
         public const string AgentMessage = "agent-message";            // inter-agent message riding the bus
         public const string ToolCall = "tool-call";
         public const string ToolResult = "tool-result";
@@ -121,7 +127,9 @@ namespace Omnipotent.Services.Projects
         public const string DigestRebuilt = "digest-rebuilt";
         public const string HookChanged = "hook-changed";              // stimulus hook CRUD is itself an event (§5.1)
         public const string ObservableChanged = "observable-changed";  // a named live value shown to Klives was created/updated/deleted
-        public const string WatchdogEscalation = "watchdog-escalation";
+        public const string WatchdogRecovery = "watchdog-recovery";     // an automatic recovery was actually initiated
+        public const string WatchdogReminder = "watchdog-reminder";     // one durable reminder for an aged approval gate
+        public const string WatchdogEscalation = "watchdog-escalation"; // automatic recovery was exhausted / human attention requested
         public const string CouncilConvened = "council-convened";      // Commander raised an adversarial council on a topic
         public const string CouncilStatement = "council-statement";    // one panelist's opening/rebuttal, or the Chair's synthesis
         public const string CouncilVerdict = "council-verdict";        // the council's synthesized recommendation

@@ -46,6 +46,9 @@ namespace Omnipotent.Services.Projects
         public string Purpose { get; set; } = "decision";
         public string Topic { get; set; } = "";
         public string Briefing { get; set; } = "";
+        /// <summary>Stable hash of the normalized topic + briefing. It lets the store reject an
+        /// identical deliberation before another seven model calls are spent.</summary>
+        public string InputFingerprint { get; set; } = "";
         /// <summary>"routine" | "elevated" | "critical".</summary>
         public string Urgency { get; set; } = "routine";
         /// <summary>The panelist roles (excludes the always-present Chair).</summary>
@@ -94,6 +97,53 @@ namespace Omnipotent.Services.Projects
             lock (LockFor(session.ProjectID))
             {
                 var all = LoadLocked(session.ProjectID);
+                all.RemoveAll(s => s.CouncilID == session.CouncilID);
+                all.Add(session);
+                TrimLocked(all);
+                SaveLocked(session.ProjectID, all);
+                return Clone(session);
+            }
+        }
+
+        /// <summary>
+        /// Atomically applies duplicate/wake/day guardrails and persists a new running session.
+        /// Keeping the checks and append under one project lock prevents overlapping wakes from
+        /// both observing spare capacity and overspending it.
+        /// </summary>
+        public CouncilSession? TryCreateWithGuards(CouncilSession session, int maxPerWake, int maxPerDay,
+            out string? refusal)
+        {
+            refusal = null;
+            lock (LockFor(session.ProjectID))
+            {
+                var all = LoadLocked(session.ProjectID);
+                DateTime now = DateTime.UtcNow;
+                if (!string.IsNullOrWhiteSpace(session.InputFingerprint))
+                {
+                    var duplicate = all.OrderByDescending(s => s.CreatedAt).FirstOrDefault(s =>
+                        string.Equals(s.InputFingerprint, session.InputFingerprint, StringComparison.Ordinal)
+                        && s.CreatedAt >= now.AddHours(-24)
+                        && s.Status is CouncilStatus.Running or CouncilStatus.Completed);
+                    if (duplicate != null)
+                    {
+                        refusal = $"Duplicate council blocked: council {duplicate.CouncilID} already considered this same topic and briefing. " +
+                            "Act on its verdict, or supply a materially updated briefing containing the new evidence or changed decision.";
+                        return null;
+                    }
+                }
+                if (maxPerWake > 0 && !string.IsNullOrEmpty(session.WakeID)
+                    && all.Count(s => s.WakeID == session.WakeID) >= maxPerWake)
+                {
+                    refusal = $"Council limit for this wake reached ({maxPerWake}). Act on the verdict you already have, or wait for the next wake.";
+                    return null;
+                }
+                if (maxPerDay > 0 && all.Count(s => s.CreatedAt >= now.Date) >= maxPerDay)
+                {
+                    refusal = $"Daily council limit reached ({maxPerDay}). Councils cost real tokens — decide with what you have, or convene tomorrow.";
+                    return null;
+                }
+
+                if (string.IsNullOrWhiteSpace(session.CouncilID)) session.CouncilID = Guid.NewGuid().ToString("N");
                 all.RemoveAll(s => s.CouncilID == session.CouncilID);
                 all.Add(session);
                 TrimLocked(all);

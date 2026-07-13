@@ -53,6 +53,21 @@ public class ExecutionUnblockTests
         Assert.DoesNotContain("`1", reference, StringComparison.Ordinal); // no raw generic arity
     }
 
+    [Fact]
+    public void ReflectionMembers_ExposeConventionalCompatibilityAliases()
+    {
+        var member = new Omnipotent.Services.KliveAgent.Models.AgentObjectMember
+        {
+            Kind = "method", Type = "Task<string>", Name = "Fetch",
+        };
+
+        Assert.Equal("method", member.MemberType);
+        Assert.Equal("Task<string>", member.TypeName);
+        Assert.NotNull(typeof(ProjectCommanderTools.WorkScriptGlobals).GetProperty("Globals"));
+        Assert.NotNull(typeof(ProjectCommanderTools.WorkScriptGlobals).GetMethod("RunBashAsync"));
+        Assert.NotNull(typeof(ProjectCommanderTools.WorkScriptGlobals).GetMethod("ToSafeJson"));
+    }
+
     // ── WS3: verification-code extraction ──
 
     [Theory]

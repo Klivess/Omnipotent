@@ -105,6 +105,48 @@ namespace Omnipotent.Tests.Projects
             string script = File.ReadAllText(scriptPath);
             Assert.Contains("Accessibility.getFullAXTree", script);
             Assert.Contains("performance.getEntriesByType", script);
+            Assert.DoesNotContain("x.value", script);
+            var inspect = VisualComputerToolCatalog.Build(new ComputerCapabilities { SupportsBrowserControl = true })
+                .Single(t => t.function.name == "computer_browser_inspect");
+            Assert.Contains("tabIndex", System.Text.Json.JsonSerializer.Serialize(inspect.function.parameters));
+            Assert.Contains("interceptedBy", script);
+            Assert.Contains("elementFromPoint", script);
+            Assert.DoesNotContain("Input.dispatch", script);
+        }
+
+        [Fact]
+        public void ProjectCatalog_OffersPhysicalSemanticBrowserClick()
+        {
+            var tool = ProjectCommanderAgent.BuildComputerToolDefinitions()
+                .Single(t => t.function.name == "computer_click_browser_control");
+            string schema = System.Text.Json.JsonSerializer.Serialize(tool.function.parameters);
+            Assert.Contains("name", schema);
+            Assert.Contains("role", schema);
+            Assert.Contains("modifiers", schema);
+
+            var router = new ProjectTierRouter(new ProjectSettingsStore());
+            Assert.True(router.IsToolAllowed(ProjectAgentTier.Text, "computer_click_browser_control"));
+        }
+
+        [Fact]
+        public void ClickTextContract_AcceptsKeyboardModifiers()
+        {
+            var clickText = VisualComputerToolCatalog.Build(new ComputerCapabilities { SupportsOcr = true })
+                .Single(t => t.function.name == "computer_click_text");
+            string schema = System.Text.Json.JsonSerializer.Serialize(clickText.function.parameters);
+
+            Assert.Contains("modifiers", schema);
+            Assert.Contains("array", schema);
+        }
+
+        [Fact]
+        public void PublishedDesktopContext_ContainsEveryDockerCopyDependency()
+        {
+            string context = Omnipotent.Services.Projects.Containers.ContainerDesktopManager.ResolveBuildContextDirectory();
+            foreach (string name in Omnipotent.Services.Projects.Containers.ContainerOrchestrator.DesktopBuildContextFiles)
+                Assert.True(File.Exists(Path.Combine(context, name)), $"Missing desktop build asset: {name} in {context}");
+            Assert.Contains("browser-inspect.py",
+                Omnipotent.Services.Projects.Containers.ContainerOrchestrator.DesktopBuildContextFiles);
         }
 
         [Fact]

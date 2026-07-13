@@ -17,12 +17,22 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum RiskSeverity { Low, Medium, High }
 
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum PlanRiskStatus { Open, Mitigated, Accepted }
+
+    /// <summary>Validation state for an assumption that must hold before execution can advance.</summary>
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum PlanPreconditionStatus { Unverified, Verified, Failed }
+
     /// <summary>Evidence supporting a milestone/criterion transition; references remain stable in the event/file/artifact stores.</summary>
     public class PlanEvidence
     {
         public string Summary { get; set; } = "";
         public long? EventSequence { get; set; }
         public List<string> ArtifactIDs { get; set; } = new();
+        /// <summary>An approval-gate reference. Used when Klives explicitly accepts a risk in a
+        /// material plan; agents cannot manufacture this reference through progress updates.</summary>
+        public string? GateID { get; set; }
         public string RecordedBy { get; set; } = "";
         public DateTime RecordedAt { get; set; } = DateTime.UtcNow;
     }
@@ -75,6 +85,22 @@ namespace Omnipotent.Services.Projects
         public string Description { get; set; } = "";
         public RiskSeverity Severity { get; set; } = RiskSeverity.Medium;
         public string Mitigation { get; set; } = "";
+        public PlanRiskStatus Status { get; set; } = PlanRiskStatus.Open;
+        /// <summary>True for a legality, policy, safety, rights, or irreversible-risk decision
+        /// that must be resolved before execution can advance.</summary>
+        public bool BlocksExecution { get; set; }
+        public DateTime? UpdatedAt { get; set; }
+        public List<PlanEvidence> Evidence { get; set; } = new();
+    }
+
+    public class PlanPrecondition
+    {
+        public string ID { get; set; } = "";
+        public string Description { get; set; } = "";
+        public string Verification { get; set; } = "";
+        public PlanPreconditionStatus Status { get; set; } = PlanPreconditionStatus.Unverified;
+        public DateTime? UpdatedAt { get; set; }
+        public List<PlanEvidence> Evidence { get; set; } = new();
     }
 
     /// <summary>
@@ -90,6 +116,8 @@ namespace Omnipotent.Services.Projects
         public List<PlanWorkstream> Workstreams { get; set; } = new();
         public List<PlanMilestone> Milestones { get; set; } = new();
         public List<PlanRisk> Risks { get; set; } = new();
+        /// <summary>Go/no-go assumptions proven against reality before milestones may advance.</summary>
+        public List<PlanPrecondition> Preconditions { get; set; } = new();
         public List<PlanCriterion> SuccessCriteria { get; set; } = new();
         /// <summary>Prose budget plan; live actuals come from the ProjectBudgetLedger, not here.</summary>
         public string BudgetPlan { get; set; } = "";
@@ -162,13 +190,18 @@ namespace Omnipotent.Services.Projects
         public GrandPlanVersion SubmitVersion(string projectID, GrandPlanContent content, string summary,
             string? changeNote, bool material, string? wakeID)
         {
-            if (content == null || string.IsNullOrWhiteSpace(content.Mission))
+            if (content == null)
+                throw new InvalidOperationException("Grand Plan must have a mission.");
+            NormalizeContent(content);
+            if (string.IsNullOrWhiteSpace(content.Mission))
                 throw new InvalidOperationException("Grand Plan must have a mission.");
             lock (LockFor(projectID))
             {
                 var doc = LoadLocked(projectID);
-                AssignIds(content, CurrentApprovedLocked(doc)?.Content);
+                var previous = CurrentApprovedLocked(doc)?.Content;
+                AssignIds(content, previous);
                 ValidateDependencyGraph(content);
+                ValidateSubmittedState(content, previous, material);
                 int next = doc.Versions.Count == 0 ? 1 : doc.Versions.Max(v => v.Version) + 1;
                 var version = new GrandPlanVersion
                 {
@@ -208,6 +241,23 @@ namespace Omnipotent.Services.Projects
                 v.GateID = gateID;
                 v.KlivesComment = comment;
                 v.ResolvedAt = DateTime.UtcNow;
+                if (v.Content != null)
+                {
+                    foreach (var risk in v.Content.Risks.Where(r => r.Status == PlanRiskStatus.Accepted
+                        && !HasEvidenceReference(r.Evidence)))
+                    {
+                        if (string.IsNullOrWhiteSpace(gateID))
+                            throw new InvalidOperationException("An accepted risk requires a durable approval gate reference.");
+                        risk.Evidence.Add(new PlanEvidence
+                        {
+                            Summary = "Risk explicitly accepted by Klives as part of this material Grand Plan approval.",
+                            GateID = gateID,
+                            RecordedBy = "klives",
+                        });
+                        risk.UpdatedAt = DateTime.UtcNow;
+                    }
+                    v.Markdown = RenderMarkdown(v.Content);
+                }
                 SaveLocked(projectID, doc);
             }
         }
@@ -245,6 +295,16 @@ namespace Omnipotent.Services.Projects
                 if (m == null) return null;
                 if (status is MilestoneStatus.InProgress or MilestoneStatus.Done)
                 {
+                    var unverifiedPreconditions = v!.Content!.Preconditions
+                        .Where(x => x.Status != PlanPreconditionStatus.Verified || !HasEvidenceReference(x.Evidence))
+                        .Select(x => x.ID).ToList();
+                    if (unverifiedPreconditions.Count > 0)
+                        throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance until plan preconditions are verified: {string.Join(", ", unverifiedPreconditions)}.");
+                    var openBlockingRisks = v.Content.Risks.Where(x => x.BlocksExecution
+                            && (x.Status == PlanRiskStatus.Open || !HasEvidenceReference(x.Evidence)))
+                        .Select(x => x.ID).ToList();
+                    if (openBlockingRisks.Count > 0)
+                        throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance while blocking risks remain open: {string.Join(", ", openBlockingRisks)}.");
                     var unmet = m.DependsOn.Where(dep => v!.Content!.Milestones
                         .FirstOrDefault(x => string.Equals(x.ID, dep, StringComparison.OrdinalIgnoreCase))?.Status != MilestoneStatus.Done).ToList();
                     if (unmet.Count > 0)
@@ -252,6 +312,9 @@ namespace Omnipotent.Services.Projects
                 }
                 if (status == MilestoneStatus.Blocked && string.IsNullOrWhiteSpace(blockReason))
                     throw new InvalidOperationException("A blocked milestone requires a block reason.");
+                if (status == MilestoneStatus.Done && !HasEvidenceReference(evidence)
+                    && !HasEvidenceReference(m.Evidence))
+                    throw new InvalidOperationException("A completed milestone requires evidence with a durable event, artifact, or approval-gate reference.");
                 m.Status = status;
                 m.BlockReason = status == MilestoneStatus.Blocked ? blockReason!.Trim() : null;
                 if (!string.IsNullOrWhiteSpace(ownerAgentID)) m.OwnerAgentID = ownerAgentID.Trim();
@@ -276,11 +339,58 @@ namespace Omnipotent.Services.Projects
                     string.Equals(x.ID, criterionRef, StringComparison.OrdinalIgnoreCase)
                     || string.Equals(x.Text, criterionRef, StringComparison.OrdinalIgnoreCase));
                 if (c == null) return null;
+                if (met && !HasEvidenceReference(evidence) && !HasEvidenceReference(c.Evidence))
+                    throw new InvalidOperationException("A met success criterion requires evidence with a durable event, artifact, or approval-gate reference.");
                 c.Met = met;
                 if (evidence != null) c.Evidence.Add(CloneJson(evidence));
                 c.UpdatedAt = DateTime.UtcNow;
                 SaveLocked(projectID, doc);
                 return CloneJson(c);
+            }
+        }
+
+        public PlanPrecondition? SetPreconditionStatus(string projectID, string preconditionRef,
+            PlanPreconditionStatus status, PlanEvidence evidence)
+        {
+            ArgumentNullException.ThrowIfNull(evidence);
+            EnsureEvidenceReference(evidence, "A precondition decision");
+            lock (LockFor(projectID))
+            {
+                var doc = LoadLocked(projectID);
+                var v = CurrentApprovedLocked(doc);
+                var p = v?.Content?.Preconditions.FirstOrDefault(x =>
+                    string.Equals(x.ID, preconditionRef, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(x.Description, preconditionRef, StringComparison.OrdinalIgnoreCase));
+                if (p == null) return null;
+                p.Status = status;
+                p.Evidence.Add(CloneJson(evidence));
+                p.UpdatedAt = DateTime.UtcNow;
+                SaveLocked(projectID, doc);
+                return CloneJson(p);
+            }
+        }
+
+        public PlanRisk? SetRiskStatus(string projectID, string riskRef, PlanRiskStatus status, PlanEvidence evidence)
+        {
+            ArgumentNullException.ThrowIfNull(evidence);
+            if (status == PlanRiskStatus.Open)
+                throw new InvalidOperationException("Use Mitigated or Accepted when resolving a risk; reopening belongs in a plan amendment.");
+            if (status == PlanRiskStatus.Accepted)
+                throw new InvalidOperationException("Agents cannot accept a risk through a progress update. Put the acceptance in a material Grand Plan amendment for Klives to approve.");
+            EnsureEvidenceReference(evidence, "A mitigated risk");
+            lock (LockFor(projectID))
+            {
+                var doc = LoadLocked(projectID);
+                var v = CurrentApprovedLocked(doc);
+                var risk = v?.Content?.Risks.FirstOrDefault(x =>
+                    string.Equals(x.ID, riskRef, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(x.Description, riskRef, StringComparison.OrdinalIgnoreCase));
+                if (risk == null) return null;
+                risk.Status = status;
+                risk.Evidence.Add(CloneJson(evidence));
+                risk.UpdatedAt = DateTime.UtcNow;
+                SaveLocked(projectID, doc);
+                return CloneJson(risk);
             }
         }
 
@@ -324,9 +434,12 @@ namespace Omnipotent.Services.Projects
             if (v?.Content == null) return new();
             var byId = v.Content.Milestones.ToDictionary(m => m.ID, StringComparer.OrdinalIgnoreCase);
             return v.Content.Milestones
+                .Where(_ => v.Content.Preconditions.All(p => p.Status == PlanPreconditionStatus.Verified && HasEvidenceReference(p.Evidence)))
+                .Where(_ => v.Content.Risks.All(r => !r.BlocksExecution
+                    || r.Status != PlanRiskStatus.Open && HasEvidenceReference(r.Evidence)))
                 .Where(m => m.Status is MilestoneStatus.Pending or MilestoneStatus.InProgress)
                 .Where(m => m.DependsOn.All(dep => byId.TryGetValue(dep, out var prerequisite)
-                    && prerequisite.Status == MilestoneStatus.Done))
+                    && prerequisite.Status == MilestoneStatus.Done && HasEvidenceReference(prerequisite.Evidence)))
                 .OrderBy(m => m.Order).Select(CloneJson).ToList();
         }
 
@@ -337,6 +450,10 @@ namespace Omnipotent.Services.Projects
             var parts = new List<string>();
             if (c.Milestones.Count > 0)
                 parts.Add($"{c.Milestones.Count(m => m.Status == MilestoneStatus.Done)}/{c.Milestones.Count} milestones");
+            if (c.Preconditions.Count > 0)
+                parts.Add($"{c.Preconditions.Count(p => p.Status == PlanPreconditionStatus.Verified)}/{c.Preconditions.Count} preconditions");
+            if (c.Risks.Count > 0)
+                parts.Add($"{c.Risks.Count(r => r.Status != PlanRiskStatus.Open)}/{c.Risks.Count} risks resolved");
             if (c.SuccessCriteria.Count > 0)
                 parts.Add($"{c.SuccessCriteria.Count(x => x.Met)}/{c.SuccessCriteria.Count} criteria");
             return parts.Count == 0 ? "" : $" (progress: {string.Join(", ", parts)})";
@@ -349,13 +466,21 @@ namespace Omnipotent.Services.Projects
             var v = GetCurrentApproved(projectID);
             if (v?.Content == null) return new List<string>();
             var issues = new List<string>();
+            issues.AddRange(v.Content.Preconditions.Where(p => p.Status != PlanPreconditionStatus.Verified)
+                .Select(p => $"precondition {p.ID} '{p.Description}' is {p.Status}"));
+            issues.AddRange(v.Content.Preconditions.Where(p => p.Status == PlanPreconditionStatus.Verified && !HasEvidenceReference(p.Evidence))
+                .Select(p => $"precondition {p.ID} '{p.Description}' has no verification evidence"));
+            issues.AddRange(v.Content.Risks.Where(r => r.Status == PlanRiskStatus.Open && (r.Severity == RiskSeverity.High || r.BlocksExecution))
+                .Select(r => $"risk {r.ID} '{r.Description}' remains open ({r.Severity}{(r.BlocksExecution ? ", blocking" : "")})"));
+            issues.AddRange(v.Content.Risks.Where(r => r.Status != PlanRiskStatus.Open && !HasEvidenceReference(r.Evidence))
+                .Select(r => $"risk {r.ID} '{r.Description}' is {r.Status} without evidence"));
             issues.AddRange(v.Content.Milestones.Where(m => m.Status != MilestoneStatus.Done)
                 .Select(m => $"milestone {m.ID} '{m.Title}' is {m.Status}"));
             issues.AddRange(v.Content.SuccessCriteria.Where(c => !c.Met)
                 .Select(c => $"criterion {c.ID} '{c.Text}' is unmet"));
-            issues.AddRange(v.Content.Milestones.Where(m => m.Status == MilestoneStatus.Done && m.Evidence.Count == 0)
+            issues.AddRange(v.Content.Milestones.Where(m => m.Status == MilestoneStatus.Done && !HasEvidenceReference(m.Evidence))
                 .Select(m => $"milestone {m.ID} '{m.Title}' has no completion evidence"));
-            issues.AddRange(v.Content.SuccessCriteria.Where(c => c.Met && c.Evidence.Count == 0)
+            issues.AddRange(v.Content.SuccessCriteria.Where(c => c.Met && !HasEvidenceReference(c.Evidence))
                 .Select(c => $"criterion {c.ID} '{c.Text}' has no evidence"));
             return issues;
         }
@@ -368,13 +493,14 @@ namespace Omnipotent.Services.Projects
             => doc.Versions.Where(v => v.Status == GrandPlanVersionStatus.Approved)
                            .OrderByDescending(v => v.Version).FirstOrDefault();
 
-        /// <summary>Assigns stable per-version ids (m1.., c1.., r1.., w1..) and milestone display order.</summary>
+        /// <summary>Assigns stable per-version ids (m1.., c1.., r1.., w1.., p1..) and milestone display order.</summary>
         private static void AssignIds(GrandPlanContent c, GrandPlanContent? previous)
         {
             int nextW = NextId(previous?.Workstreams.Select(x => x.ID), "w");
             int nextM = NextId(previous?.Milestones.Select(x => x.ID), "m");
             int nextR = NextId(previous?.Risks.Select(x => x.ID), "r");
             int nextC = NextId(previous?.SuccessCriteria.Select(x => x.ID), "c");
+            int nextP = NextId(previous?.Preconditions.Select(x => x.ID), "p");
             foreach (var w in c.Workstreams)
                 w.ID = previous?.Workstreams.FirstOrDefault(x => string.Equals(x.Name, w.Name, StringComparison.OrdinalIgnoreCase))?.ID ?? "w" + nextW++;
             for (int i = 0; i < c.Milestones.Count; i++)
@@ -398,7 +524,27 @@ namespace Omnipotent.Services.Projects
                         || string.Equals(x.Title, dep, StringComparison.OrdinalIgnoreCase))?.ID
                     ?? dep).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             foreach (var r in c.Risks)
-                r.ID = previous?.Risks.FirstOrDefault(x => string.Equals(x.Description, r.Description, StringComparison.OrdinalIgnoreCase))?.ID ?? "r" + nextR++;
+            {
+                var old = previous?.Risks.FirstOrDefault(x => string.Equals(x.Description, r.Description, StringComparison.OrdinalIgnoreCase));
+                r.ID = old?.ID ?? "r" + nextR++;
+                if (old != null)
+                {
+                    if (r.Status == PlanRiskStatus.Open) r.Status = old.Status;
+                    if (r.Evidence.Count == 0) r.Evidence = CloneJson(old.Evidence);
+                    r.BlocksExecution |= old.BlocksExecution;
+                }
+            }
+            foreach (var precondition in c.Preconditions)
+            {
+                var old = previous?.Preconditions.FirstOrDefault(x =>
+                    string.Equals(x.Description, precondition.Description, StringComparison.OrdinalIgnoreCase));
+                precondition.ID = old?.ID ?? "p" + nextP++;
+                if (old != null)
+                {
+                    if (precondition.Status == PlanPreconditionStatus.Unverified) precondition.Status = old.Status;
+                    if (precondition.Evidence.Count == 0) precondition.Evidence = CloneJson(old.Evidence);
+                }
+            }
             foreach (var criterion in c.SuccessCriteria)
             {
                 var old = previous?.SuccessCriteria.FirstOrDefault(x => string.Equals(x.Text, criterion.Text, StringComparison.OrdinalIgnoreCase));
@@ -450,6 +596,48 @@ namespace Omnipotent.Services.Projects
                 throw new InvalidOperationException("Grand Plan milestone dependencies contain a cycle.");
         }
 
+        private static void ValidateSubmittedState(GrandPlanContent content, GrandPlanContent? previous, bool material)
+        {
+            foreach (var milestone in content.Milestones)
+            {
+                if (milestone.Status == MilestoneStatus.Done && !HasEvidenceReference(milestone.Evidence))
+                    throw new InvalidOperationException($"Milestone '{milestone.Title}' is marked done without durable evidence. Carry forward evidence-backed state or submit it pending.");
+                if (milestone.Status == MilestoneStatus.Blocked && string.IsNullOrWhiteSpace(milestone.BlockReason))
+                    throw new InvalidOperationException($"Milestone '{milestone.Title}' is marked blocked without a block reason.");
+            }
+            foreach (var criterion in content.SuccessCriteria.Where(c => c.Met && !HasEvidenceReference(c.Evidence)))
+                throw new InvalidOperationException($"Success criterion '{criterion.Text}' is marked met without durable evidence.");
+            foreach (var precondition in content.Preconditions.Where(p => p.Status != PlanPreconditionStatus.Unverified
+                && !HasEvidenceReference(p.Evidence)))
+                throw new InvalidOperationException($"Precondition '{precondition.Description}' has a terminal status without durable evidence.");
+            foreach (var risk in content.Risks.Where(r => r.Status == PlanRiskStatus.Mitigated
+                && !HasEvidenceReference(r.Evidence)))
+                throw new InvalidOperationException($"Risk '{risk.Description}' is marked mitigated without durable evidence.");
+
+            foreach (var accepted in content.Risks.Where(r => r.Status == PlanRiskStatus.Accepted))
+            {
+                bool wasAlreadyAccepted = previous?.Risks.Any(old =>
+                    string.Equals(old.Description, accepted.Description, StringComparison.OrdinalIgnoreCase)
+                    && old.Status == PlanRiskStatus.Accepted && HasEvidenceReference(old.Evidence)) == true;
+                if (!wasAlreadyAccepted && !material)
+                    throw new InvalidOperationException($"Accepting risk '{accepted.Description}' is material and requires Klives' approval.");
+            }
+        }
+
+        private static bool HasEvidenceReference(PlanEvidence? evidence) => evidence != null
+            && !string.IsNullOrWhiteSpace(evidence.Summary)
+            && (evidence.EventSequence is > 0 || evidence.ArtifactIDs.Any(x => !string.IsNullOrWhiteSpace(x))
+                || !string.IsNullOrWhiteSpace(evidence.GateID));
+
+        private static bool HasEvidenceReference(IEnumerable<PlanEvidence>? evidence) =>
+            evidence?.Any(HasEvidenceReference) == true;
+
+        private static void EnsureEvidenceReference(PlanEvidence evidence, string subject)
+        {
+            if (!HasEvidenceReference(evidence))
+                throw new InvalidOperationException($"{subject} requires a concise summary and a durable event, artifact, or approval-gate reference.");
+        }
+
         /// <summary>Renders structured content to canonical markdown for text consumers (wake seeds, Discord, get_grand_plan).</summary>
         public static string RenderMarkdown(GrandPlanContent c)
         {
@@ -484,11 +672,26 @@ namespace Omnipotent.Services.Projects
                 }
                 sb.AppendLine();
             }
+            if (c.Preconditions.Count > 0)
+            {
+                sb.AppendLine("## Preconditions");
+                foreach (var p in c.Preconditions)
+                {
+                    string box = p.Status == PlanPreconditionStatus.Verified ? "[x]"
+                        : p.Status == PlanPreconditionStatus.Failed ? "[!]" : "[ ]";
+                    sb.AppendLine($"- {box} **{p.Description}**" +
+                        (string.IsNullOrWhiteSpace(p.Verification) ? "" : $" — verify: {p.Verification}") +
+                        (p.Evidence.Count > 0 ? $" [evidence: {p.Evidence.Count}]" : ""));
+                }
+                sb.AppendLine();
+            }
             if (c.Risks.Count > 0)
             {
                 sb.AppendLine("## Risks");
                 foreach (var r in c.Risks)
-                    sb.AppendLine($"- **[{r.Severity}]** {r.Description}" + (string.IsNullOrWhiteSpace(r.Mitigation) ? "" : $" → {r.Mitigation}"));
+                    sb.AppendLine($"- **[{r.Severity}/{r.Status}{(r.BlocksExecution ? "/BLOCKING" : "")}]** {r.Description}" +
+                        (string.IsNullOrWhiteSpace(r.Mitigation) ? "" : $" → {r.Mitigation}") +
+                        (r.Evidence.Count > 0 ? $" [evidence: {r.Evidence.Count}]" : ""));
                 sb.AppendLine();
             }
             if (c.SuccessCriteria.Count > 0)
@@ -514,13 +717,79 @@ namespace Omnipotent.Services.Projects
             if (!File.Exists(path)) return new GrandPlanDocument { ProjectID = projectID };
             try
             {
-                return JsonConvert.DeserializeObject<GrandPlanDocument>(File.ReadAllText(path))
-                       ?? new GrandPlanDocument { ProjectID = projectID };
+                var document = JsonConvert.DeserializeObject<GrandPlanDocument>(File.ReadAllText(path))
+                               ?? new GrandPlanDocument { ProjectID = projectID };
+                NormalizeDocument(document, projectID);
+                return document;
             }
             catch (Exception ex)
             {
                 log($"ProjectGrandPlanStore: failed to load {path} ({ex.Message}) — starting empty, file preserved.");
                 return new GrandPlanDocument { ProjectID = projectID };
+            }
+        }
+
+        /// <summary>Old plan JSON predates several structured collections. Newtonsoft can also
+        /// assign an explicit JSON null over a property initializer, so normalize every loaded or
+        /// submitted graph before planning logic enumerates it.</summary>
+        private static void NormalizeDocument(GrandPlanDocument document, string projectID)
+        {
+            document.ProjectID = string.IsNullOrWhiteSpace(document.ProjectID) ? projectID : document.ProjectID;
+            document.Versions ??= new();
+            document.Versions = document.Versions.Where(v => v != null).ToList();
+            foreach (var version in document.Versions)
+            {
+                version.Markdown ??= "";
+                version.Summary ??= "";
+                if (version.Content != null) NormalizeContent(version.Content);
+            }
+        }
+
+        private static void NormalizeContent(GrandPlanContent content)
+        {
+            content.Mission ??= "";
+            content.BudgetPlan ??= "";
+            content.Workstreams ??= new();
+            content.Milestones ??= new();
+            content.Risks ??= new();
+            content.Preconditions ??= new();
+            content.SuccessCriteria ??= new();
+            content.Workstreams = content.Workstreams.Where(x => x != null).ToList();
+            content.Milestones = content.Milestones.Where(x => x != null).ToList();
+            content.Risks = content.Risks.Where(x => x != null).ToList();
+            content.Preconditions = content.Preconditions.Where(x => x != null).ToList();
+            content.SuccessCriteria = content.SuccessCriteria.Where(x => x != null).ToList();
+            foreach (var milestone in content.Milestones)
+            {
+                milestone.DependsOn ??= new();
+                milestone.Evidence ??= new();
+                NormalizeEvidence(milestone.Evidence);
+            }
+            foreach (var precondition in content.Preconditions)
+            {
+                precondition.Evidence ??= new();
+                NormalizeEvidence(precondition.Evidence);
+            }
+            foreach (var risk in content.Risks)
+            {
+                risk.Evidence ??= new();
+                NormalizeEvidence(risk.Evidence);
+            }
+            foreach (var criterion in content.SuccessCriteria)
+            {
+                criterion.Evidence ??= new();
+                NormalizeEvidence(criterion.Evidence);
+            }
+        }
+
+        private static void NormalizeEvidence(List<PlanEvidence> evidence)
+        {
+            evidence.RemoveAll(x => x == null);
+            foreach (var item in evidence)
+            {
+                item.Summary ??= "";
+                item.RecordedBy ??= "";
+                item.ArtifactIDs ??= new();
             }
         }
 

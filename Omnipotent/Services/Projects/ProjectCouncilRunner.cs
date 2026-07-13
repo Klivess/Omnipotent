@@ -1,4 +1,6 @@
 using Newtonsoft.Json;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Omnipotent.Services.Projects
 {
@@ -67,10 +69,6 @@ namespace Omnipotent.Services.Projects
             string pid = project.ProjectID;
 
             // ── guardrails ──
-            if (maxPerWake > 0 && store.CountForWake(pid, wakeID) >= maxPerWake)
-                return Refused($"Council limit for this wake reached ({maxPerWake}). Act on the verdict you already have, or wait for the next wake.");
-            if (maxPerDay > 0 && store.CountToday(pid) >= maxPerDay)
-                return Refused($"Daily council limit reached ({maxPerDay}). Councils cost real tokens — decide with what you have, or convene tomorrow.");
             if (IsBudgetPaused?.Invoke(pid) == true)
                 return Refused("The project is budget-paused; a council would overrun the budget. Resolve the budget first.");
 
@@ -83,12 +81,14 @@ namespace Omnipotent.Services.Projects
                 Purpose = string.IsNullOrWhiteSpace(purpose) ? "decision" : purpose.Trim().ToLowerInvariant(),
                 Topic = topic.Trim(),
                 Briefing = briefing,
+                InputFingerprint = InputFingerprint(topic, briefing),
                 Urgency = NormalizeUrgency(urgency),
                 Roles = panel.ToList(),
                 Model = model,
                 Status = CouncilStatus.Running,
             };
-            store.Create(session);
+            if (store.TryCreateWithGuards(session, maxPerWake, maxPerDay, out string? refusal) == null)
+                return Refused(refusal ?? "Council guardrail refused this deliberation.");
 
             AppendEvent(session, ProjectEventTypes.CouncilConvened, "commander",
                 $"Council convened: {Trunc(session.Topic, 140)} — panel: {string.Join(", ", panel)} + Chair.",
@@ -403,6 +403,14 @@ namespace Omnipotent.Services.Projects
         {
             var chars = role.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray();
             return new string(chars).Trim('-');
+        }
+
+        internal static string InputFingerprint(string topic, string briefing)
+        {
+            static string Normalize(string value) => string.Join(' ', (value ?? "")
+                .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
+            byte[] bytes = Encoding.UTF8.GetBytes(Normalize(topic) + "\n" + Normalize(briefing));
+            return Convert.ToHexString(SHA256.HashData(bytes));
         }
 
         internal static CouncilRecommendationClass ParseRecommendationClass(string? verdict)

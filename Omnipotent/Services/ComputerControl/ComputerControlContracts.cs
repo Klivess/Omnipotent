@@ -123,7 +123,7 @@ namespace Omnipotent.Services.ComputerControl
         public static string Truncate(string? value, int max) => string.IsNullOrEmpty(value) ? string.Empty :
             value.Length <= max ? value : value[..max] + "…";
 
-        private static string RedactUrl(string value)
+        public static string RedactUrl(string value)
         {
             if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)) return Truncate(value, 60);
             if (string.IsNullOrEmpty(uri.Query)) return Truncate(uri.GetLeftPart(UriPartial.Path), 60);
@@ -456,7 +456,7 @@ namespace Omnipotent.Services.ComputerControl
             {
                 Tool("computer_screenshot", "Capture the current visual state. The final image has a coordinate grid; measure from it before clicking.", Obj(new { target = Str("active | fullscreen | browser where supported") })),
                 Tool("computer_find_text", "Use local OCR on a fresh screenshot. Returns matching visible text and its clickable centre coordinates; never use it to solve a CAPTCHA.", Obj(new { text = Str("Visible text to find."), occurrence = Num("0-based match index, default 0.") }, "text")),
-                Tool("computer_click_text", "Find visible text with local OCR and click its centre. Reversible UI action only; use the normal approval policy for send/pay/submit actions.", Obj(new { text = Str("Visible text to click."), occurrence = Num("0-based match index, default 0."), button = Str("left | middle | right"), clicks = Num("1 or 2") }, "text")),
+                Tool("computer_click_text", "Find visible text with local OCR and click its centre. Reversible UI action only; use the normal approval policy for send/pay/submit actions.", Obj(new { text = Str("Visible text to click."), occurrence = Num("0-based match index, default 0."), button = Str("left | middle | right"), clicks = Num("1 or 2"), modifiers = stringArray }, "text")),
                 Tool("computer_move", "Move pointer to screenshot coordinates.", Obj(new { x = Num("X pixel"), y = Num("Y pixel") }, "x", "y")),
                 Tool("computer_mouse_move_relative", "Move the pointer by a relative delta from its current position. Use for applications/games that do not respond reliably to an absolute move; dx right and dy down are positive.", Obj(new { dx = Num("Horizontal delta"), dy = Num("Vertical delta"), steps = Num("Optional smoothing steps") }, "dx", "dy")),
                 Tool("computer_click", "Click screenshot coordinates after observing them.", Obj(new { x = Num("X pixel"), y = Num("Y pixel"), button = Str("left | middle | right"), clicks = Num("1 or 2"), modifiers = stringArray }, "x", "y")),
@@ -472,9 +472,9 @@ namespace Omnipotent.Services.ComputerControl
                 Tool("computer_wait", "Wait for visual change or a stable UI. maxMs is preferred; ms remains accepted for compatibility.", Obj(new { maxMs = Num("maximum wait milliseconds"), ms = Num("compatibility alias"), untilImageChange = new { type = "boolean" }, untilText = Str("visible text to wait for") })),
                 Tool("computer_open_browser", "Open or focus the real browser and return an observed frame.", Obj(new { url = Str("optional URL") })),
                 Tool("computer_navigate", "Navigate the real browser by URL, wait for the page to settle, then observe.", Obj(new { url = Str("absolute URL") }, "url")),
-                Tool("computer_browser_inspect", "Inspect the isolated browser structurally instead of guessing from pixels. Returns tabs, DOM text/links/forms, accessibility nodes, or recent network resource timings from the live authenticated page.", Obj(new { mode = Str("tabs | dom | accessibility | network (default dom)"), maxItems = Num("Maximum structured items, 1-200; default 80") })),
+                Tool("computer_browser_inspect", "Inspect the isolated browser structurally instead of guessing from pixels. Returns indexed tabs, DOM text/links/forms, accessibility nodes, or recent network resource timings from the selected live authenticated tab. Input values are never returned.", Obj(new { mode = Str("tabs | dom | accessibility | network (default dom)"), maxItems = Num("Maximum structured items, 1-200; default 80"), tabIndex = Num("0-based index from mode=tabs; default 0") })),
                 Tool("computer_focus_window", "Focus a window by title or process where supported.", Obj(new { titleContains = Str("title fragment"), processName = Str("process name") })),
-                Tool("computer_launch_app", "Launch an allowlisted GUI application and observe it.", Obj(new { path = Str("application"), shellName = Str("known application"), args = Str("arguments") })),
+                Tool("computer_launch_app", "Launch any installed GUI application inside the agent's isolated desktop and observe it. The executable and parsed arguments are passed as argv, not through a host shell.", Obj(new { path = Str("Container executable name or absolute path."), shellName = Str("Compatibility name for the executable."), args = Str("Optional quoted application arguments.") })),
                 Tool("computer_clipboard_get", "Read clipboard text where supported.", Obj(new { })),
                 Tool("computer_clipboard_set", "Set clipboard text where supported.", Obj(new { text = Str("clipboard text") }, "text")),
             };

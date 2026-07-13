@@ -118,6 +118,18 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task KliveMailBridgeUnavailable_IsAnExplicitToolFailure()
+        {
+            var (tools, _) = NewTools();
+
+            var result = await tools.DispatchAsync("klivemail_create_mailbox",
+                JsonConvert.SerializeObject(new { address = "project-test" }), CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("KliveMail is unavailable", result.ResultText);
+        }
+
+        [Fact]
         public async Task RunScript_ReturnsOutputAndValue()
         {
             var (tools, _) = NewTools();
@@ -143,6 +155,52 @@ namespace Omnipotent.Tests.Projects
             var r = await tools.DispatchAsync("run_script",
                 JsonConvert.SerializeObject(new { code = "WriteFile(\"from-script.txt\", \"hi\"); ReadFile(\"from-script.txt\")" }), CancellationToken.None);
             Assert.Contains("hi", r.ResultText);
+        }
+
+        [Fact]
+        public async Task RunScript_OutputAwaitsAndUnwrapsTasks()
+        {
+            var (tools, _) = NewTools();
+            var r = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "Output(Task.FromResult(\"async-value\"));" }), CancellationToken.None);
+
+            Assert.True(r.Succeeded);
+            Assert.Contains("async-value", r.ResultText);
+            Assert.DoesNotContain("Task`", r.ResultText);
+        }
+
+        [Fact]
+        public async Task RunScript_ExplainsLanguageMismatchBeforeRoslynErrorFlood()
+        {
+            var (tools, _) = NewTools();
+            var r = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "import os\nprint(os.getcwd())" }), CancellationToken.None);
+
+            Assert.False(r.Succeeded);
+            Assert.Contains("looks like Python", r.ResultText);
+            Assert.DoesNotContain("CS100", r.ResultText);
+        }
+
+        [Fact]
+        public async Task RunScript_MapsContainerProjectPathToTheSharedWorkspace()
+        {
+            var (tools, _) = NewTools();
+            var r = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "WriteFile(\"/project/from-script-path.txt\", \"mapped\"); ReadFile(\"D:/project/from-script-path.txt\")" }), CancellationToken.None);
+
+            Assert.True(r.Succeeded);
+            Assert.Contains("mapped", r.ResultText);
+        }
+
+        [Fact]
+        public async Task RunScript_GlobalsSelfReferenceCanInvokeProjectMethodsWithoutReflectionAmbiguity()
+        {
+            var (tools, _) = NewTools();
+            var r = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "Globals.WriteFile(\"via-globals.txt\", \"dynamic\"); Globals.ReadProjectFile(\"via-globals.txt\")" }), CancellationToken.None);
+
+            Assert.True(r.Succeeded);
+            Assert.Contains("dynamic", r.ResultText);
         }
 
         [Fact]
@@ -205,8 +263,12 @@ namespace Omnipotent.Tests.Projects
             var s = store.Get(NewPid());
             Assert.Equal(ProjectSettings.Defaults.CommanderModel, s.CommanderModel);
             Assert.Equal(ProjectSettings.Defaults.TierTextModel, s.TierTextModel);
-            Assert.False(s.ContainersEnabled); // text-only until Klives opts in
+            Assert.True(s.ContainersEnabled); // every project agent owns a computer by default
+            Assert.True(s.DesktopFirstWebsiteInteraction);
             Assert.True(s.VisionEnabled);
+            Assert.True(s.AutomaticModelFallbackEnabled);
+            Assert.Equal(s.UtilityModel, s.CommanderFallbackRoute());
+            Assert.Equal(s.CommanderModel, s.UtilityFallbackRoute());
         }
 
         [Fact]
@@ -221,7 +283,7 @@ namespace Omnipotent.Tests.Projects
             // p2 keeps defaults — each project owns its own settings.
             var s2 = store.Get(p2);
             Assert.Equal(ProjectSettings.Defaults.CommanderModel, s2.CommanderModel);
-            Assert.False(s2.ContainersEnabled);
+            Assert.True(s2.ContainersEnabled);
             // p1's override persists across a fresh store instance.
             Assert.Equal("custom/smart", new ProjectSettingsStore().Get(p1).CommanderModel);
         }
@@ -262,21 +324,39 @@ namespace Omnipotent.Tests.Projects
     public class SubAgentToolGatingTests
     {
         [Fact]
-        public void TextTierAgent_GetsWorkToolsButNoComputerOrCompletion()
+        public void TextTierAgent_GetsWorkToolsAndStructuredComputerButNoCompletion()
         {
             var router = new ProjectTierRouter(new ProjectSettingsStore());
             var offered = ProjectCommanderAgent.BuildCoreToolDefinitions()
+                .Concat(ProjectCommanderAgent.BuildComputerToolDefinitions())
                 .Where(t => router.IsToolAllowed(ProjectAgentTier.Text, t.function.name))
                 .Select(t => t.function.name)
                 .ToList();
             Assert.Contains("run_script", offered);
             Assert.Contains("execute_csharp", offered);
             Assert.Contains("grep", offered);
+            Assert.Contains("search_code", offered);
             Assert.Contains("http_request", offered);
             Assert.Contains("send_agent_message", offered);
             Assert.DoesNotContain("complete_project", offered); // strategy stays with the Commander
-            Assert.DoesNotContain(ProjectCommanderAgent.BuildComputerToolDefinitions(),
-                t => router.IsToolAllowed(ProjectAgentTier.Text, t.function.name));
+            Assert.Contains("computer_open_browser", offered);
+            Assert.Contains("computer_browser_inspect", offered);
+            Assert.Contains("computer_click_text", offered);
+            Assert.Contains("computer_terminal", offered);
+            Assert.Contains("ensure_desktop_ready", offered);
+            Assert.DoesNotContain("computer_screenshot", offered); // raw pixels require an image tier
+            Assert.DoesNotContain("computer_click", offered);      // coordinate-only control follows pixels
+        }
+
+        [Fact]
+        public void TextTierAgent_GetsDistinctAutomaticFallbackRoute()
+        {
+            var settings = new ProjectSettings();
+            Assert.Equal(settings.TierTextModel, settings.SubAgentFallbackModel);
+            Assert.NotEqual(settings.TierTextModel, settings.SubAgentFallbackRoute(ProjectAgentTier.Text));
+
+            settings.AutomaticModelFallbackEnabled = false;
+            Assert.Equal("", settings.SubAgentFallbackRoute(ProjectAgentTier.Text));
         }
 
         [Fact]

@@ -77,6 +77,30 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void Append_IsolatesCrashPartialTail_AndKeepsFirstPostRestartEventReadable()
+        {
+            string pid = NewProjectId();
+            string dir = Omnipotent.Data_Handling.OmniPaths.GetPath(
+                Omnipotent.Data_Handling.OmniPaths.GlobalPaths.ProjectsEventLogDirectory);
+            string path = Path.Combine(dir, pid + ".log.jsonl");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(path, "{\"ProjectID\":\"interrupted");
+            try
+            {
+                var store = NewStore();
+                var appended = store.Append(new ProjectEvent
+                {
+                    ProjectID = pid, Type = ProjectEventTypes.Status, Text = "survived restart",
+                });
+
+                Assert.Equal(1, appended.Sequence);
+                var read = Assert.Single(store.ReadSince(pid, 0));
+                Assert.Equal("survived restart", read.Text);
+            }
+            finally { try { File.Delete(path); } catch { } }
+        }
+
+        [Fact]
         public async Task ConcurrentMultiWriterAppends_ProduceUniqueContiguousSequences()
         {
             // The Projects log is multi-writer: Commander + sub-agents + stimulus bus all

@@ -12,6 +12,13 @@ public static class ProjectWorkProgress
     {
         "tool_argument_error", "unsupported", "unavailable", "failed:", " failure", " error:",
         "timed out", "permission denied", "not found", "no such", "requires approval", "blocked:",
+        "provide '", "provide the ", "can't run", "cannot run", "not available", "is not running",
+        "nothing exists", "no file at", "no message with id", "no verification code", "planning phase",
+        "no output", "not ready", "not sent", "no approved", "does not exist", "unknown tool",
+        "already open", "prohibited", "duplicate council blocked", "limit for this wake reached",
+        "daily council limit reached", "was not recorded", "was not sent",
+        "desktop_interaction_required", "tool_cancelled", "tool_execution_failed", "work_slice_rollover",
+        ProjectToolCallJournal.InterruptedResultPrefix,
     };
 
     public static bool IsProductiveResult(string resultText, IReadOnlyCollection<string>? artifactIDs = null)
@@ -33,12 +40,9 @@ public static class ProjectWorkProgress
     public static bool RecordIfNovel(ProjectRuntimeStateStore runtime, string projectID, string actorID,
         string toolName, string normalizedArgumentsJson, CommanderToolResult result)
     {
+        if (!result.Succeeded) return false;
         if (!IsProductiveResult(result.ResultText, result.ArtifactIDs)) return false;
         string fingerprint = Fingerprint(toolName, normalizedArgumentsJson, result.ResultText, result.ArtifactIDs);
-        var checkpoint = runtime.Get(projectID).Checkpoint;
-        var previous = actorID == "commander" ? checkpoint.LastSuccessfulAction
-            : checkpoint.AgentLastSuccessfulActions.GetValueOrDefault(actorID);
-        if (string.Equals(previous?.Fingerprint, fingerprint, StringComparison.Ordinal)) return false;
         var action = new ProjectActionCheckpoint
         {
             ActionID = fingerprint,
@@ -53,8 +57,6 @@ public static class ProjectWorkProgress
                 Reference = id,
             }).ToList(),
         };
-        if (actorID == "commander") runtime.SetLastSuccessfulAction(projectID, action);
-        else runtime.SetAgentLastSuccessfulAction(projectID, actorID, action);
-        return true;
+        return runtime.TryRecordNovelSuccessfulAction(projectID, actorID, action).Applied;
     }
 }

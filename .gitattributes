@@ -3,6 +3,14 @@
 ###############################################################################
 * text=auto
 
+# Files copied into Linux project containers must retain Unix line endings even
+# when the host checkout uses core.autocrlf=true. In particular, CRLF in a
+# shebang turns /usr/bin/env's interpreter name into "python3\r" or "bash\r".
+*.py text eol=lf
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #

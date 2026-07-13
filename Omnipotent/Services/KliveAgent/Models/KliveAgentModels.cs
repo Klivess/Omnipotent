@@ -414,6 +414,10 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("kind")]
         public string Kind { get; set; } = string.Empty;
 
+        /// <summary>Compatibility alias retained for scripts that use the conventional reflection name.</summary>
+        [JsonProperty("memberType")]
+        public string MemberType => Kind;
+
         /// <summary>"public" | "private"</summary>
         [JsonProperty("visibility")]
         public string Visibility { get; set; } = string.Empty;
@@ -424,6 +428,10 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// <summary>Field/property type, or a method's return type.</summary>
         [JsonProperty("type")]
         public string Type { get; set; } = string.Empty;
+
+        /// <summary>Compatibility alias for the declared field/property/return type.</summary>
+        [JsonProperty("typeName")]
+        public string TypeName => Type;
 
         /// <summary>For methods: the full callable signature. Null for fields/properties.</summary>
         [JsonProperty("signature")]

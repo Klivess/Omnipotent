@@ -1,6 +1,8 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Versioning;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Omnipotent.Services.ComputerControl;
 
 namespace Omnipotent.Services.Projects.Containers
@@ -45,7 +47,7 @@ namespace Omnipotent.Services.Projects.Containers
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
             "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
             "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all", "computer_wait",
-            "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
+            "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };
@@ -64,14 +66,19 @@ namespace Omnipotent.Services.Projects.Containers
             SupportedTools = Tools,
         };
 
+        public enum ContainerToolFailureKind { None, Validation, Semantic, Contention, Infrastructure, Cancelled }
+
         /// <summary>Result kept for the existing Project runner. Jpeg is always the final gridded frame.</summary>
         public sealed record ContainerToolResult(bool Success, string Text, byte[]? Jpeg = null)
         {
+            public ContainerToolFailureKind FailureKind { get; init; } = Success
+                ? ContainerToolFailureKind.None : ContainerToolFailureKind.Semantic;
             public List<ComputerFrame> Frames { get; init; } = new();
             public int Width { get; init; }
             public int Height { get; init; }
             public static ContainerToolResult Ok(string text, byte[]? jpeg = null) => new(true, text, jpeg);
-            public static ContainerToolResult Fail(string text) => new(false, text);
+            public static ContainerToolResult Fail(string text, ContainerToolFailureKind kind = ContainerToolFailureKind.Semantic) =>
+                new(false, text) { FailureKind = kind };
         }
 
         public ContainerToolAdapter(VncTransport transport, string containerID, string? agentID,
@@ -116,7 +123,7 @@ namespace Omnipotent.Services.Projects.Containers
 
         public async Task<ContainerToolResult> ExecuteAsync(string tool, string? argsJson, CancellationToken ct = default)
         {
-            if (!Capabilities.Supports(tool)) return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.");
+            if (!Capabilities.Supports(tool)) return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
             JsonDocument? doc = null;
             JsonElement a;
             try
@@ -133,7 +140,7 @@ namespace Omnipotent.Services.Projects.Containers
             try
             {
                 if (IsMutating(tool) && inputLock != null && agentID != null && !inputLock.TryAcquire(containerID, agentID))
-                    return ContainerToolResult.Fail($"Desktop is currently controlled by agent {inputLock.CurrentHolder(containerID)}. Wait for its action to finish.");
+                    return ContainerToolResult.Fail($"Desktop is currently controlled by agent {inputLock.CurrentHolder(containerID)}. Wait for its action to finish.", ContainerToolFailureKind.Contention);
 
                 return await DispatchAsync(tool, a, ct);
             }
@@ -142,13 +149,14 @@ namespace Omnipotent.Services.Projects.Containers
                 if (usesVisualGate)
                 {
                     await TryReleaseAsync();
-                    return ContainerToolResult.Fail("Action cancelled; held input was released.");
+                    return ContainerToolResult.Fail("Action cancelled; held input was released.", ContainerToolFailureKind.Cancelled);
                 }
-                return ContainerToolResult.Fail("Container terminal command cancelled.");
+                return ContainerToolResult.Fail("Container terminal command cancelled.", ContainerToolFailureKind.Cancelled);
             }
             catch (Exception ex)
             {
-                return ContainerToolResult.Fail($"{tool} error: {ex.GetType().Name}: {ex.Message}");
+                return ContainerToolResult.Fail($"{tool} error: {ex.GetType().Name}: {ex.Message}",
+                    ex is ArgumentException ? ContainerToolFailureKind.Validation : ContainerToolFailureKind.Infrastructure);
             }
             finally
             {
@@ -209,6 +217,8 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Browser navigated.", () => desktop.NavigateAsync(Str(a, "url") ?? throw new ArgumentException("Provide 'url'."), ct), ct, settleMs: 1000);
                 case "computer_browser_inspect":
                     return await BrowserInspectAsync(a, ct);
+                case "computer_click_browser_control":
+                    return await ClickBrowserControlAsync(a, ct);
                 case "computer_focus_window":
                     return await MutateAsync("Desktop application focused.", () => desktop.FocusAsync(Str(a, "titleContains"), Str(a, "processName"), ct), ct);
                 case "computer_launch_app":
@@ -219,27 +229,121 @@ namespace Omnipotent.Services.Projects.Containers
                     return ContainerToolResult.Ok(transport.GetClipboardText() is { } clip ? $"Clipboard: {clip}" : "Clipboard is unavailable until the desktop publishes a selection.");
                 case "computer_clipboard_set":
                     return await MutateAsync("Clipboard set.", () => transport.SetClipboardTextAsync(Str(a, "text") ?? string.Empty, ct), ct);
-                default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.");
+                default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
             }
         }
 
         private async Task<ContainerToolResult> BrowserInspectAsync(JsonElement a, CancellationToken ct)
         {
-            if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop.");
+            if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop.", ContainerToolFailureKind.Infrastructure);
             string mode = (Str(a, "mode") ?? "dom").Trim().ToLowerInvariant();
             if (mode is not ("tabs" or "dom" or "accessibility" or "network"))
-                return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.");
+                return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.", ContainerToolFailureKind.Validation);
             int maxItems = Math.Clamp(Int(a, "maxItems", 80), 1, 200);
-            var shell = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems}", "/project", 30, ct);
-            if (!shell.Success)
-                return ContainerToolResult.Fail("Browser inspection failed: " + ComputerAudit.Truncate(shell.Stderr, 1200));
-            return ContainerToolResult.Ok(ComputerAudit.Truncate(shell.Stdout, 24000));
+            int tabIndex = Math.Clamp(Int(a, "tabIndex", 0), 0, 200);
+            ContainerShellResult? last = null;
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 30, ct);
+                string stdout = last.Stdout.Trim();
+                if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
+                    return ContainerToolResult.Ok(ComputerAudit.Truncate(stdout, 24000));
+
+                if (attempt == 1)
+                {
+                    // Chromium may not have been opened yet or CDP may still be binding. Launch
+                    // the same visible persistent browser the user sees, then retry inspection.
+                    await desktop.LaunchAsync("browser", null, ct);
+                }
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
+            }
+            string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
+                .Where(x => !string.IsNullOrWhiteSpace(x)));
+            return ContainerToolResult.Fail("Browser inspection failed after launching the visible browser and retrying: " +
+                ComputerAudit.Truncate(detail, 1600), ContainerToolFailureKind.Infrastructure);
+        }
+
+        private async Task<ContainerToolResult> ClickBrowserControlAsync(JsonElement a, CancellationToken ct)
+        {
+            if (terminalAsync == null)
+                return ContainerToolResult.Fail("Structured browser control is unavailable for this desktop.", ContainerToolFailureKind.Infrastructure);
+            string name = (Str(a, "name") ?? Str(a, "text") ?? "").Trim();
+            string role = (Str(a, "role") ?? "").Trim();
+            string tag = (Str(a, "tag") ?? "").Trim();
+            if (name.Length == 0 && role.Length == 0 && tag.Length == 0)
+                return ContainerToolResult.Fail("Provide at least one of name, role, or tag for the visible browser control.", ContainerToolFailureKind.Validation);
+            if (name.Length > 500 || role.Length > 80 || tag.Length > 40)
+                return ContainerToolResult.Fail("Browser-control selector is too long.", ContainerToolFailureKind.Validation);
+
+            int occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 200);
+            int tabIndex = Math.Clamp(Int(a, "tabIndex", 0), 0, 200);
+            string query = JsonSerializer.Serialize(new { name, role, tag, exact = Bool(a, "exact"), occurrence });
+            string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(query)).TrimEnd('=')
+                .Replace('+', '-').Replace('/', '_');
+
+            await desktop.LaunchAsync("browser", null, ct);
+            ContainerShellResult? located = null;
+            for (int attempt = 1; attempt <= 3; attempt++)
+            {
+                located = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py locate 80 {tabIndex} {payload}", "/project", 30, ct);
+                if (located.Success && !string.IsNullOrWhiteSpace(located.Stdout)) break;
+                await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
+            }
+            if (located is not { Success: true } || string.IsNullOrWhiteSpace(located.Stdout))
+                return ContainerToolResult.Fail("Could not inspect controls in the visible browser: " +
+                    ComputerAudit.Truncate(string.Join("\n", new[] { located?.Stderr, located?.Stdout }
+                        .Where(x => !string.IsNullOrWhiteSpace(x))), 1600), ContainerToolFailureKind.Infrastructure);
+
+            try
+            {
+                using var document = JsonDocument.Parse(located.Stdout);
+                JsonElement root = document.RootElement;
+                if (!root.TryGetProperty("match", out var match) || match.ValueKind == JsonValueKind.Null)
+                {
+                    string candidates = root.TryGetProperty("candidates", out var sample)
+                        ? ComputerAudit.Truncate(sample.GetRawText(), 1200) : "[]";
+                    return ContainerToolResult.Fail(
+                        $"No visible browser control matched name='{ComputerAudit.Truncate(name, 120)}', role='{role}', tag='{tag}', occurrence={occurrence}. Candidate sample: {candidates}",
+                        ContainerToolFailureKind.Semantic);
+                }
+                string matchedName = match.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                string matchedRole = match.TryGetProperty("role", out var r) ? r.GetString() ?? "" : "";
+                if (match.TryGetProperty("disabled", out var disabled) && disabled.ValueKind == JsonValueKind.True)
+                    return ContainerToolResult.Fail($"The matched browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) is disabled; inspect the form for unmet requirements.", ContainerToolFailureKind.Semantic);
+                if (match.TryGetProperty("intercepted", out var intercepted) && intercepted.ValueKind == JsonValueKind.True)
+                {
+                    string blocker = match.TryGetProperty("interceptedBy", out var by) ? by.GetRawText() : "another visible element";
+                    return ContainerToolResult.Fail(
+                        $"CONTROL_INTERCEPTED: '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) is covered by {ComputerAudit.Truncate(blocker, 500)}. Inspect and dismiss or act on that visible blocker first.",
+                        ContainerToolFailureKind.Semantic);
+                }
+                if (!match.TryGetProperty("x", out var xValue) || !xValue.TryGetInt32(out int x)
+                    || !match.TryGetProperty("y", out var yValue) || !yValue.TryGetInt32(out int y))
+                    return ContainerToolResult.Fail("The matched browser control had no usable screen coordinates.", ContainerToolFailureKind.Infrastructure);
+
+                int clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2);
+                byte[]? before = RecentFrameJpeg();
+                return await WithModifiersAsync(a, async () =>
+                {
+                    var point = await ResolvePointAsync(x, y, ct);
+                    await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
+                    await Task.Delay(actionSettleMs, ct);
+                    return await ObserveAfterMutationAsync(
+                        $"Physically clicked visible browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) at ({x},{y}). Re-inspect to verify the resulting state.",
+                        before, ct);
+                }, ct);
+            }
+            catch (JsonException ex)
+            {
+                return ContainerToolResult.Fail("Browser-control locator returned malformed data: " +
+                    ComputerAudit.Truncate(ex.Message, 300), ContainerToolFailureKind.Infrastructure);
+            }
         }
 
         private async Task<ContainerToolResult> FindTextAsync(JsonElement a, CancellationToken ct, bool click)
         {
             string needle = Str(a, "text") ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(needle)) return ContainerToolResult.Fail("Provide visible 'text' to locate.");
+            if (string.IsNullOrWhiteSpace(needle)) return ContainerToolResult.Fail("Provide visible 'text' to locate.", ContainerToolFailureKind.Validation);
             var frame = await CaptureFrameWithRetryAsync(ct);
             var raw = EncodeAndCacheDisplayFrame(frame);
             var shot = BuildScreenshotResult("OCR searched the desktop.", raw.jpeg, raw.width, raw.height);
@@ -250,14 +354,22 @@ namespace Omnipotent.Services.Projects.Containers
             var matches = await ComputerVision.FindTextAsync(ocrImage, needle, ct);
             int occurrence = Math.Max(0, Int(a, "occurrence", 0));
             if (matches.Count <= occurrence)
-                return shot with { Text = $"No visible OCR match for '{ComputerAudit.Truncate(needle, 80)}' at occurrence {occurrence}. " + shot.Text };
+                return shot with
+                {
+                    Success = false,
+                    FailureKind = ContainerToolFailureKind.Semantic,
+                    Text = $"No visible OCR match for '{ComputerAudit.Truncate(needle, 80)}' at occurrence {occurrence}. " + shot.Text,
+                };
             var match = matches[occurrence];
             string text = $"OCR match {occurrence}: '{ComputerAudit.Truncate(match.Text, 120)}' centre=({match.CentreX},{match.CentreY}) confidence={match.Confidence:0}.";
             if (!click) return shot with { Text = text + " " + shot.Text };
             var point = await ResolvePointAsync(match.CentreX, match.CentreY, ct);
-            await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), Math.Clamp(Int(a, "clicks", 1), 1, 2), ct);
-            await Task.Delay(350, ct);
-            return await ObserveAfterMutationAsync(text + " Clicked OCR match.", raw.jpeg, ct);
+            return await WithModifiersAsync(a, async () =>
+            {
+                await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), Math.Clamp(Int(a, "clicks", 1), 1, 2), ct);
+                await Task.Delay(350, ct);
+                return await ObserveAfterMutationAsync(text + " Clicked OCR match.", raw.jpeg, ct);
+            }, ct);
         }
 
         private async Task<ContainerToolResult> MoveAsync(JsonElement a, CancellationToken ct)
@@ -351,23 +463,55 @@ namespace Omnipotent.Services.Projects.Containers
         private async Task<ContainerToolResult> TerminalAsync(JsonElement a, CancellationToken ct)
         {
             if (terminalAsync == null)
-                return ContainerToolResult.Fail("Direct terminal execution is unavailable for this desktop.");
+                return ContainerToolResult.Fail("Direct terminal execution is unavailable for this desktop.", ContainerToolFailureKind.Infrastructure);
             string command = Str(a, "command") ?? string.Empty;
             if (string.IsNullOrWhiteSpace(command))
-                return ContainerToolResult.Fail("Provide 'command' - a Bash command to run inside the desktop container.");
+                return ContainerToolResult.Fail("Provide 'command' - a Bash command to run inside the desktop container.", ContainerToolFailureKind.Validation);
+            if (UsesSharedPlatformRuntime(command))
+                return ContainerToolResult.Fail(
+                    "PORTABLE_RUNTIME_REQUIRED: do not execute a Python virtualenv or node_modules launcher from /project; that shared tree crosses Windows and Linux. " +
+                    "Keep source and lockfiles in /project, create the environment under $KLIVE_AGENT_RUNTIME (mounted at /agent-runtime), and run it there.",
+                    ContainerToolFailureKind.Validation);
             int timeoutSeconds = Math.Clamp(Int(a, "timeoutSeconds", 120), 1, 900);
             var result = await terminalAsync(command, Str(a, "workingDirectory"), timeoutSeconds, ct);
             // Never repeat the command in the result. Vault/account placeholders are deliberately
             // NOT resolved here: arbitrary shell stdout could echo them back to the model. Secrets
             // remain confined to computer_type's one-way keystroke substitution path.
-            return new ContainerToolResult(result.Success, result.Format());
+            return new ContainerToolResult(result.Success, result.Format())
+            {
+                // A user command's non-zero exit is not evidence that the desktop, VNC, or image
+                // is broken. Timeouts/transport exceptions are surfaced by the outer adapter.
+                FailureKind = result.Success ? ContainerToolFailureKind.None : ContainerToolFailureKind.Semantic,
+            };
+        }
+
+        internal static bool UsesSharedPlatformRuntime(string command)
+        {
+            foreach (Match match in Regex.Matches(command, @"[^\s'"";|&=]+"))
+            {
+                string path = match.Value.Trim('(', ')', '[', ']', '{', '}', ',').Replace('\\', '/');
+                bool runtimeExecutable = Regex.IsMatch(path,
+                    @"(?i)(?:^|/)\.?venv/(?:bin/(?:python(?:3(?:\.\d+)?)?|pip(?:3(?:\.\d+)?)?)|Scripts/(?:python|pip)(?:\.exe)?)$")
+                    || Regex.IsMatch(path, @"(?i)(?:^|/)node_modules/\.bin/[A-Za-z0-9_.+-]+$");
+                if (!runtimeExecutable) continue;
+
+                if (path.StartsWith("$KLIVE_AGENT_RUNTIME/", StringComparison.Ordinal)
+                    || path.StartsWith("${KLIVE_AGENT_RUNTIME}/", StringComparison.Ordinal)
+                    || path.StartsWith("/agent-runtime/", StringComparison.Ordinal)
+                    || path.StartsWith("/home/agent/", StringComparison.Ordinal))
+                    continue;
+                // computer_terminal defaults to /project, so a relative runtime path is shared
+                // even when the command omitted the explicit /project prefix.
+                return path.StartsWith("/project/", StringComparison.Ordinal) || !path.StartsWith('/');
+            }
+            return false;
         }
 
         private async Task<ContainerToolResult> KeyAsync(JsonElement a, CancellationToken ct)
         {
             string chord = Str(a, "key") ?? (a.TryGetProperty("keys", out var keys) && keys.ValueKind == JsonValueKind.Array
                 ? string.Join("+", keys.EnumerateArray().Where(k => k.ValueKind == JsonValueKind.String).Select(k => k.GetString())) : "");
-            if (string.IsNullOrWhiteSpace(chord)) return ContainerToolResult.Fail("Provide 'key' or 'keys'.");
+            if (string.IsNullOrWhiteSpace(chord)) return ContainerToolResult.Fail("Provide 'key' or 'keys'.", ContainerToolFailureKind.Validation);
             int holdMs = Math.Clamp(Int(a, "holdMs", 55), 1, 2000);
             int repeats = Math.Clamp(Int(a, "repeats", 1), 1, 50);
             return await MutateAsync($"Pressed {chord}{(repeats > 1 ? $" {repeats} times" : "")}.",

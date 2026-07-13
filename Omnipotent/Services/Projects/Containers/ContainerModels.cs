@@ -34,7 +34,7 @@ namespace Omnipotent.Services.Projects.Containers
 
     /// <summary>
     /// Result of a desktop-readiness preflight: whether the container is up with the baked
-    /// browser-automation stack present, plus a one-line human summary and the raw capability
+    /// visible-browser/structured-inspection stack present, plus a one-line human summary and the raw capability
     /// probe. Turns "a tool silently missing → the agent flails for a whole wake" into "the
     /// preflight says exactly what's present in seconds," and its facts seed later wakes.
     /// </summary>

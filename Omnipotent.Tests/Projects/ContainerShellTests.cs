@@ -9,6 +9,7 @@ namespace Omnipotent.Tests.Projects
         [InlineData("", "/project")]
         [InlineData("/project/repo/../artifacts", "/project/artifacts")]
         [InlineData("/home/agent/work", "/home/agent/work")]
+        [InlineData("/agent-runtime/venvs/uploader", "/agent-runtime/venvs/uploader")]
         public void WorkingDirectory_IsNormalizedInsideAgentOwnedRoots(string? input, string expected)
         {
             Assert.Equal(expected, ContainerShellResult.NormalizeWorkingDirectory(input));
@@ -34,6 +35,36 @@ namespace Omnipotent.Tests.Projects
             Assert.True(formatted.Length < 150);
             Assert.Contains("output truncated", formatted);
             Assert.DoesNotContain(new string('x', 100), formatted);
+        }
+
+        [Theory]
+        [InlineData("/project/work/tiktok/venv/bin/python signup.py")]
+        [InlineData("work/tiktok/.venv/bin/python3.11 worker.py")]
+        [InlineData("'/project/app/node_modules/.bin/vite' build")]
+        [InlineData("/project/app/venv/Scripts/python.exe task.py")]
+        public void SharedCrossOsRuntimeExecutables_AreRejected(string command)
+        {
+            Assert.True(ContainerToolAdapter.UsesSharedPlatformRuntime(command));
+        }
+
+        [Theory]
+        [InlineData("$KLIVE_AGENT_RUNTIME/venv/bin/python /project/task.py")]
+        [InlineData("/agent-runtime/node/bin/node /project/app.js")]
+        [InlineData("python3 /project/task.py")]
+        public void AgentRuntimeAndSystemInterpreters_RemainAvailable(string command)
+        {
+            Assert.False(ContainerToolAdapter.UsesSharedPlatformRuntime(command));
+        }
+
+        [Theory]
+        [InlineData("chromium", true)]
+        [InlineData("/usr/bin/gimp", true)]
+        [InlineData("apps/gimp", false)]
+        [InlineData("/usr/../bin/gimp", false)]
+        [InlineData("/usr//bin/gimp", false)]
+        public void DesktopApplicationExecutable_IsNameOrAbsolutePath(string executable, bool expected)
+        {
+            Assert.Equal(expected, ContainerDesktopCommandBridge.IsSafeExecutable(executable));
         }
 
         [Fact]

@@ -4,8 +4,8 @@ namespace Omnipotent.Services.Projects
     /// Maps a capability tier to (a) the model that serves it and (b) the tools it may use
     /// (§6.1). Model routing now reads from PER-PROJECT settings (ProjectSettingsStore), not
     /// OmniSettings — every project owns its own price/model list. Tool gating is a static table:
-    /// computer-use requires video-tier perception, the image tier gets screenshots, the text
-    /// tier gets scripts/HTTP/files only.
+    /// every tier owns a desktop; text workers operate it through structured OCR/DOM tools while
+    /// image-capable workers also receive the complete pixel/coordinate surface.
     /// </summary>
     public class ProjectTierRouter
     {
@@ -26,7 +26,7 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> TextTierTools = new(StringComparer.Ordinal)
         {
             "run_script", "execute_csharp", "run_powershell", "run_bash", "http_request",
-            "grep", "read_code_file", "list_code_directory", "get_global_path",
+            "grep", "search_code", "read_code_file", "list_code_directory", "get_global_path",
             "read_file", "write_file", "list_files", "stat_file", "resolve_project_path", "make_directory", "move_file", "copy_file", "delete_file", "mark_file_important",
             "send_agent_message", "spawn_sub_agent",
             "create_stimulus_hook", "list_stimulus_hooks", "delete_stimulus_hook",
@@ -52,14 +52,14 @@ namespace Omnipotent.Services.Projects
             "convene_council", "submit_grand_plan", "amend_grand_plan", "get_grand_plan",
         };
 
-        /// <summary>The full set of computer-use tools; require a container desktop (video tier).</summary>
+        /// <summary>The full set of computer-use tools backed by an agent-owned container.</summary>
         private static readonly HashSet<string> ComputerTools = new(StringComparer.Ordinal)
         {
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
             "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag",
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
-            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_focus_window", "computer_launch_app",
+            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
             "computer_confirm_action", "computer_confirm_and_click",
@@ -68,10 +68,22 @@ namespace Omnipotent.Services.Projects
             "ensure_desktop_ready",
         };
 
+        /// <summary>Desktop operations whose observations are useful without raw image
+        /// perception. Cheap text workers can therefore own a real computer through OCR,
+        /// accessibility/DOM inspection and bounded terminal output.</summary>
+        private static readonly HashSet<string> StructuredDesktopTools = new(StringComparer.Ordinal)
+        {
+            "computer_find_text", "computer_click_text", "computer_window_state",
+            "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
+            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control",
+            "computer_focus_window", "computer_launch_app", "computer_terminal",
+            "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action",
+            "ensure_desktop_ready",
+        };
+
         /// <summary>
-        /// Whether a tier is allowed to call a tool. Computer-use requires the video tier (it
-        /// needs to perceive a live desktop); the image tier gets one-shot screenshots; the text
-        /// tier gets none. Everything non-computer is available to all tiers.
+        /// Image-capable tiers receive the complete visual surface. Text-only tiers receive the
+        /// structured subset whose OCR/DOM/terminal observations do not require raw pixels.
         /// </summary>
         public bool IsToolAllowed(ProjectAgentTier tier, string toolName)
         {
@@ -80,8 +92,8 @@ namespace Omnipotent.Services.Projects
             {
                 return tier switch
                 {
-                    ProjectAgentTier.TextImageVideo or ProjectAgentTier.TextImageVideoAudio => true,
-                    ProjectAgentTier.TextImage => toolName == "computer_screenshot",
+                    ProjectAgentTier.TextImage or ProjectAgentTier.TextImageVideo or ProjectAgentTier.TextImageVideoAudio => true,
+                    ProjectAgentTier.Text => StructuredDesktopTools.Contains(toolName),
                     _ => false,
                 };
             }
@@ -91,8 +103,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Commander-only tools (complete_project, budget increase) are gated out of sub-agent loops.</summary>
         public static bool IsCommanderOnly(string toolName) => CommanderOnlyTools.Contains(toolName);
 
-        /// <summary>Does this tier get a desktop container at all? Text tier does not (§4).</summary>
-        public static bool TierGetsDesktop(ProjectAgentTier tier) =>
-            tier is ProjectAgentTier.TextImageVideo or ProjectAgentTier.TextImageVideoAudio;
+        /// <summary>Every project agent owns a lazily provisioned desktop container.</summary>
+        public static bool TierGetsDesktop(ProjectAgentTier tier) => true;
     }
 }

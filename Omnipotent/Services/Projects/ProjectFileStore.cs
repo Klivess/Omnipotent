@@ -16,6 +16,11 @@ namespace Omnipotent.Services.Projects;
 public sealed class ProjectFileStore
 {
     private static readonly string[] ScaffoldDirectories = ["inputs", "shared", "work", "outputs"];
+    private static readonly HashSet<string> UnixTextExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+        ".dockerfile", ".env", ".yaml", ".yml", ".toml", ".ini", ".conf",
+    };
     private static readonly HashSet<string> WindowsReservedNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -589,10 +594,11 @@ public sealed class ProjectFileStore
         ValidateProjectID(projectID);
         request ??= new ProjectFileListRequest();
         if (request.Reconcile) Reconcile(projectID);
-        string directory = NormalizeRelativePath(request.Directory, allowRoot: true);
+        string directory = NormalizeProjectPath(projectID, request.Directory, allowRoot: true, allowManagedMetadata: true);
         int limit = Math.Clamp(request.Limit, 1, 500);
         int offset = Math.Max(0, request.Offset);
         var all = LoadEntries(projectID);
+        all.AddRange(LoadManagedMetadataEntries(projectID));
         string prefix = directory.Length == 0 ? "" : directory + "/";
         IEnumerable<ProjectFileEntry> filtered = all.Where(entry =>
         {
@@ -618,15 +624,19 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry? Stat(string projectID, string path, bool reconcile = true)
     {
-        string normalized = NormalizeRelativePath(path);
+        string normalized = NormalizeProjectPath(projectID, path, allowManagedMetadata: true);
         if (reconcile) Reconcile(projectID);
+        if (normalized.Equals(".klive", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase))
+            return LoadManagedMetadataEntries(projectID).FirstOrDefault(x =>
+                string.Equals(x.Path, normalized, StringComparison.OrdinalIgnoreCase));
         using var connection = OpenConnection();
         return LoadEntry(connection, projectID, normalized);
     }
 
     public FileStream OpenRead(string projectID, string path)
     {
-        string physical = ResolvePhysicalPath(projectID, path);
+        string physical = ResolvePhysicalPath(projectID, path, allowManagedMetadata: true);
         if (!File.Exists(physical)) throw new FileNotFoundException("Project file not found.", path);
         return new FileStream(physical, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024,
             FileOptions.Asynchronous | FileOptions.SequentialScan);
@@ -634,7 +644,7 @@ public sealed class ProjectFileStore
 
     public string GetPhysicalFilePath(string projectID, string path)
     {
-        string physical = ResolvePhysicalPath(projectID, path);
+        string physical = ResolvePhysicalPath(projectID, path, allowManagedMetadata: true);
         if (!File.Exists(physical)) throw new FileNotFoundException("Project file not found.", path);
         return physical;
     }
@@ -666,8 +676,9 @@ public sealed class ProjectFileStore
 
     public async Task<ProjectFileEntry> WriteTextAsync(string projectID, string path, string content, ProjectFileActor actor, CancellationToken ct = default)
     {
-        string normalized = NormalizeRelativePath(path);
-        byte[] bytes = Encoding.UTF8.GetBytes(content ?? "");
+        string normalized = NormalizeProjectPath(projectID, path);
+        string normalizedContent = NormalizeUnixText(normalized, content ?? "");
+        byte[] bytes = Encoding.UTF8.GetBytes(normalizedContent);
         if (bytes.LongLength > options.MaxFileBytes) throw new ProjectFileException("File exceeds the configured maximum size.");
         EnsureFreeDiskSpace(bytes.LongLength);
         var gate = Gate("project:" + projectID);
@@ -721,7 +732,7 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry CreateDirectory(string projectID, string path, ProjectFileActor actor)
     {
-        string normalized = NormalizeRelativePath(path);
+        string normalized = NormalizeProjectPath(projectID, path);
         var gate = Gate("project:" + projectID);
         gate.Wait();
         try
@@ -750,8 +761,8 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry Move(string projectID, string sourcePath, string destinationPath, ProjectFileActor actor)
     {
-        string source = NormalizeRelativePath(sourcePath);
-        string destination = NormalizeRelativePath(destinationPath);
+        string source = NormalizeProjectPath(projectID, sourcePath);
+        string destination = NormalizeProjectPath(projectID, destinationPath);
         var gate = Gate("project:" + projectID);
         gate.Wait();
         try
@@ -806,8 +817,8 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry Copy(string projectID, string sourcePath, string destinationPath, ProjectFileActor actor)
     {
-        string source = NormalizeRelativePath(sourcePath);
-        string destination = NormalizeRelativePath(destinationPath);
+        string source = NormalizeProjectPath(projectID, sourcePath);
+        string destination = NormalizeProjectPath(projectID, destinationPath);
         var gate = Gate("project:" + projectID);
         gate.Wait();
         try
@@ -879,7 +890,7 @@ public sealed class ProjectFileStore
 
     public bool Delete(string projectID, string path, bool recursive, ProjectFileActor actor)
     {
-        string normalized = NormalizeRelativePath(path);
+        string normalized = NormalizeProjectPath(projectID, path);
         var gate = Gate("project:" + projectID);
         gate.Wait();
         try
@@ -924,7 +935,7 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry SetMetadata(string projectID, string path, bool? important, string? description, ProjectFileActor actor)
     {
-        string normalized = NormalizeRelativePath(path);
+        string normalized = NormalizeProjectPath(projectID, path);
         var gate = Gate("project:" + projectID);
         gate.Wait();
         try
@@ -1051,9 +1062,19 @@ public sealed class ProjectFileStore
         return results;
     }
 
-    public string NormalizeRelativePath(string? path, bool allowRoot = false)
+    public string NormalizeRelativePath(string? path, bool allowRoot = false, bool allowManagedMetadata = false)
     {
         string value = (path ?? "").Trim().Replace('\\', '/').Normalize(NormalizationForm.FormC);
+
+        // `/project` is the single path agents see inside every desktop. Accept that exact virtual
+        // mount everywhere the host-side file API accepts a relative path. Also translate the
+        // common drive-qualified compatibility spelling (`D:/project/...`) into the same safe
+        // namespace; the suffix is still resolved under this project's real volume root.
+        var driveProject = Regex.Match(value, "^[A-Za-z]:/project(?:/(.*))?$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (driveProject.Success) value = driveProject.Groups[1].Success ? driveProject.Groups[1].Value : "";
+        else if (value.Equals("/project", StringComparison.OrdinalIgnoreCase)) value = "";
+        else if (value.StartsWith("/project/", StringComparison.OrdinalIgnoreCase)) value = value[9..];
+
         if (value.Length == 0 || value == ".")
         {
             if (allowRoot) return "";
@@ -1073,11 +1094,34 @@ public sealed class ProjectFileStore
             string stem = segment.Split('.')[0];
             if (WindowsReservedNames.Contains(stem)) throw new ProjectFileException($"'{segment}' is a reserved host filename.");
         }
-        if (segments[0].Equals(".klive", StringComparison.OrdinalIgnoreCase))
-            throw new ProjectFileException(".klive is managed project metadata and cannot be changed directly.");
+        if (!allowManagedMetadata && segments[0].Equals(".klive", StringComparison.OrdinalIgnoreCase))
+            throw new ProjectFileException(".klive is managed project metadata: it is readable but cannot be changed directly.");
         string normalized = string.Join('/', segments);
         if (normalized.Length > 1024) throw new ProjectFileException("Path is too long.");
         return normalized;
+    }
+
+    /// <summary>
+    /// Normalizes every path spelling exposed by the project harness: project-relative,
+    /// container-mounted (/project/...), compatibility drive-mounted (D:/project/...), or the
+    /// exact host path belonging to this project's own volume. An absolute path outside that one
+    /// volume remains invalid, preserving project isolation.
+    /// </summary>
+    public string NormalizeProjectPath(string projectID, string? path, bool allowRoot = false,
+        bool allowManagedMetadata = false)
+    {
+        ValidateProjectID(projectID);
+        string supplied = (path ?? "").Trim();
+        if (Path.IsPathRooted(supplied))
+        {
+            string root = EnsureProjectRoot(projectID);
+            string full = Path.GetFullPath(supplied);
+            if (full.Equals(root, StringComparison.OrdinalIgnoreCase))
+                supplied = "";
+            else if (full.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+                supplied = Path.GetRelativePath(root, full);
+        }
+        return NormalizeRelativePath(supplied, allowRoot, allowManagedMetadata);
     }
 
     private ProjectFileEntry CreateDirectoryCore(string projectID, string path, ProjectFileActor actor, bool writeManifest)
@@ -1524,10 +1568,10 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_session ON upload_items(session_id,p
         Origin = origin ?? source.Origin, Description = description ?? source.Description, Important = important ?? source.Important,
     };
 
-    private string ResolvePhysicalPath(string projectID, string path, bool allowMissingLeaf = false)
+    private string ResolvePhysicalPath(string projectID, string path, bool allowMissingLeaf = false, bool allowManagedMetadata = false)
     {
         ValidateProjectID(projectID);
-        string normalized = NormalizeRelativePath(path);
+        string normalized = NormalizeProjectPath(projectID, path, allowManagedMetadata: allowManagedMetadata);
         string root = EnsureProjectRoot(projectID);
         string physical = Path.GetFullPath(Path.Combine(root, normalized.Replace('/', Path.DirectorySeparatorChar)));
         string relative = Path.GetRelativePath(root, physical);
@@ -1536,6 +1580,49 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_session ON upload_items(session_id,p
         string check = allowMissingLeaf ? Path.GetDirectoryName(physical)! : physical;
         EnsureNoReparsePoints(root, check);
         return physical;
+    }
+
+    private List<ProjectFileEntry> LoadManagedMetadataEntries(string projectID)
+    {
+        string root = EnsureProjectRoot(projectID);
+        string managedRoot = Path.Combine(root, ".klive");
+        if (!Directory.Exists(managedRoot)) return new();
+        var results = new List<ProjectFileEntry>();
+        foreach (string physical in Directory.EnumerateFileSystemEntries(managedRoot, "*", SearchOption.AllDirectories).Prepend(managedRoot))
+        {
+            if ((File.GetAttributes(physical) & FileAttributes.ReparsePoint) != 0) continue;
+            bool directory = Directory.Exists(physical);
+            var info = directory ? null : new FileInfo(physical);
+            DateTime modified = directory ? Directory.GetLastWriteTimeUtc(physical) : info!.LastWriteTimeUtc;
+            string relative = Path.GetRelativePath(root, physical).Replace('\\', '/');
+            results.Add(new ProjectFileEntry
+            {
+                FileID = "managed:" + relative.ToLowerInvariant(),
+                ProjectID = projectID,
+                Path = relative,
+                Kind = directory ? ProjectFileKind.Directory : ProjectFileKind.File,
+                Size = info?.Length ?? 0,
+                MimeType = directory ? "inode/directory" : "application/json",
+                FileSystemModifiedUtc = modified,
+                CreatedUtc = modified,
+                ModifiedUtc = modified,
+                CreatedBy = ProjectFileActor.System,
+                ModifiedBy = ProjectFileActor.System,
+                Origin = ProjectFileOrigin.System,
+                Description = "Read-only derived project metadata.",
+            });
+        }
+        return results;
+    }
+
+    private static string NormalizeUnixText(string path, string content)
+    {
+        string fileName = Path.GetFileName(path);
+        string extension = Path.GetExtension(path);
+        bool unixExecutedText = UnixTextExtensions.Contains(extension)
+            || fileName.Equals("Dockerfile", StringComparison.OrdinalIgnoreCase)
+            || fileName.StartsWith("Dockerfile.", StringComparison.OrdinalIgnoreCase);
+        return unixExecutedText ? content.Replace("\r\n", "\n").Replace('\r', '\n') : content;
     }
 
     private static void EnsureNoReparsePoints(string root, string candidate)

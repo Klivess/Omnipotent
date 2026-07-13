@@ -65,6 +65,29 @@ namespace Omnipotent.Tests.Projects
             Assert.True(vault.Delete(pid, "temp"));
             Assert.Null(vault.GetDecrypted(pid, "temp"));
         }
+
+        [Fact]
+        public void ZeroByteRootKey_IsRecoveredOnlyForAnEmptyVault()
+        {
+            string dir = Path.Combine(Path.GetTempPath(), "vault-key-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(dir);
+            File.WriteAllBytes(Path.Combine(dir, "root.key"), Array.Empty<byte>());
+            try
+            {
+                var vault = new ProjectVault(_ => { }, dir);
+                vault.Save("project", "token", "value");
+                Assert.Equal(32, File.ReadAllBytes(Path.Combine(dir, "root.key")).Length);
+                Assert.Equal("value", vault.GetDecrypted("project", "token"));
+
+                File.WriteAllBytes(Path.Combine(dir, "root.key"), Array.Empty<byte>());
+                var restarted = new ProjectVault(_ => { }, dir);
+                var error = Assert.Throws<InvalidOperationException>(() =>
+                    restarted.Save("another-project", "token", "new-value"));
+                Assert.Contains("encrypted data exists", error.Message, StringComparison.OrdinalIgnoreCase);
+                Assert.Empty(File.ReadAllBytes(Path.Combine(dir, "root.key")));
+            }
+            finally { Directory.Delete(dir, recursive: true); }
+        }
     }
 
     [Collection("ProjectsSerial")]
@@ -96,22 +119,25 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void ComputerTools_RequireVideoTier()
+        public void EveryTierCanOperateItsDesktop_AtItsPerceptionLevel()
         {
             var r = Router();
             Assert.False(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click"));
-            Assert.False(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_click"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click_text"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_browser_inspect"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_terminal"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_click"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImageVideo, "computer_click"));
-            Assert.False(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_terminal"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_terminal"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImageVideo, "computer_terminal"));
         }
 
         [Fact]
-        public void ImageTier_GetsScreenshotOnly()
+        public void ImageTier_GetsFullVisualDesktopSurface()
         {
             var r = Router();
             Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_screenshot"));
-            Assert.False(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_type"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.TextImage, "computer_type"));
         }
 
         [Fact]
@@ -123,11 +149,18 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void OnlyVideoTiers_GetDesktops()
+        public void EveryTierGetsAnAgentOwnedDesktop()
         {
-            Assert.False(ProjectTierRouter.TierGetsDesktop(ProjectAgentTier.Text));
-            Assert.False(ProjectTierRouter.TierGetsDesktop(ProjectAgentTier.TextImage));
-            Assert.True(ProjectTierRouter.TierGetsDesktop(ProjectAgentTier.TextImageVideo));
+            foreach (var tier in Enum.GetValues<ProjectAgentTier>())
+                Assert.True(ProjectTierRouter.TierGetsDesktop(tier));
+        }
+
+        [Fact]
+        public void NewProjectsDefaultToPerAgentDesktopContainers()
+        {
+            Assert.True(new ProjectSettings().ContainersEnabled);
+            Assert.True(new ProjectSettings().DesktopFirstWebsiteInteraction);
+            Assert.Equal(DesktopAllocationMode.PerAgentContainers, new Project().DesktopAllocation);
         }
     }
 
@@ -366,7 +399,12 @@ namespace Omnipotent.Tests.Projects
             var res = await waitTask;
             Assert.Equal(GateDecision.Approve, res.Decision);
             Assert.Equal("go ahead", res.Comment);
-            Assert.Contains(log.ReadSince(pid, 0), e => e.Type == ProjectEventTypes.ApprovalResolved);
+            var events = log.ReadSince(pid, 0);
+            var requested = Assert.Single(events, e => e.Type == ProjectEventTypes.ApprovalRequested);
+            var resolved = Assert.Single(events, e => e.Type == ProjectEventTypes.ApprovalResolved);
+            Assert.False(string.IsNullOrWhiteSpace(gate.GateID));
+            Assert.Equal(gate.GateID, requested.GateID);
+            Assert.Equal(gate.GateID, resolved.GateID);
         }
 
         [Fact]

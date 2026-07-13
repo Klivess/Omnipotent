@@ -170,6 +170,45 @@ namespace Omnipotent.Tests.Projects
         }
     }
 
+    [Collection("ProjectsSerial")]
+    public class StimulusBusCorrelationTests
+    {
+        [Fact]
+        public async Task ConfirmedStimulus_EventCarriesDeliveredEnvelopeId()
+        {
+            var log = new ProjectEventLogStore(_ => { });
+            var hooks = new StimulusHookStore(log);
+            var queue = new StimulusQueue(_ => { });
+            var store = new ProjectStore(_ => { });
+            var triage = new StimulusAgent((_, _) => Task.FromResult<string?>("CONFIRM: relevant"),
+                _ => ("free", "fallback"), _ => { });
+            var bus = new StimulusBus(hooks, queue, triage, log, store, _ => { });
+            string projectID = "stimulus_corr_" + Guid.NewGuid().ToString("N");
+            store.CreateProject("correlation", "verify correlation", 1, 0, 0, 1, projectID);
+            var hook = hooks.Create(new StimulusHookRecord
+            {
+                ProjectID = projectID,
+                SourceKind = "webhook",
+                RecognitionCriterion = "a relevant event",
+                DestinationAgentID = "commander",
+            });
+            var delivered = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+            bus.DeliverToAgent = env =>
+            {
+                delivered.TrySetResult(env.EnvelopeID);
+                return Task.FromResult<string?>(StimulusQueue.DiscardReceipt);
+            };
+
+            await bus.IngestAsync(hook, "relevant payload");
+            string envelopeID = await delivered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var stimulusEvent = Assert.Single(log.ReadSince(projectID, 0),
+                e => e.Type == ProjectEventTypes.Stimulus);
+            Assert.False(string.IsNullOrWhiteSpace(stimulusEvent.StimulusID));
+            Assert.Equal(envelopeID, stimulusEvent.StimulusID);
+        }
+    }
+
     public class StimulusAgentTests
     {
         private static StimulusAgent Agent(Func<string, string, Task<string?>> query) =>
