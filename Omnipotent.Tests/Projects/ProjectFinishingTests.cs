@@ -79,7 +79,7 @@ namespace Omnipotent.Tests.Projects
     [Collection("ProjectsSerial")]
     public class ProjectWorkToolsTests
     {
-        private static (ProjectCommanderTools tools, string pid) NewTools()
+        private static (ProjectCommanderTools tools, string pid) NewTools(ProjectStatus status = ProjectStatus.Active)
         {
             var store = new ProjectStore(_ => { });
             var log = new ProjectEventLogStore(_ => { });
@@ -94,6 +94,8 @@ namespace Omnipotent.Tests.Projects
             var budget = new ProjectBudgetLedger(store, log, fetcher, _ => { });
             var vault = new ProjectVault(_ => { });
             var p = store.CreateProject("t", "goal", 100, 100, 10, 5);
+            p.Status = status;
+            store.SaveProject(p);
             var tools = new ProjectCommanderTools(p, log, digests, subAgents, gates, budget, vault, store, "commander", "wake1");
             return (tools, p.ProjectID);
         }
@@ -216,6 +218,28 @@ namespace Omnipotent.Tests.Projects
             var second = await tools.DispatchAsync("run_script",
                 JsonConvert.SerializeObject(new { code = "persisted * 2" }), CancellationToken.None);
             Assert.Contains("80", second.ResultText);
+        }
+
+        [Fact]
+        public async Task ExecuteCSharp_IsAvailableForPlanningTimeInspection_WhileExecutionAliasesStayLocked()
+        {
+            var (tools, _) = NewTools(ProjectStatus.Planning);
+
+            var inspection = await tools.DispatchAsync("execute_csharp",
+                JsonConvert.SerializeObject(new
+                {
+                    code = "var sample = new { Name = \"MemeScraper\" }; Output(GetObjectMembers(sample).Count);"
+                }), CancellationToken.None);
+            var executionAlias = await tools.DispatchAsync("run_script",
+                JsonConvert.SerializeObject(new { code = "Output(\"must remain gated\");" }), CancellationToken.None);
+            var hostShell = await tools.DispatchAsync("run_bash",
+                JsonConvert.SerializeObject(new { script = "echo must-remain-gated" }), CancellationToken.None);
+
+            Assert.True(inspection.Succeeded, inspection.ResultText);
+            Assert.False(executionAlias.Succeeded);
+            Assert.Contains("PLANNING phase", executionAlias.ResultText);
+            Assert.False(hostShell.Succeeded);
+            Assert.Contains("execute_csharp", hostShell.ResultText);
         }
 
         [Fact]

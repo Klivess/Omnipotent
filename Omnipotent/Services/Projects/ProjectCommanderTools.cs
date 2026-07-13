@@ -168,10 +168,13 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Execution tools locked while a project is in the PLANNING phase (awaiting Grand Plan approval).
-        /// Research, memory, planning, councils, observables and messaging Klives stay available.</summary>
+        /// Research, memory, planning, councils, observables, messaging Klives and execute_csharp
+        /// inspection stay available. execute_csharp is intentionally distinct from run_script here:
+        /// it is the Commander's live Omnipotent/service-discovery console and is needed to build a
+        /// plan from real capabilities and inputs instead of assumptions.</summary>
         private static readonly HashSet<string> PlanningBlockedTools = new(StringComparer.Ordinal)
         {
-            "spawn_sub_agent", "assign_plan_work", "run_script", "execute_csharp", "run_powershell", "run_bash",
+            "spawn_sub_agent", "assign_plan_work", "run_script", "run_powershell", "run_bash",
             "record_money_spend", "complete_project", "write_file", "make_directory",
             "move_file", "copy_file", "delete_file", "mark_file_important",
         };
@@ -193,8 +196,9 @@ namespace Omnipotent.Services.Projects
             if (project.Status == ProjectStatus.Planning && PlanningBlockedTools.Contains(tool))
                 return new CommanderToolResult(
                     "This project is in the PLANNING phase — execution tools unlock once Klives approves your Grand Plan " +
-                    "(submit_grand_plan). Available now: research (web_search/search_knowledge/recall_memories), councils " +
-                    "(convene_council), planning (update_plan), observables, and messaging Klives.")
+                    "(submit_grand_plan). Available now: research (web_search/search_knowledge/recall_memories), live " +
+                    "service/input inspection (execute_csharp), councils (convene_council), planning (update_plan), " +
+                    "observables, and messaging Klives.")
                 { Succeeded = false };
 
             switch (tool)
