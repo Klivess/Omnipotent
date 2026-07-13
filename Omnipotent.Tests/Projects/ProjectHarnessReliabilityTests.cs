@@ -213,6 +213,50 @@ public class ProjectContextSliceTests
         Assert.InRange(settings.SubAgentMaxOutputTokens, 512, 32_768);
         Assert.InRange(settings.WorkSliceTokenBudget, 16_000, 128_000);
     }
+
+    [Theory]
+    [InlineData(40, 40, 8, 24, 20_000, 64_000, "tool-call boundary reached (40/40)")]
+    [InlineData(8, 40, 24, 24, 20_000, 64_000, "model-turn boundary reached (24/24)")]
+    [InlineData(8, 40, 8, 24, 64_001, 64_000, "token boundary reached (64001/64000)")]
+    public void RolloverRecordsTheExactBoundary(int calls, int callLimit, int turns, int turnLimit,
+        long tokens, long tokenLimit, string expected)
+    {
+        string? reason = ProjectWorkSliceBoundary.Describe(
+            calls, callLimit, turns, turnLimit, tokens, tokenLimit);
+
+        Assert.Equal(expected, reason);
+    }
+
+    [Fact]
+    public void CompletedToolBatchIsReportedAsExecuted_NotAsFailedOrDeferred()
+    {
+        string message = ProjectWorkSliceBoundary.CompletedBatchMessage(
+            "token boundary reached (64001/64000)", 4);
+        string resume = ProjectWorkSliceBoundary.ResumeSummary(
+            "token boundary reached (64001/64000)",
+            ["web_fetch", "web_fetch", "computer_navigate"]);
+
+        Assert.Contains("complete returned tool batch (4 calls) was executed", message);
+        Assert.Contains("every result was committed", message);
+        Assert.DoesNotContain("not executed", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("web_fetch, computer_navigate", resume);
+        Assert.Contains("current external state", resume);
+    }
+
+    [Fact]
+    public void RunnersContainNoBoundaryPathThatFabricatesFailedToolResults()
+    {
+        string root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "Omnipotent", "Services", "Projects"));
+        string commander = File.ReadAllText(Path.Combine(root, "ProjectCommanderRunner.cs"));
+        string worker = File.ReadAllText(Path.Combine(root, "ProjectSubAgentRunner.cs"));
+
+        const string removedFailure = "recorded but not executed because the context slice ended";
+        Assert.DoesNotContain(removedFailure, commander, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(removedFailure, worker, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CompletedBatchMessage", commander);
+        Assert.Contains("CompletedBatchMessage", worker);
+    }
 }
 
 public class ProjectHostShellTests

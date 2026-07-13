@@ -224,8 +224,10 @@ namespace Omnipotent.Services.Projects
 
                 var settings = parent.Settings.Get(projectID);
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID, ProjectAgentWorkStatus.Running);
-                string model = settings.ModelForTier(agent.Tier);
-                string fallbackModel = settings.SubAgentFallbackRoute(agent.Tier);
+                var modelRoutes = settings.RoutesForTier(agent.Tier).ToList();
+                if (modelRoutes.Count == 0) throw new InvalidOperationException($"Agent tier {agent.Tier} has no configured model routes.");
+                int modelRouteIndex = 0;
+                string model = modelRoutes[modelRouteIndex];
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
                 int sliceToolCalls = Math.Min(settings.WorkSliceToolCalls, 60);
                 int sliceModelTurns = settings.WorkSliceModelTurns;
@@ -299,40 +301,35 @@ namespace Omnipotent.Services.Projects
                     KliveLLM.KliveLLM.KliveLLMResponse resp;
                     try
                     {
-                    try
+                    while (true)
                     {
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
-                    }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception primaryError) when (!string.IsNullOrWhiteSpace(fallbackModel)
-                        && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
-                    {
-                        modelTurns++;
+                        try
+                        {
+                            resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
+                                maxTokensOverride: maxOutputTokens,
+                                modelOverride: model, cancellationToken: cts.Token);
+                            modelTurns++;
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception routeError)
+                        {
+                            modelTurns++;
+                            if (modelRouteIndex + 1 >= modelRoutes.Count) throw;
+                            string next = modelRoutes[++modelRouteIndex];
+                            parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
+                                $"Worker route '{model}' failed ({ProjectProviderFailure.SafeDetail(routeError.Message, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{next}'."));
+                            model = next;
+                            continue;
+                        }
+
+                        if (resp.Success) break;
+                        if (modelRouteIndex + 1 >= modelRoutes.Count)
+                            throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model, maxOutputTokens);
+                        string nextRoute = modelRoutes[++modelRouteIndex];
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
-                            $"Worker route '{model}' failed ({ProjectProviderFailure.SafeDetail(primaryError.Message, 180)}); trying fallback '{fallbackModel}' once."));
-                        model = fallbackModel;
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
+                            $"Worker route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{nextRoute}'."));
+                        model = nextRoute;
                     }
-                    if (!resp.Success && !string.IsNullOrWhiteSpace(fallbackModel)
-                        && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
-                    {
-                        parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
-                            $"Worker route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); trying fallback '{fallbackModel}' once."));
-                        model = fallbackModel;
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
-                    }
-                    if (!resp.Success)
-                        throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model,
-                            maxOutputTokens);
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
                     {
@@ -345,45 +342,18 @@ namespace Omnipotent.Services.Projects
                     }
                     finally { await budgetLease.DisposeAsync(); }
 
-                    bool tokenSliceComplete = wakePromptTokens + wakeCompletionTokens >= sliceTokenBudget;
-                    bool sliceComplete = toolCalls >= sliceToolCalls || finalModelTurn || tokenSliceComplete;
-                    if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || sliceComplete)
+                    string? sliceBoundary = ProjectWorkSliceBoundary.Describe(
+                        toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
+                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                    bool sliceComplete = sliceBoundary != null;
+                    // Tool calls already returned by this model response belong to the current
+                    // protocol turn. Execute the complete batch before ending the context slice.
+                    if (resp.ToolCalls == null || resp.ToolCalls.Count == 0)
                     {
                         endedAtWorkSlice = sliceComplete;
-                        string? deferredCall = null;
-                        if (sliceComplete && resp.ToolCalls is { Count: > 0 })
-                        {
-                            foreach (var pending in resp.ToolCalls)
-                            {
-                                string pendingName = pending.function?.name ?? "";
-                                string pendingArgs = pending.function?.arguments ?? "";
-                                var normalized = ProjectToolContract.ValidateAndNormalize(pendingName, pendingArgs, toolDefs);
-                                if (normalized.IsValid) pendingArgs = normalized.NormalizedArgumentsJson!;
-                                deferredCall ??= DescribeCall(pendingName, pendingArgs);
-                                parent.EventLog.Append(new ProjectEvent
-                                {
-                                    ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
-                                    Type = ProjectEventTypes.ToolCall, Author = "agent",
-                                    Text = DescribeCall(pendingName, pendingArgs), ToolName = pendingName,
-                                    ToolCallId = pending.id,
-                                    PayloadJson = ProjectCommanderTools.AuditPayload(pendingName, pendingArgs),
-                                });
-                                string rollover = (normalized.Warnings.Count == 0 ? "" :
-                                    "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", normalized.Warnings) + " ") +
-                                    "WORK_SLICE_ROLLOVER: this requested tool call was recorded but not executed because the context slice ended. Rehydrate and revalidate external state before deciding whether to execute it.";
-                                parent.EventLog.Append(new ProjectEvent
-                                {
-                                    ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
-                                    Type = ProjectEventTypes.ToolResult, Author = "system",
-                                    Text = rollover, ToolName = pendingName, ToolCallId = pending.id,
-                                    PayloadJson = "{\"succeeded\":false}",
-                                });
-                                llm.AppendToolResult(sessionId, pending.id, pendingName, rollover);
-                            }
-                        }
                         string final = string.IsNullOrWhiteSpace(resp.Response)
                             ? ProjectWakeStatus.ForAgent(parent.Digests.GetDigest(projectID),
-                                parent.RuntimeState.Get(projectID), agent.AgentID, deferredCall)
+                                parent.RuntimeState.Get(projectID), agent.AgentID, null)
                             : resp.Response.Trim();
                         finalReport = final;
                         bool declaredComplete = final.Contains("WORK_STATUS: COMPLETE", StringComparison.OrdinalIgnoreCase);
@@ -408,15 +378,17 @@ namespace Omnipotent.Services.Projects
                         assignmentBlocked = declaredBlocked && reportedToCommander;
                         if ((declaredBlocked || declaredComplete) && reportedToCommander) endedAtWorkSlice = false;
                         if (endedAtWorkSlice)
+                        {
+                            parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
+                                $"WORK_SLICE_ROLLOVER: {sliceBoundary}. No tool calls were pending."));
                             parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
                             {
                                 Kind = "work-slice",
-                                Summary = deferredCall == null
-                                    ? final
-                                    : $"Inspect current external state, then re-evaluate the deferred call: {deferredCall}",
+                                Summary = $"Continue from the latest committed project state. Previous context ended because {sliceBoundary}.",
                                 RecordedBy = agent.AgentID,
                                 ToolName = "resume",
                             });
+                        }
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentMessage, final));
                         break;
                     }
@@ -554,6 +526,28 @@ namespace Omnipotent.Services.Projects
                                 frames);
                         }
                         if (result.EndWake) goto done;
+                    }
+
+                    sliceBoundary = ProjectWorkSliceBoundary.Describe(
+                        toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
+                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                    if (sliceBoundary != null)
+                    {
+                        endedAtWorkSlice = true;
+                        string rollover = ProjectWorkSliceBoundary.CompletedBatchMessage(
+                            sliceBoundary, resp.ToolCalls.Count);
+                        parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status, rollover));
+                        parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
+                        {
+                            Kind = "work-slice",
+                            Summary = ProjectWorkSliceBoundary.ResumeSummary(sliceBoundary,
+                                resp.ToolCalls.Select(x => x.function?.name)),
+                            RecordedBy = agent.AgentID,
+                            ToolName = "resume",
+                        });
+                        finalReport = rollover;
+                        outcomeText = rollover;
+                        break;
                     }
                 }
                 done: ;

@@ -259,6 +259,26 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task OrderedRouteLists_AreTriedInExactOrder_UntilSuccess()
+        {
+            var calls = new List<string>();
+            var agent = new StimulusAgent(
+                (_, _, model) =>
+                {
+                    calls.Add(model);
+                    return Task.FromResult<string?>(model == "paid-2" ? "CONFIRM: final route worked" : null);
+                },
+                _ => ((IReadOnlyList<string>)new[] { "free-1", "free-2" },
+                    (IReadOnlyList<string>)new[] { "paid-1", "paid-2", "unused" }),
+                _ => { });
+
+            var result = await agent.EvaluateAsync(Env("x"), "criterion");
+
+            Assert.True(result.Confirmed);
+            Assert.Equal(new[] { "free-1", "free-2", "paid-1", "paid-2" }, calls);
+        }
+
+        [Fact]
         public async Task BothModelsFail_FailsOpen()
         {
             var agent = Agent((_, _) => throw new Exception("down"));

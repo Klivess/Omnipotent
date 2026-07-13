@@ -250,7 +250,6 @@ namespace Omnipotent.Services.Projects
                 IsBudgetPaused = pid => Store.GetProject(pid)?.Status == ProjectStatus.BudgetPaused,
                 DescribeBudget = pid => Budget.DescribeState(pid),
                 DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid),
-                FallbackModelForProject = pid => Settings.Get(pid).CouncilFallbackRoute(),
             };
             // The approved Grand Plan summary seeds every wake as the standing north star.
             WakeCycle.DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid);
@@ -265,12 +264,12 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
             }, null, TimeSpan.FromMinutes(10), TimeSpan.FromHours(1));
 
-            // Phase 4: stimulus bus. Triage uses a free omni model with a cheap paid fallback.
+            // Phase 4: stimulus bus. Each triage stage walks its explicit ordered route list.
             Hooks = new StimulusHookStore(EventLog);
             StimulusQueue = new StimulusQueue(msg => ServiceLog(msg));
             var triageAgent = new StimulusAgent(
                 queryModelAsync: QueryUtilityModelAsync,
-                modelsForProject: pid => { var s = Settings.Get(pid); return (s.StimulusFreeModel, s.StimulusFallbackModel); },
+                modelsForProject: pid => { var s = Settings.Get(pid); return ((IReadOnlyList<string>)s.StimulusFreeRoutes, (IReadOnlyList<string>)s.StimulusFallbackRoutes); },
                 log: msg => ServiceLog(msg));
             Bus = new StimulusBus(Hooks, StimulusQueue, triageAgent, EventLog, Store, msg => ServiceLog(msg));
             Bus.DeliverToAgent = DeliverStimulusAsync;
@@ -487,7 +486,7 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public async Task<Project> CreateProjectAsync(string name, string goal, double tokenBudgetUsd,
             double moneyBudgetUsd, double moneyAutonomousThresholdUsd, int subAgentCap,
-            IDictionary<string, string>? settingsPatch = null,
+            IDictionary<string, JToken>? settingsPatch = null,
             string? initialUploadSessionID = null,
             ProjectFileActor? creator = null)
         {
@@ -536,7 +535,7 @@ namespace Omnipotent.Services.Projects
                     foreach (var kv in settingsPatch)
                     {
                         if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
-                        settings.TrySet(kv.Key, kv.Value ?? "");
+                        settings.TrySet(kv.Key, kv.Value ?? JValue.CreateNull());
                     }
                     Settings.Save(settings);
                 }
@@ -620,29 +619,35 @@ namespace Omnipotent.Services.Projects
             await using (lease)
             {
                 var settings = Settings.Get(projectID);
-                string utilityFallback = settings.UtilityFallbackRoute();
                 int utilityMaxTokens = Math.Clamp(settings.UtilityMaxOutputTokens, 256, 8_192);
-                KliveLLM.KliveLLM.KliveLLMResponse resp;
-                try
-                {
-                    resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                        maxTokensOverride: utilityMaxTokens, modelOverride: modelOverride);
-                    if (!resp.Success && !string.IsNullOrWhiteSpace(utilityFallback)
-                        && !string.Equals(modelOverride, utilityFallback, StringComparison.OrdinalIgnoreCase))
-                        resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                            maxTokensOverride: utilityMaxTokens, modelOverride: utilityFallback);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException
-                    && !string.IsNullOrWhiteSpace(utilityFallback)
-                    && !string.Equals(modelOverride, utilityFallback, StringComparison.OrdinalIgnoreCase))
-                {
-                    resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                        maxTokensOverride: utilityMaxTokens, modelOverride: utilityFallback);
-                }
+                var resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
+                    maxTokensOverride: utilityMaxTokens, modelOverride: modelOverride);
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
                     await Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                 return resp.Success ? resp.Response : null;
             }
+        }
+
+        private async Task<string?> QueryUtilityRoutesAsync(string projectID, string prompt)
+        {
+            var routes = Settings.Get(projectID).UtilityRoutes;
+            Exception? lastError = null;
+            foreach (string route in routes)
+            {
+                try
+                {
+                    string? response = await QueryUtilityModelAsync(projectID, prompt, route);
+                    if (!string.IsNullOrWhiteSpace(response)) return response;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                    await ServiceLog($"Projects utility route '{route}' failed: {ProjectProviderFailure.SafeDetail(ex.Message, 180)}");
+                }
+            }
+            if (lastError != null) throw lastError;
+            return null;
         }
 
         /// <summary>The KliveLLM service instance, or null when unavailable.</summary>
@@ -728,7 +733,7 @@ namespace Omnipotent.Services.Projects
                 {
                     var s = Settings.Get(project.ProjectID);
                     var session = await CouncilRunner.ConveneAsync(project, wakeID, topic, briefing, roles,
-                        urgency, purpose, s.CouncilModel, s.CouncilMaxPerWake, s.CouncilMaxPerDay, ct2);
+                        urgency, purpose, s.CouncilRoutes, s.CouncilMaxPerWake, s.CouncilMaxPerDay, ct2);
                     return ProjectCouncilRunner.FormatForCommander(session);
                 },
                 StartAgentAsync = (agent, objective) =>
@@ -1285,9 +1290,8 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
-                string utilityModel = TierRouter.GetUtilityModel(project.ProjectID);
                 await Digests.RebuildDigestAsync(project, EventLog,
-                    prompt => QueryUtilityModelAsync(project.ProjectID, prompt, utilityModel));
+                    prompt => QueryUtilityRoutesAsync(project.ProjectID, prompt));
 
                 // Keep the budget line in the digest fresh even if the model didn't restate it.
                 var digest = Digests.GetDigest(project.ProjectID);

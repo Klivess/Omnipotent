@@ -47,9 +47,6 @@ namespace Omnipotent.Services.Projects
         public Func<string, string>? DescribeBudget { get; set; }
         /// <summary>Current Grand Plan summary line for the shared context (empty when none).</summary>
         public Func<string, string>? DescribeGrandPlan { get; set; }
-        /// <summary>Optional capability-compatible fallback route for a project's council seats.</summary>
-        public Func<string, string?>? FallbackModelForProject { get; set; }
-
         public ProjectCouncilRunner(ProjectCouncilStore store, ProjectEventLogStore eventLog, Action<string> log)
         {
             this.store = store;
@@ -63,10 +60,20 @@ namespace Omnipotent.Services.Projects
         /// are NOT persisted. Cancellation persists the partial transcript and rethrows so the wake
         /// unwinds normally.
         /// </summary>
-        public async Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
+        public Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
             string[]? roles, string urgency, string purpose, string model, int maxPerWake, int maxPerDay, CancellationToken ct)
+            => ConveneAsync(project, wakeID, topic, briefing, roles, urgency, purpose,
+                (IReadOnlyList<string>)new[] { model }, maxPerWake, maxPerDay, ct);
+
+        public async Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
+            string[]? roles, string urgency, string purpose, IReadOnlyList<string> configuredRoutes,
+            int maxPerWake, int maxPerDay, CancellationToken ct)
         {
             string pid = project.ProjectID;
+            var modelRoutes = configuredRoutes.Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (modelRoutes.Count == 0) return Refused("No council model routes are configured.");
+            string model = modelRoutes[0];
 
             // ── guardrails ──
             if (IsBudgetPaused?.Invoke(pid) == true)
@@ -92,7 +99,7 @@ namespace Omnipotent.Services.Projects
 
             AppendEvent(session, ProjectEventTypes.CouncilConvened, "commander",
                 $"Council convened: {Trunc(session.Topic, 140)} — panel: {string.Join(", ", panel)} + Chair.",
-                new { councilID = session.CouncilID, topic = session.Topic, roles = panel, urgency = session.Urgency, purpose = session.Purpose, model });
+                new { councilID = session.CouncilID, topic = session.Topic, roles = panel, urgency = session.Urgency, purpose = session.Purpose, modelRoutes });
 
             try
             {
@@ -102,7 +109,7 @@ namespace Omnipotent.Services.Projects
                 string sharedContext = BuildSharedContext(project, session);
 
                 // ── Round 1: openings (parallel) ──
-                var openingTasks = panel.Select(role => RunOpeningAsync(session, role, sharedContext, model, ct)).ToArray();
+                var openingTasks = panel.Select(role => RunOpeningAsync(session, role, sharedContext, modelRoutes, ct)).ToArray();
                 var openings = await Task.WhenAll(openingTasks);
                 var openingByRole = new Dictionary<string, string>(StringComparer.Ordinal);
                 for (int i = 0; i < panel.Length; i++)
@@ -123,7 +130,7 @@ namespace Omnipotent.Services.Projects
                 // ── Round 2: rebuttals (parallel) — only seats that opened ──
                 var respondents = panel.Where(openingByRole.ContainsKey).ToArray();
                 var rebuttalTasks = respondents
-                    .Select(role => RunRebuttalAsync(session, role, openingByRole, model, ct)).ToArray();
+                    .Select(role => RunRebuttalAsync(session, role, openingByRole, modelRoutes, ct)).ToArray();
                 await Task.WhenAll(rebuttalTasks);
 
                 if (IsBudgetPaused?.Invoke(pid) == true)
@@ -135,8 +142,8 @@ namespace Omnipotent.Services.Projects
                 await using (var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(pid, ct))
                 {
                     if (AcquireTurnAsync == null || lease != null)
-                        chair = await QueryWithFallbackAsync(session, $"projects-council-{session.CouncilID}-chair",
-                            ChairSystemPrompt(), chairPrompt, model, ChairMaxTokens, ct);
+                        chair = await QueryRoutesAsync(session, $"projects-council-{session.CouncilID}-chair",
+                            ChairSystemPrompt(), chairPrompt, modelRoutes, ChairMaxTokens, ct);
                     if (chair is { Success: true } && !string.IsNullOrWhiteSpace(chair.Text))
                         await RecordStatementAsync(session, "Chair", 3, chair);
                 }
@@ -192,7 +199,8 @@ namespace Omnipotent.Services.Projects
 
         // ── rounds ──
 
-        private async Task<string?> RunOpeningAsync(CouncilSession session, string role, string sharedContext, string model, CancellationToken ct)
+        private async Task<string?> RunOpeningAsync(CouncilSession session, string role, string sharedContext,
+            IReadOnlyList<string> modelRoutes, CancellationToken ct)
         {
             string prompt = sharedContext +
                 $"\n\nYou are the {role} seat. Give your OPENING position:\n" +
@@ -203,14 +211,15 @@ namespace Omnipotent.Services.Projects
                 "Be concrete. Play your seat's perspective hard. ≤400 words.";
             await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
             if (AcquireTurnAsync != null && lease == null) return null;
-            var turn = await QueryWithFallbackAsync(session, $"projects-council-{session.CouncilID}-{Slug(role)}",
-                RoleSystemPrompt(role), prompt, model, OpeningMaxTokens, ct);
+            var turn = await QueryRoutesAsync(session, $"projects-council-{session.CouncilID}-{Slug(role)}",
+                RoleSystemPrompt(role), prompt, modelRoutes, OpeningMaxTokens, ct);
             if (turn is not { Success: true } || string.IsNullOrWhiteSpace(turn.Text)) return null;
             await RecordStatementAsync(session, role, 1, turn);
             return turn.Text.Trim();
         }
 
-        private async Task RunRebuttalAsync(CouncilSession session, string role, Dictionary<string, string> openingByRole, string model, CancellationToken ct)
+        private async Task RunRebuttalAsync(CouncilSession session, string role,
+            Dictionary<string, string> openingByRole, IReadOnlyList<string> modelRoutes, CancellationToken ct)
         {
             var others = openingByRole.Where(kv => kv.Key != role).ToList();
             string othersBlock = string.Join("\n\n", others.Select(kv => $"--- {kv.Key} ---\n{kv.Value}"));
@@ -220,46 +229,40 @@ namespace Omnipotent.Services.Projects
                 "Then restate your FINAL position in ≤250 words, explicitly noting anything you changed your mind about.";
             await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
             if (AcquireTurnAsync != null && lease == null) return;
-            CouncilTurn? turn;
-            try
+            CouncilTurn? turn = null;
+            Exception? lastError = null;
+            foreach (string model in modelRoutes)
             {
-                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, model, RebuttalMaxTokens, ct);
-                if (turn is not { Success: true })
+                try
                 {
-                    string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
-                    if (!string.IsNullOrWhiteSpace(fallback) && !string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase))
-                        turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, fallback, RebuttalMaxTokens, ct);
+                    turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, model, RebuttalMaxTokens, ct);
+                    if (turn is { Success: true }) break;
                 }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { lastError = ex; }
             }
-            catch (OperationCanceledException) { throw; }
-            catch
-            {
-                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
-                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) throw;
-                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, fallback, RebuttalMaxTokens, ct);
-            }
+            if (turn is not { Success: true } && lastError != null) log($"Council rebuttal routes failed: {lastError.Message}");
             if (turn is { Success: true } && !string.IsNullOrWhiteSpace(turn.Text))
                 await RecordStatementAsync(session, role, 2, turn);
         }
 
-        private async Task<CouncilTurn?> QueryWithFallbackAsync(CouncilSession session, string sessionID,
-            string? systemPrompt, string prompt, string model, int maxTokens, CancellationToken ct)
+        private async Task<CouncilTurn?> QueryRoutesAsync(CouncilSession session, string sessionID,
+            string? systemPrompt, string prompt, IReadOnlyList<string> modelRoutes, int maxTokens, CancellationToken ct)
         {
-            try
+            CouncilTurn? last = null;
+            Exception? lastError = null;
+            foreach (string model in modelRoutes)
             {
-                var primary = await QueryAsync!(sessionID, systemPrompt, prompt, model, maxTokens, ct);
-                if (primary is { Success: true }) return primary;
-                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
-                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) return primary;
-                return await QueryAsync!(sessionID, systemPrompt, prompt, fallback, maxTokens, ct);
+                try
+                {
+                    last = await QueryAsync!(sessionID, systemPrompt, prompt, model, maxTokens, ct);
+                    if (last is { Success: true }) return last;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex) { lastError = ex; }
             }
-            catch (OperationCanceledException) { throw; }
-            catch
-            {
-                string? fallback = FallbackModelForProject?.Invoke(session.ProjectID);
-                if (string.IsNullOrWhiteSpace(fallback) || string.Equals(fallback, model, StringComparison.OrdinalIgnoreCase)) throw;
-                return await QueryAsync!(sessionID, systemPrompt, prompt, fallback, maxTokens, ct);
-            }
+            if (last == null && lastError != null) throw lastError;
+            return last;
         }
 
         private CouncilSession FinishOnBudget(CouncilSession session, Dictionary<string, string> openingByRole)

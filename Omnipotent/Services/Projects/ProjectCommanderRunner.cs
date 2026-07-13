@@ -233,8 +233,10 @@ namespace Omnipotent.Services.Projects
                     throw new InvalidOperationException("The Commander requires a remote LLM provider with native tool calling.");
 
                 var settings = parent.Settings.Get(projectID);
-                string model = settings.CommanderModel;
-                string fallbackModel = settings.CommanderFallbackRoute();
+                var modelRoutes = settings.CommanderRoutes.ToList();
+                if (modelRoutes.Count == 0) throw new InvalidOperationException("Commander has no configured model routes.");
+                int modelRouteIndex = 0;
+                string model = modelRoutes[modelRouteIndex];
                 bool visionEnabled = settings.VisionEnabled;
                 int sliceToolCalls = settings.WorkSliceToolCalls;
                 int sliceModelTurns = settings.WorkSliceModelTurns;
@@ -321,40 +323,35 @@ namespace Omnipotent.Services.Projects
                     KliveLLM.KliveLLM.KliveLLMResponse resp;
                     try
                     {
-                    try
+                    while (true)
                     {
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
-                    }
-                    catch (OperationCanceledException) { throw; }
-                    catch (Exception primaryError) when (!string.IsNullOrWhiteSpace(fallbackModel)
-                        && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
-                    {
-                        modelTurns++;
+                        try
+                        {
+                            resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
+                                maxTokensOverride: maxOutputTokens,
+                                modelOverride: model, cancellationToken: cts.Token);
+                            modelTurns++;
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (Exception routeError)
+                        {
+                            modelTurns++;
+                            if (modelRouteIndex + 1 >= modelRoutes.Count) throw;
+                            string next = modelRoutes[++modelRouteIndex];
+                            parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
+                                $"Commander route '{model}' failed ({ProjectProviderFailure.SafeDetail(routeError.Message, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{next}'."));
+                            model = next;
+                            continue;
+                        }
+
+                        if (resp.Success) break;
+                        if (modelRouteIndex + 1 >= modelRoutes.Count)
+                            throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model, maxOutputTokens);
+                        string nextRoute = modelRoutes[++modelRouteIndex];
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
-                            $"Commander route '{model}' failed ({ProjectProviderFailure.SafeDetail(primaryError.Message, 180)}); trying fallback '{fallbackModel}' once."));
-                        model = fallbackModel;
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
+                            $"Commander route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{nextRoute}'."));
+                        model = nextRoute;
                     }
-                    if (!resp.Success && !string.IsNullOrWhiteSpace(fallbackModel)
-                        && !string.Equals(model, fallbackModel, StringComparison.OrdinalIgnoreCase))
-                    {
-                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
-                            $"Commander route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); trying fallback '{fallbackModel}' once."));
-                        model = fallbackModel;
-                        resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
-                            maxTokensOverride: maxOutputTokens,
-                            modelOverride: model, cancellationToken: cts.Token);
-                        modelTurns++;
-                    }
-                    if (!resp.Success)
-                        throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model,
-                            maxOutputTokens);
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
                     // the response usage object (resp.CostUsd) — authoritative for whatever model is in
@@ -371,11 +368,17 @@ namespace Omnipotent.Services.Projects
                     }
                     finally { await budgetLease.DisposeAsync(); }
 
-                    bool tokenSliceComplete = wakePromptTokens + wakeCompletionTokens >= sliceTokenBudget;
-                    bool sliceComplete = toolCalls >= sliceToolCalls || finalModelTurn || tokenSliceComplete;
+                    string? sliceBoundary = ProjectWorkSliceBoundary.Describe(
+                        toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
+                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                    bool sliceComplete = sliceBoundary != null;
                     if (resp.ToolCalls is { Count: > 0 } || !string.IsNullOrWhiteSpace(resp.Response))
                         emptyResponseTrips = 0;
-                    if (resp.ToolCalls == null || resp.ToolCalls.Count == 0 || sliceComplete)
+                    // A model response and its returned tool calls are one atomic protocol turn.
+                    // Even when this response crosses a context boundary, execute and journal the
+                    // complete batch first. Rejecting it here caused every batched web_fetch call
+                    // at the boundary to be surfaced as a fake tool failure without any HTTP work.
+                    if (resp.ToolCalls == null || resp.ToolCalls.Count == 0)
                     {
                         if (!sliceComplete && string.IsNullOrWhiteSpace(resp.Response)
                             && ++emptyResponseTrips <= 2)
@@ -387,51 +390,22 @@ namespace Omnipotent.Services.Projects
                             continue;
                         }
                         endedAtWorkSlice = sliceComplete;
-                        string? deferredCall = null;
-                        if (sliceComplete && resp.ToolCalls is { Count: > 0 })
-                        {
-                            foreach (var pending in resp.ToolCalls)
-                            {
-                                string pendingName = pending.function?.name ?? "";
-                                string pendingArgs = pending.function?.arguments ?? "";
-                                var normalized = ProjectToolContract.ValidateAndNormalize(pendingName, pendingArgs, toolDefs);
-                                if (normalized.IsValid) pendingArgs = normalized.NormalizedArgumentsJson!;
-                                deferredCall ??= DescribeCall(pendingName, pendingArgs);
-                                parent.EventLog.Append(new ProjectEvent
-                                {
-                                    ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                                    Type = ProjectEventTypes.ToolCall, Author = "commander",
-                                    Text = DescribeCall(pendingName, pendingArgs), ToolName = pendingName,
-                                    ToolCallId = pending.id,
-                                    PayloadJson = ProjectCommanderTools.AuditPayload(pendingName, pendingArgs),
-                                });
-                                string rollover = (normalized.Warnings.Count == 0 ? "" :
-                                    "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", normalized.Warnings) + " ") +
-                                    "WORK_SLICE_ROLLOVER: this requested tool call was recorded but not executed because the context slice ended. Rehydrate and revalidate external state before deciding whether to execute it.";
-                                parent.EventLog.Append(new ProjectEvent
-                                {
-                                    ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                                    Type = ProjectEventTypes.ToolResult, Author = "system",
-                                    Text = rollover, ToolName = pendingName, ToolCallId = pending.id,
-                                    PayloadJson = "{\"succeeded\":false}",
-                                });
-                                llm.AppendToolResult(sessionId, pending.id, pendingName, rollover);
-                            }
-                        }
                         string final = string.IsNullOrWhiteSpace(resp.Response)
                             ? ProjectWakeStatus.ForCommander(parent.Digests.GetDigest(projectID),
-                                parent.RuntimeState.Get(projectID), deferredCall)
+                                parent.RuntimeState.Get(projectID), null)
                             : resp.Response.Trim();
                         if (sliceComplete)
+                        {
+                            parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
+                                $"WORK_SLICE_ROLLOVER: {sliceBoundary}. No tool calls were pending."));
                             parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
                             {
                                 Kind = "work-slice",
-                                Summary = deferredCall == null
-                                    ? final
-                                    : $"Inspect current external state, then re-evaluate the deferred call: {deferredCall}",
+                                Summary = $"Continue from the latest committed project state. Previous context ended because {sliceBoundary}.",
                                 RecordedBy = "commander",
                                 ToolName = "resume",
                             });
+                        }
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", final));
                         // When Klives spoke to the Commander, the answer must reach him where he
                         // asked — the event log alone reads as silence from Discord.
@@ -564,6 +538,30 @@ namespace Omnipotent.Services.Projects
                         }
 
                         if (result.EndWake) { outcomeText = "Wake ended by a tool (constraint)."; goto done; }
+                    }
+
+                    // Crossing a boundary never discards calls that the model already returned.
+                    // Re-evaluate after the entire batch so a batch that crosses the tool-call
+                    // limit is also committed atomically before the fresh context starts.
+                    sliceBoundary = ProjectWorkSliceBoundary.Describe(
+                        toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
+                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                    if (sliceBoundary != null)
+                    {
+                        endedAtWorkSlice = true;
+                        string rollover = ProjectWorkSliceBoundary.CompletedBatchMessage(
+                            sliceBoundary, resp.ToolCalls.Count);
+                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system", rollover));
+                        parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
+                        {
+                            Kind = "work-slice",
+                            Summary = ProjectWorkSliceBoundary.ResumeSummary(sliceBoundary,
+                                resp.ToolCalls.Select(x => x.function?.name)),
+                            RecordedBy = "commander",
+                            ToolName = "resume",
+                        });
+                        outcomeText = rollover;
+                        break;
                     }
                 }
                 done: ;

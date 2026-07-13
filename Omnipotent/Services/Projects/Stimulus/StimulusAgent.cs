@@ -12,12 +12,12 @@ namespace Omnipotent.Services.Projects.Stimulus
     public class StimulusAgent
     {
         private readonly Func<string, string, string, Task<string?>> queryModelAsync;   // (projectID, prompt, modelOverride) → response
-        private readonly Func<string, (string free, string fallback)> modelsForProject; // per-project triage models
+        private readonly Func<string, (IReadOnlyList<string> preferred, IReadOnlyList<string> fallback)> modelsForProject;
         private readonly Action<string> log;
 
         public StimulusAgent(
             Func<string, string, string, Task<string?>> queryModelAsync,
-            Func<string, (string free, string fallback)> modelsForProject,
+            Func<string, (IReadOnlyList<string> preferred, IReadOnlyList<string> fallback)> modelsForProject,
             Action<string> log)
         {
             this.queryModelAsync = queryModelAsync;
@@ -29,7 +29,12 @@ namespace Omnipotent.Services.Projects.Stimulus
             Func<string, string, Task<string?>> queryModelAsync,
             Func<string, (string free, string fallback)> modelsForProject,
             Action<string> log)
-            : this((_, prompt, model) => queryModelAsync(prompt, model), modelsForProject, log)
+            : this((_, prompt, model) => queryModelAsync(prompt, model), pid =>
+            {
+                var routes = modelsForProject(pid);
+                return ((IReadOnlyList<string>)new[] { routes.free },
+                    (IReadOnlyList<string>)new[] { routes.fallback });
+            }, log)
         {
         }
 
@@ -49,18 +54,19 @@ namespace Omnipotent.Services.Projects.Stimulus
 
             string prompt = BuildPrompt(env, recognitionCriterion);
 
-            var (freeModel, fallback) = modelsForProject(env.ProjectID);
-            var result = await TryEvaluate(env.ProjectID, prompt, freeModel);
-            if (result != null) return result;
+            var (preferred, fallback) = modelsForProject(env.ProjectID);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             // Free tier failed/threw (likely throttled) — step down to the cheap paid model.
-            if (!string.IsNullOrWhiteSpace(fallback) && fallback != freeModel)
+            foreach (string configured in preferred.Concat(fallback))
             {
-                result = await TryEvaluate(env.ProjectID, prompt, fallback);
+                string model = configured.Trim();
+                if (model.Length == 0 || !seen.Add(model)) continue;
+                var result = await TryEvaluate(env.ProjectID, prompt, model);
                 if (result != null) return result;
             }
 
-            log("StimulusAgent: both free and fallback triage failed — failing open (delivering).");
+            log("StimulusAgent: every configured triage route failed — failing open (delivering).");
             return new TriageResult(true, "Triage unavailable; delivered without evaluation.");
         }
 

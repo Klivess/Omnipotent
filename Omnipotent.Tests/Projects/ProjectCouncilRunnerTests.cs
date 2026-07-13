@@ -202,5 +202,34 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("new evidence", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
             Assert.Single(h.Store.List(pid));
         }
+
+        [Fact]
+        public async Task Council_WalksOnlyItsConfiguredRouteList()
+        {
+            var models = new ConcurrentBag<string>();
+            var runner = new ProjectCouncilRunner(new ProjectCouncilStore(_ => { }), new ProjectEventLogStore(_ => { }), _ => { })
+            {
+                QueryAsync = (sid, sys, user, model, max, ct) =>
+                {
+                    models.Add(model);
+                    return Task.FromResult<CouncilTurn?>(model == "bad/model" ? null
+                        : new CouncilTurn(true, sid.EndsWith("-chair") ? "VERDICT" : "OPENING", 1, 1, null, 0));
+                },
+                ContinueAsync = (sid, user, model, max, ct) =>
+                {
+                    models.Add(model);
+                    return Task.FromResult<CouncilTurn?>(model == "bad/model" ? null
+                        : new CouncilTurn(true, "REBUTTAL", 1, 1, null, 0));
+                },
+            };
+
+            var session = await runner.ConveneAsync(NewProject(NewProjectId()), "w", "T", "B", null,
+                "routine", "decision", new[] { "bad/model", "good/model", "unused/model" }, 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(7, models.Count(m => m == "bad/model"));
+            Assert.Equal(7, models.Count(m => m == "good/model"));
+            Assert.DoesNotContain("unused/model", models);
+        }
     }
 }

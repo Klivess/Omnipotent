@@ -19,6 +19,9 @@ namespace Omnipotent.Services.Projects
         public string GetModelForTier(string projectID, ProjectAgentTier tier) => settings.Get(projectID).ModelForTier(tier);
         public string GetCommanderModel(string projectID) => settings.Get(projectID).CommanderModel;
         public string GetUtilityModel(string projectID) => settings.Get(projectID).UtilityModel;
+        public IReadOnlyList<string> GetRoutesForTier(string projectID, ProjectAgentTier tier) => settings.Get(projectID).RoutesForTier(tier);
+        public IReadOnlyList<string> GetCommanderRoutes(string projectID) => settings.Get(projectID).CommanderRoutes;
+        public IReadOnlyList<string> GetUtilityRoutes(string projectID) => settings.Get(projectID).UtilityRoutes;
 
         // ── Tool gating ──
 

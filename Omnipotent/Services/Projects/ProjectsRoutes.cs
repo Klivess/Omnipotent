@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
 using Omnipotent.Services.Projects.Stimulus;
 using System.Collections.Concurrent;
@@ -87,10 +88,11 @@ namespace Omnipotent.Services.Projects
 
                     // Optional per-project settings configured on the new-project page (model routing,
                     // vision/containers, desktop image), applied at creation before the first wake.
-                    Dictionary<string, string>? settingsPatch = null;
+                    Dictionary<string, Newtonsoft.Json.Linq.JToken>? settingsPatch = null;
                     if (body?.settings != null)
                     {
-                        try { settingsPatch = ((Newtonsoft.Json.Linq.JObject)body.settings).ToObject<Dictionary<string, string>>(); }
+                        try { settingsPatch = ((Newtonsoft.Json.Linq.JObject)body.settings).Properties()
+                            .ToDictionary(p => p.Name, p => p.Value.DeepClone(), StringComparer.OrdinalIgnoreCase); }
                         catch (Exception sex) { _ = parent.ServiceLogError(sex, "Projects: parsing create-time settings failed (using defaults)"); }
                     }
 
@@ -634,20 +636,21 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            // Patch one or more settings: POST body { "key": "value", ... } (keys per ProjectSettings.TrySet).
+            // Patch one or more settings. Route values are ordered JSON arrays; scalar settings
+            // retain their natural JSON type.
             await parent.CreateAPIRoute("/projects/settings/update", async req =>
             {
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    var patch = JsonConvert.DeserializeObject<Dictionary<string, string>>(req.userMessageContent ?? "{}") ?? new();
+                    var patch = JObject.Parse(req.userMessageContent ?? "{}");
                     var settings = parent.Settings.Get(project!.ProjectID);
                     var applied = new List<string>();
                     var unknown = new List<string>();
-                    foreach (var kv in patch)
+                    foreach (var kv in patch.Properties())
                     {
-                        if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue; // routing field, not a setting
-                        (settings.TrySet(kv.Key, kv.Value) ? applied : unknown).Add(kv.Key);
+                        if (kv.Name.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue; // routing field, not a setting
+                        (settings.TrySet(kv.Name, kv.Value) ? applied : unknown).Add(kv.Name);
                     }
                     parent.Settings.Save(settings);
                     parent.EventLog.Append(new ProjectEvent
@@ -673,14 +676,14 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
-                    var patch = JsonConvert.DeserializeObject<Dictionary<string, string>>(req.userMessageContent ?? "{}") ?? new();
+                    var patch = JObject.Parse(req.userMessageContent ?? "{}");
                     var defaults = parent.Settings.GetSystemDefaults();
                     var applied = new List<string>();
                     var unknown = new List<string>();
-                    foreach (var kv in patch)
+                    foreach (var kv in patch.Properties())
                     {
-                        if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
-                        (defaults.TrySet(kv.Key, kv.Value) ? applied : unknown).Add(kv.Key);
+                        if (kv.Name.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
+                        (defaults.TrySet(kv.Name, kv.Value) ? applied : unknown).Add(kv.Name);
                     }
                     parent.Settings.SaveSystemDefaults(defaults);
                     await req.ReturnResponse(Json(new { applied, unknown, settings = defaults }));

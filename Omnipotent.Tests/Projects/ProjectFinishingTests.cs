@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.Projects;
 using Omnipotent.Services.Projects.Stimulus;
@@ -266,9 +267,9 @@ namespace Omnipotent.Tests.Projects
             Assert.True(s.ContainersEnabled); // every project agent owns a computer by default
             Assert.True(s.DesktopFirstWebsiteInteraction);
             Assert.True(s.VisionEnabled);
-            Assert.True(s.AutomaticModelFallbackEnabled);
-            Assert.Equal(s.UtilityModel, s.CommanderFallbackRoute());
-            Assert.Equal(s.CommanderModel, s.UtilityFallbackRoute());
+            Assert.Equal(new[] { ProjectSettings.Defaults.CommanderModel }, s.CommanderRoutes);
+            Assert.Single(s.UtilityRoutes);
+            Assert.DoesNotContain(ProjectSettings.Defaults.UtilityModel, s.CommanderRoutes);
         }
 
         [Fact]
@@ -285,6 +286,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal(ProjectSettings.Defaults.CommanderModel, s2.CommanderModel);
             Assert.True(s2.ContainersEnabled);
             // p1's override persists across a fresh store instance.
+            Assert.Equal("custom/smart", JsonConvert.DeserializeObject<ProjectSettings>(JsonConvert.SerializeObject(s1))!.CommanderModel);
             Assert.Equal("custom/smart", new ProjectSettingsStore().Get(p1).CommanderModel);
         }
 
@@ -299,6 +301,29 @@ namespace Omnipotent.Tests.Projects
             Assert.True(s.TrySet("visionEnabled", "false"));
             Assert.False(s.VisionEnabled);
             Assert.False(s.TrySet("nonsenseKey", "z"));
+        }
+
+        [Fact]
+        public void OrderedRoutes_AreExplicit_Deduplicated_AndPreserveOrder()
+        {
+            var s = new ProjectSettings();
+            Assert.True(s.TrySet("commanderRoutes", JArray.Parse("[\"preferred/model\",\"backup/model\",\"PREFERRED/MODEL\"]")));
+            Assert.Equal(new[] { "preferred/model", "backup/model" }, s.CommanderRoutes);
+            Assert.Equal("preferred/model", s.CommanderModel);
+        }
+
+        [Fact]
+        public void LegacyHiddenFallback_IsDiscardedDuringMigration()
+        {
+            const string json = """
+                {"CommanderModel":"chosen/model","CommanderFallbackModel":"openai/gpt-4.1-mini","AutomaticModelFallbackEnabled":true}
+                """;
+            var s = JsonConvert.DeserializeObject<ProjectSettings>(json)!;
+            s.NormalizeRoutes();
+            Assert.Equal(new[] { "chosen/model" }, s.CommanderRoutes);
+            string upgraded = JsonConvert.SerializeObject(s);
+            Assert.DoesNotContain("CommanderFallbackModel", upgraded);
+            Assert.DoesNotContain("AutomaticModelFallbackEnabled", upgraded);
         }
 
         [Fact]
@@ -349,14 +374,12 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void TextTierAgent_GetsDistinctAutomaticFallbackRoute()
+        public void TextTierAgent_UsesOnlyItsOrderedRoutes()
         {
             var settings = new ProjectSettings();
-            Assert.Equal(settings.TierTextModel, settings.SubAgentFallbackModel);
-            Assert.NotEqual(settings.TierTextModel, settings.SubAgentFallbackRoute(ProjectAgentTier.Text));
-
-            settings.AutomaticModelFallbackEnabled = false;
-            Assert.Equal("", settings.SubAgentFallbackRoute(ProjectAgentTier.Text));
+            settings.TierTextRoutes = ["preferred/text", "backup/text", "last/text"];
+            Assert.Equal(settings.TierTextRoutes, settings.RoutesForTier(ProjectAgentTier.Text));
+            Assert.DoesNotContain(settings.UtilityModel, settings.RoutesForTier(ProjectAgentTier.Text));
         }
 
         [Fact]

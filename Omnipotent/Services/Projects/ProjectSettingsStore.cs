@@ -46,7 +46,7 @@ namespace Omnipotent.Services.Projects
                     try
                     {
                         var s = JsonConvert.DeserializeObject<ProjectSettings>(File.ReadAllText(systemDefaultsPath));
-                        if (s != null) { s.ProjectID = ""; return s; }
+                        if (s != null) { s.ProjectID = ""; s.NormalizeRoutes(); return s; }
                     }
                     catch { }
                 }
@@ -59,6 +59,7 @@ namespace Omnipotent.Services.Projects
             lock (systemLock)
             {
                 defaults.ProjectID = "";
+                defaults.NormalizeRoutes();
                 defaults.UpdatedAt = DateTime.UtcNow;
                 string tmp = systemDefaultsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, JsonConvert.SerializeObject(defaults, Formatting.Indented));
@@ -78,7 +79,7 @@ namespace Omnipotent.Services.Projects
                     try
                     {
                         var s = JsonConvert.DeserializeObject<ProjectSettings>(File.ReadAllText(path));
-                        if (s != null) { s.ProjectID = projectID; return s; }
+                        if (s != null) { s.ProjectID = projectID; s.NormalizeRoutes(); return s; }
                     }
                     catch { }
                 }
@@ -93,6 +94,7 @@ namespace Omnipotent.Services.Projects
         {
             lock (LockFor(settings.ProjectID))
             {
+                settings.NormalizeRoutes();
                 settings.UpdatedAt = DateTime.UtcNow;
                 string path = PathFor(settings.ProjectID);
                 string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
