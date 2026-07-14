@@ -10,41 +10,41 @@ namespace Omnipotent.Services.Projects
     public static class ProjectsContextBudget
     {
         /// <summary>The standing digest (goal, plan, org chart, budget, open threads).</summary>
-        public const int DigestBudget = 1000;
+        public const int DigestBudget = 6000;
 
         /// <summary>Recent events replayed verbatim into a wake seed.</summary>
-        public const int RecentEventsBudget = 3000;
+        public const int RecentEventsBudget = 48000;
 
         /// <summary>BM25 retrieval hits pulled from the deep log for the triggering stimulus.</summary>
-        public const int RetrievalBudget = 1500;
+        public const int RetrievalBudget = 8000;
 
         /// <summary>Cross-system knowledge (KliveRAG) injected into a Commander wake — other projects,
         /// KliveAgent memory, Omniscience facts, repo docs. Agents can search_knowledge for more.</summary>
-        public const int KnowledgeBudget = 900;
+        public const int KnowledgeBudget = 4000;
 
         /// <summary>Thinner knowledge budget for sub-agent wakes (their seed is deliberately lean).</summary>
-        public const int SubAgentKnowledgeBudget = 400;
+        public const int SubAgentKnowledgeBudget = 2000;
 
         /// <summary>Current observable values (the live dashboard agents maintain for Klives).</summary>
-        public const int ObservablesBudget = 300;
+        public const int ObservablesBudget = 1000;
 
         /// <summary>The approved Grand Plan summary (the standing north star) rendered into each wake seed.</summary>
-        public const int GrandPlanBudget = 600;
+        public const int GrandPlanBudget = 4000;
 
         /// <summary>Known accounts from the global shared registry (reuse before creating duplicates).</summary>
-        public const int AccountsBudget = 250;
+        public const int AccountsBudget = 1000;
 
         /// <summary>
         /// Shared project-file summary (important inputs/assets, recent changes and a compact tree).
         /// The full filesystem remains available through list_files/stat_file and at /project.
         /// </summary>
-        public const int SharedFilesBudget = 600;
+        public const int SharedFilesBudget = 4000;
 
         /// <summary>The triggering stimulus payload + verdict itself.</summary>
-        public const int StimulusBudget = 800;
+        public const int StimulusBudget = 4000;
 
         /// <summary>Per-tool-result truncation inside a wake.</summary>
-        public const int ToolResultBudget = 800;
+        public const int ToolResultBudget = 2400;
 
         /// <summary>Chars-per-token ratio used for estimation.</summary>
         private const double CharsPerToken = 4.0;

@@ -47,7 +47,7 @@ public static class ProjectWorkProgress
         {
             ActionID = fingerprint,
             Kind = "tool-result",
-            Summary = $"{actorID} produced a novel successful result from {toolName}.",
+            Summary = $"{actorID} completed {toolName}: {Clip(result.ResultText, 800)}",
             ToolName = toolName,
             Fingerprint = fingerprint,
             RecordedBy = actorID,
@@ -59,4 +59,8 @@ public static class ProjectWorkProgress
         };
         return runtime.TryRecordNovelSuccessfulAction(projectID, actorID, action).Applied;
     }
+
+    private static string Clip(string text, int max) =>
+        string.IsNullOrWhiteSpace(text) ? "(successful result contained no text)" :
+        text.Length <= max ? text.Trim() : text[..max].TrimEnd() + "…";
 }

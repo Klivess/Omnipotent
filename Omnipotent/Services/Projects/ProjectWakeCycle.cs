@@ -78,7 +78,15 @@ namespace Omnipotent.Services.Projects
 
             // Retrieval into the deep log, keyed by the trigger. Events already in the recent
             // window are excluded — retrieval exists to reach past it.
-            var hits = retrieval.Search(project.ProjectID, triggerDescription)
+            string retrievalQuery = string.Join(" ", new[]
+            {
+                project.Goal,
+                digest.CurrentFocus,
+                string.Join(" ", digest.NextSteps.Take(8)),
+                Truncate(digest.CurrentPlan, 1200),
+                triggerDescription,
+            }.Where(x => !string.IsNullOrWhiteSpace(x)));
+            var hits = retrieval.Search(project.ProjectID, retrievalQuery)
                 .Where(h => recent.Count == 0 || h.Sequence < recent[0].Sequence)
                 .ToList();
 

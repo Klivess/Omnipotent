@@ -103,6 +103,17 @@ namespace Omnipotent.Services.Projects
             TierTextImageVideoAudioRoutes = Normalize(TierTextImageVideoAudioRoutes, Defaults.TierTextImageVideoAudioModel);
             StimulusFreeRoutes = Normalize(StimulusFreeRoutes, Defaults.StimulusFreeModel);
             StimulusFallbackRoutes = Normalize(StimulusFallbackRoutes, Defaults.StimulusFallbackModel);
+
+            // Migrate the original small-slice triplet as a unit. Those values were emitted into
+            // every existing project settings file, so changing only the hardcoded defaults would
+            // leave old projects stuck on the defective 40-call/24-turn/64k policy forever. A
+            // project with any customised value is left untouched.
+            if (WorkSliceToolCalls == 40 && WorkSliceModelTurns == 24 && WorkSliceTokenBudget == 64_000)
+            {
+                WorkSliceToolCalls = Defaults.WorkSliceToolCalls;
+                WorkSliceModelTurns = Defaults.WorkSliceModelTurns;
+                WorkSliceTokenBudget = Defaults.WorkSliceTokenBudget;
+            }
         }
 
         public bool TrySet(string key, string value) => TrySet(key, new JValue(value));
@@ -139,11 +150,11 @@ namespace Omnipotent.Services.Projects
                 case "subagentmaxoutputtokens": SubAgentMaxOutputTokens = Math.Clamp(ParseInt(Text(value), Defaults.SubAgentMaxOutputTokens), 512, 32768); break;
                 case "utilitymaxoutputtokens": UtilityMaxOutputTokens = Math.Clamp(ParseInt(Text(value), Defaults.UtilityMaxOutputTokens), 256, 8192); break;
                 case "workslicetoolcalls": case "maxtoolcallsperwake":
-                    WorkSliceToolCalls = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceToolCalls), 5, 200); break;
+                    WorkSliceToolCalls = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceToolCalls), 0, 2_000); break;
                 case "workslicemodelturns": case "maxmodelturnsperwake":
-                    WorkSliceModelTurns = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceModelTurns), 2, 100); break;
+                    WorkSliceModelTurns = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceModelTurns), 0, 1_000); break;
                 case "workslicetokenbudget":
-                    WorkSliceTokenBudget = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceTokenBudget), 16_000, 256_000); break;
+                    WorkSliceTokenBudget = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceTokenBudget), 16_000, 2_000_000); break;
                 case "maxconvergencetripsperslice": case "maxlooptripsperwake":
                     MaxConvergenceTripsPerSlice = Math.Clamp(ParseInt(Text(value), Defaults.MaxConvergenceTripsPerSlice), 1, 20); break;
                 case "maxconsecutivecontinuations": break;
@@ -205,9 +216,13 @@ namespace Omnipotent.Services.Projects
             public const int CommanderMaxOutputTokens = 8192;
             public const int SubAgentMaxOutputTokens = 6144;
             public const int UtilityMaxOutputTokens = 1800;
-            public const int WorkSliceToolCalls = 40;
-            public const int WorkSliceModelTurns = 24;
-            public const int WorkSliceTokenBudget = 64_000;
+            // Zero disables arbitrary call/turn rollover. The measured live context is the primary
+            // boundary; convergence, budget and cancellation guards still stop unproductive work.
+            public const int WorkSliceToolCalls = 0;
+            public const int WorkSliceModelTurns = 0;
+            // Leaves an output/tool-result reserve for common 200k-class routes while retaining far
+            // more history than the legacy 64k setting. Larger-window routes can opt higher per project.
+            public const int WorkSliceTokenBudget = 180_000;
             public const int MaxConvergenceTripsPerSlice = 5;
             public const bool ContainersEnabled = true;
             public const bool DesktopFirstWebsiteInteraction = true;

@@ -153,8 +153,8 @@ namespace Omnipotent.Services.Projects
                 _ => "SYSTEM",
             };
             string body = e.Type is ProjectEventTypes.ToolCall or ProjectEventTypes.ToolResult
-                ? $"{e.ToolName}: {Truncate(e.Text, 200)}"
-                : Truncate(e.Text, 400);
+                ? $"{e.ToolName}: {Truncate(e.Text, 1200)}"
+                : Truncate(e.Text, 1600);
             return $"[#{e.Sequence} {e.Timestamp:yyyy-MM-dd HH:mm} {e.Type}] {who}: {body}";
         }
 

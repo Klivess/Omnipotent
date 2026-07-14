@@ -212,7 +212,10 @@ namespace Omnipotent.Services.Projects
             bool reportedToCommander = false;
             int productiveActions = 0;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
+            long liveContextTokens = 0; // current request context, not cumulative billed usage
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
+            string? lastCommittedTool = null;
+            string? lastCommittedResult = null;
             try
             {
                 var running = parent.RuntimeState.MarkAgentWakeRunning(projectID, agent.AgentID, wakeID, leaseGeneration);
@@ -230,9 +233,9 @@ namespace Omnipotent.Services.Projects
                 // set (see QueryToolSessionAsync modelRoutes), so there is no app-side route-advance loop.
                 string model = modelRoutes[0];
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
-                int sliceToolCalls = Math.Min(settings.WorkSliceToolCalls, 60);
+                int sliceToolCalls = settings.WorkSliceToolCalls;
                 int sliceModelTurns = settings.WorkSliceModelTurns;
-                int sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 256_000);
+                int sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.SubAgentMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
 
@@ -245,9 +248,18 @@ namespace Omnipotent.Services.Projects
                 toolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions()
                     .Where(t => parent.TierRouter.IsToolAllowed(agent.Tier, t.function.name)));
 
-                string sessionId = $"projects-agent-{projectID}-{agent.AgentID}-{wakeID}";
-                llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent));
-                llm.AppendUserMessageToToolSession(sessionId, await BuildWakeSeed(project, agent, trigger));
+                string sessionId = $"projects-agent-{projectID}-{agent.AgentID}";
+                bool continuingSession = llm.CanContinueToolSession(sessionId);
+                string wakeSeed = await BuildWakeSeed(project, agent, trigger);
+                if (continuingSession && llm.GetToolSessionContextTokens(sessionId) +
+                    ProjectsContextBudget.EstimateTokens(wakeSeed) >= sliceTokenBudget)
+                {
+                    llm.ResetSession(sessionId);
+                    continuingSession = false;
+                }
+                if (!continuingSession)
+                    llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent));
+                llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
                 int toolCalls = 0;
@@ -309,7 +321,8 @@ namespace Omnipotent.Services.Projects
                         {
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
-                                modelOverride: model, cancellationToken: cts.Token, modelRoutes: modelRoutes);
+                                modelOverride: model, cancellationToken: cts.Token, modelRoutes: modelRoutes,
+                                compactAboveTokensOverride: 0);
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
@@ -322,6 +335,8 @@ namespace Omnipotent.Services.Projects
                     {
                         wakePromptTokens += resp.PromptTokens;
                         wakeCompletionTokens += resp.CompletionTokens;
+                        liveContextTokens = ProjectWorkSliceBoundary.MeasureLiveContext(
+                            resp.PromptTokens, resp.CompletionTokens);
                         wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
                         await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                     }
@@ -331,7 +346,7 @@ namespace Omnipotent.Services.Projects
 
                     string? sliceBoundary = ProjectWorkSliceBoundary.Describe(
                         toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
-                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                        liveContextTokens, sliceTokenBudget);
                     bool sliceComplete = sliceBoundary != null;
                     // Tool calls already returned by this model response belong to the current
                     // protocol turn. Execute the complete batch before ending the context slice.
@@ -374,10 +389,12 @@ namespace Omnipotent.Services.Projects
                             parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
                             {
                                 Kind = "work-slice",
-                                Summary = $"Continue from the latest committed project state. Previous context ended because {sliceBoundary}.",
+                                Summary = ProjectWorkSliceBoundary.ResumeSummary(sliceBoundary!,
+                                    Array.Empty<string?>(), lastCommittedTool, lastCommittedResult, final),
                                 RecordedBy = agent.AgentID,
                                 ToolName = "resume",
                             });
+                            llm.ResetSession(sessionId);
                         }
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentMessage, final));
                         break;
@@ -412,7 +429,10 @@ namespace Omnipotent.Services.Projects
                                 Text = contract.ErrorText!, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, toolName, contract.ErrorText!);
+                            llm.AppendToolResult(sessionId, call.id, toolName, contract.ErrorText!, keepRecentFull: int.MaxValue);
+                            liveContextTokens += AddedContextTokens(contract.ErrorText!);
+                            lastCommittedTool = toolName;
+                            lastCommittedResult = contract.ErrorText!;
                             continue;
                         }
                         argsJson = contract.NormalizedArgumentsJson!;
@@ -434,7 +454,10 @@ namespace Omnipotent.Services.Projects
                                 Text = text, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, toolName, text);
+                            llm.AppendToolResult(sessionId, call.id, toolName, text, keepRecentFull: int.MaxValue);
+                            liveContextTokens += AddedContextTokens(text);
+                            lastCommittedTool = toolName;
+                            lastCommittedResult = text;
                         }
 
                         // Tier gating enforced at dispatch too, not just in the offered tool list.
@@ -504,7 +527,10 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, toolName, result.ResultText);
+                        llm.AppendToolResult(sessionId, call.id, toolName, result.ResultText, keepRecentFull: int.MaxValue);
+                        liveContextTokens += AddedContextTokens(result.ResultText);
+                        lastCommittedTool = toolName;
+                        lastCommittedResult = result.ResultText;
 
                         if (visionEnabled && result.Jpeg != null)
                         {
@@ -514,13 +540,14 @@ namespace Omnipotent.Services.Projects
                             llm.AppendUserContentToToolSession(sessionId,
                                 $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify before continuing.",
                                 frames);
+                            liveContextTokens += 1200L * Math.Max(1, frames.Count);
                         }
                         if (result.EndWake) goto done;
                     }
 
                     sliceBoundary = ProjectWorkSliceBoundary.Describe(
                         toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
-                        wakePromptTokens + wakeCompletionTokens, sliceTokenBudget);
+                        liveContextTokens, sliceTokenBudget);
                     if (sliceBoundary != null)
                     {
                         endedAtWorkSlice = true;
@@ -530,11 +557,13 @@ namespace Omnipotent.Services.Projects
                         parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
                         {
                             Kind = "work-slice",
-                            Summary = ProjectWorkSliceBoundary.ResumeSummary(sliceBoundary,
-                                resp.ToolCalls.Select(x => x.function?.name)),
+                            Summary = ProjectWorkSliceBoundary.ResumeSummary(sliceBoundary!,
+                                resp.ToolCalls.Select(x => x.function?.name), lastCommittedTool,
+                                lastCommittedResult, resp.Response),
                             RecordedBy = agent.AgentID,
                             ToolName = "resume",
                         });
+                        llm.ResetSession(sessionId);
                         finalReport = rollover;
                         outcomeText = rollover;
                         break;
@@ -759,6 +788,9 @@ RULES:
             }
             catch { return toolName; }
         }
+
+        private static long AddedContextTokens(string? text) =>
+            ProjectsContextBudget.EstimateTokens(text) + 16L;
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
     }

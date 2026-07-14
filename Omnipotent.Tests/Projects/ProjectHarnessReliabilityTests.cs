@@ -211,7 +211,10 @@ public class ProjectContextSliceTests
 
         Assert.InRange(settings.CommanderMaxOutputTokens, 512, 32_768);
         Assert.InRange(settings.SubAgentMaxOutputTokens, 512, 32_768);
-        Assert.InRange(settings.WorkSliceTokenBudget, 16_000, 128_000);
+        Assert.InRange(settings.WorkSliceTokenBudget, 128_000, 2_000_000);
+        Assert.Equal(0, settings.WorkSliceToolCalls);
+        Assert.Equal(0, settings.WorkSliceModelTurns);
+        Assert.Equal(48_000, ProjectsContextBudget.RecentEventsBudget);
     }
 
     [Theory]
@@ -228,6 +231,27 @@ public class ProjectContextSliceTests
     }
 
     [Fact]
+    public void ZeroCallAndTurnLimitsLeaveTheLiveContextAsThePrimaryBoundary()
+    {
+        string? below = ProjectWorkSliceBoundary.Describe(500, 0, 500, 0, 179_999, 180_000);
+        string? atLimit = ProjectWorkSliceBoundary.Describe(500, 0, 500, 0, 180_000, 180_000);
+
+        Assert.Null(below);
+        Assert.Equal("token boundary reached (180000/180000)", atLimit);
+    }
+
+    [Fact]
+    public void LiveContextUsesOnlyTheCurrentProviderTurn_NotCumulativeBillingUsage()
+    {
+        long firstTurn = ProjectWorkSliceBoundary.MeasureLiveContext(20_000, 2_000);
+        long secondTurn = ProjectWorkSliceBoundary.MeasureLiveContext(30_000, 2_000);
+
+        Assert.Equal(22_000, firstTurn);
+        Assert.Equal(32_000, secondTurn);
+        Assert.NotEqual(firstTurn + secondTurn, secondTurn);
+    }
+
+    [Fact]
     public void CompletedToolBatchIsReportedAsExecuted_NotAsFailedOrDeferred()
     {
         string message = ProjectWorkSliceBoundary.CompletedBatchMessage(
@@ -241,6 +265,19 @@ public class ProjectContextSliceTests
         Assert.DoesNotContain("not executed", message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("web_fetch, computer_navigate", resume);
         Assert.Contains("current external state", resume);
+    }
+
+    [Fact]
+    public void RolloverHandoffPreservesSpecificStatusAndLatestResult()
+    {
+        string resume = ProjectWorkSliceBoundary.ResumeSummary(
+            "token boundary reached (180100/180000)", ["read_file"], "read_file",
+            "Configuration says region=eu-west and retries=7.",
+            "Next, update the deployment manifest; do not re-read the configuration.");
+
+        Assert.Contains("region=eu-west", resume);
+        Assert.Contains("update the deployment manifest", resume);
+        Assert.Contains("do not re-read", resume);
     }
 
     [Fact]

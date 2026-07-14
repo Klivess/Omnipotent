@@ -441,6 +441,37 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        /// <summary>
+        /// Returns true when an existing structured tool session ends at a clean assistant turn and
+        /// can therefore accept another user message without resetting its history. A session whose
+        /// last assistant turn still has unanswered tool calls is deliberately rejected: continuing
+        /// it would violate the provider's tool-call protocol.
+        /// </summary>
+        public bool CanContinueToolSession(string sessionId)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId)) return false;
+            lock (sessions)
+            {
+                if (!sessions.TryGetValue(sessionId, out var session) || session.structuredMessages.Count == 0)
+                    return false;
+                var last = session.structuredMessages[^1];
+                return last.role == "assistant" && (last.tool_calls == null || last.tool_calls.Count == 0);
+            }
+        }
+
+        /// <summary>The provider-reported size of the most recent request plus its completion.
+        /// Returns zero before the session has completed its first model turn.</summary>
+        public long GetToolSessionContextTokens(string sessionId)
+        {
+            if (string.IsNullOrWhiteSpace(sessionId)) return 0;
+            lock (sessions)
+            {
+                return sessions.TryGetValue(sessionId, out var session)
+                    ? (long)session.lastPromptTokens + session.lastCompletionTokens
+                    : 0;
+            }
+        }
+
         // ── temporal grounding ──
         // Every inbound message (user turn / steering / tool result) is stamped with the wall-clock
         // at the moment it is appended, so the model can always read WHEN each thing it sees
@@ -663,7 +694,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -671,9 +702,13 @@ namespace Omnipotent.Services.KliveLLM
             {
                 if (!sessions.TryGetValue(sessionId, out session))
                     return new KliveLLMResponse { Success = false, ErrorMessage = "Tool session not found. Call StartToolSession first.", SessionId = sessionId };
-                // Keep the request from spiralling into hundreds-of-thousands of tokens (where the model
-                // mis-perceives its own context). Compacts the older middle in place when over budget.
-                CompactToolSessionIfNeeded(session, InTaskCompactAboveTokens, InTaskKeepRecentMessages);
+                // Most callers use the conservative global compactor. Long-running orchestrators can
+                // supply their own context-window policy; zero disables this lossy compactor so their
+                // measured provider usage and durable rollover mechanism remain authoritative.
+                int compactAbove = compactAboveTokensOverride ?? InTaskCompactAboveTokens;
+                int keepRecent = compactKeepRecentMessagesOverride ?? InTaskKeepRecentMessages;
+                if (compactAbove > 0)
+                    CompactToolSessionIfNeeded(session, compactAbove, keepRecent);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 
@@ -691,6 +726,8 @@ namespace Omnipotent.Services.KliveLLM
                     content = content, // "" not null — strict providers reject null content
                     tool_calls = toolCalls,
                 });
+                session.lastPromptTokens = response.usage?.prompt_tokens ?? 0;
+                session.lastCompletionTokens = response.usage?.completion_tokens ?? 0;
                 session.lastUpdated = DateTime.UtcNow;
             }
 
@@ -2037,6 +2074,8 @@ namespace Omnipotent.Services.KliveLLM
 
             public string sessionId;
             public DateTime lastUpdated;
+            public int lastPromptTokens;
+            public int lastCompletionTokens;
             public ChatHistory chatHistory;
 
             // Tool-calling path only: a structured message log that can represent assistant turns
