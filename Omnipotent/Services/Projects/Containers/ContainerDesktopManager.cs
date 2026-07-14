@@ -237,7 +237,7 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 var frame = await GetTransport(record).CaptureFrameAsync(ct);
                 caps["vnc"] = "up";
-                caps["frame"] = IsUsableFrame(frame.bgra, frame.width, frame.height) ? "usable" : "black";
+                caps["frame"] = IsCompleteFrame(frame.bgra, frame.width, frame.height) ? "usable" : "incomplete";
                 caps["frame-size"] = $"{frame.width}x{frame.height}";
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
@@ -402,8 +402,8 @@ namespace Omnipotent.Services.Projects.Containers
                 try
                 {
                     var frame = await transport.CaptureFrameAsync(ct);
-                    if (!IsUsableFrame(frame.bgra, frame.width, frame.height))
-                        throw new InvalidOperationException($"VNC returned an all-black or incomplete {frame.width}x{frame.height} framebuffer while the desktop session was still starting.");
+                    if (!IsCompleteFrame(frame.bgra, frame.width, frame.height))
+                        throw new InvalidOperationException($"VNC returned an incomplete {frame.width}x{frame.height} framebuffer ({frame.bgra?.LongLength ?? 0} bytes) while the desktop session was still starting.");
                     log($"Desktop {record.ContainerID[..12]} returned its first frame after {attempt} probe(s).");
                     return;
                 }
@@ -454,24 +454,23 @@ namespace Omnipotent.Services.Projects.Containers
             }
         }
 
-        internal static bool IsUsableFrame(byte[] bgra, int width, int height)
+        /// <summary>
+        /// A frame is usable once the transport has delivered a STRUCTURALLY COMPLETE framebuffer:
+        /// sane dimensions and at least width*height*4 bytes of pixel data. This is a rigid, confirmed
+        /// signal rather than a heuristic — <see cref="VncTransport.CaptureFrameAsync"/> only returns
+        /// after a full FramebufferUpdate covering the whole screen has been applied (it throws
+        /// otherwise), so a frame that reaches this method already proves the RFB handshake succeeded
+        /// and x11vnc is serving a live Xvfb display of the expected size.
+        ///
+        /// We deliberately do NOT judge pixel brightness. A dark desktop — a dark theme, a dark solid
+        /// root, a fullscreen dark application — is a perfectly valid desktop. The previous luminance
+        /// heuristic rejected those as "black" and was the direct cause of spurious "no usable
+        /// framebuffer" readiness failures that left agents with a working desktop reported as broken.
+        /// </summary>
+        internal static bool IsCompleteFrame(byte[] bgra, int width, int height)
         {
-            if (width < 320 || height < 200 || bgra.Length < checked(width * height * 4)) return false;
-            int pixels = width * height;
-            int step = Math.Max(1, pixels / 4096);
-            long luminance = 0;
-            int sampled = 0, almostBlack = 0;
-            for (int pixel = 0; pixel < pixels; pixel += step)
-            {
-                int i = pixel * 4;
-                int y = (bgra[i + 2] * 54 + bgra[i + 1] * 183 + bgra[i] * 19) >> 8;
-                luminance += y;
-                if (y < 4) almostBlack++;
-                sampled++;
-            }
-            double mean = sampled == 0 ? 0 : (double)luminance / sampled;
-            double blackFraction = sampled == 0 ? 1 : (double)almostBlack / sampled;
-            return mean >= 8 && blackFraction < 0.995;
+            if (bgra == null || width < 320 || height < 200) return false;
+            return bgra.LongLength >= checked((long)width * height * 4);
         }
 
         /// <summary>The transport for a container by ID (for the live-view stream route), or null if unknown.</summary>

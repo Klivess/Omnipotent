@@ -369,9 +369,13 @@ public class ProjectProviderFailureTelemetryTests
 public class ProjectDesktopReadinessInvariantTests
 {
     [Fact]
-    public void BlackFramebuffer_IsRejected_ButPaintedDesktopIsUsable()
+    public void CompleteFramebuffer_IsUsableRegardlessOfBrightness_IncompleteIsRejected()
     {
-        byte[] black = new byte[640 * 480 * 4];
+        // Readiness is confirmed by a structurally complete framebuffer, NOT by brightness. A dark
+        // desktop (dark theme / dark solid root / fullscreen dark app) is a perfectly valid desktop,
+        // so an all-dark but full-size frame must be accepted — rejecting it was the old luminance
+        // heuristic's false-negative that reported working desktops as broken.
+        byte[] dark = new byte[640 * 480 * 4];
         byte[] painted = new byte[640 * 480 * 4];
         for (int i = 0; i < painted.Length; i += 4)
         {
@@ -381,8 +385,13 @@ public class ProjectDesktopReadinessInvariantTests
             painted[i + 3] = 255;
         }
 
-        Assert.False(ContainerDesktopManager.IsUsableFrame(black, 640, 480));
-        Assert.True(ContainerDesktopManager.IsUsableFrame(painted, 640, 480));
+        Assert.True(ContainerDesktopManager.IsCompleteFrame(dark, 640, 480));
+        Assert.True(ContainerDesktopManager.IsCompleteFrame(painted, 640, 480));
+
+        // Rigid rejections: a truncated buffer, undersized dimensions, and a null frame.
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(new byte[640 * 480 * 4 - 1], 640, 480));
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(new byte[64 * 64 * 4], 64, 64));
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(null!, 640, 480));
     }
 
     [Fact]
