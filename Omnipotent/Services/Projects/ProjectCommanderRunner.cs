@@ -235,8 +235,9 @@ namespace Omnipotent.Services.Projects
                 var settings = parent.Settings.Get(projectID);
                 var modelRoutes = settings.CommanderRoutes.ToList();
                 if (modelRoutes.Count == 0) throw new InvalidOperationException("Commander has no configured model routes.");
-                int modelRouteIndex = 0;
-                string model = modelRoutes[modelRouteIndex];
+                // Index 0 is the primary; the whole ordered list is handed to OpenRouter as its fallback
+                // set (see QueryToolSessionAsync modelRoutes), so there is no app-side route-advance loop.
+                string model = modelRoutes[0];
                 bool visionEnabled = settings.VisionEnabled;
                 int sliceToolCalls = settings.WorkSliceToolCalls;
                 int sliceModelTurns = settings.WorkSliceModelTurns;
@@ -323,35 +324,22 @@ namespace Omnipotent.Services.Projects
                     KliveLLM.KliveLLM.KliveLLMResponse resp;
                     try
                     {
-                    while (true)
-                    {
+                        // Fallback across the configured routes happens at the OpenRouter level: the whole
+                        // ordered list is sent as the request's `models` array and OpenRouter tries each in
+                        // turn, server-side, within this single call. A failure here means every route was
+                        // exhausted, so it propagates to the outer handler (circuit breaker / deferral).
                         try
                         {
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
-                                modelOverride: model, cancellationToken: cts.Token);
+                                modelOverride: model, cancellationToken: cts.Token, modelRoutes: modelRoutes);
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
-                        catch (Exception routeError)
-                        {
-                            modelTurns++;
-                            if (modelRouteIndex + 1 >= modelRoutes.Count) throw;
-                            string next = modelRoutes[++modelRouteIndex];
-                            parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
-                                $"Commander route '{model}' failed ({ProjectProviderFailure.SafeDetail(routeError.Message, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{next}'."));
-                            model = next;
-                            continue;
-                        }
+                        catch (Exception) { modelTurns++; throw; }
 
-                        if (resp.Success) break;
-                        if (modelRouteIndex + 1 >= modelRoutes.Count)
-                            throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, model, maxOutputTokens);
-                        string nextRoute = modelRoutes[++modelRouteIndex];
-                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
-                            $"Commander route '{model}' returned a provider failure ({ProjectProviderFailure.SafeDetail(resp.ErrorMessage, 180)}); advancing to configured route {modelRouteIndex + 1}/{modelRoutes.Count} '{nextRoute}'."));
-                        model = nextRoute;
-                    }
+                        if (!resp.Success)
+                            throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, resp.Model ?? model, maxOutputTokens);
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
                     // the response usage object (resp.CostUsd) — authoritative for whatever model is in
@@ -576,56 +564,16 @@ namespace Omnipotent.Services.Projects
                 var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
                 string providerDetail = ProjectProviderFailure.Describe(ex);
                 outcomePayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
-                var stateBeforeFailure = parent.RuntimeState.Get(projectID);
-                if (ex.IsRetryable)
-                {
-                    DateTime retryAt = DateTime.UtcNow + (ex.RetryAfter is { } ra && ra > TimeSpan.Zero
-                        ? ra : TimeSpan.FromMinutes(15));
-                    failure.RetryAt = retryAt;
-                    parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
-                    parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
-                        healthy: false, ex.Kind.ToString(), providerDetail, retryAt);
-                    outcome = ProjectEventTypes.WakeDeferred;
-                    outcomeText = $"Wake deferred by provider failure: {providerDetail}; retry after {retryAt:O}.";
-                }
-                else
-                {
-                    parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true);
-                    parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
-                        healthy: false, ex.Kind.ToString(), providerDetail);
-                    // A provider/configuration failure is execution health, not permission to erase
-                    // the project's real business blocker (for example an undelivered verification
-                    // email). Install a provider blocker only when no blocker already exists.
-                    if (stateBeforeFailure.Blocker == null)
-                        parent.RuntimeState.SetBlocker(projectID, new ProjectRuntimeBlocker
-                        {
-                            Category = ex.Kind switch
-                            {
-                                RemoteLLMFailureKind.InsufficientProviderCredit => ProjectBlockerCategory.Capacity,
-                                RemoteLLMFailureKind.Authentication => ProjectBlockerCategory.Configuration,
-                                _ => ProjectBlockerCategory.Configuration,
-                            },
-                            Code = ex.Kind.ToString(),
-                            Summary = providerDetail,
-                            Retryable = false,
-                        });
-                    parent.RuntimeState.SetDisposition(projectID, ProjectExecutionDisposition.Blocked);
-                    var blocked = parent.Store.GetProject(projectID);
-                    if (blocked != null && blocked.Status is ProjectStatus.Active or ProjectStatus.Planning)
-                    {
-                        blocked.Status = ProjectStatus.Blocked;
-                        if (string.IsNullOrWhiteSpace(blocked.BlockedReason))
-                            blocked.BlockedReason = stateBeforeFailure.Blocker?.Summary ?? providerDetail;
-                        blocked.BlockedAt = DateTime.UtcNow;
-                        parent.Store.SaveProject(blocked);
-                    }
-                    var blockedEvent = WakeEvt(projectID, wakeID, ProjectEventTypes.ProjectBlocked, "system",
-                        $"Execution blocked by action-required provider failure: {providerDetail}.");
-                    blockedEvent.PayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
-                    parent.EventLog.Append(blockedEvent);
-                    outcome = ProjectEventTypes.WakeFailed;
-                    outcomeText = $"Wake failed and execution blocked: {providerDetail}.";
-                }
+                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex);
+                // A provider failure is telemetry, never an autonomous project veto. Keep the
+                // circuit finite so a restored provider or adjusted route can recover itself.
+                failure.Retryable = true;
+                failure.RetryAt = retryAt;
+                parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
+                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                    healthy: false, ex.Kind.ToString(), providerDetail, retryAt);
+                outcome = ProjectEventTypes.WakeDeferred;
+                outcomeText = $"Wake deferred by provider failure: {providerDetail}; automatic retry after {retryAt:O}.";
             }
             catch (Exception ex)
             {

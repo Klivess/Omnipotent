@@ -32,7 +32,7 @@ namespace Omnipotent.Tests.Projects
             {
                 Runner = new ProjectCouncilRunner(Store, Log, _ => { })
                 {
-                    QueryAsync = (sid, sys, user, model, max, ct) =>
+                    QueryAsync = (sid, sys, user, routes, max, ct) =>
                     {
                         ct.ThrowIfCancellationRequested();
                         lock (QueryCalls) QueryCalls.Add((sid, user));
@@ -41,7 +41,7 @@ namespace Omnipotent.Tests.Projects
                         string text = sid.EndsWith("-chair") ? "CHAIR-VERDICT" : $"OPENING:{sid}";
                         return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, text, 100, 50, "gen", 0.001));
                     },
-                    ContinueAsync = (sid, user, model, max, ct) =>
+                    ContinueAsync = (sid, user, routes, max, ct) =>
                     {
                         ct.ThrowIfCancellationRequested();
                         lock (ContinueCalls) ContinueCalls.Add((sid, user));
@@ -68,6 +68,45 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal("CHAIR-VERDICT", session.VerdictText);
             Assert.Equal(7, h.SpendCalls); // every model turn booked to the ledger
             Assert.True(session.TotalCostUsd > 0);
+        }
+
+        [Fact]
+        public async Task LegacyHardPolicyBlock_IsDowngradedToNonVetoingOwnerDecision()
+        {
+            var h = new Harness();
+            h.Runner.QueryAsync = (sid, sys, user, routes, max, ct) =>
+                Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
+                    sid.EndsWith("-chair")
+                        ? "DECISION CLASS: HARD_POLICY_BLOCK\nRECOMMENDATION: stop the project"
+                        : "OPENING", 1, 1, null, 0));
+            string pid = NewProjectId();
+
+            var session = await h.Runner.ConveneAsync(NewProject(pid), "w1", "T", "B", null,
+                "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision, session.RecommendationClass);
+            Assert.Contains("This is advisory", ProjectCouncilRunner.FormatForCommander(session));
+        }
+
+        [Fact]
+        public void LegacyHardPolicyBlock_IsNormalizedBeforePersistence()
+        {
+            var store = new ProjectCouncilStore(_ => { });
+            string pid = NewProjectId();
+#pragma warning disable CS0618 // This verifies migration behavior for the persisted legacy enum value.
+            var created = store.Create(new CouncilSession
+            {
+                ProjectID = pid,
+                RecommendationClass = CouncilRecommendationClass.HardPolicyBlock,
+            });
+            created.RecommendationClass = CouncilRecommendationClass.HardPolicyBlock;
+            store.Update(created);
+#pragma warning restore CS0618
+
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision, created.RecommendationClass);
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision,
+                store.List(pid).Single().RecommendationClass);
         }
 
         [Fact]
@@ -156,7 +195,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task PerWakeCap_Refuses_WithoutPersisting()
+        public async Task PerWakeCap_LeavesProjectFreeToProceed_WithoutPersistingAnotherCouncil()
         {
             var h = new Harness();
             string pid = NewProjectId();
@@ -172,7 +211,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task PerDayCap_Refuses()
+        public async Task PerDayCap_LeavesProjectFreeToProceed()
         {
             var h = new Harness();
             string pid = NewProjectId();
@@ -186,7 +225,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task DuplicateTopicAndBriefing_IsRefusedBeforeAnotherCouncilIsPersisted()
+        public async Task DuplicateTopicAndBriefing_ReusesExistingAdviceBeforeAnotherCouncilIsPersisted()
         {
             var h = new Harness();
             string pid = NewProjectId();
@@ -198,28 +237,27 @@ namespace Omnipotent.Tests.Projects
                 null, "routine", "decision", "m", 5, 10, CancellationToken.None);
 
             Assert.Equal(CouncilStatus.Failed, duplicate.Status);
-            Assert.Contains("duplicate", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("matching", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("new evidence", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
             Assert.Single(h.Store.List(pid));
         }
 
         [Fact]
-        public async Task Council_WalksOnlyItsConfiguredRouteList()
+        public async Task Council_PassesItsConfiguredRouteListToEveryTurn()
         {
-            var models = new ConcurrentBag<string>();
+            var routeLists = new ConcurrentBag<string>();
             var runner = new ProjectCouncilRunner(new ProjectCouncilStore(_ => { }), new ProjectEventLogStore(_ => { }), _ => { })
             {
-                QueryAsync = (sid, sys, user, model, max, ct) =>
+                QueryAsync = (sid, sys, user, routes, max, ct) =>
                 {
-                    models.Add(model);
-                    return Task.FromResult<CouncilTurn?>(model == "bad/model" ? null
-                        : new CouncilTurn(true, sid.EndsWith("-chair") ? "VERDICT" : "OPENING", 1, 1, null, 0));
+                    routeLists.Add(string.Join("|", routes));
+                    return Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
+                        sid.EndsWith("-chair") ? "VERDICT" : "OPENING", 1, 1, null, 0));
                 },
-                ContinueAsync = (sid, user, model, max, ct) =>
+                ContinueAsync = (sid, user, routes, max, ct) =>
                 {
-                    models.Add(model);
-                    return Task.FromResult<CouncilTurn?>(model == "bad/model" ? null
-                        : new CouncilTurn(true, "REBUTTAL", 1, 1, null, 0));
+                    routeLists.Add(string.Join("|", routes));
+                    return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "REBUTTAL", 1, 1, null, 0));
                 },
             };
 
@@ -227,9 +265,8 @@ namespace Omnipotent.Tests.Projects
                 "routine", "decision", new[] { "bad/model", "good/model", "unused/model" }, 5, 10, CancellationToken.None);
 
             Assert.Equal(CouncilStatus.Completed, session.Status);
-            Assert.Equal(7, models.Count(m => m == "bad/model"));
-            Assert.Equal(7, models.Count(m => m == "good/model"));
-            Assert.DoesNotContain("unused/model", models);
+            Assert.Equal(7, routeLists.Count);
+            Assert.All(routeLists, routes => Assert.Equal("bad/model|good/model|unused/model", routes));
         }
     }
 }

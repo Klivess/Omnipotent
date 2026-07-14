@@ -211,7 +211,7 @@ namespace Omnipotent.Tests.Projects
 
     public class StimulusAgentTests
     {
-        private static StimulusAgent Agent(Func<string, string, Task<string?>> query) =>
+        private static StimulusAgent Agent(Func<string, IReadOnlyList<string>, Task<string?>> query) =>
             new(query, _ => ("free-model", "fallback-model"), _ => { });
 
         private static StimulusEnvelope Env(string payload) => new() { SourceKind = "email", Payload = payload };
@@ -244,38 +244,47 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task FreeModelThrottled_FallsBackToPaid()
+        public async Task PreferredAndFallbackRoutes_ArePassedAsOneOrderedListToOpenRouter()
         {
+            // Fallback now lives at the OpenRouter level: the agent makes ONE call handing the whole
+            // ordered route list (preferred first, then fallback) to the provider, which steps down
+            // internally. It must not loop model-by-model itself.
             int calls = 0;
-            var agent = Agent((_, model) =>
+            IReadOnlyList<string>? seen = null;
+            var agent = Agent((_, routes) =>
             {
                 calls++;
-                if (model == "free-model") throw new Exception("429 throttled");
-                return Task.FromResult<string?>("CONFIRM: fallback handled it");
+                seen = routes;
+                return Task.FromResult<string?>("CONFIRM: provider handled routing");
             });
+
             var r = await agent.EvaluateAsync(Env("x"), "some criterion");
+
             Assert.True(r.Confirmed);
-            Assert.Equal(2, calls); // free failed, fallback succeeded
+            Assert.Equal(1, calls); // one call — OpenRouter, not the agent, does the fallback
+            Assert.Equal(new[] { "free-model", "fallback-model" }, seen);
         }
 
         [Fact]
-        public async Task OrderedRouteLists_AreTriedInExactOrder_UntilSuccess()
+        public async Task OrderedRouteLists_ArePassedInExactOrder_DedupedAcrossPreferredAndFallback()
         {
-            var calls = new List<string>();
+            var calls = new List<IReadOnlyList<string>>();
             var agent = new StimulusAgent(
-                (_, _, model) =>
+                (_, _, routes) =>
                 {
-                    calls.Add(model);
-                    return Task.FromResult<string?>(model == "paid-2" ? "CONFIRM: final route worked" : null);
+                    calls.Add(routes);
+                    return Task.FromResult<string?>("CONFIRM: provider routed it");
                 },
                 _ => ((IReadOnlyList<string>)new[] { "free-1", "free-2" },
-                    (IReadOnlyList<string>)new[] { "paid-1", "paid-2", "unused" }),
+                    (IReadOnlyList<string>)new[] { "free-2", "paid-1", "unused" }),
                 _ => { });
 
             var result = await agent.EvaluateAsync(Env("x"), "criterion");
 
             Assert.True(result.Confirmed);
-            Assert.Equal(new[] { "free-1", "free-2", "paid-1", "paid-2" }, calls);
+            var passed = Assert.Single(calls);
+            // Preferred then fallback, in order, with duplicates removed ("free-2" appears once).
+            Assert.Equal(new[] { "free-1", "free-2", "paid-1", "unused" }, passed);
         }
 
         [Fact]

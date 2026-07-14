@@ -11,12 +11,14 @@ namespace Omnipotent.Services.Projects.Stimulus
     /// </summary>
     public class StimulusAgent
     {
-        private readonly Func<string, string, string, Task<string?>> queryModelAsync;   // (projectID, prompt, modelOverride) → response
+        // (projectID, prompt, orderedRoutes) → response. The route list is handed to OpenRouter as its
+        // own fallback set, so one call tries every route in turn rather than the agent looping.
+        private readonly Func<string, string, IReadOnlyList<string>, Task<string?>> queryModelAsync;
         private readonly Func<string, (IReadOnlyList<string> preferred, IReadOnlyList<string> fallback)> modelsForProject;
         private readonly Action<string> log;
 
         public StimulusAgent(
-            Func<string, string, string, Task<string?>> queryModelAsync,
+            Func<string, string, IReadOnlyList<string>, Task<string?>> queryModelAsync,
             Func<string, (IReadOnlyList<string> preferred, IReadOnlyList<string> fallback)> modelsForProject,
             Action<string> log)
         {
@@ -26,10 +28,10 @@ namespace Omnipotent.Services.Projects.Stimulus
         }
 
         public StimulusAgent(
-            Func<string, string, Task<string?>> queryModelAsync,
+            Func<string, IReadOnlyList<string>, Task<string?>> queryModelAsync,
             Func<string, (string free, string fallback)> modelsForProject,
             Action<string> log)
-            : this((_, prompt, model) => queryModelAsync(prompt, model), pid =>
+            : this((_, prompt, routes) => queryModelAsync(prompt, routes), pid =>
             {
                 var routes = modelsForProject(pid);
                 return ((IReadOnlyList<string>)new[] { routes.free },
@@ -42,9 +44,11 @@ namespace Omnipotent.Services.Projects.Stimulus
 
         /// <summary>
         /// Decides whether a raw stimulus meets its hook's criterion. Returns the confirm/reject
-        /// decision plus a one-line verdict. On a throttle/error from the free model, retries
-        /// once on the fallback; if both fail, fails OPEN (confirm) so a real event is never
-        /// silently dropped — over-delivery is cheaper than a missed stimulus.
+        /// decision plus a one-line verdict. The preferred + fallback routes are handed to OpenRouter
+        /// as one ordered fallback set (free tier first, cheap paid model behind it), so a throttled
+        /// free model steps down server-side within a single call. If the whole set fails, triage
+        /// fails OPEN (confirm) so a real event is never silently dropped — over-delivery is cheaper
+        /// than a missed stimulus.
         /// </summary>
         public async Task<TriageResult> EvaluateAsync(StimulusEnvelope env, string recognitionCriterion)
         {
@@ -55,14 +59,15 @@ namespace Omnipotent.Services.Projects.Stimulus
             string prompt = BuildPrompt(env, recognitionCriterion);
 
             var (preferred, fallback) = modelsForProject(env.ProjectID);
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var routes = preferred.Concat(fallback)
+                .Select(m => (m ?? "").Trim())
+                .Where(m => m.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
-            // Free tier failed/threw (likely throttled) — step down to the cheap paid model.
-            foreach (string configured in preferred.Concat(fallback))
+            if (routes.Count > 0)
             {
-                string model = configured.Trim();
-                if (model.Length == 0 || !seen.Add(model)) continue;
-                var result = await TryEvaluate(env.ProjectID, prompt, model);
+                var result = await TryEvaluate(env.ProjectID, prompt, routes);
                 if (result != null) return result;
             }
 
@@ -70,17 +75,17 @@ namespace Omnipotent.Services.Projects.Stimulus
             return new TriageResult(true, "Triage unavailable; delivered without evaluation.");
         }
 
-        private async Task<TriageResult?> TryEvaluate(string projectID, string prompt, string model)
+        private async Task<TriageResult?> TryEvaluate(string projectID, string prompt, IReadOnlyList<string> routes)
         {
             try
             {
-                string? resp = await queryModelAsync(projectID, prompt, model);
+                string? resp = await queryModelAsync(projectID, prompt, routes);
                 if (string.IsNullOrWhiteSpace(resp)) return null;
                 return Parse(resp);
             }
             catch (Exception ex)
             {
-                log($"StimulusAgent: model '{model}' failed ({ex.Message}).");
+                log($"StimulusAgent: triage routes [{string.Join(", ", routes)}] failed ({ex.Message}).");
                 return null;
             }
         }

@@ -178,6 +178,12 @@ namespace Omnipotent.Services.Projects
             try { a = JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson); }
             catch { a = new JObject(); }
 
+            // The offered-tool list is not a security boundary: a worker can still produce an
+            // arbitrary function name. Enforce strategic/human-gate tools here as well so no
+            // sub-agent can indirectly pause a project by opening a gate.
+            if (actingAgentID != "commander" && ProjectTierRouter.IsCommanderOnly(tool))
+                return FailedResult($"'{tool}' is reserved to the Commander. Report evidence and a recommended next action instead.");
+
             if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived && FileMutationTools.Contains(tool))
                 return new CommanderToolResult("This project's shared filesystem is browse-only after completion or archive.")
                 { Succeeded = false };
@@ -221,7 +227,6 @@ namespace Omnipotent.Services.Projects
                     string op = ((string?)a["op"] ?? "").Trim().ToLowerInvariant();
                     string key = ((string?)a["key"] ?? "").Trim();
                     string summary = ((string?)a["summary"] ?? "").Trim();
-                    string blockerSummary = ((string?)a["blockerSummary"] ?? "").Trim();
                     var evidence = BuildCheckpointEvidence(a);
                     ProjectRuntimeMutationResult changed;
 
@@ -315,21 +320,8 @@ namespace Omnipotent.Services.Projects
                             changed = RuntimeState.RemoveCanonicalArtifact(project.ProjectID, key);
                             break;
                         case "set_blocker":
-                            if (blockerSummary.Length > 0) summary = blockerSummary;
-                            if (summary.Length == 0) return new CommanderToolResult("set_blocker requires 'summary'.");
-                            changed = RuntimeState.SetBlocker(project.ProjectID, new ProjectRuntimeBlocker
-                            {
-                                Category = ParseBlockerCategory((string?)a["blockerCategory"]),
-                                Code = key.Length == 0 ? "unspecified" : key,
-                                Summary = summary,
-                                Retryable = (bool?)a["retryable"] ?? false,
-                                NextRetryAt = ParseUtc((string?)a["nextRetryAt"]),
-                                Evidence = evidence,
-                            });
-                            break;
                         case "clear_blocker":
-                            changed = RuntimeState.ClearBlocker(project.ProjectID);
-                            break;
+                            return FailedResult("Project agents cannot set or clear project blockers. Report the obstacle, mitigation, and next action to Klives or the Commander instead.");
                         case "set_active_milestones":
                             changed = RuntimeState.SetActiveMilestones(project.ProjectID, (int?)a["grandPlanVersion"],
                                 (a["milestoneIDs"] as JArray)?.Values<string>()
@@ -355,8 +347,6 @@ namespace Omnipotent.Services.Projects
                     {
                         "set_resume" => changed.State.Checkpoint.ResumeAction?.ActionID ?? "resume-action",
                         "clear_resume" => "resume-action",
-                        "set_blocker" => changed.State.Blocker?.Code ?? "unspecified",
-                        "clear_blocker" => "project-blocker",
                         "set_active_milestones" => "active-milestones",
                         "record_success" => changed.State.Checkpoint.LastSuccessfulAction?.ActionID ?? "last-success",
                         _ => op,
@@ -579,6 +569,8 @@ namespace Omnipotent.Services.Projects
 
                 case "request_user_approval":
                 {
+                    if (actingAgentID != "commander")
+                        return FailedResult("Only the Commander may open a project approval gate. Report the recommendation and evidence to the Commander instead.");
                     var gate = new ProjectGate
                     {
                         ProjectID = project.ProjectID,
@@ -1590,8 +1582,6 @@ namespace Omnipotent.Services.Projects
                         string? evidenceError = ValidatePlanEvidenceReferences(evidenceSequence, evidenceArtifacts);
                         if (evidenceError != null) return FailedResult(evidenceError);
                     }
-                    if (mRef.Length > 0 && requestedMilestoneStatus == MilestoneStatus.Blocked && requestedBlockReason.Length == 0)
-                        return FailedResult("A blocked milestone requires 'blockReason'.");
                     if (mRef.Length > 0)
                     {
                         var m = GrandPlans.UpdateMilestoneStatus(project.ProjectID, mRef, requestedMilestoneStatus,
@@ -1778,12 +1768,11 @@ namespace Omnipotent.Services.Projects
             if (!hasLiveCapabilityPrecondition)
                 return "EXTERNAL_OPERATION_PLAN_INCOMPLETE: add an unverified go/no-go precondition with an exact live test for account access, registration eligibility, verification delivery, or another real external dependency.";
 
-            bool hasPolicyGate = content.Risks.Any(r => r.BlocksExecution
-                && !string.IsNullOrWhiteSpace(r.Mitigation)
+            bool hasPolicyRisk = content.Risks.Any(r => !string.IsNullOrWhiteSpace(r.Mitigation)
                 && Regex.IsMatch(r.Description + " " + r.Mitigation,
                     @"\b(terms|policy|right|copyright|licen[cs]e|consent|privacy|legal|eligib\w*|automation|spam|content|reputation)\b", options));
-            if (!hasPolicyGate)
-                return "EXTERNAL_OPERATION_PLAN_INCOMPLETE: add a blocking risk, with a concrete mitigation, covering the live platform terms/policy, account eligibility, content rights, privacy, or comparable external constraint.";
+            if (!hasPolicyRisk)
+                return "EXTERNAL_OPERATION_PLAN_INCOMPLETE: add a documented risk, with a concrete mitigation, covering the live platform terms/policy, account eligibility, content rights, privacy, or comparable external constraint.";
 
             bool ongoing = Regex.IsMatch(objective,
                 @"\b(run|manage|operate|grow|schedule|ongoing|continuous|regular\w*|daily|weekly|posting|campaign)\b", options);
@@ -1917,7 +1906,9 @@ namespace Omnipotent.Services.Projects
             {
                 "in_progress" or "inprogress" or "started" or "wip" => MilestoneStatus.InProgress,
                 "done" or "complete" or "completed" or "finished" => MilestoneStatus.Done,
-                "blocked" or "stuck" => MilestoneStatus.Blocked,
+                // Legacy model output is treated as an in-progress handoff with an optional
+                // obstacle note; a project agent cannot turn it into an execution stop.
+                "blocked" or "stuck" => MilestoneStatus.InProgress,
                 _ => MilestoneStatus.Pending,
             };
 
@@ -1999,7 +1990,9 @@ namespace Omnipotent.Services.Projects
                     Description = desc,
                     Severity = ParseSeverity((string?)r?["severity"]),
                     Mitigation = ((string?)r?["mitigation"] ?? "").Trim(),
-                    BlocksExecution = (bool?)r?["blocksExecution"] ?? false,
+                    // Retain risk visibility, but never permit model-authored risk metadata to
+                    // become an execution gate.
+                    BlocksExecution = false,
                     Status = ParseRiskStatus((string?)r?["status"]),
                 });
             }

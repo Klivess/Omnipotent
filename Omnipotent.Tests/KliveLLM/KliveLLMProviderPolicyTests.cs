@@ -135,9 +135,49 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(TimeSpan.Zero, LlmService.BoundProviderRetryAfter(TimeSpan.FromSeconds(-1)));
         }
 
+        [Fact]
+        public void ModelFallback_SendsOpenRouterModelsArray_OnlyWhenMoreThanOneRoute()
+        {
+            // Multiple routes → the whole ordered list becomes OpenRouter's native `models` fallback set.
+            var multi = Payload(null);
+            LlmService.ApplyModelFallback(ref multi, OpenRouter(), new[] { "anthropic/claude-sonnet-4.5", "openai/gpt-4.1" });
+            Assert.Equal(new[] { "anthropic/claude-sonnet-4.5", "openai/gpt-4.1" }, multi.models);
+
+            // A single route needs no fallback — `models` stays unset so the plain `model` field is used.
+            var single = Payload(null);
+            LlmService.ApplyModelFallback(ref single, OpenRouter(), new[] { "anthropic/claude-sonnet-4.5" });
+            Assert.Null(single.models);
+
+            // No routes supplied at all.
+            var none = Payload(null);
+            LlmService.ApplyModelFallback(ref none, OpenRouter(), null);
+            Assert.Null(none.models);
+        }
+
+        [Fact]
+        public void ModelFallback_DedupesAndTrims_AndIgnoresNonOpenRouterProviders()
+        {
+            var deduped = Payload(null);
+            LlmService.ApplyModelFallback(ref deduped, OpenRouter(),
+                new[] { " a/b ", "a/b", "", "c/d", "A/B" });
+            Assert.Equal(new[] { "a/b", "c/d" }, deduped.models);
+
+            // Only OpenRouter understands the parameter; other providers never receive it.
+            var hf = Payload(null);
+            LlmService.ApplyModelFallback(ref hf, HuggingFace(), new[] { "a/b", "c/d" });
+            Assert.Null(hf.models);
+        }
+
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(
             LlmService.LLMProvider.OpenRouter,
             "OpenRouter",
+            "https://provider.test/v1/chat/completions",
+            "test-token",
+            "test/model");
+
+        private static LlmService.RemoteLLMProviderConfiguration HuggingFace() => new(
+            LlmService.LLMProvider.HuggingFace,
+            "HuggingFace",
             "https://provider.test/v1/chat/completions",
             "test-token",
             "test/model");

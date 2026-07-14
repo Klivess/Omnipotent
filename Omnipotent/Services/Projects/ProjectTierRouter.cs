@@ -48,7 +48,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
-            "complete_project", "request_budget_increase", "retire_sub_agent", "assign_plan_work", "record_money_spend",
+            "complete_project", "request_user_approval", "request_budget_increase", "retire_sub_agent", "assign_plan_work", "record_money_spend",
             // Councils and the Grand Plan are the Commander's strategic instruments — sub-agents
             // execute under the plan, they don't set or revise it. (These are also absent from
             // TextTierTools, so IsToolAllowed already blocks them; this makes the intent explicit.)

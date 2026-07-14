@@ -9,9 +9,19 @@ namespace Omnipotent.Services.Projects
     [JsonConverter(typeof(StringEnumConverter))]
     public enum CouncilStatus { Running, Completed, Failed, Cancelled }
 
-    /// <summary>Decision semantics are explicit: a council advises unless it identifies a genuine policy gate.</summary>
-    [JsonConverter(typeof(StringEnumConverter))]
-    public enum CouncilRecommendationClass { Unclassified, Proceed, ProceedWithConditions, NeedsUserDecision, HardPolicyBlock }
+        /// <summary>Decision semantics are advisory: councils surface evidence and recommendations, never veto a project.</summary>
+        [JsonConverter(typeof(StringEnumConverter))]
+        public enum CouncilRecommendationClass
+        {
+            Unclassified,
+            Proceed,
+            ProceedWithConditions,
+            NeedsUserDecision,
+            // Retained solely so historical council transcripts deserialize. New verdicts are
+            // normalized to NeedsUserDecision because a council has no veto authority.
+            [Obsolete("Historical persistence value only; councils cannot block projects.")]
+            HardPolicyBlock,
+        }
 
     /// <summary>One panelist turn (or the Chair's synthesis) in a council deliberation.</summary>
     public class CouncilStatement
@@ -46,7 +56,7 @@ namespace Omnipotent.Services.Projects
         public string Purpose { get; set; } = "decision";
         public string Topic { get; set; } = "";
         public string Briefing { get; set; } = "";
-        /// <summary>Stable hash of the normalized topic + briefing. It lets the store reject an
+        /// <summary>Stable hash of the normalized topic + briefing. It lets the store reuse an
         /// identical deliberation before another seven model calls are spent.</summary>
         public string InputFingerprint { get; set; } = "";
         /// <summary>"routine" | "elevated" | "critical".</summary>
@@ -93,6 +103,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Persists a new session (assigns a CouncilID if unset). Returns a clone.</summary>
         public CouncilSession Create(CouncilSession session)
         {
+            NormalizeLegacyRecommendation(session);
             if (string.IsNullOrWhiteSpace(session.CouncilID)) session.CouncilID = Guid.NewGuid().ToString("N");
             lock (LockFor(session.ProjectID))
             {
@@ -111,9 +122,10 @@ namespace Omnipotent.Services.Projects
         /// both observing spare capacity and overspending it.
         /// </summary>
         public CouncilSession? TryCreateWithGuards(CouncilSession session, int maxPerWake, int maxPerDay,
-            out string? refusal)
+            out string? reason)
         {
-            refusal = null;
+            NormalizeLegacyRecommendation(session);
+            reason = null;
             lock (LockFor(session.ProjectID))
             {
                 var all = LoadLocked(session.ProjectID);
@@ -126,20 +138,20 @@ namespace Omnipotent.Services.Projects
                         && s.Status is CouncilStatus.Running or CouncilStatus.Completed);
                     if (duplicate != null)
                     {
-                        refusal = $"Duplicate council blocked: council {duplicate.CouncilID} already considered this same topic and briefing. " +
-                            "Act on its verdict, or supply a materially updated briefing containing the new evidence or changed decision.";
+                        reason = $"A matching council already considered this topic and briefing (council {duplicate.CouncilID}). " +
+                            "Use its advisory verdict, or supply a materially updated briefing containing new evidence or a changed decision.";
                         return null;
                     }
                 }
                 if (maxPerWake > 0 && !string.IsNullOrEmpty(session.WakeID)
                     && all.Count(s => s.WakeID == session.WakeID) >= maxPerWake)
                 {
-                    refusal = $"Council limit for this wake reached ({maxPerWake}). Act on the verdict you already have, or wait for the next wake.";
+                    reason = $"Council limit for this wake reached ({maxPerWake}). Continue with the advisory verdicts already available, or try again next wake.";
                     return null;
                 }
                 if (maxPerDay > 0 && all.Count(s => s.CreatedAt >= now.Date) >= maxPerDay)
                 {
-                    refusal = $"Daily council limit reached ({maxPerDay}). Councils cost real tokens — decide with what you have, or convene tomorrow.";
+                    reason = $"Daily council limit reached ({maxPerDay}). Councils cost real tokens; continue with the evidence already available, or try again tomorrow.";
                     return null;
                 }
 
@@ -155,6 +167,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Overwrites the stored session with the same CouncilID (progress/verdict updates).</summary>
         public void Update(CouncilSession session)
         {
+            NormalizeLegacyRecommendation(session);
             lock (LockFor(session.ProjectID))
             {
                 var all = LoadLocked(session.ProjectID);
@@ -207,18 +220,35 @@ namespace Omnipotent.Services.Projects
         }
 
         private static CouncilSession Clone(CouncilSession s)
-            => JsonConvert.DeserializeObject<CouncilSession>(JsonConvert.SerializeObject(s))!;
+        {
+            var clone = JsonConvert.DeserializeObject<CouncilSession>(JsonConvert.SerializeObject(s))!;
+            NormalizeLegacyRecommendation(clone);
+            return clone;
+        }
 
         private List<CouncilSession> LoadLocked(string projectID)
         {
             string path = PathFor(projectID);
             if (!File.Exists(path)) return new();
-            try { return JsonConvert.DeserializeObject<List<CouncilSession>>(File.ReadAllText(path)) ?? new(); }
+            try
+            {
+                var sessions = JsonConvert.DeserializeObject<List<CouncilSession>>(File.ReadAllText(path)) ?? new();
+                sessions.ForEach(NormalizeLegacyRecommendation);
+                return sessions;
+            }
             catch (Exception ex)
             {
                 log($"ProjectCouncilStore: failed to load {path} ({ex.Message}) — starting empty, file preserved.");
                 return new();
             }
+        }
+
+        private static void NormalizeLegacyRecommendation(CouncilSession session)
+        {
+#pragma warning disable CS0618 // Historical persisted value is deliberately normalized on read.
+            if (session.RecommendationClass == CouncilRecommendationClass.HardPolicyBlock)
+                session.RecommendationClass = CouncilRecommendationClass.NeedsUserDecision;
+#pragma warning restore CS0618
         }
 
         private void SaveLocked(string projectID, List<CouncilSession> all)

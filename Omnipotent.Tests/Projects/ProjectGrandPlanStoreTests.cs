@@ -242,7 +242,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void EvidenceBackedPreconditions_GateMilestoneExecutionAndCompletion()
+        public void EvidenceBackedPreconditions_AreAdvisoryForExecution_ButStillInformCompletion()
         {
             var store = NewStore();
             string pid = NewProjectId();
@@ -262,9 +262,9 @@ namespace Omnipotent.Tests.Projects
             }, "preconditioned plan", null, true, "w1");
             store.MarkApproved(pid, 1, "g1", null);
 
-            Assert.Empty(store.GetReadyMilestones(pid));
-            Assert.Throws<InvalidOperationException>(() =>
-                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress));
+            Assert.Equal("Create account", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Equal(MilestoneStatus.InProgress,
+                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress)!.Status);
             Assert.Contains(store.GetCompletionReadinessIssues(pid), x => x.Contains("precondition p1"));
 
             var verified = store.SetPreconditionStatus(pid, "p1", PlanPreconditionStatus.Verified,
@@ -276,7 +276,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void BlockingAndHighRisks_MustBeExplicitlyResolvedWithEvidence()
+        public void Risks_AreAdvisoryForExecution_ButHighRisksStillInformCompletion()
         {
             var store = NewStore();
             string pid = NewProjectId();
@@ -289,7 +289,7 @@ namespace Omnipotent.Tests.Projects
                     {
                         Description = "Platform policy permits the planned operation",
                         Severity = RiskSeverity.High,
-                        BlocksExecution = true,
+                        BlocksExecution = true, // legacy metadata must not gain veto power
                         Mitigation = "Review the current policy and constrain the workflow",
                     },
                 },
@@ -298,9 +298,9 @@ namespace Omnipotent.Tests.Projects
             }, "risk-aware plan", null, true, "w1");
             store.MarkApproved(pid, 1, "g1", null);
 
-            Assert.Empty(store.GetReadyMilestones(pid));
-            Assert.Throws<InvalidOperationException>(() =>
-                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress));
+            Assert.Equal("Operate account", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Equal(MilestoneStatus.InProgress,
+                store.UpdateMilestoneStatus(pid, "m1", MilestoneStatus.InProgress)!.Status);
             Assert.Contains(store.GetCompletionReadinessIssues(pid), issue => issue.Contains("risk r1"));
 
             var resolved = store.SetRiskStatus(pid, "r1", PlanRiskStatus.Mitigated,
@@ -309,6 +309,33 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal(PlanRiskStatus.Mitigated, resolved!.Status);
             Assert.Equal("Operate account", Assert.Single(store.GetReadyMilestones(pid)).Title);
             Assert.DoesNotContain(store.GetCompletionReadinessIssues(pid), issue => issue.Contains("risk r1"));
+        }
+
+        [Fact]
+        public void LegacyBlockedMilestone_IsNormalizedToRunnableInProgressWork()
+        {
+            var store = NewStore();
+            string pid = NewProjectId();
+            store.SubmitVersion(pid, new GrandPlanContent
+            {
+                Mission = "Keep moving",
+                Milestones =
+                {
+                    new PlanMilestone
+                    {
+                        Title = "Recover the external dependency",
+                        Status = MilestoneStatus.Blocked,
+                        BlockReason = "Legacy obstacle note",
+                    },
+                },
+                SuccessCriteria = { new PlanCriterion { Text = "Dependency is recovered" } },
+            }, "legacy blocked plan", null, true, "w1");
+            store.MarkApproved(pid, 1, "g1", null);
+
+            var current = store.GetCurrentApproved(pid)!.Content!;
+            Assert.Equal(MilestoneStatus.InProgress, current.Milestones.Single().Status);
+            Assert.Equal("Recover the external dependency", Assert.Single(store.GetReadyMilestones(pid)).Title);
+            Assert.Contains("OBSERVATION: Legacy obstacle note", ProjectGrandPlanStore.RenderMarkdown(current));
         }
     }
 }

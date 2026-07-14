@@ -138,7 +138,7 @@ public class ProjectToolContractTests
     }
 
     [Fact]
-    public void PreviouslyMissingCompatibilityToolsAndFields_AreOffered()
+    public void CompatibilityToolsAreOffered_ButAgentsCannotDeclareProjectBlockers()
     {
         var tools = ProjectCommanderAgent.BuildCoreToolDefinitions();
         Assert.Contains(tools, t => t.function.name == "search_code");
@@ -148,7 +148,7 @@ public class ProjectToolContractTests
         var checkpoint = ProjectToolContract.ValidateAndNormalize("update_checkpoint",
             "{\"op\":\"set_blocker\",\"blockerSummary\":\"SMS verification required\"}", tools);
         Assert.True(human.IsValid, human.ErrorText);
-        Assert.True(checkpoint.IsValid, checkpoint.ErrorText);
+        Assert.False(checkpoint.IsValid);
     }
 
     [Fact]

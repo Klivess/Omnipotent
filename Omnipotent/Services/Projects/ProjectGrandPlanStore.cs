@@ -11,7 +11,9 @@ namespace Omnipotent.Services.Projects
 
     /// <summary>Live status of a plan milestone. Advanced in place via update_plan_progress (non-material).</summary>
     [JsonConverter(typeof(StringEnumConverter))]
-    public enum MilestoneStatus { Pending, InProgress, Done, Blocked }
+        // Blocked is retained for old persisted plans; it is normalized to InProgress so agents
+        // cannot use milestone state to stop project execution.
+        public enum MilestoneStatus { Pending, InProgress, Done, Blocked }
 
     /// <summary>Assessed severity of a plan risk.</summary>
     [JsonConverter(typeof(StringEnumConverter))]
@@ -86,8 +88,7 @@ namespace Omnipotent.Services.Projects
         public RiskSeverity Severity { get; set; } = RiskSeverity.Medium;
         public string Mitigation { get; set; } = "";
         public PlanRiskStatus Status { get; set; } = PlanRiskStatus.Open;
-        /// <summary>True for a legality, policy, safety, rights, or irreversible-risk decision
-        /// that must be resolved before execution can advance.</summary>
+        /// <summary>Legacy persisted field. Risks remain visible and auditable, but never gate execution.</summary>
         public bool BlocksExecution { get; set; }
         public DateTime? UpdatedAt { get; set; }
         public List<PlanEvidence> Evidence { get; set; } = new();
@@ -293,30 +294,20 @@ namespace Omnipotent.Services.Projects
                     string.Equals(x.ID, milestoneRef, StringComparison.OrdinalIgnoreCase)
                     || string.Equals(x.Title, milestoneRef, StringComparison.OrdinalIgnoreCase));
                 if (m == null) return null;
+                if (status == MilestoneStatus.Blocked) status = MilestoneStatus.InProgress;
                 if (status is MilestoneStatus.InProgress or MilestoneStatus.Done)
                 {
-                    var unverifiedPreconditions = v!.Content!.Preconditions
-                        .Where(x => x.Status != PlanPreconditionStatus.Verified || !HasEvidenceReference(x.Evidence))
-                        .Select(x => x.ID).ToList();
-                    if (unverifiedPreconditions.Count > 0)
-                        throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance until plan preconditions are verified: {string.Join(", ", unverifiedPreconditions)}.");
-                    var openBlockingRisks = v.Content.Risks.Where(x => x.BlocksExecution
-                            && (x.Status == PlanRiskStatus.Open || !HasEvidenceReference(x.Evidence)))
-                        .Select(x => x.ID).ToList();
-                    if (openBlockingRisks.Count > 0)
-                        throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance while blocking risks remain open: {string.Join(", ", openBlockingRisks)}.");
                     var unmet = m.DependsOn.Where(dep => v!.Content!.Milestones
                         .FirstOrDefault(x => string.Equals(x.ID, dep, StringComparison.OrdinalIgnoreCase))?.Status != MilestoneStatus.Done).ToList();
                     if (unmet.Count > 0)
                         throw new InvalidOperationException($"Milestone '{m.Title}' cannot advance until dependencies are done: {string.Join(", ", unmet)}.");
                 }
-                if (status == MilestoneStatus.Blocked && string.IsNullOrWhiteSpace(blockReason))
-                    throw new InvalidOperationException("A blocked milestone requires a block reason.");
                 if (status == MilestoneStatus.Done && !HasEvidenceReference(evidence)
                     && !HasEvidenceReference(m.Evidence))
                     throw new InvalidOperationException("A completed milestone requires evidence with a durable event, artifact, or approval-gate reference.");
                 m.Status = status;
-                m.BlockReason = status == MilestoneStatus.Blocked ? blockReason!.Trim() : null;
+                if (!string.IsNullOrWhiteSpace(blockReason)) m.BlockReason = blockReason.Trim();
+                else if (status is MilestoneStatus.Pending or MilestoneStatus.Done) m.BlockReason = null;
                 if (!string.IsNullOrWhiteSpace(ownerAgentID)) m.OwnerAgentID = ownerAgentID.Trim();
                 if (evidence != null) m.Evidence.Add(CloneJson(evidence));
                 m.UpdatedAt = DateTime.UtcNow;
@@ -434,10 +425,7 @@ namespace Omnipotent.Services.Projects
             if (v?.Content == null) return new();
             var byId = v.Content.Milestones.ToDictionary(m => m.ID, StringComparer.OrdinalIgnoreCase);
             return v.Content.Milestones
-                .Where(_ => v.Content.Preconditions.All(p => p.Status == PlanPreconditionStatus.Verified && HasEvidenceReference(p.Evidence)))
-                .Where(_ => v.Content.Risks.All(r => !r.BlocksExecution
-                    || r.Status != PlanRiskStatus.Open && HasEvidenceReference(r.Evidence)))
-                .Where(m => m.Status is MilestoneStatus.Pending or MilestoneStatus.InProgress)
+                .Where(m => m.Status is MilestoneStatus.Pending or MilestoneStatus.InProgress or MilestoneStatus.Blocked)
                 .Where(m => m.DependsOn.All(dep => byId.TryGetValue(dep, out var prerequisite)
                     && prerequisite.Status == MilestoneStatus.Done && HasEvidenceReference(prerequisite.Evidence)))
                 .OrderBy(m => m.Order).Select(CloneJson).ToList();
@@ -531,7 +519,7 @@ namespace Omnipotent.Services.Projects
                 {
                     if (r.Status == PlanRiskStatus.Open) r.Status = old.Status;
                     if (r.Evidence.Count == 0) r.Evidence = CloneJson(old.Evidence);
-                    r.BlocksExecution |= old.BlocksExecution;
+                    r.BlocksExecution = false;
                 }
             }
             foreach (var precondition in c.Preconditions)
@@ -602,8 +590,6 @@ namespace Omnipotent.Services.Projects
             {
                 if (milestone.Status == MilestoneStatus.Done && !HasEvidenceReference(milestone.Evidence))
                     throw new InvalidOperationException($"Milestone '{milestone.Title}' is marked done without durable evidence. Carry forward evidence-backed state or submit it pending.");
-                if (milestone.Status == MilestoneStatus.Blocked && string.IsNullOrWhiteSpace(milestone.BlockReason))
-                    throw new InvalidOperationException($"Milestone '{milestone.Title}' is marked blocked without a block reason.");
             }
             foreach (var criterion in content.SuccessCriteria.Where(c => c.Met && !HasEvidenceReference(c.Evidence)))
                 throw new InvalidOperationException($"Success criterion '{criterion.Text}' is marked met without durable evidence.");
@@ -659,13 +645,13 @@ namespace Omnipotent.Services.Projects
                     {
                         MilestoneStatus.Done => "[x]",
                         MilestoneStatus.InProgress => "[~]",
-                        MilestoneStatus.Blocked => "[!]",
+                        MilestoneStatus.Blocked => "[~]", // legacy value: treated as active work
                         _ => "[ ]",
                     };
                     string tail = string.IsNullOrWhiteSpace(m.Detail) ? "" : $" — {m.Detail}";
                     string target = string.IsNullOrWhiteSpace(m.Target) ? "" : $" (target: {m.Target})";
                     string owner = string.IsNullOrWhiteSpace(m.OwnerAgentID) ? "" : $" (owner: {m.OwnerAgentID})";
-                    string blocked = string.IsNullOrWhiteSpace(m.BlockReason) ? "" : $" — BLOCKER: {m.BlockReason}";
+                    string blocked = string.IsNullOrWhiteSpace(m.BlockReason) ? "" : $" — OBSERVATION: {m.BlockReason}";
                     string deps = m.DependsOn.Count == 0 ? "" : $" (depends on: {string.Join(", ", m.DependsOn)})";
                     sb.AppendLine($"- {box} **{m.Title}**{tail}{target}{owner}{deps}{blocked}" +
                         (m.Evidence.Count > 0 ? $" [evidence: {m.Evidence.Count}]" : ""));
@@ -689,7 +675,7 @@ namespace Omnipotent.Services.Projects
             {
                 sb.AppendLine("## Risks");
                 foreach (var r in c.Risks)
-                    sb.AppendLine($"- **[{r.Severity}/{r.Status}{(r.BlocksExecution ? "/BLOCKING" : "")}]** {r.Description}" +
+                    sb.AppendLine($"- **[{r.Severity}/{r.Status}]** {r.Description}" +
                         (string.IsNullOrWhiteSpace(r.Mitigation) ? "" : $" → {r.Mitigation}") +
                         (r.Evidence.Count > 0 ? $" [evidence: {r.Evidence.Count}]" : ""));
                 sb.AppendLine();
@@ -761,6 +747,10 @@ namespace Omnipotent.Services.Projects
             content.SuccessCriteria = content.SuccessCriteria.Where(x => x != null).ToList();
             foreach (var milestone in content.Milestones)
             {
+                // Historical plans could mark a milestone Blocked. Preserve its narrative
+                // observation, but keep it runnable so an agent cannot stop the project.
+                if (milestone.Status == MilestoneStatus.Blocked)
+                    milestone.Status = MilestoneStatus.InProgress;
                 milestone.DependsOn ??= new();
                 milestone.Evidence ??= new();
                 NormalizeEvidence(milestone.Evidence);
@@ -772,6 +762,9 @@ namespace Omnipotent.Services.Projects
             }
             foreach (var risk in content.Risks)
             {
+                // Historical risk metadata remains useful for reporting, but it has no
+                // authority to gate a project's execution.
+                risk.BlocksExecution = false;
                 risk.Evidence ??= new();
                 NormalizeEvidence(risk.Evidence);
             }

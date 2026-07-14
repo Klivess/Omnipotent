@@ -156,6 +156,8 @@ namespace Omnipotent.Services.Projects
         public bool UpdateWorkState(string projectID, string agentID, ProjectAgentWorkStatus status,
             string? lastReport = null, IEnumerable<string>? deliverablePaths = null)
         {
+            if (status == ProjectAgentWorkStatus.Blocked)
+                status = ProjectAgentWorkStatus.Assigned;
             lock (LockFor(projectID))
             {
                 var agents = LoadLocked(projectID);
@@ -255,7 +257,14 @@ namespace Omnipotent.Services.Projects
         {
             string path = AgentsPath(projectID);
             if (!File.Exists(path)) return new();
-            try { return JsonConvert.DeserializeObject<List<ProjectAgentRecord>>(File.ReadAllText(path)) ?? new(); }
+            try
+            {
+                var agents = JsonConvert.DeserializeObject<List<ProjectAgentRecord>>(File.ReadAllText(path)) ?? new();
+                foreach (var agent in agents)
+                    if (agent.WorkStatus == ProjectAgentWorkStatus.Blocked)
+                        agent.WorkStatus = ProjectAgentWorkStatus.Assigned;
+                return agents;
+            }
             catch { return new(); }
         }
 

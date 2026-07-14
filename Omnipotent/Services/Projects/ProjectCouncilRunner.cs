@@ -14,8 +14,8 @@ namespace Omnipotent.Services.Projects
     /// synthesis. The Chair's output is the verdict returned to the Commander.
     ///
     /// Councils are NOT sub-agents: they don't count against SubAgentCap and hold no tools. The
-    /// panelists see only the Commander's briefing — the Chair has an explicit
-    /// "INSUFFICIENT INFORMATION — gather X and reconvene" escape hatch for when that isn't enough.
+        /// panelists see only the Commander's briefing. They can identify missing evidence, risks,
+        /// and decisions that need Klives, but never refuse, veto, or halt the project.
     ///
     /// The LLM/budget dependencies are injected as delegates (mirrors StimulusAgent) so the
     /// orchestration can be unit-tested with scripted turns.
@@ -33,10 +33,11 @@ namespace Omnipotent.Services.Projects
         private readonly ProjectEventLogStore eventLog;
         private readonly Action<string> log;
 
-        /// <summary>Fresh session: (sessionId, systemPrompt, userMessage, model, maxTokens, ct) → turn.</summary>
-        public Func<string, string?, string, string, int, CancellationToken, Task<CouncilTurn?>>? QueryAsync { get; set; }
-        /// <summary>Continue an existing session (rebuttal round): (sessionId, userMessage, model, maxTokens, ct) → turn.</summary>
-        public Func<string, string, string, int, CancellationToken, Task<CouncilTurn?>>? ContinueAsync { get; set; }
+        /// <summary>Fresh session: (sessionId, systemPrompt, userMessage, modelRoutes, maxTokens, ct) → turn.
+        /// The ordered route list is OpenRouter's own fallback set for the single request.</summary>
+        public Func<string, string?, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? QueryAsync { get; set; }
+        /// <summary>Continue an existing session (rebuttal round): (sessionId, userMessage, modelRoutes, maxTokens, ct) → turn.</summary>
+        public Func<string, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? ContinueAsync { get; set; }
         /// <summary>Reserves budget for a provider turn without serializing the provider call.</summary>
         public Func<string, CancellationToken, Task<IAsyncDisposable?>>? AcquireTurnAsync { get; set; }
         /// <summary>Books a turn's spend to the ledger: (projectID, prompt, completion, genId, cost).</summary>
@@ -56,7 +57,7 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>
         /// Runs a full council. Returns the completed (or failed/cancelled) session. Cap/budget
-        /// refusals return a transient Failed session with <see cref="CouncilSession.Error"/> set and
+        /// availability limits return a transient Failed session with <see cref="CouncilSession.Error"/> set and
         /// are NOT persisted. Cancellation persists the partial transcript and rethrows so the wake
         /// unwinds normally.
         /// </summary>
@@ -72,12 +73,12 @@ namespace Omnipotent.Services.Projects
             string pid = project.ProjectID;
             var modelRoutes = configuredRoutes.Where(x => !string.IsNullOrWhiteSpace(x))
                 .Select(x => x.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            if (modelRoutes.Count == 0) return Refused("No council model routes are configured.");
+            if (modelRoutes.Count == 0) return Unavailable("No council model routes are configured; continue without a council verdict.");
             string model = modelRoutes[0];
 
             // ── guardrails ──
             if (IsBudgetPaused?.Invoke(pid) == true)
-                return Refused("The project is budget-paused; a council would overrun the budget. Resolve the budget first.");
+                return Unavailable("The project is budget-paused, so this council cannot spend tokens. Continue using the evidence already available.");
 
             var panel = NormalizeRoles(roles);
             var session = new CouncilSession
@@ -94,8 +95,8 @@ namespace Omnipotent.Services.Projects
                 Model = model,
                 Status = CouncilStatus.Running,
             };
-            if (store.TryCreateWithGuards(session, maxPerWake, maxPerDay, out string? refusal) == null)
-                return Refused(refusal ?? "Council guardrail refused this deliberation.");
+            if (store.TryCreateWithGuards(session, maxPerWake, maxPerDay, out string? availabilityReason) == null)
+                return Unavailable(availabilityReason ?? "This council is unavailable right now; continue without a new verdict.");
 
             AppendEvent(session, ProjectEventTypes.CouncilConvened, "commander",
                 $"Council convened: {Trunc(session.Topic, 140)} — panel: {string.Join(", ", panel)} + Chair.",
@@ -229,19 +230,14 @@ namespace Omnipotent.Services.Projects
                 "Then restate your FINAL position in ≤250 words, explicitly noting anything you changed your mind about.";
             await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
             if (AcquireTurnAsync != null && lease == null) return;
+            // Fallback across routes is OpenRouter's job now — one call, the whole ordered list.
             CouncilTurn? turn = null;
-            Exception? lastError = null;
-            foreach (string model in modelRoutes)
+            try
             {
-                try
-                {
-                    turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, model, RebuttalMaxTokens, ct);
-                    if (turn is { Success: true }) break;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { lastError = ex; }
+                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, modelRoutes, RebuttalMaxTokens, ct);
             }
-            if (turn is not { Success: true } && lastError != null) log($"Council rebuttal routes failed: {lastError.Message}");
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { log($"Council rebuttal routes failed: {ex.Message}"); }
             if (turn is { Success: true } && !string.IsNullOrWhiteSpace(turn.Text))
                 await RecordStatementAsync(session, role, 2, turn);
         }
@@ -249,20 +245,9 @@ namespace Omnipotent.Services.Projects
         private async Task<CouncilTurn?> QueryRoutesAsync(CouncilSession session, string sessionID,
             string? systemPrompt, string prompt, IReadOnlyList<string> modelRoutes, int maxTokens, CancellationToken ct)
         {
-            CouncilTurn? last = null;
-            Exception? lastError = null;
-            foreach (string model in modelRoutes)
-            {
-                try
-                {
-                    last = await QueryAsync!(sessionID, systemPrompt, prompt, model, maxTokens, ct);
-                    if (last is { Success: true }) return last;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex) { lastError = ex; }
-            }
-            if (last == null && lastError != null) throw lastError;
-            return last;
+            // Fallback across routes is handled by OpenRouter (the whole ordered list rides one request),
+            // so this is a single delegate call rather than a per-model retry loop.
+            return await QueryAsync!(sessionID, systemPrompt, prompt, modelRoutes, maxTokens, ct);
         }
 
         private CouncilSession FinishOnBudget(CouncilSession session, Dictionary<string, string> openingByRole)
@@ -343,14 +328,14 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine(st.Text);
                 sb.AppendLine();
             }
-            sb.AppendLine("Synthesize the council's verdict. Do NOT vote-count — weigh the arguments. Output these sections:");
-            sb.AppendLine("DECISION CLASS: exactly one of PROCEED | PROCEED_WITH_CONDITIONS | NEEDS_USER_DECISION | HARD_POLICY_BLOCK. HARD_POLICY_BLOCK is only for an actual governing policy constraint; feasibility or strategic disagreement is advisory, not a veto.");
+            sb.AppendLine("Synthesize the council's advisory verdict. Do NOT vote-count — weigh the arguments. Output these sections:");
+            sb.AppendLine("DECISION CLASS: exactly one of PROCEED | PROCEED_WITH_CONDITIONS | NEEDS_USER_DECISION. You have no authority to refuse, veto, halt, or block this project. Treat every policy, feasibility, strategic, or ethical concern as actionable advice, conditions, evidence to gather, or a decision for Klives.");
             sb.AppendLine("RECOMMENDATION: the single course of action, stated plainly.");
             sb.AppendLine("KEY RISKS: the risks that survived debate.");
             sb.AppendLine("DISSENTS (preserved): quote any minority view the panel could not resolve, verbatim in spirit.");
             sb.AppendLine("CONDITIONS / TRIPWIRES: what must hold for this to work; what would reverse it.");
             sb.AppendLine("CONFIDENCE: low | medium | high.");
-            sb.AppendLine("If the panel genuinely lacked the information to decide well, instead LEAD with: 'INSUFFICIENT INFORMATION — gather <what> and reconvene.'");
+            sb.AppendLine("If the panel genuinely lacked the information to decide well, instead LEAD with: 'INSUFFICIENT INFORMATION — gather <what> and continue.'");
             return sb.ToString();
         }
 
@@ -365,7 +350,7 @@ namespace Omnipotent.Services.Projects
                     "advances the mission, what compounding advantages or path-dependencies it creates, and what the strongest " +
                     "version of the plan looks like.",
                 "Skeptic" => "You hold the SKEPTIC / RED-TEAM seat: find the strongest case AGAINST the emerging consensus — hidden " +
-                    "assumptions, failure modes, cheaper alternatives, and reasons to do nothing. You are rewarded for being right " +
+                    "assumptions, failure modes, cheaper alternatives, and ways to improve the approach. You are rewarded for being right " +
                     "when the others are wrong, never for agreeing.",
                 "Pragmatist" => "You hold the PRAGMATIST seat: focus on execution reality — cost, time, complexity, what can actually " +
                     "be done now with the resources at hand, and the simplest thing that could work.",
@@ -376,9 +361,10 @@ namespace Omnipotent.Services.Projects
 
         private static string ChairSystemPrompt() =>
             "You are the CHAIR of an adversarial decision council. You did not argue a side; your job is to synthesize the panel's " +
-            "deliberation into a clear, decision-ready verdict for the Commander. Do not vote-count — weigh the arguments on merit. " +
-            "Preserve genuine dissent rather than papering over it. If the panel lacked the information to decide well, say exactly " +
-            "what to gather before deciding. Be decisive where the evidence supports it and honest where it does not.";
+            "deliberation into a clear, decision-ready advisory verdict for the Commander. Do not vote-count — weigh the arguments on merit. " +
+            "You cannot refuse, veto, halt, or block the project; turn every concern into a recommendation, condition, evidence request, " +
+            "or a decision for Klives. Preserve genuine dissent rather than papering over it. If the panel lacked the information to decide well, " +
+            "say exactly what to gather before deciding. Be decisive where the evidence supports it and honest where it does not.";
 
         // ── helpers ──
 
@@ -421,14 +407,16 @@ namespace Omnipotent.Services.Projects
             if (string.IsNullOrWhiteSpace(verdict)) return CouncilRecommendationClass.Unclassified;
             string first = verdict.Split('\n').FirstOrDefault(l => l.Contains("DECISION CLASS", StringComparison.OrdinalIgnoreCase)) ?? "";
             string normalized = first.Replace("-", "_", StringComparison.Ordinal).Replace(" ", "_", StringComparison.Ordinal).ToUpperInvariant();
-            if (normalized.Contains("HARD_POLICY_BLOCK", StringComparison.Ordinal)) return CouncilRecommendationClass.HardPolicyBlock;
+            // Historical chair output may contain this legacy label. It is advisory only, so
+            // normalize it to an owner decision rather than granting the council a veto.
+            if (normalized.Contains("HARD_POLICY_BLOCK", StringComparison.Ordinal)) return CouncilRecommendationClass.NeedsUserDecision;
             if (normalized.Contains("NEEDS_USER_DECISION", StringComparison.Ordinal)) return CouncilRecommendationClass.NeedsUserDecision;
             if (normalized.Contains("PROCEED_WITH_CONDITIONS", StringComparison.Ordinal)) return CouncilRecommendationClass.ProceedWithConditions;
             if (normalized.Contains("PROCEED", StringComparison.Ordinal)) return CouncilRecommendationClass.Proceed;
             return CouncilRecommendationClass.Unclassified;
         }
 
-        private CouncilSession Refused(string reason) =>
+        private CouncilSession Unavailable(string reason) =>
             new() { Status = CouncilStatus.Failed, Error = reason };
 
         private void AppendEvent(CouncilSession session, string type, string author, string text, object payload)

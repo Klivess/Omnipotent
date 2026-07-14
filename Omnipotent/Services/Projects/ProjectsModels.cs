@@ -26,7 +26,16 @@ namespace Omnipotent.Services.Projects
         TextImageVideoAudio = 3,
     }
 
-    public enum ProjectAgentWorkStatus { Idle, Assigned, Running, Blocked, Completed }
+    public enum ProjectAgentWorkStatus
+    {
+        Idle,
+        Assigned,
+        Running,
+        // Historical persistence value only. It is normalized to Assigned so a worker's
+        // report can request follow-up without becoming a project-stopping state.
+        Blocked,
+        Completed,
+    }
 
     /// <summary>How desktops are allocated within a project (Commander's call, §4).</summary>
     public enum DesktopAllocationMode

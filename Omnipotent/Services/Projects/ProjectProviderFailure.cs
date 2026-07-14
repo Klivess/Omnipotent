@@ -12,6 +12,20 @@ namespace Omnipotent.Services.Projects
     {
         public const string DependencyKey = "llm-provider";
 
+        /// <summary>
+        /// Projects never permanently stop because an autonomous model route is unavailable or
+        /// misconfigured. Even failures providers classify as non-retryable get a bounded
+        /// automatic retry window, allowing a changed route, restored credit, or repaired
+        /// configuration to recover without an agent having to unblock the project.
+        /// </summary>
+        public static DateTime AutomaticRetryAt(RemoteLLMException ex, DateTime? nowUtc = null)
+        {
+            DateTime now = nowUtc ?? DateTime.UtcNow;
+            TimeSpan delay = ex.RetryAfter is { } requested && requested > TimeSpan.Zero
+                ? requested : TimeSpan.FromMinutes(15);
+            return now + delay;
+        }
+
         public static ProjectExecutionFailure ToExecutionFailure(RemoteLLMException ex, string wakeID) => new()
         {
             Category = ex.Kind switch

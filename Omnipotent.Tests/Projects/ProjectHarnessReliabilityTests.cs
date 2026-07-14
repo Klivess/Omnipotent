@@ -350,6 +350,18 @@ public class ProjectProviderFailureTelemetryTests
         Assert.DoesNotContain("raw-token", payload);
     }
 
+    [Fact]
+    public void NonRetryableProviderFailure_StillGetsFiniteAutomaticRetry()
+    {
+        var error = new RemoteLLMException(RemoteLLMFailureKind.Authentication,
+            "credential rejected", "OpenRouter", "provider/model", HttpStatusCode.Unauthorized);
+        DateTime now = new(2026, 7, 14, 12, 0, 0, DateTimeKind.Utc);
+
+        DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(error, now);
+
+        Assert.Equal(now.AddMinutes(15), retryAt);
+    }
+
     [Theory]
     [InlineData("OpenRouter 400 InvalidRequest: malformed tools", RemoteLLMFailureKind.InvalidRequest, 400)]
     [InlineData("OpenRouter 429 rate limited", RemoteLLMFailureKind.RateLimited, 429)]

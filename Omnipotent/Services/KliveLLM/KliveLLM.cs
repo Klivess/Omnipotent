@@ -663,7 +663,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -677,7 +677,7 @@ namespace Omnipotent.Services.KliveLLM
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete);
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete, modelRoutes: modelRoutes);
             var msg = response.choices[0].message;
             var content = HFWrapper.ContentToText(msg?.content);
             var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -705,6 +705,7 @@ namespace Omnipotent.Services.KliveLLM
                 CompletionTokens = response.usage?.completion_tokens ?? 0,
                 GenerationId = response.id,
                 CostUsd = response.usage?.cost,
+                Model = response.model,
             };
         }
 
@@ -900,17 +901,26 @@ namespace Omnipotent.Services.KliveLLM
             CancellationToken cancellationToken = default,
             Action<string>? onToken = null,
             string? thinkingOverride = null,
-            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null,
+            IReadOnlyList<string>? modelRoutes = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
+            // The primary model is the first configured route (when a route list is supplied), else the
+            // explicit override, else the provider default. Additional routes become OpenRouter's own
+            // fallback list (see ApplyModelFallback) rather than an app-side retry loop.
+            string primaryModel = (modelRoutes != null && modelRoutes.Count > 0 && !string.IsNullOrWhiteSpace(modelRoutes[0]))
+                ? modelRoutes[0].Trim()
+                : (string.IsNullOrWhiteSpace(modelOverride) ? remoteProvider.Model : modelOverride);
+
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
-                model = string.IsNullOrWhiteSpace(modelOverride) ? remoteProvider.Model : modelOverride,
+                model = primaryModel,
                 stream = false,
                 max_tokens = maxTokensOverride,
                 tools = tools,
             };
+            ApplyModelFallback(ref payload, remoteProvider, modelRoutes);
             ApplyServiceTier(ref payload, remoteProvider);
             ApplyUsageAccounting(ref payload, remoteProvider);
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
@@ -962,6 +972,26 @@ namespace Omnipotent.Services.KliveLLM
                 parts.Add(new HFWrapper.HFTextPart { text = volatileTail });
 
             system.content = parts;
+        }
+
+        /// <summary>
+        /// Turns an ordered route list into OpenRouter-native fallback routing: the whole list is sent as
+        /// the request's <c>models</c> array so OpenRouter tries each model in order until one succeeds,
+        /// server-side, in a single request. This replaces app-side "try model A, on failure re-query with
+        /// model B" loops. Only applied for OpenRouter (the only provider that understands the parameter)
+        /// and only when more than one distinct route exists — a single route needs no fallback and is sent
+        /// as the plain <c>model</c> field alone.
+        /// </summary>
+        internal static void ApplyModelFallback(ref HFWrapper.HFLLMInferenceRequest payload,
+            RemoteLLMProviderConfiguration remoteProvider, IReadOnlyList<string>? modelRoutes)
+        {
+            if (remoteProvider.Provider != LLMProvider.OpenRouter || modelRoutes == null) return;
+            var distinct = modelRoutes
+                .Select(m => (m ?? "").Trim())
+                .Where(m => m.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (distinct.Count > 1) payload.models = distinct;
         }
 
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
@@ -1764,6 +1794,11 @@ namespace Omnipotent.Services.KliveLLM
             /// round-trip. Null when the provider doesn't report a cost (HuggingFace/local), in which
             /// case callers fall back to a provisional estimate + optional /generation reconciliation.</summary>
             public double? CostUsd { get; set; }
+
+            /// <summary>The model that actually served this turn, as reported by the provider (OpenRouter's
+            /// response `model`). With OpenRouter fallback routing this may be a later route than the primary
+            /// one requested. Null when the provider doesn't echo it.</summary>
+            public string? Model { get; set; }
 
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.

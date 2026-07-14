@@ -218,6 +218,61 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task AgentCannotCreateOrClearProjectBlockersThroughCheckpointTool()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            var runtime = new ProjectRuntimeStateStore(_ => { });
+            s.Tools.RuntimeState = runtime;
+
+            var set = await s.Tools.DispatchAsync("update_checkpoint",
+                JsonConvert.SerializeObject(new { op = "set_blocker", blockerSummary = "Stop the project" }),
+                CancellationToken.None);
+            var clear = await s.Tools.DispatchAsync("update_checkpoint",
+                JsonConvert.SerializeObject(new { op = "clear_blocker" }),
+                CancellationToken.None);
+
+            Assert.False(set.Succeeded);
+            Assert.False(clear.Succeeded);
+            Assert.Null(runtime.Get(s.Project.ProjectID).Blocker);
+            Assert.Equal(ProjectExecutionDisposition.Running, runtime.Get(s.Project.ProjectID).Disposition);
+            Assert.Equal(ProjectStatus.Active, s.Store.GetProject(s.Project.ProjectID)!.Status);
+        }
+
+        [Fact]
+        public async Task WorkerCannotOpenAnApprovalGateThroughDirectToolDispatch()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            var workerTools = new ProjectCommanderTools(s.Project, s.Log,
+                new ProjectDigestStore(_ => { }), new ProjectSubAgentManager(s.Store, s.Log), s.Gates,
+                new ProjectBudgetLedger(s.Store, s.Log,
+                    new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { }), _ => { }),
+                new ProjectVault(_ => { }), s.Store, "worker_1", "w1");
+
+            var result = await workerTools.DispatchAsync("request_user_approval",
+                JsonConvert.SerializeObject(new { title = "Stop work", description = "A worker cannot pause this project." }),
+                CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Empty(s.Gates.ListPending(s.Project.ProjectID));
+            Assert.Equal(ProjectStatus.Active, s.Store.GetProject(s.Project.ProjectID)!.Status);
+        }
+
+        [Fact]
+        public void WorkerBlockedStatus_IsNormalizedToAssignedFollowup()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            var agents = new ProjectSubAgentManager(s.Store, s.Log);
+            agents.EnsureCommander(s.Project.ProjectID);
+            var worker = agents.Spawn(s.Project.ProjectID, "commander", ProjectAgentTier.Text, "researcher", "Research the next step.");
+
+            Assert.True(agents.UpdateWorkState(s.Project.ProjectID, worker.AgentID,
+                ProjectAgentWorkStatus.Blocked, "Legacy worker obstacle."));
+
+            Assert.Equal(ProjectAgentWorkStatus.Assigned,
+                agents.ListActive(s.Project.ProjectID).Single(a => a.AgentID == worker.AgentID).WorkStatus);
+        }
+
+        [Fact]
         public async Task OngoingExternalAccountPlan_RequiresLiveGateDurableCadenceAndFeedbackLoop()
         {
             var s = NewSetup(ProjectStatus.Planning, "Run and grow a TikTok account on a posting schedule");
@@ -243,7 +298,7 @@ namespace Omnipotent.Tests.Projects
                     new { title = "Review analytics metrics and feed the next growth experiment" },
                 },
                 preconditions = new[] { new { description = "TikTok signup and email verification are available", verification = "Use the visible browser and confirm a real KliveMail code arrives" } },
-                risks = new[] { new { description = "Platform terms, account eligibility, and media rights", severity = "high", mitigation = "Review live policy and license every asset", blocksExecution = true } },
+                risks = new[] { new { description = "Platform terms, account eligibility, and media rights", severity = "high", mitigation = "Review live policy and license every asset" } },
                 successCriteria = new[] { new { text = "Publishing ledger, recurring cadence, and reach review remain operational" } },
                 summary = "Operate through a verified, policy-aware, measured publishing loop"
             }), CancellationToken.None);

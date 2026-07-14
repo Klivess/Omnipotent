@@ -230,20 +230,20 @@ namespace Omnipotent.Services.Projects
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
-                QueryAsync = async (sid, sys, user, model, maxTokens, ct) =>
+                QueryAsync = async (sid, sys, user, routes, maxTokens, ct) =>
                 {
                     var llm = await GetKliveLLM();
                     if (llm == null) return null;
                     llm.StartToolSession(sid, sys);
                     llm.AppendUserMessageToToolSession(sid, user);
-                    return await RunCouncilTurnAsync(llm, sid, model, maxTokens, ct);
+                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct);
                 },
-                ContinueAsync = async (sid, user, model, maxTokens, ct) =>
+                ContinueAsync = async (sid, user, routes, maxTokens, ct) =>
                 {
                     var llm = await GetKliveLLM();
                     if (llm == null) return null;
                     llm.AppendUserMessageToToolSession(sid, user);
-                    return await RunCouncilTurnAsync(llm, sid, model, maxTokens, ct);
+                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct);
                 },
                 AcquireTurnAsync = (pid, ct) => Budget.TryAcquireLlmTurnAsync(pid, ct),
                 RecordSpendAsync = (pid, p, c, g, cost) => Budget.RecordTokenSpendAsync(pid, p, c, g, cost),
@@ -706,9 +706,12 @@ namespace Omnipotent.Services.Projects
                    $"Blocker: {runtime.Blocker?.Summary ?? p.BlockedReason ?? "none"}. Last event: {lastText}.";
         }
 
-        /// <summary>Queries the utility model with a one-shot prompt; used by triage and digest rebuilds.</summary>
-        private async Task<string?> QueryUtilityModelAsync(string projectID, string prompt, string modelOverride)
+        /// <summary>Queries the utility model with a one-shot prompt; used by triage and digest rebuilds.
+        /// The ordered routes are handed to OpenRouter as its own fallback set (one request tries them all
+        /// in turn) rather than looping model-by-model in-process.</summary>
+        private async Task<string?> QueryUtilityModelAsync(string projectID, string prompt, IReadOnlyList<string> routes)
         {
+            if (routes == null || routes.Count == 0) return null;
             var llmServices = await GetServicesByType<KliveLLM.KliveLLM>();
             if (llmServices == null || llmServices.Length == 0) return null;
             var llm = (KliveLLM.KliveLLM)llmServices[0];
@@ -722,34 +725,15 @@ namespace Omnipotent.Services.Projects
                 var settings = Settings.Get(projectID);
                 int utilityMaxTokens = Math.Clamp(settings.UtilityMaxOutputTokens, 256, 8_192);
                 var resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                    maxTokensOverride: utilityMaxTokens, modelOverride: modelOverride);
+                    maxTokensOverride: utilityMaxTokens, modelOverride: routes[0], modelRoutes: routes);
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
                     await Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
                 return resp.Success ? resp.Response : null;
             }
         }
 
-        private async Task<string?> QueryUtilityRoutesAsync(string projectID, string prompt)
-        {
-            var routes = Settings.Get(projectID).UtilityRoutes;
-            Exception? lastError = null;
-            foreach (string route in routes)
-            {
-                try
-                {
-                    string? response = await QueryUtilityModelAsync(projectID, prompt, route);
-                    if (!string.IsNullOrWhiteSpace(response)) return response;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (Exception ex)
-                {
-                    lastError = ex;
-                    await ServiceLog($"Projects utility route '{route}' failed: {ProjectProviderFailure.SafeDetail(ex.Message, 180)}");
-                }
-            }
-            if (lastError != null) throw lastError;
-            return null;
-        }
+        private Task<string?> QueryUtilityRoutesAsync(string projectID, string prompt)
+            => QueryUtilityModelAsync(projectID, prompt, Settings.Get(projectID).UtilityRoutes);
 
         /// <summary>The KliveLLM service instance, or null when unavailable.</summary>
         private async Task<KliveLLM.KliveLLM?> GetKliveLLM()
@@ -758,11 +742,12 @@ namespace Omnipotent.Services.Projects
             return (svcs == null || svcs.Length == 0) ? null : (KliveLLM.KliveLLM)svcs[0];
         }
 
-        /// <summary>One council-panelist round-trip on an already-seeded session. Spend is booked by the runner.</summary>
-        private static async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, string model, int maxTokens, CancellationToken ct)
+        /// <summary>One council-panelist round-trip on an already-seeded session. Spend is booked by the
+        /// runner. The ordered routes are OpenRouter's own fallback set for this single request.</summary>
+        private static async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, IReadOnlyList<string> routes, int maxTokens, CancellationToken ct)
         {
             var resp = await llm.QueryToolSessionAsync(sessionId, new List<KliveLLM.HFWrapper.HFTool>(),
-                maxTokensOverride: maxTokens, modelOverride: model, cancellationToken: ct);
+                maxTokensOverride: maxTokens, modelOverride: routes.Count > 0 ? routes[0] : null, cancellationToken: ct, modelRoutes: routes);
             if (!resp.Success) return null;
             return new CouncilTurn(true, resp.Response ?? "", resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
         }
