@@ -71,6 +71,16 @@ namespace Omnipotent.Services.Projects
         /// <summary>Machine-owned reason for an action-required block. Narrative observables must not override it.</summary>
         public string? BlockedReason { get; set; }
         public DateTime? BlockedAt { get; set; }
+
+        /// <summary>
+        /// When this project was halted by a fleet-wide halt-all, the status it held immediately
+        /// beforehand — so unhalt-all restores each project to exactly where it was (Active, Planning,
+        /// Paused, BudgetPaused, …) rather than blanket-resuming everything to Active. Null when the
+        /// project is not currently under a global halt. Cleared whenever Klives changes the project's
+        /// status individually (pause/resume/archive/unarchive/budget-resume), so a later unhalt-all
+        /// never resurrects a stale state.
+        /// </summary>
+        public ProjectStatus? HaltedFromStatus { get; set; }
     }
 
     /// <summary>One agent in a project's org chart (Commander included, with a null parent).</summary>

@@ -592,6 +592,106 @@ namespace Omnipotent.Services.Projects
             return true;
         }
 
+        /// <summary>
+        /// Delivers the same message to every live project (Klives → every Commander). Terminal projects
+        /// (Completed/Archived) are skipped — they never wake to read it. Each delivery is logged and
+        /// steers the Commander if the project is currently working. Returns the affected project IDs.
+        /// </summary>
+        public IReadOnlyList<string> BroadcastMessage(string text)
+        {
+            var affected = new List<string>();
+            foreach (var p in Store.ListProjects())
+            {
+                if (p.Status is ProjectStatus.Completed or ProjectStatus.Archived) continue;
+                if (MessageProject(p.ProjectID, text)) affected.Add(p.ProjectID);
+            }
+            return affected;
+        }
+
+        /// <summary>
+        /// Halts a single project as part of a fleet-wide halt: records the pre-halt status so it can be
+        /// restored exactly, forces the project to Paused, and stops in-flight work. No-op (returns false)
+        /// for terminal projects and for projects already under a global halt. See <see cref="HaltedFromStatus"/>.
+        /// </summary>
+        public bool HaltProject(string projectID)
+        {
+            var project = Store.GetProject(projectID);
+            if (project == null) return false;
+            if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived) return false;
+            if (project.HaltedFromStatus.HasValue) return false; // already halted — don't overwrite the remembered state
+
+            project.HaltedFromStatus = project.Status;
+            project.Status = ProjectStatus.Paused;
+            Store.SaveProject(project);
+            RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
+            // Stop the in-flight wake + sub-agents so a halt bites immediately, mirroring /projects/pause.
+            bool cancelled = CommanderRunner.CancelActiveWake(project.ProjectID);
+            SubAgentRunner.CancelProject(project.ProjectID);
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                Type = ProjectEventTypes.Status,
+                Author = "klives",
+                Text = cancelled
+                    ? "Project halted by Klives (fleet halt-all) — in-flight wake halted."
+                    : "Project halted by Klives (fleet halt-all).",
+            });
+            return true;
+        }
+
+        /// <summary>
+        /// Reverses <see cref="HaltProject"/>: restores the project to the exact status it held before the
+        /// halt. Active/Planning restorations re-wake the Commander (mirroring /projects/resume); every
+        /// other restored state (Paused, BudgetPaused, Blocked) is left at rest for Klives to resume.
+        /// No-op (returns false) for projects that are not under a global halt.
+        /// </summary>
+        public bool UnhaltProject(string projectID)
+        {
+            var project = Store.GetProject(projectID);
+            if (project == null) return false;
+            if (!project.HaltedFromStatus.HasValue) return false; // not halted
+
+            ProjectStatus target = project.HaltedFromStatus.Value;
+            project.HaltedFromStatus = null;
+
+            bool resumeWork = target is ProjectStatus.Active or ProjectStatus.Planning;
+            if (resumeWork)
+            {
+                // The Grand Plan gate still stands: a project with no approved plan resumes to Planning.
+                bool wasPlanning = target == ProjectStatus.Planning || !GrandPlans.HasApprovedPlan(project.ProjectID);
+                project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
+                Store.SaveProject(project);
+                RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
+                RuntimeState.ClearBlocker(project.ProjectID);
+                RuntimeState.CloseCircuit(project.ProjectID);
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = project.ProjectID,
+                    Type = ProjectEventTypes.Status,
+                    Author = "klives",
+                    Text = $"Project unhalted by Klives (fleet unhalt-all) — resumed to {project.Status}.",
+                });
+                CommanderRunner.Wake(project, wasPlanning
+                    ? "Project unhalted by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
+                    : "Project unhalted by Klives. Rehydrate current state and continue with the next concrete step.");
+            }
+            else
+            {
+                project.Status = target;
+                Store.SaveProject(project);
+                RuntimeState.SetDisposition(project.ProjectID, target == ProjectStatus.Blocked
+                    ? ProjectExecutionDisposition.Blocked : ProjectExecutionDisposition.Paused);
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = project.ProjectID,
+                    Type = ProjectEventTypes.Status,
+                    Author = "klives",
+                    Text = $"Project unhalted by Klives (fleet unhalt-all) — restored to {target} (left at rest).",
+                });
+            }
+            return true;
+        }
+
         /// <summary>Compact one-line status (status/goal/budget/agents/last-event) for the bridge. Null if unknown.</summary>
         public string? DescribeProjectStatus(string projectID)
         {

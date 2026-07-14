@@ -139,6 +139,7 @@ namespace Omnipotent.Services.Projects
                 {
                     if (!RequireProject(req, out var project)) return;
                     project!.Status = ProjectStatus.Paused;
+                    project.HaltedFromStatus = null; // individual pause overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
                     // Halt the in-flight wake too, so "pause" stops work promptly rather than only
@@ -164,6 +165,7 @@ namespace Omnipotent.Services.Projects
                 {
                     if (!RequireProject(req, out var project)) return;
                     project!.Status = ProjectStatus.Archived;
+                    project.HaltedFromStatus = null; // shelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Archived);
                     parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
@@ -188,6 +190,7 @@ namespace Omnipotent.Services.Projects
                     // Restore to Paused (not Active) — Klives explicitly resumes when ready, so
                     // unshelving never silently sets the fleet back to work.
                     project!.Status = ProjectStatus.Paused;
+                    project.HaltedFromStatus = null; // unshelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Paused);
                     parent.EventLog.Append(new ProjectEvent
@@ -297,6 +300,7 @@ namespace Omnipotent.Services.Projects
                         // Return to where it was paused — a never-approved plan resumes to Planning.
                         project.Status = parent.GrandPlans.HasApprovedPlan(project.ProjectID)
                             ? ProjectStatus.Active : ProjectStatus.Planning;
+                        project.HaltedFromStatus = null; // budget-resume overrides any remembered fleet-halt state
                         parent.Store.SaveProject(project);
                         parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                         parent.RuntimeState.ClearBlocker(project.ProjectID);
@@ -342,6 +346,7 @@ namespace Omnipotent.Services.Projects
                     bool wasBlocked = project.BlockedAt.HasValue || !string.IsNullOrWhiteSpace(project.BlockedReason);
                     project.BlockedAt = null;
                     project.BlockedReason = null;
+                    project.HaltedFromStatus = null; // individual resume overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                     parent.RuntimeState.ClearBlocker(project.ProjectID);
@@ -357,6 +362,54 @@ namespace Omnipotent.Services.Projects
                         ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
                         : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
                     await req.ReturnResponse(Json(project));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // ── Fleet-wide controls (broadcast + global halt) ──
+
+            // Deliver one message to every live project's Commander. POST { text }.
+            await parent.CreateAPIRoute("/projects/broadcast", async req =>
+            {
+                try
+                {
+                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
+                    string text = (string?)body?.text ?? "";
+                    if (string.IsNullOrWhiteSpace(text))
+                    {
+                        await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var affected = parent.BroadcastMessage(text);
+                    await req.ReturnResponse(Json(new { ok = true, delivered = affected.Count, projectIDs = affected }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Halt every project that isn't already halted (or terminal), remembering each project's
+            // pre-halt status so unhalt-all restores it exactly. POST (no body).
+            await parent.CreateAPIRoute("/projects/halt-all", async req =>
+            {
+                try
+                {
+                    var halted = new List<string>();
+                    foreach (var p in parent.Store.ListProjects())
+                        if (parent.HaltProject(p.ProjectID)) halted.Add(p.ProjectID);
+                    await req.ReturnResponse(Json(new { ok = true, halted = halted.Count, projectIDs = halted }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Restore every globally-halted project to the exact status it held before the halt.
+            // POST (no body).
+            await parent.CreateAPIRoute("/projects/unhalt-all", async req =>
+            {
+                try
+                {
+                    var restored = new List<string>();
+                    foreach (var p in parent.Store.ListProjects())
+                        if (parent.UnhaltProject(p.ProjectID)) restored.Add(p.ProjectID);
+                    await req.ReturnResponse(Json(new { ok = true, restored = restored.Count, projectIDs = restored }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
@@ -970,6 +1023,8 @@ namespace Omnipotent.Services.Projects
                 p.Name,
                 p.Goal,
                 Status = p.Status.ToString(),
+                Halted = p.HaltedFromStatus.HasValue,
+                HaltedFromStatus = p.HaltedFromStatus?.ToString(),
                 p.CreatedAt,
                 p.TokenBudgetUsd,
                 p.MoneyBudgetUsd,
