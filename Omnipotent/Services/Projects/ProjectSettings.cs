@@ -184,7 +184,8 @@ namespace Omnipotent.Services.Projects
         {
             var result = (routes ?? []).Select(x => (x ?? "").Trim())
                 .Where(x => x.Length is > 0 and <= 300)
-                .Distinct(StringComparer.OrdinalIgnoreCase).Take(16).ToList();
+                // OpenRouter accepts at most three entries in its native `models` fallback array.
+                .Distinct(StringComparer.OrdinalIgnoreCase).Take(3).ToList();
             if (result.Count == 0 && permitFallback && !string.IsNullOrWhiteSpace(fallback)) result.Add(fallback);
             return result;
         }

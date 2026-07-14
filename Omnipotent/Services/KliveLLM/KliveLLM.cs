@@ -1012,8 +1012,9 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>
-        /// Turns an ordered route list into OpenRouter-native fallback routing: the whole list is sent as
-        /// the request's <c>models</c> array so OpenRouter tries each model in order until one succeeds,
+        /// Turns an ordered route list into OpenRouter-native fallback routing: up to the first three
+        /// distinct routes are sent in the request's <c>models</c> array (OpenRouter's API maximum),
+        /// so OpenRouter tries each model in order until one succeeds,
         /// server-side, in a single request. This replaces app-side "try model A, on failure re-query with
         /// model B" loops. Only applied for OpenRouter (the only provider that understands the parameter)
         /// and only when more than one distinct route exists — a single route needs no fallback and is sent
@@ -1027,6 +1028,7 @@ namespace Omnipotent.Services.KliveLLM
                 .Select(m => (m ?? "").Trim())
                 .Where(m => m.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(3)
                 .ToList();
             if (distinct.Count > 1) payload.models = distinct;
         }

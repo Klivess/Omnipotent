@@ -168,6 +168,16 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Null(hf.models);
         }
 
+        [Fact]
+        public void ModelFallback_RespectsOpenRouterThreeModelMaximum()
+        {
+            var payload = Payload(maxTokens: null);
+            LlmService.ApplyModelFallback(ref payload, OpenRouter(),
+                new[] { "a/one", "b/two", "c/three", "d/four", "e/five" });
+
+            Assert.Equal(new[] { "a/one", "b/two", "c/three" }, payload.models);
+        }
+
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(
             LlmService.LLMProvider.OpenRouter,
             "OpenRouter",
