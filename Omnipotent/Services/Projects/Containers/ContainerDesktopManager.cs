@@ -396,25 +396,62 @@ namespace Omnipotent.Services.Projects.Containers
         {
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(45);
             var transport = GetTransport(record);
+            string lastError = "no framebuffer capture was attempted";
             for (int attempt = 1; DateTime.UtcNow < deadline; attempt++)
             {
                 try
                 {
                     var frame = await transport.CaptureFrameAsync(ct);
                     if (!IsUsableFrame(frame.bgra, frame.width, frame.height))
-                        throw new InvalidOperationException("VNC returned an all-black or incomplete framebuffer while the desktop session was still starting.");
+                        throw new InvalidOperationException($"VNC returned an all-black or incomplete {frame.width}x{frame.height} framebuffer while the desktop session was still starting.");
                     log($"Desktop {record.ContainerID[..12]} returned its first frame after {attempt} probe(s).");
                     return;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
                 catch (Exception ex)
                 {
+                    lastError = ex.Message;
                     if (attempt == 1) log($"Waiting for desktop {record.ContainerID[..12]} to come up ({ex.Message})…");
                     await Task.Delay(TimeSpan.FromSeconds(2), ct);
                 }
             }
+            // The opaque "no usable framebuffer" is what agents kept reporting with nothing to act
+            // on. Probe the live container so the failure names the actual cause — display down,
+            // x11vnc crash-looping (with its own log), or a persistently black root.
+            string diagnostics = await DescribeDesktopFailureAsync(record, ct);
             throw new InvalidOperationException(
-                $"Desktop {record.ContainerID[..12]} did not return a usable VNC framebuffer within 45 seconds.");
+                $"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} did not return a usable VNC framebuffer within 45 seconds. " +
+                $"Last capture error: {lastError}. Live container state — {diagnostics}");
+        }
+
+        /// <summary>Best-effort in-container probe for the framebuffer-timeout error message: which
+        /// desktop processes are up and the tail of x11vnc's own log. Never throws — a diagnostic
+        /// that fails must not mask the underlying readiness failure it is describing.</summary>
+        private async Task<string> DescribeDesktopFailureAsync(DesktopContainerRecord record, CancellationToken ct)
+        {
+            const string probe =
+                "set +e\n" +
+                "echo \"xvfb=$(pgrep -x Xvfb >/dev/null 2>&1 && echo up || echo down)\"\n" +
+                "echo \"x11vnc=$(pgrep -x x11vnc >/dev/null 2>&1 && echo up || echo down)\"\n" +
+                "echo \"xfwm4=$(pgrep -x xfwm4 >/dev/null 2>&1 && echo up || echo down)\"\n" +
+                "echo \"display=$(xdpyinfo -display :1 >/dev/null 2>&1 && echo up || echo down)\"\n" +
+                "echo \"xsetroot=$(command -v xsetroot >/dev/null 2>&1 && echo present || echo missing)\"\n" +
+                "echo \"--- x11vnc.log tail ---\"\n" +
+                "tail -n 12 /tmp/x11vnc.log 2>/dev/null || echo \"(no x11vnc log)\"\n";
+            try
+            {
+                using var diagTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                diagTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+                var result = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, probe, "/home/agent", 8, diagTimeout.Token);
+                string text = (result.Stdout + (string.IsNullOrWhiteSpace(result.Stderr) ? "" : "\n" + result.Stderr)).Trim();
+                return string.IsNullOrWhiteSpace(text)
+                    ? "diagnostic probe returned no output."
+                    : text.Replace("\r\n", " | ").Replace('\n', ' ').Trim();
+            }
+            catch (Exception ex)
+            {
+                return $"diagnostic probe could not run ({ex.Message}).";
+            }
         }
 
         internal static bool IsUsableFrame(byte[] bgra, int width, int height)

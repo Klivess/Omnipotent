@@ -21,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         xvfb x11vnc xfce4 xfce4-terminal dbus-x11 \
         firefox-esr chromium \
-        xdotool wmctrl xclip x11-utils \
+        xdotool wmctrl xclip x11-utils x11-xserver-utils \
         curl ca-certificates fonts-dejavu \
         python3 python3-pip python3-venv python3-websocket \
         ffmpeg \
@@ -47,7 +47,7 @@ RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"3","capabilities":["display","chromium","firefox","browser-inspect","python3","ffmpeg"],"display":":1"}' \
+    '{"imageVersion":"4","capabilities":["display","window-manager","chromium","firefox","browser-inspect","python3","ffmpeg"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent
