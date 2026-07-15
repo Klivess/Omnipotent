@@ -8,6 +8,16 @@ namespace Omnipotent.Services.Projects;
 /// </summary>
 public static class ProjectWorkSliceBoundary
 {
+    /// <summary>Whether a configured tool-call boundary has been reached. A zero limit explicitly
+    /// disables this boundary; it must never be interpreted as "zero calls allowed".</summary>
+    public static bool IsToolCallLimitReached(int toolCalls, int toolCallLimit) =>
+        toolCallLimit > 0 && toolCalls >= toolCallLimit;
+
+    /// <summary>Whether the next model request is the last one permitted by a configured
+    /// model-turn boundary. A zero limit explicitly disables this boundary.</summary>
+    public static bool IsFinalModelTurn(int modelTurns, int modelTurnLimit) =>
+        modelTurnLimit > 0 && modelTurns >= modelTurnLimit - 1;
+
     /// <summary>Provider prompt usage is the whole current request, so the live context is this
     /// turn's prompt plus completion. It must never be accumulated across turns (that is billing
     /// usage, not resident context).</summary>
@@ -18,7 +28,7 @@ public static class ProjectWorkSliceBoundary
         long consumedTokens, long tokenLimit)
     {
         var reasons = new List<string>(3);
-        if (toolCallLimit > 0 && toolCalls >= toolCallLimit)
+        if (IsToolCallLimitReached(toolCalls, toolCallLimit))
             reasons.Add($"tool-call boundary reached ({toolCalls}/{toolCallLimit})");
         if (modelTurnLimit > 0 && modelTurns >= modelTurnLimit)
             reasons.Add($"model-turn boundary reached ({modelTurns}/{modelTurnLimit})");

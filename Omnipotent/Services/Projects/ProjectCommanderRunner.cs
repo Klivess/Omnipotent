@@ -245,13 +245,20 @@ namespace Omnipotent.Services.Projects
             string? outcomePayloadJson = null;
             int stuckTrips = 0;
             int emptyResponseTrips = 0;
+            int emptyResponses = 0;
             bool endedAtWorkSlice = false;
             int productiveActions = 0;
+            int dispatchedToolCalls = 0;
+            int toolCalls = 0, modelTurns = 0;
+            int sliceToolCalls = 0, sliceModelTurns = 0, sliceTokenBudget = 0;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             long liveContextTokens = 0; // current request context, NOT cumulative billed prompt tokens
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
             string? lastCommittedTool = null;
             string? lastCommittedResult = null;
+            string? initialModel = null;
+            string? finalModel = null;
+            DateTime wakeStartedAtUtc = DateTime.UtcNow;
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
@@ -276,10 +283,12 @@ namespace Omnipotent.Services.Projects
                 // Index 0 is the primary. OpenRouter receives it as `model` and later routes as its
                 // ordered fallback set; a successful backup is pinned for the rest of this wake.
                 string model = modelRoutes[0];
+                initialModel = model;
+                finalModel = model;
                 bool visionEnabled = settings.VisionEnabled;
-                int sliceToolCalls = settings.WorkSliceToolCalls;
-                int sliceModelTurns = settings.WorkSliceModelTurns;
-                int sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
+                sliceToolCalls = settings.WorkSliceToolCalls;
+                sliceModelTurns = settings.WorkSliceModelTurns;
+                sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.CommanderMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
                 parent.SubAgents.EnsureCommander(projectID);
@@ -313,8 +322,6 @@ namespace Omnipotent.Services.Projects
                         "Assign only dependency-ready work, set milestone owners, and require explicit deliverables unless the next step is genuinely indivisible.");
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
-                int toolCalls = 0;
-                int modelTurns = 0;
 
                 while (true)
                 {
@@ -355,11 +362,11 @@ namespace Omnipotent.Services.Projects
                             llm.AppendUserMessageToToolSession(sessionId,
                                 $"MESSAGE FROM A SUB-AGENT (mid-wake — take this into account now): {report}");
 
-                    if (toolCalls >= sliceToolCalls)
+                    if (ProjectWorkSliceBoundary.IsToolCallLimitReached(toolCalls, sliceToolCalls))
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"CONTEXT WORK SLICE COMPLETE ({sliceToolCalls} tool calls). This is not a work limit. Stop calling tools, record verified status and the exact next action; productive work continues immediately in a fresh context.");
 
-                    bool finalModelTurn = modelTurns >= sliceModelTurns - 1;
+                    bool finalModelTurn = ProjectWorkSliceBoundary.IsFinalModelTurn(modelTurns, sliceModelTurns);
                     if (finalModelTurn)
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"CONTEXT WORK SLICE COMPLETE ({sliceModelTurns} model turns). This is not a work limit. Give verified status and the exact next action for immediate continuation in a fresh context.");
@@ -397,6 +404,7 @@ namespace Omnipotent.Services.Projects
                         string? servedRoute = modelRoutes.FirstOrDefault(route =>
                             string.Equals(route, resp.Model, StringComparison.OrdinalIgnoreCase));
                         if (!string.IsNullOrWhiteSpace(servedRoute)) model = servedRoute;
+                        finalModel = resp.Model ?? model;
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
                     // the response usage object (resp.CostUsd) — authoritative for whatever model is in
@@ -424,6 +432,8 @@ namespace Omnipotent.Services.Projects
                     bool sliceComplete = sliceBoundary != null;
                     if (resp.ToolCalls is { Count: > 0 } || !string.IsNullOrWhiteSpace(resp.Response))
                         emptyResponseTrips = 0;
+                    else
+                        emptyResponses++;
                     // A model response and its returned tool calls are one atomic protocol turn.
                     // Even when this response crosses a context boundary, execute and journal the
                     // complete batch first. Rejecting it here caused every batched web_fetch call
@@ -544,6 +554,7 @@ namespace Omnipotent.Services.Projects
                         CommanderToolResult result;
                         try
                         {
+                            dispatchedToolCalls++;
                             result = await parent.CommanderToolDispatch(project, "commander", wakeID, toolName, argsJson, cts.Token);
                         }
                         catch (OperationCanceledException)
@@ -686,6 +697,10 @@ namespace Omnipotent.Services.Projects
                     var outcomeEvent = WakeEvt(projectID, wakeID, outcome, "system", outcomeText);
                     outcomeEvent.PayloadJson = outcomePayloadJson;
                     parent.EventLog.Append(outcomeEvent);
+                    parent.EventLog.Append(ProjectWakeDiagnostics.Create(projectID, wakeID, "commander",
+                        outcome, wakeStartedAtUtc, modelTurns, toolCalls, dispatchedToolCalls, productiveActions,
+                        emptyResponses, stuckTrips, endedAtWorkSlice, initialModel, finalModel,
+                        sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool));
 
                     // A failed Klives-triggered wake must not read as silence either.
                     if ((outcome is ProjectEventTypes.WakeFailed or ProjectEventTypes.WakeDeferred)

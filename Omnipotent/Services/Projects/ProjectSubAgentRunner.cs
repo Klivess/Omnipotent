@@ -211,11 +211,18 @@ namespace Omnipotent.Services.Projects
             bool assignmentNeedsCommanderFollowup = false;
             bool reportedToCommander = false;
             int productiveActions = 0;
+            int dispatchedToolCalls = 0;
+            int toolCalls = 0, modelTurns = 0, loopTrips = 0;
+            int emptyResponses = 0;
+            int sliceToolCalls = 0, sliceModelTurns = 0, sliceTokenBudget = 0;
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             long liveContextTokens = 0; // current request context, not cumulative billed usage
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
             string? lastCommittedTool = null;
             string? lastCommittedResult = null;
+            string? initialModel = null;
+            string? finalModel = null;
+            DateTime wakeStartedAtUtc = DateTime.UtcNow;
             try
             {
                 var running = parent.RuntimeState.MarkAgentWakeRunning(projectID, agent.AgentID, wakeID, leaseGeneration);
@@ -232,10 +239,12 @@ namespace Omnipotent.Services.Projects
                 // Index 0 is the primary. OpenRouter receives it as `model` and later routes as its
                 // ordered fallback set; a successful backup is pinned for the rest of this wake.
                 string model = modelRoutes[0];
+                initialModel = model;
+                finalModel = model;
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
-                int sliceToolCalls = settings.WorkSliceToolCalls;
-                int sliceModelTurns = settings.WorkSliceModelTurns;
-                int sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
+                sliceToolCalls = settings.WorkSliceToolCalls;
+                sliceModelTurns = settings.WorkSliceModelTurns;
+                sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.SubAgentMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
 
@@ -262,9 +271,6 @@ namespace Omnipotent.Services.Projects
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
-                int toolCalls = 0;
-                int modelTurns = 0;
-                int loopTrips = 0;
 
                 string steerKey = Key(projectID, agent.AgentID);
 
@@ -296,11 +302,11 @@ namespace Omnipotent.Services.Projects
                         while (sq.TryDequeue(out var steer))
                             llm.AppendUserMessageToToolSession(sessionId, $"NEW MESSAGE (mid-wake — take this into account now): {steer}");
 
-                    if (toolCalls >= sliceToolCalls)
+                    if (ProjectWorkSliceBoundary.IsToolCallLimitReached(toolCalls, sliceToolCalls))
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"CONTEXT WORK SLICE COMPLETE ({sliceToolCalls} tool calls). This is not an assignment limit. Stop calling tools, report verified status and the exact next action; productive work continues immediately in a fresh context.");
 
-                    bool finalModelTurn = modelTurns >= sliceModelTurns - 1;
+                    bool finalModelTurn = ProjectWorkSliceBoundary.IsFinalModelTurn(modelTurns, sliceModelTurns);
                     if (finalModelTurn)
                         llm.AppendUserMessageToToolSession(sessionId,
                             $"CONTEXT WORK SLICE COMPLETE ({sliceModelTurns} model turns). This is not an assignment limit. Report verified results and the exact next action for immediate continuation.");
@@ -336,6 +342,7 @@ namespace Omnipotent.Services.Projects
                         string? servedRoute = modelRoutes.FirstOrDefault(route =>
                             string.Equals(route, resp.Model, StringComparison.OrdinalIgnoreCase));
                         if (!string.IsNullOrWhiteSpace(servedRoute)) model = servedRoute;
+                        finalModel = resp.Model ?? model;
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
                     {
@@ -354,6 +361,9 @@ namespace Omnipotent.Services.Projects
                         toolCalls, sliceToolCalls, modelTurns, sliceModelTurns,
                         liveContextTokens, sliceTokenBudget);
                     bool sliceComplete = sliceBoundary != null;
+                    if ((resp.ToolCalls == null || resp.ToolCalls.Count == 0)
+                        && string.IsNullOrWhiteSpace(resp.Response))
+                        emptyResponses++;
                     // Tool calls already returned by this model response belong to the current
                     // protocol turn. Execute the complete batch before ending the context slice.
                     if (resp.ToolCalls == null || resp.ToolCalls.Count == 0)
@@ -501,6 +511,7 @@ namespace Omnipotent.Services.Projects
                         CommanderToolResult result;
                         try
                         {
+                            dispatchedToolCalls++;
                             result = await parent.CommanderToolDispatch(project, agent.AgentID, wakeID, toolName, argsJson, cts.Token);
                         }
                         catch (OperationCanceledException)
@@ -613,6 +624,10 @@ namespace Omnipotent.Services.Projects
                     var outcomeEvent = Evt(projectID, wakeID, agent.AgentID, outcome, outcomeText);
                     outcomeEvent.PayloadJson = outcomePayloadJson;
                     parent.EventLog.Append(outcomeEvent);
+                    parent.EventLog.Append(ProjectWakeDiagnostics.Create(projectID, wakeID, agent.AgentID,
+                        outcome, wakeStartedAtUtc, modelTurns, toolCalls, dispatchedToolCalls, productiveActions,
+                        emptyResponses, loopTrips, endedAtWorkSlice, initialModel, finalModel,
+                        sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool));
                 }
                 catch { }
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID,

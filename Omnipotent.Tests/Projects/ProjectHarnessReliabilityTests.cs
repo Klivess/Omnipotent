@@ -241,6 +241,34 @@ public class ProjectContextSliceTests
     }
 
     [Fact]
+    public void DisabledCallAndTurnBoundaries_DoNotTellAgentsToStopWorking()
+    {
+        Assert.False(ProjectWorkSliceBoundary.IsToolCallLimitReached(0, 0));
+        Assert.False(ProjectWorkSliceBoundary.IsToolCallLimitReached(500, 0));
+        Assert.False(ProjectWorkSliceBoundary.IsFinalModelTurn(0, 0));
+        Assert.False(ProjectWorkSliceBoundary.IsFinalModelTurn(500, 0));
+
+        Assert.True(ProjectWorkSliceBoundary.IsToolCallLimitReached(3, 3));
+        Assert.True(ProjectWorkSliceBoundary.IsFinalModelTurn(2, 3));
+    }
+
+    [Fact]
+    public void WakeDiagnostic_ExplainsWhenTheModelReturnedNoToolCalls()
+    {
+        var diagnostic = ProjectWakeDiagnostics.Create("p", "w", "commander",
+            ProjectEventTypes.WakeCompleted, DateTime.UtcNow.AddSeconds(-2), modelTurns: 1,
+            modelToolCalls: 0, dispatchedToolCalls: 0, productiveActions: 0, emptyResponses: 0,
+            loopTrips: 0, endedAtWorkSlice: false, initialModel: "model/a", finalModel: "model/a",
+            toolCallLimit: 0, modelTurnLimit: 0, liveContextTokens: 1234, tokenLimit: 180000,
+            lastToolName: null);
+
+        Assert.Equal(ProjectEventTypes.WakeDiagnostic, diagnostic.Type);
+        Assert.Contains("model returned prose/no native tool calls", diagnostic.Text);
+        Assert.Contains("slice limits: tools=disabled, turns=disabled", diagnostic.Text);
+        Assert.Contains("\"modelToolCalls\":0", diagnostic.PayloadJson);
+    }
+
+    [Fact]
     public void LiveContextUsesOnlyTheCurrentProviderTurn_NotCumulativeBillingUsage()
     {
         long firstTurn = ProjectWorkSliceBoundary.MeasureLiveContext(20_000, 2_000);
