@@ -118,10 +118,10 @@ namespace Omnipotent.Services.Projects.Containers
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 wmctrl -a Chromium >/dev/null 2>&1 && DISPLAY=:1 wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || (DISPLAY=:1 chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 &)" },
+                    => new[] { "sh", "-lc", "export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent; mkdir -p \"$XDG_RUNTIME_DIR\" \"$OMNIPOTENT_BROWSER_PROFILE\"; if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; wmctrl -a Chromium >/dev/null 2>&1 && wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || (nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 </dev/null &)" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "sh", "-lc", "mkdir -p \"$OMNIPOTENT_BROWSER_PROFILE\"; DISPLAY=:1 chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 &", "desktop-control", uri.AbsoluteUri },
+                    => new[] { "sh", "-lc", "export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent; mkdir -p \"$XDG_RUNTIME_DIR\" \"$OMNIPOTENT_BROWSER_PROFILE\"; if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 </dev/null &", "desktop-control", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
                 ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app

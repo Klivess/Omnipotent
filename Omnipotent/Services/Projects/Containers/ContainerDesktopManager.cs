@@ -123,6 +123,13 @@ namespace Omnipotent.Services.Projects.Containers
         private static readonly string[] RequiredCapabilities =
             { "display", "window-manager", "vnc", "frame", "chromium", "browser-inspect" };
 
+        // Chromium being installed only proves the image contains a binary. Browser work also
+        // requires the visible process, its local CDP endpoint, and a tab the inspection helper
+        // can actually query. Without this live probe, a detached launcher failure was reported
+        // to agents as the misleading "Browser opened." success.
+        private static readonly string[] RequiredBrowserCapabilities =
+            { "browser-process", "browser-cdp", "browser-tabs" };
+
         // One shell probe of the baked stack. `set +e` so a missing tool yields "no", not a
         // non-zero exit that would mask the other answers.
         private const string ReadinessProbeScript =
@@ -136,6 +143,14 @@ namespace Omnipotent.Services.Projects.Containers
             "echo \"browser-inspect=$([ -f /usr/local/bin/browser-inspect.py ] && echo yes || echo no)\"\n" +
             "echo \"ffmpeg=$(command -v ffmpeg >/dev/null 2>&1 && echo yes || echo no)\"\n" +
             "echo \"image-version=$(sed -n 's/.*\\\"imageVersion\\\":\\\"\\([^\\\"]*\\)\\\".*/\\1/p' /etc/klive-desktop.json 2>/dev/null)\"\n";
+
+        private const string BrowserReadinessProbeScript =
+            "set +e\n" +
+            "echo \"browser-process=$(pgrep -f '[c]hromium.*remote-debugging-port=9222' >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "echo \"browser-cdp=$(python3 -c 'import urllib.request; urllib.request.urlopen(\\\"http://127.0.0.1:9222/json/version\\\", timeout=2).read(); print(\\\"up\\\")' 2>/dev/null || echo down)\"\n" +
+            "echo \"browser-tabs=$(python3 /usr/local/bin/browser-inspect.py tabs 1 0 >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "printf 'chromium-log='\n" +
+            "tail -n 12 /tmp/chromium.log 2>/dev/null | tr '\\n' ' ' | cut -c 1-1200\n";
 
         /// <summary>
         /// Preflight a project's desktop before browser work: self-heal Docker + the image
@@ -159,7 +174,36 @@ namespace Omnipotent.Services.Projects.Containers
             }
 
             var readiness = await ProbeReadinessAsync(record, ct);
-            if (readiness.Ok) return readiness;
+            if (readiness.Ok)
+            {
+                readiness = await EnsureBrowserReadyAsync(record, readiness, ct);
+                if (readiness.Ok) return readiness;
+
+                // Other project desktops can remain healthy while this project's persistent
+                // Chromium profile is locked or corrupted. Recover that one profile first:
+                // archive it in-place (never delete it), recreate an empty profile, then retry.
+                // Rebuilding the shared image is an expensive and irrelevant first response.
+                if (BrowserFailedToStart(readiness.Capabilities))
+                {
+                    string? profileRecovery = await ArchiveBrokenBrowserProfileAsync(record, ct);
+                    if (profileRecovery != null)
+                    {
+                        var retriedDesktop = await ProbeReadinessAsync(record, ct);
+                        if (retriedDesktop.Ok)
+                        {
+                            var retriedBrowser = await EnsureBrowserReadyAsync(record, retriedDesktop, ct);
+                            if (retriedBrowser.Ok)
+                                return new DesktopReadiness
+                                {
+                                    Ok = true, ContainerID = retriedBrowser.ContainerID,
+                                    ImageVersion = retriedBrowser.ImageVersion, Capabilities = retriedBrowser.Capabilities,
+                                    Summary = "Desktop browser recovered from its archived project-local profile. " + retriedBrowser.Summary,
+                                };
+                            readiness = retriedBrowser;
+                        }
+                    }
+                }
+            }
 
             // A current-looking image can still be incomplete (partial publish context, interrupted
             // build, or external retag). The live probe is authoritative: rebuild once from the
@@ -204,6 +248,8 @@ namespace Omnipotent.Services.Projects.Containers
             record = await EnsureDesktopAsync(project, agentID, requireVisualReady: true, ct);
             var repaired = await ProbeReadinessAsync(record, ct);
             if (!repaired.Ok) return repaired;
+            repaired = await EnsureBrowserReadyAsync(record, repaired, ct);
+            if (!repaired.Ok) return repaired;
             return new DesktopReadiness
             {
                 Ok = true,
@@ -212,6 +258,92 @@ namespace Omnipotent.Services.Projects.Containers
                 Capabilities = repaired.Capabilities,
                 Summary = "Desktop ready after automatic repair. " + repaired.Summary,
             };
+        }
+
+        private async Task<DesktopReadiness> EnsureBrowserReadyAsync(
+            DesktopContainerRecord record, DesktopReadiness desktopReadiness, CancellationToken ct)
+        {
+            try { await orchestrator.ExecuteDesktopControlAsync(record.ContainerID, ContainerDesktopControlCommand.LaunchBrowser, null, ct); }
+            catch (Exception ex)
+            {
+                return new DesktopReadiness
+                {
+                    Ok = false, ContainerID = record.ContainerID, ImageVersion = desktopReadiness.ImageVersion,
+                    Capabilities = desktopReadiness.Capabilities,
+                    Summary = desktopReadiness.Summary + $" Browser launch command failed: {ex.Message}",
+                };
+            }
+
+            Dictionary<string, string> caps = new(desktopReadiness.Capabilities, StringComparer.Ordinal);
+            string lastLog = "";
+            for (int attempt = 1; attempt <= 8; attempt++)
+            {
+                try
+                {
+                    var probe = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID,
+                        BrowserReadinessProbeScript, "/home/agent", 10, ct);
+                    if (probe.Success)
+                    {
+                        foreach (var pair in ParseCapabilities(probe.Stdout)) caps[pair.Key] = pair.Value;
+                        caps.TryGetValue("chromium-log", out lastLog);
+                        if (BrowserControlIsReady(caps))
+                        {
+                            return new DesktopReadiness
+                            {
+                                Ok = true, ContainerID = record.ContainerID, ImageVersion = desktopReadiness.ImageVersion,
+                                Capabilities = caps,
+                                Summary = desktopReadiness.Summary + " Browser control ready (process up, CDP up, inspectable tab up).",
+                            };
+                        }
+                    }
+                    else lastLog = probe.Format(1200);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception ex) { lastLog = ex.Message; }
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
+            }
+
+            string browserState = string.Join(", ", RequiredBrowserCapabilities.Select(cap =>
+                $"{cap} {caps.GetValueOrDefault(cap, "unknown")}"));
+            string logTail = string.IsNullOrWhiteSpace(lastLog) ? "(no Chromium log output)" : TruncateOneLine(lastLog, 1200);
+            return new DesktopReadiness
+            {
+                Ok = false, ContainerID = record.ContainerID, ImageVersion = desktopReadiness.ImageVersion,
+                Capabilities = caps,
+                Summary = desktopReadiness.Summary +
+                    $" Browser failed live readiness after launch: {browserState}. Chromium log: {logTail}",
+            };
+        }
+
+        private async Task<string?> ArchiveBrokenBrowserProfileAsync(DesktopContainerRecord record, CancellationToken ct)
+        {
+            const string recoveryScript =
+                "set +e\n" +
+                "profile=\"${OMNIPOTENT_BROWSER_PROFILE:-}\"\n" +
+                "if [ -z \"$profile\" ]; then echo 'browser-profile-recovery=skipped:no-profile-path'; exit 0; fi\n" +
+                "pkill -f '[c]hromium' >/dev/null 2>&1 || true\n" +
+                "sleep 1\n" +
+                "stamp=$(date -u +%Y%m%dT%H%M%SZ)\n" +
+                "if [ -e \"$profile\" ]; then mv \"$profile\" \"${profile}.recovery-${stamp}\" || exit 1; echo \"browser-profile-recovery=archived:${profile}.recovery-${stamp}\"; else echo 'browser-profile-recovery=created-empty'; fi\n" +
+                "mkdir -p \"$profile\"\n";
+            try
+            {
+                var result = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, recoveryScript, "/home/agent", 20, ct);
+                if (!result.Success)
+                {
+                    log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} browser-profile recovery failed: {result.Format(1200)}");
+                    return null;
+                }
+                string summary = TruncateOneLine(result.Stdout, 1200);
+                log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} {summary}");
+                return summary;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} browser-profile recovery failed: {ex.Message}");
+                return null;
+            }
         }
 
         private async Task<DesktopReadiness> ProbeReadinessAsync(DesktopContainerRecord record, CancellationToken ct)
@@ -227,12 +359,7 @@ namespace Omnipotent.Services.Projects.Containers
                 return new DesktopReadiness { Ok = false, ContainerID = record.ContainerID,
                     Summary = "Desktop readiness probe returned non-zero: " + probe.Format(2000) };
 
-            var caps = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (var line in probe.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                int eq = line.IndexOf('=');
-                if (eq > 0) caps[line[..eq].Trim()] = line[(eq + 1)..].Trim();
-            }
+            var caps = ParseCapabilities(probe.Stdout);
             try
             {
                 var frame = await GetTransport(record).CaptureFrameAsync(ct);
@@ -276,6 +403,29 @@ namespace Omnipotent.Services.Projects.Containers
                     ? $"Desktop ready (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}."
                     : $"Desktop degraded (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}. Missing: {string.Join(", ", missing)}.",
             };
+        }
+
+        internal static bool BrowserControlIsReady(IReadOnlyDictionary<string, string> capabilities) =>
+            RequiredBrowserCapabilities.All(cap => string.Equals(capabilities.GetValueOrDefault(cap), "up", StringComparison.Ordinal));
+
+        private static bool BrowserFailedToStart(IReadOnlyDictionary<string, string> capabilities) =>
+            !string.Equals(capabilities.GetValueOrDefault("browser-process"), "up", StringComparison.Ordinal);
+
+        private static Dictionary<string, string> ParseCapabilities(string? stdout)
+        {
+            var caps = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var line in (stdout ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int eq = line.IndexOf('=');
+                if (eq > 0) caps[line[..eq].Trim()] = line[(eq + 1)..].Trim();
+            }
+            return caps;
+        }
+
+        private static string TruncateOneLine(string text, int max)
+        {
+            string oneLine = text.Replace("\r", " ").Replace("\n", " ").Trim();
+            return oneLine.Length <= max ? oneLine : oneLine[..max] + "…";
         }
 
         /// <summary>

@@ -156,5 +156,23 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal("https://example.test/path?q=one", seenArgument);
             Assert.False(transport.Connected); // no address-bar key sequence was attempted
         }
+
+        [Fact]
+        public void BrowserReadiness_RequiresALiveProcessCdpAndInspectableTab()
+        {
+            var installedOnly = new Dictionary<string, string>
+            {
+                ["chromium"] = "yes",
+                ["browser-process"] = "down",
+                ["browser-cdp"] = "down",
+                ["browser-tabs"] = "down",
+            };
+            Assert.False(ContainerDesktopManager.BrowserControlIsReady(installedOnly));
+
+            installedOnly["browser-process"] = "up";
+            installedOnly["browser-cdp"] = "up";
+            installedOnly["browser-tabs"] = "up";
+            Assert.True(ContainerDesktopManager.BrowserControlIsReady(installedOnly));
+        }
     }
 }

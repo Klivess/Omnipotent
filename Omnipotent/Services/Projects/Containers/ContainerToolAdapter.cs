@@ -212,7 +212,7 @@ namespace Omnipotent.Services.Projects.Containers
                     return await ScreenshotAsync("Released all held inputs and the desktop lease.", ct);
                 case "computer_wait": return await WaitAsync(a, ct);
                 case "computer_open_browser":
-                    return await MutateAsync("Browser opened.", () => desktop.LaunchAsync("browser", Str(a, "url"), ct), ct, settleMs: 800);
+                    return await OpenBrowserAsync(Str(a, "url"), ct);
                 case "computer_navigate":
                     return await MutateAsync("Browser navigated.", () => desktop.NavigateAsync(Str(a, "url") ?? throw new ArgumentException("Provide 'url'."), ct), ct, settleMs: 1000);
                 case "computer_browser_inspect":
@@ -231,6 +231,36 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Clipboard set.", () => transport.SetClipboardTextAsync(Str(a, "text") ?? string.Empty, ct), ct);
                 default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
             }
+        }
+
+        private async Task<ContainerToolResult> OpenBrowserAsync(string? url, CancellationToken ct)
+        {
+            var launched = await MutateAsync("Browser launch requested.", () => desktop.LaunchAsync("browser", url, ct), ct, settleMs: 800);
+            if (!launched.Success) return launched;
+            if (terminalAsync == null)
+                return new ContainerToolResult(false,
+                    "BROWSER_LAUNCH_UNVERIFIED: the browser launch was requested but this desktop cannot verify its control endpoint.",
+                    launched.Jpeg)
+                {
+                    FailureKind = ContainerToolFailureKind.Infrastructure,
+                    Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
+                };
+
+            using var inspectRequest = JsonDocument.Parse("{\"mode\":\"tabs\",\"maxItems\":1}");
+            var verified = await BrowserInspectAsync(inspectRequest.RootElement, ct);
+            if (verified.Success)
+                return new ContainerToolResult(true, "Browser opened and verified (visible Chromium has an inspectable tab).", launched.Jpeg)
+                {
+                    Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
+                };
+
+            return new ContainerToolResult(false,
+                "BROWSER_LAUNCH_UNVERIFIED: Chromium did not expose an inspectable tab after launch. " +
+                ComputerAudit.Truncate(verified.Text, 1600), launched.Jpeg)
+            {
+                FailureKind = ContainerToolFailureKind.Infrastructure,
+                Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
+            };
         }
 
         private async Task<ContainerToolResult> BrowserInspectAsync(JsonElement a, CancellationToken ct)
