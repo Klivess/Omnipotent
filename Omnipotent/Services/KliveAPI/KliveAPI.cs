@@ -1660,11 +1660,18 @@ namespace Omnipotent.Services.KliveAPI
             {
                 try
                 {
-                    bool enabled = await GetBoolOmniSetting("KliveAPIResponseCacheEnabled", defaultValue: false);
+                    // The cache is ON by default and the setting is a kill switch. It is
+                    // deliberately named ...Disabled (not the old ...Enabled): OmniSettings
+                    // persist their default on first read, so live servers already have
+                    // KliveAPIResponseCacheEnabled=false materialized from the initial
+                    // default-off rollout — flipping that default in code would never
+                    // take effect on them. A fresh inverted setting defaults every
+                    // deployment to cached-on while keeping a one-toggle escape hatch.
+                    bool disabled = await GetBoolOmniSetting("KliveAPIResponseCacheDisabled", defaultValue: false);
                     int maxMB = await GetIntOmniSetting("KliveAPICacheMaxMB", defaultValue: 256);
                     string denylist = await GetStringOmniSetting("KliveAPICacheDenylistPrefixes", defaultValue: "") ?? "";
 
-                    cacheEnabled = enabled;
+                    cacheEnabled = !disabled;
                     cacheDenylistPrefixes = ParseDenylist(denylist);
                     responseCache.Configure((long)Math.Max(1, maxMB) * 1024 * 1024, 10_000);
                 }

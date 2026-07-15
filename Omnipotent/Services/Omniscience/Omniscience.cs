@@ -148,14 +148,17 @@ namespace Omnipotent.Services.Omniscience
             var deductionRoutes = new DeductionRoutes(this);
             await deductionRoutes.RegisterRoutes();
             await ReplicaFidelity.RegisterRoutes();
+            // Compose() runs several time-filtered aggregates over the full messages /
+            // qa_pairs tables, and the dashboard batch requests this on every refresh —
+            // cache + warm it so the batch never waits on it. A 5-minute TTL is fine
+            // for a 24-hour digest.
+            OmniscienceRoutes.RegisterWarmTarget("briefing/preview", TimeSpan.FromMinutes(5), ComposeBriefingPayload);
             await CreateAPIRoute("/omniscience/briefing/preview", async req =>
             {
                 try
                 {
                     // Compose-only: renders the digest for the console WITHOUT sending a DM.
-                    string md = await Task.Run(() => Briefing.Compose());
-                    await req.ReturnResponse(new Newtonsoft.Json.Linq.JObject(
-                        new Newtonsoft.Json.Linq.JProperty("markdown", md)).ToString(Newtonsoft.Json.Formatting.None));
+                    await OmniscienceRoutes.CachedRead(req, "briefing/preview", TimeSpan.FromMinutes(5), ComposeBriefingPayload);
                 }
                 catch (Exception ex)
                 {
@@ -200,6 +203,14 @@ namespace Omnipotent.Services.Omniscience
             Scheduler.HookSchedule();
 
             await ServiceLog("[Omniscience] Online.");
+        }
+
+        // Shared by the /omniscience/briefing/preview route and its warm target.
+        private string ComposeBriefingPayload()
+        {
+            return new Newtonsoft.Json.Linq.JObject(
+                new Newtonsoft.Json.Linq.JProperty("markdown", Briefing.Compose()))
+                .ToString(Newtonsoft.Json.Formatting.None);
         }
     }
 }

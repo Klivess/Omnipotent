@@ -288,6 +288,26 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task TriageRouteChain_UsesOnePrimaryAndAtMostThreeFallbacks()
+        {
+            IReadOnlyList<string>? seen = null;
+            var agent = new StimulusAgent(
+                (_, _, routes) =>
+                {
+                    seen = routes;
+                    return Task.FromResult<string?>("CONFIRM: provider routed it");
+                },
+                _ => ((IReadOnlyList<string>)new[] { "free-1", "free-2", "free-3" },
+                    (IReadOnlyList<string>)new[] { "paid-1", "paid-2" }),
+                _ => { });
+
+            var result = await agent.EvaluateAsync(Env("x"), "criterion");
+
+            Assert.True(result.Confirmed);
+            Assert.Equal(new[] { "free-1", "free-2", "free-3", "paid-1" }, seen);
+        }
+
+        [Fact]
         public async Task BothModelsFail_FailsOpen()
         {
             var agent = Agent((_, _) => throw new Exception("down"));

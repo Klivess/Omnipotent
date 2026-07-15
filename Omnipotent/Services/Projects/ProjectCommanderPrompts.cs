@@ -33,7 +33,8 @@ namespace Omnipotent.Services.Projects
             string? accountsBlock = null,
             string? filesBlock = null,
             string? runtimeStateBlock = null,
-            string? kliveAgentContextBlock = null)
+            string? kliveAgentContextBlock = null,
+            string? directivesBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -43,6 +44,15 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"Goal: {project.Goal}");
             sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampWithAge(project.CreatedAt)}");
             sb.AppendLine($"Budgets: tokens ${project.TokenBudgetUsd:0.##} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
+
+            // This is intentionally ahead of the grand plan/digest/retrieval legs. A rule from
+            // Klives is authoritative and must not be summarized away, outranked by a stale plan,
+            // or omitted because an unrelated trigger had better lexical retrieval score.
+            if (!string.IsNullOrWhiteSpace(directivesBlock))
+            {
+                sb.AppendLine("── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before all plans) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(directivesBlock, ProjectsContextBudget.DirectivesBudget));
+            }
 
             // The approved Grand Plan is the standing north star — surfaced right under the header so
             // every wake anchors on it. Read it in full with get_grand_plan; revise via amend_grand_plan.

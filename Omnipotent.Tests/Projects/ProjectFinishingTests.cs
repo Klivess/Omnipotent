@@ -335,6 +335,16 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void OrderedRoutes_KeepPrimaryAndThreeOpenRouterFallbacks()
+        {
+            var s = new ProjectSettings();
+            Assert.True(s.TrySet("commanderRoutes",
+                JArray.Parse("[\"a/primary\",\"b/backup\",\"c/backup\",\"d/backup\",\"e/dropped\"]")));
+
+            Assert.Equal(new[] { "a/primary", "b/backup", "c/backup", "d/backup" }, s.CommanderRoutes);
+        }
+
+        [Fact]
         public void LegacyHiddenFallback_IsDiscardedDuringMigration()
         {
             const string json = """
@@ -386,6 +396,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("http_request", offered);
             Assert.Contains("send_agent_message", offered);
             Assert.DoesNotContain("complete_project", offered); // strategy stays with the Commander
+            Assert.DoesNotContain("request_human", offered); // workers hand obstacles to the Commander
             Assert.Contains("computer_open_browser", offered);
             Assert.Contains("computer_browser_inspect", offered);
             Assert.Contains("computer_click_text", offered);

@@ -71,6 +71,37 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void FailedTriggerAcknowledgement_ReleasesTheExactPayloadForReplayAfterRestart()
+        {
+            var store = NewStore();
+            const string pid = "p3-retry";
+            store.EnqueueTrigger(pid, new ProjectWakeTrigger
+            {
+                Kind = ProjectWakeTriggerKind.HumanMessage,
+                Payload = "durable human instruction",
+                Priority = 100,
+            });
+            var firstLease = store.TryAcquireWakeLease(pid, "wake-a").Lease!;
+            var firstClaim = store.TryClaimNextTrigger(pid, "wake-a", firstLease.Generation);
+
+            Assert.True(firstClaim.Claimed);
+            Assert.True(store.AcknowledgeTrigger(pid, firstClaim.Trigger!.TriggerID, "wake-a", firstLease.Generation,
+                succeeded: false).Applied);
+            Assert.True(store.ReleaseWakeLease(pid, "wake-a", firstLease.Generation).Applied);
+
+            var reloaded = NewStore();
+            var pending = Assert.Single(reloaded.ListPendingTriggers(pid));
+            Assert.Equal("durable human instruction", pending.Payload);
+            Assert.Equal(1, pending.AttemptCount);
+            Assert.Null(pending.ClaimedByWakeID);
+
+            var secondLease = reloaded.TryAcquireWakeLease(pid, "wake-b").Lease!;
+            var replay = reloaded.TryClaimNextTrigger(pid, "wake-b", secondLease.Generation);
+            Assert.True(replay.Claimed);
+            Assert.Equal(firstClaim.Trigger.TriggerID, replay.Trigger!.TriggerID);
+        }
+
+        [Fact]
         public void AgentWakeLeases_AreIndependentDurableAndGenerationFenced()
         {
             var store = NewStore();

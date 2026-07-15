@@ -60,7 +60,58 @@ namespace Omnipotent.Services.Omniscience
         }
         private static readonly ConcurrentDictionary<string, CacheEntry> ResponseCache = new();
 
-        private static async Task<string> GetOrComputeAsync(string cacheKey, TimeSpan ttl, Func<string> buildPayload)
+        // Cached routes the background warmer keeps perpetually fresh. Keyed so a
+        // service restart re-registering a route replaces (not duplicates) its target.
+        private sealed record WarmTarget(string Key, TimeSpan Ttl, Func<string> Build);
+        private static readonly ConcurrentDictionary<string, WarmTarget> WarmTargets = new();
+        internal static void RegisterWarmTarget(string key, TimeSpan ttl, Func<string> build)
+            => WarmTargets[key] = new WarmTarget(key, ttl, build);
+
+        /// <summary>
+        /// Drops cached payloads whose key starts with <paramref name="prefix"/>.
+        /// Called by mutation routes so the next dashboard read reflects the write
+        /// immediately instead of waiting out the TTL (or serving a stale entry).
+        /// </summary>
+        internal static void InvalidateCachePrefix(string prefix)
+        {
+            foreach (var key in ResponseCache.Keys)
+            {
+                if (key.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    ResponseCache.TryRemove(key, out _);
+                }
+            }
+        }
+
+        // Must be called under lock(entry). Starts the single-flight rebuild task.
+        private static Task<string> StartBuild(CacheEntry entry, TimeSpan ttl, Func<string> buildPayload)
+        {
+            var task = Task.Run(async () =>
+            {
+                await ReadGate.WaitAsync();
+                try
+                {
+                    string payload = buildPayload();
+                    lock (entry)
+                    {
+                        entry.Payload = payload;
+                        entry.ExpiresAtTicks = DateTime.UtcNow.Add(ttl).Ticks;
+                        entry.InFlight = null;
+                    }
+                    return payload;
+                }
+                catch
+                {
+                    lock (entry) { entry.InFlight = null; }
+                    throw;
+                }
+                finally { ReadGate.Release(); }
+            });
+            entry.InFlight = task;
+            return task;
+        }
+
+        internal static async Task<string> GetOrComputeAsync(string cacheKey, TimeSpan ttl, Func<string> buildPayload)
         {
             long nowTicks = DateTime.UtcNow.Ticks;
             if (ResponseCache.TryGetValue(cacheKey, out var hit) && hit.Payload != null && hit.ExpiresAtTicks > nowTicks)
@@ -77,44 +128,38 @@ namespace Omnipotent.Services.Omniscience
                 {
                     return entry.Payload;
                 }
-                if (entry.InFlight != null)
+                task = entry.InFlight ?? StartBuild(entry, ttl, buildPayload);
+
+                // Stale-while-revalidate: an expired entry still holds the last good
+                // payload — serve it instantly and let the refresh land in the
+                // background. Only a truly cold key (first request after startup,
+                // before the warmer has filled it) ever waits on the DB scan.
+                if (entry.Payload != null)
                 {
-                    task = entry.InFlight;
-                }
-                else
-                {
-                    task = Task.Run(async () =>
-                    {
-                        await ReadGate.WaitAsync();
-                        try
-                        {
-                            string payload = buildPayload();
-                            lock (entry)
-                            {
-                                entry.Payload = payload;
-                                entry.ExpiresAtTicks = DateTime.UtcNow.Add(ttl).Ticks;
-                                entry.InFlight = null;
-                            }
-                            return payload;
-                        }
-                        catch
-                        {
-                            lock (entry) { entry.InFlight = null; }
-                            throw;
-                        }
-                        finally { ReadGate.Release(); }
-                    });
-                    entry.InFlight = task;
+                    return entry.Payload;
                 }
             }
             return await task;
+        }
+
+        /// <summary>Warmer path: rebuild an expired/cold entry, never serving stale.</summary>
+        private static async Task EnsureFreshAsync(WarmTarget target)
+        {
+            var entry = ResponseCache.GetOrAdd(target.Key, _ => new CacheEntry());
+            Task<string> task;
+            lock (entry)
+            {
+                if (entry.Payload != null && entry.ExpiresAtTicks > DateTime.UtcNow.Ticks) return;
+                task = entry.InFlight ?? StartBuild(entry, target.Ttl, target.Build);
+            }
+            await task;
         }
 
         // Helper: gate a synchronous-DB route body, run the blocking work on a dedicated
         // worker thread (Task.Run), then write the response on the original async path.
         // Use this for routes where caching is not appropriate (per-id detail lookups);
         // use GetOrComputeAsync for list/aggregate routes that re-run the same query.
-        private static async Task GatedRead(UserRequest req, Func<string> buildPayload)
+        internal static async Task GatedRead(UserRequest req, Func<string> buildPayload)
         {
             await ReadGate.WaitAsync();
             try
@@ -125,7 +170,7 @@ namespace Omnipotent.Services.Omniscience
             finally { ReadGate.Release(); }
         }
 
-        private static async Task CachedRead(UserRequest req, string cacheKey, TimeSpan ttl, Func<string> buildPayload)
+        internal static async Task CachedRead(UserRequest req, string cacheKey, TimeSpan ttl, Func<string> buildPayload)
         {
             string payload = await GetOrComputeAsync(cacheKey, ttl, buildPayload);
             await req.ReturnResponse(payload);
@@ -149,35 +194,41 @@ namespace Omnipotent.Services.Omniscience
         // full O(n) scans on the messages table. With millions of rows that easily
         // exceeds the website's 8s AbortController timeout, so the browser cancels
         // the request before the response can return — exactly what was happening
-        // in the network tab. We pro-actively rebuild the dashboard's default cache
-        // keys in the background so a real user request always hits a warm entry.
+        // in the network tab. We pro-actively rebuild every registered warm target
+        // in the background so a real user request always hits a warm entry, and
+        // the stale-while-revalidate read path means even an unwarmed key only
+        // ever blocks the very first requester.
         private void StartCacheWarmer()
         {
+            // Keys must mirror the keys constructed in the matching routes. The
+            // persons key uses limit=60 because that is what the Omniscience page
+            // actually requests (a l=200 entry was previously warmed here, which
+            // the site never asked for — its real query always missed the warm
+            // cache and paid the full messages scan).
+            RegisterWarmTarget("sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
+            RegisterWarmTarget("stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
+            RegisterWarmTarget("profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
+            RegisterWarmTarget("persons|s=|p=|r=|l=60|o=0", TimeSpan.FromSeconds(45),
+                () => BuildPersonsPayload(null, null, null, 60, 0));
+            RegisterWarmTarget("conversations|p=|k=|l=200", TimeSpan.FromSeconds(45),
+                () => BuildConversationsPayload(null, null, 200));
+
             _ = Task.Run(async () =>
             {
                 // Tiny initial delay so we don't fight the rest of service start-up.
                 try { await Task.Delay(TimeSpan.FromSeconds(2)); } catch { }
                 while (true)
                 {
-                    try { await WarmDashboardOnce(); }
-                    catch { /* swallow — next tick will retry */ }
+                    foreach (var target in WarmTargets.Values)
+                    {
+                        try { await EnsureFreshAsync(target); }
+                        catch { /* swallow — next tick will retry */ }
+                    }
                     // Refresh interval slightly under the shortest TTL we warm (sources=15s)
                     // so the cache is always pre-populated before it can expire.
                     try { await Task.Delay(TimeSpan.FromSeconds(10)); } catch { break; }
                 }
             });
-        }
-
-        private async Task WarmDashboardOnce()
-        {
-            // Default dashboard keys must mirror the keys constructed in the routes.
-            await GetOrComputeAsync("sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
-            await GetOrComputeAsync("stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
-            await GetOrComputeAsync("profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
-            await GetOrComputeAsync("persons|s=|p=|r=|l=200|o=0", TimeSpan.FromSeconds(45),
-                () => BuildPersonsPayload(null, null, null, 200, 0));
-            await GetOrComputeAsync("conversations|p=|k=|l=200", TimeSpan.FromSeconds(45),
-                () => BuildConversationsPayload(null, null, 200));
         }
 
         // ── Sources ──
@@ -216,6 +267,7 @@ namespace Omnipotent.Services.Omniscience
                         await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = false, error }), code: HttpStatusCode.BadRequest);
                         return;
                     }
+                    InvalidateCachePrefix("sources");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, self_id = selfId, self_username = selfName }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -232,6 +284,7 @@ namespace Omnipotent.Services.Omniscience
                         return;
                     }
                     await service.Discord.RemoveSourceAsync(sourceId);
+                    InvalidateCachePrefix("sources");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -385,6 +438,8 @@ namespace Omnipotent.Services.Omniscience
                     bool enabled = !string.Equals(req.userParameters?["enabled"], "false", StringComparison.OrdinalIgnoreCase)
                         && req.userParameters?["enabled"] != "0";
                     await service.Scheduler.SetProfileTargetAsync(personId, enabled, CancellationToken.None);
+                    InvalidateCachePrefix("profile-targets");
+                    InvalidateCachePrefix("persons|");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, person_id = personId, enabled }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -432,6 +487,9 @@ namespace Omnipotent.Services.Omniscience
                         tx.Commit();
                     }
                     finally { service.Db.WriteLock.Release(); }
+                    InvalidateCachePrefix("persons|");
+                    InvalidateCachePrefix("profile-targets");
+                    InvalidateCachePrefix("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }

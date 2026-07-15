@@ -128,6 +128,44 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
+        public void FallbackHistoryRateLimit_DoesNotOverrideFinalStructuredError()
+        {
+            const string body = """
+                { "error": {
+                  "code": 400,
+                  "message": "Tool schema is invalid",
+                  "metadata": {
+                    "error_type": "invalid_request",
+                    "previous_errors": [{ "code": 429, "message": "temporarily rate limited upstream" }]
+                  }
+                }}
+                """;
+
+            Assert.Equal(RemoteLLMFailureKind.InvalidRequest,
+                LlmService.ClassifyRemoteFailure(HttpStatusCode.BadRequest, body));
+        }
+
+        [Fact]
+        public async Task LongRateLimitRetryAfter_DefersWithoutReplayingTheFallbackChain()
+        {
+            var handler = new RecordingHandler(_ =>
+            {
+                var response = JsonResponse(HttpStatusCode.TooManyRequests,
+                    "{\"error\":{\"code\":429,\"message\":\"rate limited\"}}");
+                response.Headers.TryAddWithoutValidation("Retry-After", "60");
+                return response;
+            });
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(
+                () => service.SendPayloadWithRetryAsync(OpenRouter(), Payload(maxTokens: null)));
+
+            Assert.Single(handler.RequestBodies);
+            Assert.Equal(TimeSpan.FromSeconds(60), error.RetryAfter!.Value);
+        }
+
+        [Fact]
         public void RetryAfter_IsCappedToBoundedInWakePolicy()
         {
             Assert.Equal(TimeSpan.FromSeconds(7), LlmService.BoundProviderRetryAfter(TimeSpan.FromSeconds(7)));
@@ -136,15 +174,17 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
-        public void ModelFallback_SendsOpenRouterModelsArray_OnlyWhenMoreThanOneRoute()
+        public void ModelFallback_SendsOnlyBackupRoutesAfterThePrimaryModel()
         {
             // Multiple routes → the whole ordered list becomes OpenRouter's native `models` fallback set.
             var multi = Payload(null);
+            multi.model = "anthropic/claude-sonnet-4.5";
             LlmService.ApplyModelFallback(ref multi, OpenRouter(), new[] { "anthropic/claude-sonnet-4.5", "openai/gpt-4.1" });
-            Assert.Equal(new[] { "anthropic/claude-sonnet-4.5", "openai/gpt-4.1" }, multi.models);
+            Assert.Equal(new[] { "openai/gpt-4.1" }, multi.models);
 
             // A single route needs no fallback — `models` stays unset so the plain `model` field is used.
             var single = Payload(null);
+            single.model = "anthropic/claude-sonnet-4.5";
             LlmService.ApplyModelFallback(ref single, OpenRouter(), new[] { "anthropic/claude-sonnet-4.5" });
             Assert.Null(single.models);
 
@@ -158,9 +198,10 @@ namespace Omnipotent.Tests.KliveLLM
         public void ModelFallback_DedupesAndTrims_AndIgnoresNonOpenRouterProviders()
         {
             var deduped = Payload(null);
+            deduped.model = "a/b";
             LlmService.ApplyModelFallback(ref deduped, OpenRouter(),
                 new[] { " a/b ", "a/b", "", "c/d", "A/B" });
-            Assert.Equal(new[] { "a/b", "c/d" }, deduped.models);
+            Assert.Equal(new[] { "c/d" }, deduped.models);
 
             // Only OpenRouter understands the parameter; other providers never receive it.
             var hf = Payload(null);
@@ -169,13 +210,25 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
-        public void ModelFallback_RespectsOpenRouterThreeModelMaximum()
+        public void ModelFallback_RespectsOpenRouterThreeBackupMaximum()
         {
             var payload = Payload(maxTokens: null);
+            payload.model = "a/one";
             LlmService.ApplyModelFallback(ref payload, OpenRouter(),
                 new[] { "a/one", "b/two", "c/three", "d/four", "e/five" });
 
-            Assert.Equal(new[] { "a/one", "b/two", "c/three" }, payload.models);
+            Assert.Equal(new[] { "b/two", "c/three", "d/four" }, payload.models);
+        }
+
+        [Fact]
+        public void ModelFallback_RotatesBackupsAfterAPinnedSuccessfulRoute()
+        {
+            var payload = Payload(maxTokens: null);
+            payload.model = "b/two";
+            LlmService.ApplyModelFallback(ref payload, OpenRouter(),
+                new[] { "a/one", "b/two", "c/three" });
+
+            Assert.Equal(new[] { "c/three", "a/one" }, payload.models);
         }
 
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(

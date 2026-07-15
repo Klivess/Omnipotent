@@ -12,6 +12,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>The standing digest (goal, plan, org chart, budget, open threads).</summary>
         public const int DigestBudget = 6000;
 
+        /// <summary>
+        /// Klives' durable project directives. This is separate from the digest budget because
+        /// rules are authoritative constraints, not expendable model-authored narrative.
+        /// </summary>
+        public const int DirectivesBudget = 3000;
+
         /// <summary>Recent events replayed verbatim into a wake seed.</summary>
         public const int RecentEventsBudget = 48000;
 

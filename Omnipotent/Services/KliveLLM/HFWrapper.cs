@@ -158,9 +158,9 @@ namespace Omnipotent.Services.KliveLLM
             public HFMessage[] messages;
             public string model;
 
-            // OpenRouter model routing / fallback: an ordered preference list. OpenRouter attempts each
-            // model in turn until one succeeds, so provider-side fallback replaces app-side route loops.
-            // Only sent for OpenRouter and only when more than one route is configured; ignored otherwise.
+            // OpenRouter model routing / fallback: ordered backups after `model`. OpenRouter attempts them
+            // in turn if the primary fails, so provider-side fallback replaces app-side route loops.
+            // Only sent for OpenRouter and only when a distinct backup route is configured; ignored otherwise.
             [JsonProperty("models", NullValueHandling = NullValueHandling.Ignore)]
             public List<string> models;
 

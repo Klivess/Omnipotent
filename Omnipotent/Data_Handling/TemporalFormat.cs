@@ -110,6 +110,16 @@ namespace Omnipotent.Data_Handling
                 out var parsed))
             {
                 bool hasExplicitYear = System.Text.RegularExpressions.Regex.IsMatch(text, @"\d{4}");
+                bool hasDateComponent = hasExplicitYear
+                    || System.Text.RegularExpressions.Regex.IsMatch(text, @"\d{1,2}\s*[-/]\s*\d{1,2}")
+                    || System.Text.RegularExpressions.Regex.IsMatch(text, @"(?i)\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)");
+                if (!hasDateComponent)
+                {
+                    // Bare time-of-day: DateTime.TryParse resolves "09:00" against the
+                    // machine's real today, but the instant must be anchored to the
+                    // caller's reference date (they can differ — tests, replays).
+                    parsed = DateTime.SpecifyKind(nowUtc.Date + parsed.TimeOfDay, DateTimeKind.Utc);
+                }
                 if (!hasExplicitYear)
                     while (parsed <= nowUtc) parsed = parsed.AddDays(1);
                 instantUtc = parsed;

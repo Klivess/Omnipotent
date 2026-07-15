@@ -229,8 +229,8 @@ namespace Omnipotent.Services.Projects
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID, ProjectAgentWorkStatus.Running);
                 var modelRoutes = settings.RoutesForTier(agent.Tier).ToList();
                 if (modelRoutes.Count == 0) throw new InvalidOperationException($"Agent tier {agent.Tier} has no configured model routes.");
-                // Index 0 is the primary; the whole ordered list is handed to OpenRouter as its fallback
-                // set (see QueryToolSessionAsync modelRoutes), so there is no app-side route-advance loop.
+                // Index 0 is the primary. OpenRouter receives it as `model` and later routes as its
+                // ordered fallback set; a successful backup is pinned for the rest of this wake.
                 string model = modelRoutes[0];
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
                 int sliceToolCalls = settings.WorkSliceToolCalls;
@@ -314,9 +314,9 @@ namespace Omnipotent.Services.Projects
                     KliveLLM.KliveLLM.KliveLLMResponse resp;
                     try
                     {
-                        // Fallback across the tier's routes happens at the OpenRouter level: the ordered list
-                        // is sent as the request's `models` array and OpenRouter tries each in turn, server-
-                        // side, in this one call. A failure means every route was exhausted, so it propagates.
+                        // Fallback across the tier's routes happens at the OpenRouter level: the current
+                        // `model` is primary and later routes are tried server-side if it fails. A failure
+                        // means every route was exhausted, so it propagates.
                         try
                         {
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
@@ -330,6 +330,12 @@ namespace Omnipotent.Services.Projects
 
                         if (!resp.Success)
                             throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, resp.Model ?? model, maxOutputTokens);
+
+                        // Avoid re-hitting a route OpenRouter just bypassed on every tool continuation.
+                        // Pin only an actual configured route, then restore normal ordering next wake.
+                        string? servedRoute = modelRoutes.FirstOrDefault(route =>
+                            string.Equals(route, resp.Model, StringComparison.OrdinalIgnoreCase));
+                        if (!string.IsNullOrWhiteSpace(servedRoute)) model = servedRoute;
 
                     if (resp.PromptTokens > 0 || resp.CompletionTokens > 0)
                     {
@@ -680,6 +686,14 @@ RULES:
             var digest = parent.Digests.GetDigest(project.ProjectID);
             var sb = new StringBuilder();
             sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps below and in your messages are UTC.");
+            string directives = "";
+            try { directives = parent.Directives.DescribeForPrompt(project.ProjectID, agent.AgentID,
+                ProjectDirectiveStore.TryExtractDirectiveID(trigger)); } catch { }
+            if (!string.IsNullOrWhiteSpace(directives))
+            {
+                sb.AppendLine("── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before the assignment) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(directives, ProjectsContextBudget.DirectivesBudget));
+            }
             sb.AppendLine("── PROJECT PLAN (commander's, for context) ──");
             string planSeed = ProjectsContextBudget.ScrubHarnessLeak(
                 digest.CurrentPlan is { Length: > 0 } p ? p : "(none)",

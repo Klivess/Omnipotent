@@ -230,7 +230,8 @@ namespace Omnipotent.Services.Projects
                 "Then restate your FINAL position in ≤250 words, explicitly noting anything you changed your mind about.";
             await using var lease = AcquireTurnAsync == null ? null : await AcquireTurnAsync(session.ProjectID, ct);
             if (AcquireTurnAsync != null && lease == null) return;
-            // Fallback across routes is OpenRouter's job now — one call, the whole ordered list.
+            // Fallback across routes is OpenRouter's job: one request uses route 0 as primary and the
+            // remaining configured routes as ordered backups.
             CouncilTurn? turn = null;
             try
             {
@@ -245,8 +246,8 @@ namespace Omnipotent.Services.Projects
         private async Task<CouncilTurn?> QueryRoutesAsync(CouncilSession session, string sessionID,
             string? systemPrompt, string prompt, IReadOnlyList<string> modelRoutes, int maxTokens, CancellationToken ct)
         {
-            // Fallback across routes is handled by OpenRouter (the whole ordered list rides one request),
-            // so this is a single delegate call rather than a per-model retry loop.
+            // Fallback across routes is handled by OpenRouter (a primary plus ordered backups in one
+            // request), so this is a single delegate call rather than a per-model retry loop.
             return await QueryAsync!(sessionID, systemPrompt, prompt, modelRoutes, maxTokens, ct);
         }
 

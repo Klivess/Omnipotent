@@ -361,6 +361,9 @@ namespace Omnipotent.Services.Projects
                     parent.CommanderRunner.Wake(project, wasPlanning
                         ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
                         : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+                    // Commands sent while paused are not discarded or falsely marked delivered;
+                    // their durable directive records are re-injected as soon as work resumes.
+                    parent.DeliverPendingDirectives(project.ProjectID);
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -368,23 +371,74 @@ namespace Omnipotent.Services.Projects
 
             // ── Fleet-wide controls (broadcast + global halt) ──
 
-            // Deliver one message to every live project's Commander. POST { text }.
+            // Durable broadcast. Default is a concrete task to each Commander; scope=all-agents
+            // creates individually tracked tasks for every active worker too. The response is a
+            // recipient-level receipt, never the old optimistic "delivered=N" claim.
             await parent.CreateAPIRoute("/projects/broadcast", async req =>
             {
                 try
                 {
-                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
-                    string text = (string?)body?.text ?? "";
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    string text = ((string?)body["text"] ?? "").Trim();
                     if (string.IsNullOrWhiteSpace(text))
                     {
                         await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    var affected = parent.BroadcastMessage(text);
-                    await req.ReturnResponse(Json(new { ok = true, delivered = affected.Count, projectIDs = affected }));
+                    string scope = ((string?)body["scope"] ?? "commander").Trim();
+                    bool remember = (bool?)body["remember"] ?? false;
+                    int priority = Math.Clamp((int?)body["priority"] ?? 100, -1000, 1000);
+                    var kind = ParseDirectiveKind((string?)body["kind"], ProjectDirectiveKind.Task);
+                    var expected = ParseStringArray(body["expectedArtifactPaths"]);
+                    string broadcastID = Guid.NewGuid().ToString("N");
+                    var receipts = parent.BroadcastMessageWithReceipts(text, scope, kind, remember, priority, expected, broadcastID);
+                    await req.ReturnResponse(Json(new
+                    {
+                        ok = receipts.Any(x => x.Accepted),
+                        broadcastID,
+                        scope,
+                        accepted = receipts.Count(x => x.Accepted),
+                        delivered = receipts.Count(x => x.Status == "delivered"),
+                        deferred = receipts.Count(x => x.Status == "deferred"),
+                        rejected = receipts.Count(x => x.Status == "rejected"),
+                        receipts,
+                    }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Durable broadcast reconciliation. A caller can refresh this after a page reload to
+            // answer “did every Project actually finish its report?” without retaining receipts client-side.
+            await parent.CreateAPIRoute("/projects/broadcast/status", async req =>
+            {
+                try
+                {
+                    string broadcastID = (req.userParameters?.Get("broadcastID") ?? "").Trim();
+                    if (broadcastID.Length == 0)
+                    {
+                        await req.ReturnResponse("broadcastID required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var directives = parent.GetBroadcastDirectives(broadcastID);
+                    if (directives.Count == 0)
+                    {
+                        await req.ReturnResponse("unknown broadcastID", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await req.ReturnResponse(Json(new
+                    {
+                        broadcastID,
+                        total = directives.Count,
+                        active = directives.Count(x => x.Status is ProjectDirectiveStatus.Active or ProjectDirectiveStatus.Delivered),
+                        acknowledged = directives.Count(x => x.Status == ProjectDirectiveStatus.Acknowledged),
+                        completed = directives.Count(x => x.Status == ProjectDirectiveStatus.Completed),
+                        failed = directives.Count(x => x.Status == ProjectDirectiveStatus.Failed),
+                        revoked = directives.Count(x => x.Status == ProjectDirectiveStatus.Revoked),
+                        directives,
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             // Halt every project that isn't already halted (or terminal), remembering each project's
             // pre-halt status so unhalt-all restores it exactly. POST (no body).
@@ -744,24 +798,122 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            // Klives → Commander message (website chat). Logged, and wakes the Commander so it
-            // responds. (Once P4's bus exists this becomes a durable stimulus; the wake call
-            // is idempotent — a no-op if a wake is already active.)
+            // ── Durable project memory + steering ──
+
+            // GET ?projectID&includeResolved=false. Rules are visible and editable as explicit
+            // project memory instead of being hidden in a compacted message timeline.
+            await parent.CreateAPIRoute("/projects/memory", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    bool includeResolved = !bool.TryParse(req.userParameters?.Get("includeResolved"), out var parsed) || parsed;
+                    await req.ReturnResponse(Json(parent.Directives.List(project!.ProjectID, includeResolved)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // POST { projectID, text, key?, priority? }. Rules are all-agent, durable and are
+            // immediately injected into the Commander; every future worker receives them too.
+            await parent.CreateAPIRoute("/projects/memory/upsert", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    string text = ((string?)body["text"] ?? "").Trim();
+                    if (text.Length == 0)
+                    {
+                        await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    string? key = ((string?)body["key"])?.Trim();
+                    int priority = Math.Clamp((int?)body["priority"] ?? 100, -1000, 1000);
+                    var receipt = parent.MessageProjectWithReceipt(project!.ProjectID, text,
+                        ProjectDirectiveKind.Rule, remember: true, key: key, priority: priority);
+                    await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/memory/revoke", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    string directiveID = ((string?)body["directiveID"] ?? "").Trim();
+                    if (directiveID.Length == 0)
+                    {
+                        await req.ReturnResponse("directiveID required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var revoked = parent.Directives.Revoke(project!.ProjectID, directiveID, (string?)body["reason"]);
+                    if (revoked == null)
+                    {
+                        await req.ReturnResponse("unknown directiveID", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    parent.EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = project.ProjectID, Type = ProjectEventTypes.DirectiveRevoked,
+                        Author = "klives", StimulusID = directiveID,
+                        Text = $"Directive {directiveID} revoked by Klives.",
+                    });
+                    await req.ReturnResponse(Json(new { ok = true, directive = revoked }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Klives → one live sub-agent. It has the same durable receipt/lifecycle as Commander
+            // steering instead of relying on the internal-only inter-agent bus.
+            await parent.CreateAPIRoute("/projects/agents/message", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    string agentID = ((string?)body["agentID"] ?? "").Trim();
+                    string text = ((string?)body["text"] ?? "").Trim();
+                    if (agentID.Length == 0 || text.Length == 0)
+                    {
+                        await req.ReturnResponse("agentID and text required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var kind = ParseDirectiveKind((string?)body["kind"], ProjectDirectiveKind.Task);
+                    int priority = Math.Clamp((int?)body["priority"] ?? 100, -1000, 1000);
+                    var receipt = parent.MessageAgentWithReceipt(project!.ProjectID, agentID, text, kind,
+                        priority, ParseStringArray(body["expectedArtifactPaths"]));
+                    await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Klives → Commander message. A message is now a durable steering record first,
+            // then a low-latency live injection; returning {ok:true} never again implies a wake
+            // actually accepted it.
             await parent.CreateAPIRoute("/projects/message", async req =>
             {
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    dynamic body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent ?? "{}") ?? new System.Dynamic.ExpandoObject();
-                    string text = (string?)body?.text ?? "";
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    string text = ((string?)body["text"] ?? "").Trim();
                     if (string.IsNullOrWhiteSpace(text))
                     {
                         await req.ReturnResponse("text required", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    // Logs the Klives message and steers/wakes the Commander (lands within a live wake).
-                    parent.MessageProject(project!.ProjectID, text);
-                    await req.ReturnResponse(Json(new { ok = true }));
+                    bool remember = (bool?)body["remember"] ?? false;
+                    // Do not infer "one-off" from punctuation: “Can you send a PDF report?” is
+                    // still a deliverable. Callers that truly want transient chat can set kind=steering.
+                    var defaultKind = ProjectDirectiveKind.Task;
+                    var kind = ParseDirectiveKind((string?)body["kind"], defaultKind);
+                    string? key = ((string?)body["key"])?.Trim();
+                    int priority = Math.Clamp((int?)body["priority"] ?? 100, -1000, 1000);
+                    var receipt = parent.MessageProjectWithReceipt(project!.ProjectID, text, kind, remember,
+                        key, priority, ParseStringArray(body["expectedArtifactPaths"]));
+                    await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
@@ -1063,6 +1215,25 @@ namespace Omnipotent.Services.Projects
             return DateTimeOffset.TryParse(raw, CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var dto)
                 ? dto.UtcDateTime : null;
+        }
+
+        private static ProjectDirectiveKind ParseDirectiveKind(string? raw, ProjectDirectiveKind fallback)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return fallback;
+            return raw.Trim().ToLowerInvariant() switch
+            {
+                "rule" or "memory" => ProjectDirectiveKind.Rule,
+                "task" or "command" or "report" => ProjectDirectiveKind.Task,
+                "steering" or "message" => ProjectDirectiveKind.Steering,
+                _ => fallback,
+            };
+        }
+
+        private static List<string> ParseStringArray(JToken? token)
+        {
+            if (token is not JArray array) return new List<string>();
+            return array.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).Take(16).ToList();
         }
 
         // Reduces a project name to a filesystem-safe slug for the Content-Disposition filename.

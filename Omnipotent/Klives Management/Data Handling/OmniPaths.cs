@@ -175,6 +175,7 @@ namespace Omnipotent.Data_Handling
             public static string ProjectsObservablesDirectory = $"{ProjectsDirectory}/Observables";
             public static string ProjectsCouncilsDirectory = $"{ProjectsDirectory}/Councils";
             public static string ProjectsGrandPlansDirectory = $"{ProjectsDirectory}/GrandPlans";
+            public static string ProjectsMemoryDirectory = $"{ProjectsDirectory}/Memory";
 
             //KAPI Reachability Monitor
             public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";

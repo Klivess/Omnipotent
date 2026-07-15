@@ -63,6 +63,8 @@ namespace Omnipotent.Services.Projects.Stimulus
                 .Select(m => (m ?? "").Trim())
                 .Where(m => m.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
+                // One primary plus the three fallback slots OpenRouter accepts for this request.
+                .Take(4)
                 .ToList();
 
             if (routes.Count > 0)

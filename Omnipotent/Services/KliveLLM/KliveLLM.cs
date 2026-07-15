@@ -943,12 +943,14 @@ namespace Omnipotent.Services.KliveLLM
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
-            // The primary model is the first configured route (when a route list is supplied), else the
-            // explicit override, else the provider default. Additional routes become OpenRouter's own
-            // fallback list (see ApplyModelFallback) rather than an app-side retry loop.
-            string primaryModel = (modelRoutes != null && modelRoutes.Count > 0 && !string.IsNullOrWhiteSpace(modelRoutes[0]))
-                ? modelRoutes[0].Trim()
-                : (string.IsNullOrWhiteSpace(modelOverride) ? remoteProvider.Model : modelOverride);
+            // An explicit override pins a route that already succeeded earlier in this wake. Otherwise
+            // use the first configured route, then the provider default. Remaining routes become
+            // OpenRouter's own fallback list (see ApplyModelFallback) rather than an app-side retry loop.
+            string primaryModel = !string.IsNullOrWhiteSpace(modelOverride)
+                ? modelOverride.Trim()
+                : (modelRoutes != null && modelRoutes.Count > 0 && !string.IsNullOrWhiteSpace(modelRoutes[0])
+                    ? modelRoutes[0].Trim()
+                    : remoteProvider.Model);
 
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
@@ -1012,25 +1014,29 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>
-        /// Turns an ordered route list into OpenRouter-native fallback routing: up to the first three
-        /// distinct routes are sent in the request's <c>models</c> array (OpenRouter's API maximum),
-        /// so OpenRouter tries each model in order until one succeeds,
-        /// server-side, in a single request. This replaces app-side "try model A, on failure re-query with
-        /// model B" loops. Only applied for OpenRouter (the only provider that understands the parameter)
-        /// and only when more than one distinct route exists — a single route needs no fallback and is sent
-        /// as the plain <c>model</c> field alone.
+        /// Turns an ordered route list into OpenRouter-native fallback routing. The request's
+        /// <c>model</c> remains the primary and only routes after it are sent in the <c>models</c> array,
+        /// which OpenRouter treats as its ordered fallback list. Repeating the primary in <c>models</c>
+        /// makes OpenRouter retry the already-rate-limited route before it reaches a real backup.
+        /// This replaces app-side "try model A, on failure re-query with model B" loops. Only applied for
+        /// OpenRouter (the only provider that understands the parameter) and only when at least one
+        /// distinct backup route exists.
         /// </summary>
         internal static void ApplyModelFallback(ref HFWrapper.HFLLMInferenceRequest payload,
             RemoteLLMProviderConfiguration remoteProvider, IReadOnlyList<string>? modelRoutes)
         {
             if (remoteProvider.Provider != LLMProvider.OpenRouter || modelRoutes == null) return;
-            var distinct = modelRoutes
+            var routes = modelRoutes
                 .Select(m => (m ?? "").Trim())
                 .Where(m => m.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .Take(3)
                 .ToList();
-            if (distinct.Count > 1) payload.models = distinct;
+            string? primary = payload.model;
+            int primaryIndex = routes.FindIndex(m => string.Equals(m, primary, StringComparison.OrdinalIgnoreCase));
+            var fallbacks = primaryIndex < 0
+                ? routes.Take(3).ToList()
+                : routes.Skip(primaryIndex + 1).Concat(routes.Take(primaryIndex)).Take(3).ToList();
+            if (fallbacks.Count > 0) payload.models = fallbacks;
         }
 
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
@@ -1455,7 +1461,7 @@ namespace Omnipotent.Services.KliveLLM
                             continue;
                         }
 
-                        var retryAfter = GetBoundedRetryAfter(response);
+                        var retryAfter = GetProviderRetryAfter(response);
                         var httpEx = new RemoteLLMException(
                             ClassifyRemoteFailure(response.StatusCode, responseContent),
                             $"{remoteProvider.DisplayName} request failed with status {status} ({response.ReasonPhrase}). Body: {responseContent}",
@@ -1466,7 +1472,12 @@ namespace Omnipotent.Services.KliveLLM
                             affordableMaxTokens,
                             retryAfter);
 
-                        if (transient && attempt < maxAttempts)
+                        // A long Retry-After is the provider telling us this wake cannot recover yet.
+                        // Do not send another full native-fallback chain before that window expires; the
+                        // project circuit will defer the next wake using the unbounded provider hint.
+                        bool retryFitsThisWake = !rateLimited || !retryAfter.HasValue
+                            || retryAfter.Value <= TimeSpan.FromMilliseconds(RateLimitMaxDelayMs);
+                        if (transient && retryFitsThisWake && attempt < maxAttempts)
                         {
                             lastError = httpEx;
                             try { await ServiceLog($"Remote LLM {(rateLimited ? "rate-limit" : "transient")} {status} (attempt {attempt}/{maxAttempts}). Retrying."); } catch { }
@@ -1642,15 +1653,18 @@ namespace Omnipotent.Services.KliveLLM
             await Task.Delay(delay, cancellationToken);
         }
 
-        private static TimeSpan? GetBoundedRetryAfter(HttpResponseMessage? response)
+        private static TimeSpan? GetProviderRetryAfter(HttpResponseMessage? response)
         {
             if (response?.Headers?.RetryAfter == null) return null;
             TimeSpan? requested = response.Headers.RetryAfter.Delta;
             if (!requested.HasValue && response.Headers.RetryAfter.Date.HasValue)
                 requested = response.Headers.RetryAfter.Date.Value - DateTimeOffset.UtcNow;
             if (!requested.HasValue || requested.Value <= TimeSpan.Zero) return null;
-            return BoundProviderRetryAfter(requested.Value);
+            return requested;
         }
+
+        private static TimeSpan? GetBoundedRetryAfter(HttpResponseMessage? response) =>
+            GetProviderRetryAfter(response) is TimeSpan requested ? BoundProviderRetryAfter(requested) : null;
 
         internal static TimeSpan BoundProviderRetryAfter(TimeSpan requested)
         {
@@ -1659,30 +1673,46 @@ namespace Omnipotent.Services.KliveLLM
             return requested > maximum ? maximum : requested;
         }
 
-        // OpenRouter routes a request across multiple upstream providers and, when they're all throttling a
-        // (usually free/cheap) model, commonly returns a TOP-LEVEL 400 whose body STILL reveals the real
-        // upstream condition: a 429 ("temporarily rate-limited upstream"), or Xiaomi/MiMo's 441 "risk_control"
-        // ("Detected high-frequency non-compliant requests"). We only see this on an error body, so matching on
-        // these markers lets the retry policy treat the wrapped 400 as the transient condition it actually is.
+        // OpenRouter can wrap an upstream 429/441 in a top-level 400. Inspect the FINAL structured error,
+        // rather than its nested history: native fallback responses can contain an earlier route's 429 even
+        // when the final route failed for a permanent validation/configuration reason.
         private static bool IsUpstreamRateLimitBody(string? body)
         {
             if (string.IsNullOrEmpty(body)) return false;
-            if (body.Contains("risk_control", StringComparison.OrdinalIgnoreCase)
-                || body.Contains("rate-limited", StringComparison.OrdinalIgnoreCase)
-                || body.Contains("rate limited", StringComparison.OrdinalIgnoreCase)
-                || body.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
-                || body.Contains("too many requests", StringComparison.OrdinalIgnoreCase))
-                return true;
+            try
+            {
+                var root = JToken.Parse(body);
+                var error = (root as JObject)?["error"] ?? root;
+                if (error is JObject errorObject)
+                {
+                    string? errorType = errorObject.SelectToken("metadata.error_type")?.ToString()
+                        ?? errorObject["error_type"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(errorType))
+                        return string.Equals(errorType, "rate_limit_exceeded", StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(errorType, "rate_limited", StringComparison.OrdinalIgnoreCase)
+                            || errorType.Contains("risk_control", StringComparison.OrdinalIgnoreCase);
 
-            // Whitespace-insensitive check for an upstream code the top-level status hid (429 = rate limit,
-            // 441 = MiMo/Xiaomi risk-control). Both appear as numbers or quoted strings across providers.
-            string compact = body.Replace(" ", string.Empty).Replace("\n", string.Empty)
-                                  .Replace("\r", string.Empty).Replace("\t", string.Empty).Replace("\\n", string.Empty);
-            return compact.Contains("\"code\":429", StringComparison.OrdinalIgnoreCase)
-                || compact.Contains("\"code\":\"429\"", StringComparison.OrdinalIgnoreCase)
-                || compact.Contains("\"code\":441", StringComparison.OrdinalIgnoreCase)
-                || compact.Contains("\"code\":\"441\"", StringComparison.OrdinalIgnoreCase);
+                    if (IsRateLimitCode(errorObject["code"])) return true;
+                    return HasRateLimitMarker(errorObject["message"]?.ToString());
+                }
+            }
+            catch (JsonException)
+            {
+                // Plain-text compatible-provider errors have no structured final error to inspect.
+            }
+
+            return HasRateLimitMarker(body);
         }
+
+        private static bool IsRateLimitCode(JToken? code) => int.TryParse(code?.ToString(), out int value)
+            && value is 429 or 441;
+
+        private static bool HasRateLimitMarker(string? text) => !string.IsNullOrEmpty(text)
+            && (text.Contains("risk_control", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("rate-limited", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("rate limited", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("rate limit", StringComparison.OrdinalIgnoreCase)
+                || text.Contains("too many requests", StringComparison.OrdinalIgnoreCase));
         private async Task EnsureModelDownloadedAsync()
         {
             try { await ServiceLog($"Ensuring model exists at startup: {ModelDownloadUrl}"); } catch { }

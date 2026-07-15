@@ -69,6 +69,10 @@ namespace Omnipotent.Services.Projects
         public ProjectObservableStore? Observables { get; set; }
         /// <summary>Machine-owned runtime/checkpoint state, separate from model-authored digest prose.</summary>
         public ProjectRuntimeStateStore? RuntimeState { get; set; }
+        /// <summary>Durable Klives rules/tasks/steering receipts, never folded into the digest.</summary>
+        public ProjectDirectiveStore? Directives { get; set; }
+        /// <summary>Surfaces verified directive deliverables to Klives (Discord/UI) after completion.</summary>
+        public Func<ProjectDirective, IReadOnlyList<string>, string, Task>? NotifyDirectiveCompletedAsync { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
         public Func<Task>? CompleteProjectAsync { get; set; }
         /// <summary>Renames the project's Discord channel to match a new project name (null-safe).</summary>
@@ -213,6 +217,95 @@ namespace Omnipotent.Services.Projects
                     string note = (string?)a["note"] ?? "";
                     eventLog.Append(Evt(ProjectEventTypes.CommanderMessage, "commander", note));
                     return new CommanderToolResult("Progress recorded.");
+                }
+
+                case "list_project_directives":
+                {
+                    if (Directives == null) return FailedResult("Durable project memory is unavailable.");
+                    bool includeResolved = (bool?)a["includeResolved"] ?? false;
+                    var items = Directives.List(project.ProjectID, includeResolved)
+                        .Where(x => ProjectDirectiveStore.ScopeAppliesTo(x, actingAgentID)).ToList();
+                    if (items.Count == 0) return new CommanderToolResult("No durable Klives directives are recorded.");
+                    var lines = items.Select(x =>
+                        $"[{x.DirectiveID}] {x.Kind}/{x.Status} scope={x.Scope}: {Trunc(x.Text, 500)}" +
+                        (x.ExpectedArtifactPaths.Count == 0 ? "" : $" | required: {string.Join(", ", x.ExpectedArtifactPaths)}"));
+                    return new CommanderToolResult(string.Join("\n", lines));
+                }
+
+                case "acknowledge_project_directive":
+                {
+                    if (Directives == null) return FailedResult("Durable project memory is unavailable.");
+                    string directiveID = ((string?)a["directiveID"] ?? "").Trim();
+                    if (directiveID.Length == 0) return FailedResult("Provide directiveID.");
+                    string note = ((string?)a["note"] ?? "").Trim();
+                    var before = Directives.Get(project.ProjectID, directiveID);
+                    if (before == null) return FailedResult($"No directive '{directiveID}' exists for this project.");
+                    if (!ProjectDirectiveStore.AppliesTo(before, actingAgentID))
+                        return FailedResult($"Directive '{directiveID}' is not assigned to {actingAgentID}.");
+                    var updated = Directives.Acknowledge(project.ProjectID, directiveID, actingAgentID, note);
+                    if (updated == null || updated.Status != ProjectDirectiveStatus.Acknowledged ||
+                        !string.Equals(updated.AcknowledgedBy, actingAgentID, StringComparison.OrdinalIgnoreCase))
+                        return FailedResult($"Directive '{directiveID}' cannot be acknowledged by {actingAgentID} (it may be a rule, resolved, or owned by another agent).");
+                    eventLog.Append(Evt(ProjectEventTypes.DirectiveAcknowledged, actingAgentID,
+                        $"Directive {directiveID} acknowledged by {actingAgentID}."));
+                    return new CommanderToolResult($"Acknowledged directive {directiveID}.");
+                }
+
+                case "complete_project_directive":
+                {
+                    if (Directives == null) return FailedResult("Durable project memory is unavailable.");
+                    string directiveID = ((string?)a["directiveID"] ?? "").Trim();
+                    string summary = ((string?)a["summary"] ?? "").Trim();
+                    if (directiveID.Length == 0 || summary.Length == 0)
+                        return FailedResult("complete_project_directive requires directiveID and summary.");
+                    var directive = Directives.Get(project.ProjectID, directiveID);
+                    if (directive == null) return FailedResult($"No directive '{directiveID}' exists for this project.");
+                    if (directive.Kind == ProjectDirectiveKind.Rule)
+                        return FailedResult("Standing rules cannot be completed; Klives must revoke or replace them.");
+                    if (!ProjectDirectiveStore.AppliesTo(directive, actingAgentID))
+                        return FailedResult($"Directive '{directiveID}' is not assigned to {actingAgentID}.");
+                    if (directive.Status != ProjectDirectiveStatus.Acknowledged ||
+                        !string.Equals(directive.AcknowledgedBy, actingAgentID, StringComparison.OrdinalIgnoreCase))
+                        return FailedResult($"DIRECTIVE_ACK_REQUIRED: acknowledge directive {directiveID} as {actingAgentID} before completing it.");
+
+                    var artifactPaths = ((a["artifactPaths"] as JArray) ?? new JArray())
+                        .Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    var verifiedArtifacts = new List<string>();
+                    if (artifactPaths.Count > 0)
+                    {
+                        if (Files == null) return FailedResult("Shared file store is unavailable; supplied deliverables cannot be verified.");
+                        foreach (string path in artifactPaths)
+                        {
+                            var entry = Files.Stat(project.ProjectID, path);
+                            if (entry?.Kind == ProjectFileKind.File) verifiedArtifacts.Add(path);
+                        }
+                    }
+                    if (directive.ExpectedArtifactPaths.Count > 0)
+                    {
+                        if (Files == null) return FailedResult("Shared file store is unavailable; required deliverables cannot be verified.");
+                        foreach (string expected in directive.ExpectedArtifactPaths)
+                        {
+                            bool verified = verifiedArtifacts.Any(path => ExpectedArtifactMatches(expected, path) &&
+                                IsExpectedArtifactVerified(Files, project.ProjectID, expected, path));
+                            if (!verified)
+                                return FailedResult($"DIRECTIVE_DELIVERABLE_MISSING: directive {directiveID} requires '{expected}'. Pass an existing matching /project path in artifactPaths after verification.");
+                        }
+                    }
+                    var completed = Directives.Complete(project.ProjectID, directiveID, actingAgentID, summary, verifiedArtifacts);
+                    if (completed == null || completed.Status != ProjectDirectiveStatus.Completed)
+                        return FailedResult($"Directive '{directiveID}' cannot be completed by {actingAgentID}.");
+                    var completedEvent = Evt(ProjectEventTypes.DirectiveCompleted, actingAgentID,
+                        $"Directive {directiveID} completed by {actingAgentID}: {Trunc(summary, 500)}");
+                    completedEvent.StimulusID = directiveID;
+                    completedEvent.PayloadJson = JsonConvert.SerializeObject(new { directiveID, artifactPaths = verifiedArtifacts, batchID = completed.BatchID });
+                    eventLog.Append(completedEvent);
+                    if (NotifyDirectiveCompletedAsync != null)
+                    {
+                        try { await NotifyDirectiveCompletedAsync(completed, verifiedArtifacts, summary); }
+                        catch { /* verified completion remains visible in the event log and project files */ }
+                    }
+                    return new CommanderToolResult($"Completed directive {directiveID}. Verified deliverables: " +
+                        (verifiedArtifacts.Count == 0 ? "none recorded" : string.Join(", ", verifiedArtifacts)) + ".");
                 }
 
                 case "get_checkpoint":
@@ -690,6 +783,10 @@ namespace Omnipotent.Services.Projects
                     string rationale = ((string?)a["rationale"] ?? "").Trim();
                     if (what.Length == 0)
                         return new CommanderToolResult("Provide 'what' or 'description' with the exact human-only action.") { Succeeded = false };
+                    if (IsAutomaticProviderRecoveryRequest(what, title, rationale))
+                        return FailedResult(
+                            "INFRASTRUCTURE_REQUEST_REJECTED: an LLM provider rate limit or temporary provider failure is retried automatically. " +
+                            "It does not make project tools or files inaccessible, so do not ask Klives to read files or perform work. Continue independent work and let the retry circuit recover.");
                     if (title.Length > 0) what = title + ": " + what;
                     if (rationale.Length > 0) what += "\nWhy a human is required: " + rationale;
                     if (RequestHumanAsync == null)
@@ -2527,6 +2624,20 @@ namespace Omnipotent.Services.Projects
             eventLog.Append(evt);
         }
 
+        private static bool IsAutomaticProviderRecoveryRequest(params string?[] parts)
+        {
+            string text = string.Join(" ", parts.Where(x => !string.IsNullOrWhiteSpace(x)));
+            if (Regex.IsMatch(text, @"\b(?:captcha|sms|(?:two|2)[\s-]?factor|phone\s+verification|hardware[\s-]?key|physical(?:[\s-]?world)?)\b",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)) return false;
+            if (Regex.IsMatch(text,
+                @"\b(?:rate[\s-]?limit(?:ed)?|ratelimit(?:ed)?|too\s+many\s+requests|risk_control)\b",
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)) return true;
+            return Regex.IsMatch(text, @"\b(?:llm\s+provider|openrouter|model\s+route)\b",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+                && Regex.IsMatch(text, @"\b(?:unavailable|failure|failed|throttl|cooldown|retry)\b",
+                    RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+
         private static bool AccountUsesDisposableMail(string? service, string? email)
         {
             string key = Omnipotent.Services.AccountRegistry.AccountRegistryStore.NormalizeService(service ?? "");
@@ -2536,6 +2647,37 @@ namespace Omnipotent.Services.Projects
             // registered as the mail.tm service in this harness. We intentionally avoid a stale
             // hard-coded domain list here.
             return false;
+        }
+
+        /// <summary>Matches either an exact requested project path or a required suffix such as
+        /// ".pdf". The caller still verifies that the supplied path exists in ProjectFileStore.</summary>
+        private static bool ExpectedArtifactMatches(string expected, string candidate)
+        {
+            expected = (expected ?? "").Trim().Replace('\\', '/');
+            candidate = (candidate ?? "").Trim().Replace('\\', '/');
+            if (expected.Length == 0 || candidate.Length == 0) return false;
+            return expected.StartsWith(".", StringComparison.Ordinal)
+                ? candidate.EndsWith(expected, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(expected.TrimStart('/'), candidate.TrimStart('/'), StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>PDF-named output must be an actual regular PDF file, not merely a path whose
+        /// extension looks right. Other expected artifacts still require an existing regular file.</summary>
+        private static bool IsExpectedArtifactVerified(ProjectFileStore files, string projectID, string expected, string path)
+        {
+            var entry = files.Stat(projectID, path);
+            if (entry?.Kind != ProjectFileKind.File) return false;
+            bool expectsPdf = expected.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+            if (!expectsPdf) return true;
+            try
+            {
+                using var stream = files.OpenRead(projectID, path);
+                Span<byte> header = stackalloc byte[5];
+                return stream.Read(header) == header.Length &&
+                    header[0] == (byte)'%' && header[1] == (byte)'P' && header[2] == (byte)'D' &&
+                    header[3] == (byte)'F' && header[4] == (byte)'-';
+            }
+            catch { return false; }
         }
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");

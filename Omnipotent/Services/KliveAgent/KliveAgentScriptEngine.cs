@@ -3,6 +3,7 @@ using Microsoft.CodeAnalysis.Scripting;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
+using Omnipotent.Services.Projects;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
@@ -151,9 +152,12 @@ namespace Omnipotent.Services.KliveAgent
         {
             var projects = GetProjectsService();
             if (projects == null) return "Projects service is not available.";
-            return projects.MessageProject(projectID, message)
-                ? $"Message delivered to project {projectID}."
-                : $"No project with ID {projectID}.";
+                var receipt = projects.MessageProjectWithReceipt(projectID, message, ProjectDirectiveKind.Task);
+            if (!receipt.Accepted)
+                return receipt.Reason ?? $"No project with ID {projectID}.";
+            return receipt.Status == "delivered"
+                ? $"Project command {receipt.DirectiveID} was persisted and delivered to wake {receipt.WakeID}."
+                : $"Project command {receipt.DirectiveID} was persisted and is {receipt.Status}: {receipt.Reason ?? "awaiting a runnable wake"}.";
         }
 
         /// <summary>Get a single Project's current status/budget/agent summary.</summary>

@@ -40,6 +40,8 @@ namespace Omnipotent.Services.Projects
         /// <summary>Phase 3 server-push: fans the event log out to WebSocket clients (replaces polling).</summary>
         public ProjectEventBroadcaster EventBroadcaster { get; private set; } = null!;
         public ProjectDigestStore Digests { get; private set; } = null!;
+        /// <summary>Durable Klives rules, tasks and steering receipts. Never folded into the digest.</summary>
+        public ProjectDirectiveStore Directives { get; private set; } = null!;
         /// <summary>Typed runtime coordination, health, blockers, checkpoints and durable wake inbox.</summary>
         public ProjectRuntimeStateStore RuntimeState { get; private set; } = null!;
         public ProjectRetrievalIndex Retrieval { get; private set; } = null!;
@@ -117,12 +119,15 @@ namespace Omnipotent.Services.Projects
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
             EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg));
             Digests = new ProjectDigestStore(msg => ServiceLog(msg));
+            Directives = new ProjectDirectiveStore(msg => ServiceLog(msg));
             RuntimeState = new ProjectRuntimeStateStore(msg => ServiceLog(msg));
             Retrieval = new ProjectRetrievalIndex(EventLog);
             EventLog.EventAppended += Retrieval.Ingest;
             WakeCycle = new ProjectWakeCycle(EventLog, Digests, Retrieval);
             WakeCycle.DescribeFiles = pid => Files.DescribeForPrompt(pid);
             WakeCycle.DescribeRuntimeState = pid => RuntimeState.DescribeForWake(pid);
+            WakeCycle.DescribeDirectives = (pid, trigger) => Directives.DescribeForPrompt(pid, "commander",
+                ProjectDirectiveStore.TryExtractDirectiveID(trigger));
             WakeCycle.DescribeKliveAgentContextAsync = DescribeKliveAgentContextAsync;
             // Cross-system knowledge leg for wake seeds (KliveRAG). Excludes the project's own log
             // (already covered by the BM25 retrieval leg). Fails soft — no KliveRAG → no block.
@@ -302,8 +307,19 @@ namespace Omnipotent.Services.Projects
             // Crash recovery: clear any wake left active by a restart (rehydrate-on-wake safe).
             try { CommanderRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted wakes"); }
+            try { CommanderRunner.RecoverPendingTriggers(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover queued Commander triggers"); }
             try { SubAgentRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted agent wakes"); }
+
+            // Human instructions are stored independently of the transient wake/session state.
+            // Re-deliver every open directive after recovery so a restart can never make Klives'
+            // rules or queued commands disappear.
+            foreach (var existing in Store.ListProjects())
+            {
+                try { DeliverPendingDirectives(existing.ProjectID); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: failed to restore directives for {existing.ProjectID}"); }
+            }
 
             // Wire the email push source (via KliveMail) before arming so email hooks attach at boot.
             // The Discord push source is wired later in InitialiseDiscordAsync once the bot is confirmed up.
@@ -572,40 +588,277 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// Logs a Klives message to a project and steers/wakes the Commander (lands within a live wake
-        /// if one is running). Returns false if the project ID is unknown. Used by /projects/message
-        /// and the KliveAgent bridge.
+        /// Creates a durable commander directive before attempting live delivery. The receipt is
+        /// intentionally more precise than the old boolean: Accepted means persisted, Delivered
+        /// means a specific wake accepted it, and Deferred means it will remain in project memory
+        /// until the project can run again.
         /// </summary>
-        public bool MessageProject(string projectID, string text)
+        public ProjectCommandReceipt MessageProjectWithReceipt(string projectID, string text,
+            ProjectDirectiveKind kind = ProjectDirectiveKind.Steering, bool remember = false,
+            string? key = null, int priority = 100, IEnumerable<string>? expectedArtifactPaths = null,
+            string? batchID = null)
         {
             var project = Store.GetProject(projectID);
-            if (project == null) return false;
-            EventLog.Append(new ProjectEvent
+            if (project == null)
+                return new ProjectCommandReceipt { ProjectID = projectID, Status = "rejected", Reason = "Unknown projectID." };
+            if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived)
+                return new ProjectCommandReceipt { ProjectID = projectID, Status = "rejected", Reason = $"Project is {project.Status}." };
+
+            if (remember) kind = ProjectDirectiveKind.Rule;
+            var scope = kind == ProjectDirectiveKind.Rule ? ProjectDirectiveScope.AllAgents : ProjectDirectiveScope.Commander;
+            var receipt = CreateAndDeliverDirective(project, text, kind, scope, Array.Empty<string>(), "commander",
+                key, priority, expectedArtifactPaths, batchID);
+            if (receipt.Accepted && scope == ProjectDirectiveScope.AllAgents)
             {
-                ProjectID = project.ProjectID,
-                Type = ProjectEventTypes.KlivesMessage,
-                Author = "klives",
-                Text = text,
-            });
-            if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
-                CommanderRunner.Steer(project, text);
-            return true;
+                var directive = Directives.Get(project.ProjectID, receipt.DirectiveID);
+                if (directive != null) DeliverDirectiveToActiveWorkers(project, directive);
+            }
+            return receipt;
+        }
+
+        /// <summary>Durable Klives → one specific live sub-agent instruction. Rules should normally
+        /// use <see cref="MessageProjectWithReceipt"/> so every future agent inherits them.</summary>
+        public ProjectCommandReceipt MessageAgentWithReceipt(string projectID, string agentID, string text,
+            ProjectDirectiveKind kind = ProjectDirectiveKind.Task, int priority = 100,
+            IEnumerable<string>? expectedArtifactPaths = null, string? batchID = null)
+        {
+            var project = Store.GetProject(projectID);
+            if (project == null)
+                return new ProjectCommandReceipt { ProjectID = projectID, TargetAgentID = agentID, Status = "rejected", Reason = "Unknown projectID." };
+            if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived)
+                return new ProjectCommandReceipt { ProjectID = projectID, TargetAgentID = agentID, Status = "rejected", Reason = $"Project is {project.Status}." };
+            if (string.Equals(agentID, "commander", StringComparison.OrdinalIgnoreCase))
+                return MessageProjectWithReceipt(projectID, text, kind, remember: kind == ProjectDirectiveKind.Rule,
+                    priority: priority, expectedArtifactPaths: expectedArtifactPaths, batchID: batchID);
+
+            var agent = SubAgents.ListActive(projectID).FirstOrDefault(x =>
+                string.Equals(x.AgentID, agentID, StringComparison.OrdinalIgnoreCase));
+            if (agent == null)
+                return new ProjectCommandReceipt
+                {
+                    ProjectID = projectID, TargetAgentID = agentID, Status = "rejected",
+                    Reason = "No active agent with that ID. Retired agents cannot accept new instructions."
+                };
+            return CreateAndDeliverDirective(project, text, kind, ProjectDirectiveScope.SpecificAgents,
+                new[] { agent.AgentID }, agent.AgentID, null, priority, expectedArtifactPaths, batchID);
         }
 
         /// <summary>
-        /// Delivers the same message to every live project (Klives → every Commander). Terminal projects
-        /// (Completed/Archived) are skipped — they never wake to read it. Each delivery is logged and
-        /// steers the Commander if the project is currently working. Returns the affected project IDs.
+        /// Backwards-compatible bridge for KliveAgent scripts. It now means "persisted and
+        /// accepted", never the misleading old claim that an agent had already read the message.
         /// </summary>
-        public IReadOnlyList<string> BroadcastMessage(string text)
+        public bool MessageProject(string projectID, string text) =>
+            MessageProjectWithReceipt(projectID, text, ProjectDirectiveKind.Task).Accepted;
+
+        /// <summary>
+        /// Broadcasts with recipient-level receipts. scope=commander preserves the old behaviour;
+        /// scope=all-agents creates a separately tracked task for every active worker as well.
+        /// </summary>
+        public IReadOnlyList<ProjectCommandReceipt> BroadcastMessageWithReceipts(string text, string scope = "commander",
+            ProjectDirectiveKind kind = ProjectDirectiveKind.Task, bool remember = false, int priority = 100,
+            IEnumerable<string>? expectedArtifactPaths = null, string? batchID = null)
         {
-            var affected = new List<string>();
-            foreach (var p in Store.ListProjects())
+            batchID ??= Guid.NewGuid().ToString("N");
+            bool allAgents = string.Equals(scope, "all-agents", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(scope, "all_agents", StringComparison.OrdinalIgnoreCase);
+            var receipts = new List<ProjectCommandReceipt>();
+            foreach (var project in Store.ListProjects())
             {
-                if (p.Status is ProjectStatus.Completed or ProjectStatus.Archived) continue;
-                if (MessageProject(p.ProjectID, text)) affected.Add(p.ProjectID);
+                if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived)
+                {
+                    receipts.Add(new ProjectCommandReceipt
+                    {
+                        ProjectID = project.ProjectID, Status = "rejected", Reason = $"Project is {project.Status}.",
+                        TargetAgentID = "commander"
+                    });
+                    continue;
+                }
+
+                // A standing rule is one project-wide memory record, not a redundant copy for
+                // every current worker. New workers inherit it automatically too.
+                if (!allAgents || remember || kind == ProjectDirectiveKind.Rule)
+                {
+                    receipts.Add(MessageProjectWithReceipt(project.ProjectID, text, kind, remember,
+                        priority: priority, expectedArtifactPaths: expectedArtifactPaths, batchID: batchID));
+                    continue;
+                }
+
+                SubAgents.EnsureCommander(project.ProjectID);
+                var agents = SubAgents.ListActive(project.ProjectID)
+                    .Select(x => x.AgentID).Append("commander").Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                foreach (string agentID in agents)
+                    receipts.Add(string.Equals(agentID, "commander", StringComparison.OrdinalIgnoreCase)
+                        ? MessageProjectWithReceipt(project.ProjectID, text, kind, priority: priority,
+                            expectedArtifactPaths: expectedArtifactPaths, batchID: batchID)
+                        : MessageAgentWithReceipt(project.ProjectID, agentID, text, kind, priority, expectedArtifactPaths, batchID));
             }
-            return affected;
+            return receipts;
+        }
+
+        /// <summary>Compatibility shape for callers that only need affected project IDs.</summary>
+        public IReadOnlyList<string> BroadcastMessage(string text) => BroadcastMessageWithReceipts(text)
+            .Where(x => x.Accepted).Select(x => x.ProjectID).Distinct(StringComparer.Ordinal).ToList();
+
+        /// <summary>Durable broadcast audit; survives UI reloads and process restarts.</summary>
+        public IReadOnlyList<ProjectDirective> GetBroadcastDirectives(string batchID)
+        {
+            if (string.IsNullOrWhiteSpace(batchID)) return Array.Empty<ProjectDirective>();
+            return Store.ListProjects().SelectMany(project => Directives.List(project.ProjectID, includeResolved: true))
+                .Where(x => string.Equals(x.BatchID, batchID, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(x => x.ProjectID).ThenBy(x => x.CreatedAt).ToList();
+        }
+
+        /// <summary>Re-delivers all still-open durable directives after startup or resume. The
+        /// directive store is authoritative, so a process restart cannot forget a human command.</summary>
+        public void DeliverPendingDirectives(string projectID)
+        {
+            var project = Store.GetProject(projectID);
+            if (project?.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return;
+            foreach (var directive in Directives.List(projectID, includeResolved: false))
+            {
+                if (!directive.IsOpen) continue;
+                if (directive.Kind == ProjectDirectiveKind.Steering && directive.Status == ProjectDirectiveStatus.Acknowledged)
+                    continue; // answered chats are history, not work to re-inject after restart
+                if (directive.Scope == ProjectDirectiveScope.Commander || directive.Scope == ProjectDirectiveScope.AllAgents)
+                {
+                    string? wakeID = CommanderRunner.DeliverHumanDirective(project, directive);
+                    MarkDirectiveDelivered(project, directive, "commander", wakeID);
+                    if (directive.Scope == ProjectDirectiveScope.AllAgents)
+                        DeliverDirectiveToActiveWorkers(project, directive);
+                    continue;
+                }
+                foreach (string target in directive.TargetAgentIDs)
+                {
+                    var agent = SubAgents.ListActive(projectID).FirstOrDefault(x =>
+                        string.Equals(x.AgentID, target, StringComparison.OrdinalIgnoreCase));
+                    if (agent == null) continue;
+                    string trigger = $"Message from Klives [directive:{directive.DirectiveID}]: {directive.Text}";
+                    string? wakeID = SubAgentRunner.Wake(project, agent, trigger, queueIfBusy: true);
+                    MarkDirectiveDelivered(project, directive, agent.AgentID, wakeID);
+                }
+            }
+        }
+
+        private ProjectCommandReceipt CreateAndDeliverDirective(Project project, string text, ProjectDirectiveKind kind,
+            ProjectDirectiveScope scope, IEnumerable<string> targetAgentIDs, string deliveryTargetAgentID,
+            string? key, int priority, IEnumerable<string>? expectedArtifactPaths, string? batchID = null)
+        {
+            text = (text ?? "").Trim();
+            var expected = (expectedArtifactPaths ?? Array.Empty<string>()).Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x.Trim()).ToList();
+            // A report request that explicitly asks for PDF must not be silently treated as an
+            // ordinary prose reply. The completion tool will require a real matching project file.
+            if (kind == ProjectDirectiveKind.Task && expected.Count == 0 &&
+                System.Text.RegularExpressions.Regex.IsMatch(text ?? "", @"\bPDF\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
+                expected.Add(".pdf");
+            var directive = Directives.Create(project.ProjectID, text, kind, scope, targetAgentIDs,
+                expected, priority, key, batchID);
+            var messageEvent = EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                AgentID = deliveryTargetAgentID,
+                Type = ProjectEventTypes.KlivesMessage,
+                Author = "klives",
+                StimulusID = directive.DirectiveID,
+                Text = text,
+                PayloadJson = JsonConvert.SerializeObject(new
+                {
+                    directiveID = directive.DirectiveID,
+                    directiveKind = directive.Kind.ToString(),
+                    directiveScope = directive.Scope.ToString(),
+                    expectedArtifactPaths = directive.ExpectedArtifactPaths,
+                }),
+            });
+            Directives.SetSourceEvent(project.ProjectID, directive.DirectiveID, messageEvent.EventID, messageEvent.Sequence);
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                AgentID = deliveryTargetAgentID,
+                Type = ProjectEventTypes.DirectiveCreated,
+                Author = "klives",
+                StimulusID = directive.DirectiveID,
+                Text = $"Durable {directive.Kind} directive {directive.DirectiveID} accepted for {deliveryTargetAgentID}.",
+                PayloadJson = JsonConvert.SerializeObject(new { directiveID = directive.DirectiveID, directive.Key, directive.Kind, directive.Scope }),
+            });
+
+            var receipt = new ProjectCommandReceipt
+            {
+                Accepted = true,
+                ProjectID = project.ProjectID,
+                DirectiveID = directive.DirectiveID,
+                BatchID = directive.BatchID,
+                TargetAgentID = deliveryTargetAgentID,
+                Status = "accepted",
+                EventSequence = messageEvent.Sequence,
+                CreatedAt = directive.CreatedAt,
+                ExpectedArtifactPaths = directive.ExpectedArtifactPaths,
+            };
+
+            string? wakeID = null;
+            if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
+            {
+                if (string.Equals(deliveryTargetAgentID, "commander", StringComparison.OrdinalIgnoreCase))
+                    wakeID = CommanderRunner.DeliverHumanDirective(project, directive);
+                else
+                {
+                    var agent = SubAgents.ListActive(project.ProjectID).FirstOrDefault(x =>
+                        string.Equals(x.AgentID, deliveryTargetAgentID, StringComparison.OrdinalIgnoreCase));
+                    if (agent != null)
+                    {
+                        string trigger = $"Message from Klives [directive:{directive.DirectiveID}]: {directive.Text}";
+                        wakeID = SubAgentRunner.Wake(project, agent, trigger, queueIfBusy: true);
+                    }
+                }
+            }
+
+            receipt.WakeID = wakeID;
+            if (!string.IsNullOrWhiteSpace(wakeID))
+            {
+                receipt.Status = "delivered";
+                MarkDirectiveDelivered(project, directive, deliveryTargetAgentID, wakeID);
+            }
+            else
+            {
+                receipt.Status = "deferred";
+                receipt.Reason = project.Status is ProjectStatus.Active or ProjectStatus.Planning
+                    ? "No wake could be acquired now; the directive remains durable and will be retried."
+                    : $"Project is {project.Status}; the directive is queued until it resumes.";
+            }
+            return receipt;
+        }
+
+        private void MarkDirectiveDelivered(Project project, ProjectDirective directive, string agentID, string? wakeID)
+        {
+            if (string.IsNullOrWhiteSpace(wakeID)) return;
+            var updated = Directives.MarkDelivered(project.ProjectID, directive.DirectiveID, agentID, wakeID);
+            if (updated == null) return;
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = project.ProjectID,
+                AgentID = agentID,
+                Type = ProjectEventTypes.DirectiveDelivered,
+                Author = "system",
+                WakeID = wakeID,
+                StimulusID = directive.DirectiveID,
+                Text = $"Directive {directive.DirectiveID} delivered to {agentID} in wake {wakeID}.",
+            });
+        }
+
+        /// <summary>
+        /// Rules affect every active worker immediately, not merely the Commander or a worker's
+        /// next natural context rollover. The durable rule remains in each future seed as the
+        /// recovery source of truth if a live worker queue is unavailable.
+        /// </summary>
+        private void DeliverDirectiveToActiveWorkers(Project project, ProjectDirective directive)
+        {
+            if (directive.Scope != ProjectDirectiveScope.AllAgents) return;
+            foreach (var agent in SubAgents.ListActive(project.ProjectID)
+                .Where(x => !string.Equals(x.AgentID, "commander", StringComparison.OrdinalIgnoreCase)))
+            {
+                string trigger = $"Message from Klives [directive:{directive.DirectiveID}]: {directive.Text}";
+                string? wakeID = SubAgentRunner.Wake(project, agent, trigger, queueIfBusy: true);
+                MarkDirectiveDelivered(project, directive, agent.AgentID, wakeID);
+            }
         }
 
         /// <summary>
@@ -707,8 +960,8 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Queries the utility model with a one-shot prompt; used by triage and digest rebuilds.
-        /// The ordered routes are handed to OpenRouter as its own fallback set (one request tries them all
-        /// in turn) rather than looping model-by-model in-process.</summary>
+        /// Route 0 is handed to OpenRouter as the primary and later routes as its fallback set (one request
+        /// tries them in turn) rather than looping model-by-model in-process.</summary>
         private async Task<string?> QueryUtilityModelAsync(string projectID, string prompt, IReadOnlyList<string> routes)
         {
             if (routes == null || routes.Count == 0) return null;
@@ -743,7 +996,7 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>One council-panelist round-trip on an already-seeded session. Spend is booked by the
-        /// runner. The ordered routes are OpenRouter's own fallback set for this single request.</summary>
+        /// runner. Route 0 is OpenRouter's primary and later routes are its fallback set for this request.</summary>
         private static async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, IReadOnlyList<string> routes, int maxTokens, CancellationToken ct)
         {
             var resp = await llm.QueryToolSessionAsync(sessionId, new List<KliveLLM.HFWrapper.HFTool>(),
@@ -768,6 +1021,10 @@ namespace Omnipotent.Services.Projects
         public async Task<CommanderToolResult> CommanderToolDispatch(
             Project project, string actingAgentID, string wakeID, string toolName, string argsJson, CancellationToken ct)
         {
+            string? directiveViolation = ProjectDirectivePolicy.FindViolation(
+                Directives.List(project.ProjectID, includeResolved: false), actingAgentID, toolName);
+            if (directiveViolation != null)
+                return new CommanderToolResult(directiveViolation) { Succeeded = false };
             var projectSettings = Settings.Get(project.ProjectID);
             string? interactionViolation = ProjectDesktopInteractionPolicy.FindViolation(
                 projectSettings, toolName, argsJson, ProjectWorkspaceLocator.HostRoot(project.ProjectID));
@@ -796,6 +1053,9 @@ namespace Omnipotent.Services.Projects
                 Files = Files,
                 Observables = Observables,
                 RuntimeState = RuntimeState,
+                Directives = Directives,
+                NotifyDirectiveCompletedAsync = (directive, paths, summary) =>
+                    NotifyDirectiveCompletionAsync(project, directive, paths, summary),
                 Accounts = GetAccountRegistry(),
                 KliveAgentService = GetKliveAgentService(),
                 GrandPlans = GrandPlans,
@@ -825,6 +1085,17 @@ namespace Omnipotent.Services.Projects
             };
             return await tools.DispatchAsync(toolName, argsJson, ct);
         }
+
+        /// <summary>
+        /// A directive completion already streams to the project UI as an event. When a project
+        /// has Discord enabled, also post the verified report/artifact there so “send me a PDF”
+        /// means a concrete user-visible delivery rather than an invisible file on /project.
+        /// </summary>
+        private Task NotifyDirectiveCompletionAsync(Project project, ProjectDirective directive,
+            IReadOnlyList<string> artifactPaths, string summary) =>
+            DiscordManager == null
+                ? Task.CompletedTask
+                : DiscordManager.PostDirectiveCompletionAsync(project, directive, artifactPaths, summary);
 
         private async Task<CommanderToolResult> DispatchComputerConfirmationAsync(
             Project project, string actingAgentID, string wakeID, string toolName, string argsJson, CancellationToken ct)

@@ -44,6 +44,7 @@ PROJECT AUTHORITY:
 
 HOW YOU OPERATE:
 - You wake in response to a stimulus (an event, a message from Klives, a sub-agent report, a timer, or a watchdog nudge). Each wake you are handed a fresh rehydrated context: the standing digest (plan, org chart, budget, open threads), recent events, and retrieved history. There is no persistent conversation — the event log is your memory. Trust the digest and retrieved facts over any half-memory.
+- KLIVES DIRECTIVES: the wake seed may contain a NON-NEGOTIABLE KLIVES DIRECTIVES block. It is durable project memory, not advisory chat history: obey active RULES before the plan, acknowledge every open task/steering directive with acknowledge_project_directive, and only use complete_project_directive once its stated deliverables are verified. Never silently downgrade, reinterpret, or forget a directive.
 - Work for as long as the project needs. The harness refreshes context in renewable work slices; a slice boundary is never a reason to wind down. At rollover, record verified status and one exact resume action, then continue immediately. End a wake only when the assignment is actually complete, cancelled, budget-paused, waiting on a real dependency/approval/human action, or machine-detected as non-converging.
 - Sleep is for WAITING, not for pacing. End a wake only when you're waiting on something external — a sub-agent working, a hook you expect to fire, a reply from Klives — or nothing more can usefully be done right now. If your closing status would list actions you could take immediately, that status is wrong: take them this wake instead of deferring them to a future one.
 - You distribute work aggressively — you are a commander, not a lone worker. Whenever a task has separable parts, can run in parallel, or wants focused/specialised effort, spawn sub-agents rather than grinding through it yourself wake by wake: they run concurrently, each with its own fresh context, so fanning work out to a small team is usually both faster and cheaper on your own context than doing it serially. Spawn in the cheapest capability tier whose tools the job needs (text < image < video < audio — the tier list is a price list), keep them busy, and retire them the moment they're done to free slots against your cap. If the agent cap is the only thing limiting useful parallelism, make the case with request_budget_increase. Sub-agents may spawn short-lived helpers ONE level deep; no deeper.
@@ -73,7 +74,7 @@ SELF-SUFFICIENCY (you have your own computer — use it):
 - Never ask Klives to do your work for you ('commit this yourself', 'run this command', 'create a token for me' when you can create it from your desktop). If a credential genuinely only Klives holds, ask ONCE via request_human, store what you receive with vault_save, and never ask for it again.
 - Before creating an account on ANY external service, call account_list first. Every project and KliveAgent share ONE global account registry — reuse an existing account instead of registering a redundant duplicate. When you DO create one, account_register it immediately (service, username, email, secrets). Use a dedicated <something>@klive.dev email per service (KliveMail is catch-all, so verification and password-reset mail arrives there — set an email stimulus hook {{to: <address>}} to be woken by it). vault_save is only for project-local scratch secrets; real service accounts belong in the shared registry, and you type their secrets as {{account:<service>/<field>}}.
 - Never create or fall back to mail.tm or another disposable inbox. Use the native klivemail_* tools for mailbox creation and code retrieval; the harness blocks the failed disposable-mail path.
-- request_human is strictly for obstacles that structurally require a human: captchas, SMS/2FA codes, physical-world actions, or decisions/credentials only Klives possesses. It is not for work that is hard, tedious, or unfamiliar — that work is yours.
+- request_human is strictly for obstacles that structurally require a human: captchas, SMS/2FA codes, physical-world actions, or decisions/credentials only Klives possesses. It is not for work that is hard, tedious, or unfamiliar — that work is yours. A provider 429, model-route failure, retry delay, or temporary infrastructure error is automatic runtime recovery, never a reason to ask Klives to read files, run tools, or do project work.
 - Do not repeat a request Klives has already answered, and do not re-raise an unanswered one wake after wake. Log it as an open thread, make progress elsewhere, and let him respond in his own time.
 
 MONEY & AUTONOMY:
@@ -138,6 +139,24 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
 
                 Tool("report_progress", "Record a progress note against the goal for the timeline and reports.",
                     Obj(new { note = Str("What advanced, what was verified, what's next.") }, "note")),
+
+                Tool("list_project_directives", "Read Klives' durable project rules, tasks and steering receipts. These records survive wake compaction; active rules are non-negotiable.",
+                    Obj(new { includeResolved = Bool("Include completed/revoked history (default false).") }, Array.Empty<string>())),
+
+                Tool("acknowledge_project_directive", "Explicitly acknowledge a durable task or steering directive from Klives before acting on it. This records who accepted it and gives Klives an immediate lifecycle receipt.",
+                    Obj(new
+                    {
+                        directiveID = Str("Directive id from the NON-NEGOTIABLE KLIVES DIRECTIVES block."),
+                        note = Str("Brief concrete interpretation/next action."),
+                    }, "directiveID")),
+
+                Tool("complete_project_directive", "Complete a durable task directive only after its requested result is verified. If it requires deliverables, pass their existing /project paths; the harness rejects a completion without the required artifacts.",
+                    Obj(new
+                    {
+                        directiveID = Str("Directive id from the NON-NEGOTIABLE KLIVES DIRECTIVES block."),
+                        summary = Str("What was completed and the verification evidence."),
+                        artifactPaths = Arr(Str("Existing path relative to /project, e.g. outputs/report.pdf."), "Verified deliverable paths."),
+                    }, "directiveID", "summary")),
 
                 Tool("update_checkpoint", "Update the machine-owned project handoff state. Use this whenever you verify a durable fact, establish the canonical artifact for a role, or need a later wake to resume at one exact action. Unlike digest prose, checkpoints survive compaction without reinterpretation. Ops: set_resume, clear_resume, upsert_fact, invalidate_fact, register_artifact, remove_artifact, set_active_milestones, record_success. Project blockers are system-owned and cannot be changed by agents.",
                     Obj(new
@@ -288,7 +307,7 @@ Be concise and concrete. Report measured facts, not adjectives. Everything you d
                         lookbackSeconds = Num("Also accept a code received shortly before this call (default 600, cap 3600), so a wake/tool rollover cannot hide fresh mail."),
                     }, "mailbox")),
 
-                Tool("request_human", "Ask a human (Klives) to clear a human-only obstacle such as a captcha, SMS/phone verification, or physical action. Provide either 'what' or a structured title/description; infrastructure debugging and ordinary email retrieval are not human-only.",
+                Tool("request_human", "Ask a human (Klives) to clear a human-only obstacle such as a captcha, SMS/phone verification, or physical action. Provide either 'what' or a structured title/description; provider rate limits, infrastructure debugging, tool execution, file reads, and ordinary email retrieval are not human-only.",
                     Obj(new
                     {
                         what = Str("Concise action the human must take."),

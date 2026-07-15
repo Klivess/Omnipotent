@@ -55,6 +55,13 @@ namespace Omnipotent.Services.Projects
         /// <summary>Machine-owned typed checkpoint/runtime state, seeded ahead of narrative digest.</summary>
         public Func<string, string>? DescribeRuntimeState;
 
+        /// <summary>
+        /// Durable Klives rules/tasks scoped to the Commander. Unlike the event-log and digest
+        /// legs, this block is injected on every wake and is never compacted away.
+        /// </summary>
+        /// <summary>(projectID, triggerDescription) -> a budget-fitted durable directive block.</summary>
+        public Func<string, string, string>? DescribeDirectives;
+
         /// <summary>Optional live KliveAgent bridge summary: active services, registered capabilities,
         /// reusable shortcuts and a compact task-relevant repository map. This keeps Project wakes
         /// grounded in the same operating environment as interactive KliveAgent without copying a
@@ -128,6 +135,12 @@ namespace Omnipotent.Services.Projects
                 try { runtimeState = DescribeRuntimeState(project.ProjectID); } catch { runtimeState = null; }
             }
 
+            string? directives = null;
+            if (DescribeDirectives != null)
+            {
+                try { directives = DescribeDirectives(project.ProjectID, triggerDescription); } catch { directives = null; }
+            }
+
             string? kliveAgentContext = null;
             if (DescribeKliveAgentContextAsync != null)
             {
@@ -135,7 +148,7 @@ namespace Omnipotent.Services.Projects
             }
 
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription,
-                knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext);
+                knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives);
         }
 
         private static string Truncate(string s, int max) =>

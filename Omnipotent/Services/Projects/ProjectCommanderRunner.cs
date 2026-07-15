@@ -32,7 +32,8 @@ namespace Omnipotent.Services.Projects
         // Klives steering that should land WITHIN the current wake (not after it): drained at the
         // top of each tool-loop turn and injected into the live session, so a message reshapes the
         // Commander's behaviour on its very next model turn instead of one whole wake later.
-        private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> steerQueue = new(StringComparer.Ordinal);
+        private sealed record QueuedSteer(string Text, string? DirectiveID);
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<QueuedSteer>> steerQueue = new(StringComparer.Ordinal);
 
         // Sub-agent reports use the same low-latency path, but remain distinct from Klives steering
         // so they do not incorrectly mark the wake as requiring a human-facing Discord reply.
@@ -57,18 +58,37 @@ namespace Omnipotent.Services.Projects
         /// (fast steering, item 5); otherwise it wakes the Commander normally. The caller is
         /// responsible for having logged the KlivesMessage event.
         /// </summary>
-        public void Steer(Project project, string text)
+        public string? Steer(Project project, string text, string? directiveID = null)
         {
             // Origin stamp travels WITH the text: a steer can be injected mid-wake seconds from
             // now, or replayed as a missed-steer wake much later — either way the Commander must
             // see when Klives actually said it, not when it finally reached a session.
             text = $"[sent {Data_Handling.TemporalFormat.NowStamp()}] {text}";
-            if (activeWakeCts.ContainsKey(project.ProjectID))
+            lock (WakeGate(project.ProjectID))
             {
-                steerQueue.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<string>()).Enqueue(text);
-                return;
+                // The persisted lease/digest is authoritative during the short startup window
+                // before activeWakeCts is registered. The old activeWakeCts-only check could
+                // start a second wake or strand a steer in exactly that race.
+                var activeWakeID = parent.RuntimeState.Get(project.ProjectID).ActiveWakeLease?.WakeID
+                    ?? parent.Digests.GetDigest(project.ProjectID).ActiveWakeID;
+                if (!string.IsNullOrWhiteSpace(activeWakeID))
+                {
+                    steerQueue.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<QueuedSteer>())
+                        .Enqueue(new QueuedSteer(text, directiveID));
+                    return activeWakeID;
+                }
+                return WakeLocked(project, $"Message from Klives: {text}", queueIfBusy: true);
             }
-            Wake(project, $"Message from Klives: {text}");
+        }
+
+        /// <summary>
+        /// Delivers a durable Klives directive with next-safe-turn latency. The directive store is
+        /// the recovery source of truth; this queue only makes an already-running wake react now.
+        /// </summary>
+        public string? DeliverHumanDirective(Project project, ProjectDirective directive)
+        {
+            if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return null;
+            return Steer(project, $"[directive:{directive.DirectiveID}] {directive.Text}", directive.DirectiveID);
         }
 
         /// <summary>
@@ -171,9 +191,14 @@ namespace Omnipotent.Services.Projects
                     parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
                 return null;
             }
-            foreach (var pending in parent.RuntimeState.ListPendingTriggers(project.ProjectID)
-                .Where(t => t.ClaimedByWakeID == null && string.Equals(t.Payload, triggerDescription, StringComparison.Ordinal)))
-                parent.RuntimeState.RemoveTrigger(project.ProjectID, pending.TriggerID);
+            // Claim (rather than remove) one durable inbox item for this wake.  A trigger must
+            // survive a provider failure/cancellation so it can be replayed; the old exact-match
+            // removal acknowledged it before the model had even seen it.
+            var claimed = parent.RuntimeState.TryClaimNextTrigger(project.ProjectID, wakeID, acquired.Lease.Generation);
+            string effectiveTrigger = claimed.Claimed && claimed.Trigger != null
+                ? claimed.Trigger.Payload
+                : triggerDescription;
+            string? claimedTriggerID = claimed.Claimed ? claimed.Trigger?.TriggerID : null;
 
             try
             {
@@ -186,22 +211,32 @@ namespace Omnipotent.Services.Projects
                     AgentID = "commander",
                     Type = ProjectEventTypes.CommanderWake,
                     Author = "system",
-                    Text = $"Commander woke. Trigger: {Trunc(triggerDescription, 200)}",
+                    Text = $"Commander woke. Trigger: {Trunc(effectiveTrigger, 200)}",
                     PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { leaseGeneration = acquired.Lease.Generation }),
                 });
             }
             catch
             {
+                if (!string.IsNullOrWhiteSpace(claimedTriggerID))
+                {
+                    try
+                    {
+                        parent.RuntimeState.AcknowledgeTrigger(project.ProjectID, claimedTriggerID, wakeID,
+                            acquired.Lease.Generation, succeeded: false);
+                    }
+                    catch { }
+                }
                 parent.RuntimeState.ReleaseWakeLease(project.ProjectID, wakeID, acquired.Lease.Generation);
                 if (digest.ActiveWakeID == wakeID) { digest.ActiveWakeID = null; parent.Digests.SaveDigest(digest); }
                 throw;
             }
 
-            _ = Task.Run(() => ExecuteWakeAsync(project, wakeID, acquired.Lease.Generation, triggerDescription));
+            _ = Task.Run(() => ExecuteWakeAsync(project, wakeID, acquired.Lease.Generation, effectiveTrigger, claimedTriggerID));
             return wakeID;
         }
 
-        private async Task ExecuteWakeAsync(Project project, string wakeID, long leaseGeneration, string triggerDescription)
+        private async Task ExecuteWakeAsync(Project project, string wakeID, long leaseGeneration, string triggerDescription,
+            string? claimedTriggerID)
         {
             string projectID = project.ProjectID;
             long wakeStartSeq = parent.EventLog.GetLastSequence(projectID);
@@ -238,8 +273,8 @@ namespace Omnipotent.Services.Projects
                 var settings = parent.Settings.Get(projectID);
                 var modelRoutes = settings.CommanderRoutes.ToList();
                 if (modelRoutes.Count == 0) throw new InvalidOperationException("Commander has no configured model routes.");
-                // Index 0 is the primary; the whole ordered list is handed to OpenRouter as its fallback
-                // set (see QueryToolSessionAsync modelRoutes), so there is no app-side route-advance loop.
+                // Index 0 is the primary. OpenRouter receives it as `model` and later routes as its
+                // ordered fallback set; a successful backup is pinned for the rest of this wake.
                 string model = modelRoutes[0];
                 bool visionEnabled = settings.VisionEnabled;
                 int sliceToolCalls = settings.WorkSliceToolCalls;
@@ -311,7 +346,7 @@ namespace Omnipotent.Services.Projects
                     if (steerQueue.TryGetValue(projectID, out var sq))
                         while (sq.TryDequeue(out var steer))
                         {
-                            llm.AppendUserMessageToToolSession(sessionId, $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer}");
+                            llm.AppendUserMessageToToolSession(sessionId, $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer.Text}");
                             klivesInvolved = true;
                         }
 
@@ -338,10 +373,10 @@ namespace Omnipotent.Services.Projects
                     KliveLLM.KliveLLM.KliveLLMResponse resp;
                     try
                     {
-                        // Fallback across the configured routes happens at the OpenRouter level: the whole
-                        // ordered list is sent as the request's `models` array and OpenRouter tries each in
-                        // turn, server-side, within this single call. A failure here means every route was
-                        // exhausted, so it propagates to the outer handler (circuit breaker / deferral).
+                        // Fallback across configured routes happens at the OpenRouter level: the current
+                        // `model` is primary and the remaining routes are tried server-side if it fails.
+                        // A failure here means every route was exhausted, so it propagates to the outer
+                        // handler (circuit breaker / deferral).
                         try
                         {
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
@@ -355,6 +390,13 @@ namespace Omnipotent.Services.Projects
 
                         if (!resp.Success)
                             throw ProjectProviderFailure.FromUnsuccessfulResponse(resp.ErrorMessage, resp.Model ?? model, maxOutputTokens);
+
+                        // Do not re-hit a route OpenRouter just bypassed for the rest of this wake. A
+                        // successful fallback is safe to pin because it is one of this role's configured
+                        // routes; on the next wake the normal preference order is reconsidered.
+                        string? servedRoute = modelRoutes.FirstOrDefault(route =>
+                            string.Equals(route, resp.Model, StringComparison.OrdinalIgnoreCase));
+                        if (!string.IsNullOrWhiteSpace(servedRoute)) model = servedRoute;
 
                     // Meter this round's spend against the budget. OpenRouter reports the ACTUAL cost in
                     // the response usage object (resp.CostUsd) — authoritative for whatever model is in
@@ -646,7 +688,8 @@ namespace Omnipotent.Services.Projects
                     parent.EventLog.Append(outcomeEvent);
 
                     // A failed Klives-triggered wake must not read as silence either.
-                    if (outcome == ProjectEventTypes.WakeFailed && klivesInvolved && parent.DiscordManager != null)
+                    if ((outcome is ProjectEventTypes.WakeFailed or ProjectEventTypes.WakeDeferred)
+                        && klivesInvolved && parent.DiscordManager != null)
                     {
                         try { await parent.DiscordManager.PostCommanderReplyAsync(project, $"⚠️ {outcomeText}"); }
                         catch { }
@@ -682,6 +725,18 @@ namespace Omnipotent.Services.Projects
                 {
                     parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
                     parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
+                }
+                // The durable inbox entry is only removed after a successful wake. Failed and
+                // deferred wakes release their claim, allowing recovery/retry to replay the exact
+                // payload instead of silently losing it.
+                if (!string.IsNullOrWhiteSpace(claimedTriggerID))
+                {
+                    try
+                    {
+                        parent.RuntimeState.AcknowledgeTrigger(projectID, claimedTriggerID, wakeID,
+                            leaseGeneration, outcome == ProjectEventTypes.WakeCompleted);
+                    }
+                    catch { /* never mask the wake outcome */ }
                 }
                 parent.RuntimeState.ReleaseWakeLease(projectID, wakeID, leaseGeneration);
                 var finalProjectStatus = parent.Store.GetProject(projectID)?.Status;
@@ -748,19 +803,35 @@ namespace Omnipotent.Services.Projects
 
                 var missed = new List<string>();
                 if (queued != null) missed.AddRange(queued);
-                if (leftoverSteers != null) missed.AddRange(leftoverSteers.Select(s => $"Message from Klives: {s}"));
+                if (leftoverSteers != null) missed.AddRange(leftoverSteers.Select(s => $"Message from Klives: {s.Text}"));
                 if (leftoverAgentMessages != null) missed.AddRange(leftoverAgentMessages);
+                // RuntimeState is the durable wake inbox. Earlier versions wrote here when a
+                // wake was busy, but only drained the in-memory queues above; after a restart
+                // every such trigger was stranded forever. Fold all applicable persisted work
+                // back into the scheduler. We start one exact payload at a time so WakeLocked's
+                // exact-match removal acknowledges it without losing the remaining FIFO work.
+                var runtime = parent.RuntimeState.Get(projectID);
+                var durableTriggers = parent.RuntimeState.ListPendingTriggers(projectID, includeClaimed: false)
+                    .Where(t => ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, DateTime.UtcNow)
+                        == ProjectWakeTriggerApplicability.Applicable)
+                    .ToList();
+                var durablePayloads = durableTriggers.Select(t => t.Payload).ToHashSet(StringComparer.Ordinal);
+                missed.AddRange(durableTriggers.Select(t => t.Payload));
                 // Legacy/in-flight keepalives are ephemeral and state-specific. A planning nudge
                 // queued before plan approval must never be replayed into an Active project (and
                 // vice versa). Current keepalives no longer queue, but this also drains old state.
                 missed.RemoveAll(t => t.StartsWith("Periodic keepalive:", StringComparison.Ordinal)
                     && ((refreshed.Status == ProjectStatus.Active && t.Contains("PLANNING", StringComparison.OrdinalIgnoreCase))
                         || (refreshed.Status == ProjectStatus.Planning && !t.Contains("PLANNING", StringComparison.OrdinalIgnoreCase))));
-                missed = missed.Distinct().ToList();
+                missed = missed.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
                 if (missed.Count == 0) return false;
 
-                Wake(refreshed, missed.Count == 1 ? missed[0]
-                    : "Stimuli that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
+                // Preserve any legacy in-memory-only remainder before consuming the first one.
+                // The durable cap is 512 and EnqueueTrigger returns a visible store result; unlike
+                // the old 12-item in-memory cap this cannot silently forget a command.
+                foreach (string trigger in missed.Where(x => !durablePayloads.Contains(x)))
+                    try { parent.RuntimeState.EnqueueTrigger(projectID, TriggerFor(trigger)); } catch { }
+                Wake(refreshed, missed[0]);
                 return true;
             }
             catch { return false; /* never mask the wake outcome */ }
@@ -819,6 +890,7 @@ namespace Omnipotent.Services.Projects
                         Text = "Omnipotent restarted mid-wake. The fenced lease was released and its typed resume action was requeued." +
                             (uncertainCalls > 0 ? $" {uncertainCalls} interrupted tool outcome(s) were marked unknown and require inspection before retry." : ""),
                     });
+                    ReleaseClaimedTriggers(runtime.ProjectID, lease.WakeID, lease.Generation);
                     parent.RuntimeState.ReleaseWakeLease(runtime.ProjectID, lease.WakeID, lease.Generation);
                     var legacyDigest = parent.Digests.GetDigest(runtime.ProjectID);
                     if (legacyDigest.ActiveWakeID == lease.WakeID)
@@ -849,6 +921,7 @@ namespace Omnipotent.Services.Projects
                     }
                     ProjectToolCallJournal.ReconcileInterruptedWake(
                         parent.EventLog, digest.ProjectID, digest.ActiveWakeID, "commander");
+                    ReleaseClaimedTriggers(digest.ProjectID, digest.ActiveWakeID, null);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = digest.ProjectID, WakeID = digest.ActiveWakeID,
@@ -859,6 +932,54 @@ namespace Omnipotent.Services.Projects
                     parent.Digests.SaveDigest(digest);
                 }
                 catch { }
+            }
+        }
+
+        /// <summary>
+        /// Starts one applicable persisted inbox item for each idle project. This is deliberately
+        /// separate from interrupted-wake recovery: a process can restart while no wake is active
+        /// yet still have durable human/stimulus work waiting in the inbox.
+        /// </summary>
+        public void RecoverPendingTriggers()
+        {
+            foreach (var project in parent.Store.ListProjects())
+            {
+                if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
+                try
+                {
+                    lock (WakeGate(project.ProjectID))
+                    {
+                        if (!string.IsNullOrWhiteSpace(parent.Digests.GetDigest(project.ProjectID).ActiveWakeID)) continue;
+                        var runtime = parent.RuntimeState.Get(project.ProjectID);
+                        var next = parent.RuntimeState.ListPendingTriggers(project.ProjectID, includeClaimed: false)
+                            .FirstOrDefault(t => ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, DateTime.UtcNow)
+                                == ProjectWakeTriggerApplicability.Applicable);
+                        if (next != null) WakeLocked(project, next.Payload, queueIfBusy: false);
+                    }
+                }
+                catch { /* startup recovery is best effort per project */ }
+            }
+        }
+
+        /// <summary>
+        /// A process may die after claiming a durable inbox item but before the wake's finally
+        /// block acknowledges it. Release that claim during recovery so the payload is eligible
+        /// for the next fenced wake instead of being stranded forever as "in progress".
+        /// </summary>
+        private void ReleaseClaimedTriggers(string projectID, string? wakeID, long? fallbackGeneration)
+        {
+            if (string.IsNullOrWhiteSpace(wakeID)) return;
+            foreach (var trigger in parent.RuntimeState.ListPendingTriggers(projectID, includeClaimed: true)
+                .Where(x => string.Equals(x.ClaimedByWakeID, wakeID, StringComparison.Ordinal)))
+            {
+                long? generation = trigger.ClaimedByLeaseGeneration ?? fallbackGeneration;
+                if (!generation.HasValue) continue;
+                try
+                {
+                    parent.RuntimeState.AcknowledgeTrigger(projectID, trigger.TriggerID, wakeID,
+                        generation.Value, succeeded: false);
+                }
+                catch { /* recovery proceeds even if one old trigger is malformed */ }
             }
         }
 

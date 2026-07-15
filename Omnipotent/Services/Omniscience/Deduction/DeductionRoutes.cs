@@ -25,13 +25,23 @@ namespace Omnipotent.Services.Omniscience.Deduction
 
         public async Task RegisterRoutes()
         {
+            // Aggregate/list routes below share OmniscienceRoutes' TTL response cache
+            // (stale-while-revalidate + background warmer), so the dashboard batch
+            // never waits on their full-table scans. Per-person detail routes instead
+            // run through GatedRead: still fresh every call, but their synchronous
+            // SQLite work is capped by the shared read gate instead of freely pinning
+            // thread-pool workers during a page-load burst.
+            OmniscienceRoutes.RegisterWarmTarget("deduction/status", TimeSpan.FromSeconds(60), BuildDeductionStatusPayload);
+            OmniscienceRoutes.RegisterWarmTarget("radar/alerts", TimeSpan.FromSeconds(30), BuildRadarAlertsPayload);
+            OmniscienceRoutes.RegisterWarmTarget("targets/suggestions", TimeSpan.FromSeconds(60), BuildTargetSuggestionsPayload);
+
             await service.CreateAPIRoute("/omniscience/persons/facts", async req =>
             {
                 try
                 {
                     string personId = req.userParameters?["personId"] ?? "";
                     if (personId.Length == 0) { await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest); return; }
-                    await req.ReturnResponse(BuildFactsPayload(personId));
+                    await OmniscienceRoutes.GatedRead(req, () => BuildFactsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -42,7 +52,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 {
                     string personId = req.userParameters?["personId"] ?? "";
                     if (personId.Length == 0) { await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest); return; }
-                    await req.ReturnResponse(BuildRelationshipsPayload(personId));
+                    await OmniscienceRoutes.GatedRead(req, () => BuildRelationshipsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -53,16 +63,19 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 {
                     string personId = req.userParameters?["personId"] ?? "";
                     if (personId.Length == 0) { await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest); return; }
-                    var resolver = new AliasResolver(service, service.Db);
-                    var conclusions = resolver.ComputeAliasConclusions(personId);
-                    await req.ReturnResponse(new JObject(
-                        new JProperty("aliases", new JArray(conclusions.OrderByDescending(c => c.Confidence).Select(c => new JObject(
-                            new JProperty("name", c.Name),
-                            new JProperty("kind", c.Kind),
-                            new JProperty("confidence", Math.Round(c.Confidence, 2)),
-                            new JProperty("uses", c.UsageCount),
-                            new JProperty("distinct_speakers", c.DistinctSpeakers),
-                            new JProperty("evidence_message_ids", new JArray(c.EvidenceMessageIds))))))).ToString(Formatting.None));
+                    await OmniscienceRoutes.GatedRead(req, () =>
+                    {
+                        var resolver = new AliasResolver(service, service.Db);
+                        var conclusions = resolver.ComputeAliasConclusions(personId);
+                        return new JObject(
+                            new JProperty("aliases", new JArray(conclusions.OrderByDescending(c => c.Confidence).Select(c => new JObject(
+                                new JProperty("name", c.Name),
+                                new JProperty("kind", c.Kind),
+                                new JProperty("confidence", Math.Round(c.Confidence, 2)),
+                                new JProperty("uses", c.UsageCount),
+                                new JProperty("distinct_speakers", c.DistinctSpeakers),
+                                new JProperty("evidence_message_ids", new JArray(c.EvidenceMessageIds))))))).ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -73,7 +86,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 {
                     string personId = req.userParameters?["personId"] ?? "";
                     if (personId.Length == 0) { await req.ReturnResponse("personId required", code: HttpStatusCode.BadRequest); return; }
-                    await req.ReturnResponse(BuildOpenQuestionsPayload(personId));
+                    await OmniscienceRoutes.GatedRead(req, () => BuildOpenQuestionsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -83,18 +96,21 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 try
                 {
                     string personId = req.userParameters?["personId"] ?? "";
-                    var arr = new JArray();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT generated_at, changes_markdown FROM profile_changelogs
-                        WHERE person_id=$p ORDER BY generated_at DESC LIMIT 20";
-                    cmd.Parameters.AddWithValue("$p", personId);
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
-                        arr.Add(new JObject(
-                            new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(0)).UtcDateTime.ToString("o")),
-                            new JProperty("changes_markdown", r.GetString(1))));
-                    await req.ReturnResponse(new JObject(new JProperty("changelogs", arr)).ToString(Formatting.None));
+                    await OmniscienceRoutes.GatedRead(req, () =>
+                    {
+                        var arr = new JArray();
+                        using var conn = service.Db.Open();
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = @"SELECT generated_at, changes_markdown FROM profile_changelogs
+                            WHERE person_id=$p ORDER BY generated_at DESC LIMIT 20";
+                        cmd.Parameters.AddWithValue("$p", personId);
+                        using var r = cmd.ExecuteReader();
+                        while (r.Read())
+                            arr.Add(new JObject(
+                                new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(0)).UtcDateTime.ToString("o")),
+                                new JProperty("changes_markdown", r.GetString(1))));
+                        return new JObject(new JProperty("changelogs", arr)).ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -104,33 +120,36 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 try
                 {
                     string personId = req.userParameters?["personId"] ?? "";
-                    var arr = new JArray();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT generated_at, traits_json FROM personality_profiles
-                        WHERE person_id=$p ORDER BY generated_at ASC LIMIT 100";
-                    cmd.Parameters.AddWithValue("$p", personId);
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
+                    await OmniscienceRoutes.GatedRead(req, () =>
                     {
-                        try
+                        var arr = new JArray();
+                        using var conn = service.Db.Open();
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = @"SELECT generated_at, traits_json FROM personality_profiles
+                            WHERE person_id=$p ORDER BY generated_at ASC LIMIT 100";
+                        cmd.Parameters.AddWithValue("$p", personId);
+                        using var r = cmd.ExecuteReader();
+                        while (r.Read())
                         {
-                            var traits = JObject.Parse(r.GetString(1));
-                            if (traits["big_five_estimate"] is JObject b5)
-                                arr.Add(new JObject(
-                                    new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(0)).UtcDateTime.ToString("o")),
-                                    new JProperty("big_five", b5)));
+                            try
+                            {
+                                var traits = JObject.Parse(r.GetString(1));
+                                if (traits["big_five_estimate"] is JObject b5)
+                                    arr.Add(new JObject(
+                                        new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(0)).UtcDateTime.ToString("o")),
+                                        new JProperty("big_five", b5)));
+                            }
+                            catch { }
                         }
-                        catch { }
-                    }
-                    await req.ReturnResponse(new JObject(new JProperty("series", arr)).ToString(Formatting.None));
+                        return new JObject(new JProperty("series", arr)).ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
             await service.CreateAPIRoute("/omniscience/review/queue", async req =>
             {
-                try { await req.ReturnResponse(BuildReviewQueuePayload()); }
+                try { await OmniscienceRoutes.CachedRead(req, "review/queue", TimeSpan.FromSeconds(30), BuildReviewQueuePayload); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
@@ -144,6 +163,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     if (suggestionId.Length == 0 || action is not ("accept" or "reject"))
                     { await req.ReturnResponse("suggestionId and action(accept|reject) required", code: HttpStatusCode.BadRequest); return; }
                     await ResolveMergeSuggestionAsync(suggestionId, action == "accept");
+                    OmniscienceRoutes.InvalidateCachePrefix("review/queue");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -151,7 +171,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
 
             await service.CreateAPIRoute("/omniscience/targets/suggestions", async req =>
             {
-                try { await req.ReturnResponse(BuildTargetSuggestionsPayload()); }
+                try { await OmniscienceRoutes.CachedRead(req, "targets/suggestions", TimeSpan.FromSeconds(60), BuildTargetSuggestionsPayload); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
@@ -172,6 +192,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                         cmd.ExecuteNonQuery();
                     }
                     finally { service.Db.WriteLock.Release(); }
+                    OmniscienceRoutes.InvalidateCachePrefix("targets/suggestions");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -187,6 +208,10 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     if (personId.Length == 0 || tier is not ("tracked" or "watch" or "archive"))
                     { await req.ReturnResponse("personId and tier(tracked|watch|archive) required", code: HttpStatusCode.BadRequest); return; }
                     await SetTierAsync(personId, tier);
+                    OmniscienceRoutes.InvalidateCachePrefix("persons|");
+                    OmniscienceRoutes.InvalidateCachePrefix("targets/suggestions");
+                    OmniscienceRoutes.InvalidateCachePrefix("profile-targets");
+                    OmniscienceRoutes.InvalidateCachePrefix("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -220,25 +245,28 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 try
                 {
                     string personId = req.userParameters?["personId"] ?? "";
-                    var arr = new JArray();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT era, generated_at, profile_markdown, traits_json FROM personality_profiles
-                        WHERE person_id=$p AND era IS NOT NULL ORDER BY era ASC, generated_at DESC";
-                    cmd.Parameters.AddWithValue("$p", personId);
-                    using var r = cmd.ExecuteReader();
-                    var seen = new HashSet<string>();
-                    while (r.Read())
+                    await OmniscienceRoutes.GatedRead(req, () =>
                     {
-                        string era = r.GetString(0);
-                        if (!seen.Add(era)) continue; // newest generation per era
-                        arr.Add(new JObject(
-                            new JProperty("era", era),
-                            new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(1)).UtcDateTime.ToString("o")),
-                            new JProperty("profile_markdown", r.IsDBNull(2) ? "" : r.GetString(2)),
-                            new JProperty("traits_json", r.IsDBNull(3) ? "{}" : r.GetString(3))));
-                    }
-                    await req.ReturnResponse(new JObject(new JProperty("eras", arr)).ToString(Formatting.None));
+                        var arr = new JArray();
+                        using var conn = service.Db.Open();
+                        using var cmd = conn.CreateCommand();
+                        cmd.CommandText = @"SELECT era, generated_at, profile_markdown, traits_json FROM personality_profiles
+                            WHERE person_id=$p AND era IS NOT NULL ORDER BY era ASC, generated_at DESC";
+                        cmd.Parameters.AddWithValue("$p", personId);
+                        using var r = cmd.ExecuteReader();
+                        var seen = new HashSet<string>();
+                        while (r.Read())
+                        {
+                            string era = r.GetString(0);
+                            if (!seen.Add(era)) continue; // newest generation per era
+                            arr.Add(new JObject(
+                                new JProperty("era", era),
+                                new JProperty("generated_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(1)).UtcDateTime.ToString("o")),
+                                new JProperty("profile_markdown", r.IsDBNull(2) ? "" : r.GetString(2)),
+                                new JProperty("traits_json", r.IsDBNull(3) ? "{}" : r.GetString(3))));
+                        }
+                        return new JObject(new JProperty("eras", arr)).ToString(Formatting.None);
+                    });
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -247,23 +275,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
             {
                 try
                 {
-                    var arr = new JArray();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT matched_alias, author_display, channel_label, snippet, occurred_at, notified
-                        FROM radar_alerts ORDER BY occurred_at DESC LIMIT 100";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
-                        arr.Add(new JObject(
-                            new JProperty("matched_alias", r.GetString(0)),
-                            new JProperty("author_display", r.IsDBNull(1) ? "" : r.GetString(1)),
-                            new JProperty("channel_label", r.IsDBNull(2) ? "" : r.GetString(2)),
-                            new JProperty("snippet", r.IsDBNull(3) ? "" : r.GetString(3)),
-                            new JProperty("occurred_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(4)).UtcDateTime.ToString("o")),
-                            new JProperty("notified", r.GetInt32(5) == 1)));
-                    await req.ReturnResponse(new JObject(
-                        new JProperty("aliases_watched", new JArray(service.Radar.CurrentAliases)),
-                        new JProperty("alerts", arr)).ToString(Formatting.None));
+                    await OmniscienceRoutes.CachedRead(req, "radar/alerts", TimeSpan.FromSeconds(30), BuildRadarAlertsPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -272,28 +284,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
             {
                 try
                 {
-                    var arr = new JArray();
-                    using var conn = service.Db.Open();
-                    using var cmd = conn.CreateCommand();
-                    cmd.CommandText = @"SELECT s.suggestion_id, s.person_id_a, COALESCE(pa.display_name,''),
-                               s.person_id_b, COALESCE(pb.display_name,''), s.score, s.reason
-                        FROM person_link_suggestions s
-                        LEFT JOIN persons pa ON pa.person_id = s.person_id_a
-                        LEFT JOIN persons pb ON pb.person_id = s.person_id_b
-                        WHERE s.status='pending'
-                          AND pa.merged_into_person_id IS NULL AND pb.merged_into_person_id IS NULL
-                        ORDER BY s.score DESC LIMIT 50";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read())
-                        arr.Add(new JObject(
-                            new JProperty("suggestion_id", r.GetString(0)),
-                            new JProperty("person_id_a", r.GetString(1)),
-                            new JProperty("display_a", r.GetString(2)),
-                            new JProperty("person_id_b", r.GetString(3)),
-                            new JProperty("display_b", r.GetString(4)),
-                            new JProperty("score", r.GetDouble(5)),
-                            new JProperty("reason", r.IsDBNull(6) ? "" : r.GetString(6))));
-                    await req.ReturnResponse(new JObject(new JProperty("links", arr)).ToString(Formatting.None));
+                    await OmniscienceRoutes.CachedRead(req, "identity-links", TimeSpan.FromSeconds(30), BuildIdentityLinksPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -308,6 +299,8 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     if (suggestionId.Length == 0 || action is not ("accept" or "reject"))
                     { await req.ReturnResponse("suggestionId and action(accept|reject) required", code: HttpStatusCode.BadRequest); return; }
                     await ResolveLinkSuggestionAsync(suggestionId, action == "accept");
+                    OmniscienceRoutes.InvalidateCachePrefix("identity-links");
+                    OmniscienceRoutes.InvalidateCachePrefix("persons|");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -335,6 +328,8 @@ namespace Omnipotent.Services.Omniscience.Deduction
                         tx.Commit();
                     }
                     finally { service.Db.WriteLock.Release(); }
+                    OmniscienceRoutes.InvalidateCachePrefix("deduction/status");
+                    OmniscienceRoutes.InvalidateCachePrefix("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -419,9 +414,13 @@ namespace Omnipotent.Services.Omniscience.Deduction
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // This payload is ~10 COUNT(*) aggregates, several over tables that grow
+            // with the full message corpus (qa_pairs, name_usages, stimulus_reply_pairs).
+            // Uncached it was the slowest item in the dashboard's /batch — and a batch
+            // only returns when its slowest item does.
             await service.CreateAPIRoute("/omniscience/deduction/status", async req =>
             {
-                try { await req.ReturnResponse(BuildDeductionStatusPayload()); }
+                try { await OmniscienceRoutes.CachedRead(req, "deduction/status", TimeSpan.FromSeconds(60), BuildDeductionStatusPayload); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
@@ -622,6 +621,53 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     new JProperty("computed_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(5)).UtcDateTime.ToString("o"))));
             }
             return new JObject(new JProperty("suggestions", arr)).ToString(Formatting.None);
+        }
+
+        private string BuildRadarAlertsPayload()
+        {
+            var arr = new JArray();
+            using var conn = service.Db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT matched_alias, author_display, channel_label, snippet, occurred_at, notified
+                FROM radar_alerts ORDER BY occurred_at DESC LIMIT 100";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                arr.Add(new JObject(
+                    new JProperty("matched_alias", r.GetString(0)),
+                    new JProperty("author_display", r.IsDBNull(1) ? "" : r.GetString(1)),
+                    new JProperty("channel_label", r.IsDBNull(2) ? "" : r.GetString(2)),
+                    new JProperty("snippet", r.IsDBNull(3) ? "" : r.GetString(3)),
+                    new JProperty("occurred_at", DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64(4)).UtcDateTime.ToString("o")),
+                    new JProperty("notified", r.GetInt32(5) == 1)));
+            return new JObject(
+                new JProperty("aliases_watched", new JArray(service.Radar.CurrentAliases)),
+                new JProperty("alerts", arr)).ToString(Formatting.None);
+        }
+
+        private string BuildIdentityLinksPayload()
+        {
+            var arr = new JArray();
+            using var conn = service.Db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT s.suggestion_id, s.person_id_a, COALESCE(pa.display_name,''),
+                       s.person_id_b, COALESCE(pb.display_name,''), s.score, s.reason
+                FROM person_link_suggestions s
+                LEFT JOIN persons pa ON pa.person_id = s.person_id_a
+                LEFT JOIN persons pb ON pb.person_id = s.person_id_b
+                WHERE s.status='pending'
+                  AND pa.merged_into_person_id IS NULL AND pb.merged_into_person_id IS NULL
+                ORDER BY s.score DESC LIMIT 50";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                arr.Add(new JObject(
+                    new JProperty("suggestion_id", r.GetString(0)),
+                    new JProperty("person_id_a", r.GetString(1)),
+                    new JProperty("display_a", r.GetString(2)),
+                    new JProperty("person_id_b", r.GetString(3)),
+                    new JProperty("display_b", r.GetString(4)),
+                    new JProperty("score", r.GetDouble(5)),
+                    new JProperty("reason", r.IsDBNull(6) ? "" : r.GetString(6))));
+            return new JObject(new JProperty("links", arr)).ToString(Formatting.None);
         }
 
         private string BuildDeductionStatusPayload()

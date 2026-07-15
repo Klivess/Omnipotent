@@ -37,6 +37,112 @@ namespace Omnipotent.Services.Projects
         Completed,
     }
 
+    /// <summary>
+    /// A durable instruction from Klives. Unlike ordinary timeline messages, directives are
+    /// injected into every applicable wake and never depend on digest compaction or retrieval.
+    /// </summary>
+    public enum ProjectDirectiveKind
+    {
+        /// <summary>A standing constraint or preference, such as "do not use bot accounts".</summary>
+        Rule,
+        /// <summary>A concrete piece of work that remains visible until it is completed or revoked.</summary>
+        Task,
+        /// <summary>A one-off steering message. It remains visible until the Commander replies.</summary>
+        Steering,
+    }
+
+    /// <summary>Which project agents must receive a directive.</summary>
+    public enum ProjectDirectiveScope
+    {
+        Commander,
+        AllAgents,
+        SpecificAgents,
+    }
+
+    /// <summary>Lifecycle of a durable Klives directive.</summary>
+    public enum ProjectDirectiveStatus
+    {
+        Active,
+        Delivered,
+        Acknowledged,
+        Completed,
+        Failed,
+        Revoked,
+    }
+
+    /// <summary>
+    /// Persisted project memory / command record. The event log remains the audit trail; this is
+    /// the small, authoritative instruction set that survives restarts and digest rebuilds.
+    /// </summary>
+    public sealed class ProjectDirective
+    {
+        public string DirectiveID { get; set; } = "";
+        public string ProjectID { get; set; } = "";
+        /// <summary>Optional durable correlation for a fleet broadcast.</summary>
+        public string? BatchID { get; set; }
+        /// <summary>Optional user-controlled stable key; rules with the same key are updated in place.</summary>
+        public string? Key { get; set; }
+        public ProjectDirectiveKind Kind { get; set; } = ProjectDirectiveKind.Steering;
+        public ProjectDirectiveScope Scope { get; set; } = ProjectDirectiveScope.Commander;
+        public List<string> TargetAgentIDs { get; set; } = new();
+        public string Text { get; set; } = "";
+        /// <summary>Higher values are rendered first. Human directives default to 100.</summary>
+        public int Priority { get; set; } = 100;
+        public ProjectDirectiveStatus Status { get; set; } = ProjectDirectiveStatus.Active;
+        public List<string> ExpectedArtifactPaths { get; set; } = new();
+        public string CreatedBy { get; set; } = "klives";
+        public string? SourceEventID { get; set; }
+        public long? SourceEventSequence { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? DeliveredAt { get; set; }
+        public string? DeliveredToAgentID { get; set; }
+        public string? DeliveredWakeID { get; set; }
+        /// <summary>Per-recipient delivery ledger; the legacy Delivered* fields mirror the latest entry.</summary>
+        public List<ProjectDirectiveDelivery> Deliveries { get; set; } = new();
+        public DateTime? AcknowledgedAt { get; set; }
+        public string? AcknowledgedBy { get; set; }
+        public string? Acknowledgement { get; set; }
+        /// <summary>Bounded automatic re-delivery attempts after a wake closed without an explicit acknowledgement.</summary>
+        public int RetryCount { get; set; }
+        public DateTime? LastRetryAt { get; set; }
+        public DateTime? CompletedAt { get; set; }
+        public string? CompletedBy { get; set; }
+        public string? CompletionSummary { get; set; }
+        /// <summary>Verified project-relative deliverables recorded at completion.</summary>
+        public List<string> CompletionArtifactPaths { get; set; } = new();
+        public long? ReplyEventSequence { get; set; }
+        public long Revision { get; set; }
+
+        public bool IsOpen => Status is ProjectDirectiveStatus.Active or ProjectDirectiveStatus.Delivered
+            or ProjectDirectiveStatus.Acknowledged;
+    }
+
+    /// <summary>One agent/wake delivery attempt for a durable directive.</summary>
+    public sealed class ProjectDirectiveDelivery
+    {
+        public string AgentID { get; set; } = "";
+        public string? WakeID { get; set; }
+        public DateTime DeliveredAt { get; set; } = DateTime.UtcNow;
+    }
+
+    /// <summary>Immediate, truthful receipt returned when Klives sends a Project command.</summary>
+    public sealed class ProjectCommandReceipt
+    {
+        public bool Accepted { get; set; }
+        public string ProjectID { get; set; } = "";
+        public string DirectiveID { get; set; } = "";
+        public string? BatchID { get; set; }
+        public string TargetAgentID { get; set; } = "commander";
+        /// <summary>accepted | delivered | deferred | rejected.</summary>
+        public string Status { get; set; } = "accepted";
+        public string? WakeID { get; set; }
+        public long? EventSequence { get; set; }
+        public string? Reason { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public List<string> ExpectedArtifactPaths { get; set; } = new();
+    }
+
     /// <summary>How desktops are allocated within a project (Commander's call, §4).</summary>
     public enum DesktopAllocationMode
     {
@@ -163,6 +269,11 @@ namespace Omnipotent.Services.Projects
         public const string ProjectBlocked = "project-blocked";        // action-required blocker changed lifecycle to Blocked
         public const string ProjectUnblocked = "project-unblocked";    // Klives resumed after remediation
         public const string CheckpointChanged = "checkpoint-changed";  // typed execution checkpoint/fact/artifact/blocker mutation
+        public const string DirectiveCreated = "directive-created";    // Klives created/updated durable project memory
+        public const string DirectiveDelivered = "directive-delivered"; // directive entered a specific agent wake
+        public const string DirectiveAcknowledged = "directive-acknowledged";
+        public const string DirectiveCompleted = "directive-completed";
+        public const string DirectiveRevoked = "directive-revoked";
     }
 
     /// <summary>

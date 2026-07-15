@@ -187,18 +187,20 @@ namespace Omnipotent.Services.Projects.Discord
                 var project = parent.Store.GetProject(projectID);
                 if (project == null) return;
 
-                parent.EventLog.Append(new ProjectEvent
+                var receipt = parent.MessageProjectWithReceipt(projectID, e.Message.Content, ProjectDirectiveKind.Task);
+                if (!receipt.Accepted)
                 {
-                    ProjectID = projectID,
-                    Type = ProjectEventTypes.KlivesMessage,
-                    Author = "klives",
-                    Text = e.Message.Content,
-                });
+                    await e.Message.RespondAsync($"I could not queue that instruction: {receipt.Reason ?? "project unavailable"}");
+                    return;
+                }
                 if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
                 {
                     // Steer: injected into the live wake if one is running (fast steering, item 5).
-                    parent.CommanderRunner.Steer(project, e.Message.Content);
                     // The reply can be a moment away — show life immediately.
+                    string state = receipt.Status == "delivered"
+                        ? $"delivered to wake `{receipt.WakeID}`"
+                        : "stored durably and queued for the next runnable wake";
+                    await e.Message.RespondAsync($"Accepted directive `{receipt.DirectiveID}` — {state}.");
                     try { await e.Channel.TriggerTypingAsync(); } catch { }
                 }
                 else
@@ -225,6 +227,44 @@ namespace Omnipotent.Services.Projects.Discord
                     await channel.SendMessageAsync(text.Substring(at, Math.Min(1900, text.Length - at)));
             }
             catch (Exception ex) { log($"Commander reply post failed for {project.ProjectID}: {ex.Message}"); }
+        }
+
+        /// <summary>
+        /// Posts a verified directive result to Klives and attaches small project files directly
+        /// to the project channel. Larger files remain downloadable from Project Files, with their
+        /// exact /project paths surfaced in chat.
+        /// </summary>
+        public async Task PostDirectiveCompletionAsync(Project project, ProjectDirective directive,
+            IReadOnlyList<string> artifactPaths, string summary)
+        {
+            if (project.DiscordChannelID == 0) return;
+            try
+            {
+                var channel = await discord.Client.GetChannelAsync(project.DiscordChannelID);
+                string files = artifactPaths.Count == 0 ? "No file deliverables were recorded."
+                    : "Verified deliverables: " + string.Join(", ", artifactPaths.Select(x => $"`/project/{x.TrimStart('/').Replace('\\', '/')}`"));
+                await channel.SendMessageAsync($"[Directive complete] `{directive.DirectiveID}` completed by {directive.CompletedBy ?? "agent"}.\n{summary}\n{files}");
+
+                foreach (string path in artifactPaths)
+                {
+                    try
+                    {
+                        var entry = parent.Files.Stat(project.ProjectID, path);
+                        if (entry?.Kind != ProjectFileKind.File) continue;
+                        if (entry.Size > 8L * 1024 * 1024)
+                        {
+                            await channel.SendMessageAsync($"`/project/{path}` is {entry.Size:N0} bytes, so it is ready in Project Files rather than attached here.");
+                            continue;
+                        }
+                        await using var stream = parent.Files.OpenRead(project.ProjectID, path);
+                        var builder = new DiscordMessageBuilder().WithContent($"Deliverable for directive `{directive.DirectiveID}`: `/project/{path}`");
+                        builder.AddFile(Path.GetFileName(path), stream);
+                        await channel.SendMessageAsync(builder);
+                    }
+                    catch (Exception ex) { log($"Directive artifact delivery failed for {project.ProjectID}/{path}: {ex.Message}"); }
+                }
+            }
+            catch (Exception ex) { log($"Directive completion post failed for {project.ProjectID}: {ex.Message}"); }
         }
 
         // ── reports ──

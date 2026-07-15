@@ -338,6 +338,26 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task ProviderRateLimit_IsNotEscalatedAsHumanWork()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            int deliveries = 0;
+            s.Tools.RequestHumanAsync = _ => { deliveries++; return Task.CompletedTask; };
+
+            var result = await s.Tools.DispatchAsync("request_human", JsonConvert.SerializeObject(new
+            {
+                title = "LLM provider rate-limit",
+                description = "Read work/github_intel.md manually because the provider is throttled."
+            }), CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("INFRASTRUCTURE_REQUEST_REJECTED", result.ResultText);
+            Assert.Equal(0, deliveries);
+            Assert.DoesNotContain(s.Log.ReadSince(s.Project.ProjectID, 0),
+                e => e.Type == ProjectEventTypes.HumanAssistanceRequested);
+        }
+
+        [Fact]
         public async Task IndefiniteAccountOperation_CannotBeCompletedAfterInitialSetup()
         {
             var s = NewSetup(ProjectStatus.Active, "Run and grow a TikTok account continuously");
