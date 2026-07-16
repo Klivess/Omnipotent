@@ -1971,8 +1971,10 @@ namespace Omnipotent.Services.Projects
                 return;
             }
             int fps = Math.Clamp(int.TryParse(query["fps"], out var f) ? f : ProjectContainerConfig.DefaultStreamFps, 1, 30);
-            // An interactive remote-control viewer requests higher quality than the idle wall tiles.
+            // An interactive remote-control viewer requests higher quality/resolution than the
+            // idle wall tiles (which keep the downscaled 1280px default).
             int quality = Math.Clamp(int.TryParse(query["quality"], out var q) ? q : 45, 10, 92);
+            int maxWidth = Math.Clamp(int.TryParse(query["maxWidth"], out var mw) ? mw : 1280, 320, 3840);
             int delayMs = Math.Max(33, 1000 / fps);
             string shortID = containerID.Length >= 12 ? containerID[..12] : containerID;
             long lastVersion = -1;
@@ -2011,7 +2013,7 @@ namespace Omnipotent.Services.Projects
                         }
                         jpeg = version == lastVersion && lastJpeg != null
                             ? lastJpeg
-                            : VncFrameEncoder.EncodeJpeg(bgra, w, h, quality);
+                            : VncFrameEncoder.EncodeJpeg(bgra, w, h, maxWidth, quality);
                         lastVersion = version;
                         lastJpeg = jpeg;
                     }
