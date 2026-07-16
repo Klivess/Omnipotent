@@ -174,5 +174,19 @@ namespace Omnipotent.Tests.Projects
             installedOnly["browser-tabs"] = "up";
             Assert.True(ContainerDesktopManager.BrowserControlIsReady(installedOnly));
         }
+
+        [Fact]
+        public void BrowserLauncher_IsSingleProcessAndWaitsForCdp()
+        {
+            string script = ContainerOrchestrator.BrowserLaunchScript;
+
+            Assert.Contains("wait_cdp", script);
+            Assert.Contains("if cdp_up", script);
+            Assert.Contains("pkill -f '[c]hromium'", script);
+            Assert.Contains("SingletonLock", script);
+            Assert.Contains("/json/new?", script);
+            Assert.Contains("single supervised launch", script);
+            Assert.DoesNotContain("--new-tab", script);
+        }
     }
 }

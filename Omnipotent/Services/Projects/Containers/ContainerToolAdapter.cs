@@ -278,18 +278,11 @@ namespace Omnipotent.Services.Projects.Containers
                 string stdout = last.Stdout.Trim();
                 if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
                     return ContainerToolResult.Ok(ComputerAudit.Truncate(stdout, 24000));
-
-                if (attempt == 1)
-                {
-                    // Chromium may not have been opened yet or CDP may still be binding. Launch
-                    // the same visible persistent browser the user sees, then retry inspection.
-                    await desktop.LaunchAsync("browser", null, ct);
-                }
                 await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
             }
             string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
                 .Where(x => !string.IsNullOrWhiteSpace(x)));
-            return ContainerToolResult.Fail("Browser inspection failed after launching the visible browser and retrying: " +
+            return ContainerToolResult.Fail("Browser inspection failed after retrying the existing visible browser: " +
                 ComputerAudit.Truncate(detail, 1600), ContainerToolFailureKind.Infrastructure);
         }
 

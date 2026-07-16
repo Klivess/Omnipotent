@@ -25,6 +25,10 @@ namespace Omnipotent.Services.Projects.Containers
         private DockerClient? client;
         private readonly SemaphoreSlim clientGate = new(1, 1);
         private readonly ConcurrentDictionary<string, ImageBuildFlight> imageBuildFlights = new(StringComparer.OrdinalIgnoreCase);
+        // Browser startup is single-flight per container. Readiness checks, explicit opens and
+        // structured inspection can arrive concurrently; without this gate each spawned a new
+        // Chromium against the same profile and manufactured SingletonLock conflicts.
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> browserLaunchGates = new(StringComparer.Ordinal);
 
         private sealed class ImageBuildFlight
         {
@@ -115,13 +119,19 @@ namespace Omnipotent.Services.Projects.Containers
         public async Task ExecuteDesktopControlAsync(string containerID, ContainerDesktopControlCommand command, string? argument,
             CancellationToken ct = default)
         {
+            SemaphoreSlim? browserGate = command == ContainerDesktopControlCommand.LaunchBrowser
+                ? browserLaunchGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1))
+                : null;
+            if (browserGate != null) await browserGate.WaitAsync(ct);
+            try
+            {
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent; mkdir -p \"$XDG_RUNTIME_DIR\" \"$OMNIPOTENT_BROWSER_PROFILE\"; if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; wmctrl -a Chromium >/dev/null 2>&1 && wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || (nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" >/tmp/chromium.log 2>&1 </dev/null &)" },
+                    => new[] { "bash", "-lc", BrowserLaunchScript, "desktop-browser", "" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "sh", "-lc", "export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent; mkdir -p \"$XDG_RUNTIME_DIR\" \"$OMNIPOTENT_BROWSER_PROFILE\"; if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=\"$OMNIPOTENT_BROWSER_PROFILE\" --new-tab \"$1\" >/tmp/chromium.log 2>&1 </dev/null &", "desktop-control", uri.AbsoluteUri },
+                    => new[] { "bash", "-lc", BrowserLaunchScript, "desktop-browser", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
                 ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app
@@ -153,7 +163,51 @@ namespace Omnipotent.Services.Projects.Containers
             var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, ct);
             if (inspected.ExitCode != 0)
                 throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+            }
+            finally
+            {
+                browserGate?.Release();
+            }
         }
+
+        // One idempotent browser supervisor. It waits for an in-progress start instead of spawning
+        // a competitor, kills a genuinely wedged local Chromium before clearing stale singleton
+        // markers, and does not return success until CDP is listening. When a browser is already
+        // healthy, URL navigation uses CDP to create a visible tab without starting another process.
+        internal const string BrowserLaunchScript = """
+            set -u
+            export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent
+            mkdir -p "$XDG_RUNTIME_DIR" "$OMNIPOTENT_BROWSER_PROFILE"
+            if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi
+            url="${1:-}"
+            cdp_up() { python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1).read()' >/dev/null 2>&1; }
+            wait_cdp() { for i in $(seq 1 60); do cdp_up && return 0; sleep 0.25; done; return 1; }
+            open_url() {
+              [ -z "$url" ] && return 0
+              python3 -c 'import sys,urllib.parse,urllib.request; u="http://127.0.0.1:9222/json/new?"+urllib.parse.quote(sys.argv[1],safe=""); urllib.request.urlopen(urllib.request.Request(u,method="PUT"),timeout=3).read()' "$url"
+            }
+            focus_browser() { wmctrl -a Chromium >/dev/null 2>&1 || true; wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true; }
+            if cdp_up; then open_url; focus_browser; exit 0; fi
+            if pgrep -f '[c]hromium.*remote-debugging-port=9222' >/dev/null 2>&1; then
+              if wait_cdp; then open_url; focus_browser; exit 0; fi
+            fi
+            # A browser left by an older launcher may not have CDP enabled but can still own this
+            # profile. There is exactly one browser per desktop container, so stop every local
+            # Chromium before repairing singleton markers and performing the supervised start.
+            pkill -f '[c]hromium' >/dev/null 2>&1 || true
+            for i in $(seq 1 20); do pgrep -f '[c]hromium' >/dev/null 2>&1 || break; sleep 0.25; done
+            rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
+            : > /tmp/chromium.log
+            if [ -n "$url" ]; then
+              nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" "$url" >/tmp/chromium.log 2>&1 </dev/null &
+            else
+              nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" >/tmp/chromium.log 2>&1 </dev/null &
+            fi
+            if wait_cdp; then focus_browser; exit 0; fi
+            echo 'Chromium failed to expose CDP after a single supervised launch.' >&2
+            tail -n 20 /tmp/chromium.log >&2 || true
+            exit 1
+            """;
 
         private sealed record DesktopApplicationRequest(string Executable, string[] Arguments);
         private sealed record DesktopWindowFocusRequest(string? TitleContains, string? ProcessName);
