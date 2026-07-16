@@ -212,6 +212,11 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("SingletonLock", script);
             Assert.Contains("/json/new?", script);
             Assert.Contains("single supervised launch", script);
+            Assert.Contains("optional CDP endpoint is unavailable", script);
+            Assert.Contains("browser_visible", script);
+            Assert.Contains("--disable-dev-shm-usage", script);
+            Assert.Contains("--remote-allow-origins=*", script);
+            Assert.Contains("ProxyHandler({})", script);
             Assert.DoesNotContain("--new-tab", script);
             Assert.DoesNotContain('\r', script);
         }

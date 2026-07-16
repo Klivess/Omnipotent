@@ -34,13 +34,13 @@ namespace Omnipotent.Services.Projects.Containers
 
     /// <summary>
     /// Result of a desktop-readiness preflight: whether the container is up with the baked
-    /// visible-browser/structured-inspection stack present, plus a one-line human summary and the raw capability
+    /// human-usable shell/VNC stack present, plus a one-line human summary and the raw capability
     /// probe. Turns "a tool silently missing → the agent flails for a whole wake" into "the
     /// preflight says exactly what's present in seconds," and its facts seed later wakes.
     /// </summary>
     public sealed class DesktopReadiness
     {
-        /// <summary>True when the desktop is up AND every required capability is present.</summary>
+        /// <summary>True when the human-usable desktop is up. Optional browser CDP is not required.</summary>
         public bool Ok { get; init; }
         /// <summary>One-line summary suitable for a tool result and a checkpoint fact.</summary>
         public string Summary { get; init; } = "";

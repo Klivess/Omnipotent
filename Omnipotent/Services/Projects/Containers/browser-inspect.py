@@ -9,7 +9,10 @@ import websocket
 
 
 def http_json(path):
-    with urllib.request.urlopen("http://127.0.0.1:9222" + path, timeout=3) as response:
+    # The CDP endpoint is always container-local. Ignore inherited proxy variables: routing a
+    # loopback request through a corporate/system proxy makes a healthy browser look offline.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open("http://127.0.0.1:9222" + path, timeout=3) as response:
         return json.load(response)
 
 

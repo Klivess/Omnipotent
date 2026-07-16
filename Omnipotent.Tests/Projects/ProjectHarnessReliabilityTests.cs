@@ -487,8 +487,11 @@ public class ProjectDesktopReadinessInvariantTests
             ContainerToolAdapter.ContainerToolFailureKind.Semantic);
         var infrastructure = ContainerToolAdapter.ContainerToolResult.Fail("VNC disconnected",
             ContainerToolAdapter.ContainerToolFailureKind.Infrastructure);
+        var browserInspection = ContainerToolAdapter.ContainerToolResult.Fail("CDP unavailable",
+            ContainerToolAdapter.ContainerToolFailureKind.BrowserInspection);
 
         Assert.False(global::Omnipotent.Services.Projects.Projects.InvalidatesDesktopReadiness(semantic));
+        Assert.False(global::Omnipotent.Services.Projects.Projects.InvalidatesDesktopReadiness(browserInspection));
         Assert.True(global::Omnipotent.Services.Projects.Projects.InvalidatesDesktopReadiness(infrastructure));
     }
 }

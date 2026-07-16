@@ -180,13 +180,14 @@ namespace Omnipotent.Services.Projects.Containers
             mkdir -p "$XDG_RUNTIME_DIR" "$OMNIPOTENT_BROWSER_PROFILE"
             if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi
             url="${1:-}"
-            cdp_up() { python3 -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=1).read()' >/dev/null 2>&1; }
+            cdp_up() { python3 -c 'import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:9222/json/version", timeout=1).read()' >/dev/null 2>&1; }
             wait_cdp() { for i in $(seq 1 60); do cdp_up && return 0; sleep 0.25; done; return 1; }
             open_url() {
               [ -z "$url" ] && return 0
-              python3 -c 'import sys,urllib.parse,urllib.request; u="http://127.0.0.1:9222/json/new?"+urllib.parse.quote(sys.argv[1],safe=""); urllib.request.urlopen(urllib.request.Request(u,method="PUT"),timeout=3).read()' "$url"
+              python3 -c 'import sys,urllib.parse,urllib.request; u="http://127.0.0.1:9222/json/new?"+urllib.parse.quote(sys.argv[1],safe=""); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(urllib.request.Request(u,method="PUT"),timeout=3).read()' "$url"
             }
             focus_browser() { wmctrl -a Chromium >/dev/null 2>&1 || true; wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true; }
+            browser_visible() { wmctrl -lx 2>/dev/null | grep -qi 'chromium'; }
             if cdp_up; then open_url; focus_browser; exit 0; fi
             if pgrep -x chromium >/dev/null 2>&1; then
               if wait_cdp; then open_url; focus_browser; exit 0; fi
@@ -199,11 +200,16 @@ namespace Omnipotent.Services.Projects.Containers
             rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
             : > /tmp/chromium.log
             if [ -n "$url" ]; then
-              nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" "$url" >/tmp/chromium.log 2>&1 </dev/null &
+              nohup chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check --password-store=basic --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" "$url" >/tmp/chromium.log 2>&1 </dev/null &
             else
-              nohup chromium --no-sandbox --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" >/tmp/chromium.log 2>&1 </dev/null &
+              nohup chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check --password-store=basic --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" >/tmp/chromium.log 2>&1 </dev/null &
             fi
             if wait_cdp; then focus_browser; exit 0; fi
+            if browser_visible; then
+              echo 'Chromium is visible but its optional CDP endpoint is unavailable; visual control remains usable.' >>/tmp/chromium.log
+              focus_browser
+              exit 0
+            fi
             echo 'Chromium failed to expose CDP after a single supervised launch.' >&2
             tail -n 20 /tmp/chromium.log >&2 || true
             exit 1

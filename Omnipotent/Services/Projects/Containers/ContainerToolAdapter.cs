@@ -66,7 +66,7 @@ namespace Omnipotent.Services.Projects.Containers
             SupportedTools = Tools,
         };
 
-        public enum ContainerToolFailureKind { None, Validation, Semantic, Contention, Infrastructure, Cancelled }
+        public enum ContainerToolFailureKind { None, Validation, Semantic, Contention, BrowserInspection, Infrastructure, Cancelled }
 
         /// <summary>Result kept for the existing Project runner. Jpeg is always the final gridded frame.</summary>
         public sealed record ContainerToolResult(bool Success, string Text, byte[]? Jpeg = null)
@@ -238,11 +238,10 @@ namespace Omnipotent.Services.Projects.Containers
             var launched = await MutateAsync("Browser launch requested.", () => desktop.LaunchAsync("browser", url, ct), ct, settleMs: 800);
             if (!launched.Success) return launched;
             if (terminalAsync == null)
-                return new ContainerToolResult(false,
-                    "BROWSER_LAUNCH_UNVERIFIED: the browser launch was requested but this desktop cannot verify its control endpoint.",
+                return new ContainerToolResult(true,
+                    "Browser opened visibly. Structured inspection is unavailable; continue with screenshot, OCR, mouse, and keyboard tools.",
                     launched.Jpeg)
                 {
-                    FailureKind = ContainerToolFailureKind.Infrastructure,
                     Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
                 };
 
@@ -254,18 +253,18 @@ namespace Omnipotent.Services.Projects.Containers
                     Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
                 };
 
-            return new ContainerToolResult(false,
-                "BROWSER_LAUNCH_UNVERIFIED: Chromium did not expose an inspectable tab after launch. " +
-                ComputerAudit.Truncate(verified.Text, 1600), launched.Jpeg)
+            return new ContainerToolResult(true,
+                "Browser opened visibly, but optional structured inspection is unavailable. " +
+                "Continue through screenshot, OCR, mouse, and keyboard tools. " +
+                ComputerAudit.Truncate(verified.Text, 800), launched.Jpeg)
             {
-                FailureKind = ContainerToolFailureKind.Infrastructure,
                 Frames = launched.Frames, Width = launched.Width, Height = launched.Height,
             };
         }
 
         private async Task<ContainerToolResult> BrowserInspectAsync(JsonElement a, CancellationToken ct)
         {
-            if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop.", ContainerToolFailureKind.Infrastructure);
+            if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop. The visible desktop remains usable through screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
             string mode = (Str(a, "mode") ?? "dom").Trim().ToLowerInvariant();
             if (mode is not ("tabs" or "dom" or "accessibility" or "network"))
                 return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.", ContainerToolFailureKind.Validation);
@@ -283,13 +282,13 @@ namespace Omnipotent.Services.Projects.Containers
             string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
                 .Where(x => !string.IsNullOrWhiteSpace(x)));
             return ContainerToolResult.Fail("Browser inspection failed after retrying the existing visible browser: " +
-                ComputerAudit.Truncate(detail, 1600), ContainerToolFailureKind.Infrastructure);
+                ComputerAudit.Truncate(detail, 1600) + " Continue with visible screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
         }
 
         private async Task<ContainerToolResult> ClickBrowserControlAsync(JsonElement a, CancellationToken ct)
         {
             if (terminalAsync == null)
-                return ContainerToolResult.Fail("Structured browser control is unavailable for this desktop.", ContainerToolFailureKind.Infrastructure);
+                return ContainerToolResult.Fail("Structured browser control is unavailable for this desktop; use OCR or screenshot coordinates.", ContainerToolFailureKind.BrowserInspection);
             string name = (Str(a, "name") ?? Str(a, "text") ?? "").Trim();
             string role = (Str(a, "role") ?? "").Trim();
             string tag = (Str(a, "tag") ?? "").Trim();
@@ -315,7 +314,7 @@ namespace Omnipotent.Services.Projects.Containers
             if (located is not { Success: true } || string.IsNullOrWhiteSpace(located.Stdout))
                 return ContainerToolResult.Fail("Could not inspect controls in the visible browser: " +
                     ComputerAudit.Truncate(string.Join("\n", new[] { located?.Stderr, located?.Stdout }
-                        .Where(x => !string.IsNullOrWhiteSpace(x))), 1600), ContainerToolFailureKind.Infrastructure);
+                        .Where(x => !string.IsNullOrWhiteSpace(x))), 1600) + " Use OCR or screenshot coordinates instead.", ContainerToolFailureKind.BrowserInspection);
 
             try
             {
@@ -342,7 +341,7 @@ namespace Omnipotent.Services.Projects.Containers
                 }
                 if (!match.TryGetProperty("x", out var xValue) || !xValue.TryGetInt32(out int x)
                     || !match.TryGetProperty("y", out var yValue) || !yValue.TryGetInt32(out int y))
-                    return ContainerToolResult.Fail("The matched browser control had no usable screen coordinates.", ContainerToolFailureKind.Infrastructure);
+                    return ContainerToolResult.Fail("The matched browser control had no usable screen coordinates.", ContainerToolFailureKind.BrowserInspection);
 
                 int clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2);
                 byte[]? before = RecentFrameJpeg();
@@ -359,7 +358,7 @@ namespace Omnipotent.Services.Projects.Containers
             catch (JsonException ex)
             {
                 return ContainerToolResult.Fail("Browser-control locator returned malformed data: " +
-                    ComputerAudit.Truncate(ex.Message, 300), ContainerToolFailureKind.Infrastructure);
+                    ComputerAudit.Truncate(ex.Message, 300), ContainerToolFailureKind.BrowserInspection);
             }
         }
 

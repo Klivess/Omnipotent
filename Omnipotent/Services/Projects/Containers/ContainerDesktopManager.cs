@@ -154,9 +154,10 @@ namespace Omnipotent.Services.Projects.Containers
             "tail -n 12 /tmp/chromium.log 2>/dev/null | tr '\\n' ' ' | cut -c 1-1200\n";
 
         /// <summary>
-        /// Preflight a project's desktop before browser work: self-heal Docker + the image
+        /// Preflight a project's human-usable desktop: self-heal Docker + the image
         /// (rebuilding/recreating a stale container so it picks up the current baked tools), then
-        /// probe the visible-browser control/inspection stack and report exactly what's present. The result's facts
+        /// probe the visible shell and framebuffer. Browser CDP is an optional inspection aid and
+        /// is deliberately not part of this gate. The result's facts
         /// are recorded by the caller so later wakes start from known-good state instead of
         /// re-deriving the environment.
         /// </summary>
@@ -175,55 +176,11 @@ namespace Omnipotent.Services.Projects.Containers
             }
 
             var readiness = await ProbeReadinessAsync(record, ct);
-            bool desktopInfrastructureWasReady = readiness.Ok;
-            if (desktopInfrastructureWasReady)
-            {
-                readiness = await EnsureBrowserReadyAsync(record, readiness, ct);
-                if (readiness.Ok) return readiness;
-
-                // Other project desktops can remain healthy while this project's persistent
-                // Chromium profile is locked or corrupted. Recover that one profile first:
-                // archive it in-place (never delete it), recreate an empty profile, then retry.
-                // Rebuilding the shared image is an expensive and irrelevant first response.
-                if (BrowserFailedToStart(readiness.Capabilities))
-                {
-                    string? profileRecovery = await ArchiveBrokenBrowserProfileAsync(record, ct);
-                    if (profileRecovery != null)
-                    {
-                        var retriedDesktop = await ProbeReadinessAsync(record, ct);
-                        if (retriedDesktop.Ok)
-                        {
-                            var retriedBrowser = await EnsureBrowserReadyAsync(record, retriedDesktop, ct);
-                            if (retriedBrowser.Ok)
-                                return new DesktopReadiness
-                                {
-                                    Ok = true, ContainerID = retriedBrowser.ContainerID,
-                                    ImageVersion = retriedBrowser.ImageVersion, Capabilities = retriedBrowser.Capabilities,
-                                    Summary = "Desktop browser recovered from its archived project-local profile. " + retriedBrowser.Summary,
-                                };
-                            readiness = retriedBrowser;
-                        }
-                    }
-                }
-
-                // Browser launch/control is host logic operating inside an otherwise healthy
-                // desktop. Rebuilding the image and replacing this container cannot repair a
-                // host-side launcher defect, and it tears down the live-view stream on every
-                // computer action. Preserve the proven XFCE/VNC session and report only the
-                // browser failure after the one project-profile recovery attempt above.
-                return new DesktopReadiness
-                {
-                    Ok = false,
-                    ContainerID = record.ContainerID,
-                    ImageVersion = readiness.ImageVersion,
-                    Capabilities = readiness.Capabilities,
-                    Summary = readiness.Summary + " The desktop shell and VNC session remain healthy; the container was preserved because this is a browser-only failure.",
-                };
-            }
+            if (readiness.Ok) return readiness;
 
             // A current-looking image can still have broken desktop infrastructure (partial publish
             // context, interrupted build, or external retag). Only a base shell/VNC failure reaches
-            // this repair path; browser-only failures above preserve the working live stream.
+            // this repair path; browser inspection is not part of desktop readiness.
             log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} failed readiness; attempting one automatic image/container repair.");
             if (!string.Equals(imageTag, ProjectSettings.Defaults.DesktopImage, StringComparison.OrdinalIgnoreCase))
                 return new DesktopReadiness
@@ -264,15 +221,13 @@ namespace Omnipotent.Services.Projects.Containers
             record = await EnsureDesktopAsync(project, agentID, requireVisualReady: true, ct);
             var repaired = await ProbeReadinessAsync(record, ct);
             if (!repaired.Ok) return repaired;
-            repaired = await EnsureBrowserReadyAsync(record, repaired, ct);
-            if (!repaired.Ok) return repaired;
             return new DesktopReadiness
             {
                 Ok = true,
                 ContainerID = repaired.ContainerID,
                 ImageVersion = repaired.ImageVersion,
                 Capabilities = repaired.Capabilities,
-                Summary = "Desktop ready after automatic repair. " + repaired.Summary,
+                Summary = "Desktop ready after automatic shell/VNC repair. " + repaired.Summary,
             };
         }
 

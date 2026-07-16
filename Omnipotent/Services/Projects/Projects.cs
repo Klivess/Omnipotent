@@ -1224,7 +1224,8 @@ namespace Omnipotent.Services.Projects
 
             // The preflight is a harness invariant, not prompt advice. The first visual/browser
             // operation for each agent automatically proves that its own container is current and
-            // complete. A fresh typed fact avoids rebuilding/probing on every click.
+            // complete. CDP is deliberately not part of this gate: optional structured inspection
+            // must never block screenshots, OCR, mouse, or keyboard control of a visible browser.
             if (toolName != "computer_terminal")
             {
                 string factKey = DesktopReadyFactKey(actingAgentID);
@@ -1242,7 +1243,7 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>
         /// Preflight the project's desktop (self-heal Docker + a stale image/container, then probe
-        /// the baked visible-browser stack) and record the outcome as a durable checkpoint fact
+        /// the human-usable shell/VNC stack) and record the outcome as a durable checkpoint fact
         /// so later wakes don't re-derive the environment. Dispatch invokes it automatically before
         /// an agent's first browser/visual action; the fact is seeded into later wakes.
         /// </summary>
@@ -1309,7 +1310,7 @@ namespace Omnipotent.Services.Projects
                     {
                         Key = DesktopReadyFactKey(actingAgentID),
                         Value = $"Desktop ready; container={readiness.ContainerID ?? "unknown"}; {readiness.Summary}",
-                        Description = "Per-agent live desktop preflight: display, window manager, VNC framebuffer, visible browser and structured inspection.",
+                        Description = "Per-agent live desktop preflight: display, XFCE shell, panel, window manager, and VNC framebuffer. Browser inspection is optional.",
                         VerifiedAt = DateTime.UtcNow,
                         // Live GUI state changes quickly; container identity is embedded and a short
                         // TTL prevents a successful wake from trusting a six-hour-old framebuffer.
