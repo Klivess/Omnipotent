@@ -205,7 +205,10 @@ namespace Omnipotent.Tests.Projects
 
             Assert.Contains("wait_cdp", script);
             Assert.Contains("if cdp_up", script);
-            Assert.Contains("pkill -f '[c]hromium'", script);
+            Assert.Contains("pkill -x chromium", script);
+            Assert.Contains("pgrep -x chromium", script);
+            Assert.DoesNotContain("pkill -f", script);
+            Assert.DoesNotContain("pgrep -f", script);
             Assert.Contains("SingletonLock", script);
             Assert.Contains("/json/new?", script);
             Assert.Contains("single supervised launch", script);

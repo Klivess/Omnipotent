@@ -147,7 +147,7 @@ namespace Omnipotent.Services.Projects.Containers
 
         private const string BrowserReadinessProbeScript =
             "set +e\n" +
-            "echo \"browser-process=$(pgrep -f '[c]hromium.*remote-debugging-port=9222' >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "echo \"browser-process=$(pgrep -x chromium >/dev/null 2>&1 && echo up || echo down)\"\n" +
             "echo \"browser-cdp=$(python3 -c 'import urllib.request; urllib.request.urlopen(\\\"http://127.0.0.1:9222/json/version\\\", timeout=2).read(); print(\\\"up\\\")' 2>/dev/null || echo down)\"\n" +
             "echo \"browser-tabs=$(python3 /usr/local/bin/browser-inspect.py tabs 1 0 >/dev/null 2>&1 && echo up || echo down)\"\n" +
             "printf 'chromium-log='\n" +
@@ -175,7 +175,8 @@ namespace Omnipotent.Services.Projects.Containers
             }
 
             var readiness = await ProbeReadinessAsync(record, ct);
-            if (readiness.Ok)
+            bool desktopInfrastructureWasReady = readiness.Ok;
+            if (desktopInfrastructureWasReady)
             {
                 readiness = await EnsureBrowserReadyAsync(record, readiness, ct);
                 if (readiness.Ok) return readiness;
@@ -204,11 +205,25 @@ namespace Omnipotent.Services.Projects.Containers
                         }
                     }
                 }
+
+                // Browser launch/control is host logic operating inside an otherwise healthy
+                // desktop. Rebuilding the image and replacing this container cannot repair a
+                // host-side launcher defect, and it tears down the live-view stream on every
+                // computer action. Preserve the proven XFCE/VNC session and report only the
+                // browser failure after the one project-profile recovery attempt above.
+                return new DesktopReadiness
+                {
+                    Ok = false,
+                    ContainerID = record.ContainerID,
+                    ImageVersion = readiness.ImageVersion,
+                    Capabilities = readiness.Capabilities,
+                    Summary = readiness.Summary + " The desktop shell and VNC session remain healthy; the container was preserved because this is a browser-only failure.",
+                };
             }
 
-            // A current-looking image can still be incomplete (partial publish context, interrupted
-            // build, or external retag). The live probe is authoritative: rebuild once from the
-            // verified three-file context, recreate the container, and probe the replacement.
+            // A current-looking image can still have broken desktop infrastructure (partial publish
+            // context, interrupted build, or external retag). Only a base shell/VNC failure reaches
+            // this repair path; browser-only failures above preserve the working live stream.
             log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} failed readiness; attempting one automatic image/container repair.");
             if (!string.Equals(imageTag, ProjectSettings.Defaults.DesktopImage, StringComparison.OrdinalIgnoreCase))
                 return new DesktopReadiness
@@ -322,7 +337,7 @@ namespace Omnipotent.Services.Projects.Containers
                 "set +e\n" +
                 "profile=\"${OMNIPOTENT_BROWSER_PROFILE:-}\"\n" +
                 "if [ -z \"$profile\" ]; then echo 'browser-profile-recovery=skipped:no-profile-path'; exit 0; fi\n" +
-                "pkill -f '[c]hromium' >/dev/null 2>&1 || true\n" +
+                "pkill -x chromium >/dev/null 2>&1 || true\n" +
                 "sleep 1\n" +
                 "stamp=$(date -u +%Y%m%dT%H%M%SZ)\n" +
                 "if [ -e \"$profile\" ]; then mv \"$profile\" \"${profile}.recovery-${stamp}\" || exit 1; echo \"browser-profile-recovery=archived:${profile}.recovery-${stamp}\"; else echo 'browser-profile-recovery=created-empty'; fi\n" +

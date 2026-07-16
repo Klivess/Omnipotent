@@ -1870,6 +1870,7 @@ namespace Omnipotent.Services.Projects
                     {
                         if (!await AuthorizeWsAsKlivesAsync(query, user))
                         {
+                            ServiceLog("Projects: rejected unauthorized container screen-stream connection.");
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
                         }
@@ -1909,6 +1910,7 @@ namespace Omnipotent.Services.Projects
             var transport = Desktops?.GetTransportByContainerID(containerID);
             if (transport == null)
             {
+                ServiceLog($"Projects: screen stream requested unknown or retired container {(containerID.Length > 12 ? containerID[..12] : containerID)}.");
                 try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "unknown container", CancellationToken.None); } catch { }
                 return;
             }
@@ -1919,6 +1921,8 @@ namespace Omnipotent.Services.Projects
             byte[]? lastJpeg = null;
             DateTime lastSentUtc = DateTime.MinValue;
             bool sentFirstFrame = false;
+            string? lastCaptureError = null;
+            DateTime lastCaptureErrorLoggedUtc = DateTime.MinValue;
             // A desktop that never produces a first frame (x11vnc still starting, or a container
             // wedged in a restart loop) must not leave the viewer spinning on "Waiting for first
             // frame…" forever. Give the first frame a bounded budget of retries; if it never
@@ -1936,6 +1940,11 @@ namespace Omnipotent.Services.Projects
                         // silent) can't wedge the loop; the loop below just retries on timeout.
                         using var captureCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
                         var (bgra, w, h, version) = await transport.CaptureFrameWithVersionAsync(captureCts.Token);
+                        if (lastCaptureError != null)
+                        {
+                            ServiceLog($"Projects: container {shortID} live-view capture recovered after: {lastCaptureError}");
+                            lastCaptureError = null;
+                        }
                         bool heartbeatDue = DateTime.UtcNow - lastSentUtc >= TimeSpan.FromSeconds(2);
                         if (version == lastVersion && lastJpeg != null && !heartbeatDue)
                         {
@@ -1948,8 +1957,14 @@ namespace Omnipotent.Services.Projects
                         lastVersion = version;
                         lastJpeg = jpeg;
                     }
-                    catch
+                    catch (Exception ex)
                     {
+                        lastCaptureError = $"{ex.GetType().Name}: {ex.Message}";
+                        if (DateTime.UtcNow - lastCaptureErrorLoggedUtc >= TimeSpan.FromSeconds(10))
+                        {
+                            ServiceLog($"Projects: container {shortID} live-view capture failed: {lastCaptureError}");
+                            lastCaptureErrorLoggedUtc = DateTime.UtcNow;
+                        }
                         if (!sentFirstFrame && DateTime.UtcNow > firstFrameDeadline)
                         {
                             ServiceLog($"Projects: container {shortID} produced no first frame within the live-view warm-up window — closing so the viewer reconnects.");
@@ -1968,7 +1983,10 @@ namespace Omnipotent.Services.Projects
                     await Task.Delay(delayMs);
                 }
             }
-            catch { /* viewer gone */ }
+            catch (Exception ex)
+            {
+                ServiceLog($"Projects: container {shortID} live-view socket ended: {ex.GetType().Name}: {ex.Message}");
+            }
             finally
             {
                 try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }

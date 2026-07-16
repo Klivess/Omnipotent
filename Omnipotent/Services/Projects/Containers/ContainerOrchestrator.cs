@@ -188,14 +188,14 @@ namespace Omnipotent.Services.Projects.Containers
             }
             focus_browser() { wmctrl -a Chromium >/dev/null 2>&1 || true; wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true; }
             if cdp_up; then open_url; focus_browser; exit 0; fi
-            if pgrep -f '[c]hromium.*remote-debugging-port=9222' >/dev/null 2>&1; then
+            if pgrep -x chromium >/dev/null 2>&1; then
               if wait_cdp; then open_url; focus_browser; exit 0; fi
             fi
             # A browser left by an older launcher may not have CDP enabled but can still own this
             # profile. There is exactly one browser per desktop container, so stop every local
             # Chromium before repairing singleton markers and performing the supervised start.
-            pkill -f '[c]hromium' >/dev/null 2>&1 || true
-            for i in $(seq 1 20); do pgrep -f '[c]hromium' >/dev/null 2>&1 || break; sleep 0.25; done
+            pkill -x chromium >/dev/null 2>&1 || true
+            for i in $(seq 1 20); do pgrep -x chromium >/dev/null 2>&1 || break; sleep 0.25; done
             rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
             : > /tmp/chromium.log
             if [ -n "$url" ]; then
