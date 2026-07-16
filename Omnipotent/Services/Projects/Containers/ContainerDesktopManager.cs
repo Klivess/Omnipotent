@@ -116,12 +116,11 @@ namespace Omnipotent.Services.Projects.Containers
                    ?? candidates[0];
         }
 
-        // The capabilities a desktop MUST have before browser work is worth attempting. A missing
-        // one is what stalled the first live project (no browser and no browser-inspect helper),
-        // so the preflight treats their absence as "not ready" rather than letting a
-        // computer_* tool discover it mid-task.
+        // The capabilities a desktop MUST have before visual work is worth attempting. A display
+        // and VNC frame alone are only a framebuffer; require the actual desktop, panel, and
+        // window manager so the browser appears inside a normal, human-usable environment.
         private static readonly string[] RequiredCapabilities =
-            { "display", "window-manager", "vnc", "frame", "chromium", "browser-inspect" };
+            { "display", "desktop-shell", "panel", "window-manager", "vnc", "frame", "chromium", "browser-inspect" };
 
         // Chromium being installed only proves the image contains a binary. Browser work also
         // requires the visible process, its local CDP endpoint, and a tab the inspection helper
@@ -135,6 +134,8 @@ namespace Omnipotent.Services.Projects.Containers
         private const string ReadinessProbeScript =
             "set +e\n" +
             "echo \"display=$(xdpyinfo -display :1 >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "echo \"desktop-shell=$(pgrep -x xfce4-session >/dev/null 2>&1 && pgrep -x xfdesktop >/dev/null 2>&1 && echo up || echo down)\"\n" +
+            "echo \"panel=$(pgrep -x xfce4-panel >/dev/null 2>&1 && echo up || echo down)\"\n" +
             "echo \"window-manager=$(DISPLAY=:1 wmctrl -m >/dev/null 2>&1 && echo up || echo down)\"\n" +
             "echo \"xvfb=$(pgrep -x Xvfb >/dev/null 2>&1 && echo up || echo down)\"\n" +
             "echo \"x11vnc=$(pgrep -x x11vnc >/dev/null 2>&1 && echo up || echo down)\"\n" +
@@ -375,15 +376,12 @@ namespace Omnipotent.Services.Projects.Containers
                 caps["vnc-error"] = ex.Message;
             }
             caps.TryGetValue("image-version", out var imageVersion);
-            var missing = RequiredCapabilities.Where(c => c switch
-                {
-                    "display" or "window-manager" or "vnc" => !string.Equals(caps.GetValueOrDefault(c), "up", StringComparison.Ordinal),
-                    "frame" => !string.Equals(caps.GetValueOrDefault(c), "usable", StringComparison.Ordinal),
-                    _ => !string.Equals(caps.GetValueOrDefault(c), "yes", StringComparison.Ordinal),
-                }).ToList();
+            var missing = RequiredCapabilities.Where(c => !CapabilityIsReady(c, caps)).ToList();
             string capsText = string.Join(", ", new[]
             {
                 $"display {caps.GetValueOrDefault("display", "?")}",
+                $"desktop-shell {caps.GetValueOrDefault("desktop-shell", "?")}",
+                $"panel {caps.GetValueOrDefault("panel", "?")}",
                 $"window-manager {caps.GetValueOrDefault("window-manager", "?")}",
                 $"vnc {caps.GetValueOrDefault("vnc", "?")}",
                 $"frame {caps.GetValueOrDefault("frame", "?")} {caps.GetValueOrDefault("frame-size", "")}".TrimEnd(),
@@ -392,7 +390,7 @@ namespace Omnipotent.Services.Projects.Containers
                 $"browser-inspect {caps.GetValueOrDefault("browser-inspect", "?")}",
                 $"ffmpeg {caps.GetValueOrDefault("ffmpeg", "?")}",
             });
-            bool ok = missing.Count == 0;
+            bool ok = DesktopControlIsReady(caps);
             return new DesktopReadiness
             {
                 Ok = ok,
@@ -407,6 +405,18 @@ namespace Omnipotent.Services.Projects.Containers
 
         internal static bool BrowserControlIsReady(IReadOnlyDictionary<string, string> capabilities) =>
             RequiredBrowserCapabilities.All(cap => string.Equals(capabilities.GetValueOrDefault(cap), "up", StringComparison.Ordinal));
+
+        internal static bool DesktopControlIsReady(IReadOnlyDictionary<string, string> capabilities) =>
+            RequiredCapabilities.All(cap => CapabilityIsReady(cap, capabilities));
+
+        private static bool CapabilityIsReady(string capability, IReadOnlyDictionary<string, string> capabilities) =>
+            capability switch
+            {
+                "display" or "desktop-shell" or "panel" or "window-manager" or "vnc" =>
+                    string.Equals(capabilities.GetValueOrDefault(capability), "up", StringComparison.Ordinal),
+                "frame" => string.Equals(capabilities.GetValueOrDefault(capability), "usable", StringComparison.Ordinal),
+                _ => string.Equals(capabilities.GetValueOrDefault(capability), "yes", StringComparison.Ordinal),
+            };
 
         private static bool BrowserFailedToStart(IReadOnlyDictionary<string, string> capabilities) =>
             !string.Equals(capabilities.GetValueOrDefault("browser-process"), "up", StringComparison.Ordinal);

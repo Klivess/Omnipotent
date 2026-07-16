@@ -150,6 +150,22 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void DesktopImage_BootsACompleteHumanDesktop_NotAStandaloneFramebuffer()
+        {
+            string context = Omnipotent.Services.Projects.Containers.ContainerDesktopManager.ResolveBuildContextDirectory();
+            string entrypoint = File.ReadAllText(Path.Combine(context, "desktop-entrypoint.sh"));
+            string dockerfile = File.ReadAllText(Path.Combine(context, "desktop.Dockerfile"));
+
+            Assert.Contains("xfce4-session", entrypoint);
+            Assert.Contains("xfdesktop", entrypoint);
+            Assert.Contains("xfce4-panel", entrypoint);
+            Assert.Contains("thunar mousepad ristretto", dockerfile);
+            Assert.Contains("\"imageVersion\":\"5\"", dockerfile);
+            Assert.Contains("\"desktop-shell\"", dockerfile);
+            Assert.DoesNotContain("deliberately do NOT run xfdesktop", entrypoint);
+        }
+
+        [Fact]
         public void HeldMouseTools_RequireCoordinates()
         {
             var tools = VisualComputerToolCatalog.Build(new ComputerCapabilities());

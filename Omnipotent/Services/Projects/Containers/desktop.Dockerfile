@@ -19,7 +19,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DISPLAY_HEIGHT=1080
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        xvfb x11vnc xfce4 xfce4-terminal dbus-x11 \
+        xvfb x11vnc dbus-x11 \
+        xfce4 xfce4-session xfce4-panel xfdesktop4 xfwm4 xfce4-terminal \
+        thunar mousepad ristretto desktop-base adwaita-icon-theme \
         firefox-esr chromium \
         xdotool wmctrl xclip x11-utils x11-xserver-utils \
         curl ca-certificates fonts-dejavu \
@@ -47,7 +49,7 @@ RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"4","capabilities":["display","window-manager","chromium","firefox","browser-inspect","python3","ffmpeg"],"display":":1"}' \
+    '{"imageVersion":"5","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","python3","ffmpeg"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent

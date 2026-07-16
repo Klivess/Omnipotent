@@ -128,10 +128,10 @@ namespace Omnipotent.Services.Projects.Containers
             IList<string> cmd = command switch
             {
                 ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "bash", "-lc", BrowserLaunchScript, "desktop-browser", "" },
+                    => new[] { "bash", "-lc", BrowserLaunchScriptForExec, "bash", "" },
                 ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
-                    => new[] { "bash", "-lc", BrowserLaunchScript, "desktop-browser", uri.AbsoluteUri },
+                    => new[] { "bash", "-lc", BrowserLaunchScriptForExec, "bash", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
                 ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app
@@ -208,6 +208,15 @@ namespace Omnipotent.Services.Projects.Containers
             tail -n 20 /tmp/chromium.log >&2 || true
             exit 1
             """;
+
+        // C# raw strings retain their source file's physical line endings. This repository is
+        // commonly checked out as CRLF on Windows, while the script executes inside Linux. Strip
+        // carriage returns at the Docker argv boundary so Bash never sees `set -u\r` or `$'\r'`.
+        // The fourth `bash -lc` argv is deliberately just "bash" ($0), not a pretend executable
+        // name that agents could mistake for a missing launcher binary.
+        internal static string BrowserLaunchScriptForExec => NormalizeLinuxShellScript(BrowserLaunchScript);
+        internal static string NormalizeLinuxShellScript(string script) =>
+            (script ?? "").Replace("\r", "", StringComparison.Ordinal);
 
         private sealed record DesktopApplicationRequest(string Executable, string[] Arguments);
         private sealed record DesktopWindowFocusRequest(string? TitleContains, string? ProcessName);

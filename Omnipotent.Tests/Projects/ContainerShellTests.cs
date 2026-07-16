@@ -176,9 +176,32 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void DesktopReadiness_RequiresTheHumanDesktopShellAndPanel()
+        {
+            var capabilities = new Dictionary<string, string>
+            {
+                ["display"] = "up",
+                ["desktop-shell"] = "up",
+                ["panel"] = "up",
+                ["window-manager"] = "up",
+                ["vnc"] = "up",
+                ["frame"] = "usable",
+                ["chromium"] = "yes",
+                ["browser-inspect"] = "yes",
+            };
+
+            Assert.True(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+            capabilities["panel"] = "down";
+            Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+            capabilities["panel"] = "up";
+            capabilities["desktop-shell"] = "down";
+            Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+        }
+
+        [Fact]
         public void BrowserLauncher_IsSingleProcessAndWaitsForCdp()
         {
-            string script = ContainerOrchestrator.BrowserLaunchScript;
+            string script = ContainerOrchestrator.BrowserLaunchScriptForExec;
 
             Assert.Contains("wait_cdp", script);
             Assert.Contains("if cdp_up", script);
@@ -187,6 +210,17 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("/json/new?", script);
             Assert.Contains("single supervised launch", script);
             Assert.DoesNotContain("--new-tab", script);
+            Assert.DoesNotContain('\r', script);
+        }
+
+        [Fact]
+        public void BrowserLauncher_NormalizesWindowsLineEndingsBeforeLinuxExec()
+        {
+            string windowsCheckout = "set -u\r\necho ready\r\n";
+
+            string normalized = ContainerOrchestrator.NormalizeLinuxShellScript(windowsCheckout);
+
+            Assert.Equal("set -u\necho ready\n", normalized);
         }
     }
 }
