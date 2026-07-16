@@ -1045,7 +1045,9 @@ namespace Omnipotent.Services.Projects
                 // request_human surfaces through the project's own Discord channel with an @mention —
                 // the agent is blocked on a human-only obstacle, so it should actually ping Klives.
                 RequestHumanAsync = DiscordManager == null ? RequestHumanHook
-                    : what => DiscordManager.PostAttentionAsync(project, "🙋 Human assistance needed", what),
+                    : what => DiscordManager.PostAttentionAsync(project, "🙋 Human assistance needed",
+                        what + "\n\n🖥 Hands-on help (captcha/login): KM website → Projects → this project → " +
+                        "Desktops → open the agent's desktop → Take control. The agent is nudged automatically when you finish."),
                 HookStore = Hooks,
                 RearmAdapters = () => Adapters.ArmAll(),
                 GetHookArmInfo = hookID => Adapters.GetArmInfo(hookID),
@@ -1580,7 +1582,12 @@ namespace Omnipotent.Services.Projects
             try
             {
                 var reg = Desktops.Registry;
-                // 1. Prune orphaned Lost records so they don't accumulate forever.
+                // Reattach/adopt Docker reality before deleting either registry records or
+                // "orphans". Otherwise a surviving desktop with a temporarily missing registry
+                // entry can be destroyed by cleanup while its resumed agent is still using it.
+                await RefreshDesktopRegistryAsync();
+
+                // 1. Prune records still confirmed Lost after live reconciliation.
                 foreach (var lost in reg.All().Where(r => r.Lost))
                     reg.Remove(lost.ContainerID);
 
@@ -1789,6 +1796,23 @@ namespace Omnipotent.Services.Projects
                 msg => ServiceLog(msg),
                 imageForProject: pid => Settings.Get(pid).DesktopImage,
                 dockerUri: ProjectContainerConfig.ResolveDockerUri());
+            manager.DesktopChanged += (record, change) => EventLog.Append(new ProjectEvent
+            {
+                ProjectID = record.ProjectID,
+                AgentID = record.AgentID,
+                Type = ProjectEventTypes.DesktopChanged,
+                Author = "system",
+                Text = $"Desktop {change}{(record.AgentID == null ? " (shared)" : $" for {record.AgentID}")}.",
+                PayloadJson = JsonConvert.SerializeObject(new
+                {
+                    change,
+                    record.ContainerID,
+                    record.AgentID,
+                    record.Width,
+                    record.Height,
+                    record.Lost,
+                }),
+            });
             Desktops = manager;
 
             // Screen-diff hooks need the desktop subsystem; hand it to the adapter manager and
@@ -1819,6 +1843,15 @@ namespace Omnipotent.Services.Projects
             });
             // NOTE: the screen-stream WS route is registered in RegisterWebSocketRoutesAsync (at init,
             // decoupled from this method) so it exists even when Docker/desktops fail to come up.
+        }
+
+        /// <summary>Best-effort live refresh used by resume and desktop discovery. Desktop
+        /// availability must never make the otherwise-valid project control routes fail.</summary>
+        internal async Task RefreshDesktopRegistryAsync()
+        {
+            if (Desktops == null || !OperatingSystem.IsWindows()) return;
+            try { await Desktops.ReconcileAsync(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: live desktop registry refresh failed"); }
         }
 
         /// <summary>
@@ -1900,6 +1933,28 @@ namespace Omnipotent.Services.Projects
                     },
                     Profiles.KMProfileManager.KMPermissions.Anybody);
                 ServiceLog("Projects: container screen-stream route registered (/projects/containers/screen/stream).");
+
+                // Remote control (two-way input): the control half of the live view. Klives'
+                // browser sends JSON input events (same wire format as HostControl's
+                // /kliveagent/remote/input) and they replay on the container's VNC transport —
+                // this is how a human clears human-only obstacles like captchas for an agent.
+                await api.CreateWebSocketRoute("/projects/containers/remote/input",
+                    async (context, socket, query, user) =>
+                    {
+                        if (!await AuthorizeWsAsKlivesAsync(query, user))
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        if (Desktops == null || !OperatingSystem.IsWindows())
+                        {
+                            try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "desktop subsystem unavailable", CancellationToken.None); } catch { }
+                            return;
+                        }
+                        await HandleContainerRemoteInputAsync(socket, query);
+                    },
+                    Profiles.KMProfileManager.KMPermissions.Anybody);
+                ServiceLog("Projects: container remote-input route registered (/projects/containers/remote/input).");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register WebSocket routes (non-fatal)"); }
         }
@@ -1916,6 +1971,8 @@ namespace Omnipotent.Services.Projects
                 return;
             }
             int fps = Math.Clamp(int.TryParse(query["fps"], out var f) ? f : ProjectContainerConfig.DefaultStreamFps, 1, 30);
+            // An interactive remote-control viewer requests higher quality than the idle wall tiles.
+            int quality = Math.Clamp(int.TryParse(query["quality"], out var q) ? q : 45, 10, 92);
             int delayMs = Math.Max(33, 1000 / fps);
             string shortID = containerID.Length >= 12 ? containerID[..12] : containerID;
             long lastVersion = -1;
@@ -1954,7 +2011,7 @@ namespace Omnipotent.Services.Projects
                         }
                         jpeg = version == lastVersion && lastJpeg != null
                             ? lastJpeg
-                            : VncFrameEncoder.EncodeJpeg(bgra, w, h, quality: 45);
+                            : VncFrameEncoder.EncodeJpeg(bgra, w, h, quality);
                         lastVersion = version;
                         lastJpeg = jpeg;
                     }
@@ -1992,6 +2049,113 @@ namespace Omnipotent.Services.Projects
             {
                 try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
             }
+        }
+
+        /// <summary>
+        /// Klives' remote-control input session for one container desktop — the control half of
+        /// the live view. Each WebSocket text frame is one JSON input event (see
+        /// <see cref="ContainerRemoteInput"/>) replayed on the container's VNC transport. Events
+        /// serialise on the same per-container action gate agent tool transactions use, so a human
+        /// drag can never interleave with an agent's observe→act→settle. On disconnect every held
+        /// button/modifier is released; if Klives actually drove the desktop, the owning agent is
+        /// nudged so a wake blocked on a human-only obstacle (a captcha) re-checks the screen
+        /// instead of waiting indefinitely for a Discord reply.
+        /// </summary>
+        [SupportedOSPlatform("windows")]
+        private async Task HandleContainerRemoteInputAsync(WebSocket socket, NameValueCollection query)
+        {
+            string containerID = query["containerID"] ?? "";
+            var control = Desktops?.GetRemoteControlByContainerID(containerID);
+            if (control == null)
+            {
+                ServiceLog($"Projects: remote-input session requested unknown or retired container {(containerID.Length > 12 ? containerID[..12] : containerID)}.");
+                try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "unknown container", CancellationToken.None); } catch { }
+                return;
+            }
+            var (transport, actionGate, record) = control.Value;
+            string shortID = containerID.Length >= 12 ? containerID[..12] : containerID;
+            ServiceLog($"Projects: Klives opened a remote-control session on container {shortID} (project {record.ProjectID}, agent {record.AgentID ?? "shared"}).");
+
+            var buffer = new byte[16 * 1024];
+            var sb = new StringBuilder();
+            int applied = 0;
+            string? lastEventError = null;
+            DateTime lastEventErrorLoggedUtc = DateTime.MinValue;
+            try
+            {
+                while (socket.State == WebSocketState.Open)
+                {
+                    sb.Clear();
+                    WebSocketReceiveResult res;
+                    do
+                    {
+                        res = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
+                        if (res.MessageType == WebSocketMessageType.Close) return;
+                        if (res.MessageType == WebSocketMessageType.Text)
+                            sb.Append(Encoding.UTF8.GetString(buffer, 0, res.Count));
+                    } while (!res.EndOfMessage);
+
+                    var ev = ContainerRemoteInput.Parse(sb.ToString());
+                    if (ev == null) continue;
+                    try
+                    {
+                        // Bound each event so a wedged transport (or an agent holding the gate for
+                        // a long action) can't stall the session loop forever; the operator's next
+                        // event simply retries against a fresh gate wait.
+                        using var evCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                        await actionGate.WaitAsync(evCts.Token);
+                        try { if (await ContainerRemoteInput.ApplyAsync(transport, ev, evCts.Token)) applied++; }
+                        finally { actionGate.Release(); }
+                    }
+                    catch (Exception ex)
+                    {
+                        // A single failed event (unknown key name, transient VNC reconnect, gate
+                        // timeout) must not end Klives' control session. Log throttled and move on.
+                        lastEventError = $"{ex.GetType().Name}: {ex.Message}";
+                        if (DateTime.UtcNow - lastEventErrorLoggedUtc >= TimeSpan.FromSeconds(10))
+                        {
+                            ServiceLog($"Projects: remote-input event on container {shortID} failed: {lastEventError}");
+                            lastEventErrorLoggedUtc = DateTime.UtcNow;
+                        }
+                    }
+                }
+            }
+            catch { /* viewer disconnected mid-frame → unwind */ }
+            finally
+            {
+                // Never leave a human's half-finished drag or held modifier pinned on the desktop.
+                try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
+                try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+                ServiceLog($"Projects: remote-control session on container {shortID} ended ({applied} input event(s) applied).");
+                if (applied > 0) NotifyAgentOfRemoteControl(record, applied);
+            }
+        }
+
+        /// <summary>
+        /// After a remote-control session in which Klives actually sent input, tell the desktop's
+        /// owning agent (or the commander for a shared desktop) via a durable directive. This is
+        /// what closes the captcha loop: the agent asked for human help, Klives solved it silently
+        /// by driving the desktop, and without this nudge the agent would keep waiting for a reply.
+        /// </summary>
+        private void NotifyAgentOfRemoteControl(DesktopContainerRecord record, int inputEvents)
+        {
+            try
+            {
+                string text =
+                    $"Klives just remote-controlled your desktop directly ({inputEvents} input event(s)) — typically to clear a " +
+                    "human-only obstacle such as a captcha or a login challenge. Take a fresh screenshot to see the current " +
+                    "state, re-check whether your blocker is now resolved, and continue the task.";
+                var receipt = record.AgentID == null
+                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering)
+                    : MessageAgentWithReceipt(record.ProjectID, record.AgentID, text, ProjectDirectiveKind.Steering);
+                // A per-agent desktop can outlive its retired agent; the commander still needs to know.
+                if (!receipt.Accepted && record.AgentID != null)
+                    receipt = MessageProjectWithReceipt(record.ProjectID,
+                        $"[desktop of retired agent {record.AgentID}] " + text, ProjectDirectiveKind.Steering);
+                if (!receipt.Accepted)
+                    ServiceLog($"Projects: post-remote-control nudge for {record.ProjectID}/{record.AgentID ?? "commander"} was not accepted: {receipt.Reason}");
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to nudge the agent after a remote-control session"); }
         }
     }
 }

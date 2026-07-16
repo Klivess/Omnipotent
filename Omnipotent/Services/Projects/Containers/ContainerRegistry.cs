@@ -47,7 +47,15 @@ namespace Omnipotent.Services.Projects.Containers
 
         public void Add(DesktopContainerRecord record)
         {
-            lock (gate) { records.Add(record); SaveLocked(); }
+            lock (gate)
+            {
+                // Reconciliation can discover a just-started Docker container in the small window
+                // before its provisioning path persists the record. Treat Add as an idempotent
+                // upsert so that race cannot leave two menu entries for the same desktop.
+                records.RemoveAll(r => r.ContainerID == record.ContainerID);
+                records.Add(record);
+                SaveLocked();
+            }
         }
 
         public void Remove(string containerID)
@@ -63,8 +71,8 @@ namespace Omnipotent.Services.Projects.Containers
         {
             lock (gate)
             {
-                int i = records.FindIndex(r => r.ContainerID == record.ContainerID);
-                if (i >= 0) records[i] = record; else records.Add(record);
+                records.RemoveAll(r => r.ContainerID == record.ContainerID);
+                records.Add(record);
                 SaveLocked();
             }
         }

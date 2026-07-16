@@ -351,6 +351,10 @@ namespace Omnipotent.Services.Projects
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                     parent.RuntimeState.ClearBlocker(project.ProjectID);
                     parent.RuntimeState.CloseCircuit(project.ProjectID);
+                    // Agents may already be attached to Docker desktops that survived the pause or
+                    // process restart. Reconcile before publishing the resume event and waking them,
+                    // so the Desktops menu sees the same live fleet the agents use.
+                    await parent.RefreshDesktopRegistryAsync();
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -725,6 +729,10 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
+                    // Never serve the persisted pre-startup snapshot. This also adopts a surviving
+                    // labelled Docker desktop whose registry entry was lost, which is the state in
+                    // which an agent can use a desktop that the menu cannot discover.
+                    await parent.RefreshDesktopRegistryAsync();
                     var containers = (parent.Desktops?.Registry.ForProject(project!.ProjectID) ?? new())
                         .Select(c => new { c.ContainerID, c.AgentID, c.Width, c.Height }).ToList();
                     await req.ReturnResponse(Json(containers));

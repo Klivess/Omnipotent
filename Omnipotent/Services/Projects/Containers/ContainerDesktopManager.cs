@@ -24,11 +24,16 @@ namespace Omnipotent.Services.Projects.Containers
         // socket writes, but this gate serialises the whole observe → act → settle transaction.
         private readonly ConcurrentDictionary<string, SemaphoreSlim> actionGates = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, SemaphoreSlim> provisioningGates = new(StringComparer.Ordinal);
+        // Startup, project resume, and the desktop-list route can all request reconciliation at
+        // once. Docker reconciliation mutates the persisted registry, so keep it single-flight.
+        private readonly SemaphoreSlim reconcileGate = new(1, 1);
         private readonly string vncHost;
 
         public ContainerRegistry Registry => registry;
         public ContainerOrchestrator Orchestrator => orchestrator;
         public InputLockCoordinator InputLock => inputLock;
+        /// <summary>Raised when desktop discoverability changes so project clients can refresh.</summary>
+        public event Action<DesktopContainerRecord, string>? DesktopChanged;
 
         public ContainerDesktopManager(
             Action<string> log,
@@ -46,17 +51,32 @@ namespace Omnipotent.Services.Projects.Containers
         /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
         public async Task ReconcileAsync(CancellationToken ct = default)
         {
-            await orchestrator.ReconcileAsync(ct);
-            // Docker may assign a new ephemeral host port when a stopped container restarts.
-            // Never leave the pooled VNC client dialing its persisted, now-stale endpoint.
-            var records = registry.All()
-                .GroupBy(r => r.ContainerID, StringComparer.Ordinal)
-                .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
-            foreach (var pair in transports.ToArray())
+            await reconcileGate.WaitAsync(ct);
+            try
             {
-                if (!records.TryGetValue(pair.Key, out var record) || record.Lost || pair.Value.Port != record.VncHostPort)
-                    if (transports.TryRemove(new KeyValuePair<string, VncTransport>(pair.Key, pair.Value))) pair.Value.Dispose();
+                var before = registry.All()
+                    .GroupBy(r => r.ContainerID, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => (g.Last().Lost, g.Last().VncHostPort), StringComparer.Ordinal);
+                await orchestrator.ReconcileAsync(ct);
+                // Docker may assign a new ephemeral host port when a stopped container restarts.
+                // Never leave the pooled VNC client dialing its persisted, now-stale endpoint.
+                var records = registry.All()
+                    .GroupBy(r => r.ContainerID, StringComparer.Ordinal)
+                    .ToDictionary(g => g.Key, g => g.Last(), StringComparer.Ordinal);
+                foreach (var pair in transports.ToArray())
+                {
+                    if (!records.TryGetValue(pair.Key, out var record) || record.Lost || pair.Value.Port != record.VncHostPort)
+                        if (transports.TryRemove(new KeyValuePair<string, VncTransport>(pair.Key, pair.Value))) pair.Value.Dispose();
+                }
+                foreach (var record in records.Values)
+                {
+                    if (!before.TryGetValue(record.ContainerID, out var prior))
+                        NotifyDesktopChanged(record, "discovered");
+                    else if (prior.Lost != record.Lost || prior.VncHostPort != record.VncHostPort)
+                        NotifyDesktopChanged(record, record.Lost ? "unavailable" : "restored");
+                }
             }
+            finally { reconcileGate.Release(); }
         }
 
         /// <summary>Probes the Docker daemon; null when healthy, else a human-readable reason.</summary>
@@ -510,6 +530,8 @@ namespace Omnipotent.Services.Projects.Containers
                 registry.Update(record);
             }
 
+            if (created) NotifyDesktopChanged(record, "created");
+
             // Readiness probing is deliberately outside the provisioning lock: a terminal call
             // may use the newly started container while a visual caller waits for Xvfb/x11vnc.
             if (created && requireVisualReady) await WaitForDesktopReadyAsync(record, ct);
@@ -610,6 +632,21 @@ namespace Omnipotent.Services.Projects.Containers
             return record == null ? null : GetTransport(record);
         }
 
+        /// <summary>
+        /// Everything Klives' remote-control input route needs for one container: the pooled
+        /// transport, the per-container action gate (so human input serialises with agent
+        /// observe→act→settle transactions instead of interleaving mid-drag), and the registry
+        /// record for project/agent attribution. Null when the container is unknown or retired.
+        /// </summary>
+        public (VncTransport Transport, SemaphoreSlim ActionGate, DesktopContainerRecord Record)? GetRemoteControlByContainerID(string containerID)
+        {
+            var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost);
+            if (record == null) return null;
+            return (GetTransport(record),
+                actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1)),
+                record);
+        }
+
         private VncTransport GetTransport(DesktopContainerRecord record)
         {
             if (transports.TryGetValue(record.ContainerID, out var existing) && existing.Port != record.VncHostPort)
@@ -632,6 +669,13 @@ namespace Omnipotent.Services.Projects.Containers
                 if (provisioningGates.TryRemove(ownerKey, out var provisioningGate)) provisioningGate.Dispose();
             }
             await orchestrator.StopContainerAsync(containerID, ct);
+            if (record != null) NotifyDesktopChanged(record, "removed");
+        }
+
+        private void NotifyDesktopChanged(DesktopContainerRecord record, string change)
+        {
+            try { DesktopChanged?.Invoke(record, change); }
+            catch (Exception ex) { log($"Desktop lifecycle notification failed for {record.ContainerID}: {ex.Message}"); }
         }
 
         /// <summary>Wake cancellation/retirement cleanup for a shared desktop lease. Input events

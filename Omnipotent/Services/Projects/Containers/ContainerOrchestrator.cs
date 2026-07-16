@@ -562,6 +562,8 @@ namespace Omnipotent.Services.Projects.Containers
                     [ContainerLabels.Owner] = "projects",
                     [ContainerLabels.ProjectID] = projectID,
                     [ContainerLabels.AgentID] = agentID ?? "",
+                    [ContainerLabels.Width] = resolvedWidth.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    [ContainerLabels.Height] = resolvedHeight.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     [ContainerLabels.ContextHash] = imageContextHash,
                 },
                 Env = new List<string>
@@ -689,10 +691,11 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         /// <summary>
-        /// Boot-time reconciliation: registry ∩ Docker reality. Registry records whose container
-        /// is gone are marked Lost (never silently dropped — the Commander should learn its
-        /// desktop died); running containers are re-inspected so a changed ephemeral port is
-        /// picked up; stopped-but-present containers are restarted.
+        /// Reconciliation between the persisted registry and Docker reality. Docker containers
+        /// carrying our ownership labels are adopted when their registry entry is missing;
+        /// registry records whose container is gone are marked Lost (never silently dropped — the
+        /// Commander should learn its desktop died). Running containers are re-inspected so a
+        /// changed ephemeral port is picked up; stopped-but-present containers are restarted.
         /// </summary>
         public async Task ReconcileAsync(CancellationToken ct = default)
         {
@@ -705,6 +708,64 @@ namespace Omnipotent.Services.Projects.Containers
             }
             var docker = await GetClientAsync();
             var liveByID = live.ToDictionary(c => c.ID, c => c);
+
+            // The registry is a cache of discoverability, not the authority for whether a desktop
+            // exists. A surviving labelled Docker container may still be in active use by an agent
+            // even if a prior registry write/load was interrupted. Adopt it before the UI snapshots
+            // the registry (and before the orphan reaper can mistake it for garbage).
+            var trackedIDs = new HashSet<string>(registry.All().Select(r => r.ContainerID), StringComparer.Ordinal);
+            foreach (var summary in live.Where(c => !trackedIDs.Contains(c.ID)))
+            {
+                if (summary.Labels == null
+                    || !summary.Labels.TryGetValue(ContainerLabels.ProjectID, out string? projectID)
+                    || string.IsNullOrWhiteSpace(projectID))
+                {
+                    log($"Reconcile: labelled desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} has no project ID; leaving it untracked for orphan cleanup.");
+                    continue;
+                }
+
+                if (!string.Equals(summary.State, "running", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { await docker.Containers.StartContainerAsync(summary.ID, new ContainerStartParameters(), ct); }
+                    catch (Exception ex)
+                    {
+                        log($"Reconcile: failed to restart untracked desktop {summary.ID[..Math.Min(12, summary.ID.Length)]}: {ex.Message}");
+                        continue;
+                    }
+                }
+
+                try
+                {
+                    var inspect = await docker.Containers.InspectContainerAsync(summary.ID, ct);
+                    int? port = ResolveHostPort(inspect);
+                    if (!port.HasValue)
+                    {
+                        log($"Reconcile: surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} has no VNC host port yet; adoption deferred.");
+                        continue;
+                    }
+
+                    summary.Labels.TryGetValue(ContainerLabels.AgentID, out string? agentID);
+                    summary.Labels.TryGetValue(ContainerLabels.ContextHash, out string? contextHash);
+                    int width = ReadDesktopDimension(summary.Labels, inspect.Config?.Env, ContainerLabels.Width, "DISPLAY_WIDTH", 1920);
+                    int height = ReadDesktopDimension(summary.Labels, inspect.Config?.Env, ContainerLabels.Height, "DISPLAY_HEIGHT", 1080);
+                    var adopted = new DesktopContainerRecord
+                    {
+                        ContainerID = summary.ID,
+                        ProjectID = projectID,
+                        AgentID = string.IsNullOrWhiteSpace(agentID) ? null : agentID,
+                        VncHostPort = port.Value,
+                        Width = width,
+                        Height = height,
+                        CreatedAt = summary.Created,
+                        LastUsedAt = DateTime.UtcNow,
+                        ImageContextHash = contextHash ?? "",
+                    };
+                    registry.Add(adopted);
+                    trackedIDs.Add(summary.ID);
+                    log($"Reconcile: adopted surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} for project {projectID}{(adopted.AgentID == null ? " (shared)" : $" agent {adopted.AgentID}")}.");
+                }
+                catch (Exception ex) { log($"Reconcile: failed to adopt surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]}: {ex.Message}"); }
+            }
 
             foreach (var record in registry.All())
             {
@@ -803,6 +864,19 @@ namespace Omnipotent.Services.Projects.Containers
                 int.TryParse(bindings[0].HostPort, out int port))
                 return port;
             return null;
+        }
+
+        private static int ReadDesktopDimension(IDictionary<string, string> labels, IList<string>? env,
+            string labelName, string envName, int fallback)
+        {
+            if (labels.TryGetValue(labelName, out string? labelled)
+                && int.TryParse(labelled, out int labelValue) && labelValue > 0)
+                return labelValue;
+            string prefix = envName + "=";
+            string? envValue = env?.FirstOrDefault(value => value.StartsWith(prefix, StringComparison.Ordinal));
+            return envValue != null && int.TryParse(envValue[prefix.Length..], out int parsed) && parsed > 0
+                ? parsed
+                : fallback;
         }
     }
 }

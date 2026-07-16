@@ -117,6 +117,25 @@ namespace Omnipotent.Tests.Projects
             reg.Add(rec);
             Assert.Null(reg.ResolveForAgent(pid, "agentA"));
         }
+
+        [Fact]
+        public void Add_IsIdempotentForAReconciledContainer()
+        {
+            var reg = new ContainerRegistry(_ => { });
+            string pid = "test_" + Guid.NewGuid().ToString("N");
+            string containerID = "container_" + Guid.NewGuid().ToString("N");
+            reg.Add(new DesktopContainerRecord
+            {
+                ContainerID = containerID, ProjectID = pid, AgentID = "agentA", VncHostPort = 5901,
+            });
+            reg.Add(new DesktopContainerRecord
+            {
+                ContainerID = containerID, ProjectID = pid, AgentID = "agentA", VncHostPort = 5902,
+            });
+
+            var record = Assert.Single(reg.All().Where(r => r.ContainerID == containerID));
+            Assert.Equal(5902, record.VncHostPort);
+        }
     }
 
     public class VncTransportCaptureTests

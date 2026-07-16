@@ -58,6 +58,8 @@ namespace Omnipotent.Services.Projects.Containers
         public const string Owner = "omnipotent.owner";          // always "projects"
         public const string ProjectID = "omnipotent.projectID";
         public const string AgentID = "omnipotent.agentID";
+        public const string Width = "omnipotent.desktop.width";
+        public const string Height = "omnipotent.desktop.height";
         /// <summary>Build-context SHA of the image the container was created from. Same key the
         /// image itself carries, so a container and its image can be compared for staleness.</summary>
         public const string ContextHash = "omnipotent.projects.context-hash";
