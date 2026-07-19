@@ -10,6 +10,7 @@ namespace Omnipotent.Services.KliveAgent
 #pragma warning disable CS4014
     public class KliveAgentRoutes
     {
+        private const long MaxBufferedRequestBytes = 256 * 1024;
         private readonly KliveAgent service;
 
         public KliveAgentRoutes(KliveAgent service)
@@ -24,6 +25,8 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterCapabilityRoutes();
             await RegisterConversationRoutes();
             await RegisterTaskRoutes();
+            await RegisterLongTermJobRoutes();
+            await RegisterNotificationRoutes();
             await RegisterMemoryRoutes();
             await RegisterStatsRoutes();
             await RegisterIndexRoutes();
@@ -31,7 +34,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
         {
-            await service.CreateAPIRoute(path, async (req) =>
+            await service.CreateBufferedAPIRoute(path, async (req) =>
             {
                 if (!service.TryGetApiAvailability(out var statusCode, out var message))
                 {
@@ -42,7 +45,28 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 await handler(req);
-            }, method, permission);
+            }, method, permission, MaxBufferedRequestBytes);
+        }
+
+        /// <summary>Durable reads and control commands must remain available while the model is
+        /// warming up, disabled, or failed. Authentication/authorization is still enforced by KliveAPI.</summary>
+        private async Task CreateDurableRoute(
+            string path,
+            Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
+            HttpMethod method,
+            KMPermissions permission)
+        {
+            await service.CreateBufferedAPIRoute(path, async req =>
+            {
+                if (!service.TryGetDurableApiAvailability(out var statusCode, out var message))
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { success = false, error = message }),
+                        code: statusCode);
+                    return;
+                }
+                await handler(req);
+            }, method, permission, MaxBufferedRequestBytes);
         }
 
         // ── Setup status (for the website's loading bar) ──
@@ -74,13 +98,24 @@ namespace Omnipotent.Services.KliveAgent
                             code: HttpStatusCode.BadRequest);
                         return;
                     }
+                    if (body.Message.Length > 200_000)
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "Message is too large (maximum 200,000 characters)." }),
+                            code: HttpStatusCode.RequestEntityTooLarge);
+                        return;
+                    }
 
                     var response = await service.QueueIncomingApiMessageAsync(
                         body.Message,
                         body.ConversationId,
-                        req.user?.Name ?? "API");
+                        req.user?.Name ?? "API",
+                        body.ClientMessageId);
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(response));
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(response),
+                        code: response.IsPending ? HttpStatusCode.Accepted
+                            : response.Success ? HttpStatusCode.OK : HttpStatusCode.BadRequest);
                 }
                 catch (Exception ex)
                 {
@@ -90,20 +125,23 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await CreateRoute("/kliveagent/chat/pending", async (req) =>
+            await CreateDurableRoute("/kliveagent/chat/pending", async (req) =>
             {
                 try
                 {
                     string requestId = req.userParameters["requestId"];
-                    if (string.IsNullOrWhiteSpace(requestId))
+                    string conversationId = req.userParameters["conversationId"];
+                    if (string.IsNullOrWhiteSpace(requestId) && string.IsNullOrWhiteSpace(conversationId))
                     {
                         await req.ReturnResponse(
-                            JsonConvert.SerializeObject(new { error = "requestId is required." }),
+                            JsonConvert.SerializeObject(new { error = "requestId or conversationId is required." }),
                             code: HttpStatusCode.BadRequest);
                         return;
                     }
 
-                    var pendingResponse = service.GetPendingApiResponse(requestId);
+                    var pendingResponse = !string.IsNullOrWhiteSpace(requestId)
+                        ? service.GetPendingApiResponse(requestId)
+                        : service.GetLatestConversationRun(conversationId);
                     if (pendingResponse == null)
                     {
                         await req.ReturnResponse(
@@ -122,9 +160,74 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            // Reconciliation endpoint: the browser can always rediscover work after a reload, across
+            // tabs, or after losing the original POST response. No localStorage request ID is required.
+            await CreateDurableRoute("/kliveagent/chat/runs", async (req) =>
+            {
+                try
+                {
+                    string conversationId = req.userParameters["conversationId"];
+                    if (!string.IsNullOrWhiteSpace(conversationId)
+                        && !KliveAgent.IsSafeIdentifier(conversationId))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "Invalid conversationId." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    bool includeCompleted = !string.Equals(
+                        req.userParameters["includeCompleted"], "false", StringComparison.OrdinalIgnoreCase);
+                    var runs = service.GetPendingApiResponses(conversationId, includeCompleted);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(runs));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await CreateRoute("/kliveagent/chat/steer", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string requestId = body?.requestId;
+                    string message = body?.message;
+                    string clientMessageId = body?.clientMessageId;
+                    if (string.IsNullOrWhiteSpace(requestId) || string.IsNullOrWhiteSpace(message))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "requestId and message are required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    if (message.Length > 200_000)
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "Message is too large." }),
+                            code: HttpStatusCode.RequestEntityTooLarge);
+                        return;
+                    }
+
+                    var result = await service.SteerPendingApiResponseAsync(
+                        requestId, message, req.user?.Name ?? "API", clientMessageId);
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(result),
+                        code: result.Accepted ? HttpStatusCode.Accepted : HttpStatusCode.Conflict);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // Manual Stop: cancel a running message. The run unwinds (LLM call, agent loop, any running
             // script) and resolves to a truthful partial answer.
-            await CreateRoute("/kliveagent/chat/cancel", async (req) =>
+            await CreateDurableRoute("/kliveagent/chat/cancel", async (req) =>
             {
                 try
                 {
@@ -151,7 +254,7 @@ namespace Omnipotent.Services.KliveAgent
 
             // Approve/deny a pending computer-use action (the website's inline Approve/Deny buttons).
             // Unblocks the waiting action via HostControlManager's ApprovalBroker.
-            await CreateRoute("/kliveagent/chat/approve", async (req) =>
+            await CreateDurableRoute("/kliveagent/chat/approve", async (req) =>
             {
                 try
                 {
@@ -240,7 +343,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterConversationRoutes()
         {
-            await CreateRoute("/kliveagent/conversations", async (req) =>
+            await CreateDurableRoute("/kliveagent/conversations", async (req) =>
             {
                 try
                 {
@@ -255,7 +358,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await CreateRoute("/kliveagent/conversations/get", async (req) =>
+            await CreateDurableRoute("/kliveagent/conversations/get", async (req) =>
             {
                 try
                 {
@@ -334,6 +437,119 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         // ── Memories ──
+
+        private async Task RegisterLongTermJobRoutes()
+        {
+            await CreateDurableRoute("/kliveagent/jobs", async req =>
+            {
+                await req.ReturnResponse(JsonConvert.SerializeObject(service.GetLongTermJobs()));
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/jobs/get", async req =>
+            {
+                string jobId = req.userParameters["jobId"];
+                var job = service.GetLongTermJob(jobId);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(job ?? (object)new { error = "Job not found." }),
+                    code: job == null ? HttpStatusCode.NotFound : HttpStatusCode.OK);
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/jobs/create", async req =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<AgentLongTermJobRequest>(req.userMessageContent);
+                    if (body == null || string.IsNullOrWhiteSpace(body.Goal))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "goal is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    var job = await service.CreateLongTermJobAsync(body);
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(job),
+                        code: HttpStatusCode.Accepted);
+                }
+                catch (ArgumentException ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { error = ex.Message }),
+                        code: HttpStatusCode.BadRequest);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { error = ex.Message }),
+                        code: HttpStatusCode.ServiceUnavailable);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/jobs/steer", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string jobId = body?.jobId;
+                string message = body?.message;
+                if (string.IsNullOrWhiteSpace(jobId) || string.IsNullOrWhiteSpace(message))
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new { error = "jobId and message are required." }),
+                        code: HttpStatusCode.BadRequest);
+                    return;
+                }
+                var receipt = service.SteerLongTermJob(jobId, message);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(receipt),
+                    code: receipt.Accepted ? HttpStatusCode.Accepted : HttpStatusCode.Conflict);
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/jobs/stop", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string jobId = body?.jobId;
+                bool stopped = service.StopLongTermJob(jobId);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = stopped }),
+                    code: stopped ? HttpStatusCode.OK : HttpStatusCode.Conflict);
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/jobs/resume", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string jobId = body?.jobId;
+                bool resumed = await service.ResumeLongTermJobAsync(jobId);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = resumed }),
+                    code: resumed ? HttpStatusCode.OK : HttpStatusCode.Conflict);
+            }, HttpMethod.Post, KMPermissions.Klives);
+        }
+
+        private async Task RegisterNotificationRoutes()
+        {
+            await CreateDurableRoute("/kliveagent/notifications", async req =>
+            {
+                bool unreadOnly = string.Equals(
+                    req.userParameters["unreadOnly"], "true", StringComparison.OrdinalIgnoreCase);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(service.GetNotifications(unreadOnly)));
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/notifications/read", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string notificationId = body?.notificationId;
+                bool marked = await service.MarkNotificationReadAsync(notificationId);
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = marked }),
+                    code: marked ? HttpStatusCode.OK : HttpStatusCode.NotFound);
+            }, HttpMethod.Post, KMPermissions.Klives);
+        }
 
         private async Task RegisterMemoryRoutes()
         {

@@ -7,6 +7,7 @@ using Omnipotent.Services.Projects;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
@@ -137,6 +138,35 @@ namespace Omnipotent.Services.KliveAgent
             catch (Exception ex) { return $"Failed to create project: {ex.Message}"; }
         }
 
+        /// <summary>Create a durable, independently-running job linked to this conversation. The
+        /// website keeps showing it after navigation/restart and notifies Klives with its result.</summary>
+        public async Task<string> CreateLongTermJob(string name, string goal, double tokenBudgetUsd = 10,
+            double moneyBudgetUsd = 0, double moneyAutonomousThresholdUsd = 0, int subAgentCap = 3)
+        {
+            try
+            {
+                var job = await agentService.CreateLongTermJobAsync(new AgentLongTermJobRequest
+                {
+                    ClientJobId = "agentjob_" + Convert.ToHexString(SHA256.HashData(
+                        Encoding.UTF8.GetBytes(
+                            $"{ConversationId ?? "standalone"}\n{name}\n{goal}")))
+                        .Substring(0, 40).ToLowerInvariant(),
+                    Name = name,
+                    Goal = goal,
+                    ConversationId = ConversationId,
+                    TokenBudgetUsd = tokenBudgetUsd,
+                    MoneyBudgetUsd = moneyBudgetUsd,
+                    MoneyAutonomousThresholdUsd = moneyAutonomousThresholdUsd,
+                    SubAgentCap = subAgentCap
+                });
+                return $"Long-term job {job.JobId} accepted (Project {job.ProjectId}, status {job.Status}).";
+            }
+            catch (Exception ex)
+            {
+                return $"Failed to create long-term job: {ex.Message}";
+            }
+        }
+
         /// <summary>List every Project with a one-line status (id, name, status, budget, active agents, last event).</summary>
         public string ListProjects()
         {
@@ -152,7 +182,8 @@ namespace Omnipotent.Services.KliveAgent
         {
             var projects = GetProjectsService();
             if (projects == null) return "Projects service is not available.";
-                var receipt = projects.MessageProjectWithReceipt(projectID, message, ProjectDirectiveKind.Task);
+            var receipt = projects.MessageProjectWithReceipt(
+                projectID, message, ProjectDirectiveKind.Steering);
             if (!receipt.Accepted)
                 return receipt.Reason ?? $"No project with ID {projectID}.";
             return receipt.Status == "delivered"

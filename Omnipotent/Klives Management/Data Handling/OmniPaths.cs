@@ -136,6 +136,9 @@ namespace Omnipotent.Data_Handling
             public static string KliveAgentDirectory = $"{SavedDataDirectory}/KliveAgent";
             public static string KliveAgentMemoriesDirectory = $"{KliveAgentDirectory}/Memories";
             public static string KliveAgentConversationsDirectory = $"{KliveAgentDirectory}/Conversations";
+            public static string KliveAgentChatRunsDirectory = $"{KliveAgentDirectory}/ChatRuns";
+            public static string KliveAgentJobsDirectory = $"{KliveAgentDirectory}/Jobs";
+            public static string KliveAgentNotificationsDirectory = $"{KliveAgentDirectory}/Notifications";
             public static string KliveAgentBackgroundTasksDirectory = $"{KliveAgentDirectory}/BackgroundTasks";
             public static string KliveAgentScheduledTasksDirectory = $"{KliveAgentDirectory}/ScheduledTasks";
             public static string KliveAgentScriptLogsDirectory = $"{KliveAgentDirectory}/ScriptLogs";

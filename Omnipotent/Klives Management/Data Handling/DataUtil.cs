@@ -31,6 +31,72 @@ namespace Omnipotent.Data_Handling
             catch { return "file:" + (path ?? string.Empty).ToLowerInvariant(); }
         }
 
+        /// <summary>Writes a complete replacement beside the destination, flushes it, then atomically
+        /// swaps it into place. A crash can leave an ignorable .tmp file, never a truncated sole copy.</summary>
+        private static async Task WriteTextAtomicallyAsync(
+            string path, string content, CancellationToken cancellationToken)
+        {
+            string fullPath = Path.GetFullPath(path);
+            string directory = Path.GetDirectoryName(fullPath)
+                ?? throw new InvalidOperationException("File path has no parent directory.");
+            Directory.CreateDirectory(directory);
+            string tempPath = Path.Combine(
+                directory, "." + Path.GetFileName(fullPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                await using (var stream = new FileStream(
+                    tempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    64 * 1024,
+                    FileOptions.Asynchronous | FileOptions.WriteThrough))
+                await using (var writer = new StreamWriter(
+                    stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+                {
+                    await writer.WriteAsync(content.AsMemory(), cancellationToken);
+                    await writer.FlushAsync(cancellationToken);
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(tempPath, fullPath, overwrite: true);
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
+        }
+
+        private static async Task WriteBytesAtomicallyAsync(
+            string path, byte[] content, CancellationToken cancellationToken)
+        {
+            string fullPath = Path.GetFullPath(path);
+            string directory = Path.GetDirectoryName(fullPath)
+                ?? throw new InvalidOperationException("File path has no parent directory.");
+            Directory.CreateDirectory(directory);
+            string tempPath = Path.Combine(
+                directory, "." + Path.GetFileName(fullPath) + "." + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                await using (var stream = new FileStream(
+                    tempPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    64 * 1024,
+                    FileOptions.Asynchronous | FileOptions.WriteThrough))
+                {
+                    await stream.WriteAsync(content, cancellationToken);
+                    await stream.FlushAsync(cancellationToken);
+                    stream.Flush(flushToDisk: true);
+                }
+                File.Move(tempPath, fullPath, overwrite: true);
+            }
+            finally
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+            }
+        }
+
         private enum ReadWrite
         {
             Read,
@@ -52,6 +118,7 @@ namespace Omnipotent.Data_Handling
             public TaskCompletionSource<string> result;
             public TaskCompletionSource<byte[]>? resultBytes;
             public ReadWrite operation;
+            public CancellationTokenSource deadline = new(TimeSpan.FromSeconds(60));
         }
 
         private readonly Channel<FileOperation> _queue = Channel.CreateUnbounded<FileOperation>();
@@ -85,27 +152,34 @@ namespace Omnipotent.Data_Handling
             {
                 await ServiceLogError("File path is null for task: " + task.ID);
                 task.result.TrySetResult("Failed");
+                task.deadline.Dispose();
                 return;
             }
 
             var fileLock = _fileLocks.GetOrAdd(task.path, _ => new SemaphoreSlim(1, 1));
-            await fileLock.WaitAsync();
+            using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken.Token, task.deadline.Token);
+            var operationToken = operationCancellation.Token;
+            bool lockAcquired = false;
 
             try
             {
+                await fileLock.WaitAsync(operationToken);
+                lockAcquired = true;
                 bool success = false;
-                while (!success && !cancellationToken.IsCancellationRequested)
+                while (!success && !operationToken.IsCancellationRequested)
                 {
                     try
                     {
                         if (task.operation == ReadWrite.Write)
                         {
-                            await File.WriteAllTextAsync(task.path, task.content, cancellationToken.Token);
+                            await WriteTextAtomicallyAsync(
+                                task.path, task.content ?? string.Empty, operationToken);
                             task.result.TrySetResult("Successful");
                         }
                         else if (task.operation == ReadWrite.Read)
                         {
-                            task.result.TrySetResult(await File.ReadAllTextAsync(task.path, cancellationToken.Token));
+                            task.result.TrySetResult(await File.ReadAllTextAsync(task.path, operationToken));
                         }
                         else if (task.operation == ReadWrite.CreateDirectory)
                         {
@@ -114,7 +188,7 @@ namespace Omnipotent.Data_Handling
                         }
                         else if (task.operation == ReadWrite.AppendToFile)
                         {
-                            await File.AppendAllTextAsync(task.path, task.content, cancellationToken.Token);
+                            await File.AppendAllTextAsync(task.path, task.content, operationToken);
                             task.result.TrySetResult("Successful");
                         }
                         else if (task.operation == ReadWrite.DeleteFile)
@@ -129,12 +203,13 @@ namespace Omnipotent.Data_Handling
                         }
                         else if (task.operation == ReadWrite.WriteBytes)
                         {
-                            await File.WriteAllBytesAsync(task.path, task.bytes ?? Array.Empty<byte>(), cancellationToken.Token);
+                            await WriteBytesAtomicallyAsync(
+                                task.path, task.bytes ?? Array.Empty<byte>(), operationToken);
                             task.result.TrySetResult("Successful");
                         }
                         else if (task.operation == ReadWrite.ReadBytes)
                         {
-                            task.resultBytes?.TrySetResult(await File.ReadAllBytesAsync(task.path, cancellationToken.Token));
+                            task.resultBytes?.TrySetResult(await File.ReadAllBytesAsync(task.path, operationToken));
                         }
                         success = true;
                     }
@@ -143,7 +218,11 @@ namespace Omnipotent.Data_Handling
                         await ServiceLogError(exception);
                         // Original logic was an infinite retry loop.
                         // We wait a bit before retrying to avoid CPU spinning.
-                        await Task.Delay(100, cancellationToken.Token);
+                        await Task.Delay(100, operationToken);
+                    }
+                    catch (OperationCanceledException) when (operationToken.IsCancellationRequested)
+                    {
+                        throw;
                     }
                     catch (Exception ex)
                     {
@@ -158,9 +237,18 @@ namespace Omnipotent.Data_Handling
                     }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                Exception failure = task.deadline.IsCancellationRequested
+                    ? new TimeoutException($"File operation timed out after 60 seconds: {task.path}")
+                    : new OperationCanceledException("Data service stopped before the file operation completed.");
+                task.result.TrySetException(failure);
+                task.resultBytes?.TrySetException(failure);
+            }
             finally
             {
-                fileLock.Release();
+                if (lockAcquired) fileLock.Release();
+                task.deadline.Dispose();
             }
         }
 

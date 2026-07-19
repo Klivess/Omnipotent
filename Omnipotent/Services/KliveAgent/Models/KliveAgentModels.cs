@@ -26,7 +26,9 @@ namespace Omnipotent.Services.KliveAgent.Models
         Running,
         Completed,
         Cancelled,
-        Failed
+        Failed,
+        /// <summary>A process restart interrupted work whose side effects cannot be replayed safely.</summary>
+        Interrupted
     }
 
     [JsonConverter(typeof(StringEnumConverter))]
@@ -200,6 +202,13 @@ namespace Omnipotent.Services.KliveAgent.Models
 
     public class AgentMessage
     {
+        [JsonProperty("messageId")]
+        public string MessageId { get; set; } = Guid.NewGuid().ToString("N");
+
+        /// <summary>The durable chat run that produced/accepted this message. Null on legacy history.</summary>
+        [JsonProperty("requestId")]
+        public string? RequestId { get; set; }
+
         [JsonProperty("role")]
         public AgentMessageRole Role { get; set; }
 
@@ -222,10 +231,18 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("senderName")]
         public string SenderName { get; set; }
+
+        /// <summary>running | completed | cancelled | failed | interrupted. Primarily useful on the
+        /// user message, which is persisted before the agent starts so a reload never loses it.</summary>
+        [JsonProperty("deliveryStatus")]
+        public string? DeliveryStatus { get; set; }
     }
 
     public class AgentConversation
     {
+        [JsonIgnore]
+        public object SyncRoot { get; } = new();
+
         [JsonProperty("conversationId")]
         public string ConversationId { get; set; } = Guid.NewGuid().ToString("N");
 
@@ -675,6 +692,11 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("conversationId")]
         public string ConversationId { get; set; }
+
+        /// <summary>Stable ID generated once by the client. Retrying an ambiguous POST with the same
+        /// value returns the original run instead of executing the message twice.</summary>
+        [JsonProperty("clientMessageId")]
+        public string? ClientMessageId { get; set; }
     }
 
     public class AgentChatResponse
@@ -684,6 +706,9 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("conversationId")]
         public string ConversationId { get; set; }
+
+        [JsonProperty("clientMessageId")]
+        public string? ClientMessageId { get; set; }
 
         [JsonProperty("scriptsExecuted")]
         public List<AgentScriptResult> ScriptsExecuted { get; set; } = new();
@@ -708,6 +733,57 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("pendingRequestId")]
         public string PendingRequestId { get; set; }
+
+        /// <summary>True when this message was attached to the already-running turn as steering rather
+        /// than starting a second, conflicting run in the same conversation.</summary>
+        [JsonProperty("wasSteering")]
+        public bool WasSteering { get; set; }
+
+        [JsonProperty("acceptedMessageId")]
+        public string? AcceptedMessageId { get; set; }
+    }
+
+    public class AgentSteeringMessage
+    {
+        [JsonProperty("messageId")]
+        public string MessageId { get; set; } = Guid.NewGuid().ToString("N");
+
+        [JsonProperty("message")]
+        public string Message { get; set; } = string.Empty;
+
+        [JsonProperty("senderName")]
+        public string SenderName { get; set; } = "API";
+
+        [JsonProperty("clientMessageId")]
+        public string? ClientMessageId { get; set; }
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        [JsonProperty("appliedAt")]
+        public DateTime? AppliedAt { get; set; }
+
+        /// <summary>queued | applied | rejected.</summary>
+        [JsonProperty("status")]
+        public string Status { get; set; } = "queued";
+    }
+
+    public class AgentSteeringResult
+    {
+        [JsonProperty("accepted")]
+        public bool Accepted { get; set; }
+
+        [JsonProperty("requestId")]
+        public string? RequestId { get; set; }
+
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("messageId")]
+        public string? MessageId { get; set; }
+
+        [JsonProperty("reason")]
+        public string? Reason { get; set; }
     }
 
     public class AgentPendingChatResponse
@@ -718,6 +794,9 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("conversationId")]
         public string ConversationId { get; set; }
 
+        [JsonProperty("clientMessageId")]
+        public string? ClientMessageId { get; set; }
+
         [JsonProperty("status")]
         public AgentTaskStatus Status { get; set; } = AgentTaskStatus.Running;
 
@@ -726,6 +805,9 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// conversation file.</summary>
         [JsonProperty("userMessage")]
         public string UserMessage { get; set; }
+
+        [JsonProperty("senderName")]
+        public string? SenderName { get; set; }
 
         [JsonProperty("response")]
         public string Response { get; set; }
@@ -761,6 +843,11 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("activity")]
         public List<AgentActivityEvent> Activity { get; set; } = new();
 
+        /// <summary>User guidance accepted while this run was active. It is durable and each entry says
+        /// whether the brain has consumed it yet, so reconnecting clients can render an honest timeline.</summary>
+        [JsonProperty("steeringMessages")]
+        public List<AgentSteeringMessage> SteeringMessages { get; set; } = new();
+
         /// <summary>Latest annotated screenshot from a computer-use action (base64 JPEG), streamed to the
         /// website so the page can render a live video of what the agent is doing on the host machine.</summary>
         [JsonProperty("latestFrame")]
@@ -780,6 +867,14 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("completedAt")]
         public DateTime? CompletedAt { get; set; }
 
+        [JsonProperty("updatedAt")]
+        public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+
+        /// <summary>Monotonically increasing revision used by polling/WebSocket clients to ignore
+        /// duplicate snapshots and resume after a disconnect.</summary>
+        [JsonProperty("sequence")]
+        public long Sequence { get; set; } = 1;
+
         /// <summary>Last moment the run made real progress (LLM reply, token, iteration, or script
         /// result). The stall watchdog cancels a run only when this stops advancing — so a slow but
         /// progressing task is never aborted, while a truly hung one is.</summary>
@@ -791,8 +886,270 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonIgnore]
         public CancellationTokenSource CancellationSource { get; set; }
 
+        /// <summary>Atomic steering/completion gate. Not persisted; reconstructed for a live run.</summary>
+        [JsonIgnore]
+        internal AgentChatRunControl? Control { get; set; }
+
         [JsonProperty("errorMessage")]
         public string ErrorMessage { get; set; }
+    }
+
+    /// <summary>
+    /// Coordinates steering with finalization. TryEnqueue and TrySeal share a lock, so a message can
+    /// never be acknowledged into the tiny gap after the brain's final steering check.
+    /// </summary>
+    public sealed class AgentChatRunControl
+    {
+        private readonly object sync = new();
+        private readonly Queue<AgentSteeringMessage> queued = new();
+        private readonly HashSet<string> reservations = new(StringComparer.Ordinal);
+        private bool accepting = true;
+
+        public bool TryEnqueue(AgentSteeringMessage message)
+        {
+            lock (sync)
+            {
+                if (!accepting) return false;
+                queued.Enqueue(message);
+                return true;
+            }
+        }
+
+        /// <summary>Reserves the completion gate without making guidance visible to the brain.
+        /// The coordinator persists it first, then calls <see cref="Commit"/>.</summary>
+        public bool TryReserve(AgentSteeringMessage message)
+        {
+            lock (sync)
+            {
+                if (!accepting) return false;
+                return reservations.Add(message.MessageId);
+            }
+        }
+
+        public bool Commit(AgentSteeringMessage message)
+        {
+            lock (sync)
+            {
+                if (!reservations.Remove(message.MessageId) || !accepting) return false;
+                queued.Enqueue(message);
+                return true;
+            }
+        }
+
+        public void Reject(AgentSteeringMessage message)
+        {
+            lock (sync) reservations.Remove(message.MessageId);
+        }
+
+        public List<AgentSteeringMessage> Drain()
+        {
+            lock (sync)
+            {
+                var result = new List<AgentSteeringMessage>(queued.Count);
+                while (queued.Count > 0) result.Add(queued.Dequeue());
+                return result;
+            }
+        }
+
+        /// <summary>Seals only when no queued steering exists. False means the caller must apply
+        /// <paramref name="pending"/> and take another iteration before trying to complete again.</summary>
+        public bool TrySeal(out List<AgentSteeringMessage> pending)
+        {
+            lock (sync)
+            {
+                pending = new List<AgentSteeringMessage>(queued.Count);
+                while (queued.Count > 0) pending.Add(queued.Dequeue());
+                if (pending.Count > 0 || reservations.Count > 0) return false;
+                accepting = false;
+                return true;
+            }
+        }
+
+        public void Seal()
+        {
+            lock (sync)
+            {
+                accepting = false;
+                reservations.Clear();
+            }
+        }
+    }
+
+    /// <summary>Reload-safe conversation response. Existing message fields remain at the top level for
+    /// backwards compatibility; recentRuns rediscovers active work without browser-local state.</summary>
+    public class AgentConversationView
+    {
+        [JsonProperty("conversationId")]
+        public string ConversationId { get; set; } = string.Empty;
+
+        [JsonProperty("messages")]
+        public List<AgentMessage> Messages { get; set; } = new();
+
+        [JsonProperty("lastUpdated")]
+        public DateTime LastUpdated { get; set; }
+
+        [JsonProperty("sourceChannel")]
+        public AgentSourceChannel SourceChannel { get; set; }
+
+        [JsonProperty("recentRuns")]
+        public List<AgentPendingChatResponse> RecentRuns { get; set; } = new();
+    }
+
+    public class AgentLongTermJobRequest
+    {
+        /// <summary>Stable client-generated ID. Retrying a lost create response returns the same job.</summary>
+        [JsonProperty("clientJobId")]
+        public string? ClientJobId { get; set; }
+
+        [JsonProperty("name")]
+        public string? Name { get; set; }
+
+        [JsonProperty("goal")]
+        public string Goal { get; set; } = string.Empty;
+
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("originatingMessageId")]
+        public string? OriginatingMessageId { get; set; }
+
+        [JsonProperty("tokenBudgetUsd")]
+        public double TokenBudgetUsd { get; set; } = 10;
+
+        [JsonProperty("moneyBudgetUsd")]
+        public double MoneyBudgetUsd { get; set; }
+
+        [JsonProperty("moneyAutonomousThresholdUsd")]
+        public double MoneyAutonomousThresholdUsd { get; set; }
+
+        [JsonProperty("subAgentCap")]
+        public int SubAgentCap { get; set; } = 3;
+
+        [JsonProperty("expectedArtifactPaths")]
+        public List<string> ExpectedArtifactPaths { get; set; } = new();
+    }
+
+    public class AgentLongTermJobLink
+    {
+        [JsonProperty("jobId")]
+        public string JobId { get; set; } = Guid.NewGuid().ToString("N");
+
+        [JsonProperty("clientJobId")]
+        public string? ClientJobId { get; set; }
+
+        [JsonProperty("projectId")]
+        public string ProjectId { get; set; } = string.Empty;
+
+        [JsonProperty("directiveId")]
+        public string DirectiveId { get; set; } = string.Empty;
+
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("originatingMessageId")]
+        public string? OriginatingMessageId { get; set; }
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        [JsonProperty("lastObservedStatus")]
+        public string? LastObservedStatus { get; set; }
+
+        [JsonProperty("completionNotifiedAt")]
+        public DateTime? CompletionNotifiedAt { get; set; }
+
+        [JsonProperty("lastAttentionKey")]
+        public string? LastAttentionKey { get; set; }
+    }
+
+    public class AgentLongTermJobView
+    {
+        [JsonProperty("jobId")]
+        public string JobId { get; set; } = string.Empty;
+
+        [JsonProperty("clientJobId")]
+        public string? ClientJobId { get; set; }
+
+        [JsonProperty("projectId")]
+        public string ProjectId { get; set; } = string.Empty;
+
+        [JsonProperty("directiveId")]
+        public string DirectiveId { get; set; } = string.Empty;
+
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("goal")]
+        public string Goal { get; set; } = string.Empty;
+
+        [JsonProperty("status")]
+        public string Status { get; set; } = string.Empty;
+
+        [JsonProperty("requiresPlanApproval")]
+        public bool RequiresPlanApproval { get; set; }
+
+        [JsonProperty("attentionRequired")]
+        public bool AttentionRequired { get; set; }
+
+        [JsonProperty("attentionMessage")]
+        public string? AttentionMessage { get; set; }
+
+        [JsonProperty("attentionKey")]
+        public string? AttentionKey { get; set; }
+
+        [JsonProperty("result")]
+        public string? Result { get; set; }
+
+        [JsonProperty("artifactPaths")]
+        public List<string> ArtifactPaths { get; set; } = new();
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; }
+
+        [JsonProperty("completedAt")]
+        public DateTime? CompletedAt { get; set; }
+
+        [JsonProperty("lastUpdated")]
+        public DateTime LastUpdated { get; set; }
+    }
+
+    public class AgentNotification
+    {
+        [JsonProperty("notificationId")]
+        public string NotificationId { get; set; } = Guid.NewGuid().ToString("N");
+
+        [JsonProperty("kind")]
+        public string Kind { get; set; } = string.Empty;
+
+        [JsonProperty("title")]
+        public string Title { get; set; } = string.Empty;
+
+        [JsonProperty("body")]
+        public string Body { get; set; } = string.Empty;
+
+        [JsonProperty("conversationId")]
+        public string? ConversationId { get; set; }
+
+        [JsonProperty("requestId")]
+        public string? RequestId { get; set; }
+
+        [JsonProperty("jobId")]
+        public string? JobId { get; set; }
+
+        [JsonProperty("projectId")]
+        public string? ProjectId { get; set; }
+
+        [JsonProperty("artifactPaths")]
+        public List<string> ArtifactPaths { get; set; } = new();
+
+        [JsonProperty("createdAt")]
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+
+        [JsonProperty("readAt")]
+        public DateTime? ReadAt { get; set; }
     }
 
     /// <summary>A human-in-the-loop approval request for an irreversible computer-use action. Surfaced to

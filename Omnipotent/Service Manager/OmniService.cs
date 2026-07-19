@@ -321,6 +321,11 @@ namespace Omnipotent.Service_Manager
             }
             else
             {
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    cancellationToken.Dispose();
+                    cancellationToken = new CancellationTokenSource();
+                }
                 //serviceTask = Task.Run(ServiceMain, cancellationToken.Token);
                 serviceUptime = Stopwatch.StartNew();
                 serviceThread = new Thread(() =>
@@ -428,12 +433,13 @@ namespace Omnipotent.Service_Manager
         {
             try
             {
-                if (!ServiceActive)
+                if (!ServiceActive && (serviceThread == null || !serviceThread.IsAlive))
                 {
                     return true;
                 }
 
                 ServiceActive = false;
+                try { cancellationToken.Cancel(); } catch { }
                 ServiceQuitRequest?.Invoke();
                 await Task.Delay(500);
                 await ServiceLog("Ending " + name + " service.");

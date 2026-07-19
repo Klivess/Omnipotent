@@ -171,6 +171,7 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("- EXHAUST YOUR OWN OPTIONS BEFORE ASKING. You have a real browser, KliveMail (real inboxes — you can RECEIVE verification & password-reset emails), the encrypted credential vault, request_human, execute_csharp, and the whole live service graph. Before asking Klive for ANYTHING, ask \"can I get or do this myself?\" — need a password? check the vault and the browser's saved logins, or run the site's email password-RESET through KliveMail. Blocked by a captcha/2FA/login wall? call request_human. Wrong API method/shape? discover the right one (GetTypeSchema/GetObjectMembers) and continue. Always try alternative routes — not one attempt then a question.");
             sb.AppendLine("- ASK ONLY AS A LAST RESORT, ONCE, AND SPECIFICALLY. Stop for Klive only when something is genuinely his to give and you cannot obtain it by ANY means you have (a secret that exists nowhere you can reach, a real authorization/judgement call, or a physical-world action you cannot perform). When you must ask, ask ONE precise question that states what you already tried — never a vague \"how should I do this?\", and never offer a menu of choices you are equally capable of just picking yourself.");
             sb.AppendLine("- DON'T END A TURN WITH AN OFFER YOU COULD JUST FULFILL. \"Want me to…?\" / \"Should I…?\" about something within your power = just DO it and report the result. Reserve questions for genuine forks or truly missing inputs.");
+            sb.AppendLine("- DELEGATE LONG WORK: when Klive asks for work that should continue independently, in parallel, or beyond this chat session, call CreateLongTermJob(name, goal, tokenBudgetUsd) instead of keeping the interactive turn open or spawning a raw background task. Report the durable job ID; its progress and final artifacts appear in the website even after Klive leaves.");
             sb.AppendLine("- SAFETY STILL HOLDS. Driving hard NEVER means bypassing the approval gate for irreversible / money / outward actions, or exposing Klive's secrets. Pursue the goal THROUGH the tools and gates — relentless, but safe.");
             sb.AppendLine();
 
@@ -1181,15 +1182,13 @@ namespace Omnipotent.Services.KliveAgent
             AgentConversation conversation,
             string? senderName = null,
             Action<AgentProgressUpdate>? onProgress = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            AgentChatRunControl? runControl = null,
+            Action<AgentSteeringMessage>? onSteeringApplied = null)
         {
             try
             {
                 var turnStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                // Receipt time of the user's message, captured NOW: a long agentic turn can run for
-                // minutes, and the stored history timestamp should say when Klive spoke, not when
-                // the turn finished.
-                var messageReceivedAtUtc = DateTime.UtcNow;
                 // Accumulates the agent's conversational prose across iterations so the user can be
                 // shown it "talking" (via onProgress) while its scripts are still running.
                 var progressText = new StringBuilder();
@@ -1356,6 +1355,35 @@ namespace Omnipotent.Services.KliveAgent
                     else currentPrompt = text;
                 }
 
+                void ApplySteering(IReadOnlyList<AgentSteeringMessage>? messages)
+                {
+                    if (messages == null || messages.Count == 0) return;
+                    var guidance = new StringBuilder();
+                    guidance.AppendLine("[New user steering - apply this before continuing]");
+                    foreach (var steering in messages.OrderBy(x => x.CreatedAt))
+                    {
+                        steering.Status = "applied";
+                        steering.AppliedAt = DateTime.UtcNow;
+                        guidance.AppendLine(
+                            $"[{Data_Handling.TemporalFormat.StampMinute(steering.CreatedAt)}] {steering.SenderName}: {steering.Message}");
+                        try { onSteeringApplied?.Invoke(steering); } catch { }
+                        ReportProgress("steering", "_...applying new guidance_", new AgentActivityEvent
+                        {
+                            Iteration = Math.Max(1, iterationsDone),
+                            Kind = "steer",
+                            Text = steering.Message.Length > 200
+                                ? steering.Message.Substring(0, 200) + "..."
+                                : steering.Message
+                        });
+                    }
+
+                    string text = guidance.ToString().TrimEnd();
+                    if (useToolCalling)
+                        llm.AppendUserMessageToToolSession(llmSessionId, text);
+                    else
+                        currentPrompt = currentPrompt + "\n\n" + text;
+                }
+
                 // Adaptive reasoning effort for the upcoming LLM call. Cheap, on-track turns ask for LOW
                 // effort (no wasted reasoning tokens — the dominant per-turn latency cost). We escalate
                 // toward MEDIUM/HIGH only when the task shows it's hard: recent script errors, broken-output
@@ -1388,14 +1416,6 @@ namespace Omnipotent.Services.KliveAgent
                         ? partial + "\n\n_(Run stopped before completion.)_"
                         : "_(Run stopped before completion — no output was produced yet.)_";
                     try { llm.ResetSession(llmSessionId); } catch { }
-                    conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage, Timestamp = messageReceivedAtUtc });
-                    conversation.Messages.Add(new AgentMessage
-                    {
-                        Role = AgentMessageRole.Agent,
-                        Content = finalText,
-                        ScriptResults = allScriptsExecuted.Count > 0 ? new List<AgentScriptResult>(allScriptsExecuted) : null
-                    });
-                    conversation.LastUpdated = DateTime.UtcNow;
                     agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                         allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
                         turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
@@ -1424,6 +1444,10 @@ namespace Omnipotent.Services.KliveAgent
                     // Stopped between iterations (manual Stop / stall watchdog) — bail with a partial answer.
                     if (cancellationToken.IsCancellationRequested)
                         return BuildStoppedResponse();
+
+                    // Steering is a durable inbox on the active run. Consume it only at safe model
+                    // boundaries, never by launching another brain against the same provider session.
+                    ApplySteering(runControl?.Drain());
 
                     // Per-run budget guardrail (token/wall-clock). Soft-warn once at 80%; at 100% demand a
                     // final answer this turn and finalize regardless of what the model returns.
@@ -1637,8 +1661,23 @@ namespace Omnipotent.Services.KliveAgent
                                 continue;
                             }
 
-                            // Genuinely persistent empty: surface a truthful failure (same path as any
-                            // other LLM failure), not a fabricated persona response.
+                            // Genuinely persistent empty: only fail once steering intake has atomically
+                            // closed. A durable reservation may still be finishing its disk write.
+                            bool retryForSteering = false;
+                            while (runControl != null && !runControl.TrySeal(out var lateSteering))
+                            {
+                                if (lateSteering.Count > 0)
+                                {
+                                    ApplySteering(lateSteering);
+                                    retryForSteering = true;
+                                    break;
+                                }
+                                await Task.Delay(25, cancellationToken);
+                            }
+                            if (retryForSteering) continue;
+
+                            // Surface a truthful failure (same path as any other LLM failure), not a
+                            // fabricated persona response.
                             llm.ResetSession(llmSessionId);
                             agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                                 allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
@@ -1670,20 +1709,22 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
-                        llm.ResetSession(llmSessionId);
-
-                        conversation.Messages.Add(new AgentMessage { Role = AgentMessageRole.User, Content = userMessage, Timestamp = messageReceivedAtUtc });
-                        conversation.Messages.Add(new AgentMessage
+                        // Atomically close the steering inbox immediately before the actual return. If
+                        // guidance raced with this answer, apply it and give the model another turn.
+                        bool finalRetryForSteering = false;
+                        while (runControl != null && !runControl.TrySeal(out var finalSteering))
                         {
-                            Role = AgentMessageRole.Agent,
-                            Content = finalText,
-                            // Persist the code KliveAgent wrote+ran this turn (and its outputs) so it
-                            // can see its own prior actions on later turns and the UI can replay them.
-                            ScriptResults = allScriptsExecuted.Count > 0
-                                ? new List<AgentScriptResult>(allScriptsExecuted)
-                                : null
-                        });
-                        conversation.LastUpdated = DateTime.UtcNow;
+                            if (finalSteering.Count > 0)
+                            {
+                                ApplySteering(finalSteering);
+                                finalRetryForSteering = true;
+                                break;
+                            }
+                            await Task.Delay(25, cancellationToken);
+                        }
+                        if (finalRetryForSteering) continue;
+
+                        llm.ResetSession(llmSessionId);
 
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
@@ -2027,17 +2068,27 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine();
             }
 
+            // The coordinator persists the current user message before execution. Snapshot only
+            // completed history here so that durable acceptance does not duplicate [New Message].
+            List<AgentMessage> historySnapshot;
+            lock (conversation.SyncRoot)
+            {
+                historySnapshot = (conversation.Messages ?? new List<AgentMessage>())
+                    .Where(m => !string.Equals(m.DeliveryStatus, "running", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+            }
+
             // Budget-aware conversation history selection
-            if (conversation.Messages.Count > 0)
+            if (historySnapshot.Count > 0)
             {
                 var historyMessages = SelectHistoryMessages(
-                    conversation.Messages, userMessage, KliveAgentContextBudget.HistoryBudget);
+                    historySnapshot, userMessage, KliveAgentContextBudget.HistoryBudget);
 
                 if (historyMessages.Count > 0)
                 {
                     // Compaction: turns that fall before the retained window are summarised into a
                     // short synopsis rather than silently dropped, so the earlier thread survives.
-                    var earlierSummary = BuildEarlierSummary(conversation.Messages, historyMessages,
+                    var earlierSummary = BuildEarlierSummary(historySnapshot, historyMessages,
                         KliveAgentContextBudget.HistorySummaryBudget);
                     if (!string.IsNullOrWhiteSpace(earlierSummary))
                     {
