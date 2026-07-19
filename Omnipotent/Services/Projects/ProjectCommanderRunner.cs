@@ -1,6 +1,7 @@
 using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.ComputerControl;
 using System.Collections.Concurrent;
+using Newtonsoft.Json;
 
 namespace Omnipotent.Services.Projects
 {
@@ -276,6 +277,12 @@ namespace Omnipotent.Services.Projects
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
                 if (!await llm.SupportsNativeToolCallingAsync())
                     throw new InvalidOperationException("The Commander requires a remote LLM provider with native tool calling.");
+                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
+                {
+                    var credit = await parent.ProviderCredit.CheckAsync(cts.Token);
+                    if (credit.Status == OpenRouterCreditStatus.Exhausted)
+                        throw new OpenRouterCreditExhaustedException(credit);
+                }
 
                 var settings = parent.Settings.Get(projectID);
                 var modelRoutes = settings.CommanderRoutes.ToList();
@@ -544,6 +551,13 @@ namespace Omnipotent.Services.Projects
                             if (stuckTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated-call loop trips.";
+                                parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
+                                {
+                                    Kind = "loop-recovery",
+                                    RecordedBy = "commander",
+                                    ToolName = toolName,
+                                    Summary = $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the durable obstacle."
+                                });
                                 parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander",
                                     $"Stopped after {stuckTrips} repeated-call detections. The next attempt must use a different strategy, not repeat the same tool inputs."));
                                 goto done;
@@ -645,6 +659,28 @@ namespace Omnipotent.Services.Projects
             {
                 outcome = ProjectEventTypes.WakeCancelled;
                 outcomeText = "Wake cancelled because the project was paused, archived, or a recovery was requested.";
+            }
+            catch (OpenRouterCreditExhaustedException ex)
+            {
+                DateTime retryAt = DateTime.UtcNow.AddMinutes(15);
+                var failure = new ProjectExecutionFailure
+                {
+                    Category = ProjectFailureCategory.Capacity,
+                    Code = "OpenRouterCreditExhausted",
+                    Summary = ex.Message,
+                    Retryable = true,
+                    RetryAt = retryAt,
+                    WakeID = wakeID,
+                    Provider = "OpenRouter",
+                    HttpStatus = 402,
+                };
+                parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
+                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                    healthy: false, failure.Code, failure.Summary, retryAt);
+                outcomePayloadJson = JsonConvert.SerializeObject(new
+                    { provider = "OpenRouter", status = 402, code = failure.Code, remainingUsd = ex.Check.RemainingUsd });
+                outcome = ProjectEventTypes.WakeDeferred;
+                outcomeText = $"Wake deferred before model dispatch: {ex.Message} Automatic retry after {retryAt:O}.";
             }
             catch (RemoteLLMException ex)
             {
@@ -771,11 +807,9 @@ namespace Omnipotent.Services.Projects
                 bool madeUsefulProgress = verifiedProgressSequence.HasValue || productiveActions > 0;
                 bool continueAfterSlice = endedAtWorkSlice && madeUsefulProgress
                     && outcome == ProjectEventTypes.WakeCompleted;
-                if (!endedAtWorkSlice && outcome == ProjectEventTypes.WakeCompleted)
-                {
-                    var resume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
-                    if (resume?.Kind == "work-slice") parent.RuntimeState.ClearResumeAction(projectID, resume.ActionID);
-                }
+                var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
+                if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
+                    parent.RuntimeState.ClearResumeAction(projectID, consumedResume!.ActionID);
                 if (!DrainPendingTriggers(projectID) && continueAfterSlice)
                     ContinueProductiveWork(projectID);
             }

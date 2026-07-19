@@ -153,6 +153,34 @@ public class ProjectWakeStatusTests
         Assert.Contains("inspect the verification screen", status);
         Assert.DoesNotContain("(no closing status)", status);
     }
+
+    [Fact]
+    public void ConsumedWorkSliceResume_IsClearedRegardlessOfWakeOutcome()
+    {
+        var resume = new ProjectResumeAction { Kind = "work-slice", Summary = "continue" };
+
+        Assert.True(ProjectWorkSliceBoundary.ShouldClearConsumedResume(false, resume));
+        Assert.False(ProjectWorkSliceBoundary.ShouldClearConsumedResume(true, resume));
+        Assert.False(ProjectWorkSliceBoundary.ShouldClearConsumedResume(false,
+            new ProjectResumeAction { Kind = "loop-recovery", Summary = "change strategy" }));
+    }
+
+    [Theory]
+    [InlineData("HTTP 402 from the API", "retry 402 API")]
+    [InlineData("Received a DM through Discord", "DM status")]
+    public void EventScoring_RetainsMeaningfulShortTokens(string eventText, string query)
+    {
+        double matching = ProjectsContextBudget.ScoreEvent(eventText, query, 20);
+        double unrelated = ProjectsContextBudget.ScoreEvent("unrelated historical event", query, 20);
+
+        Assert.True(matching > unrelated);
+    }
+
+    [Fact]
+    public void EventScoring_HasARecencyFloor()
+    {
+        Assert.True(ProjectsContextBudget.ScoreEvent("unrelated", "query", 100_000) >= 0.06);
+    }
 }
 
 public class KliveMailboxIntegrityTests

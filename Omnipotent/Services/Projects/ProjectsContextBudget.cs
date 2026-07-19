@@ -1,3 +1,5 @@
+using System.Text.RegularExpressions;
+
 namespace Omnipotent.Services.Projects
 {
     /// <summary>
@@ -9,6 +11,11 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public static class ProjectsContextBudget
     {
+        private static readonly HashSet<string> QueryStopWords = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is",
+            "it", "of", "on", "or", "that", "the", "this", "to", "was", "were", "with"
+        };
         /// <summary>The standing digest (goal, plan, org chart, budget, open threads).</summary>
         public const int DigestBudget = 6000;
 
@@ -104,18 +111,21 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public static double ScoreEvent(string eventText, string queryText, int indexFromEnd)
         {
-            double recencyScore = 1.0 / (1.0 + indexFromEnd);
+            double recencyScore = Math.Max(0.1, 1.0 / (1.0 + Math.Max(0, indexFromEnd)));
 
             double keywordScore = 0;
             if (!string.IsNullOrWhiteSpace(queryText) && !string.IsNullOrWhiteSpace(eventText))
             {
-                var queryTerms = queryText.ToLowerInvariant()
-                    .Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                    .Where(t => t.Length > 3)
-                    .ToHashSet();
+                var queryTerms = Regex.Matches(queryText, @"[\p{L}\p{N}]+")
+                    .Select(m => m.Value)
+                    .Where(t => t.Length >= 2 && !QueryStopWords.Contains(t))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-                var matchCount = queryTerms.Count(term =>
-                    eventText.Contains(term, StringComparison.OrdinalIgnoreCase));
+                var eventTerms = Regex.Matches(eventText, @"[\p{L}\p{N}]+")
+                    .Select(m => m.Value)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var matchCount = queryTerms.Count(eventTerms.Contains);
 
                 keywordScore = queryTerms.Count > 0
                     ? (double)matchCount / queryTerms.Count

@@ -199,6 +199,7 @@ public sealed class ProjectDirectiveStoreTests : IDisposable
         Assert.Contains(preferred.DirectiveID, prompt);
         Assert.Contains("additional durable task(s)", prompt);
         Assert.DoesNotContain("[...truncated]", prompt);
+        Assert.True(ProjectsContextBudget.EstimateTokens(prompt) <= ProjectsContextBudget.DirectivesBudget);
     }
 
     [Fact]

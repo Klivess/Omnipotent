@@ -165,4 +165,33 @@ else:
     output = ((result.get("result") or {}).get("value"))
     if output is None:
         raise RuntimeError("Runtime.evaluate returned no inspectable value for the selected visible tab.")
+
+# Detect human-verification gates on every inspectable mode, before an agent burns retries trying
+# controls that automation cannot complete. DOM selectors catch reCAPTCHA/hCaptcha/Turnstile;
+# bounded visible-text signals cover provider-hosted interstitials.
+if mode != "tabs" and isinstance(output, dict):
+    challenge_expression = r"""
+    (() => {
+      const signals = [];
+      const visible = x => {
+        const r = x.getBoundingClientRect(); const s = getComputedStyle(x);
+        return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
+      };
+      const selectors = ['.g-recaptcha','.h-captcha','[data-sitekey]','[name="cf-turnstile-response"]',
+        'iframe[src*="recaptcha"]','iframe[src*="hcaptcha"]','iframe[src*="challenges.cloudflare.com"]'];
+      for (const selector of selectors) {
+        if ([...document.querySelectorAll(selector)].some(visible)) signals.push('visible selector: ' + selector);
+      }
+      const text = (document.body?.innerText || '').slice(0, 6000).toLowerCase();
+      for (const marker of ['verify you are human','complete the security check','checking your browser',
+        'security verification','captcha']) {
+        if (text.includes(marker)) signals.push('visible text: ' + marker);
+      }
+      return {detected: signals.length > 0, signals: [...new Set(signals)].slice(0,8)};
+    })()
+    """
+    challenge_result = cdp(ws_url, "Runtime.evaluate", {
+        "expression": challenge_expression, "returnByValue": True, "awaitPromise": True
+    })
+    output["humanChallenge"] = ((challenge_result.get("result") or {}).get("value")) or {"detected": False, "signals": []}
 print(json.dumps(output, indent=2, ensure_ascii=False))

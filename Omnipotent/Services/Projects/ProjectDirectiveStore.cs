@@ -16,6 +16,7 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public sealed class ProjectDirectiveStore
     {
+        private const int OmissionNoticeReserveTokens = 64;
         public const int MaxDirectivesPerProject = 256;
         public const int MaxRuleLength = 1_000;
         public const int MaxTaskLength = 4_000;
@@ -253,34 +254,39 @@ namespace Omnipotent.Services.Projects
                 .OrderByDescending(x => string.Equals(x.DirectiveID, preferredDirectiveID, StringComparison.OrdinalIgnoreCase))
                 .ThenByDescending(x => x.Priority).ThenByDescending(x => x.CreatedAt).ToList();
 
-            var rendered = new List<string>();
-            int used = 0;
+            var renderedRules = new List<string>();
             foreach (var rule in rules)
-            {
-                string text = RenderForPrompt(rule);
-                rendered.Add(text);
-                used += ProjectsContextBudget.EstimateTokens(text);
-            }
+                renderedRules.Add(RenderForPrompt(rule));
 
+            var selectedWork = new List<string>();
             int omitted = 0;
             foreach (var item in work)
             {
                 string text = RenderForPrompt(item);
-                int cost = ProjectsContextBudget.EstimateTokens(text);
-                if (used + cost > ProjectsContextBudget.DirectivesBudget)
+                string candidate = string.Join("\n", renderedRules.Concat(selectedWork).Append(text));
+                if (ProjectsContextBudget.EstimateTokens(candidate) >
+                    ProjectsContextBudget.DirectivesBudget - OmissionNoticeReserveTokens)
                 {
                     omitted++;
                     continue;
                 }
-                rendered.Add(text);
-                used += cost;
+                selectedWork.Add(text);
             }
+
+            var rendered = renderedRules.Concat(selectedWork).ToList();
             if (omitted > 0)
             {
-                string note = $"[{omitted} additional durable task(s) are queued but not expanded in this seed. " +
+                string Notice() => $"[{omitted} additional durable task(s) are queued but not expanded in this seed. " +
                     "Use list_project_directives before declaring the directive queue empty.]";
-                if (used + ProjectsContextBudget.EstimateTokens(note) <= ProjectsContextBudget.DirectivesBudget)
-                    rendered.Add(note);
+                string note = Notice();
+                while (selectedWork.Count > 0 && ProjectsContextBudget.EstimateTokens(
+                    string.Join("\n", renderedRules.Concat(selectedWork).Append(note))) > ProjectsContextBudget.DirectivesBudget)
+                {
+                    selectedWork.RemoveAt(selectedWork.Count - 1);
+                    omitted++;
+                    note = Notice();
+                }
+                rendered = renderedRules.Concat(selectedWork).Append(note).ToList();
             }
             return string.Join("\n", rendered);
         }
@@ -443,12 +449,14 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private static void EnsureRulePromptCapacity(IEnumerable<ProjectDirective> directives)
         {
-            int tokens = directives.Where(x => x.Kind == ProjectDirectiveKind.Rule &&
+            int tokens = ProjectsContextBudget.EstimateTokens(string.Join("\n", directives
+                .Where(x => x.Kind == ProjectDirectiveKind.Rule &&
                     x.Status != ProjectDirectiveStatus.Revoked && x.Status != ProjectDirectiveStatus.Failed)
-                .Sum(x => ProjectsContextBudget.EstimateTokens(RenderForPrompt(x)));
-            if (tokens > ProjectsContextBudget.DirectivesBudget)
+                .Select(RenderForPrompt)));
+            if (tokens > ProjectsContextBudget.DirectivesBudget - OmissionNoticeReserveTokens)
                 throw new InvalidOperationException(
-                    $"Standing rules exceed the durable-directives prompt capacity ({ProjectsContextBudget.DirectivesBudget} tokens). " +
+                    $"Standing rules exceed the durable-directives prompt capacity " +
+                    $"({ProjectsContextBudget.DirectivesBudget - OmissionNoticeReserveTokens} tokens plus queue notice reserve). " +
                     "Replace or revoke an existing rule instead of adding one that agents could not all see.");
         }
 

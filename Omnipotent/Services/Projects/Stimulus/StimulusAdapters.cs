@@ -393,7 +393,7 @@ namespace Omnipotent.Services.Projects.Stimulus
             {
                 try
                 {
-                    if (!DiscordMatches(hook, msg)) continue;
+                    if (!DiscordRouteMatches(hook, msg)) continue;
                     string where = msg.IsPrivate ? "DM" : $"channel {msg.ChannelId}";
                     string payload = $"Discord message in {where} from {msg.AuthorName} ({msg.AuthorId}):\n{Truncate(msg.Content, 800)}";
                     await bus.IngestAsync(hook, payload);
@@ -415,15 +415,15 @@ namespace Omnipotent.Services.Projects.Stimulus
             return true;
         }
 
-        private bool DiscordMatches(StimulusHookRecord hook, InboundDiscordStimulus msg)
+        // Channel and author are routing scope. Content recognition belongs in StimulusAgent so
+        // rejection is observable and the hook's natural-language criterion is actually reached.
+        private bool DiscordRouteMatches(StimulusHookRecord hook, InboundDiscordStimulus msg)
         {
             var spec = ParseSpec(hook.SourceSpecJson);
             string? channelId = spec["channelId"]?.Value<string>();
             string? authorId = spec["authorId"]?.Value<string>();
-            string? contains = spec["contains"]?.Value<string>();
             if (!string.IsNullOrWhiteSpace(channelId) && msg.ChannelId != channelId) return false;
             if (!string.IsNullOrWhiteSpace(authorId) && msg.AuthorId != authorId) return false;
-            if (!string.IsNullOrWhiteSpace(contains) && msg.Content.IndexOf(contains, StringComparison.OrdinalIgnoreCase) < 0) return false;
             return true;
         }
 

@@ -225,7 +225,7 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public async Task DuplicateTopicAndBriefing_ReusesExistingAdviceBeforeAnotherCouncilIsPersisted()
+        public async Task DuplicateTopicAndBriefing_CanBeRetestedOnALaterWake()
         {
             var h = new Harness();
             string pid = NewProjectId();
@@ -236,10 +236,62 @@ namespace Omnipotent.Tests.Projects
             var duplicate = await h.Runner.ConveneAsync(NewProject(pid), "w2", "  CHOOSE   launch path ", " evidence a AND b ",
                 null, "routine", "decision", "m", 5, 10, CancellationToken.None);
 
+            Assert.Equal(CouncilStatus.Completed, duplicate.Status);
+            Assert.Equal(2, h.Store.List(pid).Count);
+        }
+
+        [Fact]
+        public async Task DuplicateTopicAndBriefing_IsDeduplicatedWithinTheSameWake()
+        {
+            var h = new Harness();
+            string pid = NewProjectId();
+            var first = await h.Runner.ConveneAsync(NewProject(pid), "w1", "Choose launch path", "Evidence A and B",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            var duplicate = await h.Runner.ConveneAsync(NewProject(pid), "w1", " choose LAUNCH path ", " evidence a and B ",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, first.Status);
             Assert.Equal(CouncilStatus.Failed, duplicate.Status);
-            Assert.Contains("matching", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("new evidence", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("wake", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
             Assert.Single(h.Store.List(pid));
+        }
+
+        [Fact]
+        public async Task CostCeiling_StopsLaunchingTurnsAndReturnsPartialEvidence()
+        {
+            var h = new Harness();
+            h.Runner.QueryAsync = (sid, sys, user, routes, max, ct) =>
+            {
+                lock (h.QueryCalls) h.QueryCalls.Add((sid, user));
+                return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "OPENING", 100, 50, "gen", 0.03));
+            };
+            string pid = NewProjectId();
+
+            var session = await h.Runner.ConveneAsync(NewProject(pid), "w1", "T", "B", null,
+                "routine", "decision", new[] { "m" }, 5, 10, maxCostUsd: 0.05, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Partial, session.Status);
+            Assert.Equal(2, h.QueryCalls.Count);
+            Assert.Empty(h.ContinueCalls);
+            Assert.Contains("cost ceiling", session.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.StartsWith("COUNCIL PARTIAL VERDICT", ProjectCouncilRunner.FormatForCommander(session));
+            Assert.Equal(ProjectEventTypes.CouncilVerdict, h.Log.ReadSince(pid, 0).Last().Type);
+        }
+
+        [Fact]
+        public async Task MidCouncilBudgetPause_IsPartialRatherThanFailed()
+        {
+            var h = new Harness();
+            h.Runner.IsBudgetPaused = _ => h.SpendCalls > 0;
+            string pid = NewProjectId();
+
+            var session = await h.Runner.ConveneAsync(NewProject(pid), "w1", "T", "B", null,
+                "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Partial, session.Status);
+            Assert.NotEmpty(session.VerdictText!);
+            Assert.StartsWith("COUNCIL PARTIAL VERDICT", ProjectCouncilRunner.FormatForCommander(session));
         }
 
         [Fact]

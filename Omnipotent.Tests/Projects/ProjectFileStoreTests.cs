@@ -130,8 +130,10 @@ public sealed class ProjectFileStoreTests : IDisposable
     [Fact]
     public async Task ManagedMetadata_IsVisibleAndReadable_ButRemainsImmutable()
     {
+        var rootListing = store.List(ProjectID, new ProjectFileListRequest { Recursive = true });
         var listed = store.List(ProjectID, new ProjectFileListRequest { Directory = ".klive", Recursive = true });
 
+        Assert.DoesNotContain(rootListing.Entries, x => x.Path.StartsWith(".klive", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(listed.Entries, x => x.Path == ".klive/manifest.json");
         Assert.Contains("Derived metadata", await store.ReadTextAsync(ProjectID, "/project/.klive/manifest.json"));
         await Assert.ThrowsAsync<ProjectFileException>(() =>

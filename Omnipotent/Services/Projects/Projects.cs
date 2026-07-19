@@ -51,6 +51,7 @@ namespace Omnipotent.Services.Projects
         public ProjectSettingsStore Settings { get; private set; } = null!;
         public ProjectVault Vault { get; private set; } = null!;
         public ProjectBudgetLedger Budget { get; private set; } = null!;
+        public OpenRouterCreditChecker ProviderCredit { get; private set; } = null!;
         public ProjectTierRouter TierRouter { get; private set; } = null!;
         public ProjectGateManager Gates { get; private set; } = null!;
         public ProjectSubAgentManager SubAgents { get; private set; } = null!;
@@ -141,9 +142,11 @@ namespace Omnipotent.Services.Projects
             // Phase 3: orchestration subsystems.
             Settings = new ProjectSettingsStore();
             Vault = new ProjectVault(msg => ServiceLog(msg));
+            Func<Task<string?>> openRouterToken = () => GetStringOmniSettingNullable("OpenRouterLLMToken");
             var costFetcher = new OpenRouterCostFetcher(
-                tokenProvider: () => GetStringOmniSettingNullable("OpenRouterLLMToken"),
+                tokenProvider: openRouterToken,
                 log: msg => ServiceLog(msg));
+            ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg));
             // Alert Klives when a project auto-pauses on budget exhaustion (checks DiscordManager at
             // fire time, so it works even if Discord came up after the ledger was created).
@@ -1066,7 +1069,8 @@ namespace Omnipotent.Services.Projects
                 {
                     var s = Settings.Get(project.ProjectID);
                     var session = await CouncilRunner.ConveneAsync(project, wakeID, topic, briefing, roles,
-                        urgency, purpose, s.CouncilRoutes, s.CouncilMaxPerWake, s.CouncilMaxPerDay, ct2);
+                        urgency, purpose, s.CouncilRoutes, s.CouncilMaxPerWake, s.CouncilMaxPerDay,
+                        s.CouncilMaxCostUsd, ct2);
                     return ProjectCouncilRunner.FormatForCommander(session);
                 },
                 StartAgentAsync = (agent, objective) =>

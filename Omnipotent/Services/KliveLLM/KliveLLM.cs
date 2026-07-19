@@ -426,6 +426,13 @@ namespace Omnipotent.Services.KliveLLM
             return await GetActiveProviderAsync() != LLMProvider.Local;
         }
 
+        /// <summary>Projects uses this to run OpenRouter-specific credit preflight only when its
+        /// ordinary wake requests will actually use OpenRouter.</summary>
+        public async Task<bool> IsOpenRouterActiveAsync()
+        {
+            return await GetActiveProviderAsync() == LLMProvider.OpenRouter;
+        }
+
         /// <summary>Begin (or reset) a tool-calling session, seeding its structured message log with the
         /// system prompt. Subsequent turns are appended via AppendUserMessageToToolSession / AppendToolResult.</summary>
         public void StartToolSession(string sessionId, string? systemPrompt)

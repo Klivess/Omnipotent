@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.Projects
@@ -28,8 +29,12 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string DigestPath(string projectID) => Path.Combine(root, projectID + ".digest.json");
 
+        // /projects/digest serves this straight to the website; a rebuild must invalidate it.
+        private static string CacheKey(string projectID) => "projects:digest:" + projectID;
+
         public ProjectDigest GetDigest(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID))
             {
                 string path = DigestPath(projectID);
@@ -55,12 +60,15 @@ namespace Omnipotent.Services.Projects
                 string tmp = path + ".tmp";
                 File.WriteAllText(tmp, JsonConvert.SerializeObject(digest, Formatting.Indented));
                 File.Move(tmp, path, overwrite: true);
+                CacheDeps.Bump(CacheKey(digest.ProjectID));
             }
         }
 
         /// <summary>All digests still pointing at an active wake (startup crash recovery).</summary>
         public List<ProjectDigest> AllDigestsWithActiveWakes()
         {
+            // A directory scan's result set isn't a version the model can track (see ProjectRuntimeStateStore).
+            CacheDeps.MarkUncacheable("digest directory scan");
             var list = new List<ProjectDigest>();
             if (!Directory.Exists(root)) return list;
             foreach (var f in Directory.EnumerateFiles(root, "*.digest.json"))

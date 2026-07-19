@@ -9,7 +9,7 @@ namespace Omnipotent.Services.Projects
 
     /// <summary>
     /// Orchestrates an adversarial council: a panel of role-played LLM seats plus a Chair that the
-    /// Commander convenes for a high-stakes decision. Three rounds — parallel openings, parallel
+    /// Commander convenes for a high-stakes decision. Three rounds — budget-aware openings,
     /// rebuttals (each seat attacks the others in its own continued session), then a single Chair
     /// synthesis. The Chair's output is the verdict returned to the Commander.
     ///
@@ -64,11 +64,17 @@ namespace Omnipotent.Services.Projects
         public Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
             string[]? roles, string urgency, string purpose, string model, int maxPerWake, int maxPerDay, CancellationToken ct)
             => ConveneAsync(project, wakeID, topic, briefing, roles, urgency, purpose,
-                (IReadOnlyList<string>)new[] { model }, maxPerWake, maxPerDay, ct);
+                (IReadOnlyList<string>)new[] { model }, maxPerWake, maxPerDay, double.PositiveInfinity, ct);
+
+        public Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
+            string[]? roles, string urgency, string purpose, IReadOnlyList<string> configuredRoutes,
+            int maxPerWake, int maxPerDay, CancellationToken ct) =>
+            ConveneAsync(project, wakeID, topic, briefing, roles, urgency, purpose, configuredRoutes,
+                maxPerWake, maxPerDay, double.PositiveInfinity, ct);
 
         public async Task<CouncilSession> ConveneAsync(Project project, string? wakeID, string topic, string briefing,
             string[]? roles, string urgency, string purpose, IReadOnlyList<string> configuredRoutes,
-            int maxPerWake, int maxPerDay, CancellationToken ct)
+            int maxPerWake, int maxPerDay, double maxCostUsd, CancellationToken ct)
         {
             string pid = project.ProjectID;
             var modelRoutes = configuredRoutes.Where(x => !string.IsNullOrWhiteSpace(x))
@@ -109,12 +115,17 @@ namespace Omnipotent.Services.Projects
 
                 string sharedContext = BuildSharedContext(project, session);
 
-                // ── Round 1: openings (parallel) ──
-                var openingTasks = panel.Select(role => RunOpeningAsync(session, role, sharedContext, modelRoutes, ct)).ToArray();
-                var openings = await Task.WhenAll(openingTasks);
+                // ── Round 1: openings (sequential for spend enforcement) ──
                 var openingByRole = new Dictionary<string, string>(StringComparer.Ordinal);
-                for (int i = 0; i < panel.Length; i++)
-                    if (openings[i] != null) openingByRole[panel[i]] = openings[i]!;
+                foreach (string role in panel)
+                {
+                    string? opening = await RunOpeningAsync(session, role, sharedContext, modelRoutes, ct);
+                    if (opening != null) openingByRole[role] = opening;
+                    if (ReachedCostCeiling(session, maxCostUsd))
+                        return FinishAtCostCeiling(session, openingByRole, maxCostUsd);
+                    if (IsBudgetPaused?.Invoke(pid) == true)
+                        return FinishOnBudget(session, openingByRole);
+                }
 
                 if (openingByRole.Count < 2)
                 {
@@ -128,11 +139,16 @@ namespace Omnipotent.Services.Projects
                 if (IsBudgetPaused?.Invoke(pid) == true)
                     return FinishOnBudget(session, openingByRole);
 
-                // ── Round 2: rebuttals (parallel) — only seats that opened ──
+                // ── Round 2: rebuttals (sequential for spend enforcement) — only seats that opened ──
                 var respondents = panel.Where(openingByRole.ContainsKey).ToArray();
-                var rebuttalTasks = respondents
-                    .Select(role => RunRebuttalAsync(session, role, openingByRole, modelRoutes, ct)).ToArray();
-                await Task.WhenAll(rebuttalTasks);
+                foreach (string role in respondents)
+                {
+                    await RunRebuttalAsync(session, role, openingByRole, modelRoutes, ct);
+                    if (ReachedCostCeiling(session, maxCostUsd))
+                        return FinishAtCostCeiling(session, openingByRole, maxCostUsd);
+                    if (IsBudgetPaused?.Invoke(pid) == true)
+                        return FinishOnBudget(session, openingByRole);
+                }
 
                 if (IsBudgetPaused?.Invoke(pid) == true)
                     return FinishOnBudget(session, openingByRole);
@@ -191,9 +207,11 @@ namespace Omnipotent.Services.Projects
         /// <summary>Formats a finished council into the text handed back to the Commander as the tool result.</summary>
         public static string FormatForCommander(CouncilSession session)
         {
-            if (session.Status != CouncilStatus.Completed || string.IsNullOrWhiteSpace(session.VerdictText))
+            if (session.Status is not (CouncilStatus.Completed or CouncilStatus.Partial)
+                || string.IsNullOrWhiteSpace(session.VerdictText))
                 return session.Error ?? "The council did not reach a verdict.";
-            return $"COUNCIL VERDICT [{session.RecommendationClass}] ({session.Roles.Count} seats + Chair, {session.Statements.Count} statements, " +
+            string label = session.Status == CouncilStatus.Partial ? "COUNCIL PARTIAL VERDICT" : "COUNCIL VERDICT";
+            return $"{label} [{session.RecommendationClass}] ({session.Roles.Count} seats + Chair, {session.Statements.Count} statements, " +
                    $"${session.TotalCostUsd:0.####} spent):\n\n{session.VerdictText}\n\n" +
                    "(This is advisory — you decide and remain accountable. The full transcript is on the timeline.)";
         }
@@ -253,14 +271,37 @@ namespace Omnipotent.Services.Projects
 
         private CouncilSession FinishOnBudget(CouncilSession session, Dictionary<string, string> openingByRole)
         {
-            session.Status = CouncilStatus.Failed;
-            session.Error = "Council stopped early — the project ran out of token budget mid-deliberation.";
-            session.VerdictText = "Council incomplete (budget exhausted). Panel openings so far:\n\n" +
-                string.Join("\n\n", openingByRole.Select(kv => $"[{kv.Key}] {kv.Value}"));
+            return FinishPartial(session,
+                "Council stopped early because the project ran out of token budget mid-deliberation.",
+                "Council incomplete (budget exhausted). Panel positions so far:\n\n" +
+                string.Join("\n\n", openingByRole.Select(kv => $"[{kv.Key}] {kv.Value}")));
+        }
+
+        private CouncilSession FinishAtCostCeiling(CouncilSession session,
+            Dictionary<string, string> openingByRole, double maxCostUsd)
+        {
+            return FinishPartial(session,
+                $"Council stopped at its configured ${maxCostUsd:0.####} per-session cost ceiling.",
+                $"Council stopped at its configured cost ceiling after {session.Statements.Count} statement(s). " +
+                "Panel positions so far:\n\n" +
+                string.Join("\n\n", openingByRole.Select(kv => $"[{kv.Key}] {kv.Value}")));
+        }
+
+        private CouncilSession FinishPartial(CouncilSession session, string error, string verdict)
+        {
+            session.Status = CouncilStatus.Partial;
+            session.Error = error;
+            session.VerdictText = verdict;
             session.CompletedAt = DateTime.UtcNow;
             store.Update(session);
+            AppendEvent(session, ProjectEventTypes.CouncilVerdict, "commander",
+                $"Council partial verdict — {Trunc(session.Topic, 100)}: {Trunc(session.VerdictText, 1500)}",
+                new { councilID = session.CouncilID, partial = true, totalCostUsd = session.TotalCostUsd, reason = error });
             return session;
         }
+
+        private static bool ReachedCostCeiling(CouncilSession session, double maxCostUsd) =>
+            double.IsFinite(maxCostUsd) && maxCostUsd > 0 && session.TotalCostUsd >= maxCostUsd;
 
         // ── recording ──
 
@@ -275,9 +316,8 @@ namespace Omnipotent.Services.Projects
                 CompletionTokens = turn.CompletionTokens,
                 CostUsd = turn.CostUsd ?? 0,
             };
-            // Round 1 and 2 run their panelists in parallel and all mutate this one session object.
-            // Hold the lock across the persist too — store.Update serializes Statements, so another
-            // panelist adding to the list mid-serialize would throw "collection modified".
+            // Hold the session lock across the persisted aggregate update so cancellation and any
+            // future concurrent recorder cannot serialize a half-applied statement/cost pair.
             lock (session)
             {
                 session.Statements.Add(statement);

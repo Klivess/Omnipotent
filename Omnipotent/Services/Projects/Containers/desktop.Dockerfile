@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         thunar mousepad ristretto desktop-base adwaita-icon-theme \
         firefox-esr chromium \
         xdotool wmctrl xclip x11-utils x11-xserver-utils \
-        curl ca-certificates fonts-dejavu \
+        curl ca-certificates fonts-dejavu util-linux \
         python3 python3-pip python3-venv python3-websocket \
         ffmpeg \
         sudo \

@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System.Globalization;
 
 namespace Omnipotent.Services.Projects
 {
@@ -79,6 +80,7 @@ namespace Omnipotent.Services.Projects
         public int ComputerTypingDelayMs { get; set; } = Defaults.ComputerTypingDelayMs;
         public int CouncilMaxPerDay { get; set; } = Defaults.CouncilMaxPerDay;
         public int CouncilMaxPerWake { get; set; } = Defaults.CouncilMaxPerWake;
+        public double CouncilMaxCostUsd { get; set; } = Defaults.CouncilMaxCostUsd;
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
         public IReadOnlyList<string> RoutesForTier(ProjectAgentTier tier) => tier switch
@@ -146,6 +148,7 @@ namespace Omnipotent.Services.Projects
                 case "councilfallbackmodel": case "automaticmodelfallbackenabled": return true;
                 case "councilmaxperday": CouncilMaxPerDay = Math.Clamp(ParseInt(Text(value), Defaults.CouncilMaxPerDay), 0, 24); break;
                 case "councilmaxperwake": CouncilMaxPerWake = Math.Clamp(ParseInt(Text(value), Defaults.CouncilMaxPerWake), 0, 5); break;
+                case "councilmaxcostusd": CouncilMaxCostUsd = Math.Clamp(ParseDouble(Text(value), Defaults.CouncilMaxCostUsd), 0.01, 5); break;
                 case "commandermaxoutputtokens": CommanderMaxOutputTokens = Math.Clamp(ParseInt(Text(value), Defaults.CommanderMaxOutputTokens), 512, 32768); break;
                 case "subagentmaxoutputtokens": SubAgentMaxOutputTokens = Math.Clamp(ParseInt(Text(value), Defaults.SubAgentMaxOutputTokens), 512, 32768); break;
                 case "utilitymaxoutputtokens": UtilityMaxOutputTokens = Math.Clamp(ParseInt(Text(value), Defaults.UtilityMaxOutputTokens), 256, 8192); break;
@@ -200,6 +203,8 @@ namespace Omnipotent.Services.Projects
         private static string Text(JToken value) => value.Type == JTokenType.String ? value.Value<string>() ?? "" : value.ToString();
         private static bool ParseBool(string v) => v.Trim().ToLowerInvariant() is "true" or "1" or "yes" or "on";
         private static int ParseInt(string v, int fallback) => int.TryParse(v, out var parsed) ? parsed : fallback;
+        private static double ParseDouble(string v, double fallback) =>
+            double.TryParse(v, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : fallback;
 
         public static class Defaults
         {
@@ -214,6 +219,7 @@ namespace Omnipotent.Services.Projects
             public const string StimulusFallbackModel = "openai/gpt-4.1-mini";
             public const int CouncilMaxPerDay = 6;
             public const int CouncilMaxPerWake = 2;
+            public const double CouncilMaxCostUsd = 0.10;
             public const int CommanderMaxOutputTokens = 8192;
             public const int SubAgentMaxOutputTokens = 6144;
             public const int UtilityMaxOutputTokens = 1800;

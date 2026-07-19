@@ -276,13 +276,30 @@ namespace Omnipotent.Services.Projects.Containers
                 last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 30, ct);
                 string stdout = last.Stdout.Trim();
                 if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
-                    return ContainerToolResult.Ok(ComputerAudit.Truncate(stdout, 24000));
+                    return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateHumanChallenge(stdout), 24000));
                 await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
             }
             string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
                 .Where(x => !string.IsNullOrWhiteSpace(x)));
             return ContainerToolResult.Fail("Browser inspection failed after retrying the existing visible browser: " +
                 ComputerAudit.Truncate(detail, 1600) + " Continue with visible screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
+        }
+
+        internal static string AnnotateHumanChallenge(string inspectionJson)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(inspectionJson);
+                if (document.RootElement.TryGetProperty("humanChallenge", out var challenge)
+                    && challenge.ValueKind == JsonValueKind.Object
+                    && challenge.TryGetProperty("detected", out var detected)
+                    && detected.ValueKind is JsonValueKind.True)
+                    return "HUMAN_CHALLENGE_DETECTED: CAPTCHA or human verification is visible. " +
+                        "Do not retry automated signup controls; preserve the page and request human verification through the commander.\n" +
+                        inspectionJson;
+            }
+            catch (JsonException) { }
+            return inspectionJson;
         }
 
         private async Task<ContainerToolResult> ClickBrowserControlAsync(JsonElement a, CancellationToken ct)

@@ -244,6 +244,19 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task DiscordEmptyCriterion_RejectsWithoutCallingModel()
+        {
+            bool called = false;
+            var agent = Agent((_, _) => { called = true; return Task.FromResult<string?>("CONFIRM: x"); });
+            var env = new StimulusEnvelope { SourceKind = "discord", Payload = "anything" };
+
+            var result = await agent.EvaluateAsync(env, "");
+
+            Assert.False(result.Confirmed);
+            Assert.False(called);
+        }
+
+        [Fact]
         public async Task PreferredAndFallbackRoutes_ArePassedAsOneOrderedListToOpenRouter()
         {
             // Fallback now lives at the OpenRouter level: the agent makes ONE call handing the whole
@@ -399,6 +412,55 @@ namespace Omnipotent.Tests.Projects
             Assert.Null(mgr.GetArmInfo(h.HookID));
             mgr.Dispose();
         }
+
+        [Fact]
+        public async Task DiscordContentFilter_ReachesTriageInsteadOfAdapterPrefilter()
+        {
+            var log = new ProjectEventLogStore(_ => { });
+            var hooks = new StimulusHookStore(log);
+            var queue = new StimulusQueue(_ => { });
+            var projects = new ProjectStore(_ => { });
+            var project = projects.CreateProject("discord", "test", 100, 100, 10, 5);
+            string uniqueFilter = "urgent-" + Guid.NewGuid().ToString("N");
+            int matchingTriageCalls = 0;
+            string? promptSeen = null;
+            var triage = new StimulusAgent((_, prompt, _) =>
+            {
+                if (prompt.Contains(uniqueFilter, StringComparison.Ordinal))
+                {
+                    matchingTriageCalls++;
+                    promptSeen = prompt;
+                }
+                return Task.FromResult<string?>("REJECT: literal absent");
+            }, _ => ((IReadOnlyList<string>)new[] { "free" },
+                (IReadOnlyList<string>)Array.Empty<string>()), _ => { });
+            var bus = new StimulusBus(hooks, queue, triage, log, projects, _ => { });
+            var manager = new StimulusAdapterManager(bus, hooks, _ => { });
+            Func<InboundDiscordStimulus, Task>? inbound = null;
+            manager.DiscordSource = handler =>
+            {
+                inbound = handler;
+                return new ActionDisposable(() => { });
+            };
+            hooks.Create(new StimulusHookRecord
+            {
+                ProjectID = project.ProjectID,
+                SourceKind = "discord",
+                SourceSpecJson = "{\"contains\":\"" + uniqueFilter + "\"}",
+                RecognitionCriterion = ""
+            });
+            manager.ArmAll();
+
+            var handler = Assert.IsType<Func<InboundDiscordStimulus, Task>>(inbound);
+            await handler(new InboundDiscordStimulus
+            {
+                ChannelId = "general", AuthorId = "u1", AuthorName = "person", Content = "routine update"
+            });
+
+            Assert.Equal(1, matchingTriageCalls);
+            Assert.Contains(uniqueFilter, promptSeen);
+            manager.Dispose();
+        }
     }
 
     public class StimulusHookStoreTests
@@ -417,6 +479,25 @@ namespace Omnipotent.Tests.Projects
             Assert.Empty(store.List(pid));
             // Each mutation logged a HookChanged event.
             Assert.Equal(2, log.ReadSince(pid, 0).Count(e => e.Type == ProjectEventTypes.HookChanged));
+        }
+
+        [Fact]
+        public void MalformedTimerFirstRun_IsRejectedBeforeAnyRecordOrEventIsCreated()
+        {
+            var log = new ProjectEventLogStore(_ => { });
+            var store = new StimulusHookStore(log);
+            string pid = "test_" + Guid.NewGuid().ToString("N");
+
+            var error = Assert.Throws<InvalidOperationException>(() => store.Create(new StimulusHookRecord
+            {
+                ProjectID = pid,
+                SourceKind = "timer",
+                SourceSpecJson = "{\"intervalSeconds\":60,\"firstRunUtc\":\"not-a-date\"}"
+            }));
+
+            Assert.Contains("firstRunUtc", error.Message);
+            Assert.Empty(store.List(pid));
+            Assert.Empty(log.ReadSince(pid, 0).Where(e => e.Type == ProjectEventTypes.HookChanged));
         }
     }
 }

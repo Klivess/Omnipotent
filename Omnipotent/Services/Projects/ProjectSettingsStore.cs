@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -15,6 +16,12 @@ namespace Omnipotent.Services.Projects
     /// retroactively changes an existing project.
     ///
     /// Layout: Projects/Settings/&lt;projectID&gt;.settings.json  +  Projects/Settings/_system-defaults.json
+    ///
+    /// Reads note a <see cref="CacheDeps"/> version and writes bump it, so the KliveAPI response
+    /// cache cannot serve a settings GET that a save has superseded. This is not optional: every
+    /// /projects/* GET resolves its project through ProjectStore, which notes `projects:index` —
+    /// that lone dependency makes the response cacheable, so an uninstrumented settings read would
+    /// be pinned to a version no settings save ever bumps and served stale indefinitely.
     /// </summary>
     public class ProjectSettingsStore
     {
@@ -33,12 +40,18 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".settings.json");
 
+        // A project with no file yet still has a version (0) — noting it unconditionally is what
+        // lets the first Save of a previously-inherited project invalidate the inherited response.
+        private static string CacheKey(string projectID) => "projects:settings:" + projectID;
+        private const string SystemCacheKey = "projects:settings:_system-defaults";
+
         // ── system defaults (what new projects inherit) ──
 
         /// <summary>The system-wide default settings new projects inherit. Falls back to the
         /// hardcoded <see cref="ProjectSettings.Defaults"/> when no override file exists.</summary>
         public ProjectSettings GetSystemDefaults()
         {
+            CacheDeps.NoteRead(SystemCacheKey);
             lock (systemLock)
             {
                 if (File.Exists(systemDefaultsPath))
@@ -64,6 +77,7 @@ namespace Omnipotent.Services.Projects
                 string tmp = systemDefaultsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, JsonConvert.SerializeObject(defaults, Formatting.Indented));
                 File.Move(tmp, systemDefaultsPath, overwrite: true);
+                CacheDeps.Bump(SystemCacheKey);
             }
         }
 
@@ -71,6 +85,7 @@ namespace Omnipotent.Services.Projects
 
         public ProjectSettings Get(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID))
             {
                 string path = PathFor(projectID);
@@ -100,6 +115,7 @@ namespace Omnipotent.Services.Projects
                 string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 File.WriteAllText(tmp, JsonConvert.SerializeObject(settings, Formatting.Indented));
                 File.Move(tmp, path, overwrite: true);
+                CacheDeps.Bump(CacheKey(settings.ProjectID));
             }
         }
 

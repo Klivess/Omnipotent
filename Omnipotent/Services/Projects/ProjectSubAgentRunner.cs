@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
+using Newtonsoft.Json;
 using Omnipotent.Services.ComputerControl;
 using Omnipotent.Services.KliveLLM;
 
@@ -231,6 +232,12 @@ namespace Omnipotent.Services.Projects
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
+                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
+                {
+                    var credit = await parent.ProviderCredit.CheckAsync(cts.Token);
+                    if (credit.Status == OpenRouterCreditStatus.Exhausted)
+                        throw new OpenRouterCreditExhaustedException(credit);
+                }
 
                 var settings = parent.Settings.Get(projectID);
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID, ProjectAgentWorkStatus.Running);
@@ -503,6 +510,13 @@ namespace Omnipotent.Services.Projects
                             if (loopTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Agent {agent.AgentID} stopped after {loopTrips} repeated-call loop trips.";
+                                parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
+                                {
+                                    Kind = "loop-recovery",
+                                    RecordedBy = agent.AgentID,
+                                    ToolName = toolName,
+                                    Summary = $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the obstacle to the commander."
+                                });
                                 goto done;
                             }
                             continue;
@@ -593,6 +607,28 @@ namespace Omnipotent.Services.Projects
                 outcome = ProjectEventTypes.WakeCancelled;
                 outcomeText = $"Agent {agent.AgentID} wake cancelled because the project or agent was stopped.";
             }
+            catch (OpenRouterCreditExhaustedException ex)
+            {
+                DateTime retryAt = DateTime.UtcNow.AddMinutes(15);
+                var failure = new ProjectExecutionFailure
+                {
+                    Category = ProjectFailureCategory.Capacity,
+                    Code = "OpenRouterCreditExhausted",
+                    Summary = ex.Message,
+                    Retryable = true,
+                    RetryAt = retryAt,
+                    WakeID = wakeID,
+                    Provider = "OpenRouter",
+                    HttpStatus = 402,
+                };
+                parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
+                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                    healthy: false, failure.Code, failure.Summary, retryAt);
+                outcomePayloadJson = JsonConvert.SerializeObject(new
+                    { provider = "OpenRouter", status = 402, code = failure.Code, remainingUsd = ex.Check.RemainingUsd });
+                outcome = ProjectEventTypes.WakeDeferred;
+                outcomeText = $"Agent {agent.AgentID} wake deferred before model dispatch: {ex.Message} Automatic retry after {retryAt:O}.";
+            }
             catch (RemoteLLMException ex)
             {
                 string providerDetail = ProjectProviderFailure.Describe(ex);
@@ -654,12 +690,9 @@ namespace Omnipotent.Services.Projects
                 parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
                 parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
             }
-            if (!endedAtWorkSlice && outcome == ProjectEventTypes.WakeCompleted)
-            {
-                var resume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agent.AgentID);
-                if (resume?.Kind == "work-slice")
-                    parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, resume.ActionID);
-            }
+            var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agent.AgentID);
+            if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
+                parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, consumedResume!.ActionID);
             return endedAtWorkSlice && (madeMeasurableProgress || productiveActions > 0)
                 && outcome == ProjectEventTypes.WakeCompleted;
         }
@@ -714,6 +747,21 @@ RULES:
                 digest.CurrentPlan is { Length: > 0 } p ? p : "(none)",
                 "(plan omitted — contained non-project agent scaffolding)");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(planSeed, 400));
+
+            // Durable recovery instructions must survive context reset. In particular, the
+            // convergence guard records the repeated call here so a fresh agent cannot blindly
+            // restart the same browser/signup loop.
+            try
+            {
+                var resume = parent.RuntimeState.Get(project.ProjectID).Checkpoint.AgentResumeActions
+                    .GetValueOrDefault(agent.AgentID);
+                if (resume != null && (!resume.NotBefore.HasValue || resume.NotBefore.Value <= DateTime.UtcNow))
+                {
+                    sb.AppendLine("── EXACT RESUME ACTION (durable checkpoint) ──");
+                    sb.AppendLine(ProjectsContextBudget.TruncateToTokens(resume.Summary, 500));
+                }
+            }
+            catch { }
 
             // Live observable values (Klives' dashboard) — same block the Commander sees.
             string observables = "";

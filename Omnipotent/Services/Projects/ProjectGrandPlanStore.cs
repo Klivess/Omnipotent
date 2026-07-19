@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -181,6 +182,11 @@ namespace Omnipotent.Services.Projects
 
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".grandplan.json");
+
+        // Noted/bumped at the load and save chokepoints rather than per public method: this store has
+        // many read shapes (Get, GetCurrentApproved, GetReadyMilestones, DescribeForSeed, …) and any
+        // one of them missing a NoteRead would silently serve a superseded plan from the response cache.
+        private static string CacheKey(string projectID) => "projects:grandplan:" + projectID;
 
         /// <summary>
         /// Appends a new version (auto-numbered) from structured content. A material version enters
@@ -699,6 +705,7 @@ namespace Omnipotent.Services.Projects
 
         private GrandPlanDocument LoadLocked(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID)); // before the read, per the never-stale contract
             string path = PathFor(projectID);
             if (!File.Exists(path)) return new GrandPlanDocument { ProjectID = projectID };
             try
@@ -801,6 +808,7 @@ namespace Omnipotent.Services.Projects
                     Thread.Sleep(15 * (attempt + 1));
                 }
             }
+            CacheDeps.Bump(CacheKey(projectID)); // after the move — the write is now visible
         }
     }
 }

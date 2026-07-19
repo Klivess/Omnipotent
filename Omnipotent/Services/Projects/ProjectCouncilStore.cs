@@ -2,12 +2,13 @@ using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
     /// <summary>Lifecycle of a convened council.</summary>
     [JsonConverter(typeof(StringEnumConverter))]
-    public enum CouncilStatus { Running, Completed, Failed, Cancelled }
+    public enum CouncilStatus { Running, Completed, Partial, Failed, Cancelled }
 
         /// <summary>Decision semantics are advisory: councils surface evidence and recommendations, never veto a project.</summary>
         [JsonConverter(typeof(StringEnumConverter))]
@@ -57,7 +58,7 @@ namespace Omnipotent.Services.Projects
         public string Topic { get; set; } = "";
         public string Briefing { get; set; } = "";
         /// <summary>Stable hash of the normalized topic + briefing. It lets the store reuse an
-        /// identical deliberation before another seven model calls are spent.</summary>
+        /// identical deliberation within the same wake before another set of model calls is spent.</summary>
         public string InputFingerprint { get; set; } = "";
         /// <summary>"routine" | "elevated" | "critical".</summary>
         public string Urgency { get; set; } = "routine";
@@ -100,6 +101,10 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string PathFor(string projectID) => Path.Combine(dir, projectID + ".councils.json");
 
+        // Noted/bumped at the load and save chokepoints so every read shape (List, Get, CountToday,
+        // CountForWake) participates and no new one can forget.
+        private static string CacheKey(string projectID) => "projects:councils:" + projectID;
+
         /// <summary>Persists a new session (assigns a CouncilID if unset). Returns a clone.</summary>
         public CouncilSession Create(CouncilSession session)
         {
@@ -135,11 +140,14 @@ namespace Omnipotent.Services.Projects
                     var duplicate = all.OrderByDescending(s => s.CreatedAt).FirstOrDefault(s =>
                         string.Equals(s.InputFingerprint, session.InputFingerprint, StringComparison.Ordinal)
                         && s.CreatedAt >= now.AddHours(-24)
-                        && s.Status is CouncilStatus.Running or CouncilStatus.Completed);
+                        && (s.Status == CouncilStatus.Running
+                            || string.Equals(s.WakeID, session.WakeID, StringComparison.Ordinal)
+                            && s.Status is CouncilStatus.Completed or CouncilStatus.Partial));
                     if (duplicate != null)
                     {
-                        reason = $"A matching council already considered this topic and briefing (council {duplicate.CouncilID}). " +
-                            "Use its advisory verdict, or supply a materially updated briefing containing new evidence or a changed decision.";
+                        reason = duplicate.Status == CouncilStatus.Running
+                            ? $"A matching council is already running (council {duplicate.CouncilID}). Use its result when it finishes."
+                            : $"This wake already convened a matching council (council {duplicate.CouncilID}). Use its advisory verdict before spending on another.";
                         return null;
                     }
                 }
@@ -228,6 +236,7 @@ namespace Omnipotent.Services.Projects
 
         private List<CouncilSession> LoadLocked(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID)); // before the read, per the never-stale contract
             string path = PathFor(projectID);
             if (!File.Exists(path)) return new();
             try
@@ -265,6 +274,7 @@ namespace Omnipotent.Services.Projects
                     Thread.Sleep(15 * (attempt + 1));
                 }
             }
+            CacheDeps.Bump(CacheKey(projectID)); // after the move — the write is now visible
         }
     }
 }

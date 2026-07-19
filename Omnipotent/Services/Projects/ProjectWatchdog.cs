@@ -99,6 +99,13 @@ namespace Omnipotent.Services.Projects
                 if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open
                     && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > now))
                     return (null, null); // typed provider/dependency circuit owns recovery timing
+
+                // A durable resume action with a future not-before time is an intentional sleep,
+                // not a wedge. The keepalive owns the scheduled wake; force-waking here burns a
+                // model turn and defeats the commander's explicit timing decision.
+                if (runtime.Checkpoint.ResumeAction?.NotBefore is DateTime notBefore
+                    && notBefore.ToUniversalTime() > now)
+                    return (null, null);
             }
 
             // 1. Heartbeat staleness — measured on COMMANDER ACTIVITY, not just wake starts. A

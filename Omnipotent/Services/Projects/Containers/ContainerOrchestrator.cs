@@ -197,6 +197,19 @@ namespace Omnipotent.Services.Projects.Containers
             # Chromium before repairing singleton markers and performing the supervised start.
             pkill -x chromium >/dev/null 2>&1 || true
             for i in $(seq 1 20); do pgrep -x chromium >/dev/null 2>&1 || break; sleep 0.25; done
+            if pgrep -x chromium >/dev/null 2>&1; then
+              pkill -KILL -x chromium >/dev/null 2>&1 || true
+              for i in $(seq 1 20); do pgrep -x chromium >/dev/null 2>&1 || break; sleep 0.25; done
+            fi
+            if pgrep -x chromium >/dev/null 2>&1; then
+              echo 'Chromium still owns the profile after TERM/KILL; singleton markers were not removed.' >&2
+              exit 1
+            fi
+            # Chromium inherits fd 9, keeping this lock for the browser's lifetime. A replacement
+            # container sharing the persistent profile therefore cannot delete the live owner's
+            # singleton markers even though its PID namespace cannot see that owner's process.
+            exec 9>"$OMNIPOTENT_BROWSER_PROFILE/.omnipotent-launch.lock"
+            flock -w 20 9 || { echo 'Timed out waiting for the browser profile owner to exit; singleton markers were not removed.' >&2; exit 1; }
             rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
             : > /tmp/chromium.log
             if [ -n "$url" ]; then

@@ -206,7 +206,12 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("wait_cdp", script);
             Assert.Contains("if cdp_up", script);
             Assert.Contains("pkill -x chromium", script);
+            Assert.Contains("pkill -KILL -x chromium", script);
             Assert.Contains("pgrep -x chromium", script);
+            Assert.Contains("flock -w 20", script);
+            Assert.Contains("Chromium inherits fd 9", script);
+            Assert.Contains("singleton markers were not removed", script);
+            Assert.DoesNotContain("9>&-", script);
             Assert.DoesNotContain("pkill -f", script);
             Assert.DoesNotContain("pgrep -f", script);
             Assert.Contains("SingletonLock", script);
@@ -219,6 +224,16 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("ProxyHandler({})", script);
             Assert.DoesNotContain("--new-tab", script);
             Assert.DoesNotContain('\r', script);
+        }
+
+        [Fact]
+        public void BrowserInspection_HumanChallengeIsElevatedBeforeAgentRetries()
+        {
+            string result = ContainerToolAdapter.AnnotateHumanChallenge(
+                "{\"title\":\"Verify\",\"humanChallenge\":{\"detected\":true,\"signals\":[\"captcha\"]}}");
+
+            Assert.StartsWith("HUMAN_CHALLENGE_DETECTED", result);
+            Assert.Contains("Do not retry", result);
         }
 
         [Fact]

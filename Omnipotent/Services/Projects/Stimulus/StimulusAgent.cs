@@ -54,7 +54,11 @@ namespace Omnipotent.Services.Projects.Stimulus
         {
             // No criterion means "always relevant" — deliver as-is.
             if (string.IsNullOrWhiteSpace(recognitionCriterion))
+            {
+                if (env.SourceKind.Equals("discord", StringComparison.OrdinalIgnoreCase))
+                    return new TriageResult(false, "Discord hook has no recognition criterion; rejected.");
                 return new TriageResult(true, "No criterion; delivered.");
+            }
 
             string prompt = BuildPrompt(env, recognitionCriterion);
 

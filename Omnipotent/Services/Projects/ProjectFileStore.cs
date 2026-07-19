@@ -598,7 +598,11 @@ public sealed class ProjectFileStore
         int limit = Math.Clamp(request.Limit, 1, 500);
         int offset = Math.Max(0, request.Offset);
         var all = LoadEntries(projectID);
-        all.AddRange(LoadManagedMetadataEntries(projectID));
+        // Managed implementation metadata remains available by explicit path, but it is not
+        // project work and should not consume/default-pollute root list_files results.
+        if (directory.Equals(".klive", StringComparison.OrdinalIgnoreCase)
+            || directory.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase))
+            all.AddRange(LoadManagedMetadataEntries(projectID));
         string prefix = directory.Length == 0 ? "" : directory + "/";
         IEnumerable<ProjectFileEntry> filtered = all.Where(entry =>
         {

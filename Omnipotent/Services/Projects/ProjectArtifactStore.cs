@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -57,6 +58,10 @@ namespace Omnipotent.Services.Projects
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string ProjectDir(string projectID) => Path.Combine(root, projectID);
         private string IndexPath(string projectID) => Path.Combine(root, projectID + ".index.json");
+
+        // The index alone is enough of a dependency for GetBytes too: a blob only disappears via the
+        // retention sweep, which marks its record Degraded and saves the index in the same breath.
+        private static string CacheKey(string projectID) => "projects:artifacts:" + projectID;
         private string BlobPath(ArtifactRecord a) => Path.Combine(ProjectDir(a.ProjectID), a.ArtifactID + ExtFor(a.ContentType));
 
         private static string ExtFor(string contentType) => contentType switch
@@ -196,6 +201,7 @@ namespace Omnipotent.Services.Projects
 
         private List<ArtifactRecord> LoadLocked(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID)); // before the read, per the never-stale contract
             string path = IndexPath(projectID);
             if (!File.Exists(path)) return new();
             try { return JsonConvert.DeserializeObject<List<ArtifactRecord>>(File.ReadAllText(path)) ?? new(); }
@@ -208,6 +214,7 @@ namespace Omnipotent.Services.Projects
             string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             File.WriteAllText(tmp, JsonConvert.SerializeObject(index, Formatting.Indented));
             File.Move(tmp, path, overwrite: true);
+            CacheDeps.Bump(CacheKey(projectID)); // after the move — the write is now visible
         }
     }
 }

@@ -1,3 +1,6 @@
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
 namespace Omnipotent.Services.Projects.Stimulus
 {
     /// <summary>
@@ -57,7 +60,7 @@ namespace Omnipotent.Services.Projects.Stimulus
                 ExpiresAt = ttl.HasValue ? DateTime.UtcNow + ttl.Value : null,
             };
 
-            var triage = await triageAgent.EvaluateAsync(env, hook.RecognitionCriterion);
+            var triage = await triageAgent.EvaluateAsync(env, EffectiveRecognitionCriterion(hook));
             if (!triage.Confirmed)
             {
                 log($"Stimulus rejected ({hook.SourceKind}/{hook.HookID}): {triage.Verdict}");
@@ -88,6 +91,26 @@ namespace Omnipotent.Services.Projects.Stimulus
 
         /// <summary>Boot: replay durable undelivered envelopes so nothing is lost across a restart.</summary>
         public void Replay() => queue.ReplayUndelivered();
+
+        private static string EffectiveRecognitionCriterion(StimulusHookRecord hook)
+        {
+            string criterion = (hook.RecognitionCriterion ?? "").Trim();
+            if (!hook.SourceKind.Equals("discord", StringComparison.OrdinalIgnoreCase)) return criterion;
+
+            try
+            {
+                var spec = JObject.Parse(string.IsNullOrWhiteSpace(hook.SourceSpecJson) ? "{}" : hook.SourceSpecJson);
+                string? contains = spec["contains"]?.Value<string>();
+                if (!string.IsNullOrWhiteSpace(contains))
+                {
+                    string semanticFilter = "The Discord message content must contain the literal text "
+                        + JsonConvert.ToString(contains.Trim()) + ".";
+                    criterion = criterion.Length == 0 ? semanticFilter : criterion + "\n" + semanticFilter;
+                }
+            }
+            catch (JsonException) { }
+            return criterion;
+        }
 
         private static string Truncate(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
     }

@@ -8,6 +8,12 @@ namespace Omnipotent.Services.Projects;
 /// </summary>
 public static class ProjectWorkSliceBoundary
 {
+    /// <summary>A work-slice resume is consumed by any wake that gets past the boundary. Its
+    /// outcome does not matter: retaining it after a deferred/failed/cancelled wake injects stale
+    /// rollover instructions into the next seed.</summary>
+    public static bool ShouldClearConsumedResume(bool endedAtWorkSlice, ProjectResumeAction? resume) =>
+        !endedAtWorkSlice && resume?.Kind == "work-slice";
+
     /// <summary>Whether a configured tool-call boundary has been reached. A zero limit explicitly
     /// disables this boundary; it must never be interpreted as "zero calls allowed".</summary>
     public static bool IsToolCallLimitReached(int toolCalls, int toolCallLimit) =>

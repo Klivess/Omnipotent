@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -359,13 +360,22 @@ namespace Omnipotent.Services.Projects
 
         private object LockFor(string projectID) => FileLocks.GetOrAdd(GetStatePath(projectID), _ => new object());
 
+        // Runtime state is read by /projects/list and the project detail GET (status, disposition,
+        // blockers), so it must participate in the response cache's version model or those views
+        // serve whatever the state was when the entry was first filled.
+        private static string CacheKey(string projectID) => "projects:runtimestate:" + projectID;
+
         public ProjectRuntimeState Get(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID)) return Clone(LoadLocked(projectID));
         }
 
         public List<ProjectRuntimeState> ListWithActiveWakeLeases()
         {
+            // Which files exist is not a version the model can track — a brand-new project's state
+            // file appears without bumping any key this scan could have noted.
+            CacheDeps.MarkUncacheable("runtime-state directory scan");
             var states = new List<ProjectRuntimeState>();
             if (!Directory.Exists(root)) return states;
             foreach (string path in Directory.EnumerateFiles(root, "*.runtime.json"))
@@ -792,6 +802,9 @@ namespace Omnipotent.Services.Projects
 
         public List<ProjectVerifiedFact> GetFreshVerifiedFacts(string projectID, DateTime? nowUtc = null)
         {
+            // Freshness is a function of wall-clock time, not of any tracked version: a fact expires
+            // on its own with no write to bump. Caching this would serve expired facts as fresh.
+            CacheDeps.MarkUncacheable("verified-fact freshness window");
             DateTime now = Utc(nowUtc);
             return Get(projectID).Checkpoint.VerifiedFacts.Where(f => f.IsFreshAt(now)).Select(Clone).ToList();
         }
@@ -1172,6 +1185,9 @@ namespace Omnipotent.Services.Projects
             state.Revision = checked(state.Revision + 1);
             state.UpdatedAt = now;
             SaveLocked(state);
+            // Single commit chokepoint: every mutator routes through Mutate → CommitLocked, so one
+            // bump here covers all of them and no future mutator can forget to invalidate.
+            CacheDeps.Bump(CacheKey(state.ProjectID));
         }
 
         private ProjectRuntimeState LoadLocked(string projectID)

@@ -21,6 +21,7 @@ namespace Omnipotent.Tests.Projects
             typeof(ProjectsService).GetProperty(nameof(ProjectsService.Store))!.SetValue(svc, new ProjectStore(_ => { }));
             typeof(ProjectsService).GetProperty(nameof(ProjectsService.EventLog))!.SetValue(svc, new ProjectEventLogStore(_ => { }));
             typeof(ProjectsService).GetProperty(nameof(ProjectsService.Digests))!.SetValue(svc, new ProjectDigestStore(_ => { }));
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.RuntimeState))!.SetValue(svc, new ProjectRuntimeStateStore(_ => { }));
             var p = svc.Store.CreateProject("t", "goal", 100, 100, 10, 5);
             return (svc, p.ProjectID);
         }
@@ -82,6 +83,42 @@ namespace Omnipotent.Tests.Projects
             var diag = wd.Diagnose(svc.Store.GetProject(pid)!);
             Assert.NotNull(diag);
             Assert.Contains("No Commander activity", diag);
+        }
+
+        [Fact]
+        public void FutureResumeNotBefore_SuppressesWatchdogStallDiagnosis()
+        {
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.RuntimeState.SetResumeAction(pid, new ProjectResumeAction
+            {
+                Kind = "resume",
+                Summary = "Check the external result after the agreed waiting period.",
+                NotBefore = DateTime.UtcNow.AddHours(4),
+                RecordedBy = "commander"
+            });
+
+            var wd = new ProjectWatchdog(svc, _ => { });
+
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public void ExpiredResumeNotBefore_DoesNotSuppressRealStall()
+        {
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.RuntimeState.SetResumeAction(pid, new ProjectResumeAction
+            {
+                Kind = "resume",
+                Summary = "Check the result.",
+                NotBefore = DateTime.UtcNow.AddMinutes(-1),
+                RecordedBy = "commander"
+            });
+
+            var wd = new ProjectWatchdog(svc, _ => { });
+
+            Assert.NotNull(wd.Diagnose(svc.Store.GetProject(pid)!));
         }
 
         [Fact]
