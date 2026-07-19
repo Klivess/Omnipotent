@@ -57,6 +57,11 @@ namespace Omnipotent.Services.Projects.Containers
         private int pointerX, pointerY;
         private string clipboardText = string.Empty;
 
+        /// <summary>Last pointer position the transport sent, so a humanised movement layer can plan
+        /// a path from where the cursor actually is rather than teleporting.</summary>
+        public int PointerX => pointerX;
+        public int PointerY => pointerY;
+
         public VncTransport(string host, int port, Action<string> log)
         {
             this.host = host;
@@ -398,6 +403,21 @@ namespace Omnipotent.Services.Projects.Containers
                 if (shift) await SendKeyAsync(VncKeysyms.ShiftL, false, ct);
                 if (charDelayMs > 0) await Task.Delay(Math.Clamp(charDelayMs, 0, 500), ct);
             }
+        }
+
+        /// <summary>Types one character with its own hold time, letting a humanised typing layer
+        /// control per-key rhythm. Shift is overlapped around the keypress (pressed just before and
+        /// released just after) the way a real hand rolls a capital, not bracketed to the exact
+        /// millisecond.</summary>
+        public async Task TypeCharAsync(char c, int holdMs = 45, CancellationToken ct = default)
+        {
+            bool shift = char.IsUpper(c) || "~!@#$%^&*()_+{}|:\"<>?".Contains(c);
+            uint keysym = VncKeysyms.FromChar(c);
+            if (shift) { await SendKeyAsync(VncKeysyms.ShiftL, true, ct); await Task.Delay(8, ct); }
+            await SendKeyAsync(keysym, true, ct);
+            if (holdMs > 0) await Task.Delay(Math.Clamp(holdMs, 1, 400), ct);
+            await SendKeyAsync(keysym, false, ct);
+            if (shift) { await Task.Delay(9, ct); await SendKeyAsync(VncKeysyms.ShiftL, false, ct); }
         }
 
         /// <summary>Presses a chord like "ctrl+l" or a single named key like "enter".</summary>

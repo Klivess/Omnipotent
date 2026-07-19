@@ -221,6 +221,13 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("browser_visible", script);
             Assert.Contains("--disable-dev-shm-usage", script);
             Assert.Contains("--remote-allow-origins=*", script);
+            // Keep navigator.webdriver false / drop the automation hint (bot-detection hygiene).
+            Assert.Contains("--disable-blink-features=AutomationControlled", script);
+            // The fingerprint extension is loaded only when a persona is present, and degrades to a
+            // no-op otherwise (the launcher guards on OMNIPOTENT_FP_JSON + the baked template).
+            Assert.Contains("--load-extension", script);
+            Assert.Contains("OMNIPOTENT_FP_JSON", script);
+            Assert.Contains("fp_args=()", script);
             Assert.Contains("ProxyHandler({})", script);
             Assert.DoesNotContain("--new-tab", script);
             Assert.DoesNotContain('\r', script);

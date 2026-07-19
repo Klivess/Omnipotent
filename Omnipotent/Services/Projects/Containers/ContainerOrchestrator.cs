@@ -54,6 +54,7 @@ namespace Omnipotent.Services.Projects.Containers
         internal static readonly string[] DesktopBuildContextFiles =
         {
             "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py",
+            "klive-fp-manifest.json", "klive-fp-patch.js",
         };
 
         public ContainerOrchestrator(
@@ -212,10 +213,34 @@ namespace Omnipotent.Services.Projects.Containers
             flock -w 20 9 || { echo 'Timed out waiting for the browser profile owner to exit; singleton markers were not removed.' >&2; exit 1; }
             rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
             : > /tmp/chromium.log
+            # Assemble the per-desktop fingerprint extension into a writable dir: the baked template
+            # (manifest + patch.js) plus a one-line persona.js carrying this desktop's values. This is
+            # a main-world, document_start content script that normalises the page-visible environment
+            # (chiefly the WebGL renderer, which --disable-gpu otherwise exposes as SwiftShader). If the
+            # persona var or template is absent the block is skipped and the browser is unchanged.
+            fp_args=()
+            if [ -n "${OMNIPOTENT_FP_JSON:-}" ] && [ -f /usr/local/share/klive-fp/patch.js ]; then
+              FPDIR="$HOME/.klive-fp"
+              mkdir -p "$FPDIR"
+              cp -f /usr/local/share/klive-fp/manifest.json /usr/local/share/klive-fp/patch.js "$FPDIR"/ 2>/dev/null || true
+              printf 'self.__KFP__=%s;\n' "$OMNIPOTENT_FP_JSON" > "$FPDIR/persona.js"
+              fp_args=(--disable-extensions-except="$FPDIR" --load-extension="$FPDIR" \
+                --disable-features=DisableLoadExtensionCommandLineSwitch)
+            fi
+            # --disable-blink-features=AutomationControlled keeps navigator.webdriver false and drops
+            # the AutomationControlled hint; --lang gives the persona a real Accept-Language instead of
+            # the container default. CDP stays on loopback (page JS cannot read the debug port) so
+            # structured inspection keeps working. A bash array preserves the literal "*" and any
+            # spaces in the profile path across the two launch forms.
+            common_args=(--no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check \
+              --password-store=basic --disable-blink-features=AutomationControlled \
+              "--lang=${OMNIPOTENT_BROWSER_LANG:-en-US}" --start-maximized \
+              --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" \
+              --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE")
             if [ -n "$url" ]; then
-              nohup chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check --password-store=basic --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" "$url" >/tmp/chromium.log 2>&1 </dev/null &
+              nohup chromium "${common_args[@]}" "${fp_args[@]}" "$url" >/tmp/chromium.log 2>&1 </dev/null &
             else
-              nohup chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check --password-store=basic --start-maximized --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE" >/tmp/chromium.log 2>&1 </dev/null &
+              nohup chromium "${common_args[@]}" "${fp_args[@]}" >/tmp/chromium.log 2>&1 </dev/null &
             fi
             if wait_cdp; then focus_browser; exit 0; fi
             if browser_visible; then
@@ -495,6 +520,25 @@ namespace Omnipotent.Services.Projects.Containers
             }
         }
 
+        /// <summary>Container environment, including the per-desktop browser fingerprint persona. The
+        /// persona is seeded from the persistent profile identity (project + profile segment) so it is
+        /// stable across container recreation and matches the aged browser profile it drives. When the
+        /// fingerprint kill switch is off, the var is simply omitted and the launcher skips the
+        /// extension — the browser is then byte-for-byte the previous behaviour.</summary>
+        internal static List<string> BuildContainerEnv(int width, int height, string profileSegment, string projectID)
+        {
+            var env = new List<string>
+            {
+                $"DISPLAY_WIDTH={width}",
+                $"DISPLAY_HEIGHT={height}",
+                $"OMNIPOTENT_BROWSER_PROFILE=/project/.klive/browser-profiles/{profileSegment}",
+                "KLIVE_AGENT_RUNTIME=/agent-runtime",
+            };
+            if (BrowserPersona.GloballyEnabled)
+                env.Add($"OMNIPOTENT_FP_JSON={BrowserPersona.ForSeed($"{projectID}/{profileSegment}").ToEnvJson()}");
+            return env;
+        }
+
         /// <summary>In-process tar of the exact, flat desktop build context.</summary>
         private static MemoryStream CreateTarContext(string contextDir)
         {
@@ -579,13 +623,7 @@ namespace Omnipotent.Services.Projects.Containers
                     [ContainerLabels.Height] = resolvedHeight.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     [ContainerLabels.ContextHash] = imageContextHash,
                 },
-                Env = new List<string>
-                {
-                    $"DISPLAY_WIDTH={resolvedWidth}",
-                    $"DISPLAY_HEIGHT={resolvedHeight}",
-                    $"OMNIPOTENT_BROWSER_PROFILE=/project/.klive/browser-profiles/{profileSegment}",
-                    "KLIVE_AGENT_RUNTIME=/agent-runtime",
-                },
+                Env = BuildContainerEnv(resolvedWidth, resolvedHeight, profileSegment, projectID),
                 ExposedPorts = new Dictionary<string, EmptyStruct> { [$"{VncContainerPort}/tcp"] = default },
                 HostConfig = new HostConfig
                 {

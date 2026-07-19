@@ -24,7 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         thunar mousepad ristretto desktop-base adwaita-icon-theme \
         firefox-esr chromium \
         xdotool wmctrl xclip x11-utils x11-xserver-utils \
-        curl ca-certificates fonts-dejavu util-linux \
+        curl ca-certificates util-linux \
+        fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-ui-core fonts-noto-color-emoji \
         python3 python3-pip python3-venv python3-websocket \
         ffmpeg \
         sudo \
@@ -45,11 +46,17 @@ COPY desktop-entrypoint.sh /usr/local/bin/desktop-entrypoint.sh
 COPY browser-inspect.py /usr/local/bin/browser-inspect.py
 RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py
 
+# Baked template for the per-desktop main-world fingerprint extension. The launcher copies this into
+# a writable dir and adds a one-line persona.js before loading it, so the page-visible environment
+# (chiefly the WebGL renderer) looks like an ordinary consumer machine rather than a headless one.
+COPY klive-fp-manifest.json /usr/local/share/klive-fp/manifest.json
+COPY klive-fp-patch.js /usr/local/share/klive-fp/patch.js
+
 # Capability stamp — the preflight reads this to know what the image ships without probing each
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"5","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","python3","ffmpeg"],"display":":1"}' \
+    '{"imageVersion":"7","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent

@@ -94,6 +94,8 @@
 		<None Update="Services\Projects\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
 		<None Update="Services\Projects\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
 		<None Update="Services\Projects\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Projects\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Projects\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>

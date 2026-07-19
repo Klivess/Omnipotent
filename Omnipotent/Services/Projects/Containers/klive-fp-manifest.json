@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Klive Desktop Environment",
+  "version": "1.0",
+  "description": "Desktop environment integration.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["persona.js", "patch.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ]
+}

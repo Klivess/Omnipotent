@@ -160,8 +160,13 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"5\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"7\"", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
+            // The image ships a realistic font set (a thin font list is a browser-fingerprint tell).
+            Assert.Contains("fonts-liberation", dockerfile);
+            Assert.Contains("fonts-noto-color-emoji", dockerfile);
+            // The main-world fingerprint extension is baked in for the launcher to load.
+            Assert.Contains("/usr/local/share/klive-fp/patch.js", dockerfile);
             Assert.DoesNotContain("deliberately do NOT run xfdesktop", entrypoint);
         }
 

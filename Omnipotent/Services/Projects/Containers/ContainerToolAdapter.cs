@@ -17,6 +17,7 @@ namespace Omnipotent.Services.Projects.Containers
     public sealed class ContainerToolAdapter : IComputerController
     {
         private readonly VncTransport transport;
+        private readonly HumanizedInput human;
         private readonly ContainerDesktopCommandBridge desktop;
         private readonly InputLockCoordinator? inputLock;
         private readonly SemaphoreSlim actionGate;
@@ -33,6 +34,11 @@ namespace Omnipotent.Services.Projects.Containers
         // transport so a click can reuse the screenshot the agent just observed instead of doing a
         // second blocking full-frame capture before input is even sent.
         private static readonly ConditionalWeakTable<VncTransport, CachedFrameState> FrameStates = new();
+
+        // The humanised-input layer must persist with the pooled transport, not the short-lived
+        // adapter: its per-desktop random stream has to advance continuously across actions so the
+        // "person" driving this desktop keeps one consistent, non-repeating motion/typing signature.
+        private static readonly ConditionalWeakTable<VncTransport, HumanizedInput> Humanizers = new();
         private sealed class CachedFrameState
         {
             public readonly object Gate = new();
@@ -98,6 +104,7 @@ namespace Omnipotent.Services.Projects.Containers
             this.actionSettleMs = Math.Clamp(actionSettleMs, 50, 5000);
             this.typingDelayMs = Math.Clamp(typingDelayMs, 0, 500);
             frameState = FrameStates.GetValue(transport, _ => new CachedFrameState());
+            human = Humanizers.GetValue(transport, _ => new HumanizedInput(transport, HumanInputProfile.ForSeed(containerID)));
             desktop = new ContainerDesktopCommandBridge(transport, dockerControlAsync);
         }
 
@@ -361,11 +368,20 @@ namespace Omnipotent.Services.Projects.Containers
                     return ContainerToolResult.Fail("The matched browser control had no usable screen coordinates.", ContainerToolFailureKind.BrowserInspection);
 
                 int clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2);
+                // Click within the control's bounds with a slight bias toward centre rather than the
+                // exact centre pixel every time (a superhuman tell), using the reported box size.
+                int boundsW = 0, boundsH = 0;
+                if (match.TryGetProperty("bounds", out var box) && box.ValueKind == JsonValueKind.Object)
+                {
+                    if (box.TryGetProperty("width", out var bw) && bw.TryGetInt32(out var w)) boundsW = w;
+                    if (box.TryGetProperty("height", out var bh) && bh.TryGetInt32(out var h)) boundsH = h;
+                }
+                (x, y) = human.HumanizeClickPoint(x, y, boundsW, boundsH);
                 byte[]? before = RecentFrameJpeg();
                 return await WithModifiersAsync(a, async () =>
                 {
                     var point = await ResolvePointAsync(x, y, ct);
-                    await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
+                    await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
                     await Task.Delay(actionSettleMs, ct);
                     return await ObserveAfterMutationAsync(
                         $"Physically clicked visible browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) at ({x},{y}). Re-inspect to verify the resulting state.",
@@ -405,7 +421,7 @@ namespace Omnipotent.Services.Projects.Containers
             var point = await ResolvePointAsync(match.CentreX, match.CentreY, ct);
             return await WithModifiersAsync(a, async () =>
             {
-                await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), Math.Clamp(Int(a, "clicks", 1), 1, 2), ct);
+                await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), Math.Clamp(Int(a, "clicks", 1), 1, 2), ct);
                 await Task.Delay(350, ct);
                 return await ObserveAfterMutationAsync(text + " Clicked OCR match.", raw.jpeg, ct);
             }, ct);
@@ -417,7 +433,7 @@ namespace Omnipotent.Services.Projects.Containers
             return await MutateAsync($"Moved to ({x},{y}).", async () =>
             {
                 var point = await ResolvePointAsync(x, y, ct);
-                await transport.MoveMouseAsync(point.X, point.Y, ct);
+                await human.MoveAsync(point.X, point.Y, ct);
             }, ct);
         }
 
@@ -426,7 +442,8 @@ namespace Omnipotent.Services.Projects.Containers
             int dx = Int(a, "dx", 0), dy = Int(a, "dy", 0);
             if (dx == 0 && dy == 0) return ContainerToolResult.Ok("Relative pointer delta was zero.");
             int steps = Math.Clamp(Int(a, "steps", Math.Max(1, Math.Max(Math.Abs(dx), Math.Abs(dy)) / 25)), 1, 120);
-            return await MutateAsync($"Moved pointer by ({dx},{dy}).", () => transport.MoveMouseRelativeAsync(dx, dy, steps, ct), ct);
+            return await MutateAsync($"Moved pointer by ({dx},{dy}).",
+                () => human.Enabled ? human.MoveRelativeAsync(dx, dy, ct) : transport.MoveMouseRelativeAsync(dx, dy, steps, ct), ct);
         }
 
         private async Task<ContainerToolResult> ClickAsync(JsonElement a, CancellationToken ct)
@@ -436,7 +453,7 @@ namespace Omnipotent.Services.Projects.Containers
             return await WithModifiersAsync(a, () => MutateAsync($"Clicked ({x},{y}).", async () =>
             {
                 var point = await ResolvePointAsync(x, y, ct);
-                await transport.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
+                await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
             }, ct), ct);
         }
 
@@ -448,7 +465,7 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 var from = await ResolvePointAsync(fromX, fromY, ct);
                 var to = await ResolvePointAsync(toX, toY, ct);
-                await transport.DragAsync(from.X, from.Y, to.X, to.Y, ParseButton(Str(a, "button")), ct);
+                await human.DragAsync(from.X, from.Y, to.X, to.Y, ParseButton(Str(a, "button")), ct);
             }, ct), ct);
         }
 
@@ -488,7 +505,7 @@ namespace Omnipotent.Services.Projects.Containers
             int y = HasInt(a, "y") ? RequiredInt(a, "y") : Math.Max(0, (size.Height - 1) / 2);
             var point = MapPointToFramebuffer(x, y, size.Width, size.Height, transport.Width, transport.Height);
             return await MutateAsync($"Scrolled {Str(a, "direction") ?? "down"}.",
-                () => transport.ScrollAsync(point.X, point.Y, dy, dx, ct), ct);
+                () => human.ScrollAsync(point.X, point.Y, dy, dx, ct), ct);
         }
 
         private async Task<ContainerToolResult> TypeAsync(JsonElement a, CancellationToken ct)
@@ -496,7 +513,8 @@ namespace Omnipotent.Services.Projects.Containers
             string text = Str(a, "text") ?? string.Empty;
             if (resolveSecretsAsync != null) text = await resolveSecretsAsync(text);
             // Do not place either literal or substituted text in results/events.
-            return await MutateAsync("Typed text.", () => transport.TypeTextAsync(text, typingDelayMs, ct), ct);
+            return await MutateAsync("Typed text.",
+                () => human.Enabled ? human.TypeTextAsync(text, ct) : transport.TypeTextAsync(text, typingDelayMs, ct), ct);
         }
 
         private async Task<ContainerToolResult> TerminalAsync(JsonElement a, CancellationToken ct)
