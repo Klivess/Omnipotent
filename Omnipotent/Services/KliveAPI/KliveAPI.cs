@@ -592,7 +592,7 @@ namespace Omnipotent.Services.KliveAPI
                     ? $"OS build {osBuild}: http.sys TLS 1.3 supported (verify with openssl s_client -tls1_3)."
                     : $"OS build {osBuild}: http.sys TLS 1.3 NOT supported — cold connections stay on TLS 1.2 (2-RTT handshake) until OS upgrade.");
 
-                ServerListenLoop();
+                StartServerListenLoops();
                 //Create profile manager
                 CreateAndStartService(new KMProfileManager());
                 profileManager = (KMProfileManager)(await GetServicesByType<KMProfileManager>())[0];
@@ -1612,6 +1612,26 @@ namespace Omnipotent.Services.KliveAPI
             return (bodyBytes, bodyText);
         }
 
+        /// <summary>
+        /// Launches several concurrent accept loops over the single shared
+        /// <see cref="HttpListener"/> (which fully supports simultaneous
+        /// <c>GetContextAsync</c> calls). A single accept loop is both a throughput
+        /// ceiling — only one request can be dequeued from http.sys at a time — and a
+        /// fragility: if that one loop's thread is momentarily busy, nothing is accepted.
+        /// Running N loops removes both. Actual request work never runs on an accept
+        /// thread (see <see cref="ServerListenLoop"/>), so this is purely about how fast
+        /// contexts are pulled off the http.sys queue.
+        /// </summary>
+        private void StartServerListenLoops()
+        {
+            int loopCount = Math.Max(4, Environment.ProcessorCount);
+            ServiceLog($"Starting {loopCount} concurrent HTTP accept loops.");
+            for (int i = 0; i < loopCount; i++)
+            {
+                ServerListenLoop();
+            }
+        }
+
         private async void ServerListenLoop()
         {
             while (ContinueListenLoop)
@@ -1623,7 +1643,19 @@ namespace Omnipotent.Services.KliveAPI
                     // listen loop is wedged (not dequeuing from http.sys) rather than a
                     // slow handler downstream.
                     Interlocked.Exchange(ref _lastContextAcceptedUtcTicks, DateTime.UtcNow.Ticks);
-                    _ = ProcessRequestAsync(context);
+                    // Hand the request off to the thread pool rather than running it here.
+                    // ProcessRequestAsync is async, but an async method executes
+                    // SYNCHRONOUSLY on the calling thread until its first *suspending*
+                    // await — and this pipeline's whole prologue (auth = in-memory dict,
+                    // OmniDefence gate, cache lookup) plus any handler's synchronous or
+                    // blocking prologue complete before that first suspension. Running it
+                    // inline would therefore execute that work on THIS accept thread,
+                    // blocking GetContextAsync — and thus acceptance of EVERY other
+                    // request — until it yields. Task.Run moves it to a pool thread (128
+                    // min), so a slow/blocking handler can never stall global acceptance.
+                    // Mirrors the /batch handler's existing use of Task.Run for the same
+                    // reason ("handlers with synchronous prologues don't serialise each other").
+                    _ = Task.Run(() => ProcessRequestAsync(context));
                 }
                 catch (Exception ioe)
                 {
