@@ -103,7 +103,16 @@ namespace Omnipotent.Services.KliveLLM
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
         private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
         private const string DefaultFreeOpenRouterModel = "openrouter/free";
-        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter" };
+
+        // AgentRouter (https://agentrouter.org) is a plain OpenAI-compatible router: the same
+        // /v1/chat/completions contract, WITHOUT OpenRouter's proprietary extensions (the `models`
+        // fallback array, service_tier, usage.include cost reporting, cache_control prompt caching).
+        // So it is driven through the vanilla OpenAI-compatible path — every one of those extras stays
+        // gated on LLMProvider.OpenRouter so a strict endpoint can never 400 on an unknown parameter.
+        private const string AgentRouterChatCompletionsEndpoint = "https://agentrouter.org/v1/chat/completions";
+        private const string DefaultAgentRouterModel = "gpt-4.1-mini";
+
+        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", "AgentRouter" };
         private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
         private static readonly string[] ThinkingTypeOptions = new[] { "Off", "Low", "Medium", "High" };
 
@@ -140,6 +149,7 @@ namespace Omnipotent.Services.KliveLLM
             Local,
             HuggingFace,
             OpenRouter,
+            AgentRouter,
         }
 
         internal sealed class RemoteLLMProviderConfiguration
@@ -227,7 +237,12 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        private static LLMProvider ParseProvider(string? configuredProvider)
+        /// <summary>Maps the RemoteLLMProvider dropdown value onto the provider it selects. This is the
+        /// single place the setting is interpreted — every remote call site resolves its endpoint, key and
+        /// model through <see cref="GetRemoteProviderConfigurationAsync"/>, so the dropdown governs ALL
+        /// traffic (KliveAgent, Omniscience, and the Projects Commander/sub-agent/utility/council routes)
+        /// rather than any one subsystem. An unrecognised value falls back to HuggingFace.</summary>
+        internal static LLMProvider ParseProvider(string? configuredProvider)
         {
             if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
             {
@@ -237,6 +252,11 @@ namespace Omnipotent.Services.KliveLLM
             if (string.Equals(configuredProvider, "OpenRouter", StringComparison.OrdinalIgnoreCase))
             {
                 return LLMProvider.OpenRouter;
+            }
+
+            if (string.Equals(configuredProvider, "AgentRouter", StringComparison.OrdinalIgnoreCase))
+            {
+                return LLMProvider.AgentRouter;
             }
 
             return LLMProvider.HuggingFace;
@@ -277,6 +297,8 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, false);
             await GetStringOmniSetting("OpenRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
+            await GetStringOmniSetting("AgentRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
+            await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
             await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
@@ -468,9 +490,12 @@ namespace Omnipotent.Services.KliveLLM
             string modelId = model?.Trim() ?? string.Empty;
             if (string.IsNullOrWhiteSpace(modelId))
             {
-                modelId = provider == LLMProvider.OpenRouter
-                    ? await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true)
-                    : await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true);
+                modelId = provider switch
+                {
+                    LLMProvider.OpenRouter => await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true),
+                    LLMProvider.AgentRouter => await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, true),
+                    _ => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
+                };
             }
 
             if (provider == LLMProvider.OpenRouter)
@@ -1118,6 +1143,24 @@ namespace Omnipotent.Services.KliveLLM
                     openRouterServiceTier);
             }
 
+            if (string.Equals(configuredProvider, "AgentRouter", StringComparison.OrdinalIgnoreCase))
+            {
+                string agentRouterToken = await GetOmniSetting("AgentRouterLLMToken", OmniSettingType.String, true, false);
+                string agentRouterModel = await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, true);
+
+                if (string.IsNullOrWhiteSpace(agentRouterToken))
+                {
+                    throw new InvalidOperationException("AgentRouterLLMToken is missing.");
+                }
+
+                return new RemoteLLMProviderConfiguration(
+                    LLMProvider.AgentRouter,
+                    "AgentRouter",
+                    AgentRouterChatCompletionsEndpoint,
+                    agentRouterToken,
+                    agentRouterModel);
+            }
+
             if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Remote provider configuration was requested while RemoteLLMProvider is set to Local.");
@@ -1270,6 +1313,12 @@ namespace Omnipotent.Services.KliveLLM
         /// This replaces app-side "try model A, on failure re-query with model B" loops. Only applied for
         /// OpenRouter (the only provider that understands the parameter) and only when at least one
         /// distinct backup route exists.
+        ///
+        /// On every other provider — HuggingFace, AgentRouter and any future OpenAI-compatible router —
+        /// a caller's route list still selects the model (route 0 becomes the request's `model`), but the
+        /// backup entries are simply not sent: a strict endpoint would reject the unknown parameter. So a
+        /// Projects role configured with several routes runs on its PRIMARY route there, with no
+        /// provider-side failover.
         /// </summary>
         internal static void ApplyModelFallback(ref HFWrapper.HFLLMInferenceRequest payload,
             RemoteLLMProviderConfiguration remoteProvider, IReadOnlyList<string>? modelRoutes)

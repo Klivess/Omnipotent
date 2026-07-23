@@ -288,8 +288,10 @@ namespace Omnipotent.Services.Projects
                 var settings = parent.Settings.Get(projectID);
                 var modelRoutes = settings.CommanderRoutes.ToList();
                 if (modelRoutes.Count == 0) throw new InvalidOperationException("Commander has no configured model routes.");
-                // Index 0 is the primary. OpenRouter receives it as `model` and later routes as its
-                // ordered fallback set; a successful backup is pinned for the rest of this wake.
+                // Index 0 is the primary. These routes are sent to whichever router KliveLLM's
+                // RemoteLLMProvider setting selects. On OpenRouter it receives index 0 as `model` and the
+                // later routes as its ordered fallback set (a successful backup is pinned for the rest of
+                // this wake); other routers get the primary only — see KliveLLM.ApplyModelFallback.
                 string model = modelRoutes[0];
                 initialModel = model;
                 finalModel = model;

@@ -130,6 +130,7 @@ namespace Omnipotent.Services.Projects
             if (statusMatch.Success && int.TryParse(statusMatch.Groups["status"].Value, out int parsed))
                 status = (HttpStatusCode)parsed;
             string provider = lower.Contains("openrouter", StringComparison.Ordinal) ? "OpenRouter"
+                : lower.Contains("agentrouter", StringComparison.Ordinal) ? "AgentRouter"
                 : lower.Contains("huggingface", StringComparison.Ordinal) ? "HuggingFace"
                 : "KliveLLM";
             return new RemoteLLMException(kind,

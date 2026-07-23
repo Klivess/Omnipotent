@@ -207,6 +207,59 @@ namespace Omnipotent.Tests.KliveLLM
             var hf = Payload(null);
             LlmService.ApplyModelFallback(ref hf, HuggingFace(), new[] { "a/b", "c/d" });
             Assert.Null(hf.models);
+
+            // AgentRouter is a plain OpenAI-compatible router: the Projects route list still selects the
+            // primary model, but the backup entries must not be sent as an unknown parameter.
+            var agentRouter = Payload(null);
+            LlmService.ApplyModelFallback(ref agentRouter, AgentRouter(), new[] { "a/b", "c/d" });
+            Assert.Null(agentRouter.models);
+        }
+
+        [Fact]
+        public void ProviderDropdown_SelectsTheRouterEveryRemoteCallSiteUses()
+        {
+            Assert.Equal(LlmService.LLMProvider.Local, LlmService.ParseProvider("Local"));
+            Assert.Equal(LlmService.LLMProvider.OpenRouter, LlmService.ParseProvider("OpenRouter"));
+            Assert.Equal(LlmService.LLMProvider.AgentRouter, LlmService.ParseProvider("AgentRouter"));
+            Assert.Equal(LlmService.LLMProvider.AgentRouter, LlmService.ParseProvider("agentrouter"));
+            Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider("HuggingFace"));
+            // Unknown/absent settings keep the historical HuggingFace default.
+            Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider("SomethingElse"));
+            Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider(null));
+        }
+
+        [Fact]
+        public async Task AgentRouter402_FailsFastWithoutTheOpenRouterAffordableRetry()
+        {
+            var handler = new RecordingHandler(
+                _ => JsonResponse(HttpStatusCode.PaymentRequired, PaymentBody(10_000)),
+                _ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(
+                () => service.SendPayloadWithRetryAsync(AgentRouter(), Payload(maxTokens: null)));
+
+            Assert.Single(handler.RequestBodies);
+            Assert.Equal(RemoteLLMFailureKind.InsufficientProviderCredit, error.Kind);
+            Assert.Equal("AgentRouter", error.Provider);
+        }
+
+        [Fact]
+        public async Task AgentRouter_PostsToItsOwnEndpointWithItsOwnKey()
+        {
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            await service.SendPayloadWithRetryAsync(AgentRouter(), Payload(maxTokens: null));
+
+            var request = Assert.Single(handler.Requests);
+            Assert.Equal("https://agentrouter.org/v1/chat/completions", request.Uri);
+            Assert.Equal("agent-router-token", request.AuthParameter);
+            // OpenRouter-only attribution headers must not leak to a different router.
+            Assert.DoesNotContain("HTTP-Referer", request.HeaderNames);
+            Assert.DoesNotContain("X-Title", request.HeaderNames);
         }
 
         [Fact]
@@ -245,6 +298,13 @@ namespace Omnipotent.Tests.KliveLLM
             "test-token",
             "test/model");
 
+        private static LlmService.RemoteLLMProviderConfiguration AgentRouter() => new(
+            LlmService.LLMProvider.AgentRouter,
+            "AgentRouter",
+            "https://agentrouter.org/v1/chat/completions",
+            "agent-router-token",
+            "gpt-4.1-mini");
+
         private static HFWrapper.HFLLMInferenceRequest Payload(int? maxTokens) => new()
         {
             model = "test/model",
@@ -265,6 +325,8 @@ namespace Omnipotent.Tests.KliveLLM
             Content = new StringContent(body, Encoding.UTF8, "application/json"),
         };
 
+        private sealed record RequestSnapshot(string Uri, string? AuthParameter, HashSet<string> HeaderNames);
+
         private sealed class RecordingHandler : HttpMessageHandler
         {
             private readonly Queue<Func<HttpRequestMessage, HttpResponseMessage>> responses;
@@ -276,11 +338,18 @@ namespace Omnipotent.Tests.KliveLLM
 
             public List<string> RequestBodies { get; } = new();
 
+            /// <summary>Snapshot of each outbound request, captured before the caller disposes it.</summary>
+            public List<RequestSnapshot> Requests { get; } = new();
+
             protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
             {
                 RequestBodies.Add(request.Content == null
                     ? ""
                     : await request.Content.ReadAsStringAsync(cancellationToken));
+                Requests.Add(new RequestSnapshot(
+                    request.RequestUri?.ToString() ?? "",
+                    request.Headers.Authorization?.Parameter,
+                    request.Headers.Select(h => h.Key).ToHashSet(StringComparer.OrdinalIgnoreCase)));
                 if (responses.Count == 0) throw new InvalidOperationException("Unexpected provider request.");
                 return responses.Dequeue()(request);
             }

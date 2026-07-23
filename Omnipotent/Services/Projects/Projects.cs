@@ -148,8 +148,19 @@ namespace Omnipotent.Services.Projects
             Vault = new ProjectVault(msg => ServiceLog(msg));
             TokenUsage = new ProjectTokenUsageStore(msg => ServiceLog(msg));
             Func<Task<string?>> openRouterToken = () => GetStringOmniSettingNullable("OpenRouterLLMToken");
+            // The generation-cost endpoint only knows OpenRouter's own generation IDs. KliveLLM's
+            // RemoteLLMProvider dropdown governs which router the Commander/sub-agent/utility routes
+            // actually hit, so when it points somewhere else (AgentRouter, HuggingFace) the IDs are
+            // foreign: withhold the token so the fetcher no-ops instantly and the ledger keeps its
+            // provisional estimate, instead of burning a retry chain per turn on a doomed lookup.
+            Func<Task<string?>> openRouterCostToken = async () =>
+            {
+                var llm = await GetKliveLLM();
+                if (llm == null || !await llm.IsOpenRouterActiveAsync()) return null;
+                return await openRouterToken();
+            };
             var costFetcher = new OpenRouterCostFetcher(
-                tokenProvider: openRouterToken,
+                tokenProvider: openRouterCostToken,
                 log: msg => ServiceLog(msg));
             ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg), TokenUsage);
