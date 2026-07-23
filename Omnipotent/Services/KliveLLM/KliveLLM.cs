@@ -83,6 +83,21 @@ namespace Omnipotent.Services.KliveLLM
             or RemoteLLMFailureKind.EmptyResponse;
     }
 
+    /// <summary>
+    /// What a given model+provider can accept/do, negotiated once so a caller never blind-sends a
+    /// modality the endpoint would 400 on. <see cref="NativeToolCalling"/> preserves the historical
+    /// "any remote provider supports tools" behaviour; the modality flags gate the newer
+    /// image/audio/document content-parts. Sourced from the OpenRouter model catalog when reachable,
+    /// otherwise a conservative static family table (see <c>KliveLLM.StaticModelCapabilities</c>).
+    /// </summary>
+    public sealed record ModelCapabilities(
+        bool NativeToolCalling,
+        bool ImageInput,
+        bool AudioInput,
+        bool DocumentInput,
+        bool PromptCaching,
+        bool Reasoning);
+
     public class KliveLLM : OmniService
     {
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
@@ -109,6 +124,16 @@ namespace Omnipotent.Services.KliveLLM
         // so it also seeds the local model's directive.
         internal string thinkingType = "Medium";
         private Dictionary<string, KliveLLMSession> sessions = new Dictionary<string, KliveLLMSession>();
+
+        // ── Model capability negotiation ──
+        // Cached OpenRouter /models catalog (model id → capabilities), refreshed on a TTL. The catalog is the
+        // authoritative source for which input modalities a model accepts; a static family table backs it up
+        // for HuggingFace and catalog misses. See GetModelCapabilitiesAsync / GetOpenRouterCapabilityCatalogAsync.
+        private static readonly HttpClient capabilitiesHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
+        private readonly object capabilitiesLock = new();
+        private Dictionary<string, ModelCapabilities>? openRouterCapabilities;
+        private DateTime openRouterCapabilitiesFetchedUtc = DateTime.MinValue;
+        private static readonly TimeSpan CapabilitiesCacheTtl = TimeSpan.FromHours(6);
 
         internal enum LLMProvider
         {
@@ -426,6 +451,130 @@ namespace Omnipotent.Services.KliveLLM
             return await GetActiveProviderAsync() != LLMProvider.Local;
         }
 
+        /// <summary>
+        /// Negotiate what the active provider + a given model can accept, so a caller never attaches a
+        /// modality the endpoint would reject. Pass a specific <paramref name="model"/> (e.g. a per-tier
+        /// route) or null to probe the active provider's configured model. Local is always text-only; remote
+        /// keeps NativeToolCalling=true (identical to <see cref="SupportsNativeToolCallingAsync"/>), while the
+        /// image/audio/document flags come from the OpenRouter model catalog when reachable, else a
+        /// conservative static family table. The result is safe to call on hot paths: the catalog is cached.
+        /// </summary>
+        public async Task<ModelCapabilities> GetModelCapabilitiesAsync(string? model = null, CancellationToken cancellationToken = default)
+        {
+            LLMProvider provider = await GetActiveProviderAsync();
+            if (provider == LLMProvider.Local)
+                return new ModelCapabilities(NativeToolCalling: false, ImageInput: false, AudioInput: false, DocumentInput: false, PromptCaching: false, Reasoning: false);
+
+            string modelId = model?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(modelId))
+            {
+                modelId = provider == LLMProvider.OpenRouter
+                    ? await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true)
+                    : await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true);
+            }
+
+            if (provider == LLMProvider.OpenRouter)
+            {
+                var catalog = await GetOpenRouterCapabilityCatalogAsync(cancellationToken);
+                if (catalog != null && catalog.TryGetValue(modelId, out var caps))
+                    return caps;
+            }
+
+            return StaticModelCapabilities(modelId);
+        }
+
+        /// <summary>Conservative capability guess from the model id's family, used for HuggingFace and when the
+        /// OpenRouter catalog can't be reached. Asserts a modality only on positive family evidence (unknown →
+        /// false) so audio/documents are never blind-sent; NativeToolCalling stays true for remote to preserve
+        /// the pre-existing "all remote providers support tools" behaviour.</summary>
+        internal static ModelCapabilities StaticModelCapabilities(string? modelId)
+        {
+            string id = (modelId ?? string.Empty).ToLowerInvariant();
+            bool gemini = id.Contains("gemini");
+            bool gptVision = id.Contains("gpt-4o") || id.Contains("gpt-4.1") || id.Contains("gpt-5")
+                             || id.Contains("o1") || id.Contains("o3") || id.Contains("o4");
+            bool claude = id.Contains("claude");
+            bool ossVision = id.Contains("vision") || id.Contains("llava") || id.Contains("pixtral")
+                             || id.Contains("-vl") || id.Contains("internvl");
+
+            bool audio = gemini || id.Contains("audio") || id.Contains("-omni") || id.Contains("qwen2.5-omni");
+            bool image = gemini || gptVision || claude || ossVision;
+            bool document = gemini || claude; // native PDF/file input
+            bool caching = claude;             // Anthropic prompt caching
+            bool reasoning = gemini || id.Contains("o1") || id.Contains("o3") || id.Contains("o4")
+                             || id.Contains("reason") || id.Contains("thinking") || id.Contains("-r1");
+
+            return new ModelCapabilities(
+                NativeToolCalling: true,
+                ImageInput: image,
+                AudioInput: audio,
+                DocumentInput: document,
+                PromptCaching: caching,
+                Reasoning: reasoning);
+        }
+
+        /// <summary>Fetch + cache OpenRouter's /models catalog as id → capabilities (TTL-refreshed). Reads each
+        /// model's architecture.input_modalities for image/audio/file support and supported_parameters for
+        /// reasoning; NativeToolCalling is forced true (remote behaviour is unchanged and not every tool-capable
+        /// model advertises it). Returns null on any failure so the caller falls back to the static family
+        /// table — a capability probe must never break a request.</summary>
+        private async Task<Dictionary<string, ModelCapabilities>?> GetOpenRouterCapabilityCatalogAsync(CancellationToken cancellationToken)
+        {
+            lock (capabilitiesLock)
+            {
+                if (openRouterCapabilities != null && DateTime.UtcNow - openRouterCapabilitiesFetchedUtc < CapabilitiesCacheTtl)
+                    return openRouterCapabilities;
+            }
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, "https://openrouter.ai/api/v1/models");
+                string token = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
+                if (!string.IsNullOrWhiteSpace(token))
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+                using var response = await capabilitiesHttp.SendAsync(request, cancellationToken);
+                if (!response.IsSuccessStatusCode) return null;
+
+                string body = await response.Content.ReadAsStringAsync(cancellationToken);
+                var json = JObject.Parse(body);
+                var map = new Dictionary<string, ModelCapabilities>(StringComparer.OrdinalIgnoreCase);
+                foreach (var entry in (json["data"] as JArray) ?? new JArray())
+                {
+                    string entryId = (string?)entry["id"] ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(entryId)) continue;
+
+                    var inputs = (entry["architecture"]?["input_modalities"] as JArray)?
+                        .Select(x => (string?)x).Where(s => !string.IsNullOrEmpty(s))
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    var supported = (entry["supported_parameters"] as JArray)?
+                        .Select(x => (string?)x).Where(s => !string.IsNullOrEmpty(s))
+                        .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    map[entryId] = new ModelCapabilities(
+                        NativeToolCalling: true,
+                        ImageInput: inputs.Contains("image"),
+                        AudioInput: inputs.Contains("audio"),
+                        DocumentInput: inputs.Contains("file"),
+                        PromptCaching: entryId.StartsWith("anthropic/", StringComparison.OrdinalIgnoreCase),
+                        Reasoning: supported.Contains("reasoning") || supported.Contains("include_reasoning"));
+                }
+
+                lock (capabilitiesLock)
+                {
+                    openRouterCapabilities = map;
+                    openRouterCapabilitiesFetchedUtc = DateTime.UtcNow;
+                }
+                return map;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                ServiceLog($"GetModelCapabilities: OpenRouter catalog fetch failed ({ex.Message}); using static family fallback.");
+                return null;
+            }
+        }
+
         /// <summary>Projects uses this to run OpenRouter-specific credit preflight only when its
         /// ordinary wake requests will actually use OpenRouter.</summary>
         public async Task<bool> IsOpenRouterActiveAsync()
@@ -571,6 +720,79 @@ namespace Omnipotent.Services.KliveLLM
             return false;
         }
 
+        /// <summary>
+        /// Append a user turn carrying text plus inline audio clips (content-parts array). Sibling of
+        /// <see cref="AppendUserContentToToolSession"/> for the audio modality: requires an audio-capable model
+        /// on a remote provider — gate on <see cref="GetModelCapabilitiesAsync"/>(...).AudioInput BEFORE calling,
+        /// or the provider will 400. Audio is sent as the RAW base64 payload with a container hint (wav/mp3/ogg…).
+        ///
+        /// CONTEXT COMPACTION: audio is even heavier than screenshots, so after adding the new clip all but the
+        /// most recent <paramref name="keepRecentAudio"/> audio messages are flattened to a one-line text
+        /// placeholder — the model keeps only the latest clip(s) for current state, at a fraction of the tokens.
+        /// </summary>
+        public void AppendAudioContentToToolSession(string sessionId, string text, List<(byte[] data, string format)> clips, int keepRecentAudio = 2)
+        {
+            var parts = new List<object>();
+            // Stamp even audio-only turns: the text part carries the capture-receipt time (see StampIncoming).
+            parts.Add(new HFWrapper.HFTextPart { text = string.IsNullOrWhiteSpace(text) ? StampIncoming(null).TrimEnd() : StampIncoming(text) });
+            foreach (var (data, format) in clips ?? new List<(byte[], string)>())
+            {
+                if (data == null || data.Length == 0) continue;
+                parts.Add(new HFWrapper.HFInputAudioPart
+                {
+                    input_audio = new HFWrapper.HFInputAudio
+                    {
+                        data = Convert.ToBase64String(data),
+                        format = string.IsNullOrWhiteSpace(format) ? "wav" : format
+                    }
+                });
+            }
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                {
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = parts });
+                    PruneOldToolAudio(s, keepRecentAudio);
+                }
+            }
+        }
+
+        /// <summary>Flatten all but the most recent <paramref name="keepRecent"/> audio-bearing user messages to
+        /// a tiny text placeholder, to keep the audio context window from overflowing. Only touches standalone
+        /// audio messages — assistant tool_calls and their results are untouched, so the tool-call protocol
+        /// stays intact. Audio analog of <see cref="PruneOldToolImages"/>.</summary>
+        private static void PruneOldToolAudio(KliveLLMSession s, int keepRecent)
+        {
+            if (keepRecent < 1) keepRecent = 1;
+            var audioIdx = new List<int>();
+            for (int i = 0; i < s.structuredMessages.Count; i++)
+            {
+                var m = s.structuredMessages[i];
+                if (m.role == "user" && MessageHasAudio(m)) audioIdx.Add(i);
+            }
+            int toPrune = audioIdx.Count - keepRecent;
+            for (int k = 0; k < toPrune; k++)
+            {
+                s.structuredMessages[audioIdx[k]] = new HFWrapper.HFMessage
+                {
+                    role = "user",
+                    content = "[Earlier audio clip omitted to conserve context — rely on the most recent audio for the current state.]"
+                };
+            }
+        }
+
+        private static bool MessageHasAudio(HFWrapper.HFMessage m)
+        {
+            if (m.content is string) return false;
+            if (m.content is System.Collections.IEnumerable parts)
+                foreach (var p in parts)
+                {
+                    if (p is HFWrapper.HFInputAudioPart) return true;
+                    if (p is Newtonsoft.Json.Linq.JObject jo && (string?)jo["type"] == "input_audio") return true;
+                }
+            return false;
+        }
+
         /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id. After appending,
         /// OLD tool results are compacted (see <see cref="PruneOldToolResults"/>) so a long task's accumulated
         /// script/observation output doesn't bloat the window — the model keeps the most recent results in full.</summary>
@@ -641,6 +863,26 @@ namespace Omnipotent.Services.KliveLLM
                     chars += (tc.function?.name?.Length ?? 0) + (tc.function?.arguments?.Length ?? 0) + 8;
             int tokens = chars / 4;
             if (MessageHasImage(m)) tokens += 1100; // a downscaled screenshot the text estimate misses
+            tokens += EstimateAudioTokens(m);       // audio parts the "[audio]" placeholder under-counts
+            return tokens;
+        }
+
+        /// <summary>Deliberately-high token estimate for any audio content-parts in a message. The "[audio]"
+        /// text placeholder contributes almost nothing to the char count, but providers bill audio by DURATION
+        /// (tens of tokens/sec), so without this the compactor could under-count and overflow the window. Biased
+        /// high, and the audio history is capped to a couple of clips by <see cref="PruneOldToolAudio"/>, so this
+        /// only ever triggers compaction slightly early — never too late.</summary>
+        private static int EstimateAudioTokens(HFWrapper.HFMessage m)
+        {
+            if (m.content is string || m.content is not System.Collections.IEnumerable parts) return 0;
+            int tokens = 0;
+            foreach (var p in parts)
+            {
+                if (p is HFWrapper.HFInputAudioPart ap)
+                    tokens += 800 + (ap.input_audio?.data?.Length ?? 0) / 400;
+                else if (p is Newtonsoft.Json.Linq.JObject jo && (string?)jo["type"] == "input_audio")
+                    tokens += 800 + (((string?)jo["input_audio"]?["data"])?.Length ?? 0) / 400;
+            }
             return tokens;
         }
 

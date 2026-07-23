@@ -22,10 +22,12 @@ namespace Omnipotent.Services.Projects
         private readonly ProjectStore projectStore;
         private readonly ProjectEventLogStore eventLog;
         private readonly OpenRouterCostFetcher costFetcher;
+        private readonly ProjectTokenUsageStore? tokenUsage;
         private readonly Action<string> log;
         private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, SemaphoreSlim> llmTurnGates = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, double> llmTurnReservations = new(StringComparer.Ordinal);
+        private readonly SemaphoreSlim reconcileSweepGate = new(1, 1);
 
         // Provisional per-million-token USD estimate, used until the real cost reconciles.
         // Same yardstick style as KliveAgentStats; the real OpenRouter figure supersedes it.
@@ -39,11 +41,13 @@ namespace Omnipotent.Services.Projects
         public event Action<string>? BudgetPausedRaised;
 
         public ProjectBudgetLedger(ProjectStore projectStore, ProjectEventLogStore eventLog,
-            OpenRouterCostFetcher costFetcher, Action<string> log)
+            OpenRouterCostFetcher costFetcher, Action<string> log,
+            ProjectTokenUsageStore? tokenUsage = null)
         {
             this.projectStore = projectStore;
             this.eventLog = eventLog;
             this.costFetcher = costFetcher;
+            this.tokenUsage = tokenUsage;
             this.log = log ?? (_ => { });
             dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory);
             Directory.CreateDirectory(dir);
@@ -155,12 +159,22 @@ namespace Omnipotent.Services.Projects
         /// reconciled against the real OpenRouter cost in the background. Emits budget warning/pause
         /// events as thresholds are crossed.
         /// </summary>
-        public async Task RecordTokenSpendAsync(string projectID, long promptTokens, long completionTokens, string? generationId = null, double? actualCostUsd = null)
+        public async Task RecordTokenSpendAsync(
+            string projectID,
+            long promptTokens,
+            long completionTokens,
+            string? generationId = null,
+            double? actualCostUsd = null,
+            ProjectTokenUsageContext? usageContext = null)
         {
             // The completion already carries the real cost — book it and skip the estimate/reconcile
             // path entirely. A provider that doesn't report cost (HuggingFace/local) falls back to the
             // flat provisional, which the /generation fetch later reconciles when a generation ID exists.
-            bool haveActual = actualCostUsd.HasValue && actualCostUsd.Value >= 0;
+            promptTokens = Math.Max(0, promptTokens);
+            completionTokens = Math.Max(0, completionTokens);
+            bool haveActual = actualCostUsd.HasValue
+                && double.IsFinite(actualCostUsd.Value)
+                && actualCostUsd.Value >= 0;
             double amount = haveActual
                 ? actualCostUsd!.Value
                 : promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
@@ -177,29 +191,129 @@ namespace Omnipotent.Services.Projects
                 SaveLocked(ledger);
             }
 
+            ProjectTokenUsageRecord? usageRecord = tokenUsage?.TryAppend(new ProjectTokenUsageRecord
+            {
+                RecordKind = "usage",
+                ProjectID = projectID,
+                OccurredAt = usageContext?.OccurredAt ?? DateTime.UtcNow,
+                WakeID = usageContext?.WakeID,
+                AgentID = usageContext?.AgentID ?? "system",
+                Source = usageContext?.Source ?? "unknown",
+                Operation = usageContext?.Operation,
+                Model = usageContext?.Model ?? "unknown",
+                SourceReference = usageContext?.SourceReference,
+                Label = usageContext?.Label,
+                PromptTokens = promptTokens,
+                CompletionTokens = completionTokens,
+                CostUsd = amount,
+                CostBasis = haveActual ? "actual" : "provisional",
+                GenerationID = generationId,
+            });
+
             CheckTokenThresholds(projectID);
 
             if (!haveActual && !string.IsNullOrWhiteSpace(generationId))
-                _ = Task.Run(() => ReconcileAsync(projectID, generationId!));
+                _ = Task.Run(() => ReconcileAsync(projectID, generationId!, usageRecord));
         }
 
-        private async Task ReconcileAsync(string projectID, string generationId)
+        /// <summary>
+        /// Resumes provider-cost reconciliation for provisional generations that survived a
+        /// process restart. The ledger's pending map is authoritative; the usage journal is
+        /// consulted only to preserve the original time/model/wake attribution.
+        /// </summary>
+        public async Task ReconcilePendingAsync(CancellationToken cancellationToken = default)
+        {
+            if (!await reconcileSweepGate.WaitAsync(0, cancellationToken)) return;
+            try
+            {
+                foreach (var project in projectStore.ListProjects())
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    string[] generations;
+                    lock (LockFor(project.ProjectID))
+                        generations = LoadLocked(project.ProjectID).PendingReconcile.Keys.ToArray();
+                    if (generations.Length == 0) continue;
+
+                    var generationSet = generations.ToHashSet(StringComparer.Ordinal);
+                    var provisionalByGeneration = tokenUsage?
+                        .EnumerateRange(project.ProjectID, null, null)
+                        .Where(record =>
+                            !string.IsNullOrWhiteSpace(record.GenerationID)
+                            && generationSet.Contains(record.GenerationID)
+                            && string.Equals(record.CostBasis, "provisional", StringComparison.OrdinalIgnoreCase))
+                        .GroupBy(record => record.GenerationID!, StringComparer.Ordinal)
+                        .ToDictionary(
+                            group => group.Key,
+                            group => group.OrderByDescending(record => record.Sequence).First(),
+                            StringComparer.Ordinal)
+                        ?? new Dictionary<string, ProjectTokenUsageRecord>(StringComparer.Ordinal);
+
+                    foreach (string generationID in generations)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        provisionalByGeneration.TryGetValue(generationID, out var provisionalUsage);
+                        await ReconcileAsync(
+                            project.ProjectID, generationID, provisionalUsage, cancellationToken);
+                    }
+                }
+            }
+            finally
+            {
+                reconcileSweepGate.Release();
+            }
+        }
+
+        private async Task ReconcileAsync(
+            string projectID,
+            string generationId,
+            ProjectTokenUsageRecord? provisionalUsage,
+            CancellationToken cancellationToken = default)
         {
             try
             {
-                double? real = await costFetcher.TryGetCostAsync(generationId);
-                if (real == null) return; // keep the provisional figure
+                double? real = await costFetcher.TryGetCostAsync(
+                    generationId, ct: cancellationToken);
+                if (real == null || !double.IsFinite(real.Value) || real.Value < 0)
+                    return; // keep the provisional figure
+                double adjustment = 0;
+                bool reconciled = false;
                 lock (LockFor(projectID))
                 {
                     var ledger = LoadLocked(projectID);
                     if (ledger.PendingReconcile.TryGetValue(generationId, out double prov))
                     {
-                        ledger.TokenSpendUsd += real.Value - prov; // swap estimate for truth
+                        adjustment = real.Value - prov;
+                        ledger.TokenSpendUsd += adjustment; // swap estimate for truth
                         ledger.PendingReconcile.Remove(generationId);
                         SaveLocked(ledger);
+                        reconciled = true;
                     }
                 }
+                if (reconciled && provisionalUsage != null)
+                {
+                    tokenUsage?.TryAppend(new ProjectTokenUsageRecord
+                    {
+                        RecordKind = "cost-adjustment",
+                        ProjectID = projectID,
+                        OccurredAt = provisionalUsage.OccurredAt,
+                        WakeID = provisionalUsage.WakeID,
+                        AgentID = provisionalUsage.AgentID,
+                        Source = provisionalUsage.Source,
+                        Operation = provisionalUsage.Operation,
+                        Model = provisionalUsage.Model,
+                        SourceReference = provisionalUsage.SourceReference,
+                        Label = provisionalUsage.Label,
+                        CostUsd = adjustment,
+                        CostBasis = "reconciliation",
+                        GenerationID = generationId,
+                        ReconcilesUsageID = provisionalUsage.UsageID,
+                    });
+                }
                 CheckTokenThresholds(projectID);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex) { log($"Budget reconcile failed for {projectID}/{generationId}: {ex.Message}"); }
         }
@@ -239,6 +353,7 @@ namespace Omnipotent.Services.Projects
                 Type = ProjectEventTypes.MoneySpent,
                 Author = "system",
                 Text = $"Real-money spend ${amountUsd:0.##}: {description}",
+                PayloadJson = JsonConvert.SerializeObject(new { amountUsd, description }),
             });
         }
 

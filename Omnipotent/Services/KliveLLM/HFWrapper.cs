@@ -18,8 +18,10 @@ namespace Omnipotent.Services.KliveLLM
             // OpenAI permits null content when tool_calls is present, but some providers (Alibaba/Qwen
             // via OpenRouter) 400 on "content": null. Callers should coalesce to "" — never emit null.
             //
-            // Either a plain string OR a content-parts array (List<object> of HFTextPart/HFImagePart)
-            // for vision-capable models. Use ContentToText() to read it as text — never cast directly.
+            // Either a plain string OR a content-parts array (List<object> of HFTextPart / HFImagePart /
+            // HFInputAudioPart / HFFilePart) for multimodal models. Use ContentToText() to read it as text —
+            // never cast directly. Non-text parts (image/audio/file) attach only to USER turns, never a
+            // system message, so the prompt-cache split (KliveLLM.ApplyPromptCaching) is unaffected.
             [JsonProperty("content")]
             public object content;
 
@@ -68,9 +70,54 @@ namespace Omnipotent.Services.KliveLLM
             public string url = "";
         }
 
+        /// <summary>Audio element of a content-parts array (OpenAI/OpenRouter "input_audio" format). Carries
+        /// base64-encoded audio plus its container format. Only send this to a model whose capabilities
+        /// report AudioInput — see KliveLLM.GetModelCapabilitiesAsync — otherwise the provider 400s.</summary>
+        public class HFInputAudioPart
+        {
+            [JsonProperty("type")]
+            public string type = "input_audio";
+
+            [JsonProperty("input_audio")]
+            public HFInputAudio input_audio = new();
+        }
+
+        public class HFInputAudio
+        {
+            // Base64-encoded audio bytes — the RAW base64 payload, not a data: URI.
+            [JsonProperty("data")]
+            public string data = "";
+
+            // Container/codec hint the provider needs to decode: "wav" | "mp3" | "ogg" | "flac" | "m4a" | "pcm16" …
+            [JsonProperty("format")]
+            public string format = "wav";
+        }
+
+        /// <summary>Document element of a content-parts array (OpenAI/OpenRouter "file" format). SCAFFOLD:
+        /// declared now so the gateway content-model is complete; wired into a read_document / chat-upload
+        /// path in a later phase. file_data is a base64 data URI, e.g. "data:application/pdf;base64,…".</summary>
+        public class HFFilePart
+        {
+            [JsonProperty("type")]
+            public string type = "file";
+
+            [JsonProperty("file")]
+            public HFFileData file = new();
+        }
+
+        public class HFFileData
+        {
+            [JsonProperty("filename", NullValueHandling = NullValueHandling.Ignore)]
+            public string filename;
+
+            [JsonProperty("file_data")]
+            public string file_data = "";
+        }
+
         /// <summary>
         /// Reads HFMessage.content as text regardless of shape: plain string, content-parts list,
-        /// or a JArray deserialized from a provider response. Image parts contribute nothing.
+        /// or a JArray deserialized from a provider response. Image parts contribute nothing; audio/file
+        /// parts contribute a short placeholder (never their base64 payload) so digests/logs stay small.
         /// </summary>
         public static string ContentToText(object content)
         {
@@ -96,6 +143,20 @@ namespace Omnipotent.Services.KliveLLM
                                 break;
                             case Newtonsoft.Json.Linq.JObject jo when (string?)jo["type"] == "text":
                                 sb.Append((string?)jo["text"]);
+                                break;
+                            // Non-text parts render a compact placeholder — never their base64 data — so the
+                            // in-task compaction digest, token estimate and any logging stay tiny.
+                            case HFInputAudioPart:
+                                sb.Append("[audio]");
+                                break;
+                            case HFFilePart fp:
+                                sb.Append(string.IsNullOrEmpty(fp.file?.filename) ? "[file]" : $"[file: {fp.file.filename}]");
+                                break;
+                            case Newtonsoft.Json.Linq.JObject jai when (string?)jai["type"] == "input_audio":
+                                sb.Append("[audio]");
+                                break;
+                            case Newtonsoft.Json.Linq.JObject jf when (string?)jf["type"] == "file":
+                                sb.Append("[file]");
                                 break;
                             case string str:
                                 sb.Append(str);

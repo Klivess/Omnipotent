@@ -5,7 +5,14 @@ using System.Text;
 namespace Omnipotent.Services.Projects
 {
     /// <summary>One model round-trip's result, as the council runner needs it (text + spend).</summary>
-    public record CouncilTurn(bool Success, string Text, long PromptTokens, long CompletionTokens, string? GenerationId, double? CostUsd);
+    public record CouncilTurn(
+        bool Success,
+        string Text,
+        long PromptTokens,
+        long CompletionTokens,
+        string? GenerationId,
+        double? CostUsd,
+        string? Model = null);
 
     /// <summary>
     /// Orchestrates an adversarial council: a panel of role-played LLM seats plus a Chair that the
@@ -42,6 +49,11 @@ namespace Omnipotent.Services.Projects
         public Func<string, CancellationToken, Task<IAsyncDisposable?>>? AcquireTurnAsync { get; set; }
         /// <summary>Books a turn's spend to the ledger: (projectID, prompt, completion, genId, cost).</summary>
         public Func<string, long, long, string?, double?, Task>? RecordSpendAsync { get; set; }
+        /// <summary>
+        /// Production spend recorder with structured analytics attribution. Tests and older
+        /// embedders may keep using <see cref="RecordSpendAsync"/>.
+        /// </summary>
+        public Func<string, long, long, string?, double?, ProjectTokenUsageContext, Task>? RecordDetailedSpendAsync { get; set; }
         /// <summary>True when the project auto-paused on budget exhaustion mid-council.</summary>
         public Func<string, bool>? IsBudgetPaused { get; set; }
         /// <summary>Budget snapshot line for the shared context.</summary>
@@ -324,10 +336,40 @@ namespace Omnipotent.Services.Projects
                 session.TotalCostUsd += statement.CostUsd;
                 store.Update(session);
             }
-            if ((turn.PromptTokens > 0 || turn.CompletionTokens > 0) && RecordSpendAsync != null)
-                await RecordSpendAsync(session.ProjectID, turn.PromptTokens, turn.CompletionTokens, turn.GenerationId, turn.CostUsd);
-
             string roundName = round switch { 1 => "opening", 2 => "rebuttal", 3 => "synthesis", _ => "statement" };
+            if (turn.PromptTokens > 0 || turn.CompletionTokens > 0)
+            {
+                if (RecordDetailedSpendAsync != null)
+                {
+                    await RecordDetailedSpendAsync(
+                        session.ProjectID,
+                        turn.PromptTokens,
+                        turn.CompletionTokens,
+                        turn.GenerationId,
+                        turn.CostUsd,
+                        new ProjectTokenUsageContext
+                        {
+                            OccurredAt = statement.Timestamp,
+                            WakeID = session.WakeID,
+                            AgentID = "commander",
+                            Source = "council",
+                            Operation = "council-statement",
+                            Model = turn.Model ?? session.Model,
+                            SourceReference = $"{session.CouncilID}:{round}:{Slug(role)}",
+                            Label = $"{role} council {roundName}",
+                        });
+                }
+                else if (RecordSpendAsync != null)
+                {
+                    await RecordSpendAsync(
+                        session.ProjectID,
+                        turn.PromptTokens,
+                        turn.CompletionTokens,
+                        turn.GenerationId,
+                        turn.CostUsd);
+                }
+            }
+
             AppendEvent(session, ProjectEventTypes.CouncilStatement, role == "Chair" ? "commander" : "system",
                 $"{role} ({roundName}): {Trunc(statement.Text, 300)}",
                 new { councilID = session.CouncilID, role, round });

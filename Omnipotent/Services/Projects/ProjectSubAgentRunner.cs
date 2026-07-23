@@ -219,6 +219,7 @@ namespace Omnipotent.Services.Projects
             long wakePromptTokens = 0, wakeCompletionTokens = 0; // per-wake cost attribution
             long liveContextTokens = 0; // current request context, not cumulative billed usage
             double wakeCostUsd = 0; // real per-wake spend (OpenRouter usage.cost), falls back to estimate
+            bool wakeCostEstimated = false;
             string? lastCommittedTool = null;
             string? lastCommittedResult = null;
             string? initialModel = null;
@@ -358,7 +359,24 @@ namespace Omnipotent.Services.Projects
                         liveContextTokens = ProjectWorkSliceBoundary.MeasureLiveContext(
                             resp.PromptTokens, resp.CompletionTokens);
                         wakeCostUsd += resp.CostUsd ?? parent.Budget.EstimateCost(resp.PromptTokens, resp.CompletionTokens);
-                        await parent.Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
+                        if (!resp.CostUsd.HasValue) wakeCostEstimated = true;
+                        await parent.Budget.RecordTokenSpendAsync(
+                            projectID,
+                            resp.PromptTokens,
+                            resp.CompletionTokens,
+                            resp.GenerationId,
+                            resp.CostUsd,
+                            new ProjectTokenUsageContext
+                            {
+                                OccurredAt = DateTime.UtcNow,
+                                WakeID = wakeID,
+                                AgentID = agent.AgentID,
+                                Source = "subagent",
+                                Operation = "wake-model-turn",
+                                Model = finalModel,
+                                SourceReference = $"{wakeID}:turn:{modelTurns}",
+                                Label = $"{agent.Role} model turn {modelTurns}",
+                            });
                     }
 
                     }
@@ -663,7 +681,9 @@ namespace Omnipotent.Services.Projects
                     parent.EventLog.Append(ProjectWakeDiagnostics.Create(projectID, wakeID, agent.AgentID,
                         outcome, wakeStartedAtUtc, modelTurns, toolCalls, dispatchedToolCalls, productiveActions,
                         emptyResponses, loopTrips, endedAtWorkSlice, initialModel, finalModel,
-                        sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool));
+                        sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool,
+                        wakePromptTokens, wakeCompletionTokens, wakeCostUsd,
+                        wakeCostEstimated ? "provisional-or-mixed" : "actual"));
                 }
                 catch { }
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID,

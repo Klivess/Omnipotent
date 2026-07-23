@@ -50,6 +50,8 @@ namespace Omnipotent.Services.Projects
         /// <summary>Per-project settings — Projects' own setting system, not OmniSettings.</summary>
         public ProjectSettingsStore Settings { get; private set; } = null!;
         public ProjectVault Vault { get; private set; } = null!;
+        /// <summary>Append-only structured attribution for every project LLM charge.</summary>
+        public ProjectTokenUsageStore TokenUsage { get; private set; } = null!;
         public ProjectBudgetLedger Budget { get; private set; } = null!;
         public OpenRouterCreditChecker ProviderCredit { get; private set; } = null!;
         public ProjectTierRouter TierRouter { get; private set; } = null!;
@@ -83,6 +85,8 @@ namespace Omnipotent.Services.Projects
         public ProjectObservableStore Observables { get; private set; } = null!;
         /// <summary>Adversarial council transcripts — the Commander's deliberation record.</summary>
         public ProjectCouncilStore Councils { get; private set; } = null!;
+        /// <summary>Read-only project and fleet performance/cost analytics for the KM website.</summary>
+        public ProjectAnalyticsService Analytics { get; private set; } = null!;
         /// <summary>Versioned Grand Plan — the strategic north star Klives approves before work begins.</summary>
         public ProjectGrandPlanStore GrandPlans { get; private set; } = null!;
         /// <summary>Orchestrates adversarial councils (transient tool-less LLM seats + a Chair).</summary>
@@ -142,12 +146,13 @@ namespace Omnipotent.Services.Projects
             // Phase 3: orchestration subsystems.
             Settings = new ProjectSettingsStore();
             Vault = new ProjectVault(msg => ServiceLog(msg));
+            TokenUsage = new ProjectTokenUsageStore(msg => ServiceLog(msg));
             Func<Task<string?>> openRouterToken = () => GetStringOmniSettingNullable("OpenRouterLLMToken");
             var costFetcher = new OpenRouterCostFetcher(
                 tokenProvider: openRouterToken,
                 log: msg => ServiceLog(msg));
             ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
-            Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg));
+            Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg), TokenUsage);
             // Alert Klives when a project auto-pauses on budget exhaustion (checks DiscordManager at
             // fire time, so it works even if Discord came up after the ledger was created).
             Budget.BudgetPausedRaised += pid =>
@@ -165,6 +170,11 @@ namespace Omnipotent.Services.Projects
                     _ = DiscordManager.PostAttentionAsync(proj, "⛔ Budget exhausted — project paused",
                         $"{Budget.DescribeState(pid)}. Approve a budget increase to continue, or leave it paused.");
             };
+            _ = Task.Run(async () =>
+            {
+                try { await Budget.ReconcilePendingAsync(); }
+                catch (Exception ex) { await ServiceLogError(ex, "Projects: pending token-cost reconciliation failed"); }
+            });
             TierRouter = new ProjectTierRouter(Settings);
             Gates = new ProjectGateManager(EventLog, msg => ServiceLog(msg));
             SubAgents = new ProjectSubAgentManager(Store, EventLog);
@@ -236,6 +246,7 @@ namespace Omnipotent.Services.Projects
             // Strategy layer: adversarial councils + the approved Grand Plan (the project's north star).
             Councils = new ProjectCouncilStore(msg => ServiceLog(msg));
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
+            Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage);
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
                 QueryAsync = async (sid, sys, user, routes, maxTokens, ct) =>
@@ -254,7 +265,8 @@ namespace Omnipotent.Services.Projects
                     return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct);
                 },
                 AcquireTurnAsync = (pid, ct) => Budget.TryAcquireLlmTurnAsync(pid, ct),
-                RecordSpendAsync = (pid, p, c, g, cost) => Budget.RecordTokenSpendAsync(pid, p, c, g, cost),
+                RecordDetailedSpendAsync = (pid, p, c, g, cost, context) =>
+                    Budget.RecordTokenSpendAsync(pid, p, c, g, cost, context),
                 IsBudgetPaused = pid => Store.GetProject(pid)?.Status == ProjectStatus.BudgetPaused,
                 DescribeBudget = pid => Budget.DescribeState(pid),
                 DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid),
@@ -264,6 +276,8 @@ namespace Omnipotent.Services.Projects
             // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
             retentionTimer = new System.Threading.Timer(async _ =>
             {
+                try { await Budget.ReconcilePendingAsync(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: token-cost reconciliation retry failed"); }
                 try { Artifacts.RunRetentionSweep(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: artifact retention sweep failed"); }
                 try { Files.CleanupExpiredUploads(); }
@@ -276,7 +290,8 @@ namespace Omnipotent.Services.Projects
             Hooks = new StimulusHookStore(EventLog);
             StimulusQueue = new StimulusQueue(msg => ServiceLog(msg));
             var triageAgent = new StimulusAgent(
-                queryModelAsync: QueryUtilityModelAsync,
+                queryModelAsync: (projectID, prompt, routes) =>
+                    QueryUtilityModelAsync(projectID, prompt, routes, "stimulus-triage"),
                 modelsForProject: pid => { var s = Settings.Get(pid); return ((IReadOnlyList<string>)s.StimulusFreeRoutes, (IReadOnlyList<string>)s.StimulusFallbackRoutes); },
                 log: msg => ServiceLog(msg));
             Bus = new StimulusBus(Hooks, StimulusQueue, triageAgent, EventLog, Store, msg => ServiceLog(msg));
@@ -965,13 +980,17 @@ namespace Omnipotent.Services.Projects
         /// <summary>Queries the utility model with a one-shot prompt; used by triage and digest rebuilds.
         /// Route 0 is handed to OpenRouter as the primary and later routes as its fallback set (one request
         /// tries them in turn) rather than looping model-by-model in-process.</summary>
-        private async Task<string?> QueryUtilityModelAsync(string projectID, string prompt, IReadOnlyList<string> routes)
+        private async Task<string?> QueryUtilityModelAsync(
+            string projectID,
+            string prompt,
+            IReadOnlyList<string> routes,
+            string operation)
         {
             if (routes == null || routes.Count == 0) return null;
             var llmServices = await GetServicesByType<KliveLLM.KliveLLM>();
             if (llmServices == null || llmServices.Length == 0) return null;
             var llm = (KliveLLM.KliveLLM)llmServices[0];
-            string sid = $"projects-triage-{Guid.NewGuid():N}";
+            string sid = $"projects-{operation}-{Guid.NewGuid():N}";
             llm.StartToolSession(sid, null);
             llm.AppendUserMessageToToolSession(sid, prompt);
             var lease = await Budget.TryAcquireLlmTurnAsync(projectID);
@@ -983,13 +1002,31 @@ namespace Omnipotent.Services.Projects
                 var resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
                     maxTokensOverride: utilityMaxTokens, modelOverride: routes[0], modelRoutes: routes);
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
-                    await Budget.RecordTokenSpendAsync(projectID, resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
+                    await Budget.RecordTokenSpendAsync(
+                        projectID,
+                        resp.PromptTokens,
+                        resp.CompletionTokens,
+                        resp.GenerationId,
+                        resp.CostUsd,
+                        new ProjectTokenUsageContext
+                        {
+                            OccurredAt = DateTime.UtcNow,
+                            AgentID = "system",
+                            Source = "utility",
+                            Operation = operation,
+                            Model = resp.Model ?? routes[0],
+                            SourceReference = sid,
+                            Label = operation == "digest-rebuild"
+                                ? "Project digest rebuild"
+                                : "Stimulus relevance triage",
+                        });
                 return resp.Success ? resp.Response : null;
             }
         }
 
         private Task<string?> QueryUtilityRoutesAsync(string projectID, string prompt)
-            => QueryUtilityModelAsync(projectID, prompt, Settings.Get(projectID).UtilityRoutes);
+            => QueryUtilityModelAsync(
+                projectID, prompt, Settings.Get(projectID).UtilityRoutes, "digest-rebuild");
 
         /// <summary>The KliveLLM service instance, or null when unavailable.</summary>
         private async Task<KliveLLM.KliveLLM?> GetKliveLLM()
@@ -1005,7 +1042,14 @@ namespace Omnipotent.Services.Projects
             var resp = await llm.QueryToolSessionAsync(sessionId, new List<KliveLLM.HFWrapper.HFTool>(),
                 maxTokensOverride: maxTokens, modelOverride: routes.Count > 0 ? routes[0] : null, cancellationToken: ct, modelRoutes: routes);
             if (!resp.Success) return null;
-            return new CouncilTurn(true, resp.Response ?? "", resp.PromptTokens, resp.CompletionTokens, resp.GenerationId, resp.CostUsd);
+            return new CouncilTurn(
+                true,
+                resp.Response ?? "",
+                resp.PromptTokens,
+                resp.CompletionTokens,
+                resp.GenerationId,
+                resp.CostUsd,
+                resp.Model);
         }
 
         /// <summary>OpenRouter token for the cost fetcher; null when unset (fetcher then no-ops to the estimate).</summary>

@@ -574,6 +574,36 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            // Server-side analytics keep the browser from paging/scanning every project's raw log.
+            // Lifetime ledger totals remain authoritative; the response also describes the coverage
+            // of historical per-wake attribution for older records.
+            await parent.CreateAPIRoute("/projects/analytics", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string range = req.userParameters?.Get("range") ?? "30d";
+                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range);
+                    if (snapshot == null)
+                    {
+                        await req.ReturnResponse("unknown projectID", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await req.ReturnResponse(Json(snapshot));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/analytics/all", async req =>
+            {
+                try
+                {
+                    string range = req.userParameters?.Get("range") ?? "30d";
+                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             // Agent roster (org chart) for the workspace's Agents panel.
             await parent.CreateAPIRoute("/projects/agents", async req =>
             {
