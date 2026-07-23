@@ -77,7 +77,10 @@ public sealed class ProjectAnalyticsService
         var snapshot = ProjectAnalyticsCalculator.BuildProject(
             project,
             ledger,
-            events.EnumerateRange(projectID, range.FromUtc, range.ToUtc),
+            // Lifecycle reconstruction needs the status immediately before the selected range.
+            // Read from creation through the range end once; BuildProject still limits every
+            // ordinary activity/spend metric to the requested window.
+            events.EnumerateRange(projectID, project.CreatedAt, range.ToUtc),
             agents.ListActive(projectID),
             councils.List(projectID),
             range,
@@ -217,6 +220,23 @@ public sealed class AnalyticsSummary
     public int CancelledWakes { get; set; }
     public double SuccessRate { get; set; }
     public int ActiveDays { get; set; }
+    /// <summary>
+    /// Project-time represented by the selected range. For a portfolio this is the sum of each
+    /// project's eligible duration (project-hours), not wall-clock duration.
+    /// </summary>
+    public double RangeTrackedDurationMs { get; set; }
+    /// <summary>Time in Active or Planning during the selected range.</summary>
+    public double RangeActiveDurationMs { get; set; }
+    /// <summary>Time in Paused or BudgetPaused during the selected range.</summary>
+    public double RangePausedDurationMs { get; set; }
+    /// <summary>Blocked, archived or completed time in the range, excluding paused time.</summary>
+    public double RangeInactiveDurationMs { get; set; }
+    public double RangeAvailabilityPct { get; set; }
+    /// <summary>Distinct paused intervals intersecting the selected range.</summary>
+    public int PauseCount { get; set; }
+    /// <summary>Portfolio-only count of projects currently Paused or BudgetPaused.</summary>
+    public int PausedProjects { get; set; }
+    public DateTime? CurrentPauseStartedAt { get; set; }
     public double AvgWakeDurationMs { get; set; }
     public double AvgCostPerWake { get; set; }
     public int Tools { get; set; }
@@ -224,6 +244,9 @@ public sealed class AnalyticsSummary
     public int Artifacts { get; set; }
     public int Councils { get; set; }
     public double CouncilSpendUsd { get; set; }
+    /// <summary>Non-retired agent records attached to the project, whether or not it is running.</summary>
+    public int RosterAgents { get; set; }
+    /// <summary>Roster agents whose project is currently Active or Planning.</summary>
     public int ActiveAgents { get; set; }
     public DateTime? LastActivityAt { get; set; }
 }
@@ -246,6 +269,10 @@ public sealed class AnalyticsSeriesPoint
     public int CancelledWakes { get; set; }
     public int ToolCalls { get; set; }
     public int ProductiveActions { get; set; }
+    public double ActiveDurationMs { get; set; }
+    public double PausedDurationMs { get; set; }
+    public double InactiveDurationMs { get; set; }
+    public double AvailabilityPct { get; set; }
 }
 
 public sealed class AnalyticsCountItem
@@ -295,7 +322,17 @@ public sealed class AnalyticsBudgetForecast
     public double BudgetUsd { get; set; }
     public double RemainingUsd { get; set; }
     public double UsedPct { get; set; }
+    /// <summary>Spend per 24 hours of Active/Planning time.</summary>
     public double AverageDailySpendUsd { get; set; }
+    /// <summary>Spend divided by all eligible wall-clock time, including pauses.</summary>
+    public double CalendarAverageDailySpendUsd { get; set; }
+    /// <summary>
+    /// Current burn contribution. Zero while this project is not Active/Planning; for a portfolio
+    /// it is the sum of currently active projects' active-time-normalized rates.
+    /// </summary>
+    public double CurrentActiveDailySpendUsd { get; set; }
+    public bool CurrentlyPaused { get; set; }
+    public bool CurrentlyActive { get; set; }
     public double? EstimatedDaysRemaining { get; set; }
     public DateTime? EstimatedExhaustionAt { get; set; }
 }
@@ -343,7 +380,18 @@ public sealed class AnalyticsProjectRow
     public int Wakes { get; set; }
     public double SuccessRate { get; set; }
     public int ActiveAgents { get; set; }
+    public int RosterAgents { get; set; }
     public DateTime? LastActivityAt { get; set; }
+    public double RangeTrackedDurationMs { get; set; }
+    public double RangeActiveDurationMs { get; set; }
+    public double RangePausedDurationMs { get; set; }
+    public double RangeInactiveDurationMs { get; set; }
+    public double RangeAvailabilityPct { get; set; }
+    public int PauseCount { get; set; }
+    public DateTime? CurrentPauseStartedAt { get; set; }
+    public double AverageDailySpendUsd { get; set; }
+    public double? EstimatedDaysRemaining { get; set; }
+    public DateTime? EstimatedExhaustionAt { get; set; }
 }
 
 internal static class ProjectAnalyticsCalculator
@@ -411,8 +459,24 @@ internal static class ProjectAnalyticsCalculator
         IEnumerable<ProjectTokenUsageRecord>? sourceUsage = null,
         DateTime? usageCutoverUtc = null)
     {
-        var eventList = sourceEvents
-            .Where(e => e.Timestamp.ToUniversalTime() >= range.FromUtc && e.Timestamp.ToUniversalTime() <= range.ToUtc)
+        // The service streams history from project creation so range-start state can be seeded.
+        // Retain only lifecycle transitions before the requested window; old ordinary activity
+        // must not turn a long-lived project's analytics request into an unbounded allocation.
+        var eventList = new List<ProjectEvent>();
+        var lifecycleEventList = new List<ProjectEvent>();
+        foreach (var evt in sourceEvents)
+        {
+            DateTime timestamp = evt.Timestamp.ToUniversalTime();
+            if (timestamp > range.ToUtc) continue;
+            if (timestamp >= range.FromUtc) eventList.Add(evt);
+            if (ProjectLifecycleEvents.TryReadToStatus(evt, out _))
+                lifecycleEventList.Add(evt);
+        }
+        eventList = eventList
+            .OrderBy(e => e.Timestamp)
+            .ThenBy(e => e.Sequence)
+            .ToList();
+        lifecycleEventList = lifecycleEventList
             .OrderBy(e => e.Timestamp)
             .ThenBy(e => e.Sequence)
             .ToList();
@@ -435,6 +499,8 @@ internal static class ProjectAnalyticsCalculator
         var roster = activeAgents.ToList();
 
         var series = CreateSeries(range);
+        var lifecycle = BuildLifecycle(project, lifecycleEventList, range);
+        ApplyLifecycleToSeries(series, lifecycle.Intervals, range);
         var seriesByKey = series.ToDictionary(p => p.Date, StringComparer.Ordinal);
         var eventTypeCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var heatmapCounts = new int[7, 24];
@@ -745,9 +811,16 @@ internal static class ProjectAnalyticsCalculator
         double moneyBudget = Math.Max(0, project.MoneyBudgetUsd);
         double moneyRemaining = Math.Max(0, moneyBudget - moneySpend);
         double moneyUsedPct = moneyBudget > 0 ? moneySpend * 100.0 / moneyBudget : 0;
-        double calendarDays = Math.Max(1, (range.ToUtc.Date - range.FromUtc.Date).TotalDays + 1);
-        double dailySpend = rangeSpend / calendarDays;
-        double? daysRemaining = dailySpend > 0 && remaining > 0 ? remaining / dailySpend : null;
+        double trackedDays = lifecycle.TrackedDuration.TotalDays;
+        double activeDays = lifecycle.ActiveDuration.TotalDays;
+        double calendarDailySpend = trackedDays > 0 ? rangeSpend / trackedDays : 0;
+        double activeDailySpend = activeDays > 0 ? rangeSpend / activeDays : 0;
+        bool currentlyActive = IsRunnableStatus(project.Status);
+        bool currentlyPaused = IsPausedStatus(project.Status);
+        double currentActiveDailySpend = currentlyActive ? activeDailySpend : 0;
+        double? daysRemaining = activeDailySpend > 0 && remaining > 0
+            ? remaining / activeDailySpend
+            : null;
 
         double cumulative = 0;
         foreach (var point in series)
@@ -759,7 +832,7 @@ internal static class ProjectAnalyticsCalculator
         var summary = new AnalyticsSummary
         {
             ProjectCount = 1,
-            ActiveProjects = IsLiveStatus(project.Status) ? 1 : 0,
+            ActiveProjects = currentlyActive ? 1 : 0,
             LifetimeSpendUsd = RoundMoney(lifetimeSpend),
             RangeSpendUsd = RoundMoney(rangeSpend),
             TokenBudgetUsd = RoundMoney(budget),
@@ -786,6 +859,17 @@ internal static class ProjectAnalyticsCalculator
             CancelledWakes = cancelled,
             SuccessRate = Math.Round(successRate, 1),
             ActiveDays = activeDates.Count,
+            RangeTrackedDurationMs = lifecycle.TrackedDuration.TotalMilliseconds,
+            RangeActiveDurationMs = lifecycle.ActiveDuration.TotalMilliseconds,
+            RangePausedDurationMs = lifecycle.PausedDuration.TotalMilliseconds,
+            RangeInactiveDurationMs = lifecycle.InactiveDuration.TotalMilliseconds,
+            RangeAvailabilityPct = lifecycle.TrackedDuration > TimeSpan.Zero
+                ? Math.Round(lifecycle.ActiveDuration.TotalMilliseconds * 100.0
+                    / lifecycle.TrackedDuration.TotalMilliseconds, 1)
+                : 0,
+            PauseCount = lifecycle.PauseCount,
+            PausedProjects = currentlyPaused ? 1 : 0,
+            CurrentPauseStartedAt = currentlyPaused ? lifecycle.CurrentPauseStartedAt : null,
             AvgWakeDurationMs = elapsedCount > 0 ? Math.Round(elapsedTotal / (double)elapsedCount, 0) : 0,
             AvgCostPerWake = wakes.Count > 0 ? RoundMoney(rangeSpend / wakes.Count) : 0,
             Tools = toolCalls,
@@ -793,7 +877,8 @@ internal static class ProjectAnalyticsCalculator
             Artifacts = artifacts,
             Councils = councilCount,
             CouncilSpendUsd = RoundMoney(councilSpend),
-            ActiveAgents = roster.Count,
+            RosterAgents = roster.Count,
+            ActiveAgents = currentlyActive ? roster.Count : 0,
             LastActivityAt = lastActivityAt,
         };
 
@@ -854,9 +939,14 @@ internal static class ProjectAnalyticsCalculator
                 BudgetUsd = RoundMoney(budget),
                 RemainingUsd = RoundMoney(remaining),
                 UsedPct = Math.Round(usedPct, 2),
-                AverageDailySpendUsd = RoundMoney(dailySpend),
+                AverageDailySpendUsd = RoundMoney(activeDailySpend),
+                CalendarAverageDailySpendUsd = RoundMoney(calendarDailySpend),
+                CurrentActiveDailySpendUsd = RoundMoney(currentActiveDailySpend),
+                CurrentlyPaused = currentlyPaused,
+                CurrentlyActive = currentlyActive,
                 EstimatedDaysRemaining = daysRemaining.HasValue ? Math.Round(daysRemaining.Value, 1) : null,
-                EstimatedExhaustionAt = daysRemaining.HasValue && daysRemaining.Value < 36500
+                EstimatedExhaustionAt = currentlyActive
+                    && daysRemaining.HasValue && daysRemaining.Value < 36500
                     ? nowUtc.AddDays(daysRemaining.Value)
                     : null,
             },
@@ -931,6 +1021,9 @@ internal static class ProjectAnalyticsCalculator
                 target.CancelledWakes += source.CancelledWakes;
                 target.ToolCalls += source.ToolCalls;
                 target.ProductiveActions += source.ProductiveActions;
+                target.ActiveDurationMs += source.ActiveDurationMs;
+                target.PausedDurationMs += source.PausedDurationMs;
+                target.InactiveDurationMs += source.InactiveDurationMs;
             }
             foreach (var item in snapshot.Outcomes)
                 outcomes[item.Key] = outcomes.GetValueOrDefault(item.Key) + item.Count;
@@ -962,6 +1055,12 @@ internal static class ProjectAnalyticsCalculator
         {
             cumulative += point.SpendUsd;
             point.CumulativeSpendUsd = cumulative;
+            double tracked = point.ActiveDurationMs
+                + point.PausedDurationMs
+                + point.InactiveDurationMs;
+            point.AvailabilityPct = tracked > 0
+                ? Math.Round(point.ActiveDurationMs * 100.0 / tracked, 1)
+                : 0;
         }
 
         double lifetimeSpend = projects.Sum(p => p.Summary.LifetimeSpendUsd);
@@ -978,9 +1077,18 @@ internal static class ProjectAnalyticsCalculator
         int deferred = projects.Sum(p => p.Summary.DeferredWakes);
         int cancelled = projects.Sum(p => p.Summary.CancelledWakes);
         int outcomeCount = successful + failed + deferred + cancelled;
-        double calendarDays = Math.Max(1, (range.ToUtc.Date - range.FromUtc.Date).TotalDays + 1);
-        double dailySpend = rangeSpend / calendarDays;
-        double? daysRemaining = dailySpend > 0 && remaining > 0 ? remaining / dailySpend : null;
+        double wallClockDays = Math.Max(
+            0,
+            (range.ToUtc.ToUniversalTime() - range.FromUtc.ToUniversalTime()).TotalDays);
+        double calendarDailySpend = wallClockDays > 0 ? rangeSpend / wallClockDays : 0;
+        double averageActiveDailySpend = projects.Sum(p => p.Budget.AverageDailySpendUsd);
+        double currentActiveDailySpend = projects.Sum(p => p.Budget.CurrentActiveDailySpendUsd);
+        double currentActiveRemaining = projects
+            .Where(p => p.Budget.CurrentlyActive)
+            .Sum(p => p.Budget.RemainingUsd);
+        double? daysRemaining = currentActiveDailySpend > 0 && currentActiveRemaining > 0
+            ? currentActiveRemaining / currentActiveDailySpend
+            : null;
         long durationWeight = projects.Sum(p =>
             p.WakeDurationSamples > 0 ? p.WakeDurationSamples : p.Summary.Wakes);
         double weightedDuration = durationWeight > 0
@@ -994,7 +1102,7 @@ internal static class ProjectAnalyticsCalculator
         var summary = new AnalyticsSummary
         {
             ProjectCount = projects.Count,
-            ActiveProjects = projects.Count(p => IsLiveStatus(p.Project.Status)),
+            ActiveProjects = projects.Count(p => IsRunnableStatus(p.Project.Status)),
             LifetimeSpendUsd = RoundMoney(lifetimeSpend),
             RangeSpendUsd = RoundMoney(rangeSpend),
             TokenBudgetUsd = RoundMoney(totalBudget),
@@ -1023,6 +1131,25 @@ internal static class ProjectAnalyticsCalculator
             ActiveDays = portfolioActiveDates.Count > 0
                 ? portfolioActiveDates.Count
                 : series.Count(p => p.Events > 0),
+            RangeTrackedDurationMs = projects.Sum(p => p.Summary.RangeTrackedDurationMs),
+            RangeActiveDurationMs = projects.Sum(p => p.Summary.RangeActiveDurationMs),
+            RangePausedDurationMs = projects.Sum(p => p.Summary.RangePausedDurationMs),
+            RangeInactiveDurationMs = projects.Sum(p => p.Summary.RangeInactiveDurationMs),
+            RangeAvailabilityPct = projects.Sum(p => p.Summary.RangeTrackedDurationMs) > 0
+                ? Math.Round(projects.Sum(p => p.Summary.RangeActiveDurationMs) * 100.0
+                    / projects.Sum(p => p.Summary.RangeTrackedDurationMs), 1)
+                : 0,
+            PauseCount = projects.Sum(p => p.Summary.PauseCount),
+            PausedProjects = projects.Count(p => IsPausedStatus(p.Project.Status)),
+            CurrentPauseStartedAt = projects
+                .Where(p => IsPausedStatus(p.Project.Status))
+                .Select(p => p.Summary.CurrentPauseStartedAt)
+                .Where(timestamp => timestamp.HasValue)
+                .Select(timestamp => timestamp!.Value)
+                .DefaultIfEmpty()
+                .Min() is var earliestPause && earliestPause != default
+                    ? earliestPause
+                    : null,
             AvgWakeDurationMs = Math.Round(weightedDuration, 0),
             AvgCostPerWake = wakes > 0 ? RoundMoney(rangeSpend / wakes) : 0,
             Tools = projects.Sum(p => p.Summary.Tools),
@@ -1030,6 +1157,7 @@ internal static class ProjectAnalyticsCalculator
             Artifacts = projects.Sum(p => p.Summary.Artifacts),
             Councils = projects.Sum(p => p.Summary.Councils),
             CouncilSpendUsd = RoundMoney(projects.Sum(p => p.Summary.CouncilSpendUsd)),
+            RosterAgents = projects.Sum(p => p.Summary.RosterAgents),
             ActiveAgents = projects.Sum(p => p.Summary.ActiveAgents),
             LastActivityAt = projects.Select(p => p.Summary.LastActivityAt).Where(x => x.HasValue)
                 .Select(x => x!.Value).DefaultIfEmpty().Max() is var latest && latest != default
@@ -1077,7 +1205,18 @@ internal static class ProjectAnalyticsCalculator
                     Wakes = p.Summary.Wakes,
                     SuccessRate = p.Summary.SuccessRate,
                     ActiveAgents = p.Summary.ActiveAgents,
+                    RosterAgents = p.Summary.RosterAgents,
                     LastActivityAt = p.Summary.LastActivityAt,
+                    RangeTrackedDurationMs = p.Summary.RangeTrackedDurationMs,
+                    RangeActiveDurationMs = p.Summary.RangeActiveDurationMs,
+                    RangePausedDurationMs = p.Summary.RangePausedDurationMs,
+                    RangeInactiveDurationMs = p.Summary.RangeInactiveDurationMs,
+                    RangeAvailabilityPct = p.Summary.RangeAvailabilityPct,
+                    PauseCount = p.Summary.PauseCount,
+                    CurrentPauseStartedAt = p.Summary.CurrentPauseStartedAt,
+                    AverageDailySpendUsd = p.Budget.AverageDailySpendUsd,
+                    EstimatedDaysRemaining = p.Budget.EstimatedDaysRemaining,
+                    EstimatedExhaustionAt = p.Budget.EstimatedExhaustionAt,
                 })
                 .ToList(),
             Statuses = statuses.OrderByDescending(kv => kv.Value)
@@ -1094,7 +1233,13 @@ internal static class ProjectAnalyticsCalculator
                 BudgetUsd = RoundMoney(totalBudget),
                 RemainingUsd = RoundMoney(remaining),
                 UsedPct = totalBudget > 0 ? Math.Round(lifetimeSpend * 100.0 / totalBudget, 2) : 0,
-                AverageDailySpendUsd = RoundMoney(dailySpend),
+                AverageDailySpendUsd = RoundMoney(averageActiveDailySpend),
+                CalendarAverageDailySpendUsd = RoundMoney(calendarDailySpend),
+                CurrentActiveDailySpendUsd = RoundMoney(currentActiveDailySpend),
+                CurrentlyPaused = projects.Count > 0
+                    && projects.All(p => !p.Budget.CurrentlyActive)
+                    && projects.Any(p => p.Budget.CurrentlyPaused),
+                CurrentlyActive = projects.Any(p => p.Budget.CurrentlyActive),
                 EstimatedDaysRemaining = daysRemaining.HasValue ? Math.Round(daysRemaining.Value, 1) : null,
                 EstimatedExhaustionAt = daysRemaining.HasValue && daysRemaining.Value < 36500
                     ? nowUtc.AddDays(daysRemaining.Value)
@@ -1260,6 +1405,140 @@ internal static class ProjectAnalyticsCalculator
                 : 0;
     }
 
+    private static LifecycleMetrics BuildLifecycle(
+        Project project,
+        IReadOnlyList<ProjectEvent> events,
+        AnalyticsRange range)
+    {
+        DateTime createdAt = project.CreatedAt.ToUniversalTime();
+        DateTime rangeStart = range.FromUtc.ToUniversalTime();
+        DateTime rangeEnd = range.ToUtc.ToUniversalTime();
+        DateTime trackedStart = createdAt > rangeStart ? createdAt : rangeStart;
+        if (trackedStart >= rangeEnd)
+            return new LifecycleMetrics();
+
+        var transitions = events
+            .Select(evt => new
+            {
+                Event = evt,
+                Timestamp = evt.Timestamp.ToUniversalTime(),
+                HasStatus = ProjectLifecycleEvents.TryReadToStatus(evt, out ProjectStatus status),
+                Status = status,
+            })
+            .Where(item => item.HasStatus
+                && item.Timestamp >= createdAt
+                && item.Timestamp <= rangeEnd)
+            .OrderBy(item => item.Timestamp)
+            .ThenBy(item => item.Event.Sequence)
+            .ToList();
+
+        // Projects have always begun in a runnable phase (historically Active, now Planning).
+        // The distinction does not affect availability; durable transitions refine it from there.
+        AvailabilityState state = AvailabilityState.Active;
+        DateTime stateStartedAt = createdAt;
+        var intervals = new List<LifecycleInterval>();
+
+        void AddInterval(DateTime from, DateTime to, AvailabilityState intervalState)
+        {
+            DateTime clampedFrom = from > trackedStart ? from : trackedStart;
+            DateTime clampedTo = to < rangeEnd ? to : rangeEnd;
+            if (clampedTo <= clampedFrom) return;
+            intervals.Add(new LifecycleInterval(clampedFrom, clampedTo, intervalState));
+        }
+
+        foreach (var transition in transitions)
+        {
+            AvailabilityState next = AvailabilityFor(transition.Status);
+            if (next == state) continue; // repeated pause/status writes do not restart intervals
+            AddInterval(stateStartedAt, transition.Timestamp, state);
+            state = next;
+            stateStartedAt = transition.Timestamp;
+        }
+        AddInterval(stateStartedAt, rangeEnd, state);
+
+        TimeSpan tracked = rangeEnd - trackedStart;
+        TimeSpan active = SumDuration(intervals, AvailabilityState.Active);
+        TimeSpan paused = SumDuration(intervals, AvailabilityState.Paused);
+        TimeSpan inactive = SumDuration(intervals, AvailabilityState.Inactive);
+        int pauseCount = intervals.Count(interval => interval.State == AvailabilityState.Paused);
+
+        DateTime? currentPauseStartedAt = IsPausedStatus(project.Status)
+            && state == AvailabilityState.Paused
+                ? stateStartedAt
+                : null;
+
+        return new LifecycleMetrics
+        {
+            Intervals = intervals,
+            TrackedDuration = tracked,
+            ActiveDuration = active,
+            PausedDuration = paused,
+            InactiveDuration = inactive,
+            PauseCount = pauseCount,
+            CurrentPauseStartedAt = currentPauseStartedAt,
+        };
+    }
+
+    private static TimeSpan SumDuration(
+        IEnumerable<LifecycleInterval> intervals,
+        AvailabilityState state)
+        => TimeSpan.FromTicks(intervals
+            .Where(interval => interval.State == state)
+            .Sum(interval => (interval.ToUtc - interval.FromUtc).Ticks));
+
+    private static void ApplyLifecycleToSeries(
+        IReadOnlyList<AnalyticsSeriesPoint> series,
+        IReadOnlyList<LifecycleInterval> intervals,
+        AnalyticsRange range)
+    {
+        foreach (var point in series)
+        {
+            DateTime bucketStart = DateTime.SpecifyKind(
+                DateTime.ParseExact(
+                    point.Date,
+                    "yyyy-MM-dd",
+                    CultureInfo.InvariantCulture),
+                DateTimeKind.Utc);
+            DateTime bucketEnd = range.Bucket switch
+            {
+                "month" => bucketStart.AddMonths(1),
+                "week" => bucketStart.AddDays(7),
+                _ => bucketStart.AddDays(1),
+            };
+
+            foreach (var interval in intervals)
+            {
+                DateTime overlapStart = interval.FromUtc > bucketStart
+                    ? interval.FromUtc
+                    : bucketStart;
+                DateTime overlapEnd = interval.ToUtc < bucketEnd
+                    ? interval.ToUtc
+                    : bucketEnd;
+                if (overlapEnd <= overlapStart) continue;
+                double milliseconds = (overlapEnd - overlapStart).TotalMilliseconds;
+                switch (interval.State)
+                {
+                    case AvailabilityState.Active:
+                        point.ActiveDurationMs += milliseconds;
+                        break;
+                    case AvailabilityState.Paused:
+                        point.PausedDurationMs += milliseconds;
+                        break;
+                    default:
+                        point.InactiveDurationMs += milliseconds;
+                        break;
+                }
+            }
+
+            double tracked = point.ActiveDurationMs
+                + point.PausedDurationMs
+                + point.InactiveDurationMs;
+            point.AvailabilityPct = tracked > 0
+                ? Math.Round(point.ActiveDurationMs * 100.0 / tracked, 1)
+                : 0;
+        }
+    }
+
     private static List<AnalyticsSeriesPoint> CreateSeries(AnalyticsRange range)
     {
         var result = new List<AnalyticsSeriesPoint>();
@@ -1362,12 +1641,49 @@ internal static class ProjectAnalyticsCalculator
         CostUsd = RoundMoney(model.CostUsd),
     };
 
-    private static bool IsLiveStatus(ProjectStatus status)
-        => status is not (ProjectStatus.Archived or ProjectStatus.Completed);
+    private static bool IsRunnableStatus(ProjectStatus status)
+        => status is ProjectStatus.Active or ProjectStatus.Planning;
 
-    private static bool IsLiveStatus(string status)
-        => !string.Equals(status, ProjectStatus.Archived.ToString(), StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(status, ProjectStatus.Completed.ToString(), StringComparison.OrdinalIgnoreCase);
+    private static bool IsRunnableStatus(string status)
+        => string.Equals(status, ProjectStatus.Active.ToString(), StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, ProjectStatus.Planning.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsPausedStatus(ProjectStatus status)
+        => status is ProjectStatus.Paused or ProjectStatus.BudgetPaused;
+
+    private static bool IsPausedStatus(string status)
+        => string.Equals(status, ProjectStatus.Paused.ToString(), StringComparison.OrdinalIgnoreCase)
+            || string.Equals(status, ProjectStatus.BudgetPaused.ToString(), StringComparison.OrdinalIgnoreCase);
+
+    private static AvailabilityState AvailabilityFor(ProjectStatus status)
+        => IsRunnableStatus(status)
+            ? AvailabilityState.Active
+            : IsPausedStatus(status)
+                ? AvailabilityState.Paused
+                : AvailabilityState.Inactive;
+
+    private enum AvailabilityState
+    {
+        Active,
+        Paused,
+        Inactive,
+    }
+
+    private sealed record LifecycleInterval(
+        DateTime FromUtc,
+        DateTime ToUtc,
+        AvailabilityState State);
+
+    private sealed class LifecycleMetrics
+    {
+        public List<LifecycleInterval> Intervals { get; set; } = new();
+        public TimeSpan TrackedDuration { get; set; }
+        public TimeSpan ActiveDuration { get; set; }
+        public TimeSpan PausedDuration { get; set; }
+        public TimeSpan InactiveDuration { get; set; }
+        public int PauseCount { get; set; }
+        public DateTime? CurrentPauseStartedAt { get; set; }
+    }
 
     private static string Humanize(string value)
     {

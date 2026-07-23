@@ -1827,6 +1827,7 @@ namespace Omnipotent.Services.KliveAgent
             bool needsPlan = !projects.GrandPlans.HasApprovedPlan(project.ProjectID);
             bool wasBlocked = project.BlockedAt.HasValue
                 || !string.IsNullOrWhiteSpace(project.BlockedReason);
+            var fromStatus = project.Status;
             project.Status = needsPlan
                 ? Omnipotent.Services.Projects.ProjectStatus.Planning
                 : Omnipotent.Services.Projects.ProjectStatus.Active;
@@ -1847,7 +1848,9 @@ namespace Omnipotent.Services.KliveAgent
                     ? Omnipotent.Services.Projects.ProjectEventTypes.ProjectUnblocked
                     : Omnipotent.Services.Projects.ProjectEventTypes.Status,
                 Author = "klives",
-                Text = "Project resumed from the KliveAgent job dashboard."
+                Text = "Project resumed from the KliveAgent job dashboard.",
+                PayloadJson = Omnipotent.Services.Projects.ProjectLifecycleEvents.Payload(
+                    fromStatus, project.Status, wasBlocked ? "job-dashboard-unblock" : "job-dashboard-resume"),
             });
             projects.CommanderRunner.Wake(
                 project,

@@ -368,6 +368,7 @@ namespace Omnipotent.Services.Projects
 
             if (fraction >= 1.0 && project.Status is ProjectStatus.Active or ProjectStatus.Planning)
             {
+                ProjectStatus fromStatus = project.Status;
                 project.Status = ProjectStatus.BudgetPaused;
                 projectStore.SaveProject(project);
                 eventLog.Append(new ProjectEvent
@@ -375,6 +376,8 @@ namespace Omnipotent.Services.Projects
                     ProjectID = projectID,
                     Type = ProjectEventTypes.BudgetPaused,
                     Author = "system",
+                    PayloadJson = ProjectLifecycleEvents.Payload(
+                        fromStatus, ProjectStatus.BudgetPaused, "token-budget-exhausted"),
                     Text = $"Token budget exhausted (${ledger.TokenSpendUsd:0.##} of ${project.TokenBudgetUsd:0.##}). Project paused — a budget conversation with Klives is required to continue.",
                 });
                 try { BudgetPausedRaised?.Invoke(projectID); } catch { }

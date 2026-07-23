@@ -581,6 +581,8 @@ namespace Omnipotent.Services.Projects
                 ProjectID = p.ProjectID,
                 Type = ProjectEventTypes.Status,
                 Author = "klives",
+                PayloadJson = ProjectLifecycleEvents.Payload(
+                    ProjectStatus.Active, ProjectStatus.Planning, "project-created"),
                 Text = $"Project initialised. Goal: {goal} — token budget ${tokenBudgetUsd:0.##}, money budget ${moneyBudgetUsd:0.##} (autonomous ≤ ${moneyAutonomousThresholdUsd:0.##}), agent cap {subAgentCap}.",
             });
             if (initialFiles != null)
@@ -891,6 +893,7 @@ namespace Omnipotent.Services.Projects
             if (project.Status is ProjectStatus.Completed or ProjectStatus.Archived) return false;
             if (project.HaltedFromStatus.HasValue) return false; // already halted — don't overwrite the remembered state
 
+            ProjectStatus fromStatus = project.Status;
             project.HaltedFromStatus = project.Status;
             project.Status = ProjectStatus.Paused;
             Store.SaveProject(project);
@@ -903,6 +906,8 @@ namespace Omnipotent.Services.Projects
                 ProjectID = project.ProjectID,
                 Type = ProjectEventTypes.Status,
                 Author = "klives",
+                PayloadJson = ProjectLifecycleEvents.Payload(
+                    fromStatus, ProjectStatus.Paused, "fleet-halt"),
                 Text = cancelled
                     ? "Project halted by Klives (fleet halt-all) — in-flight wake halted."
                     : "Project halted by Klives (fleet halt-all).",
@@ -923,6 +928,7 @@ namespace Omnipotent.Services.Projects
             if (!project.HaltedFromStatus.HasValue) return false; // not halted
 
             ProjectStatus target = project.HaltedFromStatus.Value;
+            ProjectStatus fromStatus = project.Status;
             project.HaltedFromStatus = null;
 
             bool resumeWork = target is ProjectStatus.Active or ProjectStatus.Planning;
@@ -940,6 +946,8 @@ namespace Omnipotent.Services.Projects
                     ProjectID = project.ProjectID,
                     Type = ProjectEventTypes.Status,
                     Author = "klives",
+                    PayloadJson = ProjectLifecycleEvents.Payload(
+                        fromStatus, project.Status, "fleet-unhalt"),
                     Text = $"Project unhalted by Klives (fleet unhalt-all) — resumed to {project.Status}.",
                 });
                 CommanderRunner.Wake(project, wasPlanning
@@ -957,6 +965,8 @@ namespace Omnipotent.Services.Projects
                     ProjectID = project.ProjectID,
                     Type = ProjectEventTypes.Status,
                     Author = "klives",
+                    PayloadJson = ProjectLifecycleEvents.Payload(
+                        fromStatus, project.Status, "fleet-unhalt-restore"),
                     Text = $"Project unhalted by Klives (fleet unhalt-all) — restored to {target} (left at rest).",
                 });
             }
@@ -1549,6 +1559,7 @@ namespace Omnipotent.Services.Projects
         {
             CommanderRunner.CancelActiveWake(project.ProjectID);
             SubAgentRunner.CancelProject(project.ProjectID);
+            ProjectStatus fromStatus = project.Status;
             project.Status = ProjectStatus.Completed;
             project.CompletedAt = DateTime.UtcNow;
             Store.SaveProject(project);
@@ -1558,6 +1569,8 @@ namespace Omnipotent.Services.Projects
                 ProjectID = project.ProjectID,
                 Type = ProjectEventTypes.Status,
                 Author = "system",
+                PayloadJson = ProjectLifecycleEvents.Payload(
+                    fromStatus, ProjectStatus.Completed, "project-completed"),
                 Text = "Project completed. Goal achieved and confirmed by Klives.",
             });
             if (DiscordManager != null)
@@ -1593,6 +1606,8 @@ namespace Omnipotent.Services.Projects
                 ProjectID = project.ProjectID,
                 Type = ProjectEventTypes.Status,
                 Author = "system",
+                PayloadJson = ProjectLifecycleEvents.Payload(
+                    ProjectStatus.Planning, ProjectStatus.Active, "grand-plan-approved"),
                 Text = "Grand Plan approved by Klives — the project is now Active and execution begins.",
             });
             if (DiscordManager != null)

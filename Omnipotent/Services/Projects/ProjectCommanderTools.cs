@@ -712,9 +712,21 @@ namespace Omnipotent.Services.Projects
                                     {
                                         // Resume to where it left off: a project that never finished planning
                                         // returns to Planning (the Grand Plan gate still stands), not straight to work.
+                                        ProjectStatus fromStatus = p.Status;
                                         p.Status = (GrandPlans?.HasApprovedPlan(p.ProjectID) ?? true)
                                             ? ProjectStatus.Active : ProjectStatus.Planning;
                                         projectStore.SaveProject(p);
+                                        eventLog.Append(new ProjectEvent
+                                        {
+                                            ProjectID = p.ProjectID,
+                                            WakeID = wakeID,
+                                            AgentID = actingAgentID,
+                                            Type = ProjectEventTypes.Status,
+                                            Author = "klives",
+                                            Text = "Approved token budget increase resumed the budget-paused project.",
+                                            PayloadJson = ProjectLifecycleEvents.Payload(
+                                                fromStatus, p.Status, "approved-budget-increase-resume"),
+                                        });
                                     }
                                     break;
                                 case "money": p.MoneyBudgetUsd = amount; break;

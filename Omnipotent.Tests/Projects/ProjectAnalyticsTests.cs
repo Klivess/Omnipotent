@@ -442,6 +442,348 @@ public class ProjectAnalyticsTests
     }
 
     [Fact]
+    public void BuildProject_ReconstructsPausesAcrossRangeStartAndNormalizesBurnToActiveTime()
+    {
+        var project = NewProject("pause-history", "Pause history", ProjectStatus.Active, budget: 20);
+        var range = ProjectAnalyticsCalculator.ResolveRange("7d", project.CreatedAt, Now);
+        DateTime firstResume = range.FromUtc.AddDays(1);
+        DateTime secondPause = range.FromUtc.AddDays(3.5);
+        DateTime secondResume = range.FromUtc.AddDays(5.5);
+        var events = new[]
+        {
+            // Legacy pause predates the range. Analytics must replay it to seed range-start state.
+            new ProjectEvent
+            {
+                Sequence = 1,
+                ProjectID = project.ProjectID,
+                Timestamp = range.FromUtc.AddDays(-2),
+                Type = ProjectEventTypes.Status,
+                Author = "klives",
+                Text = "Project paused by Klives.",
+            },
+            new ProjectEvent
+            {
+                Sequence = 2,
+                ProjectID = project.ProjectID,
+                Timestamp = firstResume,
+                Type = ProjectEventTypes.Status,
+                Author = "klives",
+                Text = "Project resumed by Klives.",
+            },
+            Lifecycle(project.ProjectID, 3, secondPause,
+                ProjectStatus.Active, ProjectStatus.Paused, "manual-pause"),
+            // A repeated pause is still a timeline event, but must not split/reset the pause.
+            Lifecycle(project.ProjectID, 4, range.FromUtc.AddDays(4),
+                ProjectStatus.Paused, ProjectStatus.Paused, "repeat-pause"),
+            Lifecycle(project.ProjectID, 5, secondResume,
+                ProjectStatus.Paused, ProjectStatus.Active, "manual-resume"),
+        };
+        var usage = new[]
+        {
+            new ProjectTokenUsageRecord
+            {
+                Sequence = 1,
+                UsageID = "pause-spend",
+                ProjectID = project.ProjectID,
+                OccurredAt = Now.AddHours(-1),
+                Source = "utility",
+                Model = "provider/model",
+                PromptTokens = 600,
+                CompletionTokens = 100,
+                CostUsd = 7,
+                CostBasis = "actual",
+            },
+        };
+
+        var result = ProjectAnalyticsCalculator.BuildProject(
+            project,
+            new ProjectBudgetLedger.Ledger
+            {
+                ProjectID = project.ProjectID,
+                TokenSpendUsd = 7,
+                PromptTokens = 600,
+                CompletionTokens = 100,
+            },
+            events,
+            Array.Empty<ProjectAgentRecord>(),
+            Array.Empty<CouncilSession>(),
+            range,
+            Now,
+            usage);
+
+        Assert.Equal(TimeSpan.FromDays(6.5).TotalMilliseconds,
+            result.Summary.RangeTrackedDurationMs, precision: 3);
+        Assert.Equal(TimeSpan.FromDays(3.5).TotalMilliseconds,
+            result.Summary.RangeActiveDurationMs, precision: 3);
+        Assert.Equal(TimeSpan.FromDays(3).TotalMilliseconds,
+            result.Summary.RangePausedDurationMs, precision: 3);
+        Assert.Equal(0, result.Summary.RangeInactiveDurationMs);
+        Assert.Equal(53.8, result.Summary.RangeAvailabilityPct);
+        Assert.Equal(2, result.Summary.PauseCount);
+        Assert.Equal(2, result.Budget.AverageDailySpendUsd, precision: 6);
+        Assert.Equal(7.0 / 6.5, result.Budget.CalendarAverageDailySpendUsd, precision: 6);
+        Assert.Equal(2, result.Budget.CurrentActiveDailySpendUsd, precision: 6);
+        Assert.True(result.Budget.CurrentlyActive);
+        Assert.False(result.Budget.CurrentlyPaused);
+        Assert.Equal(6.5, result.Budget.EstimatedDaysRemaining);
+        Assert.Equal(Now.AddDays(6.5), result.Budget.EstimatedExhaustionAt);
+        Assert.Equal(result.Summary.RangeTrackedDurationMs,
+            result.Series.Sum(point => point.ActiveDurationMs
+                + point.PausedDurationMs
+                + point.InactiveDurationMs),
+            precision: 3);
+        Assert.Equal(4, result.Summary.Events); // pre-range status is lifecycle-only
+    }
+
+    [Fact]
+    public void BuildProject_CurrentPauseFreezesCalendarEtaAndDoesNotResetOnDuplicateOrUntrustedStatus()
+    {
+        var project = NewProject("paused", "Paused", ProjectStatus.Paused, budget: 10);
+        var range = ProjectAnalyticsCalculator.ResolveRange("7d", project.CreatedAt, Now);
+        DateTime pauseStartedAt = Now.AddDays(-2);
+        var events = new[]
+        {
+            new ProjectEvent
+            {
+                Sequence = 1,
+                ProjectID = project.ProjectID,
+                Timestamp = range.FromUtc.AddHours(4),
+                Type = ProjectEventTypes.ToolCall,
+                Author = "agent",
+                Text = "ordinary tool payload with a status field",
+                PayloadJson = JsonConvert.SerializeObject(new { status = "Paused" }),
+            },
+            new ProjectEvent
+            {
+                Sequence = 2,
+                ProjectID = project.ProjectID,
+                Timestamp = range.FromUtc.AddHours(8),
+                Type = ProjectEventTypes.Status,
+                Author = "agent",
+                Text = "Project paused by Klives.",
+            },
+            Lifecycle(project.ProjectID, 3, pauseStartedAt,
+                ProjectStatus.Active, ProjectStatus.Paused, "manual-pause"),
+            Lifecycle(project.ProjectID, 4, Now.AddDays(-1),
+                ProjectStatus.Paused, ProjectStatus.Paused, "repeat-pause"),
+        };
+        var usage = new[]
+        {
+            new ProjectTokenUsageRecord
+            {
+                UsageID = "before-pause",
+                ProjectID = project.ProjectID,
+                OccurredAt = Now.AddDays(-3),
+                Source = "utility",
+                Model = "provider/model",
+                PromptTokens = 400,
+                CostUsd = 4,
+            },
+            new ProjectTokenUsageRecord
+            {
+                UsageID = "during-pause",
+                ProjectID = project.ProjectID,
+                OccurredAt = Now.AddDays(-1),
+                Source = "utility",
+                Model = "provider/model",
+                PromptTokens = 100,
+                CostUsd = 1,
+            },
+        };
+        var roster = new[]
+        {
+            new ProjectAgentRecord
+            {
+                ProjectID = project.ProjectID,
+                AgentID = "commander",
+                Role = "commander",
+            },
+            new ProjectAgentRecord
+            {
+                ProjectID = project.ProjectID,
+                AgentID = "worker",
+                Role = "worker",
+            },
+        };
+
+        var result = ProjectAnalyticsCalculator.BuildProject(
+            project,
+            new ProjectBudgetLedger.Ledger
+            {
+                ProjectID = project.ProjectID,
+                TokenSpendUsd = 4,
+                PromptTokens = 400,
+            },
+            events,
+            roster,
+            Array.Empty<CouncilSession>(),
+            range,
+            Now,
+            usage);
+
+        Assert.Equal(TimeSpan.FromDays(4.5).TotalMilliseconds,
+            result.Summary.RangeActiveDurationMs, precision: 3);
+        Assert.Equal(TimeSpan.FromDays(2).TotalMilliseconds,
+            result.Summary.RangePausedDurationMs, precision: 3);
+        Assert.Equal(1, result.Summary.PauseCount);
+        Assert.Equal(pauseStartedAt, result.Summary.CurrentPauseStartedAt);
+        Assert.Equal(2, result.Summary.RosterAgents);
+        Assert.Equal(0, result.Summary.ActiveAgents);
+        Assert.Equal(5, result.Summary.RangeSpendUsd); // spend is factual even inside a pause
+        Assert.True(result.Budget.CurrentlyPaused);
+        Assert.False(result.Budget.CurrentlyActive);
+        Assert.Equal(0, result.Budget.CurrentActiveDailySpendUsd);
+        Assert.NotNull(result.Budget.EstimatedDaysRemaining); // active-runtime runway remains useful
+        Assert.Null(result.Budget.EstimatedExhaustionAt); // wall-clock countdown is frozen
+    }
+
+    [Fact]
+    public void BuildPortfolio_AggregatesProjectHoursAndUsesOnlyCurrentActiveFleetBurn()
+    {
+        var range = ProjectAnalyticsCalculator.ResolveRange("7d", Now.AddDays(-10), Now);
+        var active = NewProject("active", "Active", ProjectStatus.Active, budget: 10);
+        active.CreatedAt = Now.AddDays(-2);
+        var paused = NewProject("paused", "Paused", ProjectStatus.Paused, budget: 10);
+        paused.CreatedAt = Now.AddDays(-4);
+
+        var activeSnapshot = ProjectAnalyticsCalculator.BuildProject(
+            active,
+            new ProjectBudgetLedger.Ledger
+            {
+                ProjectID = active.ProjectID,
+                TokenSpendUsd = 2,
+                PromptTokens = 200,
+            },
+            Array.Empty<ProjectEvent>(),
+            new[]
+            {
+                new ProjectAgentRecord
+                {
+                    ProjectID = active.ProjectID,
+                    AgentID = "commander",
+                    Role = "commander",
+                },
+            },
+            Array.Empty<CouncilSession>(),
+            range,
+            Now,
+            new[]
+            {
+                new ProjectTokenUsageRecord
+                {
+                    UsageID = "active-spend",
+                    ProjectID = active.ProjectID,
+                    OccurredAt = Now.AddDays(-1),
+                    Source = "utility",
+                    Model = "provider/model",
+                    PromptTokens = 200,
+                    CostUsd = 2,
+                },
+            });
+        var pausedSnapshot = ProjectAnalyticsCalculator.BuildProject(
+            paused,
+            new ProjectBudgetLedger.Ledger
+            {
+                ProjectID = paused.ProjectID,
+                TokenSpendUsd = 4,
+                PromptTokens = 400,
+            },
+            new[]
+            {
+                Lifecycle(paused.ProjectID, 1, Now.AddDays(-2),
+                    ProjectStatus.Active, ProjectStatus.Paused, "manual-pause"),
+            },
+            new[]
+            {
+                new ProjectAgentRecord
+                {
+                    ProjectID = paused.ProjectID,
+                    AgentID = "commander",
+                    Role = "commander",
+                },
+            },
+            Array.Empty<CouncilSession>(),
+            range,
+            Now,
+            new[]
+            {
+                new ProjectTokenUsageRecord
+                {
+                    UsageID = "paused-spend",
+                    ProjectID = paused.ProjectID,
+                    OccurredAt = Now.AddDays(-3),
+                    Source = "utility",
+                    Model = "provider/model",
+                    PromptTokens = 400,
+                    CostUsd = 4,
+                },
+            });
+
+        var result = ProjectAnalyticsCalculator.BuildPortfolio(
+            new[] { activeSnapshot, pausedSnapshot },
+            range,
+            Now);
+
+        Assert.Equal(1, result.Summary.ActiveProjects);
+        Assert.Equal(1, result.Summary.PausedProjects);
+        Assert.Equal(1, result.Summary.ActiveAgents);
+        Assert.Equal(2, result.Summary.RosterAgents);
+        Assert.Equal(TimeSpan.FromDays(6).TotalMilliseconds,
+            result.Summary.RangeTrackedDurationMs, precision: 3);
+        Assert.Equal(TimeSpan.FromDays(4).TotalMilliseconds,
+            result.Summary.RangeActiveDurationMs, precision: 3);
+        Assert.Equal(TimeSpan.FromDays(2).TotalMilliseconds,
+            result.Summary.RangePausedDurationMs, precision: 3);
+        Assert.Equal(66.7, result.Summary.RangeAvailabilityPct);
+        Assert.Equal(3, result.Budget.AverageDailySpendUsd, precision: 6);
+        Assert.Equal(1, result.Budget.CurrentActiveDailySpendUsd, precision: 6);
+        Assert.Equal(8, result.Budget.EstimatedDaysRemaining);
+        Assert.Equal(Now.AddDays(8), result.Budget.EstimatedExhaustionAt);
+        Assert.True(result.Budget.CurrentlyActive);
+        Assert.False(result.Budget.CurrentlyPaused);
+        Assert.Contains(result.Projects, row =>
+            row.ProjectID == paused.ProjectID
+            && row.ActiveAgents == 0
+            && row.RosterAgents == 1
+            && row.PauseCount == 1
+            && row.EstimatedExhaustionAt == null);
+    }
+
+    [Fact]
+    public void BuildPortfolio_ActiveProjectsMeansOnlyActiveOrPlanning()
+    {
+        var range = ProjectAnalyticsCalculator.ResolveRange("7d", Now.AddDays(-10), Now);
+        string[] statuses =
+        {
+            ProjectStatus.Active.ToString(),
+            ProjectStatus.Planning.ToString(),
+            ProjectStatus.Paused.ToString(),
+            ProjectStatus.BudgetPaused.ToString(),
+            ProjectStatus.Blocked.ToString(),
+            ProjectStatus.Archived.ToString(),
+            ProjectStatus.Completed.ToString(),
+        };
+        var snapshots = statuses
+            .Select((status, index) => Snapshot(
+                $"status-{index}",
+                status,
+                status,
+                lifetimeSpend: 0,
+                budget: 0,
+                rangeSpend: 0,
+                lifetimeTokens: 0,
+                rangeTokens: 0,
+                wakes: 0,
+                successful: 0))
+            .ToList();
+
+        var result = ProjectAnalyticsCalculator.BuildPortfolio(snapshots, range, Now);
+
+        Assert.Equal(2, result.Summary.ActiveProjects);
+        Assert.Equal(2, result.Summary.PausedProjects);
+    }
+
+    [Fact]
     public void ResolveRange_CapsLongViewsWithWeeklyOrMonthlyBuckets()
     {
         var oneYear = ProjectAnalyticsCalculator.ResolveRange("365d", Now.AddYears(-3), Now);
@@ -483,6 +825,24 @@ public class ProjectAnalyticsTests
             Type = ProjectEventTypes.WakeDiagnostic,
             Timestamp = timestamp,
             PayloadJson = JsonConvert.SerializeObject(payload),
+        };
+
+    private static ProjectEvent Lifecycle(
+        string projectID,
+        long sequence,
+        DateTime timestamp,
+        ProjectStatus from,
+        ProjectStatus to,
+        string reason)
+        => new()
+        {
+            Sequence = sequence,
+            ProjectID = projectID,
+            Timestamp = timestamp,
+            Type = ProjectEventTypes.Status,
+            Author = "klives",
+            Text = $"Lifecycle {from} to {to}.",
+            PayloadJson = ProjectLifecycleEvents.Payload(from, to, reason),
         };
 
     private static ProjectAnalyticsSnapshot Snapshot(

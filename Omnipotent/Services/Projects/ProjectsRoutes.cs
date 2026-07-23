@@ -138,7 +138,8 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    project!.Status = ProjectStatus.Paused;
+                    ProjectStatus fromStatus = project!.Status;
+                    project.Status = ProjectStatus.Paused;
                     project.HaltedFromStatus = null; // individual pause overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
@@ -151,6 +152,8 @@ namespace Omnipotent.Services.Projects
                         ProjectID = project.ProjectID,
                         Type = ProjectEventTypes.Status,
                         Author = "klives",
+                        PayloadJson = ProjectLifecycleEvents.Payload(
+                            fromStatus, ProjectStatus.Paused, "manual-pause"),
                         Text = halted ? "Project paused by Klives — in-flight wake halted." : "Project paused by Klives.",
                     });
                     await req.ReturnResponse(Json(project));
@@ -164,7 +167,8 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    project!.Status = ProjectStatus.Archived;
+                    ProjectStatus fromStatus = project!.Status;
+                    project.Status = ProjectStatus.Archived;
                     project.HaltedFromStatus = null; // shelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Archived);
@@ -175,6 +179,8 @@ namespace Omnipotent.Services.Projects
                         ProjectID = project.ProjectID,
                         Type = ProjectEventTypes.Status,
                         Author = "klives",
+                        PayloadJson = ProjectLifecycleEvents.Payload(
+                            fromStatus, ProjectStatus.Archived, "archive"),
                         Text = "Project archived (shelved) by Klives.",
                     });
                     await req.ReturnResponse(Json(project));
@@ -189,7 +195,8 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     // Restore to Paused (not Active) — Klives explicitly resumes when ready, so
                     // unshelving never silently sets the fleet back to work.
-                    project!.Status = ProjectStatus.Paused;
+                    ProjectStatus fromStatus = project!.Status;
+                    project.Status = ProjectStatus.Paused;
                     project.HaltedFromStatus = null; // unshelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Paused);
@@ -198,6 +205,8 @@ namespace Omnipotent.Services.Projects
                         ProjectID = project.ProjectID,
                         Type = ProjectEventTypes.Status,
                         Author = "klives",
+                        PayloadJson = ProjectLifecycleEvents.Payload(
+                            fromStatus, ProjectStatus.Paused, "unarchive-to-paused"),
                         Text = "Project unshelved by Klives (paused — resume to set it working).",
                     });
                     await req.ReturnResponse(Json(project));
@@ -295,9 +304,11 @@ namespace Omnipotent.Services.Projects
 
                     // Re-arm the 80% warning for the new budget; un-pause if spend is back within it.
                     bool withinBudget = parent.Budget.NotifyBudgetChanged(project!.ProjectID);
+                    ProjectStatus? resumedFromStatus = null;
                     if (project.Status == ProjectStatus.BudgetPaused && withinBudget && tokenBudget.HasValue)
                     {
                         // Return to where it was paused — a never-approved plan resumes to Planning.
+                        resumedFromStatus = project.Status;
                         project.Status = parent.GrandPlans.HasApprovedPlan(project.ProjectID)
                             ? ProjectStatus.Active : ProjectStatus.Planning;
                         project.HaltedFromStatus = null; // budget-resume overrides any remembered fleet-halt state
@@ -314,6 +325,12 @@ namespace Omnipotent.Services.Projects
                         Type = ProjectEventTypes.KlivesMessage,
                         Author = "klives",
                         Text = $"Budgets updated by Klives: {string.Join(", ", changes)}.",
+                        PayloadJson = resumedFromStatus.HasValue
+                            ? ProjectLifecycleEvents.Payload(
+                                resumedFromStatus.Value,
+                                project.Status,
+                                "budget-increase-resume")
+                            : null,
                     });
                     await req.ReturnResponse(Json(project));
                 }
@@ -342,7 +359,8 @@ namespace Omnipotent.Services.Projects
                     }
                     // A project paused mid-planning resumes to Planning (the Grand Plan gate still stands).
                     bool wasPlanning = !parent.GrandPlans.HasApprovedPlan(project.ProjectID);
-                    project!.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
+                    ProjectStatus fromStatus = project!.Status;
+                    project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
                     bool wasBlocked = project.BlockedAt.HasValue || !string.IsNullOrWhiteSpace(project.BlockedReason);
                     project.BlockedAt = null;
                     project.BlockedReason = null;
@@ -361,6 +379,8 @@ namespace Omnipotent.Services.Projects
                         Type = wasBlocked ? ProjectEventTypes.ProjectUnblocked : ProjectEventTypes.Status,
                         Author = "klives",
                         Text = "Project resumed by Klives.",
+                        PayloadJson = ProjectLifecycleEvents.Payload(
+                            fromStatus, project.Status, wasBlocked ? "unblock" : "manual-resume"),
                     });
                     parent.CommanderRunner.Wake(project, wasPlanning
                         ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
