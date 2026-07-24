@@ -104,15 +104,17 @@ namespace Omnipotent.Services.KliveLLM
         private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
         private const string DefaultFreeOpenRouterModel = "openrouter/free";
 
-        // AgentRouter (https://agentrouter.org) is a plain OpenAI-compatible router: the same
-        // /v1/chat/completions contract, WITHOUT OpenRouter's proprietary extensions (the `models`
-        // fallback array, service_tier, usage.include cost reporting, cache_control prompt caching).
-        // So it is driven through the vanilla OpenAI-compatible path — every one of those extras stays
-        // gated on LLMProvider.OpenRouter so a strict endpoint can never 400 on an unknown parameter.
-        private const string AgentRouterChatCompletionsEndpoint = "https://agentrouter.org/v1/chat/completions";
-        private const string DefaultAgentRouterModel = "gpt-4.1-mini";
+        // Any OpenAI-compatible endpoint Klives points at (agentrouter.org, LiteLLM, vLLM, a self-hosted
+        // gateway…), driven entirely by two settings: CustomOpenAIEndpointURL + CustomOpenAILLMToken.
+        // It is treated as a VANILLA OpenAI chat-completions endpoint — every OpenRouter-proprietary
+        // extra (the `models` fallback array, service_tier, usage.include cost reporting, cache_control
+        // prompt caching, the attribution headers, the 402 affordable-token retry) stays gated on
+        // LLMProvider.OpenRouter so a strict endpoint can never 400 on a parameter it doesn't know.
+        private const string CustomOpenAIProviderOption = "Custom OpenAI Compatible Endpoint";
+        private const string DefaultCustomOpenAIEndpoint = "https://agentrouter.org/v1/";
+        private const string DefaultCustomOpenAIModel = "openai/gpt-4.1-mini";
 
-        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", "AgentRouter" };
+        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", CustomOpenAIProviderOption };
         private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
         private static readonly string[] ThinkingTypeOptions = new[] { "Off", "Low", "Medium", "High" };
 
@@ -149,7 +151,7 @@ namespace Omnipotent.Services.KliveLLM
             Local,
             HuggingFace,
             OpenRouter,
-            AgentRouter,
+            CustomOpenAI,
         }
 
         internal sealed class RemoteLLMProviderConfiguration
@@ -254,12 +256,28 @@ namespace Omnipotent.Services.KliveLLM
                 return LLMProvider.OpenRouter;
             }
 
-            if (string.Equals(configuredProvider, "AgentRouter", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(configuredProvider, CustomOpenAIProviderOption, StringComparison.OrdinalIgnoreCase))
             {
-                return LLMProvider.AgentRouter;
+                return LLMProvider.CustomOpenAI;
             }
 
             return LLMProvider.HuggingFace;
+        }
+
+        /// <summary>
+        /// Turns whatever Klives typed into CustomOpenAIEndpointURL into the chat-completions URL to POST.
+        /// A base URL ("https://agentrouter.org/v1/") gets "chat/completions" appended; a URL that already
+        /// names the endpoint is used verbatim. Trailing slashes either way are irrelevant, so the setting
+        /// can be pasted from any provider's docs without a format gotcha.
+        /// </summary>
+        internal static string ResolveChatCompletionsEndpoint(string? configuredUrl)
+        {
+            string url = (configuredUrl ?? string.Empty).Trim();
+            if (url.Length == 0) return string.Empty;
+            string trimmed = url.TrimEnd('/');
+            return trimmed.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)
+                ? trimmed
+                : trimmed + "/chat/completions";
         }
 
         private async Task<LLMProvider> GetActiveProviderAsync()
@@ -297,8 +315,9 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, false);
             await GetStringOmniSetting("OpenRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, false);
-            await GetStringOmniSetting("AgentRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
-            await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, false);
+            await GetStringOmniSetting("CustomOpenAIEndpointURL", DefaultCustomOpenAIEndpoint, false, false);
+            await GetStringOmniSetting("CustomOpenAILLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
+            await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
             await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
@@ -493,7 +512,7 @@ namespace Omnipotent.Services.KliveLLM
                 modelId = provider switch
                 {
                     LLMProvider.OpenRouter => await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true),
-                    LLMProvider.AgentRouter => await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, true),
+                    LLMProvider.CustomOpenAI => await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true),
                     _ => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
                 };
             }
@@ -1143,22 +1162,29 @@ namespace Omnipotent.Services.KliveLLM
                     openRouterServiceTier);
             }
 
-            if (string.Equals(configuredProvider, "AgentRouter", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(configuredProvider, CustomOpenAIProviderOption, StringComparison.OrdinalIgnoreCase))
             {
-                string agentRouterToken = await GetOmniSetting("AgentRouterLLMToken", OmniSettingType.String, true, false);
-                string agentRouterModel = await GetStringOmniSetting("AgentRouterModelID", DefaultAgentRouterModel, false, true);
+                string customToken = await GetOmniSetting("CustomOpenAILLMToken", OmniSettingType.String, true, false);
+                string customEndpoint = ResolveChatCompletionsEndpoint(
+                    await GetStringOmniSetting("CustomOpenAIEndpointURL", DefaultCustomOpenAIEndpoint, false, true));
+                string customModel = await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true);
 
-                if (string.IsNullOrWhiteSpace(agentRouterToken))
+                if (string.IsNullOrWhiteSpace(customEndpoint))
                 {
-                    throw new InvalidOperationException("AgentRouterLLMToken is missing.");
+                    throw new InvalidOperationException("CustomOpenAIEndpointURL is missing.");
+                }
+
+                if (string.IsNullOrWhiteSpace(customToken))
+                {
+                    throw new InvalidOperationException("CustomOpenAILLMToken is missing.");
                 }
 
                 return new RemoteLLMProviderConfiguration(
-                    LLMProvider.AgentRouter,
-                    "AgentRouter",
-                    AgentRouterChatCompletionsEndpoint,
-                    agentRouterToken,
-                    agentRouterModel);
+                    LLMProvider.CustomOpenAI,
+                    CustomOpenAIProviderOption,
+                    customEndpoint,
+                    customToken,
+                    customModel);
             }
 
             if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
@@ -1314,11 +1340,10 @@ namespace Omnipotent.Services.KliveLLM
         /// OpenRouter (the only provider that understands the parameter) and only when at least one
         /// distinct backup route exists.
         ///
-        /// On every other provider — HuggingFace, AgentRouter and any future OpenAI-compatible router —
-        /// a caller's route list still selects the model (route 0 becomes the request's `model`), but the
-        /// backup entries are simply not sent: a strict endpoint would reject the unknown parameter. So a
-        /// Projects role configured with several routes runs on its PRIMARY route there, with no
-        /// provider-side failover.
+        /// On every other provider — HuggingFace and a custom OpenAI-compatible endpoint — a caller's route
+        /// list still selects the model (route 0 becomes the request's `model`), but the backup entries are
+        /// simply not sent: a strict endpoint would reject the unknown parameter. So a Projects role
+        /// configured with several routes runs on its PRIMARY route there, with no provider-side failover.
         /// </summary>
         internal static void ApplyModelFallback(ref HFWrapper.HFLLMInferenceRequest payload,
             RemoteLLMProviderConfiguration remoteProvider, IReadOnlyList<string>? modelRoutes)

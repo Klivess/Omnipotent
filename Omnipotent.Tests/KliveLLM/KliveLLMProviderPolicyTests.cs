@@ -208,11 +208,11 @@ namespace Omnipotent.Tests.KliveLLM
             LlmService.ApplyModelFallback(ref hf, HuggingFace(), new[] { "a/b", "c/d" });
             Assert.Null(hf.models);
 
-            // AgentRouter is a plain OpenAI-compatible router: the Projects route list still selects the
-            // primary model, but the backup entries must not be sent as an unknown parameter.
-            var agentRouter = Payload(null);
-            LlmService.ApplyModelFallback(ref agentRouter, AgentRouter(), new[] { "a/b", "c/d" });
-            Assert.Null(agentRouter.models);
+            // A custom OpenAI-compatible endpoint: the Projects route list still selects the primary
+            // model, but the backup entries must not be sent as an unknown parameter.
+            var custom = Payload(null);
+            LlmService.ApplyModelFallback(ref custom, CustomOpenAI(), new[] { "a/b", "c/d" });
+            Assert.Null(custom.models);
         }
 
         [Fact]
@@ -220,16 +220,30 @@ namespace Omnipotent.Tests.KliveLLM
         {
             Assert.Equal(LlmService.LLMProvider.Local, LlmService.ParseProvider("Local"));
             Assert.Equal(LlmService.LLMProvider.OpenRouter, LlmService.ParseProvider("OpenRouter"));
-            Assert.Equal(LlmService.LLMProvider.AgentRouter, LlmService.ParseProvider("AgentRouter"));
-            Assert.Equal(LlmService.LLMProvider.AgentRouter, LlmService.ParseProvider("agentrouter"));
+            Assert.Equal(LlmService.LLMProvider.CustomOpenAI, LlmService.ParseProvider("Custom OpenAI Compatible Endpoint"));
+            Assert.Equal(LlmService.LLMProvider.CustomOpenAI, LlmService.ParseProvider("custom openai compatible endpoint"));
             Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider("HuggingFace"));
             // Unknown/absent settings keep the historical HuggingFace default.
             Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider("SomethingElse"));
             Assert.Equal(LlmService.LLMProvider.HuggingFace, LlmService.ParseProvider(null));
         }
 
+        [Theory]
+        // A base URL gets the endpoint appended, with or without a trailing slash…
+        [InlineData("https://agentrouter.org/v1/", "https://agentrouter.org/v1/chat/completions")]
+        [InlineData("https://agentrouter.org/v1", "https://agentrouter.org/v1/chat/completions")]
+        [InlineData("  https://api.example.com/openai/v1/  ", "https://api.example.com/openai/v1/chat/completions")]
+        // …and a URL that already names the endpoint is used as-is, so either form Klives pastes works.
+        [InlineData("https://agentrouter.org/v1/chat/completions", "https://agentrouter.org/v1/chat/completions")]
+        [InlineData("https://agentrouter.org/v1/chat/completions/", "https://agentrouter.org/v1/chat/completions")]
+        [InlineData("", "")]
+        public void CustomEndpointUrl_AcceptsEitherBaseOrFullCompletionsForm(string configured, string expected)
+        {
+            Assert.Equal(expected, LlmService.ResolveChatCompletionsEndpoint(configured));
+        }
+
         [Fact]
-        public async Task AgentRouter402_FailsFastWithoutTheOpenRouterAffordableRetry()
+        public async Task CustomOpenAI402_FailsFastWithoutTheOpenRouterAffordableRetry()
         {
             var handler = new RecordingHandler(
                 _ => JsonResponse(HttpStatusCode.PaymentRequired, PaymentBody(10_000)),
@@ -238,26 +252,26 @@ namespace Omnipotent.Tests.KliveLLM
             var service = new LlmService(http);
 
             var error = await Assert.ThrowsAsync<RemoteLLMException>(
-                () => service.SendPayloadWithRetryAsync(AgentRouter(), Payload(maxTokens: null)));
+                () => service.SendPayloadWithRetryAsync(CustomOpenAI(), Payload(maxTokens: null)));
 
             Assert.Single(handler.RequestBodies);
             Assert.Equal(RemoteLLMFailureKind.InsufficientProviderCredit, error.Kind);
-            Assert.Equal("AgentRouter", error.Provider);
+            Assert.Equal("Custom OpenAI Compatible Endpoint", error.Provider);
         }
 
         [Fact]
-        public async Task AgentRouter_PostsToItsOwnEndpointWithItsOwnKey()
+        public async Task CustomOpenAI_PostsToTheConfiguredEndpointWithItsOwnKey()
         {
             var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, SuccessBody));
             using var http = new HttpClient(handler);
             var service = new LlmService(http);
 
-            await service.SendPayloadWithRetryAsync(AgentRouter(), Payload(maxTokens: null));
+            await service.SendPayloadWithRetryAsync(CustomOpenAI(), Payload(maxTokens: null));
 
             var request = Assert.Single(handler.Requests);
             Assert.Equal("https://agentrouter.org/v1/chat/completions", request.Uri);
-            Assert.Equal("agent-router-token", request.AuthParameter);
-            // OpenRouter-only attribution headers must not leak to a different router.
+            Assert.Equal("custom-endpoint-token", request.AuthParameter);
+            // OpenRouter-only attribution headers must not leak to a different endpoint.
             Assert.DoesNotContain("HTTP-Referer", request.HeaderNames);
             Assert.DoesNotContain("X-Title", request.HeaderNames);
         }
@@ -298,12 +312,12 @@ namespace Omnipotent.Tests.KliveLLM
             "test-token",
             "test/model");
 
-        private static LlmService.RemoteLLMProviderConfiguration AgentRouter() => new(
-            LlmService.LLMProvider.AgentRouter,
-            "AgentRouter",
-            "https://agentrouter.org/v1/chat/completions",
-            "agent-router-token",
-            "gpt-4.1-mini");
+        private static LlmService.RemoteLLMProviderConfiguration CustomOpenAI() => new(
+            LlmService.LLMProvider.CustomOpenAI,
+            "Custom OpenAI Compatible Endpoint",
+            LlmService.ResolveChatCompletionsEndpoint("https://agentrouter.org/v1/"),
+            "custom-endpoint-token",
+            "openai/gpt-4.1-mini");
 
         private static HFWrapper.HFLLMInferenceRequest Payload(int? maxTokens) => new()
         {

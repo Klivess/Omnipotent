@@ -150,8 +150,8 @@ namespace Omnipotent.Services.Projects
             Func<Task<string?>> openRouterToken = () => GetStringOmniSettingNullable("OpenRouterLLMToken");
             // The generation-cost endpoint only knows OpenRouter's own generation IDs. KliveLLM's
             // RemoteLLMProvider dropdown governs which router the Commander/sub-agent/utility routes
-            // actually hit, so when it points somewhere else (AgentRouter, HuggingFace) the IDs are
-            // foreign: withhold the token so the fetcher no-ops instantly and the ledger keeps its
+            // actually hit, so when it points somewhere else (a custom OpenAI-compatible endpoint,
+            // HuggingFace) the IDs are foreign: withhold the token so the fetcher no-ops and the ledger keeps its
             // provisional estimate, instead of burning a retry chain per turn on a doomed lookup.
             Func<Task<string?>> openRouterCostToken = async () =>
             {
