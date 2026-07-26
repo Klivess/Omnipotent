@@ -40,11 +40,12 @@ namespace Omnipotent.Services.Projects
         private readonly ProjectEventLogStore eventLog;
         private readonly Action<string> log;
 
-        /// <summary>Fresh session: (sessionId, systemPrompt, userMessage, modelRoutes, maxTokens, ct) → turn.
-        /// The ordered route list is OpenRouter's own fallback set for the single request.</summary>
-        public Func<string, string?, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? QueryAsync { get; set; }
-        /// <summary>Continue an existing session (rebuttal round): (sessionId, userMessage, modelRoutes, maxTokens, ct) → turn.</summary>
-        public Func<string, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? ContinueAsync { get; set; }
+        /// <summary>Fresh session: (projectID, sessionId, systemPrompt, userMessage, modelRoutes, maxTokens, ct) → turn.
+        /// The ordered route list is OpenRouter's own fallback set for the single request. projectID is
+        /// carried so the implementation can apply that project's council-route sampling parameters.</summary>
+        public Func<string, string, string?, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? QueryAsync { get; set; }
+        /// <summary>Continue an existing session (rebuttal round): (projectID, sessionId, userMessage, modelRoutes, maxTokens, ct) → turn.</summary>
+        public Func<string, string, string, IReadOnlyList<string>, int, CancellationToken, Task<CouncilTurn?>>? ContinueAsync { get; set; }
         /// <summary>Reserves budget for a provider turn without serializing the provider call.</summary>
         public Func<string, CancellationToken, Task<IAsyncDisposable?>>? AcquireTurnAsync { get; set; }
         /// <summary>Books a turn's spend to the ledger: (projectID, prompt, completion, genId, cost).</summary>
@@ -265,7 +266,7 @@ namespace Omnipotent.Services.Projects
             CouncilTurn? turn = null;
             try
             {
-                turn = await ContinueAsync!($"projects-council-{session.CouncilID}-{Slug(role)}", prompt, modelRoutes, RebuttalMaxTokens, ct);
+                turn = await ContinueAsync!(session.ProjectID, $"projects-council-{session.CouncilID}-{Slug(role)}", prompt, modelRoutes, RebuttalMaxTokens, ct);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) { log($"Council rebuttal routes failed: {ex.Message}"); }
@@ -278,7 +279,7 @@ namespace Omnipotent.Services.Projects
         {
             // Fallback across routes is handled by OpenRouter (a primary plus ordered backups in one
             // request), so this is a single delegate call rather than a per-model retry loop.
-            return await QueryAsync!(sessionID, systemPrompt, prompt, modelRoutes, maxTokens, ct);
+            return await QueryAsync!(session.ProjectID, sessionID, systemPrompt, prompt, modelRoutes, maxTokens, ct);
         }
 
         private CouncilSession FinishOnBudget(CouncilSession session, Dictionary<string, string> openingByRole)

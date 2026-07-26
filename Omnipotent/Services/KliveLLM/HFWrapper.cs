@@ -201,6 +201,17 @@ namespace Omnipotent.Services.KliveLLM
             public HFFunctionDefinition function { get; set; }
         }
 
+        /// <summary>OpenRouter request plugin descriptor. Currently used by Projects for the
+        /// server-side context-compression safety net.</summary>
+        public class HFPlugin
+        {
+            [JsonProperty("id")]
+            public string id { get; set; }
+
+            [JsonProperty("enabled", NullValueHandling = NullValueHandling.Ignore)]
+            public bool? enabled { get; set; }
+        }
+
         public class HFFunctionDefinition
         {
             [JsonProperty("name")]
@@ -233,6 +244,38 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("service_tier", NullValueHandling = NullValueHandling.Ignore)]
             public string service_tier;
 
+            // ── Sampling / decoding parameters ──
+            // Every one is nullable + Ignore, so a request that pins none serializes byte-identically to
+            // the pre-parameter payload and the provider's own defaults apply. temperature/top_p/the two
+            // penalties/seed are vanilla OpenAI fields; top_k, repetition_penalty, min_p and top_a are
+            // OpenRouter extensions and are only ever attached for OpenRouter (see ApplySamplingParameters).
+            [JsonProperty("temperature", NullValueHandling = NullValueHandling.Ignore)]
+            public double? temperature;
+
+            [JsonProperty("top_p", NullValueHandling = NullValueHandling.Ignore)]
+            public double? top_p;
+
+            [JsonProperty("top_k", NullValueHandling = NullValueHandling.Ignore)]
+            public int? top_k;
+
+            [JsonProperty("frequency_penalty", NullValueHandling = NullValueHandling.Ignore)]
+            public double? frequency_penalty;
+
+            [JsonProperty("presence_penalty", NullValueHandling = NullValueHandling.Ignore)]
+            public double? presence_penalty;
+
+            [JsonProperty("repetition_penalty", NullValueHandling = NullValueHandling.Ignore)]
+            public double? repetition_penalty;
+
+            [JsonProperty("min_p", NullValueHandling = NullValueHandling.Ignore)]
+            public double? min_p;
+
+            [JsonProperty("top_a", NullValueHandling = NullValueHandling.Ignore)]
+            public double? top_a;
+
+            [JsonProperty("seed", NullValueHandling = NullValueHandling.Ignore)]
+            public int? seed;
+
             // Native structured tool calling. NullValueHandling.Ignore means a request with no tools
             // serializes byte-identically to the pre-tool-calling payload.
             [JsonProperty("tools", NullValueHandling = NullValueHandling.Ignore)]
@@ -256,6 +299,11 @@ namespace Omnipotent.Services.KliveLLM
             // thinking on/off for reasoning-capable models. Ignored by providers that don't support it.
             [JsonProperty("reasoning", NullValueHandling = NullValueHandling.Ignore)]
             public object reasoning;
+
+            // OpenRouter request plugins. Projects opts into context-compression after doing its own
+            // deterministic compaction so OpenRouter's exact tokenizer is the final overflow guard.
+            [JsonProperty("plugins", NullValueHandling = NullValueHandling.Ignore)]
+            public List<HFPlugin> plugins;
 
             public void BuildMessagesFromChatHistory(ChatHistory history)
             {

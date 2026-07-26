@@ -54,6 +54,8 @@ namespace Omnipotent.Services.Projects
         public ProjectTokenUsageStore TokenUsage { get; private set; } = null!;
         public ProjectBudgetLedger Budget { get; private set; } = null!;
         public OpenRouterCreditChecker ProviderCredit { get; private set; } = null!;
+        /// <summary>Live OpenRouter model-window metadata used by every Projects LLM route.</summary>
+        public OpenRouterContextWindowResolver ProviderContexts { get; private set; } = null!;
         public ProjectTierRouter TierRouter { get; private set; } = null!;
         public ProjectGateManager Gates { get; private set; } = null!;
         public ProjectSubAgentManager SubAgents { get; private set; } = null!;
@@ -163,6 +165,7 @@ namespace Omnipotent.Services.Projects
                 tokenProvider: openRouterCostToken,
                 log: msg => ServiceLog(msg));
             ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
+            ProviderContexts = new OpenRouterContextWindowResolver(openRouterToken, msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg), TokenUsage);
             // Alert Klives when a project auto-pauses on budget exhaustion (checks DiscordManager at
             // fire time, so it works even if Discord came up after the ledger was created).
@@ -260,20 +263,22 @@ namespace Omnipotent.Services.Projects
             Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage);
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
-                QueryAsync = async (sid, sys, user, routes, maxTokens, ct) =>
+                QueryAsync = async (pid, sid, sys, user, routes, maxTokens, ct) =>
                 {
                     var llm = await GetKliveLLM();
                     if (llm == null) return null;
                     llm.StartToolSession(sid, sys);
                     llm.AppendUserMessageToToolSession(sid, user);
-                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct);
+                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct,
+                        Settings.Get(pid).ParametersForRoute(ProjectSettings.RouteNames.Council));
                 },
-                ContinueAsync = async (sid, user, routes, maxTokens, ct) =>
+                ContinueAsync = async (pid, sid, user, routes, maxTokens, ct) =>
                 {
                     var llm = await GetKliveLLM();
                     if (llm == null) return null;
                     llm.AppendUserMessageToToolSession(sid, user);
-                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct);
+                    return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct,
+                        Settings.Get(pid).ParametersForRoute(ProjectSettings.RouteNames.Council));
                 },
                 AcquireTurnAsync = (pid, ct) => Budget.TryAcquireLlmTurnAsync(pid, ct),
                 RecordDetailedSpendAsync = (pid, p, c, g, cost, context) =>
@@ -301,8 +306,12 @@ namespace Omnipotent.Services.Projects
             Hooks = new StimulusHookStore(EventLog);
             StimulusQueue = new StimulusQueue(msg => ServiceLog(msg));
             var triageAgent = new StimulusAgent(
+                // Triage merges the free and fallback lists into ONE ordered request, so the free
+                // route's parameters govern it — there is no second call for the fallback list to
+                // parameterise separately.
                 queryModelAsync: (projectID, prompt, routes) =>
-                    QueryUtilityModelAsync(projectID, prompt, routes, "stimulus-triage"),
+                    QueryUtilityModelAsync(projectID, prompt, routes, "stimulus-triage",
+                        ProjectSettings.RouteNames.StimulusFree),
                 modelsForProject: pid => { var s = Settings.Get(pid); return ((IReadOnlyList<string>)s.StimulusFreeRoutes, (IReadOnlyList<string>)s.StimulusFallbackRoutes); },
                 log: msg => ServiceLog(msg));
             Bus = new StimulusBus(Hooks, StimulusQueue, triageAgent, EventLog, Store, msg => ServiceLog(msg));
@@ -1005,7 +1014,8 @@ namespace Omnipotent.Services.Projects
             string projectID,
             string prompt,
             IReadOnlyList<string> routes,
-            string operation)
+            string operation,
+            string routeName = ProjectSettings.RouteNames.Utility)
         {
             if (routes == null || routes.Count == 0) return null;
             var llmServices = await GetServicesByType<KliveLLM.KliveLLM>();
@@ -1020,8 +1030,20 @@ namespace Omnipotent.Services.Projects
             {
                 var settings = Settings.Get(projectID);
                 int utilityMaxTokens = Math.Clamp(settings.UtilityMaxOutputTokens, 256, 8_192);
+                var contextPolicy = await ResolveContextPolicyAsync(
+                    llm, routes, utilityMaxTokens, int.MaxValue, CancellationToken.None);
+                if (contextPolicy != null)
+                    utilityMaxTokens = contextPolicy.MaxOutputTokens;
+                var routeParameters = settings.ParametersForRoute(routeName);
                 var resp = await llm.QueryToolSessionAsync(sid, new List<KliveLLM.HFWrapper.HFTool>(),
-                    maxTokensOverride: utilityMaxTokens, modelOverride: routes[0], modelRoutes: routes);
+                    maxTokensOverride: utilityMaxTokens,
+                    modelOverride: routes[0],
+                    thinkingOverride: ModelParameterCatalog.ReasoningEffort(routeParameters),
+                    modelRoutes: routes,
+                    compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens,
+                    contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
+                    enableOpenRouterContextCompression: contextPolicy != null,
+                    samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters));
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
                     await Budget.RecordTokenSpendAsync(
                         projectID,
@@ -1058,10 +1080,21 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>One council-panelist round-trip on an already-seeded session. Spend is booked by the
         /// runner. Route 0 is OpenRouter's primary and later routes are its fallback set for this request.</summary>
-        private static async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, IReadOnlyList<string> routes, int maxTokens, CancellationToken ct)
+        private async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, IReadOnlyList<string> routes, int maxTokens, CancellationToken ct, IReadOnlyDictionary<string, JToken>? routeParameters = null)
         {
+            var contextPolicy = await ResolveContextPolicyAsync(llm, routes, maxTokens, int.MaxValue, ct);
+            if (contextPolicy != null)
+                maxTokens = contextPolicy.MaxOutputTokens;
             var resp = await llm.QueryToolSessionAsync(sessionId, new List<KliveLLM.HFWrapper.HFTool>(),
-                maxTokensOverride: maxTokens, modelOverride: routes.Count > 0 ? routes[0] : null, cancellationToken: ct, modelRoutes: routes);
+                maxTokensOverride: maxTokens,
+                modelOverride: routes.Count > 0 ? routes[0] : null,
+                cancellationToken: ct,
+                thinkingOverride: ModelParameterCatalog.ReasoningEffort(routeParameters),
+                modelRoutes: routes,
+                compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens,
+                contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
+                enableOpenRouterContextCompression: contextPolicy != null,
+                samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters));
             if (!resp.Success) return null;
             return new CouncilTurn(
                 true,
@@ -1071,6 +1104,31 @@ namespace Omnipotent.Services.Projects
                 resp.GenerationId,
                 resp.CostUsd,
                 resp.Model);
+        }
+
+        /// <summary>
+        /// Resolves a Projects request's dynamic OpenRouter window. Non-OpenRouter providers return
+        /// null and retain their existing caller-defined context behavior.
+        /// </summary>
+        internal async Task<ProjectContextWindowPolicy?> ResolveContextPolicyAsync(
+            KliveLLM.KliveLLM llm,
+            IReadOnlyList<string> routes,
+            int requestedMaxOutputTokens,
+            int configuredWorkSliceTokenBudget,
+            CancellationToken ct)
+        {
+            if (!await llm.IsOpenRouterActiveAsync()) return null;
+
+            // ServiceMain normally initializes this before any runner can wake. Keep a fail-safe
+            // construction path for recovery/test-created service instances.
+            ProviderContexts ??= new OpenRouterContextWindowResolver(
+                () => GetStringOmniSettingNullable("OpenRouterLLMToken"),
+                msg => ServiceLog(msg));
+            var limits = await ProviderContexts.ResolveAsync(routes, ct);
+            return ProjectsContextBudget.CreateContextWindowPolicy(
+                limits,
+                requestedMaxOutputTokens,
+                configuredWorkSliceTokenBudget);
         }
 
         /// <summary>OpenRouter token for the cost fetcher; null when unset (fetcher then no-ops to the estimate).</summary>

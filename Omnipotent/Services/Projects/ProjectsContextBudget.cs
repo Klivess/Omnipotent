@@ -2,6 +2,14 @@ using System.Text.RegularExpressions;
 
 namespace Omnipotent.Services.Projects
 {
+    /// <summary>Derived context policy for one Projects request route set.</summary>
+    public sealed record ProjectContextWindowPolicy(
+        int ContextWindowTokens,
+        int MaxOutputTokens,
+        int CompactionTriggerTokens,
+        int WorkSliceTokenBudget,
+        bool CatalogComplete);
+
     /// <summary>
     /// Token budget management for Commander/sub-agent wake prompts, cloned from
     /// KliveAgentContextBudget's approach (design doc §7 names it explicitly) with its own
@@ -61,6 +69,39 @@ namespace Omnipotent.Services.Projects
 
         /// <summary>Chars-per-token ratio used for estimation.</summary>
         private const double CharsPerToken = 4.0;
+
+        /// <summary>
+        /// Builds the local context policy from OpenRouter's live route metadata. Ten percent of the
+        /// model window is reserved for tokenizer/envelope variance, then the requested completion is
+        /// reserved before calculating the message compaction point. Work slices roll at 80% of the
+        /// real window so a completed tool batch has room to be committed before a fresh context starts.
+        /// </summary>
+        public static ProjectContextWindowPolicy CreateContextWindowPolicy(
+            OpenRouterRouteContextLimits limits,
+            int requestedMaxOutputTokens,
+            int configuredWorkSliceTokenBudget = int.MaxValue)
+        {
+            ArgumentNullException.ThrowIfNull(limits);
+            int contextWindow = Math.Max(2_048, limits.ContextWindowTokens);
+            int safeTotal = Math.Max(1_024, (int)Math.Floor(contextWindow * 0.90));
+            int routeOutputCap = Math.Max(1, limits.MaxCompletionTokens);
+            int maxOutput = Math.Clamp(
+                Math.Min(requestedMaxOutputTokens, routeOutputCap),
+                1,
+                Math.Max(1, safeTotal / 2));
+            int promptCapacity = Math.Max(256, safeTotal - maxOutput);
+            int compactionTrigger = Math.Max(256, (int)Math.Floor(promptCapacity * 0.85));
+            int rollover = Math.Max(1, (int)Math.Floor(contextWindow * 0.80));
+            if (configuredWorkSliceTokenBudget > 0)
+                rollover = Math.Min(rollover, configuredWorkSliceTokenBudget);
+
+            return new ProjectContextWindowPolicy(
+                contextWindow,
+                maxOutput,
+                compactionTrigger,
+                rollover,
+                limits.AllRoutesResolved);
+        }
 
         /// <summary>Estimates the token count for the given text using the ~4 chars/token heuristic.</summary>
         public static int EstimateTokens(string? text)

@@ -34,6 +34,52 @@ namespace Omnipotent.Services.Projects
         [JsonProperty("StimulusFreeModel")] public string StimulusFreeModel { get => First(StimulusFreeRoutes); set => SetPrimary(StimulusFreeRoutes, value); }
         [JsonProperty("StimulusFallbackModel")] public string StimulusFallbackModel { get => First(StimulusFallbackRoutes); set => SetPrimary(StimulusFallbackRoutes, value); }
 
+        // Per-route sampling parameters (temperature, top_p, …), keyed by the route names below. A route
+        // with no entry sends nothing extra and gets the provider's own defaults, exactly as before this
+        // existed. Values are validated and clamped by ModelParameterCatalog on every set and load, so a
+        // hand-edited settings file can never push an out-of-range value at a provider mid-wake.
+        [JsonProperty(ObjectCreationHandling = ObjectCreationHandling.Replace)]
+        public Dictionary<string, Dictionary<string, JToken>> RouteParameters { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public static class RouteNames
+        {
+            public const string Commander = "commander";
+            public const string Utility = "utility";
+            public const string Council = "council";
+            public const string TierText = "tierText";
+            public const string TierTextImage = "tierTextImage";
+            public const string TierTextImageVideo = "tierTextImageVideo";
+            public const string TierTextImageVideoAudio = "tierTextImageVideoAudio";
+            public const string StimulusFree = "stimulusFree";
+            // Triage folds the free and fallback model lists into ONE request, so StimulusFree's
+            // parameters govern it. This key is accepted and stored for symmetry but is not applied
+            // to any request today; the settings page shows a note instead of a control for it.
+            public const string StimulusFallback = "stimulusFallback";
+
+            /// <summary>Every route name, in the order the settings UI lists them.</summary>
+            public static readonly string[] All =
+            [
+                Commander, Utility, Council, TierText, TierTextImage,
+                TierTextImageVideo, TierTextImageVideoAudio, StimulusFree, StimulusFallback,
+            ];
+        }
+
+        /// <summary>The validated parameters pinned on one route, or an empty map when it uses defaults.</summary>
+        public IReadOnlyDictionary<string, JToken> ParametersForRoute(string routeName) =>
+            RouteParameters.TryGetValue(routeName ?? "", out var values) ? values : EmptyParameters;
+
+        public IReadOnlyDictionary<string, JToken> ParametersForTier(ProjectAgentTier tier) =>
+            ParametersForRoute(tier switch
+            {
+                ProjectAgentTier.Text => RouteNames.TierText,
+                ProjectAgentTier.TextImage => RouteNames.TierTextImage,
+                ProjectAgentTier.TextImageVideo => RouteNames.TierTextImageVideo,
+                ProjectAgentTier.TextImageVideoAudio => RouteNames.TierTextImageVideoAudio,
+                _ => RouteNames.TierText,
+            });
+
+        private static readonly Dictionary<string, JToken> EmptyParameters = new(StringComparer.OrdinalIgnoreCase);
+
         public bool ShouldSerializeCommanderModel() => false;
         public bool ShouldSerializeUtilityModel() => false;
         public bool ShouldSerializeCouncilModel() => false;
@@ -105,6 +151,7 @@ namespace Omnipotent.Services.Projects
             TierTextImageVideoAudioRoutes = Normalize(TierTextImageVideoAudioRoutes, Defaults.TierTextImageVideoAudioModel);
             StimulusFreeRoutes = Normalize(StimulusFreeRoutes, Defaults.StimulusFreeModel);
             StimulusFallbackRoutes = Normalize(StimulusFallbackRoutes, Defaults.StimulusFallbackModel);
+            NormalizeRouteParameters();
 
             // Migrate the original small-slice triplet as a unit. Those values were emitted into
             // every existing project settings file, so changing only the hardcoded defaults would
@@ -133,6 +180,18 @@ namespace Omnipotent.Services.Projects
                 case "tiertextimagevideoaudioroutes": return TryReplaceRoutes(value, routes => TierTextImageVideoAudioRoutes = routes);
                 case "stimulusfreeroutes": return TryReplaceRoutes(value, routes => StimulusFreeRoutes = routes);
                 case "stimulusfallbackroutes": return TryReplaceRoutes(value, routes => StimulusFallbackRoutes = routes);
+                // Per-route sampling parameters. `routeParameters` replaces the whole map; the
+                // `<route>Parameters` keys patch one route so a client can change a single list.
+                case "routeparameters": return TryReplaceAllRouteParameters(value);
+                case "commanderparameters": return TryReplaceRouteParameters(RouteNames.Commander, value);
+                case "utilityparameters": return TryReplaceRouteParameters(RouteNames.Utility, value);
+                case "councilparameters": return TryReplaceRouteParameters(RouteNames.Council, value);
+                case "tiertextparameters": return TryReplaceRouteParameters(RouteNames.TierText, value);
+                case "tiertextimageparameters": return TryReplaceRouteParameters(RouteNames.TierTextImage, value);
+                case "tiertextimagevideoparameters": return TryReplaceRouteParameters(RouteNames.TierTextImageVideo, value);
+                case "tiertextimagevideoaudioparameters": return TryReplaceRouteParameters(RouteNames.TierTextImageVideoAudio, value);
+                case "stimulusfreeparameters": return TryReplaceRouteParameters(RouteNames.StimulusFree, value);
+                case "stimulusfallbackparameters": return TryReplaceRouteParameters(RouteNames.StimulusFallback, value);
                 case "commandermodel": CommanderModel = Text(value); break;
                 case "utilitymodel": UtilityModel = Text(value); break;
                 case "councilmodel": CouncilModel = Text(value); break;
@@ -168,6 +227,48 @@ namespace Omnipotent.Services.Projects
                 case "computeractionsettlems": ComputerActionSettleMs = Math.Clamp(ParseInt(Text(value), Defaults.ComputerActionSettleMs), 50, 5000); break;
                 case "computertypingdelayms": ComputerTypingDelayMs = Math.Clamp(ParseInt(Text(value), Defaults.ComputerTypingDelayMs), 0, 500); break;
                 default: return false;
+            }
+            return true;
+        }
+
+        /// <summary>Drops unknown route names and unknown/out-of-range parameters, and clamps the rest.
+        /// Runs on every load and save, so an out-of-range value can only ever reach a provider if it was
+        /// legal when written and the catalog's bounds later changed.</summary>
+        private void NormalizeRouteParameters()
+        {
+            var normalized = new Dictionary<string, Dictionary<string, JToken>>(StringComparer.OrdinalIgnoreCase);
+            foreach (string routeName in RouteNames.All)
+            {
+                if (RouteParameters == null || !RouteParameters.TryGetValue(routeName, out var values) || values == null) continue;
+                var clean = ModelParameterCatalog.Normalize(values);
+                if (clean.Count > 0) normalized[routeName] = clean;
+            }
+            RouteParameters = normalized;
+        }
+
+        /// <summary>Replaces one route's parameter set wholesale. An empty object clears it back to the
+        /// provider defaults, which is how the UI removes a parameter.</summary>
+        private bool TryReplaceRouteParameters(string routeName, JToken value)
+        {
+            if (value is not JObject obj) return false;
+            var clean = ModelParameterCatalog.Normalize(
+                obj.Properties().Select(p => new KeyValuePair<string, JToken>(p.Name, p.Value)));
+            RouteParameters ??= new(StringComparer.OrdinalIgnoreCase);
+            if (clean.Count > 0) RouteParameters[routeName] = clean;
+            else RouteParameters.Remove(routeName);
+            return true;
+        }
+
+        /// <summary>Replaces every route's parameters at once (the shape the settings page saves).</summary>
+        private bool TryReplaceAllRouteParameters(JToken value)
+        {
+            if (value is not JObject obj) return false;
+            RouteParameters = new(StringComparer.OrdinalIgnoreCase);
+            foreach (var property in obj.Properties())
+            {
+                string? routeName = RouteNames.All.FirstOrDefault(
+                    r => string.Equals(r, property.Name, StringComparison.OrdinalIgnoreCase));
+                if (routeName != null) TryReplaceRouteParameters(routeName, property.Value);
             }
             return true;
         }

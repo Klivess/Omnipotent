@@ -830,6 +830,68 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // Which request parameters the models on a route can actually be given, resolved LIVE from
+            // OpenRouter's per-model `supported_parameters`. GET ?models=a,b,c (a route's ordered list).
+            //
+            // A route sends one primary plus OpenRouter's fallback models, and any of them may serve the
+            // request, so `supportedByAll` marks the parameters that hold for the whole route — those are
+            // the ones the UI offers without a caveat. When the catalog can't be reached every parameter
+            // is still offered (fromCatalog=false): OpenRouter ignores a parameter a model doesn't
+            // implement, so offering one is harmless, whereas hiding it would silently drop configuration.
+            await parent.CreateAPIRoute("/projects/models/parameters", async req =>
+            {
+                try
+                {
+                    var models = (req.userParameters?.Get("models") ?? "")
+                        .Split([',', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                        .Select(m => m.Trim()).Where(m => m.Length > 0)
+                        .Distinct(StringComparer.OrdinalIgnoreCase).Take(8).ToList();
+
+                    IReadOnlyList<OpenRouterModelParameterSupport> support =
+                        models.Count == 0 || parent.ProviderContexts == null
+                            ? Array.Empty<OpenRouterModelParameterSupport>()
+                            : await parent.ProviderContexts.ResolveParametersAsync(models);
+                    var resolved = support.Where(s => s.FromCatalog).ToList();
+
+                    // Every definition is returned so the UI can render a value already saved against a
+                    // model the catalog no longer lists; `supportedBy` is what drives the dropdown.
+                    var parameters = ModelParameterCatalog.Definitions.Select(d => new
+                    {
+                        name = d.Name,
+                        label = d.Label,
+                        kind = d.Kind.ToString().ToLowerInvariant(),
+                        min = d.Min,
+                        max = d.Max,
+                        step = d.Step,
+                        description = d.Description,
+                        defaultHint = d.DefaultHint,
+                        openRouterOnly = d.OpenRouterOnly,
+                        options = d.Options,
+                        supportedBy = resolved
+                            .Where(s => s.SupportedParameters.Contains(d.Name, StringComparer.OrdinalIgnoreCase))
+                            .Select(s => s.RequestedModel).ToList(),
+                        // With no catalog answer at all, "unknown" is reported as supported so the
+                        // parameter stays configurable rather than vanishing on a transient fetch failure.
+                        supportedByAll = resolved.Count == 0 || resolved.All(
+                            s => s.SupportedParameters.Contains(d.Name, StringComparer.OrdinalIgnoreCase)),
+                    }).ToList();
+
+                    await req.ReturnResponse(Json(new
+                    {
+                        models = support.Select(s => new
+                        {
+                            model = s.RequestedModel,
+                            resolvedModel = s.ResolvedModel,
+                            fromCatalog = s.FromCatalog,
+                            supported = s.SupportedParameters,
+                        }).ToList(),
+                        parameters,
+                        fromCatalog = resolved.Count > 0,
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             // ── System default settings (what NEW projects inherit) — Projects' own config, not OmniSettings ──
             await parent.CreateAPIRoute("/projects/system/settings", async req =>
             {

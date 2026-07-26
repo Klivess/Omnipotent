@@ -251,12 +251,24 @@ namespace Omnipotent.Services.Projects
                 string model = modelRoutes[0];
                 initialModel = model;
                 finalModel = model;
+                // Sampling parameters Klives pinned on this tier's route. Unset ones are simply not sent,
+                // so an unconfigured tier behaves exactly as it did before.
+                var tierParameters = settings.ParametersForTier(agent.Tier);
+                var routeSampling = ModelParameterCatalog.ToSamplingParameters(tierParameters);
+                string? routeReasoning = ModelParameterCatalog.ReasoningEffort(tierParameters);
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
                 sliceToolCalls = settings.WorkSliceToolCalls;
                 sliceModelTurns = settings.WorkSliceModelTurns;
                 sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.SubAgentMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
+                var contextPolicy = await parent.ResolveContextPolicyAsync(
+                    llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
+                if (contextPolicy != null)
+                {
+                    maxOutputTokens = contextPolicy.MaxOutputTokens;
+                    sliceTokenBudget = contextPolicy.WorkSliceTokenBudget;
+                }
 
                 // Tier-gated tools: core set filtered by the router, plus computer-use when the
                 // tier's perception supports it (§6.1 — the tool gating half of the tier system).
@@ -337,8 +349,12 @@ namespace Omnipotent.Services.Projects
                         {
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
-                                modelOverride: model, cancellationToken: cts.Token, modelRoutes: modelRoutes,
-                                compactAboveTokensOverride: 0);
+                                modelOverride: model, cancellationToken: cts.Token,
+                                thinkingOverride: routeReasoning, modelRoutes: modelRoutes,
+                                compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens ?? 0,
+                                contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
+                                enableOpenRouterContextCompression: contextPolicy != null,
+                                samplingParameters: routeSampling);
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }

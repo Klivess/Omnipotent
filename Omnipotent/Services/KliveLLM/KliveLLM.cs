@@ -98,6 +98,32 @@ namespace Omnipotent.Services.KliveLLM
         bool PromptCaching,
         bool Reasoning);
 
+    /// <summary>
+    /// Per-call sampling overrides. Every member is optional: a null is simply not sent, so the
+    /// provider's own default applies and a caller that pins nothing produces the identical request it
+    /// did before this type existed. Callers (Projects' per-route parameter configuration) are
+    /// responsible for range validation — see <c>ModelParameterCatalog</c>.
+    ///
+    /// <see cref="TopK"/>, <see cref="RepetitionPenalty"/>, <see cref="MinP"/> and <see cref="TopA"/>
+    /// are OpenRouter extensions rather than vanilla OpenAI fields, and are dropped for any other
+    /// provider so a strict OpenAI-compatible endpoint can never 400 on a parameter it doesn't know.
+    /// </summary>
+    public sealed record ModelSamplingParameters(
+        double? Temperature = null,
+        double? TopP = null,
+        int? TopK = null,
+        double? FrequencyPenalty = null,
+        double? PresencePenalty = null,
+        double? RepetitionPenalty = null,
+        double? MinP = null,
+        double? TopA = null,
+        int? Seed = null)
+    {
+        public bool IsEmpty => Temperature is null && TopP is null && TopK is null
+            && FrequencyPenalty is null && PresencePenalty is null && RepetitionPenalty is null
+            && MinP is null && TopA is null && Seed is null;
+    }
+
     public class KliveLLM : OmniService
     {
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
@@ -905,10 +931,44 @@ namespace Omnipotent.Services.KliveLLM
             if (m.tool_calls != null)
                 foreach (var tc in m.tool_calls)
                     chars += (tc.function?.name?.Length ?? 0) + (tc.function?.arguments?.Length ?? 0) + 8;
-            int tokens = chars / 4;
+            // Three chars/token is intentionally more conservative than the common English prose
+            // heuristic. Projects prompts contain source code, JSON and non-English text, all of
+            // which tokenize more densely; OpenRouter's exact-token compression is the final guard.
+            int tokens = (int)Math.Ceiling(chars / 3.0) + 8; // role/content envelope
             if (MessageHasImage(m)) tokens += 1100; // a downscaled screenshot the text estimate misses
             tokens += EstimateAudioTokens(m);       // audio parts the "[audio]" placeholder under-counts
             return tokens;
+        }
+
+        internal static int EstimateToolDefinitionTokens(IReadOnlyList<HFWrapper.HFTool>? tools)
+        {
+            if (tools == null || tools.Count == 0) return 0;
+            string json = JsonConvert.SerializeObject(tools);
+            return (int)Math.Ceiling(json.Length / 3.0) + tools.Count * 12;
+        }
+
+        /// <summary>
+        /// Calculates how much of a model window can be occupied by messages after reserving the
+        /// configured completion, serialized tool schemas, request envelope and 10% tokenizer margin.
+        /// </summary>
+        internal static int CalculateToolSessionMessageBudget(
+            int contextWindowTokens,
+            int maxOutputTokens,
+            IReadOnlyList<HFWrapper.HFTool>? tools)
+        {
+            int context = Math.Max(1, contextWindowTokens);
+            int safeTotal = Math.Max(1, (int)Math.Floor(context * 0.90));
+            int output = Math.Clamp(maxOutputTokens, 0, safeTotal);
+            int toolsAndEnvelope = EstimateToolDefinitionTokens(tools) + 256;
+            return Math.Max(1, safeTotal - output - toolsAndEnvelope);
+        }
+
+        internal static int EstimateToolSessionTokens(IEnumerable<HFWrapper.HFMessage> messages)
+        {
+            int total = 0;
+            foreach (var message in messages)
+                total += EstimateMessageTokens(message);
+            return total;
         }
 
         /// <summary>Deliberately-high token estimate for any audio content-parts in a message. The "[audio]"
@@ -930,67 +990,149 @@ namespace Omnipotent.Services.KliveLLM
             return tokens;
         }
 
-        private static void CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent)
+        internal static bool CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent)
         {
             var msgs = s.structuredMessages;
-            if (msgs.Count <= keepRecent + 2) return;
-            int total = 0;
-            foreach (var m in msgs) total += EstimateMessageTokens(m);
-            if (total <= aboveTokens) return;
+            if (aboveTokens <= 0 || EstimateToolSessionTokens(msgs) <= aboveTokens) return false;
 
             int headStart = 0; // keep leading system message(s) verbatim
             while (headStart < msgs.Count && msgs[headStart].role == "system") headStart++;
 
-            // Tail = last keepRecent messages, advanced so it does NOT begin on an ORPHAN tool result (one whose
-            // assistant tool_call would be in the dropped head) — that keeps the tool-call protocol valid.
-            int cut = Math.Max(headStart, msgs.Count - keepRecent);
-            while (cut < msgs.Count && msgs[cut].role == "tool") cut++;
-            if (cut <= headStart || cut >= msgs.Count) return; // nothing safe to drop / would empty the recent tail
-
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("[Context compacted to keep the window sharp. Digest of EARLIER steps this task — the verbatim messages were summarised. Trust this plus the recent messages below; DON'T redo discovery already shown here, and re-run a tool only if you need fresh detail:]");
-            for (int i = headStart; i < cut; i++)
+            List<HFWrapper.HFMessage>? rebuilt = null;
+            List<HFWrapper.HFMessage>? bestCompaction = null;
+            int bestCompactionTokens = int.MaxValue;
+            int availableTail = Math.Max(1, msgs.Count - headStart);
+            int tailToKeep = Math.Clamp(keepRecent, 1, availableTail);
+            while (tailToKeep >= 1)
             {
-                var m = msgs[i];
-                var text = HFWrapper.ContentToText(m.content)?.Trim();
-                if (m.role == "user")
+                // Tail is advanced so it never begins on an orphan tool result whose assistant
+                // tool_call would have been summarized away.
+                int cut = Math.Max(headStart, msgs.Count - tailToKeep);
+                while (cut < msgs.Count && msgs[cut].role == "tool") cut++;
+                if (cut > headStart && cut < msgs.Count)
                 {
-                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("USER: " + Clip(text, 240));
+                    var candidate = BuildCompacted(msgs, headStart, cut);
+                    int candidateTokens = EstimateToolSessionTokens(candidate);
+                    if (candidateTokens < bestCompactionTokens)
+                    {
+                        bestCompaction = candidate;
+                        bestCompactionTokens = candidateTokens;
+                    }
+                    if (candidateTokens <= aboveTokens)
+                    {
+                        rebuilt = candidate;
+                        break;
+                    }
                 }
-                else if (m.role == "assistant")
+
+                if (tailToKeep == 1) break;
+                int next = Math.Max(1, tailToKeep / 2);
+                if (next == tailToKeep) break;
+                tailToKeep = next;
+            }
+
+            rebuilt ??= bestCompaction ?? new List<HFWrapper.HFMessage>(msgs);
+            TrimStringMessagesToBudget(rebuilt, headStart, aboveTokens);
+            s.structuredMessages = rebuilt;
+            return true;
+
+            static List<HFWrapper.HFMessage> BuildCompacted(
+                List<HFWrapper.HFMessage> source,
+                int systemCount,
+                int cut)
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("[Context compacted to keep the window sharp. Digest of EARLIER steps this task — the verbatim messages were summarised. Trust this plus the recent messages below; DON'T redo discovery already shown here, and re-run a tool only if you need fresh detail:]");
+                for (int i = systemCount; i < cut; i++)
                 {
-                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("you: " + Clip(text, 200));
-                    if (m.tool_calls != null)
-                        foreach (var tc in m.tool_calls)
-                            sb.AppendLine("  ⇒ called " + (tc.function?.name ?? "tool") + "(" + Clip(tc.function?.arguments ?? "", 120) + ")");
+                    var m = source[i];
+                    var text = HFWrapper.ContentToText(m.content)?.Trim();
+                    if (m.role == "user")
+                    {
+                        if (!string.IsNullOrEmpty(text)) sb.AppendLine("USER: " + Clip(text, 240));
+                    }
+                    else if (m.role == "assistant")
+                    {
+                        if (!string.IsNullOrEmpty(text)) sb.AppendLine("you: " + Clip(text, 200));
+                        if (m.tool_calls != null)
+                            foreach (var tc in m.tool_calls)
+                                sb.AppendLine("  ⇒ called " + (tc.function?.name ?? "tool") + "(" + Clip(tc.function?.arguments ?? "", 120) + ")");
+                    }
+                    else if (m.role == "tool")
+                    {
+                        if (!string.IsNullOrEmpty(text)) sb.AppendLine("  ⤷ " + (m.name ?? "result") + ": " + Clip(FirstLine(text), 200));
+                    }
                 }
-                else if (m.role == "tool")
+                string digest = sb.ToString();
+                const int digestMaxChars = 6000;
+                if (digest.Length > digestMaxChars)
+                    digest = ClipMiddle(digest, digestMaxChars, "\n…(older steps elided)…\n");
+
+                var output = new List<HFWrapper.HFMessage>(source.Count - (cut - systemCount) + 1);
+                for (int i = 0; i < systemCount; i++) output.Add(source[i]);
+                output.Add(new HFWrapper.HFMessage { role = "user", content = digest });
+                for (int i = cut; i < source.Count; i++) output.Add(source[i]);
+                return output;
+            }
+
+            static void TrimStringMessagesToBudget(
+                List<HFWrapper.HFMessage> messages,
+                int systemCount,
+                int tokenBudget)
+            {
+                // If a single wake seed or recent tool result is itself too large, middle-truncate
+                // non-system strings while retaining both the instructions at the front and the
+                // trigger/latest evidence normally placed at the end. Tool IDs/calls stay untouched.
+                for (int i = systemCount; i < messages.Count &&
+                     EstimateToolSessionTokens(messages) > tokenBudget; i++)
                 {
-                    if (!string.IsNullOrEmpty(text)) sb.AppendLine("  ⤷ " + (m.name ?? "result") + ": " + Clip(FirstLine(text), 200));
+                    if (messages[i].content is not string text || text.Length <= 480) continue;
+                    int excessTokens = EstimateToolSessionTokens(messages) - tokenBudget;
+                    int targetChars = Math.Max(480, text.Length - excessTokens * 3 - 96);
+                    if (targetChars >= text.Length) continue;
+                    var m = messages[i];
+                    messages[i] = new HFWrapper.HFMessage
+                    {
+                        role = m.role,
+                        content = ClipMiddle(text, targetChars, "\n[…middle omitted to fit the active model context…]\n"),
+                        tool_calls = m.tool_calls,
+                        tool_call_id = m.tool_call_id,
+                        name = m.name,
+                    };
                 }
             }
-            var digest = sb.ToString();
-            const int digestMaxChars = 6000; // keep the TAIL (most recent progress) when the digest itself is long
-            if (digest.Length > digestMaxChars)
-                digest = digest.Substring(0, 420) + "\n…(older steps elided)…\n" + digest.Substring(digest.Length - (digestMaxChars - 440));
 
-            var rebuilt = new List<HFWrapper.HFMessage>(msgs.Count - (cut - headStart) + 1);
-            for (int i = 0; i < headStart; i++) rebuilt.Add(msgs[i]);
-            rebuilt.Add(new HFWrapper.HFMessage { role = "user", content = digest });
-            for (int i = cut; i < msgs.Count; i++) rebuilt.Add(msgs[i]);
-            s.structuredMessages = rebuilt;
+            static string Clip(string x, int n) =>
+                string.IsNullOrEmpty(x) ? "" : (x.Length <= n ? x : x.Substring(0, n) + "…");
 
-            static string Clip(string x, int n) => string.IsNullOrEmpty(x) ? "" : (x.Length <= n ? x : x.Substring(0, n) + "…");
-            static string FirstLine(string x) { int nl = x.IndexOf('\n'); return nl < 0 ? x : x.Substring(0, nl); }
+            static string FirstLine(string x)
+            {
+                int nl = x.IndexOf('\n');
+                return nl < 0 ? x : x.Substring(0, nl);
+            }
+
+            static string ClipMiddle(string text, int maxChars, string marker)
+            {
+                if (text.Length <= maxChars) return text;
+                if (maxChars <= marker.Length) return text[..maxChars];
+                int available = maxChars - marker.Length;
+                int front = (int)Math.Ceiling(available * 0.58);
+                int back = available - front;
+                return text[..front] + marker + text[^back..];
+            }
         }
 
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
+            bool contextWasCompacted = false;
+            int? preflightMessageBudget = null;
+            bool fixedRequestExceedsWindow = false;
+            int irreducibleSystemTokens = 0;
             lock (sessions)
             {
                 if (!sessions.TryGetValue(sessionId, out session))
@@ -1000,12 +1142,64 @@ namespace Omnipotent.Services.KliveLLM
                 // measured provider usage and durable rollover mechanism remain authoritative.
                 int compactAbove = compactAboveTokensOverride ?? InTaskCompactAboveTokens;
                 int keepRecent = compactKeepRecentMessagesOverride ?? InTaskKeepRecentMessages;
+                if (contextWindowTokensOverride is > 0)
+                {
+                    int safeTotal = Math.Max(1,
+                        (int)Math.Floor(contextWindowTokensOverride.Value * 0.90));
+                    int fixedRequestTokens = Math.Max(0, maxTokensOverride ?? 0)
+                        + EstimateToolDefinitionTokens(tools)
+                        + 256;
+                    fixedRequestExceedsWindow = fixedRequestTokens >= safeTotal;
+                    preflightMessageBudget = CalculateToolSessionMessageBudget(
+                        contextWindowTokensOverride.Value,
+                        Math.Max(0, maxTokensOverride ?? 0),
+                        tools);
+                    // A real provider window is a hard policy and therefore overrides an old
+                    // compactAbove=0 "disable generic compaction" choice made by Projects.
+                    compactAbove = compactAbove > 0
+                        ? Math.Min(compactAbove, preflightMessageBudget.Value)
+                        : preflightMessageBudget.Value;
+                }
                 if (compactAbove > 0)
-                    CompactToolSessionIfNeeded(session, compactAbove, keepRecent);
+                    contextWasCompacted = CompactToolSessionIfNeeded(session, compactAbove, keepRecent);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
+                irreducibleSystemTokens = snapshot
+                    .TakeWhile(message => message.role == "system")
+                    .Sum(EstimateMessageTokens);
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete, modelRoutes: modelRoutes);
+            if (fixedRequestExceedsWindow
+                || (preflightMessageBudget.HasValue
+                    && irreducibleSystemTokens > preflightMessageBudget.Value))
+            {
+                return new KliveLLMResponse
+                {
+                    Success = false,
+                    ErrorMessage = $"The fixed system prompt, tool schemas and output reserve cannot fit the configured {contextWindowTokensOverride} token context window.",
+                    SessionId = sessionId,
+                    ContextWindowTokens = contextWindowTokensOverride,
+                    ContextWasCompacted = contextWasCompacted,
+                };
+            }
+
+            // If local deterministic compaction cannot fit an irreducible system prompt + tool
+            // schema, only OpenRouter's exact-token compression may proceed. Without that backstop,
+            // fail before dispatch instead of knowingly sending an over-window request.
+            if (preflightMessageBudget.HasValue
+                && EstimateToolSessionTokens(snapshot) > preflightMessageBudget.Value
+                && !enableOpenRouterContextCompression)
+            {
+                return new KliveLLMResponse
+                {
+                    Success = false,
+                    ErrorMessage = $"Tool session cannot fit the configured {contextWindowTokensOverride} token context window after safe compaction.",
+                    SessionId = sessionId,
+                    ContextWindowTokens = contextWindowTokensOverride,
+                    ContextWasCompacted = contextWasCompacted,
+                };
+            }
+
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete, modelRoutes: modelRoutes, enableOpenRouterContextCompression: enableOpenRouterContextCompression, samplingParameters: samplingParameters);
             var msg = response.choices[0].message;
             var content = HFWrapper.ContentToText(msg?.content);
             var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -1036,6 +1230,8 @@ namespace Omnipotent.Services.KliveLLM
                 GenerationId = response.id,
                 CostUsd = response.usage?.cost,
                 Model = response.model,
+                ContextWindowTokens = contextWindowTokensOverride,
+                ContextWasCompacted = contextWasCompacted,
             };
         }
 
@@ -1257,7 +1453,9 @@ namespace Omnipotent.Services.KliveLLM
             Action<string>? onToken = null,
             string? thinkingOverride = null,
             Action<HFWrapper.HFToolCall>? onToolCallComplete = null,
-            IReadOnlyList<string>? modelRoutes = null)
+            IReadOnlyList<string>? modelRoutes = null,
+            bool enableOpenRouterContextCompression = false,
+            ModelSamplingParameters? samplingParameters = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -1281,6 +1479,8 @@ namespace Omnipotent.Services.KliveLLM
             ApplyServiceTier(ref payload, remoteProvider);
             ApplyUsageAccounting(ref payload, remoteProvider);
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
+            ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
+            ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
             payload.BuildMessagesFromList(structuredMessages);
             ApplyPromptCaching(ref payload, remoteProvider);
 
@@ -1362,6 +1562,36 @@ namespace Omnipotent.Services.KliveLLM
             if (fallbacks.Count > 0) payload.models = fallbacks;
         }
 
+        /// <summary>
+        /// Attaches the caller's pinned sampling parameters. Only values that were actually set are
+        /// written, so an unpinned parameter stays absent from the request and the provider's default
+        /// applies — a caller passing null produces the identical payload it did before.
+        ///
+        /// Local has no HTTP payload at all, and the OpenRouter-only extensions (top_k,
+        /// repetition_penalty, min_p, top_a) are withheld from HuggingFace and custom OpenAI-compatible
+        /// endpoints, matching the rule every other proprietary field here follows: a strict endpoint
+        /// must never see a parameter it does not know.
+        /// </summary>
+        internal static void ApplySamplingParameters(
+            ref HFWrapper.HFLLMInferenceRequest payload,
+            RemoteLLMProviderConfiguration remoteProvider,
+            ModelSamplingParameters? parameters)
+        {
+            if (parameters == null || parameters.IsEmpty) return;
+
+            payload.temperature = parameters.Temperature;
+            payload.top_p = parameters.TopP;
+            payload.frequency_penalty = parameters.FrequencyPenalty;
+            payload.presence_penalty = parameters.PresencePenalty;
+            payload.seed = parameters.Seed;
+
+            if (remoteProvider.Provider != LLMProvider.OpenRouter) return;
+            payload.top_k = parameters.TopK;
+            payload.repetition_penalty = parameters.RepetitionPenalty;
+            payload.min_p = parameters.MinP;
+            payload.top_a = parameters.TopA;
+        }
+
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
         {
             if (remoteProvider.Provider == LLMProvider.OpenRouter
@@ -1381,6 +1611,24 @@ namespace Omnipotent.Services.KliveLLM
         {
             if (remoteProvider.Provider == LLMProvider.OpenRouter)
                 payload.usage = new { include = true };
+        }
+
+        /// <summary>
+        /// Enables OpenRouter's exact-token context compression as a final safety net. Projects first
+        /// performs deterministic local compaction so its durable digest/recent-tail semantics are
+        /// preserved; this plugin handles tokenizer variance or an irreducible request envelope that
+        /// local character estimates cannot measure exactly. It is never sent to other providers.
+        /// </summary>
+        internal static void ApplyContextCompression(
+            ref HFWrapper.HFLLMInferenceRequest payload,
+            RemoteLLMProviderConfiguration remoteProvider,
+            bool enabled)
+        {
+            if (!enabled || remoteProvider.Provider != LLMProvider.OpenRouter) return;
+            payload.plugins = new List<HFWrapper.HFPlugin>
+            {
+                new() { id = "context-compression", enabled = true }
+            };
         }
 
         /// <summary>True when the configured thinking type means "no reasoning at all".</summary>
@@ -2191,6 +2439,13 @@ namespace Omnipotent.Services.KliveLLM
             /// response `model`). With OpenRouter fallback routing this may be a later route than the primary
             /// one requested. Null when the provider doesn't echo it.</summary>
             public string? Model { get; set; }
+
+            /// <summary>The live model-window limit applied to this request, when the caller supplied
+            /// one (Projects/OpenRouter).</summary>
+            public int? ContextWindowTokens { get; set; }
+
+            /// <summary>Whether KliveLLM compacted the structured session before dispatch.</summary>
+            public bool ContextWasCompacted { get; set; }
 
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.

@@ -32,7 +32,7 @@ namespace Omnipotent.Tests.Projects
             {
                 Runner = new ProjectCouncilRunner(Store, Log, _ => { })
                 {
-                    QueryAsync = (sid, sys, user, routes, max, ct) =>
+                    QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
                     {
                         ct.ThrowIfCancellationRequested();
                         lock (QueryCalls) QueryCalls.Add((sid, user));
@@ -41,7 +41,7 @@ namespace Omnipotent.Tests.Projects
                         string text = sid.EndsWith("-chair") ? "CHAIR-VERDICT" : $"OPENING:{sid}";
                         return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, text, 100, 50, "gen", 0.001));
                     },
-                    ContinueAsync = (sid, user, routes, max, ct) =>
+                    ContinueAsync = (pid_, sid, user, routes, max, ct) =>
                     {
                         ct.ThrowIfCancellationRequested();
                         lock (ContinueCalls) ContinueCalls.Add((sid, user));
@@ -74,7 +74,7 @@ namespace Omnipotent.Tests.Projects
         public async Task LegacyHardPolicyBlock_IsDowngradedToNonVetoingOwnerDecision()
         {
             var h = new Harness();
-            h.Runner.QueryAsync = (sid, sys, user, routes, max, ct) =>
+            h.Runner.QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
                 Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
                     sid.EndsWith("-chair")
                         ? "DECISION CLASS: HARD_POLICY_BLOCK\nRECOMMENDATION: stop the project"
@@ -261,7 +261,7 @@ namespace Omnipotent.Tests.Projects
         public async Task CostCeiling_StopsLaunchingTurnsAndReturnsPartialEvidence()
         {
             var h = new Harness();
-            h.Runner.QueryAsync = (sid, sys, user, routes, max, ct) =>
+            h.Runner.QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
             {
                 lock (h.QueryCalls) h.QueryCalls.Add((sid, user));
                 return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "OPENING", 100, 50, "gen", 0.03));
@@ -300,13 +300,13 @@ namespace Omnipotent.Tests.Projects
             var routeLists = new ConcurrentBag<string>();
             var runner = new ProjectCouncilRunner(new ProjectCouncilStore(_ => { }), new ProjectEventLogStore(_ => { }), _ => { })
             {
-                QueryAsync = (sid, sys, user, routes, max, ct) =>
+                QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
                 {
                     routeLists.Add(string.Join("|", routes));
                     return Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
                         sid.EndsWith("-chair") ? "VERDICT" : "OPENING", 1, 1, null, 0));
                 },
-                ContinueAsync = (sid, user, routes, max, ct) =>
+                ContinueAsync = (pid_, sid, user, routes, max, ct) =>
                 {
                     routeLists.Add(string.Join("|", routes));
                     return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "REBUTTAL", 1, 1, null, 0));
