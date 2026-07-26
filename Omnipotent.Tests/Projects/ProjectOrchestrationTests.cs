@@ -149,6 +149,17 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void ReplyingToKlives_StaysWithTheCommander()
+        {
+            // Klives converses with the Commander; workers report upward with send_agent_message
+            // and the Commander decides what actually reaches him.
+            var r = Router();
+            Assert.True(ProjectTierRouter.IsCommanderOnly("reply_to_klives"));
+            foreach (var tier in Enum.GetValues<ProjectAgentTier>())
+                Assert.False(r.IsToolAllowed(tier, "reply_to_klives"));
+        }
+
+        [Fact]
         public void EveryTierGetsAnAgentOwnedDesktop()
         {
             foreach (var tier in Enum.GetValues<ProjectAgentTier>())

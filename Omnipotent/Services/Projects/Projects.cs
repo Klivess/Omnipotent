@@ -1174,6 +1174,8 @@ namespace Omnipotent.Services.Projects
                     : what => DiscordManager.PostAttentionAsync(project, "🙋 Human assistance needed",
                         what + "\n\n🖥 Hands-on help (captcha/login): KM website → Projects → this project → " +
                         "Desktops → open the agent's desktop → Take control. The agent is nudged automatically when you finish."),
+                ReplyToKlivesAsync = DiscordManager == null ? null
+                    : message => DiscordManager.PostCommanderReplyAsync(project, message),
                 HookStore = Hooks,
                 RearmAdapters = () => Adapters.ArmAll(),
                 GetHookArmInfo = hookID => Adapters.GetArmInfo(hookID),

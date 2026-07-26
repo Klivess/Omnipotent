@@ -55,6 +55,8 @@ namespace Omnipotent.Services.Projects
         public Func<string, string, string, string, Task>? SendAgentMessageAsync { get; set; }
         /// <summary>Optional P5 hook: surface a human-only obstacle through Discord.</summary>
         public Func<string, Task>? RequestHumanAsync { get; set; }
+        /// <summary>Mirrors a mid-wake reply to Klives onto Discord (the website reads the event log).</summary>
+        public Func<string, Task>? ReplyToKlivesAsync { get; set; }
         /// <summary>Stimulus hook CRUD (null-safe: tools report unavailable when unset).</summary>
         public StimulusHookStore? HookStore { get; set; }
         /// <summary>Re-arms adapters after a hook mutation.</summary>
@@ -217,6 +219,25 @@ namespace Omnipotent.Services.Projects
                     string note = (string?)a["note"] ?? "";
                     eventLog.Append(Evt(ProjectEventTypes.CommanderMessage, "commander", note));
                     return new CommanderToolResult("Progress recorded.");
+                }
+
+                // Conversation without ending the wake. Before this existed, the only prose that
+                // reached Klives was a wake's closing status — and a wake legitimately runs for
+                // hours, so every question he asked read as silence until the Commander ran out
+                // of work. This posts the same places the closing status does, mid-wake.
+                case "reply_to_klives":
+                {
+                    string message = ((string?)a["message"] ?? "").Trim();
+                    if (message.Length == 0) return FailedResult("Provide 'message' — what Klives should read.");
+                    eventLog.Append(Evt(ProjectEventTypes.CommanderMessage, "commander", message));
+                    if (ReplyToKlivesAsync != null)
+                    {
+                        try { await ReplyToKlivesAsync(message); }
+                        catch { /* the event log already carries it to the website */ }
+                    }
+                    return new CommanderToolResult(
+                        "Delivered to Klives (project chat + Discord). Your wake is still running — continue working now; " +
+                        "only stop if you are genuinely blocked on his answer.");
                 }
 
                 case "list_project_directives":

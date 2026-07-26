@@ -264,6 +264,10 @@ namespace Omnipotent.Services.Projects
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
+            // Whether he has actually been answered yet. A wake has no wall-clock limit, so a reply
+            // owed but never sent is how the Commander reads as unresponsive: every exit path below
+            // must either carry prose to him or leave this false for the closing backstop.
+            bool repliedToKlives = false;
             using var cts = new CancellationTokenSource();
             activeWakeCts[projectID] = cts; // registered so Klives can halt this wake
             if (cancelBeforeStart.TryRemove(projectID, out _)) cts.Cancel();
@@ -333,6 +337,10 @@ namespace Omnipotent.Services.Projects
                 if (!continuingSession)
                     llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
+                if (klivesInvolved)
+                    llm.AppendUserMessageToToolSession(sessionId,
+                        "Klives is waiting on an answer. Call reply_to_klives on your FIRST turn, then get on with the work — " +
+                        "this wake may run for hours and he should not have to wait that long to hear from you.");
                 var approvedPlan = parent.GrandPlans.GetCurrentApproved(projectID)?.Content;
                 var readyMilestones = parent.GrandPlans.GetReadyMilestones(projectID);
                 if (project.Status == ProjectStatus.Active && project.SubAgentCap > 1
@@ -375,8 +383,11 @@ namespace Omnipotent.Services.Projects
                     if (steerQueue.TryGetValue(projectID, out var sq))
                         while (sq.TryDequeue(out var steer))
                         {
-                            llm.AppendUserMessageToToolSession(sessionId, $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer.Text}");
+                            llm.AppendUserMessageToToolSession(sessionId,
+                                $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer.Text}\n" +
+                                "He is waiting on an answer: call reply_to_klives THIS turn, then carry on working. Do not save your response for the end of the wake.");
                             klivesInvolved = true;
+                            repliedToKlives = false; // a new message earns its own answer
                         }
 
                     if (agentSteerQueue.TryGetValue(projectID, out var aq))
@@ -519,6 +530,7 @@ namespace Omnipotent.Services.Projects
                             try { await parent.DiscordManager.PostCommanderReplyAsync(project, final); }
                             catch { /* best-effort surface */ }
                         }
+                        repliedToKlives = true;
                         break;
                     }
 
@@ -645,6 +657,9 @@ namespace Omnipotent.Services.Projects
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;
+                        // The Commander answered him inside the wake, so the closing backstop below
+                        // must not append a second, redundant reply on top of it.
+                        if (toolName == "reply_to_klives" && result.Succeeded) repliedToKlives = true;
 
                         // Vision return: the post-action screenshot rides a follow-up user message
                         // (tool-result image support is inconsistent across providers — same
@@ -776,12 +791,25 @@ namespace Omnipotent.Services.Projects
                         wakePromptTokens, wakeCompletionTokens, wakeCostUsd,
                         wakeCostEstimated ? "provisional-or-mixed" : "actual"));
 
-                    // A failed Klives-triggered wake must not read as silence either.
-                    if ((outcome is ProjectEventTypes.WakeFailed or ProjectEventTypes.WakeDeferred)
-                        && klivesInvolved && parent.DiscordManager != null)
+                    // Backstop: every exit owes Klives prose when he was waiting on one. The ordinary
+                    // no-tool-calls ending already replied and cleared this. A work-slice rollover,
+                    // an EndWake tool, a budget stop, a cancellation or a provider failure all used
+                    // to end in total silence — which is precisely what an unresponsive Commander
+                    // looks like from the chat panel.
+                    if (klivesInvolved && !repliedToKlives)
                     {
-                        try { await parent.DiscordManager.PostCommanderReplyAsync(project, $"⚠️ {outcomeText}"); }
-                        catch { }
+                        bool trouble = outcome is ProjectEventTypes.WakeFailed
+                            or ProjectEventTypes.WakeDeferred or ProjectEventTypes.WakeCancelled;
+                        string closing = trouble
+                            ? $"⚠️ {outcomeText}"
+                            : $"{outcomeText} {ProjectWakeStatus.ForCommander(parent.Digests.GetDigest(projectID), parent.RuntimeState.Get(projectID))}";
+                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", closing));
+                        if (parent.DiscordManager != null)
+                        {
+                            try { await parent.DiscordManager.PostCommanderReplyAsync(project, closing); }
+                            catch { }
+                        }
+                        repliedToKlives = true;
                     }
 
                     // Refresh budget/org in the digest, then compact — never in the hot path.

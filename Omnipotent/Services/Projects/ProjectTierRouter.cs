@@ -50,6 +50,9 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
             "complete_project", "request_user_approval", "request_budget_increase", "request_human", "retire_sub_agent", "assign_plan_work", "record_money_spend",
+            // Klives talks to the Commander, not to the roster: a worker reports upward with
+            // send_agent_message and the Commander decides what reaches him.
+            "reply_to_klives",
             // Councils and the Grand Plan are the Commander's strategic instruments — sub-agents
             // execute under the plan, they don't set or revise it. (These are also absent from
             // TextTierTools, so IsToolAllowed already blocks them; this makes the intent explicit.)

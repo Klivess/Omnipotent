@@ -273,6 +273,56 @@ namespace Omnipotent.Tests.Projects
                 JsonConvert.SerializeObject(new { hookID }), CancellationToken.None);
             Assert.Contains("deleted", deleted.ResultText, StringComparison.OrdinalIgnoreCase);
         }
+
+        // Before reply_to_klives, the only prose that reached Klives was a wake's CLOSING status —
+        // and a wake has no wall-clock limit, so every question he asked read as silence until the
+        // Commander ran out of work. These pin the mid-wake path that fixes that.
+        [Fact]
+        public async Task ReplyToKlives_ReachesHimMidWake_WithoutEndingIt()
+        {
+            var (tools, pid) = NewTools();
+            string? mirrored = null;
+            tools.ReplyToKlivesAsync = message => { mirrored = message; return Task.CompletedTask; };
+
+            var r = await tools.DispatchAsync("reply_to_klives",
+                JsonConvert.SerializeObject(new { message = "Still on it — the browser is mid-signup." }), CancellationToken.None);
+
+            Assert.True(r.Succeeded, r.ResultText);
+            Assert.False(r.EndWake); // the whole point: conversation costs the Commander no work time
+            Assert.Equal("Still on it — the browser is mid-signup.", mirrored);
+            var posted = new ProjectEventLogStore(_ => { }).ReadSince(pid, 0)
+                .Where(e => e.Type == ProjectEventTypes.CommanderMessage).ToList();
+            Assert.Single(posted);
+            Assert.Equal("Still on it — the browser is mid-signup.", posted[0].Text);
+        }
+
+        [Fact]
+        public async Task ReplyToKlives_RejectsAnEmptyMessage_WithoutPostingAnything()
+        {
+            var (tools, pid) = NewTools();
+            var r = await tools.DispatchAsync("reply_to_klives",
+                JsonConvert.SerializeObject(new { message = "   " }), CancellationToken.None);
+
+            Assert.False(r.Succeeded);
+            Assert.Empty(new ProjectEventLogStore(_ => { }).ReadSince(pid, 0)
+                .Where(e => e.Type == ProjectEventTypes.CommanderMessage));
+        }
+
+        [Fact]
+        public async Task ReplyToKlives_SurvivesADeadDiscordMirror()
+        {
+            // The website reads the event log, so a Discord outage must not turn a reply into a
+            // tool failure the Commander then tries to "recover" from.
+            var (tools, pid) = NewTools();
+            tools.ReplyToKlivesAsync = _ => throw new InvalidOperationException("discord down");
+
+            var r = await tools.DispatchAsync("reply_to_klives",
+                JsonConvert.SerializeObject(new { message = "answering anyway" }), CancellationToken.None);
+
+            Assert.True(r.Succeeded, r.ResultText);
+            Assert.Contains("answering anyway", new ProjectEventLogStore(_ => { }).ReadSince(pid, 0)
+                .Where(e => e.Type == ProjectEventTypes.CommanderMessage).Select(e => e.Text));
+        }
     }
 
     public class ProjectSettingsTests
