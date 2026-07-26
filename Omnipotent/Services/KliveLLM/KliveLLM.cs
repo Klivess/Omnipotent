@@ -1510,6 +1510,7 @@ namespace Omnipotent.Services.KliveLLM
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
             ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
+            ApplyTextualToolProtocolStops(ref payload, remoteProvider, structuredMessages);
             // A raw Gemma call is only half of that model's control-token handshake. Once its tools
             // have run, fold the synthetic assistant/tool messages into a native tool-response turn
             // before calling the model again. Ordinary provider-native calls remain byte-for-byte on
@@ -1624,6 +1625,33 @@ namespace Omnipotent.Services.KliveLLM
             payload.repetition_penalty = parameters.RepetitionPenalty;
             payload.min_p = parameters.MinP;
             payload.top_a = parameters.TopA;
+        }
+
+        /// <summary>
+        /// Gives a textual-tool-protocol model an end-of-turn the gateway can actually act on.
+        ///
+        /// A model that emits calls as Gemma control tokens never produces the finish signal an
+        /// OpenAI-compatible gateway watches for, so generation does not stop when the call is complete —
+        /// it continues straight into a fabricated tool result and the turns after it, all the way to
+        /// max_tokens. That is a multi-minute generation whose useful part was the first few hundred
+        /// tokens, and whose tail is invented evidence the agent then acts on. Stopping at the protocol's
+        /// own terminators ends the turn where the call ends.
+        ///
+        /// Applied only when the route speaks that protocol, so a native tool-calling request — which has
+        /// a real finish_reason and may legitimately batch several calls in one turn — is untouched. Local
+        /// has no HTTP payload at all.
+        /// </summary>
+        internal static void ApplyTextualToolProtocolStops(
+            ref HFWrapper.HFLLMInferenceRequest payload,
+            RemoteLLMProviderConfiguration remoteProvider,
+            IEnumerable<HFWrapper.HFMessage>? structuredMessages)
+        {
+            if (remoteProvider.Provider == LLMProvider.Local) return;
+            if (!GemmaToolCallCompatibility.SpeaksTextualToolProtocol(
+                    payload.model, payload.models, structuredMessages))
+                return;
+
+            payload.stop = GemmaToolCallCompatibility.StopSequences.ToList();
         }
 
         private static void ApplyServiceTier(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)

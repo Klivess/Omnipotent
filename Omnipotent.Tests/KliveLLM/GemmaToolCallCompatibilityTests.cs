@@ -171,8 +171,96 @@ public class GemmaToolCallCompatibilityTests
         Assert.Contains("does not resolve to a tool offered", result.Error);
     }
 
+    [Fact]
+    public void StoppedGeneration_HasItsClosingSentinelConsumed_AndStillParses()
+    {
+        // The provider matches a stop sequence and drops it, so the completion ends at the '}'.
+        var result = Normalize(
+            """<|tool_call>call:read_file{path:"a.txt"}""",
+            new[] { Tool("read_file", ("path", "string")) });
+
+        Assert.True(result.Success, result.Error);
+        Assert.True(result.Adapted);
+        var call = Assert.Single(result.ToolCalls!);
+        Assert.Equal("read_file", call.function.name);
+        Assert.Equal("a.txt", (string?)JObject.Parse(call.function.arguments)["path"]);
+    }
+
+    [Fact]
+    public void GenerationTruncatedMidArguments_IsNeverExecutedAsAWholeCall()
+    {
+        // Hit max_tokens partway through the code argument: there is no closing '}', so end-of-text
+        // cannot stand in for the sentinel and half a script must not run.
+        var result = Normalize(
+            "<|tool_call>call:execute_csharp{code:\nvar keep = File.ReadAllText(\"a.txt\");\nFile.Delete(",
+            ProjectTools());
+
+        Assert.True(result.Detected);
+        Assert.False(result.Success);
+        Assert.Null(result.ToolCalls);
+        Assert.Contains("no closing sentinel", result.Error);
+    }
+
+    [Fact]
+    public void UnterminatedMarkerFollowedByAnotherCall_StillFailsClosed()
+    {
+        // Only the FINAL envelope may close at end-of-text, and a stop sequence can only ever consume
+        // ONE terminator. Two markers with no terminator anywhere means the envelope boundaries are
+        // genuinely unreadable — where the first call ends is a guess — so nothing here is dispatchable.
+        var result = Normalize(
+            """
+            <|tool_call>call:read_file{path:"a.txt"}
+            <|tool_call>call:read_file{path:"b.txt"}
+            """,
+            new[] { Tool("read_file", ("path", "string")) });
+
+        Assert.True(result.Detected);
+        Assert.False(result.Success);
+        Assert.Null(result.ToolCalls);
+        Assert.Contains("no closing sentinel", result.Error);
+    }
+
+    [Fact]
+    public void FabricatedTurnsAfterTheModelAnswersItsOwnCall_AreDiscarded()
+    {
+        // A runaway generation: the model wrote its own tool result and carried on holding both sides of
+        // the conversation. Only the call it made BEFORE inventing that result is real.
+        string text = """
+            Setting the status now.
+            <|tool_call>call:observable{op:"set",name:"account_status",value:"waiting"}<tool_call|>
+            <|tool_response>response:observable{result:<|"|>Observable updated.<|"|>}<tool_response|>
+            Updated account status observable.
+            <|tool_call>call:reply_to_klives{message:"All done, account is live."}<tool_call|>
+            """;
+
+        var result = Normalize(text, ProjectTools());
+
+        Assert.True(result.Success, result.Error);
+        Assert.Equal("Setting the status now.", result.Content);
+        var call = Assert.Single(result.ToolCalls!);
+        Assert.Equal("observable", call.function.name);
+        Assert.Equal("set", (string?)JObject.Parse(call.function.arguments)["op"]);
+    }
+
+    [Fact]
+    public void TextualProtocolStops_ApplyToGemmaRoutesAndProvenTextualSessions()
+    {
+        Assert.True(GemmaToolCallCompatibility.SpeaksTextualToolProtocol(
+            "google/gemma-4-26b-a4b-it:free", null, null));
+        // A route reached only as an OpenRouter fallback still needs the stop condition.
+        Assert.True(GemmaToolCallCompatibility.SpeaksTextualToolProtocol(
+            "anthropic/claude-sonnet-5", new[] { "google/gemma-3-27b-it:free" }, null));
+        // Proven by behaviour: this session already contained a turn the adapter had to translate.
+        Assert.True(GemmaToolCallCompatibility.SpeaksTextualToolProtocol(
+            "some/unnamed-model", null,
+            new[] { new HFWrapper.HFMessage { role = "assistant", GemmaTextualToolTurn = true } }));
+
+        Assert.False(GemmaToolCallCompatibility.SpeaksTextualToolProtocol(
+            "anthropic/claude-sonnet-5", new[] { "openai/gpt-5" },
+            new[] { new HFWrapper.HFMessage { role = "assistant", content = "hello" } }));
+    }
+
     [Theory]
-    [InlineData("<|tool_call>call:read_file{path:\"a.txt\"}")]
     [InlineData("<|tool_call>not-a-call<tool_call|>")]
     [InlineData("<|tool_call>call:read_file path:\"a.txt\"<tool_call|>")]
     public void MalformedEnvelopeFailsClosed(string text)

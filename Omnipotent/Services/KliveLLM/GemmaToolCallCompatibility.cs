@@ -32,6 +32,23 @@ internal static class GemmaToolCallCompatibility
     private sealed record MarkerSyntax(string Start, string[] Ends);
     private sealed record MarkerMatch(int Index, MarkerSyntax Syntax);
 
+    /// <summary>
+    /// Whether this request should carry <see cref="StopSequences"/>: the route is a Gemma-family model,
+    /// or the session already holds a turn this adapter had to translate — proof that whatever is serving
+    /// the route emits calls as text and therefore needs a stop condition.
+    /// </summary>
+    internal static bool SpeaksTextualToolProtocol(
+        string? primaryModel,
+        IEnumerable<string>? fallbackModels,
+        IEnumerable<HFWrapper.HFMessage>? messages) =>
+        IsGemmaRoute(primaryModel)
+        || (fallbackModels?.Any(IsGemmaRoute) ?? false)
+        || (messages?.Any(message => message?.GemmaTextualToolTurn == true) ?? false);
+
+    private static bool IsGemmaRoute(string? model) =>
+        !string.IsNullOrWhiteSpace(model)
+        && model.Contains("gemma", StringComparison.OrdinalIgnoreCase);
+
     private static readonly MarkerSyntax[] MarkerSyntaxes =
     [
         new("<|tool_call>", ["<tool_call|>"]),
@@ -49,6 +66,25 @@ internal static class GemmaToolCallCompatibility
         "<|/tool_response|>",
         "<tool_response>",
         "</tool_response>",
+    ];
+
+    /// <summary>
+    /// Sequences at which a textual-protocol model's turn genuinely ends, sent to the provider as
+    /// <c>stop</c>. A model emitting calls as text has no end-of-turn token the gateway recognises, so
+    /// without these it keeps generating past its own call — fabricating the tool result, a follow-up
+    /// turn, another call — until max_tokens, which reads as an agent that types forever and loops.
+    ///
+    /// OpenAI-compatible providers CONSUME the matched sequence rather than echoing it, so a call
+    /// stopped here arrives without its closing sentinel. <see cref="ParseTextCalls"/> accepts
+    /// end-of-text as the close of a final, otherwise-complete envelope for exactly that reason.
+    /// Capped at four entries because that is the documented OpenAI-compatible limit.
+    /// </summary>
+    internal static readonly string[] StopSequences =
+    [
+        "<tool_call|>",
+        "</tool_call>",
+        "<|/tool_call|>",
+        "<|tool_response>",
     ];
 
     /// <summary>
@@ -73,6 +109,13 @@ internal static class GemmaToolCallCompatibility
         if (first == null)
             return new Result(false, true, text, null, null, false);
 
+        // A response block is the APPLICATION's half of the handshake — the model's turn ends where one
+        // begins. Anything past it is the model role-playing its own tool result and the turns that
+        // follow, so the calls buried in there were authored against invented evidence. Dispatching them
+        // is what produced the observed loop: real results came back for work the model already believed
+        // it had answered, so it re-issued the same calls. Keep only the calls before that point.
+        text = TruncateFabricatedContinuation(text, first.Index);
+
         var toolsByName = (offeredTools ?? Array.Empty<HFWrapper.HFTool>())
             .Where(t => !string.IsNullOrWhiteSpace(t?.function?.name))
             .GroupBy(t => t.function.name, StringComparer.Ordinal)
@@ -94,7 +137,17 @@ internal static class GemmaToolCallCompatibility
             visibleContent.Append(text, cursor, marker.Index - cursor);
             int bodyStart = marker.Index + marker.Syntax.Start.Length;
             if (!TryFindEnd(text, bodyStart, marker.Syntax.Ends, out int endIndex, out string? endToken))
-                return Failure(text, $"Gemma tool-call marker at character {marker.Index} has no closing sentinel.");
+            {
+                // The provider swallows the stop sequence it matched (see StopSequences), so the final
+                // envelope of a correctly stopped generation legitimately has no closing sentinel. Only
+                // end-of-text may stand in for one, and only when a closing '}' is still present: a
+                // generation truncated mid-arguments has none, so a half-authored call — half a code
+                // block, half a file path — remains fail-closed rather than being executed.
+                if (FindNextMarker(text, bodyStart) != null || text.IndexOf('}', bodyStart) < 0)
+                    return Failure(text, $"Gemma tool-call marker at character {marker.Index} has no closing sentinel.");
+                endIndex = text.Length;
+                endToken = string.Empty;
+            }
 
             string envelope = text[bodyStart..endIndex].Trim();
             if (!TryParseEnvelope(envelope, toolsByName, calls.Count, out var call, out string? error))
@@ -109,6 +162,23 @@ internal static class GemmaToolCallCompatibility
 
         string cleaned = StripResponseSentinels(visibleContent.ToString()).Trim();
         return new Result(true, true, cleaned, calls, null, true);
+    }
+
+    /// <summary>
+    /// Cuts the completion at the first response sentinel that follows a tool call. Searching from the
+    /// first call (rather than character 0) keeps a stray sentinel in ordinary prose from discarding a
+    /// legitimate call that comes after it.
+    /// </summary>
+    private static string TruncateFabricatedContinuation(string text, int firstMarkerIndex)
+    {
+        int cut = -1;
+        foreach (string sentinel in ResponseSentinels)
+        {
+            int found = text.IndexOf(sentinel, firstMarkerIndex, StringComparison.Ordinal);
+            if (found < 0 || (cut >= 0 && found >= cut)) continue;
+            cut = found;
+        }
+        return cut < 0 ? text : text[..cut];
     }
 
     private static Result Failure(string original, string error) =>

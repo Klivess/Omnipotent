@@ -299,6 +299,14 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("tool_choice", NullValueHandling = NullValueHandling.Ignore)]
             public object tool_choice;
 
+            // Provider-side stop sequences. Only ever set for a model that speaks Gemma's TEXTUAL
+            // tool-call protocol (see KliveLLM.ApplyTextualToolProtocolStops): those control tokens are
+            // the model's real end-of-turn, and without them the provider has nothing to halt on and
+            // generates a whole fabricated transcript — its own tool results and follow-up turns —
+            // until max_tokens. Ignored when null, so a native tool-calling request is unchanged.
+            [JsonProperty("stop", NullValueHandling = NullValueHandling.Ignore)]
+            public List<string> stop;
+
             // When streaming, ask the provider to include a final usage chunk (OpenAI/OpenRouter/HF).
             [JsonProperty("stream_options", NullValueHandling = NullValueHandling.Ignore)]
             public object stream_options;
