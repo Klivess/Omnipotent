@@ -257,6 +257,11 @@ namespace Omnipotent.Services.Projects
                 var routeSampling = ModelParameterCatalog.ToSamplingParameters(tierParameters);
                 string? routeReasoning = ModelParameterCatalog.ReasoningEffort(tierParameters);
                 bool visionEnabled = agent.Tier != ProjectAgentTier.Text && settings.VisionEnabled;
+                // Live indicator (parity with the Commander): a token sink switches KliveLLM to SSE so
+                // the Conversation panel can show this worker generating before its turn commits.
+                Action<string>? activitySink = settings.LiveActivityStreaming
+                    ? chunk => parent.Activity.AppendToken(projectID, agent.AgentID, chunk)
+                    : null;
                 sliceToolCalls = settings.WorkSliceToolCalls;
                 sliceModelTurns = settings.WorkSliceModelTurns;
                 sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
@@ -342,9 +347,11 @@ namespace Omnipotent.Services.Projects
                         // means every route was exhausted, so it propagates.
                         try
                         {
+                            parent.Activity.BeginThinking(projectID, agent.AgentID, agent.Role, model);
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
                                 modelOverride: model, cancellationToken: cts.Token,
+                                onToken: activitySink,
                                 thinkingOverride: routeReasoning, modelRoutes: modelRoutes,
                                 compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens ?? 0,
                                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
@@ -538,6 +545,8 @@ namespace Omnipotent.Services.Projects
                             continue;
                         }
 
+                        parent.Activity.BeginTool(projectID, agent.AgentID, toolName, DescribeCall(toolName, argsJson));
+
                         string sig = toolName + "|" + argsJson;
                         recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
                         if (recentSignatures[sig] >= StuckIdenticalCallThreshold)
@@ -691,6 +700,9 @@ namespace Omnipotent.Services.Projects
             }
             finally
             {
+                // Clear the live indicator on every exit path, so a finished worker never lingers
+                // on the panel as still generating.
+                parent.Activity.End(projectID, agent.AgentID);
                 try { if (parent.Desktops != null) await parent.Desktops.ReleaseAgentInputsAsync(projectID, agent.AgentID); } catch { }
                 if (wakePromptTokens > 0 || wakeCompletionTokens > 0)
                     outcomeText += $" (this wake: ~${wakeCostUsd:0.###}, {wakePromptTokens + wakeCompletionTokens} tokens)";

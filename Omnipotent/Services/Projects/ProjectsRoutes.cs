@@ -647,6 +647,18 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            // Who is mid-turn right now. The event stream pushes this live; this route only exists so
+            // a panel can paint the indicator before its socket is up (or if the socket is down).
+            await parent.CreateAPIRoute("/projects/activity", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    await req.ReturnResponse(Json(parent.Activity.ListForProject(project!.ProjectID)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             // Observables (the agents' live dashboard for this project). History is trimmed to the
             // last N samples server-side so the 1s-debounced refresh stays cheap; ?history=0 = values only.
             await parent.CreateAPIRoute("/projects/observables", async req =>

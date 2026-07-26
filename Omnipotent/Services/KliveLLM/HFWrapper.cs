@@ -462,6 +462,15 @@ namespace Omnipotent.Services.KliveLLM
         // arrive once, arguments stream across many chunks). A final chunk may carry usage totals.
         public class HFLLMStreamChunk
         {
+            // Every SSE chunk repeats the generation id and the model that actually served the
+            // request — the buffered path reads both off the response body, so the streaming path
+            // must carry them through too (cost attribution and route pinning depend on them).
+            [JsonProperty("id")]
+            public string id { get; set; }
+
+            [JsonProperty("model")]
+            public string model { get; set; }
+
             [JsonProperty("choices")]
             public List<StreamChoice> choices { get; set; }
 

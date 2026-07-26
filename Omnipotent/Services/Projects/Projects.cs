@@ -39,6 +39,8 @@ namespace Omnipotent.Services.Projects
         public ProjectEventLogStore EventLog { get; private set; } = null!;
         /// <summary>Phase 3 server-push: fans the event log out to WebSocket clients (replaces polling).</summary>
         public ProjectEventBroadcaster EventBroadcaster { get; private set; } = null!;
+        /// <summary>Who is generating tokens right now, and what — the live gap between committed events.</summary>
+        public ProjectAgentActivityTracker Activity { get; private set; } = null!;
         public ProjectDigestStore Digests { get; private set; } = null!;
         /// <summary>Durable Klives rules, tasks and steering receipts. Never folded into the digest.</summary>
         public ProjectDirectiveStore Directives { get; private set; } = null!;
@@ -124,7 +126,8 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: shared-file scaffold failed for {existing.ProjectID}"); }
             }
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
-            EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg));
+            Activity = new ProjectAgentActivityTracker();
+            EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg), Activity);
             Digests = new ProjectDigestStore(msg => ServiceLog(msg));
             Directives = new ProjectDirectiveStore(msg => ServiceLog(msg));
             RuntimeState = new ProjectRuntimeStateStore(msg => ServiceLog(msg));

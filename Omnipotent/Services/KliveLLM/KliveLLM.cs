@@ -1776,6 +1776,11 @@ namespace Omnipotent.Services.KliveLLM
             var argsByIndex = new Dictionary<int, StringBuilder>();
             HFWrapper.HFLLMInferenceResponse.UsageDetails usage = null;
             string finishReason = null;
+            // The generation id and the model that actually served the request (which may be an
+            // OpenRouter fallback, not the one we asked for). Callers meter cost and pin routes on
+            // these, so a streamed response must report them exactly as the buffered path does.
+            string generationId = null;
+            string servedModel = null;
 
             // #9 Speculative dispatch: notify the caller the moment a tool_call's arguments are fully
             // streamed so it can start executing that tool while the model is still generating later
@@ -1819,6 +1824,8 @@ namespace Omnipotent.Services.KliveLLM
 
                     if (chunk == null) continue;
                     if (chunk.usage != null) usage = chunk.usage;
+                    if (!string.IsNullOrEmpty(chunk.id)) generationId = chunk.id;
+                    if (!string.IsNullOrEmpty(chunk.model)) servedModel = chunk.model;
 
                     var choice = chunk.choices != null && chunk.choices.Count > 0 ? chunk.choices[0] : null;
                     if (choice == null) continue;
@@ -1883,6 +1890,8 @@ namespace Omnipotent.Services.KliveLLM
 
             return new HFWrapper.HFLLMInferenceResponse
             {
+                id = generationId,
+                model = servedModel,
                 choices = new List<HFWrapper.HFLLMInferenceResponse.Choice>
                 {
                     new HFWrapper.HFLLMInferenceResponse.Choice

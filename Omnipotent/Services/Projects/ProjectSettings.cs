@@ -119,6 +119,12 @@ namespace Omnipotent.Services.Projects
         }
 
         public bool VisionEnabled { get; set; } = true;
+        /// <summary>
+        /// Stream model output so the Conversation panel can show who is generating and what. Turning
+        /// this off returns every agent to the buffered request path — the indicator then only reports
+        /// "thinking" and the executing tool, with no live text.
+        /// </summary>
+        public bool LiveActivityStreaming { get; set; } = Defaults.LiveActivityStreaming;
         public bool ContainersEnabled { get; set; } = Defaults.ContainersEnabled;
         public bool DesktopFirstWebsiteInteraction { get; set; } = Defaults.DesktopFirstWebsiteInteraction;
         public string DesktopImage { get; set; } = Defaults.DesktopImage;
@@ -221,6 +227,7 @@ namespace Omnipotent.Services.Projects
                     MaxConvergenceTripsPerSlice = Math.Clamp(ParseInt(Text(value), Defaults.MaxConvergenceTripsPerSlice), 1, 20); break;
                 case "maxconsecutivecontinuations": break;
                 case "visionenabled": VisionEnabled = ParseBool(Text(value)); break;
+                case "liveactivitystreaming": LiveActivityStreaming = ParseBool(Text(value)); break;
                 case "containersenabled": ContainersEnabled = ParseBool(Text(value)); break;
                 case "desktopfirstwebsiteinteraction": DesktopFirstWebsiteInteraction = ParseBool(Text(value)); break;
                 case "desktopimage": DesktopImage = Text(value); break;
@@ -333,6 +340,7 @@ namespace Omnipotent.Services.Projects
             public const int WorkSliceTokenBudget = 180_000;
             public const int MaxConvergenceTripsPerSlice = 5;
             public const bool ContainersEnabled = true;
+            public const bool LiveActivityStreaming = true;
             public const bool DesktopFirstWebsiteInteraction = true;
             public const string DesktopImage = "omnipotent/projects-desktop:latest";
             public const int ComputerActionSettleMs = 350;

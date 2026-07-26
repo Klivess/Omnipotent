@@ -46,11 +46,19 @@ namespace Omnipotent.Services.Projects
 
         private readonly ConcurrentDictionary<Guid, Subscriber> subscribers = new();
         private readonly Action<string> log;
+        private readonly ProjectAgentActivityTracker? activity;
 
-        public ProjectEventBroadcaster(ProjectEventLogStore eventLog, Action<string> log)
+        public ProjectEventBroadcaster(ProjectEventLogStore eventLog, Action<string> log,
+            ProjectAgentActivityTracker? activity = null)
         {
             this.log = log ?? (_ => { });
+            this.activity = activity;
             eventLog.EventAppended += OnEventAppended;
+            if (activity != null)
+            {
+                activity.Changed += OnActivityChanged;
+                activity.Ended += OnActivityEnded;
+            }
         }
 
         private void OnEventAppended(ProjectEvent e)
@@ -74,6 +82,35 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
+        /// Live agent activity (who is generating tokens, and what) rides the SAME socket as the
+        /// event log, but is ephemeral: dropped rather than queued when a client falls behind, and
+        /// never flagged for resync. A missed frame is superseded by the next one milliseconds later.
+        /// </summary>
+        private void OnActivityChanged(ProjectAgentActivity a)
+        {
+            if (subscribers.IsEmpty) return;
+            string? msg = null;
+            foreach (var s in subscribers.Values)
+            {
+                if (s.ProjectID == null || !string.Equals(s.ProjectID, a.ProjectID, StringComparison.Ordinal)) continue;
+                msg ??= JsonConvert.SerializeObject(new { kind = "activity", activity = a }, CamelCase);
+                s.Outbox.Writer.TryWrite(msg);
+            }
+        }
+
+        private void OnActivityEnded(string projectID, string agentID)
+        {
+            if (subscribers.IsEmpty) return;
+            string? msg = null;
+            foreach (var s in subscribers.Values)
+            {
+                if (s.ProjectID == null || !string.Equals(s.ProjectID, projectID, StringComparison.Ordinal)) continue;
+                msg ??= JsonConvert.SerializeObject(new { kind = "activity-ended", projectID, agentID }, CamelCase);
+                s.Outbox.Writer.TryWrite(msg);
+            }
+        }
+
+        /// <summary>
         /// Handles one WebSocket connection to /projects/events/stream. For a per-project subscriber
         /// it first replays events after <paramref name="since"/> (so a reconnect resumes without a
         /// gap), then streams live. Returns when the socket closes.
@@ -93,8 +130,16 @@ namespace Omnipotent.Services.Projects
             {
                 var send = SendLoopAsync(sub);
                 if (sub.ProjectID != null)
+                {
                     foreach (var e in replay(sub.ProjectID, since))
                         await sub.Outbox.Writer.WriteAsync(JsonConvert.SerializeObject(new { kind = "event", @event = e }, CamelCase));
+                    // Whoever is mid-turn right now: without this, a client that connects between
+                    // two activity frames shows nothing until the next model turn starts.
+                    var live = activity?.ListForProject(sub.ProjectID);
+                    if (live is { Count: > 0 })
+                        await sub.Outbox.Writer.WriteAsync(
+                            JsonConvert.SerializeObject(new { kind = "activity-snapshot", activities = live }, CamelCase));
+                }
 
                 var recv = ReceiveUntilCloseAsync(socket);
                 await Task.WhenAny(send, recv);

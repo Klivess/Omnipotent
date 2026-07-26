@@ -306,6 +306,12 @@ namespace Omnipotent.Services.Projects
                 var routeSampling = ModelParameterCatalog.ToSamplingParameters(commanderParameters);
                 string? routeReasoning = ModelParameterCatalog.ReasoningEffort(commanderParameters);
                 bool visionEnabled = settings.VisionEnabled;
+                // Live indicator: supplying a token sink switches KliveLLM to its SSE transport, which
+                // is what lets the Conversation panel show the Commander generating before the turn
+                // commits an event. Off → buffered path, and the indicator degrades to phase-only.
+                Action<string>? activitySink = settings.LiveActivityStreaming
+                    ? chunk => parent.Activity.AppendToken(projectID, "commander", chunk)
+                    : null;
                 sliceToolCalls = settings.WorkSliceToolCalls;
                 sliceModelTurns = settings.WorkSliceModelTurns;
                 sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
@@ -414,9 +420,11 @@ namespace Omnipotent.Services.Projects
                         // handler (circuit breaker / deferral).
                         try
                         {
+                            parent.Activity.BeginThinking(projectID, "commander", "commander", model);
                             resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
                                 modelOverride: model, cancellationToken: cts.Token,
+                                onToken: activitySink,
                                 thinkingOverride: routeReasoning, modelRoutes: modelRoutes,
                                 compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens ?? 0,
                                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
@@ -595,6 +603,8 @@ namespace Omnipotent.Services.Projects
                             Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
                             PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
                         });
+
+                        parent.Activity.BeginTool(projectID, "commander", toolName, DescribeCall(toolName, argsJson));
 
                         string sig = toolName + "|" + argsJson;
                         recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
@@ -791,6 +801,9 @@ namespace Omnipotent.Services.Projects
             }
             finally
             {
+                // The wake is over on every path — clear the live indicator before the postamble, so
+                // the panel never shows a Commander still "thinking" after it went to sleep.
+                parent.Activity.End(projectID, "commander");
                 try { if (parent.Desktops != null) await parent.Desktops.ReleaseAgentInputsAsync(projectID, "commander"); } catch { }
                 try
                 {
