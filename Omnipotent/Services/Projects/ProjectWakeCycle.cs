@@ -78,7 +78,7 @@ namespace Omnipotent.Services.Projects
             var digest = digests.GetDigest(project.ProjectID);
 
             // Recent verbatim window: everything after the digest watermark, newest kept.
-            var recent = eventLog.ReadSince(project.ProjectID, digest.LastDigestedSequence, max: 2000)
+            var recent = eventLog.ReadRecentSince(project.ProjectID, digest.LastDigestedSequence, count: 2000)
                 .Where(e => e.Type != ProjectEventTypes.DigestRebuilt)
                 .TakeLast(ProjectCommanderPrompts.RecentEventsConsidered)
                 .ToList();

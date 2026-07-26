@@ -120,6 +120,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("validate suppliers", seed);
             Assert.Contains("shortlisted supplier Acme", seed);
             Assert.Contains("Email from Acme: quote attached", seed);
+            Assert.Equal(0, log.FullIndexBuilds);
         }
 
         [Fact]

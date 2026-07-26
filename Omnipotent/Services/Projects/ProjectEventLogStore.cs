@@ -32,6 +32,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Bytes read from the log's end when only the last sequence is wanted. One event's
         /// payload is capped at 32KB, so this always spans at least one complete record.</summary>
         private const int TailProbeBytes = 256 * 1024;
+        private const int ReverseReadChunkBytes = 64 * 1024;
 
         /// <summary>Test-only counter: how many times a full log read has been performed.</summary>
         internal int FullIndexBuilds => fullIndexBuilds;
@@ -121,6 +122,18 @@ namespace Omnipotent.Services.Projects
         public List<ProjectEvent> ReadSince(string projectID, long sinceExclusive, int max = 500)
         {
             CacheDeps.NoteRead(CacheKey(projectID));
+            if (max <= 0) return new List<ProjectEvent>();
+
+            // The website, WebSocket replay, and active wakes almost always read immediately after
+            // the current cursor. When the whole missing range fits in this page, read it directly
+            // from the file's end instead of cold-building an index over the project's unbounded
+            // history. A genuinely old cursor still falls through to the sparse forward index so
+            // paging keeps its "oldest max events after since" contract.
+            long last = GetLastSequenceForRead(projectID);
+            if (sinceExclusive >= last) return new List<ProjectEvent>();
+            if (sinceExclusive >= Math.Max(0, last - max))
+                return ReadNewestFromTail(projectID, sinceExclusive, max);
+
             var results = new List<ProjectEvent>();
             lock (LockFor(projectID))
             {
@@ -149,11 +162,30 @@ namespace Omnipotent.Services.Projects
             return results;
         }
 
-        /// <summary>Reads the most recent <paramref name="count"/> events, ascending order.</summary>
+        /// <summary>
+        /// Reads the most recent <paramref name="count"/> events in ascending order directly from
+        /// the log's end. This deliberately does not build the full sparse index or take the append
+        /// lock: opening a project must remain cheap even when its history is hundreds of MB.
+        /// </summary>
         public List<ProjectEvent> ReadTail(string projectID, int count)
         {
-            long last = GetLastSequence(projectID);
-            return ReadSince(projectID, Math.Max(0, last - count), max: count);
+            CacheDeps.NoteRead(CacheKey(projectID));
+            return count <= 0
+                ? new List<ProjectEvent>()
+                : ReadNewestFromTail(projectID, long.MinValue, count);
+        }
+
+        /// <summary>
+        /// Reads the newest bounded window after a watermark, ascending. Wake rehydration wants the
+        /// latest relevant context rather than a forward-paging cursor, so it must never parse the
+        /// complete historical log merely because a digest watermark is old.
+        /// </summary>
+        public List<ProjectEvent> ReadRecentSince(string projectID, long sinceExclusive, int count)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            return count <= 0
+                ? new List<ProjectEvent>()
+                : ReadNewestFromTail(projectID, sinceExclusive, count);
         }
 
         /// <summary>
@@ -228,6 +260,84 @@ namespace Omnipotent.Services.Projects
             long last = ReadLastSequenceFromTailLocked(projectID);
             seqCache[projectID] = last;
             return last;
+        }
+
+        private long GetLastSequenceForRead(string projectID)
+        {
+            if (seqCache.TryGetValue(projectID, out long cached)) return cached;
+            lock (LockFor(projectID)) return GetLastSequenceLocked(projectID);
+        }
+
+        /// <summary>
+        /// Reverse-scans complete JSONL records from a snapshot of the current file length. Records
+        /// can cross chunk boundaries; a partial crash tail is ignored. Results are collected
+        /// newest-first and reversed before return, preserving the public ascending-order contract.
+        /// No project lock is taken, so a history viewer cannot stop an agent from appending.
+        /// </summary>
+        private List<ProjectEvent> ReadNewestFromTail(string projectID, long sinceExclusive, int count)
+        {
+            var newestFirst = new List<ProjectEvent>(Math.Min(count, 2048));
+            string path = LogPath(projectID);
+            if (!File.Exists(path)) return newestFirst;
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long position = fs.Length;
+            if (position == 0) return newestFirst;
+
+            var reversedLine = new List<byte>(4096);
+            var chunk = new byte[ReverseReadChunkBytes];
+            bool reachedBoundary = false;
+
+            while (position > 0 && newestFirst.Count < count && !reachedBoundary)
+            {
+                int bytesToRead = (int)Math.Min(chunk.Length, position);
+                position -= bytesToRead;
+                fs.Seek(position, SeekOrigin.Begin);
+                fs.ReadExactly(chunk, 0, bytesToRead);
+
+                for (int i = bytesToRead - 1; i >= 0; i--)
+                {
+                    if (chunk[i] != (byte)'\n')
+                    {
+                        reversedLine.Add(chunk[i]);
+                        continue;
+                    }
+
+                    reachedBoundary = ConsumeReverseLine();
+                    if (reachedBoundary || newestFirst.Count >= count) break;
+                }
+            }
+
+            if (!reachedBoundary && newestFirst.Count < count && reversedLine.Count > 0)
+                ConsumeReverseLine();
+
+            newestFirst.Reverse();
+            return newestFirst;
+
+            bool ConsumeReverseLine()
+            {
+                if (reversedLine.Count == 0) return false; // normal trailing newline / blank record
+
+                var bytes = reversedLine.ToArray();
+                Array.Reverse(bytes);
+                reversedLine.Clear();
+
+                ProjectEvent? evt = null;
+                try
+                {
+                    string line = System.Text.Encoding.UTF8.GetString(bytes)
+                        .TrimEnd('\r')
+                        .TrimStart('\uFEFF');
+                    if (!string.IsNullOrWhiteSpace(line))
+                        evt = JsonConvert.DeserializeObject<ProjectEvent>(line);
+                }
+                catch { /* partial/corrupt record: continue to the preceding complete line */ }
+
+                if (evt == null) return false;
+                if (evt.Sequence <= sinceExclusive) return true;
+                newestFirst.Add(evt);
+                return false;
+            }
         }
 
         /// <summary>

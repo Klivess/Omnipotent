@@ -48,22 +48,48 @@ namespace Omnipotent.Tests.Projects
             // load asks for the tail, which must be the NEWEST `count` events (not the oldest), in
             // ascending order, and its last sequence must equal GetLastSequence so the client cursor
             // and the displayed events agree (otherwise everything between is silently skipped).
-            var store = NewStore();
+            var writer = NewStore();
             string pid = NewProjectId();
             for (int i = 1; i <= 20; i++)
-                store.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+                writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
 
-            var tail = store.ReadTail(pid, 5);
+            var reader = NewStore(); // cold, as after a service restart
+            var tail = reader.ReadTail(pid, 5);
             Assert.Equal(5, tail.Count);
             Assert.Equal("e16", tail[0].Text);
             Assert.Equal("e20", tail[^1].Text);
-            Assert.Equal(store.GetLastSequence(pid), tail[^1].Sequence);
+            Assert.Equal(reader.GetLastSequence(pid), tail[^1].Sequence);
+            Assert.Equal(0, reader.FullIndexBuilds);
 
             // Asking for more than exist returns them all, still oldest→newest.
-            var allTail = store.ReadTail(pid, 500);
+            var allTail = reader.ReadTail(pid, 500);
             Assert.Equal(20, allTail.Count);
             Assert.Equal("e1", allTail[0].Text);
             Assert.Equal("e20", allTail[^1].Text);
+            Assert.Equal(0, reader.FullIndexBuilds);
+        }
+
+        [Fact]
+        public void ReadTail_ReassemblesRecordsAcrossReverseReadChunks()
+        {
+            string pid = NewProjectId();
+            var writer = NewStore();
+            writer.Append(new ProjectEvent
+            {
+                ProjectID = pid,
+                Type = ProjectEventTypes.ToolResult,
+                Text = "large:" + new string('x', 90_000),
+            });
+            writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = "after" });
+
+            var reader = NewStore();
+            var tail = reader.ReadTail(pid, 2);
+
+            Assert.Equal(2, tail.Count);
+            Assert.StartsWith("large:", tail[0].Text);
+            Assert.Equal(90_006, tail[0].Text.Length);
+            Assert.Equal("after", tail[1].Text);
+            Assert.Equal(0, reader.FullIndexBuilds);
         }
 
         [Fact]
@@ -174,10 +200,10 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal(0, reader.FullIndexBuilds);
         }
 
-        /// <summary>Reading the timeline still needs the sparse offset index, and it must be built
-        /// once — including when appends have already happened on the cheap path.</summary>
+        /// <summary>A current cursor stays on the reverse-tail path. A genuinely old cursor still
+        /// builds the sparse index once so forward paging returns the oldest page after `since`.</summary>
         [Fact]
-        public void ReadSince_BuildsTheIndexOnce_AndPagesCorrectlyAfterATailOnlyAppend()
+        public void ReadSince_AvoidsColdIndexForCurrentCursor_ButPreservesOldCursorPaging()
         {
             string pid = NewProjectId();
             var writer = NewStore();
@@ -189,14 +215,36 @@ namespace Omnipotent.Tests.Projects
             reader.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = "e401" });
 
             var page = reader.ReadSince(pid, 395);
-            Assert.Equal(1, reader.FullIndexBuilds);
+            Assert.Equal(0, reader.FullIndexBuilds);
             Assert.Equal(6, page.Count);
             Assert.Equal("e396", page[0].Text);
             Assert.Equal("e401", page[^1].Text);
 
-            // A second read reuses the index rather than rebuilding it.
-            Assert.Equal("e1", reader.ReadSince(pid, 0, max: 1)[0].Text);
+            // A stale cursor whose gap does not fit in one response needs the forward sparse index.
+            var firstOldPage = reader.ReadSince(pid, 0, max: 10);
+            Assert.Equal(10, firstOldPage.Count);
+            Assert.Equal("e1", firstOldPage[0].Text);
+            Assert.Equal("e10", firstOldPage[^1].Text);
             Assert.Equal(1, reader.FullIndexBuilds);
+
+            // Later old-cursor pages reuse that same index.
+            Assert.Equal("e11", reader.ReadSince(pid, 10, max: 1)[0].Text);
+            Assert.Equal(1, reader.FullIndexBuilds);
+        }
+
+        [Fact]
+        public void ReadRecentSince_ColdRead_ReturnsNewestWindowWithoutFullIndex()
+        {
+            string pid = NewProjectId();
+            var writer = NewStore();
+            for (int i = 1; i <= 30; i++)
+                writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+
+            var reader = NewStore();
+            var recent = reader.ReadRecentSince(pid, sinceExclusive: 5, count: 5);
+
+            Assert.Equal(new[] { "e26", "e27", "e28", "e29", "e30" }, recent.Select(e => e.Text));
+            Assert.Equal(0, reader.FullIndexBuilds);
         }
 
         /// <summary>A hard stop can leave a partial trailing record. The tail read must fall back to
@@ -215,7 +263,10 @@ namespace Omnipotent.Tests.Projects
                 pid + ".log.jsonl");
             File.AppendAllText(path, "{\"ProjectID\":\"" + pid + "\",\"Sequence\":6,\"Te");
 
-            Assert.Equal(5, NewStore().GetLastSequence(pid));
+            var reader = NewStore();
+            Assert.Equal(5, reader.GetLastSequence(pid));
+            Assert.Equal(new[] { "e4", "e5" }, reader.ReadTail(pid, 2).Select(e => e.Text));
+            Assert.Equal(0, reader.FullIndexBuilds);
         }
 
         [Fact]

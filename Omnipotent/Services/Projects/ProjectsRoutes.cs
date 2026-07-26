@@ -514,7 +514,11 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new
                     {
                         events,
-                        lastSequence = parent.EventLog.GetLastSequence(project.ProjectID),
+                        // This is the last sequence INCLUDED in the response, not a separately-read
+                        // high-water mark. If an append races this request, the client's HTTP/WS
+                        // cursor remains behind it and the next replay delivers it instead of
+                        // silently skipping an event that was never in this batch.
+                        lastSequence = events.LastOrDefault()?.Sequence ?? since,
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
