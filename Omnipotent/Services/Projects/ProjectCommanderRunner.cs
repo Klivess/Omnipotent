@@ -246,6 +246,7 @@ namespace Omnipotent.Services.Projects
             string? outcomePayloadJson = null;
             int stuckTrips = 0;
             int emptyResponseTrips = 0;
+            int passiveProseTrips = 0;
             int emptyResponses = 0;
             bool endedAtWorkSlice = false;
             int productiveActions = 0;
@@ -398,15 +399,6 @@ namespace Omnipotent.Services.Projects
                             llm.AppendUserMessageToToolSession(sessionId,
                                 $"MESSAGE FROM A SUB-AGENT (mid-wake — take this into account now): {report}");
 
-                    if (ProjectWorkSliceBoundary.IsToolCallLimitReached(toolCalls, sliceToolCalls))
-                        llm.AppendUserMessageToToolSession(sessionId,
-                            $"CONTEXT WORK SLICE COMPLETE ({sliceToolCalls} tool calls). This is not a work limit. Stop calling tools, record verified status and the exact next action; productive work continues immediately in a fresh context.");
-
-                    bool finalModelTurn = ProjectWorkSliceBoundary.IsFinalModelTurn(modelTurns, sliceModelTurns);
-                    if (finalModelTurn)
-                        llm.AppendUserMessageToToolSession(sessionId,
-                            $"CONTEXT WORK SLICE COMPLETE ({sliceModelTurns} model turns). This is not a work limit. Give verified status and the exact next action for immediate continuation in a fresh context.");
-
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
                     {
@@ -491,6 +483,7 @@ namespace Omnipotent.Services.Projects
                         emptyResponseTrips = 0;
                     else
                         emptyResponses++;
+                    if (resp.ToolCalls is { Count: > 0 }) passiveProseTrips = 0;
                     // A model response and its returned tool calls are one atomic protocol turn.
                     // Even when this response crosses a context boundary, execute and journal the
                     // complete batch first. Rejecting it here caused every batched web_fetch call
@@ -504,6 +497,20 @@ namespace Omnipotent.Services.Projects
                                 $"Model returned an empty response with no tool calls (retry {emptyResponseTrips}/2); the wake remains active."));
                             llm.AppendUserMessageToToolSession(sessionId,
                                 "Your last turn was empty. Continue with the next evidence-producing tool action, or give a concrete closing status explaining the real external wait/blocker. Do not silently abandon the wake.");
+                            continue;
+                        }
+                        if (!sliceComplete && !string.IsNullOrWhiteSpace(resp.Response)
+                            && parent.Store.GetProject(projectID)?.Status is ProjectStatus.Active or ProjectStatus.Planning
+                            && ++passiveProseTrips <= 2)
+                        {
+                            parent.EventLog.Append(WakeEvt(projectID, wakeID,
+                                ProjectEventTypes.CommanderThought, "commander", resp.Response.Trim()));
+                            llm.AppendUserMessageToToolSession(sessionId,
+                                "That response described status or intent but executed no project action. " +
+                                ProjectPromptHygiene.CapabilityTruth + " Use native tool calls now: perform the " +
+                                "next goal step, call complete_project if the goal is verified complete, request " +
+                                "the specific human-only dependency if one exists, or create a hook if the work " +
+                                "is genuinely waiting on a future external event. Do not end with another plan.");
                             continue;
                         }
                         endedAtWorkSlice = sliceComplete;
@@ -881,9 +888,8 @@ namespace Omnipotent.Services.Projects
 
                 // A context rollover never limits productive work. Queued stimuli take precedence;
                 // otherwise a fresh wake resumes immediately from the durable checkpoint.
-                bool madeUsefulProgress = verifiedProgressSequence.HasValue || productiveActions > 0;
-                bool continueAfterSlice = endedAtWorkSlice && madeUsefulProgress
-                    && outcome == ProjectEventTypes.WakeCompleted;
+                bool continueAfterSlice = ProjectWorkSliceBoundary.ShouldContinueAssignment(
+                    endedAtWorkSlice, outcome == ProjectEventTypes.WakeCompleted);
                 var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
                 if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                     parent.RuntimeState.ClearResumeAction(projectID, consumedResume!.ActionID);
@@ -904,8 +910,8 @@ namespace Omnipotent.Services.Projects
                 string resume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction?.Summary
                     ?? "Resume from the most recent verified action and continue the current objective.";
                 Wake(refreshed,
-                    "Automatic context rollover: the previous work slice ended, not the work. " +
-                    $"Exact resume checkpoint: {resume}");
+                    "Continue the active assignment now. " +
+                    $"Exact durable checkpoint: {ProjectPromptHygiene.ScrubState(resume, "Resume from the latest verified external state.")}");
             }
             catch { /* never mask the wake outcome */ }
         }
@@ -1137,7 +1143,9 @@ namespace Omnipotent.Services.Projects
             var kind = text.StartsWith("Periodic keepalive:", StringComparison.Ordinal) ? ProjectWakeTriggerKind.Keepalive
                 : text.Contains("Message from Klives", StringComparison.Ordinal) ? ProjectWakeTriggerKind.HumanMessage
                 : text.StartsWith("Continuation:", StringComparison.Ordinal)
-                    || text.StartsWith("Automatic context rollover:", StringComparison.Ordinal) ? ProjectWakeTriggerKind.Continuation
+                    || text.StartsWith("Automatic context rollover:", StringComparison.Ordinal)
+                    || text.StartsWith("Continue the active assignment", StringComparison.Ordinal)
+                    ? ProjectWakeTriggerKind.Continuation
                 : text.Contains("watchdog", StringComparison.OrdinalIgnoreCase) ? ProjectWakeTriggerKind.Recovery
                 : text.Contains("sub-agent", StringComparison.OrdinalIgnoreCase) ? ProjectWakeTriggerKind.AgentMessage
                 : ProjectWakeTriggerKind.Other;

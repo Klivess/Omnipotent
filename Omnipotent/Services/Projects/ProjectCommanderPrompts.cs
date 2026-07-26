@@ -44,6 +44,8 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"Goal: {project.Goal}");
             sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampWithAge(project.CreatedAt)}");
             sb.AppendLine($"Budgets: tokens ${project.TokenBudgetUsd:0.##} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
+            sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
+            sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
 
             // This is intentionally ahead of the grand plan/digest/retrieval legs. A rule from
             // Klives is authoritative and must not be summarized away, outranked by a stale plan,
@@ -67,7 +69,8 @@ namespace Omnipotent.Services.Projects
             if (!string.IsNullOrWhiteSpace(runtimeStateBlock))
             {
                 sb.AppendLine("── TYPED EXECUTION STATE (authoritative; update with checkpoint tools) ──");
-                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(runtimeStateBlock, ProjectsContextBudget.DigestBudget));
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
+                    ProjectPromptHygiene.ScrubState(runtimeStateBlock), ProjectsContextBudget.DigestBudget));
             }
 
             sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampWithAge(digest.UpdatedAt)}) ──");
@@ -121,11 +124,14 @@ namespace Omnipotent.Services.Projects
                     sb.AppendLine($"[{h.Source}{(string.IsNullOrEmpty(h.Title) ? "" : " · " + h.Title)}] {ProjectsContextBudget.TruncateToTokens(h.Text, 200)} (doc:{h.DocId})");
             }
 
-            if (retrievalHits.Count > 0)
+            var visibleRetrievalHits = retrievalHits
+                .Where(ProjectPromptHygiene.IsAgentVisibleRetrievalHit)
+                .ToList();
+            if (visibleRetrievalHits.Count > 0)
             {
                 sb.AppendLine("── RETRIEVED FROM THE FULL LOG (relevant to this wake's trigger) ──");
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
-                    retrievalHits,
+                    visibleRetrievalHits,
                     ProjectsContextBudget.RetrievalBudget,
                     h => h.Snippet,
                     h => h.Score);
@@ -133,11 +139,15 @@ namespace Omnipotent.Services.Projects
                     sb.AppendLine($"[#{hit.Sequence} {hit.Timestamp:yyyy-MM-dd HH:mm} {hit.Type}] {hit.Snippet}");
             }
 
-            if (recentEvents.Count > 0)
+            var visibleRecentEvents = recentEvents
+                .Where(ProjectPromptHygiene.IsAgentVisibleEvent)
+                .ToList();
+            if (visibleRecentEvents.Count > 0)
             {
                 sb.AppendLine("── RECENT EVENTS (newest last) ──");
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
-                    recentEvents.Select((e, i) => (evt: e, idxFromEnd: recentEvents.Count - 1 - i)),
+                    visibleRecentEvents.Select((e, i) =>
+                        (evt: e, idxFromEnd: visibleRecentEvents.Count - 1 - i)),
                     ProjectsContextBudget.RecentEventsBudget,
                     x => DescribeEvent(x.evt),
                     x => ProjectsContextBudget.ScoreEvent(x.evt.Text, triggerDescription, x.idxFromEnd));
@@ -171,11 +181,11 @@ namespace Omnipotent.Services.Projects
         private static string ComposeDigestBlock(ProjectDigest d)
         {
             var sb = new StringBuilder();
-            sb.AppendLine($"CURRENT PLAN: {OrNone(d.CurrentPlan)}");
-            sb.AppendLine($"ORG CHART: {OrNone(d.OrgChart)}");
-            sb.AppendLine($"BUDGET STATE: {OrNone(d.BudgetState)}");
-            sb.AppendLine($"OPEN THREADS: {OrNone(d.OpenThreads)}");
-            sb.AppendLine($"EARLIER HISTORY (compacted): {OrNone(d.RollingSummary)}");
+            sb.AppendLine($"CURRENT PLAN: {ProjectPromptHygiene.ScrubState(d.CurrentPlan)}");
+            sb.AppendLine($"ORG CHART: {ProjectPromptHygiene.ScrubState(d.OrgChart)}");
+            sb.AppendLine($"BUDGET STATE: {ProjectPromptHygiene.ScrubState(d.BudgetState)}");
+            sb.AppendLine($"OPEN THREADS: {ProjectPromptHygiene.ScrubState(d.OpenThreads)}");
+            sb.AppendLine($"EARLIER HISTORY (compacted): {ProjectPromptHygiene.ScrubState(d.RollingSummary)}");
             return sb.ToString();
         }
 
@@ -207,14 +217,14 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine("Keep decisions, requirements, verified outcomes and open issues. Drop tool mechanics and superseded states.");
             sb.AppendLine();
             sb.AppendLine("EXISTING DIGEST:");
-            sb.AppendLine($"{PlanHeader}\n{OrNone(DescribeExistingPlan(existing))}");
-            sb.AppendLine($"{OrgHeader}\n{OrNone(existing.OrgChart)}");
-            sb.AppendLine($"{BudgetHeader}\n{OrNone(existing.BudgetState)}");
-            sb.AppendLine($"{OpenHeader}\n{OrNone(existing.OpenThreads)}");
-            sb.AppendLine($"{SummaryHeader}\n{OrNone(existing.RollingSummary)}");
+            sb.AppendLine($"{PlanHeader}\n{ProjectPromptHygiene.ScrubState(DescribeExistingPlan(existing))}");
+            sb.AppendLine($"{OrgHeader}\n{ProjectPromptHygiene.ScrubState(existing.OrgChart)}");
+            sb.AppendLine($"{BudgetHeader}\n{ProjectPromptHygiene.ScrubState(existing.BudgetState)}");
+            sb.AppendLine($"{OpenHeader}\n{ProjectPromptHygiene.ScrubState(existing.OpenThreads)}");
+            sb.AppendLine($"{SummaryHeader}\n{ProjectPromptHygiene.ScrubState(existing.RollingSummary)}");
             sb.AppendLine();
             sb.AppendLine("NEW EVENTS:");
-            foreach (var e in newEvents)
+            foreach (var e in newEvents.Where(ProjectPromptHygiene.IsAgentVisibleEvent))
                 sb.AppendLine(DescribeEvent(e));
             return sb.ToString();
         }
@@ -244,13 +254,27 @@ namespace Omnipotent.Services.Projects
             if (sections.Count == 0)
             {
                 result.RollingSummary = response.Trim();
-                return result;
+                return SanitizeDigest(result);
             }
             if (sections.TryGetValue(PlanHeader, out var plan)) ApplyPlanSection(result, plan);
             if (sections.TryGetValue(OrgHeader, out var org)) result.OrgChart = org;
             if (sections.TryGetValue(BudgetHeader, out var budget)) result.BudgetState = budget;
             if (sections.TryGetValue(OpenHeader, out var open)) result.OpenThreads = open;
             if (sections.TryGetValue(SummaryHeader, out var summary)) result.RollingSummary = summary;
+            return SanitizeDigest(result);
+        }
+
+        private static ProjectDigest SanitizeDigest(ProjectDigest result)
+        {
+            result.CurrentPlan = ProjectPromptHygiene.ScrubState(result.CurrentPlan, "");
+            result.CurrentFocus = ProjectPromptHygiene.ScrubState(result.CurrentFocus, "");
+            result.NextSteps = result.NextSteps
+                .Where(step => !ProjectPromptHygiene.ContainsContextBookkeeping(step))
+                .ToList();
+            result.OrgChart = ProjectPromptHygiene.ScrubState(result.OrgChart, "");
+            result.BudgetState = ProjectPromptHygiene.ScrubState(result.BudgetState, "");
+            result.OpenThreads = ProjectPromptHygiene.ScrubState(result.OpenThreads, "");
+            result.RollingSummary = ProjectPromptHygiene.ScrubState(result.RollingSummary, "");
             return result;
         }
 

@@ -79,7 +79,7 @@ namespace Omnipotent.Services.Projects
 
             // Recent verbatim window: everything after the digest watermark, newest kept.
             var recent = eventLog.ReadRecentSince(project.ProjectID, digest.LastDigestedSequence, count: 2000)
-                .Where(e => e.Type != ProjectEventTypes.DigestRebuilt)
+                .Where(ProjectPromptHygiene.IsAgentVisibleEvent)
                 .TakeLast(ProjectCommanderPrompts.RecentEventsConsidered)
                 .ToList();
 
@@ -88,13 +88,16 @@ namespace Omnipotent.Services.Projects
             string retrievalQuery = string.Join(" ", new[]
             {
                 project.Goal,
-                digest.CurrentFocus,
-                string.Join(" ", digest.NextSteps.Take(8)),
-                Truncate(digest.CurrentPlan, 1200),
-                triggerDescription,
+                ProjectPromptHygiene.ScrubState(digest.CurrentFocus, ""),
+                string.Join(" ", digest.NextSteps
+                    .Where(step => !ProjectPromptHygiene.ContainsContextBookkeeping(step))
+                    .Take(8)),
+                Truncate(ProjectPromptHygiene.ScrubState(digest.CurrentPlan, ""), 1200),
+                ProjectPromptHygiene.ScrubTrigger(triggerDescription),
             }.Where(x => !string.IsNullOrWhiteSpace(x)));
             var hits = retrieval.Search(project.ProjectID, retrievalQuery)
                 .Where(h => recent.Count == 0 || h.Sequence < recent[0].Sequence)
+                .Where(ProjectPromptHygiene.IsAgentVisibleRetrievalHit)
                 .ToList();
 
             // Cross-system knowledge, excluding THIS project's own events/digests (covered by the log leg).
@@ -147,7 +150,8 @@ namespace Omnipotent.Services.Projects
                 try { kliveAgentContext = await DescribeKliveAgentContextAsync(project.ProjectID); } catch { kliveAgentContext = null; }
             }
 
-            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits, triggerDescription,
+            return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
+                ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives);
         }
 

@@ -292,7 +292,9 @@ public class ProjectContextSliceTests
 
         Assert.Equal(ProjectEventTypes.WakeDiagnostic, diagnostic.Type);
         Assert.Contains("model returned prose/no native tool calls", diagnostic.Text);
-        Assert.Contains("slice limits: tools=disabled, turns=disabled", diagnostic.Text);
+        Assert.Contains("tool-call cap=off (offered tools remained available)", diagnostic.Text);
+        Assert.DoesNotContain("tools=disabled", diagnostic.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("slice limits", diagnostic.Text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("\"modelToolCalls\":0", diagnostic.PayloadJson);
     }
 

@@ -135,8 +135,8 @@ namespace Omnipotent.Services.Projects
                 string resume = parent.RuntimeState.Get(project.ProjectID).Checkpoint.AgentResumeActions
                     .GetValueOrDefault(agent.AgentID)?.Summary ?? "Resume the assigned objective from the latest verified action.";
                 Wake(refreshed, agent,
-                    "Automatic context rollover: the previous work slice ended, not the assignment. " +
-                    $"Exact resume checkpoint: {resume}");
+                    "Continue the active assignment now. " +
+                    $"Exact durable checkpoint: {ProjectPromptHygiene.ScrubState(resume, "Resume from the latest verified external state.")}");
             }
             catch { /* never mask the wake outcome */ }
         }
@@ -327,15 +327,6 @@ namespace Omnipotent.Services.Projects
                     if (steerQueue.TryGetValue(steerKey, out var sq))
                         while (sq.TryDequeue(out var steer))
                             llm.AppendUserMessageToToolSession(sessionId, $"NEW MESSAGE (mid-wake — take this into account now): {steer}");
-
-                    if (ProjectWorkSliceBoundary.IsToolCallLimitReached(toolCalls, sliceToolCalls))
-                        llm.AppendUserMessageToToolSession(sessionId,
-                            $"CONTEXT WORK SLICE COMPLETE ({sliceToolCalls} tool calls). This is not an assignment limit. Stop calling tools, report verified status and the exact next action; productive work continues immediately in a fresh context.");
-
-                    bool finalModelTurn = ProjectWorkSliceBoundary.IsFinalModelTurn(modelTurns, sliceModelTurns);
-                    if (finalModelTurn)
-                        llm.AppendUserMessageToToolSession(sessionId,
-                            $"CONTEXT WORK SLICE COMPLETE ({sliceModelTurns} model turns). This is not an assignment limit. Report verified results and the exact next action for immediate continuation.");
 
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
@@ -725,10 +716,6 @@ namespace Omnipotent.Services.Projects
                 parent.StimulusQueue.AcknowledgeWake(wakeID, outcome == ProjectEventTypes.WakeCompleted);
             }
             var wakeEvents = parent.EventLog.ReadSince(projectID, wakeStartSeq, max: 2000);
-            bool madeMeasurableProgress = wakeEvents.Any(e =>
-                e.Type is ProjectEventTypes.ArtifactAdded or ProjectEventTypes.ProjectFileChanged
-                    or ProjectEventTypes.GrandPlanProgress or ProjectEventTypes.AccountChanged
-                    or ProjectEventTypes.CheckpointChanged);
             long? verifiedProgressSequence = wakeEvents.Where(e =>
                     e.Type is ProjectEventTypes.ArtifactAdded or ProjectEventTypes.ProjectFileChanged
                         or ProjectEventTypes.GrandPlanProgress or ProjectEventTypes.AccountChanged
@@ -743,8 +730,8 @@ namespace Omnipotent.Services.Projects
             var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agent.AgentID);
             if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                 parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, consumedResume!.ActionID);
-            return endedAtWorkSlice && (madeMeasurableProgress || productiveActions > 0)
-                && outcome == ProjectEventTypes.WakeCompleted;
+            return ProjectWorkSliceBoundary.ShouldContinueAssignment(
+                endedAtWorkSlice, outcome == ProjectEventTypes.WakeCompleted);
         }
 
         private static string BuildSystemPrompt(Project project, ProjectAgentRecord agent)
@@ -787,6 +774,8 @@ RULES:
             var digest = parent.Digests.GetDigest(project.ProjectID);
             var sb = new StringBuilder();
             sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps below and in your messages are UTC.");
+            sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
+            sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
             string directives = "";
             try { directives = parent.Directives.DescribeForPrompt(project.ProjectID, agent.AgentID,
                 ProjectDirectiveStore.TryExtractDirectiveID(trigger)); } catch { }
@@ -796,9 +785,9 @@ RULES:
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(directives, ProjectsContextBudget.DirectivesBudget));
             }
             sb.AppendLine("── PROJECT PLAN (commander's, for context) ──");
-            string planSeed = ProjectsContextBudget.ScrubHarnessLeak(
+            string planSeed = ProjectPromptHygiene.ScrubState(ProjectsContextBudget.ScrubHarnessLeak(
                 digest.CurrentPlan is { Length: > 0 } p ? p : "(none)",
-                "(plan omitted — contained non-project agent scaffolding)");
+                "(plan omitted — contained non-project agent scaffolding)"));
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(planSeed, 400));
 
             // Durable recovery instructions must survive context reset. In particular, the
@@ -811,7 +800,8 @@ RULES:
                 if (resume != null && (!resume.NotBefore.HasValue || resume.NotBefore.Value <= DateTime.UtcNow))
                 {
                     sb.AppendLine("── EXACT RESUME ACTION (durable checkpoint) ──");
-                    sb.AppendLine(ProjectsContextBudget.TruncateToTokens(resume.Summary, 500));
+                    sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
+                        ProjectPromptHygiene.ScrubState(resume.Summary), 500));
                 }
             }
             catch { }
@@ -879,7 +869,9 @@ RULES:
 
             // This agent's own recent activity, so consecutive wakes have continuity.
             var mine = parent.EventLog.ReadTail(project.ProjectID, 400)
-                .Where(e => e.AgentID == agent.AgentID && !ProjectsContextBudget.LooksLikeHarnessLeak(e.Text))
+                .Where(e => e.AgentID == agent.AgentID
+                    && ProjectPromptHygiene.IsAgentVisibleEvent(e)
+                    && !ProjectsContextBudget.LooksLikeHarnessLeak(e.Text))
                 .TakeLast(RecentEventsForSeed)
                 .ToList();
             if (mine.Count > 0)
@@ -896,7 +888,8 @@ RULES:
 
             sb.AppendLine("── YOUR TASK (this wake's trigger) ──");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
-                ProjectsContextBudget.ScrubHarnessLeak(trigger, "(trigger text omitted — contained non-project agent scaffolding)"),
+                ProjectPromptHygiene.ScrubTrigger(ProjectsContextBudget.ScrubHarnessLeak(
+                    trigger, "(trigger text omitted — contained non-project agent scaffolding)")),
                 ProjectsContextBudget.StimulusBudget));
             return sb.ToString();
         }

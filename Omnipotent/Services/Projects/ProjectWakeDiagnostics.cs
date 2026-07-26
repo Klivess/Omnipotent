@@ -20,8 +20,8 @@ public static class ProjectWakeDiagnostics
     {
         long elapsedMs = Math.Max(0, (long)(DateTime.UtcNow - startedAtUtc).TotalMilliseconds);
         string route = string.IsNullOrWhiteSpace(finalModel) ? (initialModel ?? "unknown") : finalModel;
-        string toolBoundary = toolCallLimit <= 0 ? "disabled" : toolCallLimit.ToString();
-        string turnBoundary = modelTurnLimit <= 0 ? "disabled" : modelTurnLimit.ToString();
+        string toolBoundary = toolCallLimit <= 0 ? "off (offered tools remained available)" : toolCallLimit.ToString();
+        string turnBoundary = modelTurnLimit <= 0 ? "off" : modelTurnLimit.ToString();
         string signal = modelTurns == 0
             ? "no model response was received"
             : modelToolCalls == 0
@@ -40,7 +40,8 @@ public static class ProjectWakeDiagnostics
             Text = $"Wake diagnostic: outcome={outcome}; {signal}; model turns={modelTurns}; " +
                 $"model tool calls={modelToolCalls}; dispatched={dispatchedToolCalls}; productive={productiveActions}; " +
                 $"empty responses={emptyResponses}; loop trips={loopTrips}; elapsed={elapsedMs}ms; route={route}; " +
-                $"slice limits: tools={toolBoundary}, turns={turnBoundary}, context={liveContextTokens}/{tokenLimit}; " +
+                $"context-renewal telemetry: tool-call cap={toolBoundary}, model-turn cap={turnBoundary}, " +
+                $"live context={liveContextTokens}/{tokenLimit}; " +
                 $"last tool={lastToolName ?? "none"}.",
             PayloadJson = JsonConvert.SerializeObject(new
             {

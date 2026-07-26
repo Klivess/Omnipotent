@@ -99,8 +99,15 @@ namespace Omnipotent.Services.Projects
             long watermark = digest.LastDigestedSequence;
             var newEvents = eventLog.ReadSince(project.ProjectID, watermark, max: 2000);
             if (newEvents.Count == 0) return digest;
+            var digestEvents = newEvents.Where(ProjectPromptHygiene.IsAgentVisibleEvent).ToList();
+            if (digestEvents.Count == 0)
+            {
+                digest.LastDigestedSequence = newEvents[^1].Sequence;
+                SaveDigest(digest);
+                return digest;
+            }
 
-            string prompt = ProjectCommanderPrompts.BuildDigestRebuildPrompt(project, digest, newEvents);
+            string prompt = ProjectCommanderPrompts.BuildDigestRebuildPrompt(project, digest, digestEvents);
             string? response = await queryModelAsync(prompt);
             if (string.IsNullOrWhiteSpace(response)) return null;
 

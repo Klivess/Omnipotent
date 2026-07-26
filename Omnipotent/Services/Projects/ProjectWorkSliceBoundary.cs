@@ -14,6 +14,12 @@ public static class ProjectWorkSliceBoundary
     public static bool ShouldClearConsumedResume(bool endedAtWorkSlice, ProjectResumeAction? resume) =>
         !endedAtWorkSlice && resume?.Kind == "work-slice";
 
+    /// <summary>A context boundary is never a completion condition. Once its wake was committed
+    /// successfully, the active assignment continues even when no action in that particular slice
+    /// happened to satisfy the progress classifier.</summary>
+    public static bool ShouldContinueAssignment(bool endedAtWorkSlice, bool wakeCompleted) =>
+        endedAtWorkSlice && wakeCompleted;
+
     /// <summary>Whether a configured tool-call boundary has been reached. A zero limit explicitly
     /// disables this boundary; it must never be interpreted as "zero calls allowed".</summary>
     public static bool IsToolCallLimitReached(int toolCalls, int toolCallLimit) =>
@@ -55,9 +61,10 @@ public static class ProjectWorkSliceBoundary
         {
             "Review the committed results from the completed tool batch" +
             (batch.Length == 0 ? "" : $" ({batch})") +
-            $" and continue from current external state. Previous context ended because {reason}."
+            " and continue the active assignment now from current external state."
         };
-        if (!string.IsNullOrWhiteSpace(modelStatus))
+        if (!string.IsNullOrWhiteSpace(modelStatus)
+            && !ProjectPromptHygiene.ContainsContextBookkeeping(modelStatus))
             parts.Add("Agent's last stated status/plan: " + Clip(modelStatus, 1200));
         if (!string.IsNullOrWhiteSpace(lastResult))
             parts.Add($"Latest committed result{(string.IsNullOrWhiteSpace(lastToolName) ? "" : " from " + lastToolName)}: " +
