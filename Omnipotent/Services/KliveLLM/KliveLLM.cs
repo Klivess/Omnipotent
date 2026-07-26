@@ -1201,8 +1201,35 @@ namespace Omnipotent.Services.KliveLLM
 
             var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete, modelRoutes: modelRoutes, enableOpenRouterContextCompression: enableOpenRouterContextCompression, samplingParameters: samplingParameters);
             var msg = response.choices[0].message;
-            var content = HFWrapper.ContentToText(msg?.content);
-            var toolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
+            var rawContent = HFWrapper.ContentToText(msg?.content);
+            var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
+            var normalized = GemmaToolCallCompatibility.Normalize(rawContent, nativeToolCalls, tools);
+            if (!normalized.Success)
+            {
+                // Do not append the raw envelope to the session: a later retry must start from the
+                // last clean user/tool turn, and no caller should mistake provider protocol markup
+                // for prose. Projects resets sessions that do not end at a clean assistant turn.
+                return new KliveLLMResponse
+                {
+                    Success = false,
+                    ErrorMessage = normalized.Error,
+                    RawResponse = rawContent,
+                    SessionId = sessionId,
+                    PromptTokens = response.usage?.prompt_tokens ?? 0,
+                    CompletionTokens = response.usage?.completion_tokens ?? 0,
+                    GenerationId = response.id,
+                    CostUsd = response.usage?.cost,
+                    Model = response.model,
+                    ContextWindowTokens = contextWindowTokensOverride,
+                    ContextWasCompacted = contextWasCompacted,
+                };
+            }
+
+            var content = normalized.Content;
+            var toolCalls = normalized.ToolCalls;
+            if (normalized.Adapted && onToolCallComplete != null && toolCalls != null)
+                foreach (var call in toolCalls)
+                    try { onToolCallComplete(call); } catch { }
 
             lock (sessions)
             {
@@ -1221,7 +1248,7 @@ namespace Omnipotent.Services.KliveLLM
             return new KliveLLMResponse
             {
                 Response = content,
-                RawResponse = content,
+                RawResponse = rawContent,
                 SessionId = sessionId,
                 Success = true,
                 ToolCalls = toolCalls,
