@@ -491,7 +491,7 @@ namespace Omnipotent.Services.Projects
                     // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
                     if (lastWake == null || DateTime.UtcNow - lastWake.Timestamp > TimeSpan.FromMinutes(14))
                         CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
-                            ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (submit_grand_plan) for Klives' approval."
+                            ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
                             : "Periodic keepalive: reassess the plan and make the next concrete progress toward the goal.",
                             queueIfBusy: false); // ephemeral nudge: never replay stale phase instructions behind a live wake
                 }
@@ -623,7 +623,7 @@ namespace Omnipotent.Services.Projects
             CommanderRunner.Wake(p,
                 "Project created by Klives just now — you are in the PLANNING phase. Research the goal thoroughly, " +
                 "convene a planning council (convene_council) to stress-test your approach, then draft and submit a " +
-                "Grand Plan (submit_grand_plan) for Klives' approval. Use all available tools to validate assumptions and make reversible progress while planning; keep consequential actions behind their normal approval gates." + fileNote);
+                "Grand Plan (grand_plan op:submit) for Klives' approval. Use all available tools to validate assumptions and make reversible progress while planning; keep consequential actions behind their normal approval gates." + fileNote);
             return p;
         }
 

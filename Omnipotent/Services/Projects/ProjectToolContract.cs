@@ -66,9 +66,12 @@ public static class ProjectToolContract
     public const string AliasConflict = "alias_conflict";
 
     public static CommanderToolResult AttachWarnings(ProjectToolContractResult contract, CommanderToolResult result)
+        => AttachWarnings(contract.Warnings, result);
+
+    public static CommanderToolResult AttachWarnings(IReadOnlyList<string> warnings, CommanderToolResult result)
     {
-        if (contract.Warnings.Count == 0) return result;
-        string prefix = "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", contract.Warnings) + "\n";
+        if (warnings.Count == 0) return result;
+        string prefix = "TOOL_ARGUMENT_NORMALIZED: " + string.Join(" ", warnings) + "\n";
         return result with
         {
             ResultText = prefix + result.ResultText,

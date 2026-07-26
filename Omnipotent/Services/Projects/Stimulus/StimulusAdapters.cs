@@ -380,7 +380,7 @@ namespace Omnipotent.Services.Projects.Stimulus
                     // reset links stay in KliveMail and are fetched through the live native tools;
                     // putting a body/subject into the event journal would leak short-lived secrets
                     // into CSV exports, digests and RAG.
-                    string payload = $"Email received.\nTo: {mail.To}\nFrom: {mail.From}\nSubject/body omitted from durable history; inspect the canonical mailbox with klivemail_list_messages or klivemail_wait_for_code.";
+                    string payload = $"Email received.\nTo: {mail.To}\nFrom: {mail.From}\nSubject/body omitted from durable history; inspect the canonical mailbox with klivemail op:list_messages or op:wait_for_code.";
                     await bus.IngestAsync(hook, payload);
                 }
                 catch (Exception ex) { log($"Email hook {hook.HookID} ingest failed: {ex.Message}"); }

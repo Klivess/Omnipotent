@@ -277,7 +277,7 @@ namespace Omnipotent.Services.Projects
             if (omitted > 0)
             {
                 string Notice() => $"[{omitted} additional durable task(s) are queued but not expanded in this seed. " +
-                    "Use list_project_directives before declaring the directive queue empty.]";
+                    "Use project_directive op:list before declaring the directive queue empty.]";
                 string note = Notice();
                 while (selectedWork.Count > 0 && ProjectsContextBudget.EstimateTokens(
                     string.Join("\n", renderedRules.Concat(selectedWork).Append(note))) > ProjectsContextBudget.DirectivesBudget)
@@ -305,7 +305,7 @@ namespace Omnipotent.Services.Projects
             if (item.ExpectedArtifactPaths.Count > 0)
                 sb.AppendLine($"  Required deliverables: {string.Join(", ", item.ExpectedArtifactPaths)}. Do not mark complete until they exist in /project and are verified.");
             if (item.Kind != ProjectDirectiveKind.Rule)
-                sb.AppendLine($"  Use acknowledge_project_directive then complete_project_directive for id={item.DirectiveID}; a status sentence alone does not complete this instruction.");
+                sb.AppendLine($"  Use project_directive op:acknowledge then op:complete for id={item.DirectiveID}; a status sentence alone does not complete this instruction.");
             return sb.ToString().TrimEnd();
         }
 

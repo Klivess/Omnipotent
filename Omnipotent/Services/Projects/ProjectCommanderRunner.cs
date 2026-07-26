@@ -319,9 +319,12 @@ namespace Omnipotent.Services.Projects
                 }
                 parent.SubAgents.EnsureCommander(projectID);
 
-                // The Commander is video-tier: core tools plus the full computer-use surface.
-                var toolDefs = ProjectCommanderAgent.BuildCoreToolDefinitions();
-                toolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions());
+                // The Commander is video-tier: core tools plus the full computer-use surface. The
+                // canonical set is what validation, auditing and dispatch speak; the folded set is
+                // what the model is offered, kept under the provider tool-count limit.
+                var canonicalToolDefs = ProjectCommanderAgent.BuildCoreToolDefinitions();
+                canonicalToolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions());
+                var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
                 // Keep a clean completed session across ordinary wakes. A context rollover leaves an
                 // unfinished tool protocol (or explicitly resets below), so it naturally starts fresh.
@@ -540,12 +543,19 @@ namespace Omnipotent.Services.Projects
                     foreach (var call in resp.ToolCalls)
                     {
                         cts.Token.ThrowIfCancellationRequested();
-                        string toolName = call.function?.name ?? "";
-                        string argsJson = call.function?.arguments ?? "";
+                        // The model calls a folded tool; everything below this line — audit, loop
+                        // detection, policy and dispatch — speaks the canonical name it resolves to.
+                        string offeredName = call.function?.name ?? "";
+                        var unfolded = ProjectToolFacade.Unfold(offeredName, call.function?.arguments);
+                        string toolName = unfolded.IsValid ? unfolded.ToolName : offeredName;
+                        string argsJson = unfolded.IsValid ? unfolded.ArgumentsJson : call.function?.arguments ?? "";
                         toolCalls++;
 
-                        var contract = ProjectToolContract.ValidateAndNormalize(toolName, argsJson, toolDefs);
-                        if (!contract.IsValid)
+                        var contract = unfolded.IsValid
+                            ? ProjectToolContract.ValidateAndNormalize(toolName, argsJson, canonicalToolDefs)
+                            : null;
+                        string? rejection = unfolded.ErrorText ?? (contract!.IsValid ? null : contract.ErrorText);
+                        if (rejection != null)
                         {
                             parent.EventLog.Append(new ProjectEvent
                             {
@@ -558,16 +568,16 @@ namespace Omnipotent.Services.Projects
                             {
                                 ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
                                 Type = ProjectEventTypes.ToolResult, Author = "system",
-                                Text = contract.ErrorText!, ToolName = toolName, ToolCallId = call.id,
+                                Text = rejection, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, toolName, contract.ErrorText!, keepRecentFull: int.MaxValue);
-                            liveContextTokens += AddedContextTokens(contract.ErrorText!);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: int.MaxValue);
+                            liveContextTokens += AddedContextTokens(rejection);
                             lastCommittedTool = toolName;
-                            lastCommittedResult = contract.ErrorText!;
+                            lastCommittedResult = rejection;
                             continue;
                         }
-                        argsJson = contract.NormalizedArgumentsJson!;
+                        argsJson = contract!.NormalizedArgumentsJson!;
 
                         // Commit intent before any guard or dispatch. Every subsequent path must
                         // commit a matching result so restart recovery can detect uncertainty.
@@ -592,7 +602,7 @@ namespace Omnipotent.Services.Projects
                                 Text = loopResult, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, toolName, loopResult, keepRecentFull: int.MaxValue);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, loopResult, keepRecentFull: int.MaxValue);
                             liveContextTokens += AddedContextTokens(loopResult);
                             lastCommittedTool = toolName;
                             lastCommittedResult = loopResult;
@@ -641,6 +651,7 @@ namespace Omnipotent.Services.Projects
                             result = new CommanderToolResult($"TOOL_EXECUTION_FAILED: {toolName}: {Trunc(ex.Message, 500)}")
                             { Succeeded = false };
                         }
+                        result = ProjectToolContract.AttachWarnings(unfolded.Warnings, result);
                         result = ProjectToolContract.AttachWarnings(contract, result);
                         if (ProjectWorkProgress.RecordIfNovel(parent.RuntimeState, projectID, "commander", toolName, argsJson, result))
                             productiveActions++;
@@ -653,7 +664,7 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, toolName, result.ResultText, keepRecentFull: int.MaxValue);
+                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: int.MaxValue);
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;

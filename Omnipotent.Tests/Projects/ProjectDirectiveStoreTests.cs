@@ -72,7 +72,7 @@ public sealed class ProjectDirectiveStoreTests : IDisposable
         Assert.DoesNotContain("What failed?", prompt);
         Assert.Contains("Write a PDF incident report.", prompt);
         Assert.Contains("Required deliverables: .pdf", prompt);
-        Assert.Contains("complete_project_directive", prompt);
+        Assert.Contains("project_directive op:acknowledge then op:complete", prompt);
     }
 
     [Fact]

@@ -56,7 +56,7 @@ public static class ProjectDesktopInteractionPolicy
         string raw = (argumentsJson ?? "") + "\n" + extracted;
         if (Regex.IsMatch(raw, @"(?i)(?:https?://)?(?:api\.)?mail\.tm(?:[/\s'""}]|$)"))
             return "DISPOSABLE_MAIL_PROHIBITED: mail.tm is not an account dependency for Projects. " +
-                   "Create or reuse an @klive.dev mailbox with klivemail_create_mailbox, wait through the native KliveMail tools, and enter the code in the visible browser.";
+                   "Create or reuse an @klive.dev mailbox with klivemail op:create_mailbox, wait through the native klivemail tool, and enter the code in the visible browser.";
         if (!settings.DesktopFirstWebsiteInteraction) return null;
 
         if (toolName == "http_request")
@@ -115,7 +115,7 @@ public static class ProjectDesktopInteractionPolicy
                "computer_navigate / computer_screenshot or computer_browser_inspect / computer_click(_text) / " +
                "computer_type / computer_wait tools. Shells are for installs, files, diagnostics and CLI work, " +
                "not Playwright, Selenium, headless Chromium, raw CDP, or scripted mouse/keyboard control of an " +
-               "external website. Retrieve email codes with klivemail_wait_for_code, then type them into the GUI.";
+               "external website. Retrieve email codes with klivemail op:wait_for_code, then type them into the GUI.";
 
     private static string ExtractScript(string toolName, string? argumentsJson)
     {

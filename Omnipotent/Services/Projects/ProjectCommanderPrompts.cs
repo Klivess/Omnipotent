@@ -58,7 +58,7 @@ namespace Omnipotent.Services.Projects
             // every wake anchors on it. Read it in full with get_grand_plan; revise via amend_grand_plan.
             if (!string.IsNullOrWhiteSpace(grandPlanBlock))
             {
-                sb.AppendLine("── GRAND PLAN (approved north star — amend via amend_grand_plan) ──");
+                sb.AppendLine("── GRAND PLAN (approved north star — read via grand_plan op:get, revise via op:amend) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
             }
 
@@ -78,7 +78,7 @@ namespace Omnipotent.Services.Projects
             // so the numbers the Commander sees are exactly the numbers Klives sees.
             if (!string.IsNullOrWhiteSpace(observablesBlock))
             {
-                sb.AppendLine("── OBSERVABLES (live values you maintain for Klives via update_observable) ──");
+                sb.AppendLine("── OBSERVABLES (live values you maintain for Klives via observable op:set) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observablesBlock, ProjectsContextBudget.ObservablesBudget));
             }
 
@@ -86,7 +86,7 @@ namespace Omnipotent.Services.Projects
             // creating a duplicate; account_list for details, account_register after any signup.
             if (!string.IsNullOrWhiteSpace(accountsBlock))
             {
-                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account_list for details) ──");
+                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
             }
 
@@ -94,7 +94,7 @@ namespace Omnipotent.Services.Projects
             // summary is intentionally small; list_files/stat_file provide paged detail on demand.
             if (!string.IsNullOrWhiteSpace(filesBlock))
             {
-                sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files/stat_file for more) ──");
+                sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(filesBlock, ProjectsContextBudget.SharedFilesBudget));
             }
 
