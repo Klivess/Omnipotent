@@ -115,6 +115,166 @@ internal static class GemmaToolCallCompatibility
         new(true, false, string.Empty, null,
             $"Gemma textual tool-call protocol error: {error}", false);
 
+    /// <summary>
+    /// Converts completed compatibility-tool exchanges back into Gemma's native assistant-turn
+    /// handshake before the model is queried again. The canonical session remains OpenAI-shaped for
+    /// dispatch, validation and compaction; only the provider-facing copy is folded.
+    ///
+    /// Gemma stops generation at <c>&lt;|tool_response&gt;</c> and expects the application to append
+    /// the execution result before resuming the model. A gateway which returned the raw textual call
+    /// cannot be trusted to reconstruct that continuation from a synthetic OpenAI
+    /// assistant/tool-message pair, so we do it explicitly here.
+    /// </summary>
+    internal static List<HFWrapper.HFMessage> PrepareContinuationMessages(
+        IReadOnlyList<HFWrapper.HFMessage> messages)
+    {
+        if (messages == null || messages.Count == 0
+            || !messages.Any(message => message?.GemmaTextualToolTurn == true))
+            return messages?.ToList() ?? new List<HFWrapper.HFMessage>();
+
+        var prepared = new List<HFWrapper.HFMessage>(messages.Count);
+        for (int i = 0; i < messages.Count; i++)
+        {
+            var assistant = messages[i];
+            if (assistant?.GemmaTextualToolTurn != true
+                || assistant.tool_calls == null
+                || assistant.tool_calls.Count == 0)
+            {
+                prepared.Add(assistant);
+                continue;
+            }
+
+            var expectedIds = assistant.tool_calls
+                .Where(call => !string.IsNullOrWhiteSpace(call?.id))
+                .Select(call => call.id)
+                .ToHashSet(StringComparer.Ordinal);
+            var resultsById = new Dictionary<string, HFWrapper.HFMessage>(StringComparer.Ordinal);
+            int afterResults = i + 1;
+            while (afterResults < messages.Count)
+            {
+                var candidate = messages[afterResults];
+                if (candidate?.role != "tool"
+                    || string.IsNullOrWhiteSpace(candidate.tool_call_id)
+                    || !expectedIds.Contains(candidate.tool_call_id))
+                    break;
+
+                resultsById.TryAdd(candidate.tool_call_id, candidate);
+                afterResults++;
+            }
+
+            // Never manufacture a partial Gemma continuation. The ordinary protocol validator should
+            // reject an incomplete batch rather than letting the model see a response for only some of
+            // the calls it made.
+            if (expectedIds.Count == 0 || resultsById.Count != expectedIds.Count)
+            {
+                prepared.Add(assistant);
+                continue;
+            }
+
+            prepared.Add(new HFWrapper.HFMessage
+            {
+                role = "assistant",
+                content = BuildContinuationContent(assistant, resultsById),
+            });
+            i = afterResults - 1;
+        }
+
+        return prepared;
+    }
+
+    private static string BuildContinuationContent(
+        HFWrapper.HFMessage assistant,
+        IReadOnlyDictionary<string, HFWrapper.HFMessage> resultsById)
+    {
+        var output = new StringBuilder();
+        string visibleContent = HFWrapper.ContentToText(assistant.content).Trim();
+        if (visibleContent.Length > 0)
+            output.Append(visibleContent).AppendLine();
+
+        foreach (var call in assistant.tool_calls)
+        {
+            string functionName = string.IsNullOrWhiteSpace(call.GemmaAuthoredName)
+                ? call.function?.name ?? string.Empty
+                : call.GemmaAuthoredName;
+            JObject arguments;
+            try
+            {
+                arguments = JObject.Parse(call.function?.arguments ?? "{}");
+            }
+            catch (JsonException)
+            {
+                // The inbound adapter always emits a JSON object. This defensive fallback keeps a
+                // damaged in-memory message readable to Gemma without injecting malformed grammar.
+                arguments = new JObject
+                {
+                    ["arguments_json"] = call.function?.arguments ?? string.Empty,
+                };
+            }
+
+            output.Append("<|tool_call>call:")
+                .Append(functionName)
+                .Append(WriteGemmaValue(arguments))
+                .Append("<tool_call|>");
+        }
+
+        foreach (var call in assistant.tool_calls)
+        {
+            var result = resultsById[call.id];
+            string functionName = string.IsNullOrWhiteSpace(call.GemmaAuthoredName)
+                ? call.function?.name ?? result.name ?? string.Empty
+                : call.GemmaAuthoredName;
+            output.Append("<|tool_response>response:")
+                .Append(functionName)
+                .Append("{result:")
+                .Append(GemmaQuote(HFWrapper.ContentToText(result.content)))
+                .Append("}<tool_response|>");
+        }
+
+        return output.ToString();
+    }
+
+    private static string WriteGemmaValue(JToken? token)
+    {
+        if (token == null || token.Type is JTokenType.Null or JTokenType.Undefined)
+            return "null";
+
+        if (token is JObject obj)
+            return "{" + string.Join(",", obj.Properties()
+                .Select(property => WriteGemmaKey(property.Name) + ":" + WriteGemmaValue(property.Value))) + "}";
+
+        if (token is JArray array)
+            return "[" + string.Join(",", array.Select(WriteGemmaValue)) + "]";
+
+        if (token.Type == JTokenType.Boolean)
+            return token.Value<bool>() ? "true" : "false";
+
+        if (token.Type is JTokenType.Integer or JTokenType.Float)
+            return Convert.ToString(((JValue)token).Value, CultureInfo.InvariantCulture) ?? "0";
+
+        return GemmaQuote(token.Type == JTokenType.String
+            ? token.Value<string>() ?? string.Empty
+            : token.ToString(Formatting.None));
+    }
+
+    private static string WriteGemmaKey(string key)
+    {
+        if (key.Length > 0
+            && (char.IsLetter(key[0]) || key[0] == '_')
+            && key.Skip(1).All(character => char.IsLetterOrDigit(character) || character == '_'))
+            return key;
+        return GemmaQuote(key);
+    }
+
+    private static string GemmaQuote(string value)
+    {
+        // Gemma's string delimiter is a special token rather than an escapable character. Neutralize
+        // any control-token-looking text returned by a tool so data can never close the response block.
+        string safe = (value ?? string.Empty)
+            .Replace("<|", "\\u003C|", StringComparison.Ordinal)
+            .Replace("<tool", "\\u003Ctool", StringComparison.Ordinal);
+        return "<|\"|>" + safe + "<|\"|>";
+    }
+
     private static MarkerMatch? FindNextMarker(string text, int startAt)
     {
         MarkerMatch? best = null;
@@ -204,6 +364,7 @@ internal static class GemmaToolCallCompatibility
                 name = toolName!,
                 arguments = arguments!.ToString(Formatting.None),
             },
+            GemmaAuthoredName = authoredName,
         };
         return true;
     }

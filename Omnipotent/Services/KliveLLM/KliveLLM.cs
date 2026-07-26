@@ -1098,6 +1098,7 @@ namespace Omnipotent.Services.KliveLLM
                         tool_calls = m.tool_calls,
                         tool_call_id = m.tool_call_id,
                         name = m.name,
+                        GemmaTextualToolTurn = m.GemmaTextualToolTurn,
                     };
                 }
             }
@@ -1239,6 +1240,7 @@ namespace Omnipotent.Services.KliveLLM
                     role = "assistant",
                     content = content, // "" not null — strict providers reject null content
                     tool_calls = toolCalls,
+                    GemmaTextualToolTurn = normalized.Adapted,
                 });
                 session.lastPromptTokens = response.usage?.prompt_tokens ?? 0;
                 session.lastCompletionTokens = response.usage?.completion_tokens ?? 0;
@@ -1508,7 +1510,12 @@ namespace Omnipotent.Services.KliveLLM
             ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
             ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
             ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
-            payload.BuildMessagesFromList(structuredMessages);
+            // A raw Gemma call is only half of that model's control-token handshake. Once its tools
+            // have run, fold the synthetic assistant/tool messages into a native tool-response turn
+            // before calling the model again. Ordinary provider-native calls remain byte-for-byte on
+            // the standard OpenAI path.
+            var providerMessages = GemmaToolCallCompatibility.PrepareContinuationMessages(structuredMessages);
+            payload.BuildMessagesFromList(providerMessages);
             ApplyPromptCaching(ref payload, remoteProvider);
 
             return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken, onToolCallComplete);

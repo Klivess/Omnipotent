@@ -36,6 +36,14 @@ namespace Omnipotent.Services.KliveLLM
             // Optional function name echoed back on a tool-result turn.
             [JsonProperty("name", NullValueHandling = NullValueHandling.Ignore)]
             public string name;
+
+            // In-process compatibility marker only. A provider which returns Gemma's native textual
+            // tool protocol has demonstrated that it is not translating that protocol into the
+            // OpenAI message shape reliably. Before the next request, KliveLLM uses this marker to
+            // fold the assistant call plus its role:"tool" results back into one native Gemma
+            // assistant turn. JsonIgnore guarantees the marker itself never leaks onto the wire.
+            [JsonIgnore]
+            internal bool GemmaTextualToolTurn { get; set; }
         }
 
         /// <summary>Text element of a content-parts array (OpenAI/OpenRouter vision format).</summary>
@@ -180,6 +188,13 @@ namespace Omnipotent.Services.KliveLLM
 
             [JsonProperty("function")]
             public HFFunctionCall function { get; set; }
+
+            // Gemma may encode an operation in the authored function name (for example
+            // project_directive:op:acknowledge) before the inbound adapter resolves it to the
+            // canonical offered tool. Keep that original name solely for the native response
+            // envelope used on the continuation request.
+            [JsonIgnore]
+            internal string GemmaAuthoredName { get; set; }
         }
 
         public class HFFunctionCall
