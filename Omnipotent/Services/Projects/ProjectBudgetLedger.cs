@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -67,12 +68,39 @@ namespace Omnipotent.Services.Projects
             public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
         }
 
+        /// <summary>Spend as the fleet list and budget bars render it — the only two numbers those
+        /// views need, cached so the list never re-reads N ledger files per request.</summary>
+        public readonly record struct Spend(double TokenSpendUsd, double MoneySpendUsd);
+
+        private readonly ConcurrentDictionary<string, Spend> spendCache = new(StringComparer.Ordinal);
+
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string LedgerPath(string projectID) => Path.Combine(dir, projectID + ".ledger.json");
 
+        // Spend is read by /projects/list and /projects/state, so it must participate in the
+        // response cache's version model or those views serve the spend they were first filled with.
+        private static string CacheKey(string projectID) => "projects:budget:" + projectID;
+
         public Ledger GetLedger(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID)) return LoadLocked(projectID);
+        }
+
+        /// <summary>Cumulative token and money spend, served from memory. Every write goes through
+        /// <see cref="SaveLocked"/>, which refreshes the entry, so this never lags the ledger.</summary>
+        public Spend GetSpend(string projectID)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            if (spendCache.TryGetValue(projectID, out var cached)) return cached;
+            lock (LockFor(projectID))
+            {
+                if (spendCache.TryGetValue(projectID, out cached)) return cached;
+                var ledger = LoadLocked(projectID);
+                var spend = new Spend(ledger.TokenSpendUsd, ledger.MoneySpendUsd);
+                spendCache[projectID] = spend;
+                return spend;
+            }
         }
 
         private sealed class LlmTurnLease : IAsyncDisposable
@@ -455,6 +483,10 @@ namespace Omnipotent.Services.Projects
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, JsonConvert.SerializeObject(ledger, Formatting.Indented));
             File.Move(tmp, path, overwrite: true);
+            // Single write chokepoint: refresh the projection and invalidate cached responses
+            // together, so no future mutator can update spend without both following.
+            spendCache[ledger.ProjectID] = new Spend(ledger.TokenSpendUsd, ledger.MoneySpendUsd);
+            CacheDeps.Bump(CacheKey(ledger.ProjectID));
         }
     }
 }

@@ -1285,10 +1285,15 @@ namespace Omnipotent.Services.Projects
             return true;
         }
 
+        /// <summary>
+        /// One row of the fleet list. This runs once per project on every refresh, and the website
+        /// refreshes on any project's event, so every field here is served from an in-memory
+        /// projection — no ledger/runtime/gate file is opened and no event log is walked.
+        /// </summary>
         private object ToSummary(Project p)
         {
-            var ledger = parent.Budget.GetLedger(p.ProjectID);
-            var runtime = parent.RuntimeState.Get(p.ProjectID);
+            var spend = parent.Budget.GetSpend(p.ProjectID);
+            var runtime = parent.RuntimeState.GetSummary(p.ProjectID);
             return new
             {
                 p.ProjectID,
@@ -1301,15 +1306,15 @@ namespace Omnipotent.Services.Projects
                 p.TokenBudgetUsd,
                 p.MoneyBudgetUsd,
                 p.SubAgentCap,
-                TokenSpendUsd = ledger.TokenSpendUsd,
-                MoneySpendUsd = ledger.MoneySpendUsd,
-                PendingApprovals = parent.Gates.ListPending(p.ProjectID).Count,
+                TokenSpendUsd = spend.TokenSpendUsd,
+                MoneySpendUsd = spend.MoneySpendUsd,
+                PendingApprovals = parent.Gates.CountPending(p.ProjectID),
                 ExecutionDisposition = runtime.Disposition.ToString(),
-                ExecutionHealth = runtime.Health.Status.ToString(),
-                Blocker = runtime.Blocker?.Summary ?? p.BlockedReason,
-                NextRetryAt = runtime.Health.Circuit.RetryAt ?? runtime.Blocker?.NextRetryAt,
-                ActiveMilestoneIDs = runtime.Checkpoint.ActiveMilestoneIDs,
-                CheckpointRevision = runtime.Checkpoint.Revision,
+                ExecutionHealth = runtime.HealthStatus.ToString(),
+                Blocker = runtime.BlockerSummary ?? p.BlockedReason,
+                NextRetryAt = runtime.NextRetryAt,
+                ActiveMilestoneIDs = runtime.ActiveMilestoneIDs,
+                CheckpointRevision = runtime.CheckpointRevision,
                 lastSequence = parent.EventLog.GetLastSequence(p.ProjectID),
             };
         }

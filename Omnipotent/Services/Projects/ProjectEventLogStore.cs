@@ -25,7 +25,17 @@ namespace Omnipotent.Services.Projects
         private readonly ConcurrentDictionary<string, long> seqCache = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, List<(long sequence, long offset)>> sparseOffsets = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, Dictionary<string, ProjectEvent>> lastByType = new(StringComparer.Ordinal);
+        /// <summary>Projects whose sparse offset/last-of-type index has been built from a full read of
+        /// the log. Tracked separately from <see cref="seqCache"/>, which the cheap tail read fills.</summary>
+        private readonly ConcurrentDictionary<string, byte> fullyIndexed = new(StringComparer.Ordinal);
         private const int SparseStride = 128;
+        /// <summary>Bytes read from the log's end when only the last sequence is wanted. One event's
+        /// payload is capped at 32KB, so this always spans at least one complete record.</summary>
+        private const int TailProbeBytes = 256 * 1024;
+
+        /// <summary>Test-only counter: how many times a full log read has been performed.</summary>
+        internal int FullIndexBuilds => fullIndexBuilds;
+        private int fullIndexBuilds;
 
         /// <summary>Raised after an event is durably appended. Used by the retrieval index
         /// and (later) the website's live feed. Fired in sequence order.</summary>
@@ -90,8 +100,11 @@ namespace Omnipotent.Services.Projects
                     fs.Flush(flushToDisk: true);
                 }
                 seqCache[evt.ProjectID] = next;
-                var offsets = sparseOffsets.GetOrAdd(evt.ProjectID, _ => new());
-                if ((next - 1) % SparseStride == 0) offsets.Add((next, offset));
+                // Extend the sparse index only while it is complete. A partial index built from
+                // appends alone would leave earlier offsets missing, and the early-return in
+                // EnsureIndexLocked would then accept it as authoritative.
+                if (fullyIndexed.ContainsKey(evt.ProjectID) && (next - 1) % SparseStride == 0)
+                    sparseOffsets.GetOrAdd(evt.ProjectID, _ => new()).Add((next, offset));
                 lastByType.GetOrAdd(evt.ProjectID, _ => new(StringComparer.Ordinal))[evt.Type] = evt;
                 // Bump under the append lock (write is durably visible above): invalidates
                 // any cached read of this project's log, and the coarse project-set key.
@@ -176,6 +189,11 @@ namespace Omnipotent.Services.Projects
         public long GetLastSequence(string projectID)
         {
             CacheDeps.NoteRead(CacheKey(projectID));
+            // Lock-free once the sequence is known. Append publishes it only after its durable
+            // write, so an unlocked read returns a value that was true at some instant during the
+            // call — exactly the guarantee taking the lock would give — while keeping the fleet
+            // list off a lock that Append holds across an fsync.
+            if (seqCache.TryGetValue(projectID, out long cached)) return cached;
             lock (LockFor(projectID)) return GetLastSequenceLocked(projectID);
         }
 
@@ -202,13 +220,59 @@ namespace Omnipotent.Services.Projects
 
         private long GetLastSequenceLocked(string projectID)
         {
-            EnsureIndexLocked(projectID);
-            return seqCache.TryGetValue(projectID, out var cached) ? cached : 0;
+            if (seqCache.TryGetValue(projectID, out long cached)) return cached;
+            // Only the final sequence number is wanted here, and the log's tail answers that in a
+            // few KB. Building the sparse index instead costs a full parse of a log that grows
+            // without bound — and /projects/list asks this of every project on every fleet event,
+            // while Append asks it for every event written. It must never be O(log size).
+            long last = ReadLastSequenceFromTailLocked(projectID);
+            seqCache[projectID] = last;
+            return last;
+        }
+
+        /// <summary>
+        /// Highest sequence in the log, read from the last <see cref="TailProbeBytes"/> of the file.
+        /// Only whole lines are considered (the first line of a mid-file window may be a fragment),
+        /// and the window widens until something parses so a corrupt or oversized tail still resolves
+        /// to the same answer a full read would give.
+        /// </summary>
+        private long ReadLastSequenceFromTailLocked(string projectID)
+        {
+            string path = LogPath(projectID);
+            if (!File.Exists(path)) return 0;
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            long length = fs.Length;
+            if (length == 0) return 0;
+
+            for (long window = Math.Min(TailProbeBytes, length); ; window = Math.Min(window * 8, length))
+            {
+                fs.Seek(length - window, SeekOrigin.Begin);
+                var buffer = new byte[window];
+                fs.ReadExactly(buffer, 0, (int)window);
+
+                string[] lines = System.Text.Encoding.UTF8.GetString(buffer).Split('\n');
+                // A window that starts mid-file begins with the tail of an earlier record.
+                int first = window < length ? 1 : 0;
+                long last = 0;
+                for (int i = first; i < lines.Length; i++)
+                {
+                    string line = lines[i].TrimEnd('\r').TrimStart('\uFEFF');
+                    if (string.IsNullOrWhiteSpace(line)) continue;
+                    try
+                    {
+                        var e = JsonConvert.DeserializeObject<ProjectEvent>(line);
+                        if (e != null && e.Sequence > last) last = e.Sequence;
+                    }
+                    catch { /* partial/corrupt trailing record */ }
+                }
+                if (last > 0 || window >= length) return last;
+            }
         }
 
         private void EnsureIndexLocked(string projectID)
         {
-            if (sparseOffsets.ContainsKey(projectID) && seqCache.ContainsKey(projectID)) return;
+            if (fullyIndexed.ContainsKey(projectID)) return;
+            Interlocked.Increment(ref fullIndexBuilds);
             long last = 0;
             string path = LogPath(projectID);
             var offsets = new List<(long sequence, long offset)>();
@@ -217,14 +281,22 @@ namespace Omnipotent.Services.Projects
             {
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                 long lineOffset = 0;
+                long consumed = 0;
                 var bytes = new List<byte>(4096);
-                int value;
-                while ((value = fs.ReadByte()) >= 0)
+                // Chunked rather than byte-at-a-time: this walks the whole log, and a long-lived
+                // project's log is measured in hundreds of MB.
+                var chunk = new byte[64 * 1024];
+                int read;
+                while ((read = fs.Read(chunk, 0, chunk.Length)) > 0)
                 {
-                    if (value != '\n') { bytes.Add((byte)value); continue; }
-                    IndexLine(bytes, lineOffset);
-                    bytes.Clear();
-                    lineOffset = fs.Position;
+                    for (int i = 0; i < read; i++)
+                    {
+                        if (chunk[i] != (byte)'\n') { bytes.Add(chunk[i]); continue; }
+                        IndexLine(bytes, lineOffset);
+                        bytes.Clear();
+                        lineOffset = consumed + i + 1;
+                    }
+                    consumed += read;
                 }
                 if (bytes.Count > 0) IndexLine(bytes, lineOffset);
 
@@ -246,6 +318,7 @@ namespace Omnipotent.Services.Projects
             seqCache[projectID] = last;
             sparseOffsets[projectID] = offsets;
             lastByType[projectID] = types;
+            fullyIndexed[projectID] = 0;
         }
 
         private static string TruncateUtf8(string s, int maxBytes)

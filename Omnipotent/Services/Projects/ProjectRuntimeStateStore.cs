@@ -322,6 +322,20 @@ namespace Omnipotent.Services.Projects
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     }
 
+    /// <summary>
+    /// Immutable projection of the runtime fields the fleet list renders. Serving those from a
+    /// cached summary keeps /projects/list off the disk: the full state is a large document, and
+    /// the list asks every project for it every time any project logs an event.
+    /// </summary>
+    public sealed record ProjectRuntimeSummary(
+        long Revision,
+        ProjectExecutionDisposition Disposition,
+        ProjectExecutionHealthStatus HealthStatus,
+        string? BlockerSummary,
+        DateTime? NextRetryAt,
+        IReadOnlyList<string> ActiveMilestoneIDs,
+        long CheckpointRevision);
+
     public sealed record ProjectRuntimeMutationResult(bool Applied, ProjectRuntimeState State, string? Reason = null);
     public sealed record ProjectWakeLeaseAcquireResult(bool Acquired, ProjectRuntimeState State, ProjectWakeLease? Lease, string? Reason = null);
     public sealed record ProjectWakeTriggerClaimResult(bool Claimed, ProjectRuntimeState State, ProjectWakeTrigger? Trigger, string? Reason = null);
@@ -340,6 +354,9 @@ namespace Omnipotent.Services.Projects
         private readonly Action<string> log;
         // Static so two store instances in the same process cannot race the same project file.
         private static readonly ConcurrentDictionary<string, object> FileLocks = new(StringComparer.OrdinalIgnoreCase);
+        // Keyed by state-file path (like FileLocks) so instances sharing a root share the projection.
+        // This process is the only writer of those files, and every write refreshes the entry.
+        private static readonly ConcurrentDictionary<string, ProjectRuntimeSummary> SummaryCache = new(StringComparer.OrdinalIgnoreCase);
 
         private sealed record MutationDecision(bool Applied, bool Changed, string? Reason = null);
 
@@ -370,6 +387,34 @@ namespace Omnipotent.Services.Projects
             CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID)) return Clone(LoadLocked(projectID));
         }
+
+        /// <summary>
+        /// The list-view fields only, served from memory once the state has been read or written
+        /// once. Every mutation commits through <see cref="CommitLocked"/>, which refreshes this,
+        /// so the summary is as current as <see cref="Get"/> without the read + deep clone.
+        /// </summary>
+        public ProjectRuntimeSummary GetSummary(string projectID)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            string path = GetStatePath(projectID);
+            if (SummaryCache.TryGetValue(path, out var cached)) return cached;
+            lock (LockFor(projectID))
+            {
+                if (SummaryCache.TryGetValue(path, out cached)) return cached;
+                var summary = Summarize(LoadLocked(projectID));
+                SummaryCache[path] = summary;
+                return summary;
+            }
+        }
+
+        private static ProjectRuntimeSummary Summarize(ProjectRuntimeState state) => new(
+            state.Revision,
+            state.Disposition,
+            state.Health.Status,
+            state.Blocker?.Summary,
+            state.Health.Circuit.RetryAt ?? state.Blocker?.NextRetryAt,
+            state.Checkpoint.ActiveMilestoneIDs.ToArray(),
+            state.Checkpoint.Revision);
 
         public List<ProjectRuntimeState> ListWithActiveWakeLeases()
         {
@@ -1185,6 +1230,7 @@ namespace Omnipotent.Services.Projects
             state.Revision = checked(state.Revision + 1);
             state.UpdatedAt = now;
             SaveLocked(state);
+            SummaryCache[GetStatePath(state.ProjectID)] = Summarize(state);
             // Single commit chokepoint: every mutator routes through Mutate → CommitLocked, so one
             // bump here covers all of them and no future mutator can forget to invalidate.
             CacheDeps.Bump(CacheKey(state.ProjectID));

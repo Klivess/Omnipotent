@@ -76,6 +76,70 @@ namespace Omnipotent.Tests.Projects
             Assert.NotNull(scope.UncacheableReason);
         }
 
+        /// <summary>The list renders the runtime projection rather than the whole state; it has to
+        /// track the state it summarises, or a paused project keeps rendering as running.</summary>
+        [Fact]
+        public void RuntimeState_Summary_TracksTheState_AndInvalidatesOnWrite()
+        {
+            var store = new ProjectRuntimeStateStore(_ => { });
+            string pid = NewProjectId();
+
+            var scope = CacheFillProbe.Fill(() => store.GetSummary(pid));
+            Assert.True(scope.WouldBeCached());
+            Assert.Equal(ProjectExecutionDisposition.Running, store.GetSummary(pid).Disposition);
+
+            store.SetDisposition(pid, ProjectExecutionDisposition.Paused);
+
+            Assert.False(scope.StillValid());
+            Assert.Equal(ProjectExecutionDisposition.Paused, store.GetSummary(pid).Disposition);
+            Assert.Equal(store.Get(pid).Revision, store.GetSummary(pid).Revision);
+        }
+
+        // ── budget ledger (the spend figures on every list row) ──
+
+        [Fact]
+        public async Task Budget_Spend_TracksTheLedger_AndInvalidatesOnWrite()
+        {
+            var projects = new ProjectStore(_ => { });
+            var events = new ProjectEventLogStore(_ => { });
+            var fetcher = new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { });
+            var ledger = new ProjectBudgetLedger(projects, events, fetcher, _ => { });
+            var project = projects.CreateProject("budget cache", "goal", tokenBudgetUsd: 100, 0, 0, 1);
+
+            var scope = CacheFillProbe.Fill(() => ledger.GetSpend(project.ProjectID));
+            Assert.True(scope.WouldBeCached());
+
+            await ledger.RecordTokenSpendAsync(project.ProjectID, 1000, 1000, actualCostUsd: 0.25);
+
+            Assert.False(scope.StillValid());
+            Assert.Equal(0.25, ledger.GetSpend(project.ProjectID).TokenSpendUsd, 6);
+            Assert.Equal(ledger.GetLedger(project.ProjectID).TokenSpendUsd, ledger.GetSpend(project.ProjectID).TokenSpendUsd, 6);
+        }
+
+        // ── approval gates (the pending-approvals badge) ──
+
+        [Fact]
+        public void Gates_PendingCount_TracksGates_AndInvalidatesOnWrite()
+        {
+            var events = new ProjectEventLogStore(_ => { });
+            var gates = new ProjectGateManager(events, _ => { });
+            string pid = NewProjectId();
+
+            var scope = CacheFillProbe.Fill(() => gates.CountPending(pid));
+            Assert.True(scope.WouldBeCached());
+            Assert.Equal(0, gates.CountPending(pid));
+
+            using var cts = new CancellationTokenSource();
+            var gate = new ProjectGate { ProjectID = pid, GateID = "g1", Title = "Spend money", Description = "$5" };
+            _ = gates.OpenGateAndWaitAsync(gate, cts.Token);
+
+            Assert.False(scope.StillValid());
+            Assert.Equal(1, gates.CountPending(pid));
+
+            gates.ResolveGate(pid, "g1", new GateResolution(GateDecision.Approve, "go", "klives"));
+            Assert.Equal(0, gates.CountPending(pid));
+        }
+
         // ── grand plan ──
 
         [Fact]

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -57,8 +58,14 @@ namespace Omnipotent.Services.Projects
             Directory.CreateDirectory(dir);
         }
 
+        private readonly ConcurrentDictionary<string, int> pendingCounts = new(StringComparer.Ordinal);
+
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string GatePath(string projectID) => Path.Combine(dir, projectID + ".gates.json");
+
+        // Pending approvals are read by /projects/list and the detail page, so gate writes have to
+        // invalidate those cached responses.
+        private static string CacheKey(string projectID) => "projects:gates:" + projectID;
 
         /// <summary>
         /// Opens a gate and awaits its resolution. The calling agent's turn suspends here until
@@ -153,8 +160,23 @@ namespace Omnipotent.Services.Projects
 
         public List<ProjectGate> ListPending(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             lock (LockFor(projectID))
-                return LoadLocked(projectID).Where(g => !g.Resolved).ToList();
+            {
+                var pending = LoadLocked(projectID).Where(g => !g.Resolved).ToList();
+                pendingCounts[projectID] = pending.Count;
+                return pending;
+            }
+        }
+
+        /// <summary>How many approvals are waiting on Klives, served from memory. The fleet list
+        /// shows only the number, and asking for it must not mean parsing every project's gate
+        /// file on every refresh.</summary>
+        public int CountPending(string projectID)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            if (pendingCounts.TryGetValue(projectID, out int cached)) return cached;
+            return ListPending(projectID).Count;
         }
 
         private void Persist(ProjectGate gate)
@@ -182,6 +204,10 @@ namespace Omnipotent.Services.Projects
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, JsonConvert.SerializeObject(gates, Formatting.Indented));
             File.Move(tmp, path, overwrite: true);
+            // Single write chokepoint: opening and resolving both land here, so the count and the
+            // cached responses that show it are refreshed together.
+            pendingCounts[projectID] = gates.Count(g => !g.Resolved);
+            CacheDeps.Bump(CacheKey(projectID));
         }
     }
 }

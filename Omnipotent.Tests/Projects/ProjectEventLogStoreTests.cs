@@ -152,6 +152,72 @@ namespace Omnipotent.Tests.Projects
             Assert.EndsWith("…(truncated)", evt.PayloadJson);
         }
 
+        /// <summary>
+        /// /projects/list asks every project for its last sequence on every refresh, and every
+        /// Append asks for it too. Answering from the log's tail instead of indexing the whole file
+        /// is what keeps both off an O(log size) path — a long-lived project's log is unbounded.
+        /// </summary>
+        [Fact]
+        public void GetLastSequence_DoesNotReadTheWholeLog()
+        {
+            string pid = NewProjectId();
+            var writer = NewStore();
+            for (int i = 1; i <= 300; i++)
+                writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+
+            var reader = NewStore(); // cold, as after a restart
+            Assert.Equal(300, reader.GetLastSequence(pid));
+            Assert.Equal(0, reader.FullIndexBuilds);
+
+            // Appending stays on the cheap path too.
+            Assert.Equal(301, reader.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = "next" }).Sequence);
+            Assert.Equal(0, reader.FullIndexBuilds);
+        }
+
+        /// <summary>Reading the timeline still needs the sparse offset index, and it must be built
+        /// once — including when appends have already happened on the cheap path.</summary>
+        [Fact]
+        public void ReadSince_BuildsTheIndexOnce_AndPagesCorrectlyAfterATailOnlyAppend()
+        {
+            string pid = NewProjectId();
+            var writer = NewStore();
+            for (int i = 1; i <= 400; i++)
+                writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+
+            var reader = NewStore();
+            reader.GetLastSequence(pid);                                     // cheap path first
+            reader.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = "e401" });
+
+            var page = reader.ReadSince(pid, 395);
+            Assert.Equal(1, reader.FullIndexBuilds);
+            Assert.Equal(6, page.Count);
+            Assert.Equal("e396", page[0].Text);
+            Assert.Equal("e401", page[^1].Text);
+
+            // A second read reuses the index rather than rebuilding it.
+            Assert.Equal("e1", reader.ReadSince(pid, 0, max: 1)[0].Text);
+            Assert.Equal(1, reader.FullIndexBuilds);
+        }
+
+        /// <summary>A hard stop can leave a partial trailing record. The tail read must fall back to
+        /// the last intact one rather than restarting the sequence and overwriting history.</summary>
+        [Fact]
+        public void GetLastSequence_IgnoresAPartialTrailingRecord()
+        {
+            string pid = NewProjectId();
+            var writer = NewStore();
+            for (int i = 1; i <= 5; i++)
+                writer.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.Status, Text = $"e{i}" });
+
+            string path = Path.Combine(
+                Omnipotent.Data_Handling.OmniPaths.GetPath(
+                    Omnipotent.Data_Handling.OmniPaths.GlobalPaths.ProjectsEventLogDirectory),
+                pid + ".log.jsonl");
+            File.AppendAllText(path, "{\"ProjectID\":\"" + pid + "\",\"Sequence\":6,\"Te");
+
+            Assert.Equal(5, NewStore().GetLastSequence(pid));
+        }
+
         [Fact]
         public void EventAppended_FiresForSubscribers()
         {
