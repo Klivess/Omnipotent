@@ -67,8 +67,40 @@ namespace Omnipotent.Services.Projects
         /// <summary>Per-tool-result truncation inside a wake.</summary>
         public const int ToolResultBudget = 2400;
 
+        /// <summary>
+        /// Verbatim excerpt of how the PREVIOUS wake ended, replayed at the top of the next one. Each wake
+        /// starts a fresh session, so this is the only fine-grained carry-over; everything else is
+        /// rehydrated from disk by the seed. Kept small deliberately — it is re-sent on every turn.
+        /// </summary>
+        public const int WakeTailBudget = 8000;
+
+        /// <summary>How many trailing action→result pairs the wake tail records.</summary>
+        public const int WakeTailActions = 4;
+
+        /// <summary>
+        /// New events fed into the post-wake digest rebuild. The rebuild runs after every wake and its
+        /// output is capped at ~570 words, so there is no value in shipping the entire event backlog to
+        /// the utility model — the rolling summary already carries older ground.
+        /// </summary>
+        public const int DigestRebuildEventsBudget = 24000;
+
         /// <summary>Chars-per-token ratio used for estimation.</summary>
         private const double CharsPerToken = 4.0;
+
+        /// <summary>
+        /// Token cost of one inline screenshot. Providers bill images by area after resizing the long
+        /// edge down to ~1568px, at roughly 750 pixels per token. A 1920x1080 frame therefore costs
+        /// ~1.6k tokens, not the flat 1200 the wake loop used to assume — an under-count that let a
+        /// vision-heavy wake sail past its context ceiling.
+        /// </summary>
+        public static long EstimateImageTokens(int width, int height)
+        {
+            if (width <= 0 || height <= 0) return 1600;
+            double longest = Math.Max(width, height);
+            double scale = longest > 1568 ? 1568.0 / longest : 1.0;
+            double pixels = (width * scale) * (height * scale);
+            return Math.Clamp((long)Math.Ceiling(pixels / 750.0), 256, 4096);
+        }
 
         /// <summary>
         /// Builds the local context policy from OpenRouter's live route metadata. Ten percent of the

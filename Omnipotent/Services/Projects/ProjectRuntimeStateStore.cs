@@ -217,6 +217,40 @@ namespace Omnipotent.Services.Projects
             InvalidatedAt == null && (!ValidUntil.HasValue || ValidUntil.Value > utcNow);
     }
 
+    /// <summary>
+    /// A durable NEGATIVE fact: an approach that was tried and failed. The counterpart to
+    /// <see cref="ProjectVerifiedFact"/>, which only ever records what IS true.
+    ///
+    /// Without this, negative knowledge lives solely in the append-only event log and falls out of the
+    /// wake seed's recent-event window, so an agent re-tries a dead end every few wakes — the single
+    /// most expensive way a project burns budget without progressing. Health.LastFailure is NOT a
+    /// substitute: it holds one failure and is cleared on the next success.
+    /// </summary>
+    public sealed class ProjectFailedApproach
+    {
+        public string ApproachID { get; set; } = "";
+        /// <summary>Stable identity for the thing being attempted, e.g. "ig-signup:email-domain".</summary>
+        public string Key { get; set; } = "";
+        /// <summary>What was tried.</summary>
+        public string Approach { get; set; } = "";
+        /// <summary>How it failed — the observed outcome, not a guess at the cause.</summary>
+        public string Outcome { get; set; } = "";
+        public int AttemptCount { get; set; }
+        public DateTime FirstAttemptedAt { get; set; } = DateTime.UtcNow;
+        public DateTime LastAttemptedAt { get; set; } = DateTime.UtcNow;
+        /// <summary>A known-better alternative, when one was established.</summary>
+        public string? Instead { get; set; }
+        /// <summary>Set for failures believed transient; the entry stops being advisory after this.</summary>
+        public DateTime? RetryNotBefore { get; set; }
+        public DateTime? ResolvedAt { get; set; }
+        public string? ResolutionReason { get; set; }
+        public List<ProjectEvidenceReference> Evidence { get; set; } = new();
+
+        /// <summary>True while this dead end should still steer the agent away from repeating it.</summary>
+        public bool IsActiveAt(DateTime utcNow) =>
+            ResolvedAt == null && (!RetryNotBefore.HasValue || RetryNotBefore.Value > utcNow);
+    }
+
     /// <summary>A project output/input designated as canonical, with identity and validation evidence.</summary>
     public sealed class ProjectCanonicalArtifact
     {
@@ -260,6 +294,9 @@ namespace Omnipotent.Services.Projects
         public int? GrandPlanVersion { get; set; }
         public List<string> ActiveMilestoneIDs { get; set; } = new();
         public List<ProjectVerifiedFact> VerifiedFacts { get; set; } = new();
+        /// <summary>Bounded durable record of approaches already proven not to work. Seeded into every
+        /// wake so a context reset cannot make the agent repeat a known dead end.</summary>
+        public List<ProjectFailedApproach> FailedApproaches { get; set; } = new();
         public List<ProjectCanonicalArtifact> CanonicalArtifacts { get; set; } = new();
         public ProjectActionCheckpoint? LastSuccessfulAction { get; set; }
         public Dictionary<string, ProjectActionCheckpoint> AgentLastSuccessfulActions { get; set; } = new(StringComparer.Ordinal);
@@ -268,6 +305,14 @@ namespace Omnipotent.Services.Projects
         public Dictionary<string, List<string>> RecentSuccessfulFingerprints { get; set; } = new(StringComparer.Ordinal);
         public ProjectResumeAction? ResumeAction { get; set; }
         public Dictionary<string, ProjectResumeAction> AgentResumeActions { get; set; } = new(StringComparer.Ordinal);
+        /// <summary>
+        /// A bounded verbatim excerpt of how the previous Commander wake ended — its closing status plus
+        /// its last few action→result pairs. Each wake starts a fresh model session (the seed rehydrates
+        /// everything else from disk), so this is what preserves the fine-grained "what was I just doing"
+        /// detail that the seed's summarised event lines cannot carry.
+        /// </summary>
+        public string? LastWakeTail { get; set; }
+        public DateTime? LastWakeTailAt { get; set; }
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
     }
 
@@ -854,6 +899,107 @@ namespace Omnipotent.Services.Projects
             return Get(projectID).Checkpoint.VerifiedFacts.Where(f => f.IsFreshAt(now)).Select(Clone).ToList();
         }
 
+        /// <summary>Record how the wake that just finished ended, for the next wake to open with.
+        /// Passing null/blank clears it.</summary>
+        public ProjectRuntimeMutationResult SetLastWakeTail(string projectID, string? tail,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, expectedRevision, checkpoint =>
+            {
+                string? value = string.IsNullOrWhiteSpace(tail) ? null : tail.Trim();
+                if (string.Equals(checkpoint.LastWakeTail, value, StringComparison.Ordinal)) return new(true, false);
+                checkpoint.LastWakeTail = value;
+                checkpoint.LastWakeTailAt = value == null ? null : now;
+                return new(true, true);
+            }, now);
+        }
+
+        /// <summary>Newest dead ends first; the list is bounded so a long-running project cannot grow it without limit.</summary>
+        public const int MaxFailedApproaches = 32;
+
+        /// <summary>
+        /// Record (or re-record) an approach that did not work. Re-recording the same <paramref name="approach"/>.Key
+        /// increments its attempt count rather than adding a duplicate, so the seed shows "tried 4 times" instead of
+        /// four near-identical lines.
+        /// </summary>
+        public ProjectRuntimeMutationResult RecordFailedApproach(string projectID, ProjectFailedApproach approach,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            ArgumentNullException.ThrowIfNull(approach);
+            if (string.IsNullOrWhiteSpace(approach.Key)) throw new ArgumentException("Failed-approach key required.", nameof(approach));
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, expectedRevision, checkpoint =>
+            {
+                var copy = Clone(approach);
+                copy.Key = copy.Key.Trim();
+                copy.LastAttemptedAt = now;
+
+                int index = checkpoint.FailedApproaches.FindIndex(x =>
+                    string.Equals(x.Key, copy.Key, StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    var existing = checkpoint.FailedApproaches[index];
+                    copy.ApproachID = string.IsNullOrWhiteSpace(copy.ApproachID) ? existing.ApproachID : copy.ApproachID;
+                    copy.FirstAttemptedAt = existing.FirstAttemptedAt == default ? now : existing.FirstAttemptedAt;
+                    copy.AttemptCount = Math.Max(existing.AttemptCount, 0) + Math.Max(1, approach.AttemptCount);
+                    // A re-attempt reopens a previously resolved dead end: it evidently is not resolved.
+                    copy.ResolvedAt = null;
+                    copy.ResolutionReason = null;
+                    // Keep the better alternative if this attempt didn't supply a new one.
+                    if (string.IsNullOrWhiteSpace(copy.Instead)) copy.Instead = existing.Instead;
+                    checkpoint.FailedApproaches[index] = copy;
+                }
+                else
+                {
+                    copy.ApproachID = string.IsNullOrWhiteSpace(copy.ApproachID) ? Guid.NewGuid().ToString("N") : copy.ApproachID;
+                    copy.FirstAttemptedAt = copy.FirstAttemptedAt == default ? now : Utc(copy.FirstAttemptedAt);
+                    copy.AttemptCount = Math.Max(1, copy.AttemptCount);
+                    checkpoint.FailedApproaches.Add(copy);
+                }
+
+                // Bound the list: drop the least recently attempted, preferring to shed resolved entries first.
+                if (checkpoint.FailedApproaches.Count > MaxFailedApproaches)
+                {
+                    checkpoint.FailedApproaches = checkpoint.FailedApproaches
+                        .OrderBy(x => x.ResolvedAt == null ? 0 : 1)
+                        .ThenByDescending(x => x.LastAttemptedAt)
+                        .Take(MaxFailedApproaches)
+                        .ToList();
+                }
+                return new(true, true);
+            }, now);
+        }
+
+        /// <summary>Mark a dead end resolved — the approach now works, or is no longer relevant. Kept rather
+        /// than deleted so the attempt history survives for the record.</summary>
+        public ProjectRuntimeMutationResult ResolveFailedApproach(string projectID, string key, string reason,
+            long? expectedRevision = null, DateTime? nowUtc = null)
+        {
+            if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("key required", nameof(key));
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, expectedRevision, checkpoint =>
+            {
+                var entry = checkpoint.FailedApproaches.FirstOrDefault(x =>
+                    string.Equals(x.Key, key, StringComparison.OrdinalIgnoreCase));
+                if (entry == null) return new(false, false, $"No recorded dead end named '{key}'.");
+                entry.ResolvedAt = now;
+                entry.ResolutionReason = reason;
+                return new(true, true);
+            }, now);
+        }
+
+        public List<ProjectFailedApproach> GetActiveFailedApproaches(string projectID, DateTime? nowUtc = null)
+        {
+            // Same reasoning as GetFreshVerifiedFacts: RetryNotBefore expires on wall-clock alone.
+            CacheDeps.MarkUncacheable("failed-approach retry window");
+            DateTime now = Utc(nowUtc);
+            return Get(projectID).Checkpoint.FailedApproaches
+                .Where(x => x.IsActiveAt(now))
+                .OrderByDescending(x => x.LastAttemptedAt)
+                .Select(Clone).ToList();
+        }
+
         /// <summary>Compact machine-owned handoff block. Unlike the narrative digest, these facts,
         /// blockers, artifact identities and the exact resume action are never rewritten by an LLM.</summary>
         public string DescribeForWake(string projectID, DateTime? nowUtc = null)
@@ -897,6 +1043,19 @@ namespace Omnipotent.Services.Projects
                     sb.AppendLine($"- {fact.Key} = {fact.Value}; verified={fact.VerifiedAt:O}" +
                         (fact.ValidUntil.HasValue ? $"; validUntil={fact.ValidUntil:O}" : "") +
                         (fact.Evidence.Count > 0 ? $"; evidence={string.Join(",", fact.Evidence.Take(3).Select(e => e.Reference))}" : ""));
+            }
+
+            // Negative knowledge. Seeded on EVERY wake precisely because a context reset would otherwise
+            // let the agent re-try something it already proved does not work.
+            var deadEnds = state.Checkpoint.FailedApproaches.Where(x => x.IsActiveAt(now)).ToList();
+            if (deadEnds.Count > 0)
+            {
+                sb.AppendLine("dead ends (already tried and failed — do not repeat without new information):");
+                foreach (var dead in deadEnds.OrderByDescending(x => x.LastAttemptedAt).Take(24))
+                    sb.AppendLine($"- {dead.Key}: tried {dead.Approach} → {dead.Outcome}" +
+                        $"; attempts={dead.AttemptCount}; last={Data_Handling.TemporalFormat.StampWithAge(dead.LastAttemptedAt)}" +
+                        (string.IsNullOrWhiteSpace(dead.Instead) ? "" : $"; instead: {dead.Instead}") +
+                        (dead.Evidence.Count > 0 ? $"; evidence={string.Join(",", dead.Evidence.Take(3).Select(e => e.Reference))}" : ""));
             }
 
             if (state.Checkpoint.CanonicalArtifacts.Count > 0)

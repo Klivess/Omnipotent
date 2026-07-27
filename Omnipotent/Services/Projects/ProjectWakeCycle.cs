@@ -73,14 +73,17 @@ namespace Omnipotent.Services.Projects
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
         /// </summary>
-        public async Task<string> BuildWakeSeed(Project project, string triggerDescription)
+        /// <param name="recentEventsConsidered">Overrides how many recent events are considered (project setting).</param>
+        /// <param name="recentEventsBudget">Overrides the token budget for the recent-event block (project setting).</param>
+        public async Task<string> BuildWakeSeed(Project project, string triggerDescription,
+            int? recentEventsConsidered = null, int? recentEventsBudget = null)
         {
             var digest = digests.GetDigest(project.ProjectID);
 
             // Recent verbatim window: everything after the digest watermark, newest kept.
             var recent = eventLog.ReadRecentSince(project.ProjectID, digest.LastDigestedSequence, count: 2000)
                 .Where(ProjectPromptHygiene.IsAgentVisibleEvent)
-                .TakeLast(ProjectCommanderPrompts.RecentEventsConsidered)
+                .TakeLast(recentEventsConsidered ?? ProjectCommanderPrompts.RecentEventsConsidered)
                 .ToList();
 
             // Retrieval into the deep log, keyed by the trigger. Events already in the recent
@@ -152,7 +155,8 @@ namespace Omnipotent.Services.Projects
 
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
-                knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives);
+                knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
+                recentEventsBudget);
         }
 
         private static string Truncate(string s, int max) =>

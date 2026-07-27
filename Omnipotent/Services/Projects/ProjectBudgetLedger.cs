@@ -193,7 +193,8 @@ namespace Omnipotent.Services.Projects
             long completionTokens,
             string? generationId = null,
             double? actualCostUsd = null,
-            ProjectTokenUsageContext? usageContext = null)
+            ProjectTokenUsageContext? usageContext = null,
+            long cachedPromptTokens = 0)
         {
             // The completion already carries the real cost — book it and skip the estimate/reconcile
             // path entirely. A provider that doesn't report cost (HuggingFace/local) falls back to the
@@ -233,6 +234,7 @@ namespace Omnipotent.Services.Projects
                 Label = usageContext?.Label,
                 PromptTokens = promptTokens,
                 CompletionTokens = completionTokens,
+                CachedPromptTokens = Math.Clamp(cachedPromptTokens, 0, promptTokens),
                 CostUsd = amount,
                 CostBasis = haveActual ? "actual" : "provisional",
                 GenerationID = generationId,

@@ -34,7 +34,8 @@ namespace Omnipotent.Services.Projects
             string? filesBlock = null,
             string? runtimeStateBlock = null,
             string? kliveAgentContextBlock = null,
-            string? directivesBlock = null)
+            string? directivesBlock = null,
+            int? recentEventsBudget = null)
         {
             var sb = new StringBuilder();
 
@@ -148,7 +149,7 @@ namespace Omnipotent.Services.Projects
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
                     visibleRecentEvents.Select((e, i) =>
                         (evt: e, idxFromEnd: visibleRecentEvents.Count - 1 - i)),
-                    ProjectsContextBudget.RecentEventsBudget,
+                    recentEventsBudget ?? ProjectsContextBudget.RecentEventsBudget,
                     x => DescribeEvent(x.evt),
                     x => ProjectsContextBudget.ScoreEvent(x.evt.Text, triggerDescription, x.idxFromEnd));
                 foreach (var x in fitted.OrderBy(x => x.evt.Sequence))
@@ -224,8 +225,21 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"{SummaryHeader}\n{ProjectPromptHygiene.ScrubState(existing.RollingSummary)}");
             sb.AppendLine();
             sb.AppendLine("NEW EVENTS:");
-            foreach (var e in newEvents.Where(ProjectPromptHygiene.IsAgentVisibleEvent))
-                sb.AppendLine(DescribeEvent(e));
+            // Budget-fit like every other prompt we build. This ran unbounded over up to 2,000 events at
+            // 1,200-1,600 chars each, after EVERY wake — a busy wake could push a six-figure-token prompt
+            // through the utility model purely to refresh a ≤570-word digest. Oldest-first order is
+            // preserved so the narrative still reads chronologically.
+            var visible = newEvents.Where(ProjectPromptHygiene.IsAgentVisibleEvent).ToList();
+            var fitted = ProjectsContextBudget.FitItemsInBudget(
+                visible.Select((e, i) => (evt: e, idxFromEnd: visible.Count - 1 - i)),
+                ProjectsContextBudget.DigestRebuildEventsBudget,
+                x => DescribeEvent(x.evt),
+                x => ProjectsContextBudget.ScoreEvent(x.evt.Text, project.Goal, x.idxFromEnd));
+            int dropped = visible.Count - fitted.Count;
+            if (dropped > 0)
+                sb.AppendLine($"[{dropped} lower-signal event(s) omitted to fit the digest budget; the existing ROLLING SUMMARY already covers older ground and the full log remains on disk.]");
+            foreach (var x in fitted.OrderBy(x => x.evt.Sequence))
+                sb.AppendLine(DescribeEvent(x.evt));
             return sb.ToString();
         }
 

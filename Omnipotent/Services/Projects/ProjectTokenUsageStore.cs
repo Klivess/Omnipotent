@@ -41,6 +41,9 @@ public sealed class ProjectTokenUsageRecord
     public string? Label { get; set; }
     public long PromptTokens { get; set; }
     public long CompletionTokens { get; set; }
+    /// <summary>How many of <see cref="PromptTokens"/> the provider served from its prompt cache.
+    /// Zero on routes that don't support caching — which is exactly what makes it worth journaling.</summary>
+    public long CachedPromptTokens { get; set; }
     /// <summary>
     /// Effective USD booked by this entry. Reconciliation entries may be negative so
     /// the sum of the provisional record and its adjustment equals the provider truth.

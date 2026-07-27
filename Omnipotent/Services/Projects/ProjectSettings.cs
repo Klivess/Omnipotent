@@ -99,6 +99,27 @@ namespace Omnipotent.Services.Projects
         public int WorkSliceTokenBudget { get; set; } = Defaults.WorkSliceTokenBudget;
         public int MaxConvergenceTripsPerSlice { get; set; } = Defaults.MaxConvergenceTripsPerSlice;
 
+        /// <summary>
+        /// How many of the most recent tool results stay in the model context verbatim. Older ones keep
+        /// their tool_call_id pairing but have their bulk text stubbed, since a long wake otherwise
+        /// re-uploads every result it ever produced on every subsequent turn. The agent can always re-run
+        /// a tool for fresh detail, and the full text stays in the event log.
+        /// </summary>
+        public int ToolResultKeepRecent { get; set; } = Defaults.ToolResultKeepRecent;
+
+        /// <summary>
+        /// Token budget for the recent-event replay inside a wake seed, and how many events are
+        /// considered for it. The seed is re-sent on EVERY turn of a wake, and this is its largest
+        /// block, so these are the biggest single lever on wake cost.
+        ///
+        /// They ship at the historical values deliberately: lowering them is a real capability
+        /// trade-off, not free. Everything dropped stays on disk and reachable through query_events and
+        /// BM25 retrieval, and ScoreEvent keeps the most relevant events rather than truncating blindly
+        /// — but tune these against observed agent behaviour, not on assumption.
+        /// </summary>
+        public int RecentEventsBudget { get; set; } = Defaults.RecentEventsBudget;
+        public int RecentEventsConsidered { get; set; } = Defaults.RecentEventsConsidered;
+
         [JsonProperty("MaxToolCallsPerWake", NullValueHandling = NullValueHandling.Ignore)]
         private int? LegacyMaxToolCallsPerWake
         {
@@ -225,6 +246,12 @@ namespace Omnipotent.Services.Projects
                     WorkSliceTokenBudget = Math.Clamp(ParseInt(Text(value), Defaults.WorkSliceTokenBudget), 16_000, 2_000_000); break;
                 case "maxconvergencetripsperslice": case "maxlooptripsperwake":
                     MaxConvergenceTripsPerSlice = Math.Clamp(ParseInt(Text(value), Defaults.MaxConvergenceTripsPerSlice), 1, 20); break;
+                case "toolresultkeeprecent":
+                    ToolResultKeepRecent = Math.Clamp(ParseInt(Text(value), Defaults.ToolResultKeepRecent), 2, 256); break;
+                case "recenteventsbudget":
+                    RecentEventsBudget = Math.Clamp(ParseInt(Text(value), Defaults.RecentEventsBudget), 2_000, 200_000); break;
+                case "recenteventsconsidered":
+                    RecentEventsConsidered = Math.Clamp(ParseInt(Text(value), Defaults.RecentEventsConsidered), 10, 500); break;
                 case "maxconsecutivecontinuations": break;
                 case "visionenabled": VisionEnabled = ParseBool(Text(value)); break;
                 case "liveactivitystreaming": LiveActivityStreaming = ParseBool(Text(value)); break;
@@ -339,6 +366,11 @@ namespace Omnipotent.Services.Projects
             // more history than the legacy 64k setting. Larger-window routes can opt higher per project.
             public const int WorkSliceTokenBudget = 180_000;
             public const int MaxConvergenceTripsPerSlice = 5;
+            // Matches KliveLLM's own long-standing AppendToolResult default. Lower values prune harder
+            // but make the agent re-run tools to recover detail, which costs a whole extra round trip.
+            public const int ToolResultKeepRecent = 16;
+            public const int RecentEventsBudget = ProjectsContextBudget.RecentEventsBudget;
+            public const int RecentEventsConsidered = ProjectCommanderPrompts.RecentEventsConsidered;
             public const bool ContainersEnabled = true;
             public const bool LiveActivityStreaming = true;
             public const bool DesktopFirstWebsiteInteraction = true;

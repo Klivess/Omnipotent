@@ -28,6 +28,10 @@ namespace Omnipotent.Services.Projects
         /// <summary>Ordered visual action frames. The final entry is gridded and current; earlier
         /// entries are motion-significant context for transient states.</summary>
         public List<ComputerFrame> Frames { get; init; } = new();
+        /// <summary>Framebuffer dimensions behind <see cref="Frames"/>, so the wake loop can charge the
+        /// real per-image token cost against its context budget instead of a flat guess.</summary>
+        public int FrameWidth { get; init; }
+        public int FrameHeight { get; init; }
         /// <summary>Artifacts produced by this call, referenced on the tool-result event.</summary>
         public List<string> ArtifactIDs { get; init; } = new();
     }
@@ -378,6 +382,28 @@ namespace Omnipotent.Services.Projects
                             if (key.Length == 0) return new CommanderToolResult("invalidate_fact requires fact 'key'.");
                             changed = RuntimeState.InvalidateVerifiedFact(project.ProjectID, key,
                                 summary.Length == 0 ? "Invalidated by project agent." : summary);
+                            break;
+                        case "record_dead_end":
+                        {
+                            string approach = ((string?)a["approach"] ?? "").Trim();
+                            string outcome = ((string?)a["outcome"] ?? "").Trim();
+                            if (key.Length == 0 || approach.Length == 0 || outcome.Length == 0)
+                                return new CommanderToolResult("record_dead_end requires 'key', 'approach' and 'outcome'.");
+                            changed = RuntimeState.RecordFailedApproach(project.ProjectID, new ProjectFailedApproach
+                            {
+                                Key = key,
+                                Approach = approach,
+                                Outcome = outcome,
+                                Instead = string.IsNullOrWhiteSpace((string?)a["instead"]) ? null : ((string?)a["instead"])!.Trim(),
+                                RetryNotBefore = ParseUtc((string?)a["retryNotBefore"]),
+                                Evidence = evidence,
+                            });
+                            break;
+                        }
+                        case "resolve_dead_end":
+                            if (key.Length == 0) return new CommanderToolResult("resolve_dead_end requires dead-end 'key'.");
+                            changed = RuntimeState.ResolveFailedApproach(project.ProjectID, key,
+                                summary.Length == 0 ? "Resolved by project agent." : summary);
                             break;
                         case "register_artifact":
                         {

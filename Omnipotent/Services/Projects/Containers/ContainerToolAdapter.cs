@@ -665,12 +665,21 @@ namespace Omnipotent.Services.Projects.Containers
             return BuildScreenshotResult(prefix, raw.jpeg, raw.width, raw.height, beforeJpeg);
         }
 
-        private static ContainerToolResult BuildScreenshotResult(string prefix, byte[] jpeg, int width, int height,
+        /// <summary>
+        /// When false, a mutating desktop action returns only its settled "after" frame instead of a
+        /// before/after pair. The pair is genuinely useful — it is attached only when the screen actually
+        /// changed, which is when the comparison is most informative — but it doubles the image tokens of
+        /// every productive action, and images are re-sent on every subsequent turn of the wake. Defaults
+        /// to true; turn it off per project once the cached-token figures show what it costs.
+        /// </summary>
+        public bool BeforeFrameEnabled { get; set; } = true;
+
+        private ContainerToolResult BuildScreenshotResult(string prefix, byte[] jpeg, int width, int height,
             byte[]? beforeJpeg = null)
         {
             byte[] grid = ComputerVision.AddCoordinateGrid(jpeg);
             var frames = new List<ComputerFrame>();
-            if (beforeJpeg != null && ComputerVision.FrameDelta(beforeJpeg, jpeg) >= 3)
+            if (BeforeFrameEnabled && beforeJpeg != null && ComputerVision.FrameDelta(beforeJpeg, jpeg) >= 3)
                 frames.Add(new ComputerFrame { Jpeg = beforeJpeg, OffsetMs = 0, IsSettled = false, HasCoordinateGrid = false });
             frames.Add(new ComputerFrame { Jpeg = grid, OffsetMs = frames.Count == 0 ? 0 : 1, IsSettled = true, HasCoordinateGrid = true });
             return new ContainerToolResult(true,

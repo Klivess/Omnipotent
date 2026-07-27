@@ -990,7 +990,17 @@ namespace Omnipotent.Services.KliveLLM
             return tokens;
         }
 
-        internal static bool CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent)
+        /// <param name="protectPrefixMessages">
+        /// How many messages immediately AFTER the leading system block are protected from summarisation.
+        ///
+        /// A caller whose first user turn is a large rehydrated brief must pass a non-zero value. The
+        /// Projects wake seed is one such message, carrying the agent's directives, grand plan, typed
+        /// execution state, verified facts, dead ends, retrieval hits and recent-event window. Without
+        /// this it is summarised like any other user turn — clipped to 240 characters by BuildCompacted —
+        /// and the agent silently loses its entire rehydrated context mid-wake, which reliably produces
+        /// repeated work and tool-call loops.
+        /// </param>
+        internal static bool CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent, int protectPrefixMessages = 0)
         {
             var msgs = s.structuredMessages;
             if (aboveTokens <= 0 || EstimateToolSessionTokens(msgs) <= aboveTokens) return false;
@@ -998,20 +1008,24 @@ namespace Omnipotent.Services.KliveLLM
             int headStart = 0; // keep leading system message(s) verbatim
             while (headStart < msgs.Count && msgs[headStart].role == "system") headStart++;
 
+            // Protected brief sits directly after the system block and is never summarised. Bounded so a
+            // caller can never protect the whole conversation and defeat compaction entirely.
+            int protectedEnd = Math.Clamp(headStart + Math.Max(0, protectPrefixMessages), headStart, Math.Max(headStart, msgs.Count - 1));
+
             List<HFWrapper.HFMessage>? rebuilt = null;
             List<HFWrapper.HFMessage>? bestCompaction = null;
             int bestCompactionTokens = int.MaxValue;
-            int availableTail = Math.Max(1, msgs.Count - headStart);
+            int availableTail = Math.Max(1, msgs.Count - protectedEnd);
             int tailToKeep = Math.Clamp(keepRecent, 1, availableTail);
             while (tailToKeep >= 1)
             {
                 // Tail is advanced so it never begins on an orphan tool result whose assistant
                 // tool_call would have been summarized away.
-                int cut = Math.Max(headStart, msgs.Count - tailToKeep);
+                int cut = Math.Max(protectedEnd, msgs.Count - tailToKeep);
                 while (cut < msgs.Count && msgs[cut].role == "tool") cut++;
-                if (cut > headStart && cut < msgs.Count)
+                if (cut > protectedEnd && cut < msgs.Count)
                 {
-                    var candidate = BuildCompacted(msgs, headStart, cut);
+                    var candidate = BuildCompacted(msgs, protectedEnd, cut);
                     int candidateTokens = EstimateToolSessionTokens(candidate);
                     if (candidateTokens < bestCompactionTokens)
                     {
@@ -1036,14 +1050,16 @@ namespace Omnipotent.Services.KliveLLM
             s.structuredMessages = rebuilt;
             return true;
 
+            // keepVerbatimBefore = the system block PLUS any protected brief; everything from there
+            // up to `cut` is what gets summarised into the digest.
             static List<HFWrapper.HFMessage> BuildCompacted(
                 List<HFWrapper.HFMessage> source,
-                int systemCount,
+                int keepVerbatimBefore,
                 int cut)
             {
                 var sb = new System.Text.StringBuilder();
                 sb.AppendLine("[Context compacted to keep the window sharp. Digest of EARLIER steps this task — the verbatim messages were summarised. Trust this plus the recent messages below; DON'T redo discovery already shown here, and re-run a tool only if you need fresh detail:]");
-                for (int i = systemCount; i < cut; i++)
+                for (int i = keepVerbatimBefore; i < cut; i++)
                 {
                     var m = source[i];
                     var text = HFWrapper.ContentToText(m.content)?.Trim();
@@ -1068,8 +1084,8 @@ namespace Omnipotent.Services.KliveLLM
                 if (digest.Length > digestMaxChars)
                     digest = ClipMiddle(digest, digestMaxChars, "\n…(older steps elided)…\n");
 
-                var output = new List<HFWrapper.HFMessage>(source.Count - (cut - systemCount) + 1);
-                for (int i = 0; i < systemCount; i++) output.Add(source[i]);
+                var output = new List<HFWrapper.HFMessage>(source.Count - (cut - keepVerbatimBefore) + 1);
+                for (int i = 0; i < keepVerbatimBefore; i++) output.Add(source[i]);
                 output.Add(new HFWrapper.HFMessage { role = "user", content = digest });
                 for (int i = cut; i < source.Count; i++) output.Add(source[i]);
                 return output;
@@ -1126,7 +1142,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -1162,7 +1178,7 @@ namespace Omnipotent.Services.KliveLLM
                         : preflightMessageBudget.Value;
                 }
                 if (compactAbove > 0)
-                    contextWasCompacted = CompactToolSessionIfNeeded(session, compactAbove, keepRecent);
+                    contextWasCompacted = CompactToolSessionIfNeeded(session, compactAbove, keepRecent, compactProtectPrefixMessages);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
                 irreducibleSystemTokens = snapshot
                     .TakeWhile(message => message.role == "system")
@@ -1217,6 +1233,7 @@ namespace Omnipotent.Services.KliveLLM
                     RawResponse = rawContent,
                     SessionId = sessionId,
                     PromptTokens = response.usage?.prompt_tokens ?? 0,
+                    CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
                     GenerationId = response.id,
                     CostUsd = response.usage?.cost,
@@ -1255,6 +1272,7 @@ namespace Omnipotent.Services.KliveLLM
                 Success = true,
                 ToolCalls = toolCalls,
                 PromptTokens = response.usage?.prompt_tokens ?? 0,
+                    CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
                 CompletionTokens = response.usage?.completion_tokens ?? 0,
                 GenerationId = response.id,
                 CostUsd = response.usage?.cost,
@@ -1315,6 +1333,7 @@ namespace Omnipotent.Services.KliveLLM
                     Conversation = session.chatHistory,
                     Success = true,
                     PromptTokens = response.usage?.prompt_tokens ?? 0,
+                    CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
                     GenerationId = response.id,
                     CostUsd = response.usage?.cost,
@@ -1564,6 +1583,75 @@ namespace Omnipotent.Services.KliveLLM
                 parts.Add(new HFWrapper.HFTextPart { text = volatileTail });
 
             system.content = parts;
+
+            ApplyConversationCacheBreakpoint(payload);
+        }
+
+        /// <summary>
+        /// Places a second cache breakpoint at the END of the settled conversation, so the growing
+        /// tool transcript is served from cache instead of being re-billed in full on every turn.
+        ///
+        /// Caching the system message alone only ever covered the fixed prefix; in an agentic tool loop
+        /// the conversation is the part that grows, and it was 100% uncached — which is why a Projects
+        /// wake bills prompt tokens far in excess of what it generates.
+        ///
+        /// The breakpoint goes on the last USER-role message. Anthropic (via OpenRouter) caches the whole
+        /// prefix up to and including a marked block, and a user turn is the shape that survives
+        /// OpenRouter's OpenAI-compat translation most reliably — assistant/tool turns are reshaped more
+        /// aggressively. Anthropic allows four breakpoints; this is the second.
+        /// </summary>
+        internal static void ApplyConversationCacheBreakpoint(HFWrapper.HFLLMInferenceRequest payload)
+        {
+            // The final user turn is the live one; marking it would write a new cache entry every turn
+            // and never read one back. Mark the previous user turn instead — by the next request the
+            // conversation has grown past it, so it is a stable prefix boundary.
+            int lastUser = -1, previousUser = -1;
+            for (int i = 0; i < payload.messages.Length; i++)
+            {
+                var m = payload.messages[i];
+                if (m == null || m.role != "user") continue;
+                previousUser = lastUser;
+                lastUser = i;
+            }
+            if (previousUser < 0) return;
+
+            var target = payload.messages[previousUser];
+
+            // CRITICAL: BuildMessagesFromList copies HFMessage objects but SHARES their content
+            // reference with the live session. Tagging in place would mutate the caller's stored
+            // history — poisoning the session and changing earlier turns between requests. Always
+            // build a fresh content object here.
+            if (target.content is string s)
+            {
+                target.content = new List<object>
+                {
+                    new HFWrapper.HFTextPart { text = s, cache_control = EphemeralCacheControl },
+                };
+                return;
+            }
+
+            if (target.content is System.Collections.IEnumerable existing and not string)
+            {
+                var copy = new List<object>();
+                foreach (var part in existing) copy.Add(part);
+                if (copy.Count == 0) return;
+
+                // Only a TEXT part can carry cache_control; an image/audio part cannot. If the last part
+                // is not text, append a tiny marker part rather than corrupting a media part.
+                if (copy[^1] is HFWrapper.HFTextPart lastText)
+                {
+                    copy[^1] = new HFWrapper.HFTextPart
+                    {
+                        text = lastText.text,
+                        cache_control = EphemeralCacheControl,
+                    };
+                }
+                else
+                {
+                    copy.Add(new HFWrapper.HFTextPart { text = " ", cache_control = EphemeralCacheControl });
+                }
+                target.content = copy;
+            }
         }
 
         /// <summary>
@@ -2495,6 +2583,15 @@ namespace Omnipotent.Services.KliveLLM
             public string ErrorMessage { get; set; }
             public int PromptTokens { get; set; }
             public int CompletionTokens { get; set; }
+
+            /// <summary>
+            /// How many of <see cref="PromptTokens"/> were served from the provider's prompt cache.
+            /// Deserialized from usage.prompt_tokens_details.cached_tokens. This is the ONLY way to tell
+            /// whether the cache_control breakpoints are actually landing: explicit caching is honoured
+            /// by Anthropic and Gemini, automatic on OpenAI/DeepSeek/Grok, and silently ignored by
+            /// everything else — so a route change can quietly stop it working with no other symptom.
+            /// </summary>
+            public int CachedPromptTokens { get; set; }
 
             /// <summary>The provider's generation/response id (OpenRouter's `id`), used to fetch
             /// the authoritative per-request cost from /generation. Null when unavailable.</summary>

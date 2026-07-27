@@ -267,6 +267,7 @@ namespace Omnipotent.Services.Projects
                 sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.SubAgentMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
+                int toolResultKeepRecent = Math.Clamp(settings.ToolResultKeepRecent, 2, 256);
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
                     llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
                 if (contextPolicy != null)
@@ -288,18 +289,17 @@ namespace Omnipotent.Services.Projects
                 // never shown an operation it may not perform.
                 var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
+                // Fresh session every wake, for the same reason as the Commander: the seed is a full
+                // rehydration from disk, so continuing the old session carried the previous wake's whole
+                // transcript and then stacked another seed on top of it.
                 string sessionId = $"projects-agent-{projectID}-{agent.AgentID}";
-                bool continuingSession = llm.CanContinueToolSession(sessionId);
                 string wakeSeed = await BuildWakeSeed(project, agent, trigger);
-                if (continuingSession && llm.GetToolSessionContextTokens(sessionId) +
-                    ProjectsContextBudget.EstimateTokens(wakeSeed) >= sliceTokenBudget)
-                {
-                    llm.ResetSession(sessionId);
-                    continuingSession = false;
-                }
-                if (!continuingSession)
-                    llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent));
+                llm.ResetSession(sessionId);
+                llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
+                // The seed carries this worker's whole brief; the compactor clips a user turn to 240
+                // chars, so it must never be summarised.
+                const int protectedBriefMessages = 1;
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
 
@@ -323,6 +323,10 @@ namespace Omnipotent.Services.Projects
                     if (parent.Store.GetProject(projectID)?.Status != ProjectStatus.Active ||
                         parent.SubAgents.ListActive(projectID).All(a => a.AgentID != agent.AgentID))
                     {
+                        // NOT WakeCompleted: nothing was attempted. Reporting completion here marked the
+                        // worker Completed, told the Commander the objective was done, and counted as a
+                        // successful wake in analytics — while zero tokens and zero work had happened.
+                        outcome = ProjectEventTypes.WakeDeferred;
                         outcomeText = $"Agent {agent.AgentID} stopped — project budget paused.";
                         break;
                     }
@@ -336,6 +340,9 @@ namespace Omnipotent.Services.Projects
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
                     {
+                        // Same reasoning as the status guard above: budget exhaustion is a deferral, not
+                        // a completed assignment.
+                        outcome = ProjectEventTypes.WakeDeferred;
                         outcomeText = $"Agent {agent.AgentID} stopped before the next model call because no token budget remained.";
                         break;
                     }
@@ -356,7 +363,8 @@ namespace Omnipotent.Services.Projects
                                 compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens ?? 0,
                                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
                                 enableOpenRouterContextCompression: contextPolicy != null,
-                                samplingParameters: routeSampling);
+                                samplingParameters: routeSampling,
+                                compactProtectPrefixMessages: protectedBriefMessages);
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
@@ -396,7 +404,8 @@ namespace Omnipotent.Services.Projects
                                 Model = finalModel,
                                 SourceReference = $"{wakeID}:turn:{modelTurns}",
                                 Label = $"{agent.Role} model turn {modelTurns}",
-                            });
+                            },
+                            cachedPromptTokens: resp.CachedPromptTokens);
                     }
 
                     }
@@ -497,7 +506,7 @@ namespace Omnipotent.Services.Projects
                                 Text = rejection, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: int.MaxValue);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: toolResultKeepRecent);
                             liveContextTokens += AddedContextTokens(rejection);
                             lastCommittedTool = toolName;
                             lastCommittedResult = rejection;
@@ -522,7 +531,7 @@ namespace Omnipotent.Services.Projects
                                 Text = text, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, text, keepRecentFull: int.MaxValue);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, text, keepRecentFull: toolResultKeepRecent);
                             liveContextTokens += AddedContextTokens(text);
                             lastCommittedTool = toolName;
                             lastCommittedResult = text;
@@ -606,7 +615,7 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: int.MaxValue);
+                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: toolResultKeepRecent);
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;

@@ -1568,6 +1568,8 @@ namespace Omnipotent.Services.Projects
                         : null,
                     Jpeg = result.Jpeg,
                     Frames = result.Frames,
+                    FrameWidth = result.Width,
+                    FrameHeight = result.Height,
                     ArtifactIDs = artifactIDs
                 };
             }

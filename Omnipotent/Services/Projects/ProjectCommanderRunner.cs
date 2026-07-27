@@ -259,6 +259,10 @@ namespace Omnipotent.Services.Projects
             bool wakeCostEstimated = false;
             string? lastCommittedTool = null;
             string? lastCommittedResult = null;
+            // Rolling record of the last few action→result pairs. Saved as this wake's tail in the
+            // finally below, so the NEXT wake opens knowing exactly where this one stopped. Declared
+            // out here because the finally block needs it on every exit path.
+            var actionTrail = new List<string>();
             string? initialModel = null;
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
@@ -317,6 +321,7 @@ namespace Omnipotent.Services.Projects
                 sliceTokenBudget = Math.Clamp(settings.WorkSliceTokenBudget, 16_000, 2_000_000);
                 int maxOutputTokens = Math.Clamp(settings.CommanderMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
+                int toolResultKeepRecent = Math.Clamp(settings.ToolResultKeepRecent, 2, 256);
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
                     llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
                 if (contextPolicy != null)
@@ -333,33 +338,52 @@ namespace Omnipotent.Services.Projects
                 canonicalToolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions());
                 var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
-                // Keep a clean completed session across ordinary wakes. A context rollover leaves an
-                // unfinished tool protocol (or explicitly resets below), so it naturally starts fresh.
+                // Every wake starts a FRESH session. The seed is a full rehydration from disk (digest,
+                // directives, grand plan, typed state, verified facts, dead ends, retrieval, recent
+                // events), so continuing the previous wake's session carried its entire transcript AND
+                // then appended a second full seed on top — re-billing tens of thousands of tokens on
+                // every turn for context the seed already restores. What the seed cannot restore
+                // verbatim is how the last wake was mid-thought when it stopped; that is carried
+                // separately as a bounded prose tail below.
                 string sessionId = $"projects-commander-{projectID}";
-                bool continuingSession = llm.CanContinueToolSession(sessionId);
-                string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription);
-                if (continuingSession && llm.GetToolSessionContextTokens(sessionId) +
-                    ProjectsContextBudget.EstimateTokens(wakeSeed) >= sliceTokenBudget)
-                {
-                    llm.ResetSession(sessionId);
-                    continuingSession = false;
-                }
-                if (!continuingSession)
-                    llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
+                string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
+                    settings.RecentEventsConsidered, settings.RecentEventsBudget);
+                llm.ResetSession(sessionId);
+                llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
+
+                // Messages the compactor must never summarise. These carry the wake's whole brief; the
+                // generic compactor clips a user turn to 240 chars, which would silently erase it.
+                int protectedBriefMessages = 1;
+
+                string? previousWakeTail = parent.RuntimeState.Get(projectID).Checkpoint.LastWakeTail;
+                if (!string.IsNullOrWhiteSpace(previousWakeTail))
+                {
+                    llm.AppendUserMessageToToolSession(sessionId,
+                        "── HOW YOUR PREVIOUS WAKE ENDED (verbatim; the event log and query_events hold the rest) ──\n"
+                        + previousWakeTail);
+                    protectedBriefMessages++;
+                }
+
                 if (klivesInvolved)
+                {
                     llm.AppendUserMessageToToolSession(sessionId,
                         "Klives is waiting on an answer. Call reply_to_klives on your FIRST turn, then get on with the work — " +
                         "this wake may run for hours and he should not have to wait that long to hear from you.");
+                    protectedBriefMessages++;
+                }
                 var approvedPlan = parent.GrandPlans.GetCurrentApproved(projectID)?.Content;
                 var readyMilestones = parent.GrandPlans.GetReadyMilestones(projectID);
                 if (project.Status == ProjectStatus.Active && project.SubAgentCap > 1
                     && parent.SubAgents.ListActive(projectID).Count <= 1
                     && ((approvedPlan?.Workstreams.Count ?? 0) > 1 || (approvedPlan?.Milestones.Count ?? 0) > 1))
+                {
                     llm.AppendUserMessageToToolSession(sessionId,
                         $"DELEGATION CHECKPOINT: the approved plan has separable work and {project.SubAgentCap - 1} worker slot(s) are free. " +
                         $"Dependency-ready milestones: {string.Join("; ", readyMilestones.Select(m => $"{m.ID} {m.Title}"))}. " +
                         "Assign only dependency-ready work, set milestone owners, and require explicit deliverables unless the next step is genuinely indivisible.");
+                    protectedBriefMessages++;
+                }
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
 
@@ -408,6 +432,10 @@ namespace Omnipotent.Services.Projects
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
                     {
+                        // Deferred, not completed: no model call was made and no work was attempted.
+                        // Leaving this as WakeCompleted inflated the analytics success rate and hid
+                        // budget exhaustion behind an apparently healthy wake.
+                        outcome = ProjectEventTypes.WakeDeferred;
                         outcomeText = "Wake stopped before the next model call because no token budget remained.";
                         goto done;
                     }
@@ -429,7 +457,8 @@ namespace Omnipotent.Services.Projects
                                 compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens ?? 0,
                                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
                                 enableOpenRouterContextCompression: contextPolicy != null,
-                                samplingParameters: routeSampling);
+                                samplingParameters: routeSampling,
+                                compactProtectPrefixMessages: protectedBriefMessages);
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
@@ -477,7 +506,8 @@ namespace Omnipotent.Services.Projects
                                 Model = finalModel,
                                 SourceReference = $"{wakeID}:turn:{modelTurns}",
                                 Label = $"Commander model turn {modelTurns}",
-                            });
+                            },
+                            cachedPromptTokens: resp.CachedPromptTokens);
                     }
 
                     }
@@ -586,7 +616,7 @@ namespace Omnipotent.Services.Projects
                                 Text = rejection, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: int.MaxValue);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: toolResultKeepRecent);
                             liveContextTokens += AddedContextTokens(rejection);
                             lastCommittedTool = toolName;
                             lastCommittedResult = rejection;
@@ -612,6 +642,20 @@ namespace Omnipotent.Services.Projects
                         {
                             stuckTrips++;
                             string loopResult = $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.";
+                            // Durably record the dead end. A loop trip is a machine-certain signal that this
+                            // exact approach does not work, and it must outlive this wake's context: without
+                            // it the next wake re-derives the same failure from scratch.
+                            parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
+                            {
+                                Key = $"repeated-call:{toolName}",
+                                Approach = DescribeCall(toolName, argsJson),
+                                Outcome = $"Repeated {recentSignatures[sig]}× with an unchanged result; the convergence guard tripped.",
+                                Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
+                                Evidence = new List<ProjectEvidenceReference>
+                                {
+                                    new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
+                                },
+                            });
                             parent.EventLog.Append(new ProjectEvent
                             {
                                 ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
@@ -619,7 +663,7 @@ namespace Omnipotent.Services.Projects
                                 Text = loopResult, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, loopResult, keepRecentFull: int.MaxValue);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, loopResult, keepRecentFull: toolResultKeepRecent);
                             liveContextTokens += AddedContextTokens(loopResult);
                             lastCommittedTool = toolName;
                             lastCommittedResult = loopResult;
@@ -681,10 +725,12 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: int.MaxValue);
+                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: toolResultKeepRecent);
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;
+                        actionTrail.Add($"{DescribeCall(toolName, argsJson)} → {ProjectsContextBudget.TruncateToTokens(result.ResultText ?? "", 300)}");
+                        if (actionTrail.Count > ProjectsContextBudget.WakeTailActions) actionTrail.RemoveAt(0);
                         // The Commander answered him inside the wake, so the closing backstop below
                         // must not append a second, redundant reply on top of it.
                         if (toolName == "reply_to_klives" && result.Succeeded) repliedToKlives = true;
@@ -700,7 +746,11 @@ namespace Omnipotent.Services.Projects
                             llm.AppendUserContentToToolSession(sessionId,
                                 $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify it before acting further.",
                                 frames);
-                            liveContextTokens += 1200L * Math.Max(1, frames.Count);
+                            // Charge what the provider will actually bill, from the real frame size. The
+                            // old flat 1200/frame under-counted a 1920x1080 screenshot by 40-60%, so the
+                            // work-slice boundary consistently let context overshoot its ceiling.
+                            liveContextTokens += frames.Count * ProjectsContextBudget.EstimateImageTokens(
+                                result.FrameWidth, result.FrameHeight);
                         }
 
                         if (result.EndWake) { outcomeText = "Wake ended by a tool (constraint)."; goto done; }
@@ -805,6 +855,26 @@ namespace Omnipotent.Services.Projects
                 // the panel never shows a Commander still "thinking" after it went to sleep.
                 parent.Activity.End(projectID, "commander");
                 try { if (parent.Desktops != null) await parent.Desktops.ReleaseAgentInputsAsync(projectID, "commander"); } catch { }
+
+                // Hand the NEXT wake a verbatim view of how this one ended. The wake seed rehydrates
+                // everything durable from disk, but not the fine-grained "I was midway through X" detail
+                // — without this, starting each wake in a fresh session loses it entirely.
+                try
+                {
+                    if (actionTrail.Count > 0 || !string.IsNullOrWhiteSpace(outcomeText))
+                    {
+                        var tail = new System.Text.StringBuilder();
+                        tail.AppendLine($"Ended {DateTime.UtcNow:O} — {outcome}: {outcomeText}");
+                        if (actionTrail.Count > 0)
+                        {
+                            tail.AppendLine($"Last {actionTrail.Count} action(s), oldest first:");
+                            foreach (var step in actionTrail) tail.AppendLine($"- {step}");
+                        }
+                        parent.RuntimeState.SetLastWakeTail(projectID,
+                            ProjectsContextBudget.TruncateToTokens(tail.ToString(), ProjectsContextBudget.WakeTailBudget));
+                    }
+                }
+                catch { /* the tail is an optimisation; never fail a wake over it */ }
                 try
                 {
                     // Per-wake cost attribution: the ledger is cumulative, so stamp this wake's own
