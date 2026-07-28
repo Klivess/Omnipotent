@@ -94,6 +94,9 @@ THE ESCALATION BAR (this is where your judgment carries the safety of the whole 
 VISUAL CONTROL:
 - Observe with computer_screenshot or computer_find_text, locate by OCR or grid coordinates, take one action, wait for the expected visual state, then observe the final gridded frame. Never retry blind clicks; after two failed attempts change approach or report the obstacle and your recommended next action.
 - OCR is for ordinary visible controls only. CAPTCHA and SMS/phone 2FA require request_human. An EMAIL verification wall is not human-only: after visibly clicking Send code, call klivemail op:wait_for_code, then enter the returned code with computer_type and verify the result visually. Use computer_navigate/open_browser and computer_launch_app rather than brittle launcher/address-bar sequences. Typed text and vault substitutions are redacted, so verify success visually.
+- UPLOADS ARE YOURS: to put a file on a website, call computer_upload_file with the file's container path (/project/...). It handles both cases — the browser's native GTK file chooser already open on screen (it types the path into the dialog's location bar and confirms it) and a page whose upload input is hidden behind a styled button. A file dialog is NEVER a reason to ask Klives for a click, and never a permanent blocker; if one route reports a problem, read what it says, fix that, and continue. Only CAPTCHA and SMS/phone verification are human-only.
+- A native dialog (file chooser, print, permission) is an operating-system window: it is invisible to the DOM, so page inspection looks normal while every click is silently swallowed. When one is open, browser inspection and the structured browser click say so explicitly — deal with the dialog first (computer_upload_file for a chooser, computer_key 'escape' otherwise) instead of retrying the page control.
+- KEEP ONE BROWSER, FEW TABS: computer_navigate reuses the tab that is in front and prunes blank/duplicate/cold ones, and inspection describes that same active tab. Do not open a tab per step (pass newTab only when you must keep the current page beside the new one); a wall of tabs is how earlier runs ended up inspecting one page while clicking another and looping until the convergence guard fired.
 - `computer_terminal` is container-local command execution, not visual input and not a host shell. Use it for installs, files, diagnostics, asset preparation and genuine CLI programs; reserve computer_type for actual GUI fields. It may not drive a browser through Playwright/Selenium/headless/CDP/xdotool. A broken screenshot is not permission to replace website interaction with a script. Vault/account placeholders are intentionally unavailable in terminal commands because arbitrary stdout could reveal them; enter secrets only through computer_type's one-way substitution.
 - Desktop readiness is automatic before the first visual/browser action for EACH agent-owned computer; ensure_desktop_ready is also available for an explicit diagnostic. It self-heals Docker and rebuilds/recreates stale or incomplete desktop shells/VNC. Structured browser inspection is optional: if CDP is unavailable, continue visibly with screenshot, OCR, mouse and keyboard tools rather than treating the desktop as broken or switching to host scripts.
 - EMAIL is built in: use the native klivemail tool (op:create_mailbox / list_messages / get_message / wait_for_code). It drives the live KliveMail service in-process with no HTTP call, auth header, password, reflection, desktop script, or DNS diagnosis. Give account mailboxes a stable `purpose` (for example `tiktok-signup`), then keep the canonical mailbox returned by op:create_mailbox and pass that exact address and purpose to both the website and op:wait_for_code.
@@ -581,6 +584,40 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
             object ProjectStr(string desc) => new { type = "string", description = desc };
             object ProjectNum(string desc) => new { type = "integer", description = desc };
             object ProjectBool(string desc) => new { type = "boolean", description = desc };
+            // The shared catalogue describes the host controller's browser. A Project desktop's
+            // browser is a single supervised Chromium the harness also keeps tidy, so these two
+            // definitions are replaced with ones that state what actually happens here.
+            void Replace(string name, HFWrapper.HFTool replacement)
+            {
+                tools.RemoveAll(t => t.function.name == name);
+                tools.Add(replacement);
+            }
+            Replace("computer_navigate", Tool("computer_navigate",
+                "Navigate the visible browser and observe the result. By default this REUSES the tab that is already in front (the one inspection and screenshots describe) rather than stacking a new one, and it automatically closes blank, duplicate and long-cold tabs. Pass newTab only when you genuinely need to keep the current page open beside the new one.",
+                ProjectObj(new
+                {
+                    url = ProjectStr("Absolute http(s) URL."),
+                    newTab = ProjectBool("Open a second tab instead of reusing the active one. Default false."),
+                    tabIndex = ProjectNum("Optional tab to drive, from computer_browser_inspect(mode:'tabs'); omit for the active tab."),
+                }, "url")));
+            Replace("computer_browser_inspect", Tool("computer_browser_inspect",
+                "Inspect the isolated browser structurally instead of guessing from pixels. Returns indexed tabs, DOM text/links/forms/fileInputs, accessibility nodes, or recent network resource timings — for the ACTIVE tab unless you name a tabIndex. It also reports any native (GTK) dialog blocking the page, which the DOM cannot see. Input values are never returned.",
+                ProjectObj(new
+                {
+                    mode = ProjectStr("tabs | dom | accessibility | network (default dom)"),
+                    maxItems = ProjectNum("Maximum structured items, 1-200; default 80"),
+                    tabIndex = ProjectNum("0-based index from mode=tabs; omit for the tab that is in front"),
+                })));
+            tools.Add(Tool("computer_upload_file",
+                "Attach a file from THIS desktop container to a website's upload control, and observe the result. Use it for every upload. If the browser's native file chooser is already open it types the path into that dialog and confirms it; otherwise it attaches the file straight to the page's file input (including the hidden inputs behind styled 'Upload' buttons, which no click can reach) and fires the same change event a manual selection would. Uploading NEVER requires Klives — do not request human help for a file dialog. Afterwards, complete the site's own submit/publish step yourself.",
+                ProjectObj(new
+                {
+                    path = ProjectStr("Absolute path INSIDE the desktop container, e.g. /project/render/day24.mp4."),
+                    paths = new { type = "array", items = ProjectStr("Absolute container path"), description = "Several files for one multi-file input." },
+                    name = ProjectStr("Optional name/id/aria-label fragment of the target file input when a page has more than one."),
+                    occurrence = ProjectNum("Zero-based occurrence among matching file inputs; default 0."),
+                    tabIndex = ProjectNum("Optional tab index; omit for the active tab."),
+                }, "path")));
             tools.Add(Tool("computer_click_browser_control", "Locate a visible browser control by its accessible name/role/tag using read-only DOM geometry, reject disabled or overlay-intercepted targets, then click it with the real VNC mouse. This is the structured browser action for text agents and custom controls such as role=combobox; it never invokes a page event through CDP. Re-inspect after the click to verify state.", ProjectObj(new
             {
                 name = ProjectStr("Accessible name or visible text to match; optional when role/tag is sufficient."),

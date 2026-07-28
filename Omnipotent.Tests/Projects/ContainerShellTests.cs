@@ -236,11 +236,63 @@ namespace Omnipotent.Tests.Projects
         [Fact]
         public void BrowserInspection_HumanChallengeIsElevatedBeforeAgentRetries()
         {
-            string result = ContainerToolAdapter.AnnotateHumanChallenge(
+            string result = ContainerToolAdapter.AnnotateInspection(
                 "{\"title\":\"Verify\",\"humanChallenge\":{\"detected\":true,\"signals\":[\"captcha\"]}}");
 
             Assert.StartsWith("HUMAN_CHALLENGE_DETECTED", result);
             Assert.Contains("Do not retry", result);
+        }
+
+        [Fact]
+        public void BrowserInspection_NativeFileDialogIsNamedWithTheToolThatClearsIt()
+        {
+            // The GTK chooser is invisible to the DOM, so an agent sees a page that simply stopped
+            // responding. Inspection has to say what is blocking it and what clears it.
+            string result = ContainerToolAdapter.AnnotateInspection(
+                "{\"title\":\"Upload\",\"nativeDialog\":{\"open\":true,\"fileChooser\":true,\"windows\":[{\"id\":\"0x1\",\"title\":\"Open File\",\"kind\":\"file-chooser\"}]}}");
+
+            Assert.StartsWith("NATIVE_FILE_DIALOG_OPEN", result);
+            Assert.Contains("computer_upload_file", result);
+            Assert.Contains("never ask Klives", result);
+        }
+
+        [Fact]
+        public void BrowserInspection_NonChooserDialogGetsItsOwnInstruction()
+        {
+            string result = ContainerToolAdapter.AnnotateInspection(
+                "{\"nativeDialog\":{\"open\":true,\"fileChooser\":false,\"windows\":[{\"id\":\"0x1\",\"title\":\"Print\",\"kind\":\"dialog\"}]}}");
+
+            Assert.StartsWith("NATIVE_DIALOG_OPEN", result);
+            Assert.Contains("escape", result);
+        }
+
+        [Fact]
+        public void BrowserInspection_QuietPageIsNotAnnotated()
+        {
+            string json = "{\"title\":\"Home\",\"nativeDialog\":{\"open\":false,\"fileChooser\":false,\"windows\":[]}}";
+
+            Assert.Equal(json, ContainerToolAdapter.AnnotateInspection(json));
+        }
+
+        [Fact]
+        public void Navigation_ReportsTabReuseAndAutomaticPruning()
+        {
+            string result = ContainerToolAdapter.DescribeNavigation(
+                "{\"reusedTab\":true,\"url\":\"https://example.com/upload\",\"title\":\"Upload\",\"tabIndex\":0,\"tabCount\":2," +
+                "\"closedTabs\":[{\"url\":\"about:blank\"},{\"url\":\"https://example.com/upload\"}]}",
+                "https://example.com/upload");
+
+            Assert.Contains("Navigated the active browser tab", result);
+            Assert.Contains("tab 0 of 2", result);
+            Assert.Contains("Closed 2", result);
+        }
+
+        [Fact]
+        public void Navigation_FallsBackToPlainTextWhenTheHelperOutputIsUnreadable()
+        {
+            string result = ContainerToolAdapter.DescribeNavigation("not json", "https://example.com/");
+
+            Assert.Equal("Navigated to https://example.com/.", result);
         }
 
         [Fact]

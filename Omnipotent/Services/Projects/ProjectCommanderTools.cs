@@ -846,6 +846,11 @@ namespace Omnipotent.Services.Projects
                         return FailedResult(
                             "INFRASTRUCTURE_REQUEST_REJECTED: an LLM provider rate limit or temporary provider failure is retried automatically. " +
                             "It does not make project tools or files inaccessible, so do not ask Klives to read files or perform work. Continue independent work and let the retry circuit recover.");
+                    if (ProjectUploadCapability.IsFileDialogRescueRequest(what, title, rationale))
+                        return FailedResult(
+                            "UPLOAD_IS_NOT_HUMAN_ONLY: a browser file dialog is a tool call, not an obstacle for Klives. " +
+                            "Call computer_upload_file with the file's container path (path:'/project/...'): if the native chooser is already open it types the path into that dialog's location bar and confirms it, and otherwise it attaches the file to the page's own file input — including the hidden input behind a styled upload button. " +
+                            "Do it yourself, then finish the site's submit/publish step. Only CAPTCHA and SMS/phone verification are human-only.");
                     if (title.Length > 0) what = title + ": " + what;
                     if (rationale.Length > 0) what += "\nWhy a human is required: " + rationale;
                     if (RequestHumanAsync == null)

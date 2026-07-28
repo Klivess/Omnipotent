@@ -183,8 +183,17 @@ namespace Omnipotent.Services.Projects.Containers
             url="${1:-}"
             cdp_up() { python3 -c 'import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:9222/json/version", timeout=1).read()' >/dev/null 2>&1; }
             wait_cdp() { for i in $(seq 1 60); do cdp_up && return 0; sleep 0.25; done; return 1; }
+            # Reuse the tab that is already in front instead of stacking a new one per navigation.
+            # Chromium's only HTTP navigation endpoint (/json/new) always creates a tab, which is how
+            # a desktop ended up with 15+ of them and agents started acting on stale pages. The
+            # helper drives the foreground tab over CDP and prunes blank/duplicate/cold tabs; the
+            # PUT remains as the fallback when the helper is unavailable.
             open_url() {
               [ -z "$url" ] && return 0
+              payload=$(python3 -c 'import base64,json,sys; print(base64.urlsafe_b64encode(json.dumps({"url":sys.argv[1],"maxTabs":6}).encode()).decode().rstrip("="))' "$url" 2>/dev/null)
+              if [ -n "$payload" ] && python3 /usr/local/bin/browser-inspect.py navigate "$payload" >/dev/null 2>&1; then
+                return 0
+              fi
               python3 -c 'import sys,urllib.parse,urllib.request; u="http://127.0.0.1:9222/json/new?"+urllib.parse.quote(sys.argv[1],safe=""); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(urllib.request.Request(u,method="PUT"),timeout=3).read()' "$url"
             }
             focus_browser() { wmctrl -a Chromium >/dev/null 2>&1 || true; wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true; }

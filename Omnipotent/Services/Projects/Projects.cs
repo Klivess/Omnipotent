@@ -135,7 +135,14 @@ namespace Omnipotent.Services.Projects
             EventLog.EventAppended += Retrieval.Ingest;
             WakeCycle = new ProjectWakeCycle(EventLog, Digests, Retrieval);
             WakeCycle.DescribeFiles = pid => Files.DescribeForPrompt(pid);
-            WakeCycle.DescribeRuntimeState = pid => RuntimeState.DescribeForWake(pid);
+            WakeCycle.DescribeRuntimeState = pid =>
+            {
+                // Before seeding negative knowledge into a wake, drop the entries a shipped capability
+                // has invalidated — otherwise a project keeps being told that uploading is impossible.
+                try { RuntimeState.RetireObsoleteDeadEnds(pid); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: dead-end retirement failed for {pid}"); }
+                return RuntimeState.DescribeForWake(pid);
+            };
             WakeCycle.DescribeDirectives = (pid, trigger) => Directives.DescribeForPrompt(pid, "commander",
                 ProjectDirectiveStore.TryExtractDirectiveID(trigger));
             WakeCycle.DescribeKliveAgentContextAsync = DescribeKliveAgentContextAsync;

@@ -39,6 +39,72 @@ public sealed class ProjectDeadEndLedgerTests : IDisposable
     }
 
     [Fact]
+    public void FileDialogDeadEnd_IsRetiredOnceTheHarnessCanDriveTheDialog()
+    {
+        var store = NewStore();
+        const string pid = "p1";
+        store.RecordFailedApproach(pid, new ProjectFailedApproach
+        {
+            Key = "upload:gtk3-file-dialog",
+            Approach = "7+ automated bypasses of the GTK3 file dialog",
+            Outcome = "permanent blocker — a manual VNC click on Open is still required for each upload",
+        });
+        // A dead end about the world, not about a harness gap, must survive untouched.
+        store.RecordFailedApproach(pid, new ProjectFailedApproach
+        {
+            Key = "upload:api",
+            Approach = "POST the video to the platform's private upload endpoint",
+            Outcome = "403; the endpoint is signed and cannot be called outside the web app",
+        });
+
+        var result = store.RetireObsoleteDeadEnds(pid);
+
+        Assert.True(result.Applied);
+        var survivor = Assert.Single(store.GetActiveFailedApproaches(pid));
+        Assert.Equal("upload:api", survivor.Key);
+        string seeded = store.DescribeForWake(pid);
+        Assert.DoesNotContain("gtk3-file-dialog", seeded, StringComparison.OrdinalIgnoreCase);
+        // The retired entry keeps its history, and says what replaced it.
+        var retired = Assert.Single(store.Get(pid).Checkpoint.FailedApproaches, x => x.Key == "upload:gtk3-file-dialog");
+        Assert.Contains("computer_upload_file", retired.ResolutionReason);
+    }
+
+    [Fact]
+    public void DeadEndRetirement_IsIdempotentAndWriteFreeWhenNothingMatches()
+    {
+        var store = NewStore();
+        const string pid = "p1";
+        store.RecordFailedApproach(pid, new ProjectFailedApproach
+        {
+            Key = "upload:gtk3-file-dialog",
+            Approach = "clicking Open in the native file chooser with OCR",
+            Outcome = "cannot be automated",
+        });
+
+        Assert.True(store.RetireObsoleteDeadEnds(pid).Applied);
+        long revision = store.Get(pid).Revision;
+
+        Assert.False(store.RetireObsoleteDeadEnds(pid).Applied);
+        Assert.Equal(revision, store.Get(pid).Revision);
+    }
+
+    [Fact]
+    public void CaptchaDeadEnd_IsNeverRetiredByTheUploadCapability()
+    {
+        var store = NewStore();
+        const string pid = "p1";
+        store.RecordFailedApproach(pid, new ProjectFailedApproach
+        {
+            Key = "signup:captcha",
+            Approach = "solving the upload page's captcha dialog automatically",
+            Outcome = "blocked — human verification is required",
+        });
+
+        Assert.False(store.RetireObsoleteDeadEnds(pid).Applied);
+        Assert.Single(store.GetActiveFailedApproaches(pid));
+    }
+
+    [Fact]
     public void RepeatedAttempt_IncrementsRatherThanDuplicating()
     {
         var store = NewStore();

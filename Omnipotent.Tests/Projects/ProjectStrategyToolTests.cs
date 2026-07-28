@@ -358,6 +358,45 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task FileDialogRescue_IsAnsweredWithTheUploadToolInsteadOfPingingKlives()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            int deliveries = 0;
+            s.Tools.RequestHumanAsync = _ => { deliveries++; return Task.CompletedTask; };
+
+            var result = await s.Tools.DispatchAsync("request_human", JsonConvert.SerializeObject(new
+            {
+                title = "GTK3 file dialog (permanent blocker)",
+                description = "When you're in VNC, could you click Open at ~(1135, 730) for the Day 24 upload? " +
+                              "7+ automated bypasses exhausted; manual VNC click still required for each upload.",
+            }), CancellationToken.None);
+
+            Assert.False(result.Succeeded);
+            Assert.Contains("UPLOAD_IS_NOT_HUMAN_ONLY", result.ResultText);
+            Assert.Contains("computer_upload_file", result.ResultText);
+            Assert.Equal(0, deliveries);
+            Assert.DoesNotContain(s.Log.ReadSince(s.Project.ProjectID, 0),
+                e => e.Type == ProjectEventTypes.HumanAssistanceRequested);
+        }
+
+        [Fact]
+        public async Task CaptchaRequest_StillReachesKlivesEvenWhenAnUploadIsMentioned()
+        {
+            var s = NewSetup(ProjectStatus.Active);
+            int deliveries = 0;
+            s.Tools.RequestHumanAsync = _ => { deliveries++; return Task.CompletedTask; };
+
+            var result = await s.Tools.DispatchAsync("request_human", JsonConvert.SerializeObject(new
+            {
+                title = "Captcha on the upload page",
+                description = "A hCaptcha challenge is blocking the upload form; please solve it in VNC.",
+            }), CancellationToken.None);
+
+            Assert.True(result.Succeeded);
+            Assert.Equal(1, deliveries);
+        }
+
+        [Fact]
         public async Task IndefiniteAccountOperation_CannotBeCompletedAfterInitialSetup()
         {
             var s = NewSetup(ProjectStatus.Active, "Run and grow a TikTok account continuously");

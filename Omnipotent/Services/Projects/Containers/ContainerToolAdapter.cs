@@ -54,9 +54,19 @@ namespace Omnipotent.Services.Projects.Containers
             "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
             "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all", "computer_wait",
             "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
+            "computer_upload_file",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };
+
+        /// <summary>
+        /// How many browser tabs a desktop may keep. Chromium opens a new tab for every navigation,
+        /// so an unmanaged desktop reached 15+ tabs; past that, structured inspection and the visible
+        /// window disagreed about which page was live and agents looped on stale pages. Navigation
+        /// now reuses the foreground tab, and anything blank, duplicated or cold beyond this cap is
+        /// closed automatically.
+        /// </summary>
+        internal const int MaxBrowserTabs = 6;
 
         public ComputerCapabilities Capabilities { get; } = new()
         {
@@ -221,11 +231,13 @@ namespace Omnipotent.Services.Projects.Containers
                 case "computer_open_browser":
                     return await OpenBrowserAsync(Str(a, "url"), ct);
                 case "computer_navigate":
-                    return await MutateAsync("Browser navigated.", () => desktop.NavigateAsync(Str(a, "url") ?? throw new ArgumentException("Provide 'url'."), ct), ct, settleMs: 1000);
+                    return await NavigateAsync(a, ct);
                 case "computer_browser_inspect":
                     return await BrowserInspectAsync(a, ct);
                 case "computer_click_browser_control":
                     return await ClickBrowserControlAsync(a, ct);
+                case "computer_upload_file":
+                    return await UploadFileAsync(a, ct);
                 case "computer_focus_window":
                     return await MutateAsync("Desktop application focused.", () => desktop.FocusAsync(Str(a, "titleContains"), Str(a, "processName"), ct), ct);
                 case "computer_launch_app":
@@ -276,14 +288,16 @@ namespace Omnipotent.Services.Projects.Containers
             if (mode is not ("tabs" or "dom" or "accessibility" or "network"))
                 return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.", ContainerToolFailureKind.Validation);
             int maxItems = Math.Clamp(Int(a, "maxItems", 80), 1, 200);
-            int tabIndex = Math.Clamp(Int(a, "tabIndex", 0), 0, 200);
+            // -1 means "whatever tab is actually in front". An explicit 0 used to be the default, so
+            // every inspection after a couple of navigations described a stale background page.
+            int tabIndex = RequestedTabIndex(a);
             ContainerShellResult? last = null;
             for (int attempt = 1; attempt <= 3; attempt++)
             {
-                last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 30, ct);
+                last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 45, ct);
                 string stdout = last.Stdout.Trim();
                 if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
-                    return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateHumanChallenge(stdout), 24000));
+                    return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
                 await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
             }
             string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
@@ -292,21 +306,317 @@ namespace Omnipotent.Services.Projects.Containers
                 ComputerAudit.Truncate(detail, 1600) + " Continue with visible screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
         }
 
-        internal static string AnnotateHumanChallenge(string inspectionJson)
+        /// <summary>Explicit tab index, or -1 for "the tab in front of the human".</summary>
+        private static int RequestedTabIndex(JsonElement a) =>
+            HasInt(a, "tabIndex") ? Math.Clamp(Int(a, "tabIndex", -1), -1, 200) : -1;
+
+        internal static string AnnotateInspection(string inspectionJson)
         {
             try
             {
                 using var document = JsonDocument.Parse(inspectionJson);
-                if (document.RootElement.TryGetProperty("humanChallenge", out var challenge)
+                var root = document.RootElement;
+                string banner = "";
+                if (root.ValueKind == JsonValueKind.Object
+                    && root.TryGetProperty("humanChallenge", out var challenge)
                     && challenge.ValueKind == JsonValueKind.Object
                     && challenge.TryGetProperty("detected", out var detected)
                     && detected.ValueKind is JsonValueKind.True)
-                    return "HUMAN_CHALLENGE_DETECTED: CAPTCHA or human verification is visible. " +
-                        "Do not retry automated signup controls; preserve the page and request human verification through the commander.\n" +
-                        inspectionJson;
+                    banner += "HUMAN_CHALLENGE_DETECTED: CAPTCHA or human verification is visible. " +
+                        "Do not retry automated signup controls; preserve the page and request human verification through the commander.\n";
+                if (root.ValueKind == JsonValueKind.Object && NativeDialogBanner(root) is { } dialog) banner += dialog;
+                return banner + inspectionJson;
             }
             catch (JsonException) { }
             return inspectionJson;
+        }
+
+        /// <summary>
+        /// The browser's own GTK dialog is a native X window: no DOM, no accessibility tree, no
+        /// browser-control geometry. An agent that clicked an upload button sees a page that has
+        /// simply stopped responding, which is what produced the repeated "come click Open for me"
+        /// requests. Naming the dialog and the tool that clears it turns a stall into one call.
+        /// </summary>
+        internal static string? NativeDialogBanner(JsonElement root)
+        {
+            if (!root.TryGetProperty("nativeDialog", out var dialog) || dialog.ValueKind != JsonValueKind.Object) return null;
+            if (!dialog.TryGetProperty("open", out var open) || open.ValueKind != JsonValueKind.True) return null;
+            string title = "";
+            if (dialog.TryGetProperty("windows", out var windows) && windows.ValueKind == JsonValueKind.Array
+                && windows.GetArrayLength() > 0 && windows[0].TryGetProperty("title", out var name)
+                && name.ValueKind == JsonValueKind.String)
+                title = ComputerAudit.Truncate(name.GetString() ?? "", 80);
+            bool fileChooser = dialog.TryGetProperty("fileChooser", out var kind) && kind.ValueKind == JsonValueKind.True;
+            return fileChooser
+                ? $"NATIVE_FILE_DIALOG_OPEN: the browser's own file chooser ('{title}') is on screen and is blocking the page. " +
+                  "Call computer_upload_file with the container path of the file (e.g. path:'/project/render/day24.mp4'); it types the path into this dialog and confirms it for you. " +
+                  "Do not hunt for the Open button with OCR, and never ask Klives to click it.\n"
+                : $"NATIVE_DIALOG_OPEN: a browser-owned dialog ('{title}') is on screen and is blocking page input. " +
+                  "Read it in the screenshot and clear it (its visible buttons, or computer_key with key 'escape') before clicking page controls.\n";
+        }
+
+        private static bool IsNativeDialogOpen(string json, bool fileChooserOnly = false)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) return false;
+                var probe = root.TryGetProperty("nativeDialog", out var nested) && nested.ValueKind == JsonValueKind.Object
+                    ? nested : root;
+                string property = fileChooserOnly ? "fileChooser" : "open";
+                return probe.TryGetProperty(property, out var flag) && flag.ValueKind == JsonValueKind.True;
+            }
+            catch (JsonException) { return false; }
+        }
+
+        /// <summary>base64url JSON, so no caller has to quote a URL or a path through a shell.</summary>
+        private static string EncodePayload(object payload) =>
+            Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload)))
+                .TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+        private async Task<(bool Ok, string Stdout, string Error)> RunBrowserHelperAsync(
+            string mode, object payload, int timeoutSeconds, CancellationToken ct)
+        {
+            if (terminalAsync == null) return (false, "", "Structured browser control is unavailable for this desktop.");
+            var run = await terminalAsync(
+                $"python3 /usr/local/bin/browser-inspect.py {mode} {EncodePayload(payload)}", "/project", timeoutSeconds, ct);
+            string stdout = run.Stdout.Trim();
+            if (run.Success && stdout.Length > 0) return (true, stdout, "");
+            return (false, stdout, ComputerAudit.Truncate(string.Join(" ", new[] { run.Stderr, run.Stdout }
+                .Where(x => !string.IsNullOrWhiteSpace(x))).Trim(), 1200));
+        }
+
+        /// <summary>
+        /// Navigate the ONE visible browser session. Chromium's launcher opens a fresh tab for every
+        /// URL; reusing the foreground tab (and pruning what has gone cold) is what keeps the tab the
+        /// agent inspects and the tab the human sees the same page.
+        /// </summary>
+        private async Task<ContainerToolResult> NavigateAsync(JsonElement a, CancellationToken ct)
+        {
+            string url = (Str(a, "url") ?? "").Trim();
+            if (url.Length == 0)
+                return ContainerToolResult.Fail("Provide 'url' — an absolute http(s) URL.", ContainerToolFailureKind.Validation);
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                return ContainerToolResult.Fail("computer_navigate requires an absolute http(s) URL.", ContainerToolFailureKind.Validation);
+
+            // Idempotent supervisor first: it is a no-op when Chromium is already healthy, and it
+            // starts/repairs the session (and focuses its window) when it is not.
+            await desktop.LaunchAsync("browser", null, ct);
+            if (terminalAsync == null)
+                return await MutateAsync("Browser navigated.", () => desktop.NavigateAsync(uri.AbsoluteUri, ct), ct, settleMs: 1000);
+
+            byte[]? before = RecentFrameJpeg();
+            var helper = await RunBrowserHelperAsync("navigate", new
+            {
+                url = uri.AbsoluteUri,
+                newTab = Bool(a, "newTab"),
+                tabIndex = RequestedTabIndex(a),
+                maxTabs = MaxBrowserTabs,
+            }, 120, ct);
+            if (!helper.Ok)
+                return await MutateAsync(
+                    "Browser navigated through the desktop launcher; structured navigation was unavailable (" +
+                    ComputerAudit.Truncate(helper.Error, 400) + "). Inspect mode='tabs' before clicking.",
+                    () => desktop.NavigateAsync(uri.AbsoluteUri, ct), ct, settleMs: 1000);
+
+            await Task.Delay(actionSettleMs, ct);
+            return await ObserveAfterMutationAsync(DescribeNavigation(helper.Stdout, uri.AbsoluteUri), before, ct);
+        }
+
+        internal static string DescribeNavigation(string json, string requestedUrl)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                bool reused = root.TryGetProperty("reusedTab", out var r) && r.ValueKind == JsonValueKind.True;
+                string landed = root.TryGetProperty("url", out var u) && u.ValueKind == JsonValueKind.String
+                    ? u.GetString() ?? requestedUrl : requestedUrl;
+                var text = new StringBuilder();
+                if (NativeDialogBanner(root) is { } banner) text.Append(banner);
+                text.Append(reused ? "Navigated the active browser tab to " : "Opened a new browser tab at ")
+                    .Append(ComputerAudit.Truncate(landed, 300)).Append('.');
+                if (root.TryGetProperty("title", out var t) && t.ValueKind == JsonValueKind.String
+                    && !string.IsNullOrWhiteSpace(t.GetString()))
+                    text.Append($" Page title: '{ComputerAudit.Truncate(t.GetString()!, 120)}'.");
+                if (root.TryGetProperty("tabIndex", out var index) && index.TryGetInt32(out int tabIndex)
+                    && root.TryGetProperty("tabCount", out var count) && count.TryGetInt32(out int tabCount))
+                    text.Append($" This is tab {tabIndex} of {tabCount} open; inspection defaults to it.");
+                if (root.TryGetProperty("closedTabs", out var closed) && closed.ValueKind == JsonValueKind.Array
+                    && closed.GetArrayLength() > 0)
+                    text.Append($" Closed {closed.GetArrayLength()} blank/duplicate/cold tab(s) automatically so the browser stays readable.");
+                return text.ToString();
+            }
+            catch (JsonException)
+            {
+                return $"Navigated to {ComputerAudit.Truncate(requestedUrl, 300)}.";
+            }
+        }
+
+        /// <summary>
+        /// Attach a container file to a website upload. Two routes, tried in the order that keeps
+        /// the work visible: if the browser's native GTK chooser is already on screen it is driven
+        /// with real keystrokes (its location bar takes an absolute path), otherwise the file is
+        /// attached to the page's own file input — including the display:none inputs behind styled
+        /// "Upload" buttons, which no click can reach. Neither route needs a human.
+        /// </summary>
+        private async Task<ContainerToolResult> UploadFileAsync(JsonElement a, CancellationToken ct)
+        {
+            if (terminalAsync == null)
+                return ContainerToolResult.Fail(
+                    "computer_upload_file needs this desktop's container helper, which is unavailable. " +
+                    "Open the site's file picker, then press ctrl+l in the dialog and type the absolute container path followed by enter.",
+                    ContainerToolFailureKind.Infrastructure);
+
+            var paths = new List<string>();
+            if (Str(a, "path") is { } single && !string.IsNullOrWhiteSpace(single)) paths.Add(single.Trim());
+            if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("paths", out var list) && list.ValueKind == JsonValueKind.Array)
+                foreach (var item in list.EnumerateArray())
+                    if (item.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(item.GetString()))
+                        paths.Add(item.GetString()!.Trim());
+            paths = paths.Distinct(StringComparer.Ordinal).ToList();
+            if (paths.Count == 0)
+                return ContainerToolResult.Fail(
+                    "Provide 'path' (or 'paths') — the absolute path INSIDE this desktop container, e.g. /project/render/day24.mp4.",
+                    ContainerToolFailureKind.Validation);
+            if (paths.Count > 8)
+                return ContainerToolResult.Fail("Attach at most 8 files in one call.", ContainerToolFailureKind.Validation);
+            foreach (string path in paths)
+            {
+                if (!path.StartsWith('/'))
+                    return ContainerToolResult.Fail(
+                        $"'{ComputerAudit.Truncate(path, 120)}' is not a container path. Use the absolute path inside this desktop " +
+                        "(the shared workspace is /project), not a Windows host path.", ContainerToolFailureKind.Validation);
+                if (path.Length > 1024 || path.Any(char.IsControl))
+                    return ContainerToolResult.Fail("A file path was too long or contained control characters.", ContainerToolFailureKind.Validation);
+            }
+
+            // One probe answers both questions the routing needs: does the file exist in the
+            // container, and is a native chooser already blocking the page?
+            var probe = await RunBrowserHelperAsync("dialog", new { paths }, 30, ct);
+            if (probe.Ok && MissingUploadPaths(probe.Stdout) is { Count: > 0 } missing)
+                return ContainerToolResult.Fail(
+                    $"Not found inside the desktop container: {ComputerAudit.Truncate(string.Join(", ", missing), 400)}. " +
+                    "Check the path with computer_terminal (ls -l) — files written on the host appear under /project.",
+                    ContainerToolFailureKind.Semantic);
+
+            var notes = new List<string>();
+            bool dialogOpen = probe.Ok && IsNativeDialogOpen(probe.Stdout);
+            if (dialogOpen && paths.Count == 1)
+            {
+                var driven = await DriveFileChooserAsync(paths[0], ct);
+                notes.Add(driven.Note);
+                if (driven.Closed)
+                {
+                    var confirmed = await RunBrowserHelperAsync("upload", new { verifyOnly = true, tabIndex = RequestedTabIndex(a) }, 60, ct);
+                    string verified = confirmed.Ok && AttachedFileCount(confirmed.Stdout) > 0
+                        ? $" The page's file input now holds {AttachedFileCount(confirmed.Stdout)} file(s)."
+                        : " The page did not expose a file input to verify against, so confirm the upload visually in the screenshot.";
+                    return await ObserveAfterMutationAsync(
+                        string.Join(" ", notes) + verified + " Continue the site's own submit/publish step.",
+                        RecentFrameJpeg(), ct);
+                }
+                notes.Add("Falling back to attaching the file directly to the page's file input.");
+            }
+            else if (dialogOpen)
+            {
+                notes.Add("A native file chooser was open; it only accepts one path at a time, so it was dismissed in favour of a direct multi-file attach.");
+            }
+            if (dialogOpen)
+            {
+                // A chooser left open keeps the renderer modal and would overwrite whatever the CDP
+                // route attaches when it finally returns.
+                await transport.KeyChordAsync("escape", ct: ct);
+                await Task.Delay(400, ct);
+                var after = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
+                if (after.Ok && IsNativeDialogOpen(after.Stdout))
+                {
+                    await transport.KeyChordAsync("escape", ct: ct);
+                    await Task.Delay(400, ct);
+                }
+            }
+
+            var attach = await RunBrowserHelperAsync("upload", new
+            {
+                paths,
+                name = Str(a, "name") ?? Str(a, "inputName") ?? "",
+                occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 50),
+                tabIndex = RequestedTabIndex(a),
+            }, 180, ct);
+            if (!attach.Ok)
+                return ContainerToolResult.Fail(
+                    string.Join(" ", notes.Append("Could not attach the file: " + ComputerAudit.Truncate(attach.Error, 900))),
+                    ContainerToolFailureKind.Semantic);
+
+            int attached = AttachedFileCount(attach.Stdout);
+            if (attached == 0)
+                return ContainerToolResult.Fail(
+                    string.Join(" ", notes.Append(
+                        "The file input reported no attached file afterwards. Inspect the page (mode='dom' lists fileInputs) and " +
+                        "pass 'name' to target the right input, or click the site's upload control first and call this tool again while the dialog is open.")),
+                    ContainerToolFailureKind.Semantic);
+
+            notes.Add($"Attached {attached} file(s) to the page's file input ({ComputerAudit.Truncate(string.Join(", ", paths), 300)}); " +
+                      "the page received the same change event as a manual selection. Verify the visible upload state and continue with the site's submit/publish step.");
+            return await ObserveAfterMutationAsync(string.Join(" ", notes), RecentFrameJpeg(), ct);
+        }
+
+        /// <summary>
+        /// Drive Chromium's GTK file chooser from the keyboard. ctrl+l opens its location bar, which
+        /// takes an absolute path — deterministic, unlike hunting the Open button with OCR at a
+        /// coordinate that moves with the dialog. Delete clears GTK's inline completion first, which
+        /// would otherwise submit a neighbouring filename.
+        /// </summary>
+        private async Task<(bool Closed, string Note)> DriveFileChooserAsync(string path, CancellationToken ct)
+        {
+            await RunBrowserHelperAsync("dialog", new { activate = true }, 20, ct);
+            await Task.Delay(300, ct);
+            await transport.KeyChordAsync("ctrl+l", ct: ct);
+            await Task.Delay(250, ct);
+            await transport.TypeTextAsync(path, typingDelayMs, ct);
+            await Task.Delay(250, ct);
+            await transport.KeyChordAsync("delete", ct: ct);
+            await Task.Delay(150, ct);
+            await transport.KeyChordAsync("enter", ct: ct);
+
+            for (int attempt = 1; attempt <= 8; attempt++)
+            {
+                await Task.Delay(500, ct);
+                var state = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
+                if (state.Ok && !IsNativeDialogOpen(state.Stdout))
+                    return (true, "Typed the path into the visible file chooser's location bar and confirmed it; the dialog closed.");
+            }
+            return (false, "The visible file chooser did not close after the path was entered.");
+        }
+
+        private static List<string> MissingUploadPaths(string dialogJson)
+        {
+            var missing = new List<string>();
+            try
+            {
+                using var document = JsonDocument.Parse(dialogJson);
+                if (!document.RootElement.TryGetProperty("files", out var files) || files.ValueKind != JsonValueKind.Array)
+                    return missing;
+                foreach (var file in files.EnumerateArray())
+                    if (file.TryGetProperty("exists", out var exists) && exists.ValueKind == JsonValueKind.False
+                        && file.TryGetProperty("path", out var path) && path.ValueKind == JsonValueKind.String)
+                        missing.Add(path.GetString() ?? "");
+            }
+            catch (JsonException) { }
+            return missing;
+        }
+
+        private static int AttachedFileCount(string uploadJson)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(uploadJson);
+                return document.RootElement.TryGetProperty("attached", out var attached) && attached.TryGetInt32(out int count)
+                    ? count : 0;
+            }
+            catch (JsonException) { return 0; }
         }
 
         private async Task<ContainerToolResult> ClickBrowserControlAsync(JsonElement a, CancellationToken ct)
@@ -322,7 +632,7 @@ namespace Omnipotent.Services.Projects.Containers
                 return ContainerToolResult.Fail("Browser-control selector is too long.", ContainerToolFailureKind.Validation);
 
             int occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 200);
-            int tabIndex = Math.Clamp(Int(a, "tabIndex", 0), 0, 200);
+            int tabIndex = RequestedTabIndex(a);
             string query = JsonSerializer.Serialize(new { name, role, tag, exact = Bool(a, "exact"), occurrence });
             string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(query)).TrimEnd('=')
                 .Replace('+', '-').Replace('/', '_');
@@ -344,6 +654,11 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 using var document = JsonDocument.Parse(located.Stdout);
                 JsonElement root = document.RootElement;
+                // A native (GTK) modal takes the browser's input grab: the page is still fully
+                // inspectable, so the control matches and the click "succeeds" while nothing at all
+                // happens. That mismatch is what turned an upload into a repeat-until-guard loop.
+                if (NativeDialogBanner(root) is { } blocked)
+                    return ContainerToolResult.Fail(blocked.TrimEnd('\n'), ContainerToolFailureKind.Semantic);
                 if (!root.TryGetProperty("match", out var match) || match.ValueKind == JsonValueKind.Null)
                 {
                     string candidates = root.TryGetProperty("candidates", out var sample)

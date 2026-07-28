@@ -140,6 +140,37 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void ProjectComputerTools_OfferAFirstClassUploadPathAndSingleTabNavigation()
+        {
+            var tools = ProjectCommanderAgent.BuildComputerToolDefinitions();
+            var upload = Assert.Single(tools, t => t.function.name == "computer_upload_file");
+            var navigate = Assert.Single(tools, t => t.function.name == "computer_navigate");
+            string uploadSchema = System.Text.Json.JsonSerializer.Serialize(upload.function.parameters);
+            string navigateSchema = System.Text.Json.JsonSerializer.Serialize(navigate.function.parameters);
+
+            // The upload tool has to state that a file dialog is not a human obstacle: agents were
+            // asking Klives to click "Open" in VNC once per upload.
+            Assert.Contains("path", uploadSchema);
+            Assert.Contains("NEVER", upload.function.description);
+            Assert.Contains("file chooser", upload.function.description);
+            // Navigation defaults to the active tab; a new tab is opt-in.
+            Assert.Contains("newTab", navigateSchema);
+            Assert.Contains("REUSES", navigate.function.description);
+        }
+
+        [Fact]
+        public void HostVisualCatalog_DoesNotAdvertiseTheContainerOnlyUploadTool()
+        {
+            var hostNames = VisualComputerToolCatalog.Build(new ComputerCapabilities
+            {
+                SupportsBrowserControl = true,
+                SupportsWindowControl = true,
+            }).Select(t => t.function.name).ToHashSet();
+
+            Assert.DoesNotContain("computer_upload_file", hostNames);
+        }
+
+        [Fact]
         public void PublishedDesktopContext_ContainsEveryDockerCopyDependency()
         {
             string context = Omnipotent.Services.Projects.Containers.ContainerDesktopManager.ResolveBuildContextDirectory();
@@ -160,7 +191,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"7\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"8\"", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
             // The image ships a realistic font set (a thin font list is a browser-fingerprint tell).
             Assert.Contains("fonts-liberation", dockerfile);

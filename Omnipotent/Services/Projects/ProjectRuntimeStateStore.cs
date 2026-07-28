@@ -989,6 +989,40 @@ namespace Omnipotent.Services.Projects
             }, now);
         }
 
+        /// <summary>
+        /// Resolve dead ends whose subject was a harness gap the harness has since closed. A dead end
+        /// is re-seeded into every wake forever — correct for a fact about the world, wrong for one
+        /// about a missing capability. Several projects recorded the browser's native file dialog as a
+        /// permanent blocker while nothing could drive it; computer_upload_file drives it now, so those
+        /// entries would otherwise keep steering agents to ask Klives for a manual VNC click.
+        /// Idempotent and write-free once there is nothing left to match.
+        /// </summary>
+        public ProjectRuntimeMutationResult RetireObsoleteDeadEnds(string projectID, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            var current = Get(projectID);
+            bool anyMatch = current.Checkpoint.FailedApproaches
+                .Any(x => x.IsActiveAt(now) && ProjectUploadCapability.DescribesFileDialogBlocker(
+                    x.Key, x.Approach, x.Outcome, x.Instead));
+            if (!anyMatch) return new ProjectRuntimeMutationResult(false, current);
+            return MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                bool changed = false;
+                foreach (var entry in checkpoint.FailedApproaches)
+                {
+                    if (!entry.IsActiveAt(now) || !ProjectUploadCapability.DescribesFileDialogBlocker(
+                            entry.Key, entry.Approach, entry.Outcome, entry.Instead)) continue;
+                    entry.ResolvedAt = now;
+                    entry.ResolutionReason =
+                        "Superseded by a harness capability: computer_upload_file drives the browser's native file " +
+                        "chooser (ctrl+l, absolute container path, confirm) and otherwise attaches the file to the " +
+                        "page's own file input. Uploading no longer needs a human — retry it yourself.";
+                    changed = true;
+                }
+                return new(changed, changed);
+            }, now);
+        }
+
         public List<ProjectFailedApproach> GetActiveFailedApproaches(string projectID, DateTime? nowUtc = null)
         {
             // Same reasoning as GetFreshVerifiedFacts: RetryNotBefore expires on wall-clock alone.
