@@ -56,7 +56,7 @@ COPY klive-fp-patch.js /usr/local/share/klive-fp/patch.js
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"8","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","browser-upload","tab-hygiene","native-dialog-detect","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
+    '{"imageVersion":"9","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent

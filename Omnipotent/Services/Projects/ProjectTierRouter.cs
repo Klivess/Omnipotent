@@ -50,6 +50,7 @@ namespace Omnipotent.Services.Projects
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
             "complete_project", "request_user_approval", "request_budget_increase", "request_human", "retire_sub_agent", "assign_plan_work", "record_money_spend",
+            "update_project", "update_plan_progress",
             // Klives talks to the Commander, not to the roster: a worker reports upward with
             // send_agent_message and the Commander decides what reaches him.
             "reply_to_klives",
@@ -66,7 +67,7 @@ namespace Omnipotent.Services.Projects
             "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag",
             "computer_mouse_down", "computer_mouse_up", "computer_scroll", "computer_type",
             "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
-            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
+            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_upload_file",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
@@ -76,38 +77,53 @@ namespace Omnipotent.Services.Projects
             "ensure_desktop_ready",
         };
 
-        /// <summary>Desktop operations whose observations are useful without raw image
-        /// perception. Cheap text workers can therefore own a real computer through OCR,
-        /// accessibility/DOM inspection and bounded terminal output.</summary>
-        private static readonly HashSet<string> StructuredDesktopTools = new(StringComparer.Ordinal)
+        internal static IReadOnlySet<string> KnownComputerToolNames => ComputerTools;
+
+        /// <summary>
+        /// The only Project computer operation whose result has no useful text representation.
+        /// Everything else is available without model image input: OCR supplies screen text and
+        /// coordinates, DOM/accessibility supplies browser targets, and all pointer/keyboard
+        /// operations can consume coordinates discovered by those structured observations.
+        /// </summary>
+        private static readonly HashSet<string> ImagePerceptionTools = new(StringComparer.Ordinal)
         {
-            "computer_find_text", "computer_click_text", "computer_window_state",
-            "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all",
-            "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control",
-            "computer_upload_file",
-            "computer_focus_window", "computer_launch_app", "computer_terminal",
-            "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action",
-            "ensure_desktop_ready",
+            "computer_screenshot",
         };
 
         /// <summary>
-        /// Image-capable tiers receive the complete visual surface. Text-only tiers receive the
-        /// structured subset whose OCR/DOM/terminal observations do not require raw pixels.
+        /// Image-capable tiers receive raw screenshots only when the project/model image channel is
+        /// actually enabled. Every tier receives every operation that has a text/structured
+        /// observation path, including coordinate actions whose points came from OCR or DOM.
         /// </summary>
-        public bool IsToolAllowed(ProjectAgentTier tier, string toolName)
+        public bool IsToolAllowed(ProjectAgentTier tier, string toolName, bool visionEnabled)
         {
             if (TextTierTools.Contains(toolName)) return true;
             if (ComputerTools.Contains(toolName))
             {
-                return tier switch
-                {
-                    ProjectAgentTier.TextImage or ProjectAgentTier.TextImageVideo or ProjectAgentTier.TextImageVideoAudio => true,
-                    ProjectAgentTier.Text => StructuredDesktopTools.Contains(toolName),
-                    _ => false,
-                };
+                if (!RequiresImagePerception(toolName)) return true;
+                return visionEnabled && tier is ProjectAgentTier.TextImage
+                    or ProjectAgentTier.TextImageVideo
+                    or ProjectAgentTier.TextImageVideoAudio;
             }
             return false;
         }
+
+        /// <summary>Compatibility overload for callers asking about the tier's maximum capability.</summary>
+        public bool IsToolAllowed(ProjectAgentTier tier, string toolName) =>
+            IsToolAllowed(tier, toolName, visionEnabled: tier != ProjectAgentTier.Text);
+
+        /// <summary>True only for calls whose model-facing result is raw pixels with no text equivalent.</summary>
+        public static bool RequiresImagePerception(string toolName) => ImagePerceptionTools.Contains(toolName);
+
+        /// <summary>
+        /// Tools that can remain productive while the VNC framebuffer is unavailable. They use
+        /// Docker exec/CDP against the same visible persistent browser or return textual process
+        /// state. Their optional post-action screenshot is best-effort.
+        /// </summary>
+        public static bool CanRunWithoutFramebuffer(string toolName) => toolName is
+            "computer_terminal" or "computer_window_state" or
+            "computer_open_browser" or "computer_navigate" or
+            "computer_browser_inspect" or "computer_browser_action";
 
         /// <summary>Commander-only tools (complete_project, budget increase) are gated out of sub-agent loops.</summary>
         public static bool IsCommanderOnly(string toolName) => CommanderOnlyTools.Contains(toolName);

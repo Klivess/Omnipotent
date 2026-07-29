@@ -102,7 +102,7 @@ namespace Omnipotent.Services.ComputerControl
             "text", "value", "password", "secret", "token", "authorization", "cookie", "clipboard",
             // Terminal input can contain inline credentials. Its exact body belongs neither in
             // the event log nor the audit summary (vault placeholders are not resolved here).
-            "command"
+            "command", "script", "javascript"
         };
 
         public static string Describe(string toolName, string? argumentsJson, int max = 220)
@@ -143,7 +143,16 @@ namespace Omnipotent.Services.ComputerControl
     {
         private static readonly SemaphoreSlim OcrGate = new(1, 1);
         private static TesseractEngine? ocrEngine;
-        private static bool ocrUnavailable;
+        private static DateTime ocrRetryAfterUtc;
+        private static string? ocrLastError;
+
+        /// <summary>Distinguishes a blank screen from a temporarily unavailable local OCR
+        /// dependency without exposing captured content or filesystem paths.</summary>
+        public static string OcrStatus => ocrEngine != null
+            ? "ready"
+            : DateTime.UtcNow < ocrRetryAfterUtc
+                ? "temporarily unavailable: " + (ocrLastError ?? "OCR initialization failed")
+                : "not initialized";
 
         public static byte[] AddCoordinateGrid(byte[] jpeg, int step = 100)
         {
@@ -221,8 +230,33 @@ namespace Omnipotent.Services.ComputerControl
             if (imageBytes == null || imageBytes.Length == 0) return Array.Empty<ComputerTextMatch>();
             string needle = CompactText(text);
             if (needle.Length == 0) return Array.Empty<ComputerTextMatch>();
+            var words = await ReadWordsAsync(imageBytes, ct);
+            return MatchWords(words, needle);
+        }
+
+        /// <summary>
+        /// Reads every OCR text row from a screen frame and returns its text plus framebuffer
+        /// coordinates. This is the model-independent screen reader used by text-only Project
+        /// agents: it exposes what is written on an ordinary GUI without attaching raw pixels to
+        /// the model. Rows are ordered top-to-bottom and then left-to-right.
+        /// </summary>
+        public static async Task<IReadOnlyList<ComputerTextMatch>> ReadTextAsync(
+            byte[] imageBytes, CancellationToken ct = default)
+        {
+            if (imageBytes == null || imageBytes.Length == 0) return Array.Empty<ComputerTextMatch>();
+            var words = await ReadWordsAsync(imageBytes, ct);
+            return GroupRows(words)
+                .Where(row => row.Count > 0)
+                .Select(BuildMatch)
+                .OrderBy(line => line.Y)
+                .ThenBy(line => line.X)
+                .ToList();
+        }
+
+        private static async Task<List<OcrWord>> ReadWordsAsync(byte[] imageBytes, CancellationToken ct)
+        {
             var engine = await GetOcrEngineAsync(ct);
-            if (engine == null) return Array.Empty<ComputerTextMatch>();
+            if (engine == null) return new List<OcrWord>();
             await OcrGate.WaitAsync(ct);
             try
             {
@@ -245,9 +279,18 @@ namespace Omnipotent.Services.ComputerControl
                             iter.GetConfidence(PageIteratorLevel.Word)));
                     } while (iter.Next(PageIteratorLevel.Word));
                 }
-                return MatchWords(words, needle);
+                return words;
             }
-            catch { return Array.Empty<ComputerTextMatch>(); }
+            catch (Exception ex)
+            {
+                // A failed engine must not be reported as a genuinely blank screen forever. Drop
+                // it, surface a bounded status, and allow a clean re-probe after the cooldown.
+                try { ocrEngine?.Dispose(); } catch { }
+                ocrEngine = null;
+                ocrLastError = ex.GetType().Name + ": " + ComputerAudit.Truncate(ex.Message, 160);
+                ocrRetryAfterUtc = DateTime.UtcNow.AddMinutes(2);
+                return new List<OcrWord>();
+            }
             finally { OcrGate.Release(); }
         }
 
@@ -419,21 +462,30 @@ namespace Omnipotent.Services.ComputerControl
         private static async Task<TesseractEngine?> GetOcrEngineAsync(CancellationToken ct)
         {
             if (ocrEngine != null) return ocrEngine;
-            if (ocrUnavailable) return null;
+            if (DateTime.UtcNow < ocrRetryAfterUtc) return null;
             await OcrGate.WaitAsync(ct);
             try
             {
                 if (ocrEngine != null) return ocrEngine;
+                if (DateTime.UtcNow < ocrRetryAfterUtc) return null;
                 string dataDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniscienceDirectory), "ocr", "tessdata");
                 if (!File.Exists(Path.Combine(dataDir, "eng.traineddata")))
                 {
-                    ocrUnavailable = true;
+                    ocrLastError = "English OCR data is not installed";
+                    ocrRetryAfterUtc = DateTime.UtcNow.AddMinutes(2);
                     return null;
                 }
                 ocrEngine = new TesseractEngine(dataDir, "eng", EngineMode.Default);
+                ocrLastError = null;
+                ocrRetryAfterUtc = default;
                 return ocrEngine;
             }
-            catch { ocrUnavailable = true; return null; }
+            catch (Exception ex)
+            {
+                ocrLastError = ex.GetType().Name + ": " + ComputerAudit.Truncate(ex.Message, 160);
+                ocrRetryAfterUtc = DateTime.UtcNow.AddMinutes(2);
+                return null;
+            }
             finally { OcrGate.Release(); }
         }
     }

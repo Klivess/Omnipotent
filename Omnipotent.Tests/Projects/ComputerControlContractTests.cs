@@ -105,13 +105,15 @@ namespace Omnipotent.Tests.Projects
             string script = File.ReadAllText(scriptPath);
             Assert.Contains("Accessibility.getFullAXTree", script);
             Assert.Contains("performance.getEntriesByType", script);
-            Assert.DoesNotContain("x.value", script);
+            // Structured actions may compare an option's value to select it, but inspection must
+            // expose only presence and redact value-shaped script results.
+            Assert.Contains("hasValue", script);
+            Assert.Contains("SENSITIVE_RESULT_KEY", script);
             var inspect = VisualComputerToolCatalog.Build(new ComputerCapabilities { SupportsBrowserControl = true })
                 .Single(t => t.function.name == "computer_browser_inspect");
             Assert.Contains("tabIndex", System.Text.Json.JsonSerializer.Serialize(inspect.function.parameters));
             Assert.Contains("interceptedBy", script);
             Assert.Contains("elementFromPoint", script);
-            Assert.DoesNotContain("Input.dispatch", script);
         }
 
         [Fact]
@@ -191,8 +193,9 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"8\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"9\"", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
+            Assert.Contains("\"structured-browser-actions\"", dockerfile);
             // The image ships a realistic font set (a thin font list is a browser-fingerprint tell).
             Assert.Contains("fonts-liberation", dockerfile);
             Assert.Contains("fonts-noto-color-emoji", dockerfile);

@@ -1167,6 +1167,22 @@ namespace Omnipotent.Services.Projects
             if (interactionViolation != null)
                 return new CommanderToolResult(interactionViolation) { Succeeded = false };
 
+            if (toolName.StartsWith("computer_", StringComparison.Ordinal)
+                || toolName == "ensure_desktop_ready")
+            {
+                var actor = SubAgents.ListActive(project.ProjectID)
+                    .FirstOrDefault(a => string.Equals(a.AgentID, actingAgentID, StringComparison.OrdinalIgnoreCase));
+                ProjectAgentTier tier = actor?.Tier ??
+                    (string.Equals(actingAgentID, "commander", StringComparison.OrdinalIgnoreCase)
+                        ? ProjectAgentTier.TextImageVideo
+                        : ProjectAgentTier.Text);
+                if (!TierRouter.IsToolAllowed(tier, toolName, projectSettings.VisionEnabled))
+                    return new CommanderToolResult(
+                        $"CAPABILITY_NOT_AVAILABLE: '{toolName}' requires raw image input, which is disabled for {actingAgentID}. " +
+                        "Use browser/desktop structured inspection, OCR, window state and CLI operations instead.")
+                    { Succeeded = false };
+            }
+
             if (toolName is "computer_confirm_action" or "computer_confirm_and_click")
                 return await DispatchComputerConfirmationAsync(project, actingAgentID, wakeID, toolName, argsJson, ct);
             if (toolName is "ensure_desktop_ready")
@@ -1363,11 +1379,20 @@ namespace Omnipotent.Services.Projects
             if (!OperatingSystem.IsWindows())
                 return new CommanderToolResult("Desktop control is only wired for the Windows host build.") { Succeeded = false };
 
-            // The preflight is a harness invariant, not prompt advice. The first visual/browser
-            // operation for each agent automatically proves that its own container is current and
-            // complete. CDP is deliberately not part of this gate: optional structured inspection
-            // must never block screenshots, OCR, mouse, or keyboard control of a visible browser.
-            if (toolName != "computer_terminal")
+            // Framebuffer-independent tools bootstrap/provision the current container image but do
+            // not wait for VNC. This keeps terminal and CDP control useful through a framebuffer
+            // outage. OCR/pointer/screenshot tools still receive the full self-healing desktop gate.
+            bool framebufferIndependent = ProjectTierRouter.CanRunWithoutFramebuffer(toolName);
+            if (framebufferIndependent)
+            {
+                string? bootstrap = await Desktops.TryBootstrapAsync(
+                    Settings.Get(project.ProjectID).DesktopImage, ct);
+                if (bootstrap != null)
+                    return new CommanderToolResult(
+                        "Container runtime is not ready for this structured operation: " + bootstrap)
+                    { Succeeded = false };
+            }
+            else
             {
                 string factKey = DesktopReadyFactKey(actingAgentID);
                 bool ready = RuntimeState.GetFreshVerifiedFacts(project.ProjectID)
@@ -1508,7 +1533,7 @@ namespace Omnipotent.Services.Projects
                     },
                     actionSettleMs: computerSettings.ComputerActionSettleMs,
                     typingDelayMs: computerSettings.ComputerTypingDelayMs,
-                    requireVisualReady: toolName is not ("computer_terminal" or "computer_browser_inspect"),
+                    requireVisualReady: !ProjectTierRouter.CanRunWithoutFramebuffer(toolName),
                     ct: ct);
                 var result = await adapter.ExecuteAsync(toolName, argsJson, ct);
                 if (!result.Success)
@@ -1570,7 +1595,9 @@ namespace Omnipotent.Services.Projects
                 return new CommanderToolResult(result.Text)
                 {
                     Succeeded = result.Success,
-                    AuditText = result.Success && toolName is "computer_browser_inspect" or "computer_clipboard_get"
+                    AuditText = result.Success && toolName is
+                        "computer_browser_inspect" or "computer_browser_action" or
+                        "computer_clipboard_get" or "computer_read_screen" or "computer_window_state"
                         ? $"{toolName} succeeded; live contents were omitted from durable history because they may contain form values, verification codes, or credentials."
                         : null,
                     Jpeg = result.Jpeg,

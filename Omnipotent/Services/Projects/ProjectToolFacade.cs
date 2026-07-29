@@ -179,6 +179,52 @@ public static class ProjectToolFacade
                 ("bash", "run_bash"),
             }),
 
+        ("browser",
+            "Inspect and operate the agent's one persistent visible Chromium session. Every operation has a structured text result; screenshots are an optional extra channel when this agent has image input.",
+            new[]
+            {
+                ("open", "computer_open_browser"),
+                ("navigate", "computer_navigate"),
+                ("inspect", "computer_browser_inspect"),
+                // Structured op=click is framebuffer-independent. Keep the real VNC route for
+                // sites whose trusted-event handling specifically requires physical desktop input.
+                ("physical_click", "computer_click_browser_control"),
+                ("upload", "computer_upload_file"),
+                ("*", "computer_browser_action"),
+            }),
+
+        ("desktop",
+            "Inspect and operate the agent's isolated Linux desktop. OCR, window state and input operations remain usable by text-only agents; screenshot is offered only when raw image input is enabled.",
+            new[]
+            {
+                ("ensure_ready", "ensure_desktop_ready"),
+                ("window_state", "computer_window_state"),
+                ("read_screen", "computer_read_screen"),
+                ("screenshot", "computer_screenshot"),
+                ("find_text", "computer_find_text"),
+                ("click_text", "computer_click_text"),
+                ("move", "computer_move"),
+                ("move_relative", "computer_mouse_move_relative"),
+                ("click", "computer_click"),
+                ("drag", "computer_drag"),
+                ("mouse_down", "computer_mouse_down"),
+                ("mouse_up", "computer_mouse_up"),
+                ("scroll", "computer_scroll"),
+                ("type", "computer_type"),
+                ("key", "computer_key"),
+                ("key_down", "computer_key_down"),
+                ("key_up", "computer_key_up"),
+                ("release_all", "computer_release_all"),
+                ("wait", "computer_wait"),
+                ("focus_window", "computer_focus_window"),
+                ("launch_app", "computer_launch_app"),
+                ("terminal", "computer_terminal"),
+                ("clipboard_get", "computer_clipboard_get"),
+                ("clipboard_set", "computer_clipboard_set"),
+                ("confirm_action", "computer_confirm_action"),
+                ("confirm_and_click", "computer_confirm_and_click"),
+            }),
+
         ("stimulus_hook",
             "Durable stimulus subscriptions — the tool that decides what wakes you. A well-hooked project reacts to its world instead of polling it.",
             new[]
@@ -228,6 +274,7 @@ public static class ProjectToolFacade
     private static IReadOnlyList<FoldGroup> BuildGroups()
     {
         var schemas = ProjectCommanderAgent.BuildCoreToolDefinitions()
+            .Concat(ProjectCommanderAgent.BuildComputerToolDefinitions())
             .Where(t => !string.IsNullOrEmpty(t.function?.name))
             .GroupBy(t => t.function.name, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => SchemaOf(g.First()), StringComparer.Ordinal);

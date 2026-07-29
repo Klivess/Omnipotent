@@ -453,7 +453,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("computer_terminal", offered);
             Assert.Contains("ensure_desktop_ready", offered);
             Assert.DoesNotContain("computer_screenshot", offered); // raw pixels require an image tier
-            Assert.DoesNotContain("computer_click", offered);      // coordinate-only control follows pixels
+            Assert.Contains("computer_click", offered);            // coordinates can come from OCR/DOM bounds
         }
 
         [Fact]

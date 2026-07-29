@@ -309,7 +309,8 @@ namespace Omnipotent.Services.Projects
                 var commanderParameters = settings.ParametersForRoute(ProjectSettings.RouteNames.Commander);
                 var routeSampling = ModelParameterCatalog.ToSamplingParameters(commanderParameters);
                 string? routeReasoning = ModelParameterCatalog.ReasoningEffort(commanderParameters);
-                bool visionEnabled = settings.VisionEnabled;
+                bool visionEnabled = await ProjectAgentToolCatalog.ResolveEffectiveVisionAsync(
+                    llm, settings.VisionEnabled, ProjectAgentTier.TextImageVideo, modelRoutes, cts.Token);
                 // Live indicator: supplying a token sink switches KliveLLM to its SSE transport, which
                 // is what lets the Conversation panel show the Commander generating before the turn
                 // commits an event. Off → buffered path, and the indicator degrades to phase-only.
@@ -334,8 +335,7 @@ namespace Omnipotent.Services.Projects
                 // The Commander is video-tier: core tools plus the full computer-use surface. The
                 // canonical set is what validation, auditing and dispatch speak; the folded set is
                 // what the model is offered, kept under the provider tool-count limit.
-                var canonicalToolDefs = ProjectCommanderAgent.BuildCoreToolDefinitions();
-                canonicalToolDefs.AddRange(ProjectCommanderAgent.BuildComputerToolDefinitions());
+                var canonicalToolDefs = ProjectAgentToolCatalog.BuildCommanderCanonical(visionEnabled);
                 var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
                 // Every wake starts a FRESH session. The seed is a full rehydration from disk (digest,
@@ -349,7 +349,7 @@ namespace Omnipotent.Services.Projects
                 string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
                     settings.RecentEventsConsidered, settings.RecentEventsBudget);
                 llm.ResetSession(sessionId);
-                llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project));
+                llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
 
                 // Messages the compactor must never summarise. These carry the wake's whole brief; the
@@ -714,6 +714,12 @@ namespace Omnipotent.Services.Projects
                         }
                         result = ProjectToolContract.AttachWarnings(unfolded.Warnings, result);
                         result = ProjectToolContract.AttachWarnings(contract, result);
+                        if (!visionEnabled && result.Jpeg != null)
+                            result = result with
+                            {
+                                ResultText = result.ResultText +
+                                    "\nRAW_IMAGE_OMITTED: this model has no image channel. Verify through desktop op=read_screen/window_state or browser op=inspect; do not infer anything from the unseen frame.",
+                            };
                         if (ProjectWorkProgress.RecordIfNovel(parent.RuntimeState, projectID, "commander", toolName, argsJson, result))
                             productiveActions++;
 

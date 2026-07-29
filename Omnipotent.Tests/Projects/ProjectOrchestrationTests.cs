@@ -122,7 +122,7 @@ namespace Omnipotent.Tests.Projects
         public void EveryTierCanOperateItsDesktop_AtItsPerceptionLevel()
         {
             var r = Router();
-            Assert.False(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click"));
+            Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_click_text"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_browser_inspect"));
             Assert.True(r.IsToolAllowed(ProjectAgentTier.Text, "computer_terminal"));

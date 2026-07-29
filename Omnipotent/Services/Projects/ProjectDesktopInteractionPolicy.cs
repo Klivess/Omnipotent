@@ -111,11 +111,11 @@ public static class ProjectDesktopInteractionPolicy
 
     private static string ViolationText(string reason) =>
         $"DESKTOP_INTERACTION_REQUIRED: the browser-first policy blocked {reason}. " +
-               "Operate the live account through ensure_desktop_ready and the visible computer_open_browser / " +
-               "computer_navigate / computer_screenshot or computer_browser_inspect / computer_click(_text) / " +
-               "computer_type / computer_wait tools. Shells are for installs, files, diagnostics and CLI work, " +
-               "not Playwright, Selenium, headless Chromium, raw CDP, or scripted mouse/keyboard control of an " +
-               "external website. Retrieve email codes with klivemail op:wait_for_code, then type them into the GUI.";
+               "Operate the live account through the first-party browser tool (open/navigate/inspect/click/fill/" +
+               "type/select/check/scroll/wait/history/tabs; script is the bounded last resort on that same visible tab) " +
+               "and the desktop OCR/input tool. These structured operations work without model vision. Shells are for " +
+               "installs, files, diagnostics and ordinary CLI work, not a second Playwright/Selenium/headless/raw-CDP " +
+               "browser. Retrieve email codes with klivemail op=wait_for_code, then enter them through the audited browser/desktop input path.";
 
     private static string ExtractScript(string toolName, string? argumentsJson)
     {

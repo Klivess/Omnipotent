@@ -53,11 +53,13 @@ namespace Omnipotent.Services.Projects.Containers
             "computer_screenshot", "computer_find_text", "computer_click_text", "computer_window_state", "computer_read_screen",
             "computer_move", "computer_mouse_move_relative", "computer_click", "computer_drag", "computer_mouse_down", "computer_mouse_up", "computer_scroll",
             "computer_type", "computer_key", "computer_key_down", "computer_key_up", "computer_release_all", "computer_wait",
-            "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
+            "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_upload_file",
             "computer_terminal",
             "computer_clipboard_get", "computer_clipboard_set",
         };
+
+        internal static IReadOnlySet<string> SupportedToolNames => Tools;
 
         /// <summary>
         /// How many browser tabs a desktop may keep. Chromium opens a new tab for every navigation,
@@ -152,7 +154,7 @@ namespace Omnipotent.Services.Projects.Containers
 
             // Container-local shell execution does not read or inject VNC state. Let it remain
             // usable while a live viewer or a degraded framebuffer has a visual action queued.
-            bool usesVisualGate = tool is not ("computer_terminal" or "computer_browser_inspect");
+            bool usesVisualGate = tool is not ("computer_terminal" or "computer_window_state" or "computer_browser_inspect");
             if (usesVisualGate) await actionGate.WaitAsync(ct);
             try
             {
@@ -196,9 +198,9 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 case "computer_screenshot": return await ScreenshotAsync("Captured desktop.", ct);
                 case "computer_window_state":
-                    return ContainerToolResult.Ok($"Desktop '{transport.DesktopName}' is {transport.Width}x{transport.Height}px. VNC connected: {transport.Connected}.");
+                    return await WindowStateAsync(ct);
                 case "computer_read_screen":
-                    return await ScreenshotAsync("Use the screenshot or computer_find_text to read this desktop.", ct);
+                    return await ReadScreenAsync(a, ct);
                 case "computer_find_text": return await FindTextAsync(a, ct, false);
                 case "computer_click_text": return await FindTextAsync(a, ct, true);
                 case "computer_move":
@@ -234,6 +236,8 @@ namespace Omnipotent.Services.Projects.Containers
                     return await NavigateAsync(a, ct);
                 case "computer_browser_inspect":
                     return await BrowserInspectAsync(a, ct);
+                case "computer_browser_action":
+                    return await BrowserActionAsync(a, ct);
                 case "computer_click_browser_control":
                     return await ClickBrowserControlAsync(a, ct);
                 case "computer_upload_file":
@@ -250,6 +254,69 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Clipboard set.", () => transport.SetClipboardTextAsync(Str(a, "text") ?? string.Empty, ct), ct);
                 default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
             }
+        }
+
+        private async Task<ContainerToolResult> WindowStateAsync(CancellationToken ct)
+        {
+            string header = $"Desktop '{transport.DesktopName}' is {transport.Width}x{transport.Height}px. VNC connected: {transport.Connected}.";
+            if (terminalAsync == null) return ContainerToolResult.Ok(header);
+
+            const string command =
+                "export DISPLAY=${DISPLAY:-:1}\n" +
+                "active=$(xdotool getactivewindow 2>/dev/null || true)\n" +
+                "echo \"active-id=$active\"\n" +
+                "wmctrl -lxG 2>/dev/null | awk -v active=\"$active\" '{mark=(tolower($1)==tolower(active)?\"*\":\" \"); print mark \" id=\" $1 \" desktop=\" $2 \" x=\" $3 \" y=\" $4 \" w=\" $5 \" h=\" $6 \" class=\" $7 \" title=\" substr($0,index($0,$8))}' | head -80";
+            var state = await terminalAsync(command, "/project", 15, ct);
+            string body = state.Stdout.Trim();
+            if (body.Length == 0)
+                body = state.Success ? "No mapped desktop windows were reported." :
+                    "Window enumeration was unavailable: " + ComputerAudit.Truncate(state.Stderr, 500);
+            return ContainerToolResult.Ok(ComputerAudit.Truncate(header + "\n" + body, 16000));
+        }
+
+        private async Task<ContainerToolResult> ReadScreenAsync(JsonElement a, CancellationToken ct)
+        {
+            int maxItems = Math.Clamp(Int(a, "maxItems", 120), 1, 300);
+            var frame = await CaptureFrameWithRetryAsync(ct);
+            var raw = EncodeAndCacheDisplayFrame(frame);
+            // Keep the model-facing observation compact, but OCR the lossless framebuffer. Small
+            // browser/native-UI glyphs are often destroyed by the quality-70 display JPEG.
+            byte[] ocrImage = VncFrameEncoder.EncodePng(frame.bgra, frame.width, frame.height);
+            var lines = await ComputerVision.ReadTextAsync(ocrImage, ct);
+            var text = new StringBuilder();
+            text.Append("OCR screen text, ordered top-to-bottom. Bounds are framebuffer pixels; ")
+                .Append("use their centres with coordinate actions. Desktop ")
+                .Append(raw.width).Append('x').Append(raw.height).AppendLine(".");
+            if (lines.Count == 0)
+            {
+                text.Append("No ordinary OCR text was detected. OCR status: ")
+                    .Append(ComputerVision.OcrStatus)
+                    .Append(". The screen may be blank, image-only, or using an unsupported script.");
+            }
+            else
+            {
+                int index = 0;
+                foreach (var line in lines.Take(maxItems))
+                {
+                    text.Append('[').Append(index++).Append("] text=")
+                        .Append(JsonSerializer.Serialize(ComputerAudit.Truncate(line.Text, 500)))
+                        .Append(" bounds={x:").Append(line.X).Append(",y:").Append(line.Y)
+                        .Append(",width:").Append(line.Width).Append(",height:").Append(line.Height)
+                        .Append("} centre={x:").Append(line.CentreX).Append(",y:").Append(line.CentreY)
+                        .Append("} confidence:").Append(Math.Round(line.Confidence, 1)).AppendLine();
+                }
+                if (lines.Count > maxItems)
+                    text.Append("TRUNCATED: ").Append(lines.Count - maxItems)
+                        .Append(" more OCR row(s); scroll or target a region, then read again.");
+            }
+
+            var observed = BuildScreenshotResult("Screen text read by OCR.", raw.jpeg, raw.width, raw.height);
+            return new ContainerToolResult(true, ComputerAudit.Truncate(text.ToString(), 24000), observed.Jpeg)
+            {
+                Frames = observed.Frames,
+                Width = observed.Width,
+                Height = observed.Height,
+            };
         }
 
         private async Task<ContainerToolResult> OpenBrowserAsync(string? url, CancellationToken ct)
@@ -285,8 +352,8 @@ namespace Omnipotent.Services.Projects.Containers
         {
             if (terminalAsync == null) return ContainerToolResult.Fail("Structured browser inspection is unavailable for this desktop. The visible desktop remains usable through screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
             string mode = (Str(a, "mode") ?? "dom").Trim().ToLowerInvariant();
-            if (mode is not ("tabs" or "dom" or "accessibility" or "network"))
-                return ContainerToolResult.Fail("mode must be tabs, dom, accessibility, or network.", ContainerToolFailureKind.Validation);
+            if (mode is not ("tabs" or "dom" or "controls" or "accessibility" or "network"))
+                return ContainerToolResult.Fail("mode must be tabs, dom, controls, accessibility, or network.", ContainerToolFailureKind.Validation);
             int maxItems = Math.Clamp(Int(a, "maxItems", 80), 1, 200);
             // -1 means "whatever tab is actually in front". An explicit 0 used to be the default, so
             // every inspection after a couple of navigations described a stale background page.
@@ -298,6 +365,18 @@ namespace Omnipotent.Services.Projects.Containers
                 string stdout = last.Stdout.Trim();
                 if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
                     return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                if (attempt == 1)
+                {
+                    // Inspection is a nonvisual entry point and can start the browser when no tab
+                    // exists. Do not steal focus from a different agent actively driving a shared
+                    // desktop; a healthy existing browser never reaches this branch.
+                    if (inputLock != null && agentID != null
+                        && inputLock.CurrentHolder(containerID) is { } holder && holder != agentID)
+                        return ContainerToolResult.Fail(
+                            $"No inspectable browser tab is open, and agent {holder} currently controls the shared desktop. Retry after that action finishes.",
+                            ContainerToolFailureKind.Contention);
+                    await desktop.LaunchAsync("browser", null, ct);
+                }
                 await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
             }
             string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
@@ -385,6 +464,140 @@ namespace Omnipotent.Services.Projects.Containers
             if (run.Success && stdout.Length > 0) return (true, stdout, "");
             return (false, stdout, ComputerAudit.Truncate(string.Join(" ", new[] { run.Stderr, run.Stdout }
                 .Where(x => !string.IsNullOrWhiteSpace(x))).Trim(), 1200));
+        }
+
+        private async Task<ContainerToolResult> BrowserActionAsync(JsonElement a, CancellationToken ct)
+        {
+            if (terminalAsync == null)
+                return ContainerToolResult.Fail(
+                    "Structured browser actions are unavailable for this desktop. Use OCR, keyboard and mouse tools.",
+                    ContainerToolFailureKind.BrowserInspection);
+
+            string op = (Str(a, "op") ?? "").Trim().ToLowerInvariant();
+            string[] allowed =
+            {
+                "click", "fill", "type", "select", "check", "uncheck", "focus", "hover",
+                "scroll_into_view", "scroll", "press", "wait", "back", "forward", "reload",
+                "activate_tab", "close_tab", "script",
+            };
+            if (!allowed.Contains(op, StringComparer.Ordinal))
+                return ContainerToolResult.Fail(
+                    "op must be one of: " + string.Join(", ", allowed) + ".",
+                    ContainerToolFailureKind.Validation);
+
+            string[] targetOps =
+            {
+                "click", "fill", "type", "select", "check", "uncheck", "focus", "hover",
+                "scroll_into_view", "press",
+            };
+            bool hasTarget = new[] { "ref", "name", "text", "role", "tag", "css", "label", "placeholder", "testId" }
+                .Any(name => !string.IsNullOrWhiteSpace(Str(a, name)));
+            if (targetOps.Contains(op, StringComparer.Ordinal) && !hasTarget)
+                return ContainerToolResult.Fail(
+                    $"op={op} needs a target: pass ref from inspect mode=controls, or a semantic name/text/role/tag/css/label/placeholder/testId.",
+                    ContainerToolFailureKind.Validation);
+
+            string value = Str(a, "value") ?? "";
+            var values = a.ValueKind == JsonValueKind.Object
+                && a.TryGetProperty("values", out var valuesElement)
+                && valuesElement.ValueKind == JsonValueKind.Array
+                ? valuesElement.EnumerateArray()
+                    .Where(v => v.ValueKind == JsonValueKind.String)
+                    .Select(v => v.GetString() ?? "")
+                    .Take(100)
+                    .ToList()
+                : new List<string>();
+            if (resolveSecretsAsync != null && op is "fill" or "type" or "select")
+            {
+                value = await resolveSecretsAsync(value);
+                for (int i = 0; i < values.Count; i++)
+                    values[i] = await resolveSecretsAsync(values[i]);
+            }
+
+            int timeoutMs = Math.Clamp(Int(a, "timeoutMs", 15_000), 100, 120_000);
+            string script = Str(a, "script") ?? "";
+            if (op == "script" && string.IsNullOrWhiteSpace(script))
+                return ContainerToolResult.Fail("op=script requires 'script'.", ContainerToolFailureKind.Validation);
+            if (script.Length > 16_000)
+                return ContainerToolResult.Fail("Browser script is limited to 16,000 characters.", ContainerToolFailureKind.Validation);
+
+            await desktop.LaunchAsync("browser", null, ct);
+            byte[]? before = RecentFrameJpeg();
+            var action = await RunBrowserHelperAsync("action", new
+            {
+                op,
+                @ref = Str(a, "ref") ?? "",
+                name = Str(a, "name") ?? "",
+                text = Str(a, "text") ?? "",
+                role = Str(a, "role") ?? "",
+                tag = Str(a, "tag") ?? "",
+                css = Str(a, "css") ?? "",
+                label = Str(a, "label") ?? "",
+                placeholder = Str(a, "placeholder") ?? "",
+                testId = Str(a, "testId") ?? "",
+                exact = Bool(a, "exact"),
+                occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 1000),
+                value,
+                values,
+                key = Str(a, "key") ?? "",
+                button = Str(a, "button") ?? "left",
+                clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2),
+                repeats = Math.Clamp(Int(a, "repeats", 1), 1, 50),
+                direction = Str(a, "direction") ?? "",
+                amount = Math.Clamp(Int(a, "amount", 600), 1, 100_000),
+                waitFor = Str(a, "waitFor") ?? "",
+                condition = Str(a, "condition") ?? "",
+                timeoutMs,
+                tabIndex = RequestedTabIndex(a),
+                frameId = Str(a, "frameId") ?? "",
+                script,
+            }, Math.Clamp((int)Math.Ceiling(timeoutMs / 1000d) + 15, 20, 150), ct);
+
+            string? helperError = BrowserHelperReportedError(action.Stdout);
+            if (!action.Ok || helperError != null)
+                return ContainerToolResult.Fail(
+                    $"Structured browser op={op} failed: {ComputerAudit.Truncate(helperError ?? action.Error, 1800)} " +
+                    "Re-inspect mode=controls/tabs before retrying; do not repeat a stale ref.",
+                    ContainerToolFailureKind.Semantic);
+
+            string resultText = ComputerAudit.Truncate(AnnotateInspection(action.Stdout), 24000);
+            return await ObserveAfterMutationAsync(
+                $"Structured browser op={op} completed. {resultText}", before, ct);
+        }
+
+        /// <summary>The helper reports semantic failures as bounded JSON while exiting zero so it
+        /// can still return the current URL/tab/dialog postcondition. Do not mistake that transport
+        /// success for a successful browser action.</summary>
+        internal static string? BrowserHelperReportedError(string json)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object
+                    || !root.TryGetProperty("ok", out var ok)
+                    || ok.ValueKind != JsonValueKind.False)
+                    return null;
+                if (!root.TryGetProperty("error", out var error))
+                    return "The structured browser helper rejected the action.";
+                if (error.ValueKind == JsonValueKind.String)
+                    return ComputerAudit.Truncate(error.GetString() ?? "Browser action failed.", 1600);
+                if (error.ValueKind != JsonValueKind.Object)
+                    return "The structured browser helper rejected the action.";
+                string code = error.TryGetProperty("code", out var codeValue)
+                    && codeValue.ValueKind == JsonValueKind.String ? codeValue.GetString() ?? "" : "";
+                string message = error.TryGetProperty("message", out var messageValue)
+                    && messageValue.ValueKind == JsonValueKind.String ? messageValue.GetString() ?? "" : "";
+                string detail = string.Join(": ", new[] { code, message }
+                    .Where(part => !string.IsNullOrWhiteSpace(part)));
+                return ComputerAudit.Truncate(
+                    detail.Length == 0 ? "The structured browser helper rejected the action." : detail,
+                    1600);
+            }
+            catch (JsonException)
+            {
+                return null;
+            }
         }
 
         /// <summary>
@@ -623,32 +836,55 @@ namespace Omnipotent.Services.Projects.Containers
         {
             if (terminalAsync == null)
                 return ContainerToolResult.Fail("Structured browser control is unavailable for this desktop; use OCR or screenshot coordinates.", ContainerToolFailureKind.BrowserInspection);
-            string name = (Str(a, "name") ?? Str(a, "text") ?? "").Trim();
-            string role = (Str(a, "role") ?? "").Trim();
-            string tag = (Str(a, "tag") ?? "").Trim();
-            if (name.Length == 0 && role.Length == 0 && tag.Length == 0)
-                return ContainerToolResult.Fail("Provide at least one of name, role, or tag for the visible browser control.", ContainerToolFailureKind.Validation);
-            if (name.Length > 500 || role.Length > 80 || tag.Length > 40)
-                return ContainerToolResult.Fail("Browser-control selector is too long.", ContainerToolFailureKind.Validation);
-
-            int occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 200);
-            int tabIndex = RequestedTabIndex(a);
-            string query = JsonSerializer.Serialize(new { name, role, tag, exact = Bool(a, "exact"), occurrence });
-            string payload = Convert.ToBase64String(Encoding.UTF8.GetBytes(query)).TrimEnd('=')
-                .Replace('+', '-').Replace('/', '_');
+            string[] targetFields =
+            {
+                "ref", "name", "text", "role", "tag", "css", "label", "placeholder", "testId",
+            };
+            if (!targetFields.Any(field => !string.IsNullOrWhiteSpace(Str(a, field))))
+                return ContainerToolResult.Fail(
+                    "Provide ref from inspect mode=controls, or at least one semantic target: name, text, role, tag, css, label, placeholder, or testId.",
+                    ContainerToolFailureKind.Validation);
+            if (targetFields.Any(field => (Str(a, field) ?? "").Length > 8_192))
+                return ContainerToolResult.Fail("A browser-control selector is too long.", ContainerToolFailureKind.Validation);
 
             await desktop.LaunchAsync("browser", null, ct);
-            ContainerShellResult? located = null;
+            (bool Ok, string Stdout, string Error) located = default;
+            string? locateSemanticError = null;
             for (int attempt = 1; attempt <= 3; attempt++)
             {
-                located = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py locate 80 {tabIndex} {payload}", "/project", 30, ct);
-                if (located.Success && !string.IsNullOrWhiteSpace(located.Stdout)) break;
+                located = await RunBrowserHelperAsync("action", new
+                {
+                    op = "locate",
+                    @ref = Str(a, "ref") ?? "",
+                    name = Str(a, "name") ?? "",
+                    text = Str(a, "text") ?? "",
+                    role = Str(a, "role") ?? "",
+                    tag = Str(a, "tag") ?? "",
+                    css = Str(a, "css") ?? "",
+                    label = Str(a, "label") ?? "",
+                    placeholder = Str(a, "placeholder") ?? "",
+                    testId = Str(a, "testId") ?? "",
+                    exact = Bool(a, "exact"),
+                    occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 1_000),
+                    tabIndex = RequestedTabIndex(a),
+                }, 45, ct);
+                // Transport/startup failures are worth retrying. A structured semantic response
+                // (including ok:false for a stale/ambiguous target) is authoritative immediately.
+                locateSemanticError = BrowserHelperReportedError(located.Stdout);
+                if (!string.IsNullOrWhiteSpace(located.Stdout)
+                    && (located.Ok || locateSemanticError != null))
+                    break;
                 await Task.Delay(TimeSpan.FromMilliseconds(400 * attempt), ct);
             }
-            if (located is not { Success: true } || string.IsNullOrWhiteSpace(located.Stdout))
+            if (locateSemanticError != null)
+                return ContainerToolResult.Fail(
+                    locateSemanticError + " Re-inspect mode=controls and use a fresh ref or a more specific semantic target.",
+                    ContainerToolFailureKind.Semantic);
+            if (!located.Ok || string.IsNullOrWhiteSpace(located.Stdout))
                 return ContainerToolResult.Fail("Could not inspect controls in the visible browser: " +
-                    ComputerAudit.Truncate(string.Join("\n", new[] { located?.Stderr, located?.Stdout }
-                        .Where(x => !string.IsNullOrWhiteSpace(x))), 1600) + " Use OCR or screenshot coordinates instead.", ContainerToolFailureKind.BrowserInspection);
+                    ComputerAudit.Truncate(located.Error, 1600) +
+                    " Use browser op=inspect mode=controls, OCR, or screenshot coordinates instead.",
+                    ContainerToolFailureKind.BrowserInspection);
 
             try
             {
@@ -659,34 +895,46 @@ namespace Omnipotent.Services.Projects.Containers
                 // happens. That mismatch is what turned an upload into a repeat-until-guard loop.
                 if (NativeDialogBanner(root) is { } blocked)
                     return ContainerToolResult.Fail(blocked.TrimEnd('\n'), ContainerToolFailureKind.Semantic);
-                if (!root.TryGetProperty("match", out var match) || match.ValueKind == JsonValueKind.Null)
-                {
-                    string candidates = root.TryGetProperty("candidates", out var sample)
-                        ? ComputerAudit.Truncate(sample.GetRawText(), 1200) : "[]";
+                if (!root.TryGetProperty("control", out var control)
+                    || control.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
                     return ContainerToolResult.Fail(
-                        $"No visible browser control matched name='{ComputerAudit.Truncate(name, 120)}', role='{role}', tag='{tag}', occurrence={occurrence}. Candidate sample: {candidates}",
+                        "The structured locator returned no control. Re-inspect mode=controls and use a fresh ref.",
                         ContainerToolFailureKind.Semantic);
-                }
-                string matchedName = match.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
-                string matchedRole = match.TryGetProperty("role", out var r) ? r.GetString() ?? "" : "";
-                if (match.TryGetProperty("disabled", out var disabled) && disabled.ValueKind == JsonValueKind.True)
+
+                string matchedName = control.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                string matchedRole = control.TryGetProperty("role", out var r) ? r.GetString() ?? "" : "";
+                if (control.TryGetProperty("disabled", out var disabled) && disabled.ValueKind == JsonValueKind.True)
                     return ContainerToolResult.Fail($"The matched browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) is disabled; inspect the form for unmet requirements.", ContainerToolFailureKind.Semantic);
-                if (match.TryGetProperty("intercepted", out var intercepted) && intercepted.ValueKind == JsonValueKind.True)
+
+                if (!root.TryGetProperty("geometry", out var geometry)
+                    || geometry.ValueKind != JsonValueKind.Object)
+                    return ContainerToolResult.Fail(
+                        "The matched control has no usable physical screen geometry. Use the framebuffer-independent browser op=click, or scroll it into view and locate it again.",
+                        ContainerToolFailureKind.Semantic);
+                if (geometry.TryGetProperty("intercepted", out var intercepted)
+                    && intercepted.ValueKind == JsonValueKind.True)
                 {
-                    string blocker = match.TryGetProperty("interceptedBy", out var by) ? by.GetRawText() : "another visible element";
+                    string blocker = geometry.TryGetProperty("interceptedBy", out var by)
+                        ? by.GetRawText() : "another visible element";
                     return ContainerToolResult.Fail(
                         $"CONTROL_INTERCEPTED: '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) is covered by {ComputerAudit.Truncate(blocker, 500)}. Inspect and dismiss or act on that visible blocker first.",
                         ContainerToolFailureKind.Semantic);
                 }
-                if (!match.TryGetProperty("x", out var xValue) || !xValue.TryGetInt32(out int x)
-                    || !match.TryGetProperty("y", out var yValue) || !yValue.TryGetInt32(out int y))
+                if (root.TryGetProperty("usableForPhysicalClick", out var usable)
+                    && usable.ValueKind == JsonValueKind.False)
+                    return ContainerToolResult.Fail(
+                        "The matched control is not currently usable for a physical click (hidden, off-screen, disabled, or covered). " +
+                        "Use browser op=scroll_into_view and re-inspect, or use browser op=click when physical input is unnecessary.",
+                        ContainerToolFailureKind.Semantic);
+                if (!geometry.TryGetProperty("x", out var xValue) || !xValue.TryGetInt32(out int x)
+                    || !geometry.TryGetProperty("y", out var yValue) || !yValue.TryGetInt32(out int y))
                     return ContainerToolResult.Fail("The matched browser control had no usable screen coordinates.", ContainerToolFailureKind.BrowserInspection);
 
                 int clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2);
                 // Click within the control's bounds with a slight bias toward centre rather than the
                 // exact centre pixel every time (a superhuman tell), using the reported box size.
                 int boundsW = 0, boundsH = 0;
-                if (match.TryGetProperty("bounds", out var box) && box.ValueKind == JsonValueKind.Object)
+                if (geometry.TryGetProperty("bounds", out var box) && box.ValueKind == JsonValueKind.Object)
                 {
                     if (box.TryGetProperty("width", out var bw) && bw.TryGetInt32(out var w)) boundsW = w;
                     if (box.TryGetProperty("height", out var bh) && bh.TryGetInt32(out var h)) boundsH = h;
@@ -962,6 +1210,13 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task<ContainerToolResult> ObserveAfterMutationAsync(string label, byte[]? beforeJpeg, CancellationToken ct)
         {
+            // Structured browser/CLI paths intentionally provision without connecting VNC. Their
+            // returned DOM/tab state is already the postcondition, so do not turn a healthy action
+            // into a slow framebuffer connection attempt merely to add an optional image.
+            if (!transport.Connected && beforeJpeg == null)
+                return ContainerToolResult.Ok(
+                    label + " No framebuffer was attached for this operation; the structured text result is authoritative. " +
+                    "Vision-capable agents may call desktop op=screenshot separately when pixels add value.");
             try { return await ScreenshotAsync(label, ct, beforeJpeg); }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -1104,7 +1359,10 @@ namespace Omnipotent.Services.Projects.Containers
 
         // This predicate controls the shared *input* lease. Terminal execution is independently
         // bounded inside Docker and neither waits for nor retains VNC input state.
-        private static bool IsMutating(string tool) => tool is not ("computer_screenshot" or "computer_find_text" or "computer_window_state" or "computer_read_screen" or "computer_wait" or "computer_clipboard_get" or "computer_terminal");
+        private static bool IsMutating(string tool) => tool is not (
+            "computer_screenshot" or "computer_find_text" or "computer_window_state" or
+            "computer_read_screen" or "computer_wait" or "computer_browser_inspect" or
+            "computer_clipboard_get" or "computer_terminal");
         private static int ParseButton(string? b) => (b ?? "left").Trim().ToLowerInvariant() switch { "middle" => 2, "right" => 3, _ => 1 };
         private static string NormalizeModifier(string value) => value.Trim().ToLowerInvariant() switch { "control" => "ctrl", "win" => "super", _ => value.Trim().ToLowerInvariant() };
         private static string? Str(JsonElement a, string name) => a.ValueKind == JsonValueKind.Object && a.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
