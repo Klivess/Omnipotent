@@ -269,6 +269,7 @@ namespace Omnipotent.Services.Projects
                 int maxOutputTokens = Math.Clamp(settings.SubAgentMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
                 int toolResultKeepRecent = Math.Clamp(settings.ToolResultKeepRecent, 2, 256);
+                bool attemptLedgerEnabled = settings.AttemptLedgerEnabled;
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
                     llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
                 if (contextPolicy != null)
@@ -560,6 +561,20 @@ namespace Omnipotent.Services.Projects
                             loopTrips++;
                             RecordRejectedResult(
                                 $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}×. Change approach or report the obstacle and a recommended next action to the commander.");
+                            // Project-scoped, not agent-scoped: a worker's proven dead end is the whole
+                            // project's knowledge. Recording only an agent resume action (as this did)
+                            // meant the Commander and every future worker re-discovered it from scratch.
+                            parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
+                            {
+                                Key = $"repeated-call:{toolName}",
+                                Approach = DescribeCall(toolName, argsJson),
+                                Outcome = $"Worker {agent.AgentID} repeated this {recentSignatures[sig]}× with an unchanged result; the convergence guard tripped.",
+                                Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
+                                Evidence = new List<ProjectEvidenceReference>
+                                {
+                                    new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
+                                },
+                            });
                             if (loopTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Agent {agent.AgentID} stopped after {loopTrips} repeated-call loop trips.";
@@ -606,9 +621,34 @@ namespace Omnipotent.Services.Projects
                             };
                         if (ProjectWorkProgress.RecordIfNovel(parent.RuntimeState, projectID, agent.AgentID, toolName, argsJson, result))
                             productiveActions++;
+
                         if (toolName == "send_agent_message" && result.Succeeded
                             && ProjectWorkProgress.IsProductiveResult(result.ResultText, result.ArtifactIDs))
                             reportedToCommander = true;
+
+                        // Same durable attempt ledger the Commander writes, and deliberately the same
+                        // project-scoped one: workers repeating each other's failures is as expensive as a
+                        // worker repeating its own. Poll-shaped tools are skipped for the same reasons as in
+                        // the Commander runner — write volume and a truthful attempt count.
+                        //
+                        // Last, after every classifier that reads ResultText: appending a repeat warning must
+                        // not be able to change how the result itself is judged.
+                        if (attemptLedgerEnabled && !ProjectAttemptKey.IsDeliberatelyRepeatable(toolName))
+                        {
+                            try
+                            {
+                                var prior = parent.RuntimeState.RecordAttempt(projectID,
+                                    ProjectAttemptKey.For(toolName, argsJson), toolName,
+                                    DescribeCall(toolName, argsJson), result.Succeeded, result.ResultText,
+                                    wakeID, agent.AgentID);
+                                if (ProjectAttemptWarning.ShouldWarn(prior, result.Succeeded, toolName))
+                                    result = result with
+                                    {
+                                        ResultText = result.ResultText + "\n" + ProjectAttemptWarning.Render(prior!),
+                                    };
+                            }
+                            catch { /* advisory only */ }
+                        }
 
                         parent.EventLog.Append(new ProjectEvent
                         {
@@ -837,6 +877,21 @@ RULES:
             }
             catch { }
 
+            // The project's negative and verified knowledge, which workers previously could not see at
+            // all: only the Commander received the typed-state block, so every new worker re-attempted
+            // paths the project had already proven dead and re-derived facts it had already verified.
+            try
+            {
+                string knowledge = parent.RuntimeState.DescribeProjectKnowledgeForWorker(project.ProjectID);
+                if (!string.IsNullOrWhiteSpace(knowledge))
+                {
+                    sb.AppendLine("── WHAT THE PROJECT ALREADY KNOWS (verified facts, dead ends, failed attempts — do not re-derive or retry these) ──");
+                    sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
+                        ProjectPromptHygiene.ScrubState(knowledge), ProjectsContextBudget.WorkerKnowledgeBudget));
+                }
+            }
+            catch { }
+
             // Live observable values (Klives' dashboard) — same block the Commander sees.
             string observables = "";
             try { observables = parent.Observables.DescribeAll(project.ProjectID); } catch { }
@@ -903,19 +958,11 @@ RULES:
                 .Where(e => e.AgentID == agent.AgentID
                     && ProjectPromptHygiene.IsAgentVisibleEvent(e)
                     && !ProjectsContextBudget.LooksLikeHarnessLeak(e.Text))
-                .TakeLast(RecentEventsForSeed)
+                .TakeLast(RecentEventsForSeed * ProjectsContextBudget.CompactHistoryMultiplier)
                 .ToList();
-            if (mine.Count > 0)
-            {
-                sb.AppendLine("── YOUR RECENT ACTIVITY ──");
-                var fitted = ProjectsContextBudget.FitItemsInBudget(
-                    mine.Select((e, i) => (evt: e, idx: mine.Count - 1 - i)),
-                    ProjectsContextBudget.RecentEventsBudget / 2,
-                    x => ProjectCommanderPrompts.DescribeEvent(x.evt),
-                    x => 1.0 / (1.0 + x.idx));
-                foreach (var x in fitted.OrderBy(x => x.evt.Sequence))
-                    sb.AppendLine(ProjectCommanderPrompts.DescribeEvent(x.evt));
-            }
+            string activity = ProjectCommanderPrompts.RenderHistoryBlock(
+                "── YOUR RECENT ACTIVITY ──", mine, ProjectsContextBudget.RecentEventsBudget / 2);
+            if (activity.Length > 0) sb.AppendLine(activity);
 
             sb.AppendLine("── YOUR TASK (this wake's trigger) ──");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(

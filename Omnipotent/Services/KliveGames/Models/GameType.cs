@@ -10,5 +10,6 @@ namespace Omnipotent.Services.KliveGames.Models
         Minecraft = 0,
         Terraria = 1,
         Satisfactory = 2,
+        Rust = 3,
     }
 }

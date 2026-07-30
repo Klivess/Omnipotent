@@ -187,6 +187,9 @@ namespace Omnipotent.Services.Projects.Discord
                 var project = parent.Store.GetProject(projectID);
                 if (project == null) return;
 
+                // Task is the right default for a request with a deliverable, but a constraint typed here
+                // ("don't complete it yet") has no deliverable and would sit open forever as a Task.
+                // CreateAndDeliverDirective classifies that case and saves it as a standing rule instead.
                 var receipt = parent.MessageProjectWithReceipt(projectID, e.Message.Content, ProjectDirectiveKind.Task);
                 if (!receipt.Accepted)
                 {
@@ -200,7 +203,10 @@ namespace Omnipotent.Services.Projects.Discord
                     string state = receipt.Status == "delivered"
                         ? $"delivered to wake `{receipt.WakeID}`"
                         : "stored durably and queued for the next runnable wake";
-                    await e.Message.RespondAsync($"Accepted directive `{receipt.DirectiveID}` — {state}.");
+                    string label = receipt.PromotedToRule
+                        ? "Saved as a **standing rule** (it holds until you replace or revoke it)"
+                        : "Accepted directive";
+                    await e.Message.RespondAsync($"{label} `{receipt.DirectiveID}` — {state}.");
                     try { await e.Channel.TriggerTypingAsync(); } catch { }
                 }
                 else

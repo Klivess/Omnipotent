@@ -77,6 +77,12 @@ namespace Omnipotent.Services.Projects
         public ProjectRuntimeStateStore? RuntimeState { get; set; }
         /// <summary>Durable Klives rules/tasks/steering receipts, never folded into the digest.</summary>
         public ProjectDirectiveStore? Directives { get; set; }
+
+        /// <summary>
+        /// Refuse to open a second approval gate identical to one still awaiting Klives, and make a refusal
+        /// durable. Mirrors ProjectSettings.ApprovalDedupe; set by the dispatch site.
+        /// </summary>
+        public bool ApprovalDedupe { get; set; } = true;
         /// <summary>Surfaces verified directive deliverables to Klives (Discord/UI) after completion.</summary>
         public Func<ProjectDirective, IReadOnlyList<string>, string, Task>? NotifyDirectiveCompletedAsync { get; set; }
         /// <summary>Marks the project completed (archives Discord channel, stops containers).</summary>
@@ -350,6 +356,98 @@ namespace Omnipotent.Services.Projects
 
                     switch (op)
                     {
+                        // ── the step ledger: the project's one linear path ──
+                        case "queue_steps":
+                        {
+                            var requested = new List<ProjectStep>();
+                            foreach (var item in (a["steps"] as JArray) ?? new JArray())
+                            {
+                                string title = ((string?)item["title"] ?? "").Trim();
+                                if (title.Length == 0) continue;
+                                requested.Add(new ProjectStep
+                                {
+                                    Title = title,
+                                    MilestoneID = ((string?)item["milestoneID"] ?? "").Trim() is { Length: > 0 } m ? m : null,
+                                    NextConcreteAction = ((string?)item["nextAction"] ?? "").Trim() is { Length: > 0 } n ? n : null,
+                                });
+                            }
+                            if (requested.Count == 0)
+                                return FailedResult("queue_steps requires 'steps' with at least one entry carrying a 'title'.");
+                            var queued = RuntimeState.QueueSteps(project.ProjectID, requested);
+                            if (queued.Count == 0) return FailedResult("No steps were queued.");
+                            var queueEvt = Evt(ProjectEventTypes.CheckpointChanged, actingAgentID == "commander" ? "commander" : "agent",
+                                $"Queued {queued.Count} step(s): {string.Join("; ", queued.Select(s => $"{s.StepID} {s.Title}"))}");
+                            queueEvt.PayloadJson = JsonConvert.SerializeObject(new { op, stepIDs = queued.Select(s => s.StepID) });
+                            eventLog.Append(queueEvt);
+                            // Nothing active yet means the queue would sit there; start the first one now.
+                            var currentActive = RuntimeState.GetActiveStep(project.ProjectID);
+                            if (currentActive == null)
+                            {
+                                RuntimeState.ActivateStep(project.ProjectID, queued[0].StepID);
+                                return new CommanderToolResult(
+                                    $"Queued {queued.Count} step(s) and activated {queued[0].StepID} ({queued[0].Title}). " +
+                                    "Work that one to a close before activating the next.");
+                            }
+                            return new CommanderToolResult($"Queued {queued.Count} step(s) behind the active {currentActive.StepID}: " +
+                                string.Join("; ", queued.Select(s => $"{s.StepID} {s.Title}")));
+                        }
+                        case "activate_step":
+                        {
+                            string stepID = ((string?)a["stepID"] ?? "").Trim();
+                            if (stepID.Length == 0) return FailedResult("activate_step requires 'stepID'.");
+                            changed = RuntimeState.ActivateStep(project.ProjectID, stepID);
+                            break;
+                        }
+                        case "update_step":
+                        {
+                            string stepID = ((string?)a["stepID"] ?? "").Trim();
+                            if (stepID.Length == 0) stepID = RuntimeState.GetActiveStep(project.ProjectID)?.StepID ?? "";
+                            if (stepID.Length == 0) return FailedResult("No step is active; pass 'stepID' or activate one first.");
+                            changed = RuntimeState.UpdateStep(project.ProjectID, stepID,
+                                (string?)a["nextAction"], (string?)a["outcome"], (string?)a["owner"]);
+                            break;
+                        }
+                        case "close_step":
+                        {
+                            string stepID = ((string?)a["stepID"] ?? "").Trim();
+                            if (stepID.Length == 0) stepID = RuntimeState.GetActiveStep(project.ProjectID)?.StepID ?? "";
+                            if (stepID.Length == 0) return FailedResult("No step is active; pass 'stepID'.");
+                            string resultText = ((string?)a["result"] ?? "").Trim().ToLowerInvariant();
+                            var stepResult = resultText switch
+                            {
+                                "done" => ProjectStepStatus.Done,
+                                "abandoned" => ProjectStepStatus.Abandoned,
+                                "blocked" => ProjectStepStatus.Blocked,
+                                _ => (ProjectStepStatus?)null,
+                            };
+                            if (stepResult == null) return FailedResult("close_step requires result 'done', 'abandoned' or 'blocked'.");
+                            string reason = ((string?)a["reason"] ?? summary).Trim();
+                            if (reason.Length == 0) return FailedResult("close_step requires 'reason' describing the outcome.");
+                            changed = RuntimeState.CloseStep(project.ProjectID, stepID, stepResult.Value, reason, evidence);
+                            if (!changed.Applied) return FailedResult(changed.Reason ?? "The step could not be closed.");
+                            var closeEvt = Evt(ProjectEventTypes.CheckpointChanged, actingAgentID == "commander" ? "commander" : "agent",
+                                $"Step {stepID} closed as {stepResult}: {Trunc(reason, 300)}");
+                            closeEvt.PayloadJson = JsonConvert.SerializeObject(new { op, stepID, result = stepResult.ToString() });
+                            eventLog.Append(closeEvt);
+                            // Advance the path automatically: a closed step with a queue behind it should
+                            // never leave the project with nothing in flight.
+                            var next = RuntimeState.ListSteps(project.ProjectID)
+                                .FirstOrDefault(s => s.Status == ProjectStepStatus.Queued);
+                            if (next == null)
+                                return new CommanderToolResult($"Step {stepID} closed as {stepResult}. The queue is now empty — " +
+                                    "queue the next concrete steps toward the goal with op:queue_steps, or complete the project if the goal is genuinely met.");
+                            RuntimeState.ActivateStep(project.ProjectID, next.StepID);
+                            return new CommanderToolResult($"Step {stepID} closed as {stepResult}. Now active: {next.StepID} ({next.Title})." +
+                                (string.IsNullOrWhiteSpace(next.NextConcreteAction) ? "" : $" First action: {next.NextConcreteAction}"));
+                        }
+                        case "reorder_steps":
+                        {
+                            var ids = (a["stepIDs"] as JArray)?.Values<string>()
+                                .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToList() ?? new();
+                            if (ids.Count == 0) return FailedResult("reorder_steps requires 'stepIDs'.");
+                            changed = RuntimeState.ReorderSteps(project.ProjectID, ids);
+                            break;
+                        }
                         case "set_resume":
                             if (summary.Length == 0) return new CommanderToolResult("set_resume requires 'summary' with one exact next action.");
                             changed = RuntimeState.SetResumeAction(project.ProjectID, new ProjectResumeAction
@@ -489,6 +587,8 @@ namespace Omnipotent.Services.Projects
                         "clear_resume" => "resume-action",
                         "set_active_milestones" => "active-milestones",
                         "record_success" => changed.State.Checkpoint.LastSuccessfulAction?.ActionID ?? "last-success",
+                        "activate_step" or "update_step" or "reorder_steps" =>
+                            ((string?)a["stepID"] ?? "").Trim() is { Length: > 0 } s ? s : "step-ledger",
                         _ => op,
                     };
                     var evt = Evt(ProjectEventTypes.CheckpointChanged, actingAgentID == "commander" ? "commander" : "agent",
@@ -721,8 +821,11 @@ namespace Omnipotent.Services.Projects
                         Description = (string?)a["description"] ?? "",
                         Rationale = (string?)a["rationale"] ?? "",
                     };
+                    var duplicate = FindOpenDuplicateGate(gate);
+                    if (duplicate != null) return FailedResult(DescribePendingDuplicate(duplicate));
                     var res = await gates.OpenGateAndWaitAsync(gate, ct);
                     // A denial is a hard constraint — surface it but let the Commander adapt in-wake.
+                    RecordApprovalRefusal(gate, res, "approval");
                     return new CommanderToolResult($"Klives {res.Decision}: {res.Comment}");
                 }
 
@@ -1827,9 +1930,15 @@ namespace Omnipotent.Services.Projects
                         Description = (string?)a["summary"] ?? "The Commander believes the goal is achieved.",
                         Rationale = "Completion archives the Discord channel and releases the desktops.",
                     };
+                    var pending = FindOpenDuplicateGate(gate);
+                    if (pending != null) return FailedResult(DescribePendingDuplicate(pending));
                     var res = await gates.OpenGateAndWaitAsync(gate, ct);
                     if (res.Decision != GateDecision.Approve)
-                        return new CommanderToolResult($"Klives {res.Decision}: {res.Comment} — project stays active.");
+                    {
+                        RecordApprovalRefusal(gate, res, "completion");
+                        return new CommanderToolResult($"Klives {res.Decision}: {res.Comment} — project stays active. " +
+                            "This refusal is now durable: do not re-request completion until you have addressed what he said.");
+                    }
                     if (CompleteProjectAsync != null) await CompleteProjectAsync();
                     return new CommanderToolResult("Project completed. This is the final wake.") { EndWake = true };
                 }
@@ -2745,6 +2854,54 @@ namespace Omnipotent.Services.Projects
         }
 
         private static string Trunc(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
+
+        // ── approval memory ──
+
+        /// <summary>An unresolved gate already asking this exact question, when dedupe is enabled.</summary>
+        private ProjectGate? FindOpenDuplicateGate(ProjectGate gate)
+        {
+            if (!ApprovalDedupe) return null;
+            gate.DedupeHash = ProjectGateManager.ComputeDedupeHash(gate.Kind, gate.Title, gate.Description);
+            return gates.TryFindOpenDuplicate(project.ProjectID, gate.DedupeHash);
+        }
+
+        private static string DescribePendingDuplicate(ProjectGate pending) =>
+            $"APPROVAL_ALREADY_PENDING: gate {pending.GateID} (\"{pending.Title}\") has been waiting since " +
+            $"{Data_Handling.TemporalFormat.StampWithAge(pending.CreatedAt)} and is still unanswered" +
+            (pending.DiscussionCount > 0
+                ? $". Klives has commented {pending.DiscussionCount}× without deciding: \"{pending.DiscussionComments.LastOrDefault()}\""
+                : "") +
+            ". Do not ask again — asking twice does not make him answer faster, and it puts two identical cards in front of him. " +
+            "Address what he said, work another step, or use reply_to_klives if you need something from him to proceed.";
+
+        /// <summary>
+        /// Make a refusal durable. A Deny or a Discuss used to leave nothing behind but an event that aged
+        /// out of the seed, so the next wake re-asked the question Klives had already answered.
+        /// </summary>
+        private void RecordApprovalRefusal(ProjectGate gate, GateResolution res, string kind)
+        {
+            if (res.Decision == GateDecision.Approve || RuntimeState == null) return;
+            try
+            {
+                RuntimeState.RecordFailedApproach(project.ProjectID, new ProjectFailedApproach
+                {
+                    Key = kind == "completion" ? "completion-request" : $"approval:{gate.DedupeHash}",
+                    Approach = $"Asked Klives to approve: {Trunc(gate.Title, 120)} — {Trunc(gate.Description, 200)}",
+                    Outcome = $"Klives {res.Decision}" + (string.IsNullOrWhiteSpace(res.Comment) ? "" : $": {Trunc(res.Comment, 300)}"),
+                    Instead = string.IsNullOrWhiteSpace(res.Comment)
+                        ? "Do not re-ask. Find out what is missing and address that first."
+                        : Trunc(res.Comment, 300),
+                    // Time-boxed rather than permanent: the answer may legitimately change once the work
+                    // he asked for is done, and a permanent dead end would block that forever.
+                    RetryNotBefore = DateTime.UtcNow.AddHours(12),
+                    Evidence = new List<ProjectEvidenceReference>
+                    {
+                        new() { Kind = ProjectEvidenceKind.UserConfirmation, Reference = gate.GateID, Description = res.Comment },
+                    },
+                });
+            }
+            catch { /* the gate itself is already persisted; this is the reminder layer */ }
+        }
 
         /// <summary>Resolves the live KliveMail repository through the shared KliveAgent service graph
         /// (the in-process handle the klivemail_* tools drive), or returns null with an actionable

@@ -26,6 +26,8 @@ namespace Omnipotent.Services.KliveGames.Games.Terraria
         public bool Implemented => true;
         public string Protocol => "TCP";
         public int DefaultPort => 7777;
+        public IReadOnlyList<GameNetworkPort> GetNetworkPorts(int primaryPort)
+            => new[] { new GameNetworkPort { Port = primaryPort, Protocol = Protocol } };
         public IReadOnlyList<ServerFlavor> SupportedFlavors => new[] { ServerFlavor.Vanilla, ServerFlavor.TModLoader };
 
         public bool RequiresEula => false;

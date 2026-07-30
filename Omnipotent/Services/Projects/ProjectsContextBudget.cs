@@ -36,6 +36,42 @@ namespace Omnipotent.Services.Projects
         /// <summary>Recent events replayed verbatim into a wake seed.</summary>
         public const int RecentEventsBudget = 48000;
 
+        /// <summary>
+        /// How many of the newest events in the recent window keep their full verbatim rendering.
+        /// Everything older in the window is compacted (a tool call and its result collapse into one
+        /// line), which buys several times the history depth for the same token budget.
+        /// </summary>
+        public const int RecentEventsFullDetail = 20;
+
+        /// <summary>
+        /// How much deeper than the configured event count the compacted tail is allowed to reach.
+        /// The token budget is still the real bound — this only stops the count cap from binding
+        /// first now that older events cost a fraction of what they used to.
+        /// </summary>
+        public const int CompactHistoryMultiplier = 4;
+
+        /// <summary>
+        /// Share of the recent-events budget the verbatim band may consume before everything older falls
+        /// back to compact rendering. Without this the newest few exchanges can spend the entire allowance
+        /// at a reduced budget, which is precisely when reaching further back matters most.
+        /// </summary>
+        private const double FullDetailBudgetShare = 0.5;
+
+        /// <summary>Failed attempts replayed from the durable attempt ledger.</summary>
+        public const int AttemptsBudget = 1200;
+
+        /// <summary>
+        /// The project's verified facts, dead ends and failed attempts as seeded into a WORKER's wake.
+        /// Workers used to receive none of this, so each new one re-proved what the project already knew.
+        /// </summary>
+        public const int WorkerKnowledgeBudget = 1500;
+
+        /// <summary>The step ledger: the active step, the queue behind it and recently closed steps.</summary>
+        public const int StepLedgerBudget = 1500;
+
+        /// <summary>Pending and recently resolved approval gates.</summary>
+        public const int ApprovalsBudget = 1200;
+
         /// <summary>BM25 retrieval hits pulled from the deep log for the triggering stimulus.</summary>
         public const int RetrievalBudget = 8000;
 
@@ -176,6 +212,89 @@ namespace Omnipotent.Services.Projects
             }
 
             return selected;
+        }
+
+        /// <summary>
+        /// The outcome of fitting a chronological window: the rendered lines in ascending order,
+        /// how many older items were dropped, and the oldest item that survived (so the prompt can
+        /// tell the agent exactly where to point query_events).
+        /// </summary>
+        public sealed record ChronologicalWindow<T>(List<string> Lines, int Dropped, T? OldestKept);
+
+        /// <summary>
+        /// Fits an ascending-ordered history into <paramref name="maxTokens"/> WITHOUT breaking
+        /// chronology. Walks newest → oldest and stops at the first item that does not fit, so the
+        /// retained tail is always contiguous: there are never holes in the middle of the window.
+        ///
+        /// This is deliberately different from <see cref="FitItemsInBudget"/>, which sorts by score and
+        /// skips over items that don't fit. Score-ordered selection is right for retrieval hits (any
+        /// subset is useful) and wrong for a history — a gappy timeline reads as a complete one, so an
+        /// agent re-attempts work whose record fell into a hole. Retrieval and knowledge legs keep
+        /// using the scored variant.
+        ///
+        /// The newest <paramref name="fullDetailCount"/> items — plus anything
+        /// <paramref name="alwaysFull"/> marks as policy-bearing regardless of age — render verbatim;
+        /// older ones render compactly.
+        /// </summary>
+        public static ChronologicalWindow<T> FitEventsChronologically<T>(
+            IReadOnlyList<T> ascending,
+            int maxTokens,
+            Func<T, string> renderFull,
+            Func<T, string> renderCompact,
+            Func<T, bool>? alwaysFull = null,
+            int fullDetailCount = RecentEventsFullDetail)
+        {
+            var lines = new List<string>();
+            T? oldestKept = default;
+            int used = 0;
+            int kept = 0;
+            // The verbatim band is a share of the budget, not a fixed count. Twenty full tool exchanges can
+            // cost more than a modest budget on their own, which would spend the whole allowance on the
+            // newest handful and leave nothing for the depth compaction is there to buy.
+            int fullDetailAllowance = Math.Max(1, (int)(maxTokens * FullDetailBudgetShare));
+
+            for (int i = ascending.Count - 1; i >= 0; i--)
+            {
+                var item = ascending[i];
+                int indexFromEnd = ascending.Count - 1 - i;
+                bool full = (indexFromEnd < fullDetailCount && used < fullDetailAllowance)
+                    || (alwaysFull?.Invoke(item) ?? false);
+                string text = full ? renderFull(item) : renderCompact(item);
+                int cost = EstimateTokens(text);
+                // Stop, never skip: skipping is what turns a history into swiss cheese.
+                if (kept > 0 && used + cost > maxTokens) break;
+                lines.Add(text);
+                used += cost;
+                oldestKept = item;
+                kept++;
+            }
+
+            lines.Reverse();
+            return new ChronologicalWindow<T>(lines, ascending.Count - kept, oldestKept);
+        }
+
+        /// <summary>
+        /// Builds a lexical retrieval query from a few source strings. BM25 degrades badly when handed a
+        /// long blob — a 1,500-character query of goal + plan + every next step matches nearly every
+        /// document, so the top hits become long-tail noise. Distinct content terms only, capped.
+        /// </summary>
+        public static string BuildRetrievalQuery(int maxTerms, params string?[] sources)
+        {
+            var terms = new List<string>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var source in sources)
+            {
+                if (string.IsNullOrWhiteSpace(source)) continue;
+                foreach (var match in Regex.Matches(source, @"[\p{L}\p{N}][\p{L}\p{N}\-_.]*"))
+                {
+                    string term = ((Match)match).Value;
+                    if (term.Length < 3 || QueryStopWords.Contains(term)) continue;
+                    if (!seen.Add(term)) continue;
+                    terms.Add(term);
+                    if (terms.Count >= maxTerms) return string.Join(" ", terms);
+                }
+            }
+            return string.Join(" ", terms);
         }
 
         /// <summary>

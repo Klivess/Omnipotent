@@ -62,6 +62,12 @@ namespace Omnipotent.Services.Projects
         /// <summary>(projectID, triggerDescription) -> a budget-fitted durable directive block.</summary>
         public Func<string, string, string>? DescribeDirectives;
 
+        /// <summary>
+        /// Pending and recently resolved approval gates. Without this the Commander cannot see its own
+        /// outstanding requests, so it re-opens a card that is already sitting in front of Klives.
+        /// </summary>
+        public Func<string, string>? DescribeApprovals;
+
         /// <summary>Optional live KliveAgent bridge summary: active services, registered capabilities,
         /// reusable shortcuts and a compact task-relevant repository map. This keeps Project wakes
         /// grounded in the same operating environment as interactive KliveAgent without copying a
@@ -76,28 +82,34 @@ namespace Omnipotent.Services.Projects
         /// <param name="recentEventsConsidered">Overrides how many recent events are considered (project setting).</param>
         /// <param name="recentEventsBudget">Overrides the token budget for the recent-event block (project setting).</param>
         public async Task<string> BuildWakeSeed(Project project, string triggerDescription,
-            int? recentEventsConsidered = null, int? recentEventsBudget = null)
+            int? recentEventsConsidered = null, int? recentEventsBudget = null,
+            bool chronologicalEvents = true)
         {
             var digest = digests.GetDigest(project.ProjectID);
 
-            // Recent verbatim window: everything after the digest watermark, newest kept.
+            // Recent verbatim window: everything after the digest watermark, newest kept. The window
+            // reaches deeper than the configured event count because everything past the newest handful
+            // is compacted before it is fitted — the token budget, not the count, is the real bound.
+            int considered = recentEventsConsidered ?? ProjectCommanderPrompts.RecentEventsConsidered;
+            int deepWindow = Math.Clamp(considered * ProjectsContextBudget.CompactHistoryMultiplier, considered, 800);
             var recent = eventLog.ReadRecentSince(project.ProjectID, digest.LastDigestedSequence, count: 2000)
                 .Where(ProjectPromptHygiene.IsAgentVisibleEvent)
-                .TakeLast(recentEventsConsidered ?? ProjectCommanderPrompts.RecentEventsConsidered)
+                .TakeLast(deepWindow)
                 .ToList();
 
             // Retrieval into the deep log, keyed by the trigger. Events already in the recent
             // window are excluded — retrieval exists to reach past it.
-            string retrievalQuery = string.Join(" ", new[]
-            {
+            //
+            // Distinct terms, not a blob: this used to concatenate the goal, focus, eight next steps AND
+            // 1,200 characters of plan prose, which is a broad enough BM25 query to match most of the log
+            // and therefore ranked long-tail noise to the top.
+            string retrievalQuery = ProjectsContextBudget.BuildRetrievalQuery(40,
                 project.Goal,
+                ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 ProjectPromptHygiene.ScrubState(digest.CurrentFocus, ""),
                 string.Join(" ", digest.NextSteps
                     .Where(step => !ProjectPromptHygiene.ContainsContextBookkeeping(step))
-                    .Take(8)),
-                Truncate(ProjectPromptHygiene.ScrubState(digest.CurrentPlan, ""), 1200),
-                ProjectPromptHygiene.ScrubTrigger(triggerDescription),
-            }.Where(x => !string.IsNullOrWhiteSpace(x)));
+                    .Take(3)));
             var hits = retrieval.Search(project.ProjectID, retrievalQuery)
                 .Where(h => recent.Count == 0 || h.Sequence < recent[0].Sequence)
                 .Where(ProjectPromptHygiene.IsAgentVisibleRetrievalHit)
@@ -147,6 +159,12 @@ namespace Omnipotent.Services.Projects
                 try { directives = DescribeDirectives(project.ProjectID, triggerDescription); } catch { directives = null; }
             }
 
+            string? approvals = null;
+            if (DescribeApprovals != null)
+            {
+                try { approvals = DescribeApprovals(project.ProjectID); } catch { approvals = null; }
+            }
+
             string? kliveAgentContext = null;
             if (DescribeKliveAgentContextAsync != null)
             {
@@ -156,7 +174,7 @@ namespace Omnipotent.Services.Projects
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
-                recentEventsBudget);
+                recentEventsBudget, chronologicalEvents, approvals);
         }
 
         private static string Truncate(string s, int max) =>

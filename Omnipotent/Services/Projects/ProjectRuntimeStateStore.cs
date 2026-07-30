@@ -251,6 +251,84 @@ namespace Omnipotent.Services.Projects
             ResolvedAt == null && (!RetryNotBefore.HasValue || RetryNotBefore.Value > utcNow);
     }
 
+    /// <summary>
+    /// One durable row of "we have tried this before", keyed by intent (see <see cref="ProjectAttemptKey"/>)
+    /// rather than by exact tool arguments.
+    ///
+    /// <see cref="ProjectFailedApproach"/> is the curated version of this — a considered judgement, written
+    /// deliberately by an agent or by the convergence guard. This is the raw automatic counterpart: every
+    /// tool call updates its row, with no model cooperation required, so repetition is detectable even when
+    /// the agent never thought to record anything. That matters because the in-wake convergence guard
+    /// resets on every wake and matches only byte-identical arguments, which leaves cross-wake repetition
+    /// completely undetected.
+    /// </summary>
+    public sealed class ProjectAttempt
+    {
+        public string AttemptKey { get; set; } = "";
+        public string ToolName { get; set; } = "";
+        /// <summary>Audited one-line description of the call, for the seeded ledger.</summary>
+        public string Summary { get; set; } = "";
+        public int Count { get; set; }
+        /// <summary>How many of those attempts did not succeed. Only failures are worth warning about.</summary>
+        public int FailureCount { get; set; }
+        public DateTime FirstAt { get; set; } = DateTime.UtcNow;
+        public DateTime LastAt { get; set; } = DateTime.UtcNow;
+        /// <summary>Trimmed text of the most recent result.</summary>
+        public string LastOutcome { get; set; } = "";
+        public bool LastSucceeded { get; set; }
+        public string? LastWakeID { get; set; }
+        public string? LastAgentID { get; set; }
+
+        /// <summary>True when this intent has failed repeatedly and has not since worked.</summary>
+        public bool IsRepeatedFailure(int threshold) => !LastSucceeded && FailureCount >= threshold;
+    }
+
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum ProjectStepStatus
+    {
+        Queued,
+        Active,
+        Done,
+        Abandoned,
+        Blocked,
+    }
+
+    /// <summary>
+    /// One step on the project's linear path. Exactly one step is <see cref="ProjectStepStatus.Active"/> at
+    /// a time — that invariant is the whole point.
+    ///
+    /// This exists because a project previously had four overlapping answers to "what am I doing now":
+    /// dependency-ordered Grand Plan milestones (too coarse, and only a summary line reached the seed),
+    /// the digest's prose next-steps (rewritten by a utility model after every wake, so the plan drifted
+    /// on its own), a single runner-set resume action, and the directive queue. With no single authority
+    /// and no attempt count, each wake re-derived a plausible-looking plan and often picked something
+    /// already attempted.
+    /// </summary>
+    public sealed class ProjectStep
+    {
+        public string StepID { get; set; } = "";
+        public string Title { get; set; } = "";
+        /// <summary>The Grand Plan milestone this step serves, when it serves one.</summary>
+        public string? MilestoneID { get; set; }
+        public ProjectStepStatus Status { get; set; } = ProjectStepStatus.Queued;
+        public int Order { get; set; }
+        /// <summary>How many tool attempts have been made while this step was active. Maintained automatically.</summary>
+        public int Attempts { get; set; }
+        /// <summary>Outcome of the most recent attempt, so a fresh context knows where the step actually stands.</summary>
+        public string? LastAttemptOutcome { get; set; }
+        /// <summary>The single next thing to do. This is what a renewed context resumes from.</summary>
+        public string? NextConcreteAction { get; set; }
+        public string? OwnerAgentID { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? StartedAt { get; set; }
+        public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+        public DateTime? ClosedAt { get; set; }
+        public string? ClosureReason { get; set; }
+        public List<ProjectEvidenceReference> Evidence { get; set; } = new();
+
+        public bool IsOpen => Status is ProjectStepStatus.Queued or ProjectStepStatus.Active or ProjectStepStatus.Blocked;
+    }
+
     /// <summary>A project output/input designated as canonical, with identity and validation evidence.</summary>
     public sealed class ProjectCanonicalArtifact
     {
@@ -298,6 +376,18 @@ namespace Omnipotent.Services.Projects
         /// wake so a context reset cannot make the agent repeat a known dead end.</summary>
         public List<ProjectFailedApproach> FailedApproaches { get; set; } = new();
         public List<ProjectCanonicalArtifact> CanonicalArtifacts { get; set; } = new();
+        /// <summary>
+        /// Automatic per-intent attempt history. Written by the runners on every tool result, so repetition
+        /// is visible across wakes and process restarts without the agent having to have noticed it.
+        /// </summary>
+        public List<ProjectAttempt> Attempts { get; set; } = new();
+        /// <summary>
+        /// The project's linear path: the one active step and the queue behind it. Authoritative — unlike
+        /// the digest's prose next-steps, nothing rewrites this between wakes.
+        /// </summary>
+        public List<ProjectStep> Steps { get; set; } = new();
+        /// <summary>Monotonic source for step ids (s1, s2, …) so an id is never reused after eviction.</summary>
+        public int NextStepNumber { get; set; }
         public ProjectActionCheckpoint? LastSuccessfulAction { get; set; }
         public Dictionary<string, ProjectActionCheckpoint> AgentLastSuccessfulActions { get; set; } = new(StringComparer.Ordinal);
         /// <summary>Bounded durable fingerprints prevent A→B→A rediscovery loops from being
@@ -919,6 +1009,323 @@ namespace Omnipotent.Services.Projects
         public const int MaxFailedApproaches = 32;
 
         /// <summary>
+        /// Bound on the automatic attempt ledger. Larger than the curated dead-end list, but deliberately not
+        /// huge: the whole runtime state file is rewritten on every tool call that touches it, so each row
+        /// here is bytes on a per-tool-call write. Only 24 rows are ever seeded, and eviction keeps failures.
+        /// </summary>
+        public const int MaxAttempts = 96;
+
+        /// <summary>How many failures of one intent make it worth telling the agent about.</summary>
+        public const int RepeatedFailureThreshold = 2;
+
+        /// <summary>How many failed intents the wake seed lists.</summary>
+        private const int SeededAttempts = 24;
+
+        /// <summary>
+        /// Record one attempt at an intent and return the row AS IT WAS BEFORE this attempt, so the caller
+        /// can tell the agent what already happened. Returns null the first time an intent is seen.
+        ///
+        /// Every tool call comes through here, successes included: a success is what clears an intent's
+        /// "this keeps failing" state, and without recording it a tool that worked on the fourth try would
+        /// keep being flagged forever.
+        /// </summary>
+        public ProjectAttempt? RecordAttempt(string projectID, string attemptKey, string toolName, string summary,
+            bool succeeded, string? outcome, string? wakeID, string? agentID, DateTime? nowUtc = null)
+        {
+            if (string.IsNullOrWhiteSpace(attemptKey)) return null;
+            DateTime now = Utc(nowUtc);
+            ProjectAttempt? previous = null;
+            MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                int index = checkpoint.Attempts.FindIndex(x =>
+                    string.Equals(x.AttemptKey, attemptKey, StringComparison.Ordinal));
+                var entry = index >= 0 ? checkpoint.Attempts[index] : null;
+                if (entry != null) previous = Clone(entry);
+
+                entry ??= new ProjectAttempt { AttemptKey = attemptKey, FirstAt = now };
+                entry.ToolName = toolName ?? entry.ToolName;
+                entry.Summary = string.IsNullOrWhiteSpace(summary) ? entry.Summary : Clip(summary, 160);
+                entry.Count++;
+                if (!succeeded) entry.FailureCount++;
+                entry.LastAt = now;
+                entry.LastSucceeded = succeeded;
+                entry.LastOutcome = Clip(outcome, 200);
+                entry.LastWakeID = wakeID;
+                entry.LastAgentID = agentID;
+
+                if (index >= 0) checkpoint.Attempts[index] = entry; else checkpoint.Attempts.Add(entry);
+
+                // The active step's attempt count is derived from real tool activity, not from the agent
+                // remembering to report it — a step that has silently been retried nine times should say so.
+                ChargeActiveStep(checkpoint, outcome, succeeded, now);
+
+                // Bound the ledger: shed intents that ended in success before ones still failing, then the
+                // least recently attempted. Unresolved failures are the rows worth keeping.
+                if (checkpoint.Attempts.Count > MaxAttempts)
+                {
+                    checkpoint.Attempts = checkpoint.Attempts
+                        .OrderBy(x => x.IsRepeatedFailure(RepeatedFailureThreshold) ? 0 : 1)
+                        .ThenByDescending(x => x.LastAt)
+                        .Take(MaxAttempts)
+                        .ToList();
+                }
+                return new(true, true);
+            }, now);
+            return previous;
+        }
+
+        // ── the step ledger: one linear path ──
+
+        /// <summary>Bound on the ledger; closed steps are evicted oldest-first once it is exceeded.</summary>
+        public const int MaxSteps = 64;
+
+        /// <summary>How many queued and recently closed steps the wake seed shows.</summary>
+        private const int SeededQueuedSteps = 8;
+        private const int SeededClosedSteps = 5;
+
+        /// <summary>Append steps to the end of the queue. Returns the created steps.</summary>
+        public List<ProjectStep> QueueSteps(string projectID, IEnumerable<ProjectStep> steps, DateTime? nowUtc = null)
+        {
+            ArgumentNullException.ThrowIfNull(steps);
+            DateTime now = Utc(nowUtc);
+            var created = new List<ProjectStep>();
+            MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                int nextOrder = checkpoint.Steps.Count == 0 ? 1 : checkpoint.Steps.Max(x => x.Order) + 1;
+                foreach (var step in steps)
+                {
+                    if (string.IsNullOrWhiteSpace(step?.Title)) continue;
+                    var copy = Clone(step!);
+                    copy.StepID = $"s{++checkpoint.NextStepNumber}";
+                    copy.Title = Clip(copy.Title, 200);
+                    copy.NextConcreteAction = string.IsNullOrWhiteSpace(copy.NextConcreteAction) ? null : Clip(copy.NextConcreteAction, 400);
+                    copy.MilestoneID = string.IsNullOrWhiteSpace(copy.MilestoneID) ? null : copy.MilestoneID!.Trim();
+                    copy.Status = ProjectStepStatus.Queued;
+                    copy.Order = nextOrder++;
+                    copy.Attempts = 0;
+                    copy.CreatedAt = now;
+                    copy.UpdatedAt = now;
+                    copy.StartedAt = null;
+                    copy.ClosedAt = null;
+                    checkpoint.Steps.Add(copy);
+                    created.Add(Clone(copy));
+                }
+                if (created.Count == 0) return new(false, false, "No steps with a title were supplied.");
+                EvictClosedSteps(checkpoint);
+                return new(true, true);
+            }, now);
+            return created;
+        }
+
+        /// <summary>
+        /// Make one step the active one, demoting whatever was active back to the queue. This is where the
+        /// single-active-step invariant is enforced: the model cannot hold two lines of work open by
+        /// forgetting to close the first.
+        /// </summary>
+        public ProjectRuntimeMutationResult ActivateStep(string projectID, string stepID, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                var target = FindStep(checkpoint, stepID);
+                if (target == null) return new(false, false, $"No step '{stepID}' exists.");
+                if (!target.IsOpen) return new(false, false, $"Step '{stepID}' is {target.Status} and cannot be activated; queue a new step instead.");
+                if (target.Status == ProjectStepStatus.Active) return new(true, false);
+                foreach (var other in checkpoint.Steps.Where(x => x.Status == ProjectStepStatus.Active))
+                {
+                    other.Status = ProjectStepStatus.Queued;
+                    other.UpdatedAt = now;
+                }
+                target.Status = ProjectStepStatus.Active;
+                target.StartedAt ??= now;
+                target.UpdatedAt = now;
+                return new(true, true);
+            }, now);
+        }
+
+        /// <summary>Update the active-facing fields of a step: what to do next, and the latest outcome.</summary>
+        public ProjectRuntimeMutationResult UpdateStep(string projectID, string stepID, string? nextConcreteAction,
+            string? lastAttemptOutcome, string? ownerAgentID, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                var step = FindStep(checkpoint, stepID);
+                if (step == null) return new(false, false, $"No step '{stepID}' exists.");
+                bool changed = false;
+                if (!string.IsNullOrWhiteSpace(nextConcreteAction)) { step.NextConcreteAction = Clip(nextConcreteAction, 400); changed = true; }
+                if (!string.IsNullOrWhiteSpace(lastAttemptOutcome)) { step.LastAttemptOutcome = Clip(lastAttemptOutcome, 300); changed = true; }
+                if (!string.IsNullOrWhiteSpace(ownerAgentID)) { step.OwnerAgentID = ownerAgentID!.Trim(); changed = true; }
+                if (!changed) return new(false, false, "Supply nextAction, outcome, and/or owner.");
+                step.UpdatedAt = now;
+                return new(true, true);
+            }, now);
+        }
+
+        /// <summary>
+        /// Close a step. Reaching <see cref="ProjectStepStatus.Done"/> requires an evidence reference, the
+        /// same rule the Grand Plan applies to milestones — a step is not done because the agent believes
+        /// it is, but because something durable shows it.
+        /// </summary>
+        public ProjectRuntimeMutationResult CloseStep(string projectID, string stepID, ProjectStepStatus result,
+            string reason, List<ProjectEvidenceReference>? evidence = null, DateTime? nowUtc = null)
+        {
+            if (result is not (ProjectStepStatus.Done or ProjectStepStatus.Abandoned or ProjectStepStatus.Blocked))
+                throw new ArgumentException("A step closes as Done, Abandoned or Blocked.", nameof(result));
+            DateTime now = Utc(nowUtc);
+            return MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                var step = FindStep(checkpoint, stepID);
+                if (step == null) return new(false, false, $"No step '{stepID}' exists.");
+                if (step.Status is ProjectStepStatus.Done or ProjectStepStatus.Abandoned)
+                    return new(false, false, $"Step '{stepID}' is already {step.Status}.");
+                bool hasEvidence = evidence != null && evidence.Any(e => !string.IsNullOrWhiteSpace(e.Reference));
+                if (result == ProjectStepStatus.Done && !hasEvidence)
+                    return new(false, false, $"Closing step '{stepID}' as done requires an evidence reference (an event sequence, an artifact id, or a /project path).");
+                if (string.IsNullOrWhiteSpace(reason))
+                    return new(false, false, "Supply 'reason' describing the outcome.");
+                step.Status = result;
+                step.ClosureReason = Clip(reason, 400);
+                step.ClosedAt = result == ProjectStepStatus.Blocked ? null : now;
+                step.UpdatedAt = now;
+                if (evidence != null) step.Evidence.AddRange(evidence.Where(e => !string.IsNullOrWhiteSpace(e.Reference)));
+                EvictClosedSteps(checkpoint);
+                return new(true, true);
+            }, now);
+        }
+
+        /// <summary>Reorder the open queue. Ids not listed keep their relative order behind the listed ones.</summary>
+        public ProjectRuntimeMutationResult ReorderSteps(string projectID, IEnumerable<string> stepIDsInOrder, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            var requested = (stepIDsInOrder ?? Array.Empty<string>())
+                .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim()).ToList();
+            return MutateCheckpoint(projectID, null, checkpoint =>
+            {
+                if (requested.Count == 0) return new(false, false, "Supply at least one step id.");
+                int order = 0;
+                foreach (string id in requested)
+                {
+                    var step = FindStep(checkpoint, id);
+                    if (step == null) return new(false, false, $"No step '{id}' exists.");
+                    step.Order = ++order;
+                    step.UpdatedAt = now;
+                }
+                foreach (var step in checkpoint.Steps
+                    .Where(x => !requested.Contains(x.StepID, StringComparer.OrdinalIgnoreCase))
+                    .OrderBy(x => x.Order))
+                    step.Order = ++order;
+                return new(true, true);
+            }, now);
+        }
+
+        public ProjectStep? GetActiveStep(string projectID) =>
+            Get(projectID).Checkpoint.Steps
+                .Where(x => x.Status == ProjectStepStatus.Active)
+                .Select(Clone).FirstOrDefault();
+
+        public List<ProjectStep> ListSteps(string projectID) =>
+            Get(projectID).Checkpoint.Steps.OrderBy(x => x.Order).Select(Clone).ToList();
+
+        /// <summary>True while any step is open, i.e. the ledger — not the digest prose — owns the plan.</summary>
+        public bool HasOpenSteps(string projectID) =>
+            Get(projectID).Checkpoint.Steps.Any(x => x.IsOpen);
+
+        /// <summary>
+        /// Charge one attempt against whatever step is currently active. Called from the attempt ledger, so
+        /// the count reflects what actually happened rather than what the agent remembered to report.
+        /// </summary>
+        private static void ChargeActiveStep(ProjectRuntimeCheckpoint checkpoint, string? outcome, bool succeeded, DateTime now)
+        {
+            var active = checkpoint.Steps.FirstOrDefault(x => x.Status == ProjectStepStatus.Active);
+            if (active == null) return;
+            active.Attempts++;
+            active.LastAttemptOutcome = Clip((succeeded ? "" : "failed: ") + (outcome ?? ""), 300);
+            active.UpdatedAt = now;
+        }
+
+        private static ProjectStep? FindStep(ProjectRuntimeCheckpoint checkpoint, string? stepID) =>
+            string.IsNullOrWhiteSpace(stepID) ? null : checkpoint.Steps.FirstOrDefault(x =>
+                string.Equals(x.StepID, stepID.Trim(), StringComparison.OrdinalIgnoreCase));
+
+        private static void EvictClosedSteps(ProjectRuntimeCheckpoint checkpoint)
+        {
+            if (checkpoint.Steps.Count <= MaxSteps) return;
+            // Open steps are never evicted — losing a queued step loses real plan. Closed ones age out.
+            var open = checkpoint.Steps.Where(x => x.IsOpen).ToList();
+            var closed = checkpoint.Steps.Where(x => !x.IsOpen)
+                .OrderByDescending(x => x.ClosedAt ?? x.UpdatedAt)
+                .Take(Math.Max(0, MaxSteps - open.Count))
+                .ToList();
+            checkpoint.Steps = open.Concat(closed).OrderBy(x => x.Order).ToList();
+        }
+
+        /// <summary>
+        /// The linear path as the agent sees it: the one thing in flight (with its attempt count, last
+        /// outcome and next concrete action), the queue behind it, and what was recently closed.
+        /// </summary>
+        public string DescribeStepsForWake(string projectID)
+        {
+            var steps = Get(projectID).Checkpoint.Steps;
+            if (steps.Count == 0) return "";
+            var sb = new System.Text.StringBuilder();
+
+            var active = steps.FirstOrDefault(x => x.Status == ProjectStepStatus.Active);
+            if (active != null)
+            {
+                sb.AppendLine("── CURRENT STEP (the ONE thing in flight) ──");
+                sb.AppendLine($"{active.StepID}  {active.Title}" +
+                    (string.IsNullOrWhiteSpace(active.MilestoneID) ? "" : $"  [milestone {active.MilestoneID}]"));
+                sb.AppendLine($"    attempts {active.Attempts}" +
+                    (active.StartedAt.HasValue ? $" · active since {Data_Handling.TemporalFormat.StampWithAge(active.StartedAt.Value)}" : "") +
+                    (string.IsNullOrWhiteSpace(active.OwnerAgentID) ? "" : $" · owner {active.OwnerAgentID}"));
+                if (!string.IsNullOrWhiteSpace(active.LastAttemptOutcome))
+                    sb.AppendLine($"    last attempt: {active.LastAttemptOutcome}");
+                sb.AppendLine(string.IsNullOrWhiteSpace(active.NextConcreteAction)
+                    ? "    next concrete action: (not set — set it with checkpoint op:update_step before you finish this wake)"
+                    : $"    next concrete action: {active.NextConcreteAction}");
+            }
+
+            var queued = steps.Where(x => x.Status is ProjectStepStatus.Queued or ProjectStepStatus.Blocked)
+                .OrderBy(x => x.Order).Take(SeededQueuedSteps).ToList();
+            if (queued.Count > 0)
+            {
+                sb.AppendLine(active == null
+                    ? "── STEP QUEUE (nothing is active — activate the first one with checkpoint op:activate_step) ──"
+                    : "── STEP QUEUE (work these in order; do not jump ahead) ──");
+                foreach (var step in queued)
+                    sb.AppendLine($"{step.StepID}  {step.Title}" +
+                        (step.Status == ProjectStepStatus.Blocked ? $"  [BLOCKED: {step.ClosureReason}]" : "") +
+                        (string.IsNullOrWhiteSpace(step.MilestoneID) ? "" : $"  [milestone {step.MilestoneID}]"));
+            }
+
+            var closed = steps.Where(x => x.Status is ProjectStepStatus.Done or ProjectStepStatus.Abandoned)
+                .OrderByDescending(x => x.ClosedAt ?? x.UpdatedAt).Take(SeededClosedSteps).ToList();
+            if (closed.Count > 0)
+            {
+                sb.AppendLine("── RECENTLY CLOSED (do not re-open these without new information) ──");
+                foreach (var step in closed)
+                    sb.AppendLine($"{step.StepID}  {(step.Status == ProjectStepStatus.Done ? "✓" : "✗ abandoned:")} {step.Title}" +
+                        $" ({Data_Handling.TemporalFormat.StampWithAge(step.ClosedAt ?? step.UpdatedAt)})" +
+                        (string.IsNullOrWhiteSpace(step.ClosureReason) ? "" : $" — {step.ClosureReason}"));
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        public ProjectAttempt? GetAttempt(string projectID, string attemptKey) =>
+            Get(projectID).Checkpoint.Attempts
+                .Where(x => string.Equals(x.AttemptKey, attemptKey, StringComparison.Ordinal))
+                .Select(Clone).FirstOrDefault();
+
+        /// <summary>Intents that have failed repeatedly and have not since succeeded, worst and newest first.</summary>
+        public List<ProjectAttempt> GetRepeatedFailures(string projectID) =>
+            Get(projectID).Checkpoint.Attempts
+                .Where(x => x.IsRepeatedFailure(RepeatedFailureThreshold))
+                .OrderByDescending(x => x.FailureCount)
+                .ThenByDescending(x => x.LastAt)
+                .Select(Clone).ToList();
+
+        /// <summary>
         /// Record (or re-record) an approach that did not work. Re-recording the same <paramref name="approach"/>.Key
         /// increments its attempt count rather than adding a duplicate, so the seed shows "tried 4 times" instead of
         /// four near-identical lines.
@@ -1041,6 +1448,12 @@ namespace Omnipotent.Services.Projects
             DateTime now = Utc(nowUtc);
             var state = Get(projectID);
             var sb = new System.Text.StringBuilder();
+
+            // The linear path goes first, before health, facts or dead ends. It is the answer to the only
+            // question the agent must resolve before doing anything: what is the one thing in flight.
+            string stepLedger = DescribeStepsForWake(projectID);
+            if (stepLedger.Length > 0) sb.AppendLine(stepLedger);
+
             sb.AppendLine($"runtime revision: {state.Revision}; disposition: {state.Disposition}; health: {state.Health.Status}");
             if (state.Health.Circuit.Status != ProjectCircuitStatus.Closed)
                 sb.AppendLine($"provider circuit: {state.Health.Circuit.Status}; reason={state.Health.Circuit.ReasonCode ?? "unknown"}; retryAt={state.Health.Circuit.RetryAt?.ToString("O") ?? "manual"}");
@@ -1056,9 +1469,15 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine($"checkpoint: plan v{state.Checkpoint.GrandPlanVersion?.ToString() ?? "?"}; active milestones: {(state.Checkpoint.ActiveMilestoneIDs.Count == 0 ? "none" : string.Join(", ", state.Checkpoint.ActiveMilestoneIDs))}");
             if (state.Checkpoint.LastSuccessfulAction != null)
                 sb.AppendLine($"last verified action: {state.Checkpoint.LastSuccessfulAction.Summary} ({state.Checkpoint.LastSuccessfulAction.RecordedAt:O})");
+            // With a step active, the step's next concrete action is the authoritative "what now" and this
+            // becomes context on how the last context ended. Two competing resume instructions is how an
+            // agent talks itself into a third, invented one.
             if (state.Checkpoint.ResumeAction != null)
-                sb.AppendLine($"EXACT RESUME ACTION: {state.Checkpoint.ResumeAction.Summary}" +
-                    (state.Checkpoint.ResumeAction.NotBefore.HasValue ? $"; notBefore={state.Checkpoint.ResumeAction.NotBefore:O}" : ""));
+                sb.AppendLine((stepLedger.Contains("── CURRENT STEP", StringComparison.Ordinal)
+                        ? "how the previous context ended (the current step above is what to resume): "
+                        : "EXACT RESUME ACTION: ")
+                    + state.Checkpoint.ResumeAction.Summary
+                    + (state.Checkpoint.ResumeAction.NotBefore.HasValue ? $"; notBefore={state.Checkpoint.ResumeAction.NotBefore:O}" : ""));
             if (state.ActiveAgentWakeLeases.Count > 0)
                 sb.AppendLine("active worker leases: " + string.Join(", ", state.ActiveAgentWakeLeases.Select(x =>
                     $"{x.Key}/{x.Value.WakeID[..Math.Min(8, x.Value.WakeID.Length)]} {x.Value.Status} heartbeat={x.Value.LastHeartbeatAt:O}")));
@@ -1069,7 +1488,39 @@ namespace Omnipotent.Services.Projects
                     sb.AppendLine($"- {entry.Key}: {entry.Value.Summary}");
             }
 
-            var facts = state.Checkpoint.VerifiedFacts.Where(f => f.IsFreshAt(now)).Take(32).ToList();
+            AppendProjectKnowledge(sb, state.Checkpoint, now);
+
+            if (state.Checkpoint.CanonicalArtifacts.Count > 0)
+            {
+                sb.AppendLine("canonical artifacts:");
+                foreach (var artifact in state.Checkpoint.CanonicalArtifacts.Take(24))
+                    sb.AppendLine($"- {artifact.Role}: {artifact.ProjectPath ?? artifact.ArtifactID ?? "unresolved"}; validation={artifact.ValidationStatus}" +
+                        $"; updated={Data_Handling.TemporalFormat.StampWithAge(artifact.UpdatedAt == default ? artifact.RegisteredAt : artifact.UpdatedAt)}" +
+                        (string.IsNullOrWhiteSpace(artifact.ContentHash) ? "" : $"; hash={artifact.ContentHash}"));
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// The project's accumulated positive and negative knowledge, for a sub-agent's seed. Workers do
+        /// not get the full runtime block — leases, circuits and dispositions are the Commander's concern —
+        /// but they must get this, or each new worker starts by re-proving what the project already knows.
+        /// </summary>
+        public string DescribeProjectKnowledgeForWorker(string projectID, DateTime? nowUtc = null)
+        {
+            DateTime now = Utc(nowUtc);
+            var sb = new System.Text.StringBuilder();
+            AppendProjectKnowledge(sb, Get(projectID).Checkpoint, now);
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// Verified facts, curated dead ends and the automatic attempt ledger — the three things that must
+        /// reach every agent on every wake, because a fresh context has no other way to know them.
+        /// </summary>
+        private static void AppendProjectKnowledge(System.Text.StringBuilder sb, ProjectRuntimeCheckpoint checkpoint, DateTime now)
+        {
+            var facts = checkpoint.VerifiedFacts.Where(f => f.IsFreshAt(now)).Take(32).ToList();
             if (facts.Count > 0)
             {
                 sb.AppendLine("verified facts (fresh):");
@@ -1081,7 +1532,7 @@ namespace Omnipotent.Services.Projects
 
             // Negative knowledge. Seeded on EVERY wake precisely because a context reset would otherwise
             // let the agent re-try something it already proved does not work.
-            var deadEnds = state.Checkpoint.FailedApproaches.Where(x => x.IsActiveAt(now)).ToList();
+            var deadEnds = checkpoint.FailedApproaches.Where(x => x.IsActiveAt(now)).ToList();
             if (deadEnds.Count > 0)
             {
                 sb.AppendLine("dead ends (already tried and failed — do not repeat without new information):");
@@ -1092,15 +1543,24 @@ namespace Omnipotent.Services.Projects
                         (dead.Evidence.Count > 0 ? $"; evidence={string.Join(",", dead.Evidence.Take(3).Select(e => e.Reference))}" : ""));
             }
 
-            if (state.Checkpoint.CanonicalArtifacts.Count > 0)
+            // The automatic counterpart to the curated dead ends above. Dead ends require someone to have
+            // decided an approach is finished; this row appears whether or not anybody noticed, which is
+            // what catches the same intent being retried wake after wake with cosmetic argument changes.
+            var repeated = checkpoint.Attempts
+                .Where(x => x.IsRepeatedFailure(RepeatedFailureThreshold))
+                .OrderByDescending(x => x.FailureCount)
+                .ThenByDescending(x => x.LastAt)
+                .Take(SeededAttempts)
+                .ToList();
+            if (repeated.Count > 0)
             {
-                sb.AppendLine("canonical artifacts:");
-                foreach (var artifact in state.Checkpoint.CanonicalArtifacts.Take(24))
-                    sb.AppendLine($"- {artifact.Role}: {artifact.ProjectPath ?? artifact.ArtifactID ?? "unresolved"}; validation={artifact.ValidationStatus}" +
-                        $"; updated={Data_Handling.TemporalFormat.StampWithAge(artifact.UpdatedAt == default ? artifact.RegisteredAt : artifact.UpdatedAt)}" +
-                        (string.IsNullOrWhiteSpace(artifact.ContentHash) ? "" : $"; hash={artifact.ContentHash}"));
+                sb.AppendLine("already tried (failed attempts recorded automatically — a different approach is needed, not another go):");
+                foreach (var attempt in repeated)
+                    sb.AppendLine($"- {attempt.AttemptKey}: {attempt.Summary}" +
+                        $"; failed {attempt.FailureCount}× of {attempt.Count}" +
+                        $"; last {Data_Handling.TemporalFormat.StampWithAge(attempt.LastAt)}" +
+                        $" → {attempt.LastOutcome}");
             }
-            return sb.ToString().TrimEnd();
         }
 
         public ProjectRuntimeMutationResult UpsertCanonicalArtifact(string projectID, ProjectCanonicalArtifact artifact,
@@ -1562,6 +2022,13 @@ namespace Omnipotent.Services.Projects
 
         private static T Clone<T>(T value) =>
             JsonConvert.DeserializeObject<T>(JsonConvert.SerializeObject(value))!;
+
+        /// <summary>Whitespace-collapsed and length-capped, for text destined for a wake seed.</summary>
+        private static string Clip(string? value, int max)
+        {
+            string text = System.Text.RegularExpressions.Regex.Replace(value ?? "", @"\s+", " ").Trim();
+            return text.Length <= max ? text : text[..max] + "…";
+        }
 
         private static void ValidateProjectID(string projectID)
         {

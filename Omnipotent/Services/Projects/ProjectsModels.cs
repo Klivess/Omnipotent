@@ -112,6 +112,13 @@ namespace Omnipotent.Services.Projects
         /// <summary>Verified project-relative deliverables recorded at completion.</summary>
         public List<string> CompletionArtifactPaths { get; set; } = new();
         public long? ReplyEventSequence { get; set; }
+        /// <summary>
+        /// Set when a later instruction from Klives replaced this one. A superseded directive stops being
+        /// seeded but is kept for the record — the alternative is two contradicting instructions sitting in
+        /// the same prompt with nothing to say which one won.
+        /// </summary>
+        public string? SupersededBy { get; set; }
+        public DateTime? SupersededAt { get; set; }
         public long Revision { get; set; }
 
         public bool IsOpen => Status is ProjectDirectiveStatus.Active or ProjectDirectiveStatus.Delivered
@@ -141,6 +148,14 @@ namespace Omnipotent.Services.Projects
         public string? Reason { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public List<string> ExpectedArtifactPaths { get; set; } = new();
+        /// <summary>
+        /// True when the message was recognised as a standing constraint and saved as a durable RULE rather
+        /// than the one-off kind it was sent as. Surfaced to Klives so an over-eager promotion is visible and
+        /// revocable rather than silent.
+        /// </summary>
+        public bool PromotedToRule { get; set; }
+        /// <summary>The directive this message replaced, when it carried the same key as an earlier one.</summary>
+        public string? SupersededDirectiveID { get; set; }
     }
 
     /// <summary>How desktops are allocated within a project (Commander's call, §4).</summary>

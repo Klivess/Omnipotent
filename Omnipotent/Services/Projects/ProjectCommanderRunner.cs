@@ -323,6 +323,7 @@ namespace Omnipotent.Services.Projects
                 int maxOutputTokens = Math.Clamp(settings.CommanderMaxOutputTokens, 512, 32_768);
                 int maxLoopTrips = settings.MaxConvergenceTripsPerSlice;
                 int toolResultKeepRecent = Math.Clamp(settings.ToolResultKeepRecent, 2, 256);
+                bool attemptLedgerEnabled = settings.AttemptLedgerEnabled;
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
                     llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
                 if (contextPolicy != null)
@@ -347,7 +348,8 @@ namespace Omnipotent.Services.Projects
                 // separately as a bounded prose tail below.
                 string sessionId = $"projects-commander-{projectID}";
                 string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
-                    settings.RecentEventsConsidered, settings.RecentEventsBudget);
+                    settings.RecentEventsConsidered, settings.RecentEventsBudget,
+                    settings.ChronologicalRecentEvents);
                 llm.ResetSession(sessionId);
                 llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
@@ -722,6 +724,33 @@ namespace Omnipotent.Services.Projects
                             };
                         if (ProjectWorkProgress.RecordIfNovel(parent.RuntimeState, projectID, "commander", toolName, argsJson, result))
                             productiveActions++;
+
+                        // Durable per-intent attempt ledger. The convergence guard above only sees
+                        // byte-identical calls inside this one wake; this survives wakes and restarts and
+                        // tolerates cosmetic argument differences, so a fourth attempt at something that
+                        // failed on three previous wakes actually says so.
+                        //
+                        // Poll-shaped tools are skipped rather than recorded-and-ignored. They are both the
+                        // most frequent calls in any GUI wake and the ones that can never be warned about, so
+                        // recording them would rewrite the runtime state file dozens of times per wake for no
+                        // signal — and would make a step's attempt count read as 40 screenshots rather than
+                        // the three real attempts it made.
+                        if (attemptLedgerEnabled && !ProjectAttemptKey.IsDeliberatelyRepeatable(toolName))
+                        {
+                            try
+                            {
+                                var prior = parent.RuntimeState.RecordAttempt(projectID,
+                                    ProjectAttemptKey.For(toolName, argsJson), toolName,
+                                    DescribeCall(toolName, argsJson), result.Succeeded, result.ResultText,
+                                    wakeID, "commander");
+                                if (ProjectAttemptWarning.ShouldWarn(prior, result.Succeeded, toolName))
+                                    result = result with
+                                    {
+                                        ResultText = result.ResultText + "\n" + ProjectAttemptWarning.Render(prior!),
+                                    };
+                            }
+                            catch { /* the ledger is advisory; never fail a committed tool result over it */ }
+                        }
 
                         parent.EventLog.Append(new ProjectEvent
                         {

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Text;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
@@ -27,6 +28,20 @@ namespace Omnipotent.Services.Projects
         public string? Comment { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? ResolvedAt { get; set; }
+        /// <summary>
+        /// How many times Klives has commented on this gate without approving or denying it. Discussion
+        /// used to release the waiting agent and then leave nothing on the gate at all, so the comment lived
+        /// only in the event log and the request looked untouched.
+        /// </summary>
+        public int DiscussionCount { get; set; }
+        public DateTime? LastDiscussedAt { get; set; }
+        public List<string> DiscussionComments { get; set; } = new();
+        /// <summary>
+        /// Identity of the REQUEST rather than of this gate, so a second identical ask can be recognised as
+        /// the same question. Without it the Commander — which never saw its own pending approvals — could
+        /// open a fresh "Complete the project?" card next to the one still waiting.
+        /// </summary>
+        public string DedupeHash { get; set; } = "";
     }
 
     /// <summary>
@@ -74,6 +89,7 @@ namespace Omnipotent.Services.Projects
         public async Task<GateResolution> OpenGateAndWaitAsync(ProjectGate gate, CancellationToken ct)
         {
             if (string.IsNullOrWhiteSpace(gate.GateID)) gate.GateID = Guid.NewGuid().ToString("N");
+            if (string.IsNullOrWhiteSpace(gate.DedupeHash)) gate.DedupeHash = ComputeDedupeHash(gate.Kind, gate.Title, gate.Description);
             var tcs = new TaskCompletionSource<GateResolution>(TaskCreationOptions.RunContinuationsAsynchronously);
             waiters[gate.GateID] = tcs;
             Persist(gate);
@@ -140,8 +156,21 @@ namespace Omnipotent.Services.Projects
             ProjectGate? gate;
             lock (LockFor(projectID))
             {
-                gate = LoadLocked(projectID).FirstOrDefault(g => g.GateID == gateID && !g.Resolved);
+                var gates = LoadLocked(projectID);
+                gate = gates.FirstOrDefault(g => g.GateID == gateID && !g.Resolved);
                 if (gate == null) return false;
+                // Persist the discussion. It used to be released to the waiting agent and then dropped, so
+                // an unresolved-but-discussed gate was indistinguishable from an untouched one and Klives'
+                // comment survived only as a log line that scrolled out of the seed.
+                gate.DiscussionCount++;
+                gate.LastDiscussedAt = DateTime.UtcNow;
+                if (!string.IsNullOrWhiteSpace(comment))
+                {
+                    gate.DiscussionComments.Add(comment.Trim());
+                    if (gate.DiscussionComments.Count > MaxDiscussionComments)
+                        gate.DiscussionComments.RemoveAt(0);
+                }
+                SaveLocked(projectID, gates);
             }
             var resolution = new GateResolution(GateDecision.Discuss, comment, "klives");
             if (waiters.TryRemove(gateID, out var tcs)) tcs.TrySetResult(resolution);
@@ -156,6 +185,68 @@ namespace Omnipotent.Services.Projects
                 GateID = gateID,
             });
             return true;
+        }
+
+        /// <summary>How many of Klives' comments on one gate are kept.</summary>
+        private const int MaxDiscussionComments = 6;
+
+        /// <summary>How many recently resolved approvals the wake seed recalls.</summary>
+        private const int SeededResolvedGates = 4;
+
+        /// <summary>
+        /// Identity of the request being asked, so the same question opens one gate rather than several.
+        /// Normalised on kind + title + description, since those are what Klives actually reads on the card.
+        /// </summary>
+        public static string ComputeDedupeHash(string? kind, string? title, string? description)
+        {
+            string normalized = string.Join("", new[] { kind, title, description }
+                .Select(x => System.Text.RegularExpressions.Regex.Replace(x ?? "", @"\s+", " ").Trim().ToLowerInvariant()));
+            return Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(normalized)))[..16].ToLowerInvariant();
+        }
+
+        /// <summary>
+        /// An unresolved gate asking the same thing, if one exists. Callers use this to answer "you already
+        /// asked" instead of opening a duplicate card.
+        /// </summary>
+        public ProjectGate? TryFindOpenDuplicate(string projectID, string dedupeHash)
+        {
+            if (string.IsNullOrWhiteSpace(dedupeHash)) return null;
+            lock (LockFor(projectID))
+            {
+                return LoadLocked(projectID).FirstOrDefault(g => !g.Resolved
+                    && string.Equals(g.DedupeHash, dedupeHash, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        /// <summary>
+        /// Pending and recently resolved approvals for the wake seed. The Commander previously had no view of
+        /// its own approval state at all: a request it had already made, and a decision Klives had already
+        /// given, were both only event-log lines that aged out of the recent window.
+        /// </summary>
+        public string DescribeForWake(string projectID, DateTime? nowUtc = null)
+        {
+            DateTime now = nowUtc ?? DateTime.UtcNow;
+            List<ProjectGate> gates;
+            lock (LockFor(projectID)) gates = LoadLocked(projectID);
+            if (gates.Count == 0) return "";
+
+            var sb = new StringBuilder();
+            foreach (var gate in gates.Where(g => !g.Resolved).OrderBy(g => g.CreatedAt))
+            {
+                sb.AppendLine($"PENDING: \"{gate.Title}\" ({gate.Kind}) opened {TemporalFormat.StampWithAge(gate.CreatedAt)}" +
+                    (gate.DiscussionCount > 0
+                        ? $"; Klives has commented {gate.DiscussionCount}× without deciding: \"{string.Join("\" / \"", gate.DiscussionComments.TakeLast(2))}\""
+                        : "; no response from Klives yet"));
+                sb.AppendLine("  → Do NOT re-open this request. Address his comment, or work another step and use reply_to_klives.");
+            }
+            foreach (var gate in gates.Where(g => g.Resolved)
+                .OrderByDescending(g => g.ResolvedAt ?? g.CreatedAt).Take(SeededResolvedGates))
+            {
+                sb.AppendLine($"RESOLVED: \"{gate.Title}\" — {gate.Decision} {TemporalFormat.StampWithAge(gate.ResolvedAt ?? gate.CreatedAt)}" +
+                    (string.IsNullOrWhiteSpace(gate.Comment) ? "" : $": \"{gate.Comment}\""));
+            }
+            return sb.ToString().TrimEnd();
         }
 
         public List<ProjectGate> ListPending(string projectID)
@@ -194,7 +285,19 @@ namespace Omnipotent.Services.Projects
         {
             string path = GatePath(projectID);
             if (!File.Exists(path)) return new();
-            try { return JsonConvert.DeserializeObject<List<ProjectGate>>(File.ReadAllText(path)) ?? new(); }
+            try
+            {
+                var gates = JsonConvert.DeserializeObject<List<ProjectGate>>(File.ReadAllText(path)) ?? new();
+                foreach (var gate in gates)
+                {
+                    gate.DiscussionComments ??= new();
+                    // Backfill for gates written before dedupe existed, so an already-pending request from
+                    // an older build still suppresses a duplicate ask.
+                    if (string.IsNullOrWhiteSpace(gate.DedupeHash))
+                        gate.DedupeHash = ComputeDedupeHash(gate.Kind, gate.Title, gate.Description);
+                }
+                return gates;
+            }
             catch { return new(); }
         }
 

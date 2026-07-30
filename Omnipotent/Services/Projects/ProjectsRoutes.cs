@@ -37,6 +37,14 @@ namespace Omnipotent.Services.Projects
         };
         private static string Json(object o) => JsonConvert.SerializeObject(o, CamelCase);
 
+        /// <summary>The request's JSON body as an object, or null when there isn't one.</summary>
+        private static Newtonsoft.Json.Linq.JObject? ParseBody(Services.KliveAPI.KliveAPI.UserRequest req)
+        {
+            if (string.IsNullOrWhiteSpace(req.userMessageContent)) return null;
+            try { return Newtonsoft.Json.Linq.JObject.Parse(req.userMessageContent); }
+            catch { return null; }
+        }
+
         public ProjectsRoutes(Projects parent)
         {
             this.parent = parent;
@@ -719,6 +727,142 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // ── Step ledger (the project's linear path) ──
+            // Reads go through RuntimeState.Get, so these responses participate in that store's existing
+            // cache dependency and are invalidated by any checkpoint write.
+            await parent.CreateAPIRoute("/projects/steps", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var steps = parent.RuntimeState.ListSteps(project!.ProjectID).Select(s => new
+                    {
+                        s.StepID,
+                        s.Title,
+                        s.MilestoneID,
+                        Status = s.Status.ToString(),
+                        s.Order,
+                        s.Attempts,
+                        s.LastAttemptOutcome,
+                        s.NextConcreteAction,
+                        s.OwnerAgentID,
+                        s.CreatedAt,
+                        s.StartedAt,
+                        s.UpdatedAt,
+                        s.ClosedAt,
+                        s.ClosureReason,
+                        Evidence = s.Evidence.Select(e => e.Reference).ToList(),
+                    }).ToList();
+                    await req.ReturnResponse(Json(new
+                    {
+                        activeStepID = steps.FirstOrDefault(s => s.Status == nameof(ProjectStepStatus.Active))?.StepID,
+                        steps,
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Klives can add steps to the path himself — the point of the panel is that the linear path is
+            // steerable, not just observable.
+            await parent.CreateAPIRoute("/projects/steps/add", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = ParseBody(req);
+                    string title = ((string?)body?["title"] ?? "").Trim();
+                    if (title.Length == 0) { await req.ReturnResponse(Json(new { error = "title required" })); return; }
+                    var created = parent.RuntimeState.QueueSteps(project!.ProjectID, new[]
+                    {
+                        new ProjectStep
+                        {
+                            Title = title,
+                            MilestoneID = ((string?)body?["milestoneID"] ?? "").Trim() is { Length: > 0 } m ? m : null,
+                            NextConcreteAction = ((string?)body?["nextAction"] ?? "").Trim() is { Length: > 0 } n ? n : null,
+                        },
+                    });
+                    if (created.Count > 0)
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            Type = ProjectEventTypes.CheckpointChanged,
+                            Author = "klives",
+                            Text = $"Klives queued step {created[0].StepID}: {created[0].Title}",
+                        });
+                    await req.ReturnResponse(Json(new { added = created.Select(s => s.StepID).ToList() }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/steps/reorder", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var ids = (ParseBody(req)?["stepIDs"] as Newtonsoft.Json.Linq.JArray)?.Values<string>()
+                        .Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x!).ToList() ?? new();
+                    var result = parent.RuntimeState.ReorderSteps(project!.ProjectID, ids);
+                    await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await parent.CreateAPIRoute("/projects/steps/activate", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string stepID = ((string?)ParseBody(req)?["stepID"] ?? "").Trim();
+                    var result = parent.RuntimeState.ActivateStep(project!.ProjectID, stepID);
+                    if (result.Applied)
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            Type = ProjectEventTypes.CheckpointChanged,
+                            Author = "klives",
+                            Text = $"Klives made step {stepID} the active one.",
+                        });
+                    await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Klives closing a step is a steer, so it needs no evidence gate for 'abandoned'/'blocked'; a
+            // 'done' still does, since the evidence rule protects the record rather than the agent.
+            await parent.CreateAPIRoute("/projects/steps/close", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = ParseBody(req);
+                    string stepID = ((string?)body?["stepID"] ?? "").Trim();
+                    string reason = ((string?)body?["reason"] ?? "Closed by Klives.").Trim();
+                    var status = ((string?)body?["result"] ?? "abandoned").Trim().ToLowerInvariant() switch
+                    {
+                        "done" => ProjectStepStatus.Done,
+                        "blocked" => ProjectStepStatus.Blocked,
+                        _ => ProjectStepStatus.Abandoned,
+                    };
+                    var evidence = status == ProjectStepStatus.Done
+                        ? new List<ProjectEvidenceReference>
+                        {
+                            new() { Kind = ProjectEvidenceKind.UserConfirmation, Reference = "klives-confirmed", Description = reason },
+                        }
+                        : null;
+                    var result = parent.RuntimeState.CloseStep(project!.ProjectID, stepID, status, reason, evidence);
+                    if (result.Applied)
+                        parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            Type = ProjectEventTypes.CheckpointChanged,
+                            Author = "klives",
+                            Text = $"Klives closed step {stepID} as {status}: {reason}",
+                        });
+                    await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // ── Councils (adversarial deliberation transcripts) ──
             await parent.CreateAPIRoute("/projects/councils", async req =>
             {
@@ -1095,6 +1239,12 @@ namespace Omnipotent.Services.Projects
                         return;
                     }
                     bool ok = parent.Gates.ResolveGate(project!.ProjectID, gateID, new GateResolution(decision, comment, "klives"));
+                    // A denial with a reason is an instruction, and it used to leave nothing behind but an
+                    // approval-resolved event that aged out of the seed — so the Commander re-asked the same
+                    // question a wake later. Route it through the normal directive path so it becomes durable
+                    // (and is classified as a standing rule when that is what it is).
+                    if (ok && decision == GateDecision.Deny && !string.IsNullOrWhiteSpace(comment))
+                        parent.MessageProject(project.ProjectID, comment);
                     await req.ReturnResponse(Json(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }

@@ -47,6 +47,8 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
         public bool Implemented => true;
         public string Protocol => "TCP";
         public int DefaultPort => 25565;
+        public IReadOnlyList<GameNetworkPort> GetNetworkPorts(int primaryPort)
+            => new[] { new GameNetworkPort { Port = primaryPort, Protocol = Protocol } };
         public IReadOnlyList<ServerFlavor> SupportedFlavors => _flavors.Keys.ToList();
 
         public bool RequiresEula => true;

@@ -130,14 +130,21 @@ namespace Omnipotent.Services.KliveGames
                     var inst = JsonConvert.DeserializeObject<GameServerInstance>(File.ReadAllText(meta));
                     if (inst == null || string.IsNullOrEmpty(inst.Id)) continue;
 
-                    // Reconcile: an app restart loses control of any prior child process. If the old PID is
-                    // still a live java process, terminate it to free the port, then mark Stopped.
+                    // Reconcile: an app restart loses control of any prior child process. Only reclaim the
+                    // PID when its process name still matches this instance's expected runtime.
                     if (inst.ChildPid is int pid)
                     {
                         try
                         {
                             var p = Process.GetProcessById(pid);
-                            if (p.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase))
+                            string expected = Path.GetFileNameWithoutExtension(inst.LaunchTarget ?? "");
+                            bool matches = !string.IsNullOrWhiteSpace(expected)
+                                && p.ProcessName.Equals(expected, StringComparison.OrdinalIgnoreCase);
+                            matches |= inst.GameType == GameType.Minecraft
+                                && p.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase);
+                            matches |= inst.GameType == GameType.Terraria && inst.Flavor == ServerFlavor.TModLoader
+                                && p.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase);
+                            if (matches)
                             {
                                 p.Kill(entireProcessTree: true);
                                 await ServiceLog($"[KliveGames] Reclaimed orphaned process {pid} for '{inst.Name}'.");
@@ -196,7 +203,7 @@ namespace Omnipotent.Services.KliveGames
             if (provider.RequiresEula && !req.EulaAccepted)
                 throw new InvalidOperationException($"The {provider.DisplayName} EULA must be accepted to deploy a server.");
 
-            int port = AllocatePort(req.Port > 0 ? req.Port : provider.DefaultPort);
+            int port = AllocatePort(req.Port > 0 ? req.Port : provider.DefaultPort, provider);
 
             string id = Guid.NewGuid().ToString("N").Substring(0, 8);
             string serverDir = Path.Combine(InstanceDir(id), "server");
@@ -362,8 +369,7 @@ namespace Omnipotent.Services.KliveGames
             var inst = GetInstance(id) ?? throw new InvalidOperationException("Server not found.");
             try { await KillAsync(id); } catch { }
 
-            if (inst.Public)
-                try { await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>("RemovePortForward", inst.Port, "TCP"); } catch { }
+            if (inst.Public) await RemovePublicPortsAsync(inst);
 
             _instances.TryRemove(id, out _);
             _processes.TryRemove(id, out var p); p?.Dispose();
@@ -422,7 +428,7 @@ namespace Omnipotent.Services.KliveGames
                 if (provider.TryParseListReply(line, out _, out int max, out var names))
                 {
                     inst.OnlinePlayers = names.ToList();
-                    inst.MaxPlayers = max;
+                    if (max > 0) inst.MaxPlayers = max;
                     // Hide the reply to an internal (monitor) roster poll so the live console isn't spammed.
                     if (_pendingListPoll.TryRemove(inst.Id, out var t) && DateTime.UtcNow - t < TimeSpan.FromSeconds(3))
                         suppress = true;
@@ -560,25 +566,44 @@ namespace Omnipotent.Services.KliveGames
 
         // ----------------------------------------------------------------- networking / config
 
-        /// <summary>Allocates a free TCP port at or above <paramref name="preferred"/>.</summary>
-        private int AllocatePort(int preferred)
+        /// <summary>Allocates a free primary port and every companion port required by the provider.</summary>
+        private int AllocatePort(int preferred, IGameProvider provider)
         {
             int port = Math.Clamp(preferred, 1024, 65000);
             for (int candidate = port; candidate <= 65000; candidate++)
             {
-                if (IsPortFree(candidate)) return candidate;
+                var bindings = provider.GetNetworkPorts(candidate);
+                if (bindings.All(binding => binding.Port is >= 1024 and <= 65535)
+                    && bindings.All(binding => IsPortFree(binding)))
+                    return candidate;
             }
             throw new InvalidOperationException("No free port available.");
         }
 
-        private bool IsPortFree(int port)
+        private bool IsPortFree(GameNetworkPort binding, string? ignoreInstanceId = null)
         {
-            if (_instances.Values.Any(i => i.Port == port)) return false;
+            foreach (var instance in _instances.Values)
+            {
+                if (instance.Id == ignoreInstanceId) continue;
+                var existingProvider = _providers.Get(instance.GameType);
+                if (existingProvider.GetNetworkPorts(instance.Port).Any(existing =>
+                    existing.Port == binding.Port
+                    && existing.Protocol.Equals(binding.Protocol, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+            }
+
             try
             {
-                var listener = new TcpListener(IPAddress.Any, port);
-                listener.Start();
-                listener.Stop();
+                if (binding.Protocol.Equals("UDP", StringComparison.OrdinalIgnoreCase))
+                {
+                    using var listener = new UdpClient(new IPEndPoint(IPAddress.Any, binding.Port));
+                }
+                else
+                {
+                    var listener = new TcpListener(IPAddress.Any, binding.Port);
+                    listener.Start();
+                    listener.Stop();
+                }
                 return true;
             }
             catch { return false; }
@@ -598,7 +623,7 @@ namespace Omnipotent.Services.KliveGames
             }
             else
             {
-                try { await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>("RemovePortForward", inst.Port, "TCP"); } catch { }
+                await RemovePublicPortsAsync(inst);
                 inst.PublicJoinAddress = null;
                 await SaveInstanceAsync(inst);
                 return "This server is now local-only.";
@@ -616,14 +641,20 @@ namespace Omnipotent.Services.KliveGames
                 bool available = availableObj is bool b && b;
                 if (available)
                 {
-                    await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>(
-                        "EnsurePortForwarded", inst.Port, inst.Port, "TCP", $"KliveGames: {inst.Name}");
+                    foreach (var binding in _providers.Get(inst.GameType).GetNetworkPorts(inst.Port))
+                    {
+                        await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>(
+                            "EnsurePortForwarded", binding.Port, binding.Port, binding.Protocol,
+                            $"KliveGames: {inst.Name} ({binding.Purpose})");
+                    }
                     if (persist) await SaveInstanceAsync(inst);
                     return $"Server is public at {inst.PublicJoinAddress}.";
                 }
 
                 if (persist) await SaveInstanceAsync(inst);
-                return $"Join at {inst.PublicJoinAddress} — no UPnP router found, so make sure TCP {inst.Port} is forwarded to this machine.";
+                string ports = string.Join(", ", _providers.Get(inst.GameType).GetNetworkPorts(inst.Port)
+                    .Select(binding => $"{binding.Protocol} {binding.Port}"));
+                return $"Join at {inst.PublicJoinAddress} — no UPnP router found, so forward {ports} to this machine.";
             }
             catch (Exception ex)
             {
@@ -637,15 +668,43 @@ namespace Omnipotent.Services.KliveGames
         {
             var inst = GetInstance(id) ?? throw new InvalidOperationException("Server not found.");
             var provider = _providers.Get(inst.GameType);
+            int oldPort = inst.Port;
+            int? requestedPort = null;
+            if (values.TryGetValue(provider.PortConfigKey, out var portText)
+                && int.TryParse(portText, out int parsedPort)
+                && parsedPort != oldPort)
+            {
+                if (parsedPort is < 1024 or > 65000)
+                    throw new ArgumentOutOfRangeException(provider.PortConfigKey, "The game port must be between 1024 and 65000.");
+                if (!provider.GetNetworkPorts(parsedPort).All(binding => IsPortFree(binding, inst.Id)))
+                    throw new InvalidOperationException("The selected game or companion port is already in use.");
+                requestedPort = parsedPort;
+            }
+
             await provider.ApplyConfigAsync(inst, values);
 
             // Keep the managed port in sync if the operator changed the port via config.
-            if (values.TryGetValue(provider.PortConfigKey, out var sp) && int.TryParse(sp, out int newPort) && newPort != inst.Port)
+            if (requestedPort is int newPort)
             {
+                if (inst.Public) await RemovePublicPortsAsync(inst, provider.GetNetworkPorts(oldPort));
                 inst.Port = newPort;
                 if (inst.Public) _ = EnsurePublicAsync(inst, true);
             }
             await SaveInstanceAsync(inst);
+        }
+
+        private async Task RemovePublicPortsAsync(GameServerInstance inst, IReadOnlyList<GameNetworkPort>? bindings = null)
+        {
+            bindings ??= _providers.Get(inst.GameType).GetNetworkPorts(inst.Port);
+            foreach (var binding in bindings)
+            {
+                try
+                {
+                    await ExecuteServiceMethod<global::Omnipotent.Services.PortForwardManager.PortForwardManager>(
+                        "RemovePortForward", binding.Port, binding.Protocol);
+                }
+                catch { }
+            }
         }
     }
 }

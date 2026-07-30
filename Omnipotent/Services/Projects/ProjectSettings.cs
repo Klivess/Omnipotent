@@ -139,6 +139,41 @@ namespace Omnipotent.Services.Projects
             set { if (value.HasValue) MaxConvergenceTripsPerSlice = Math.Clamp(value.Value, 1, 20); }
         }
 
+        /// <summary>
+        /// Record every tool call in the durable per-intent attempt ledger, warn the acting agent when it
+        /// repeats an intent that has already failed, and seed the failed-intent list into every wake.
+        /// Turning this off leaves only the in-wake byte-exact convergence guard, which cannot see across
+        /// wakes — i.e. it restores the behaviour where an agent silently re-tries yesterday's failure.
+        /// </summary>
+        public bool AttemptLedgerEnabled { get; set; } = Defaults.AttemptLedgerEnabled;
+
+        /// <summary>
+        /// Render the recent-events window as an unbroken chronological tail (older entries compacted, an
+        /// explicit notice when anything did not fit) instead of a score-selected subset. Off restores the
+        /// relevance-ranked window, which can silently drop the middle of the timeline.
+        /// </summary>
+        public bool ChronologicalRecentEvents { get; set; } = Defaults.ChronologicalRecentEvents;
+
+        /// <summary>
+        /// Maintain the step ledger: one Active step at a time, with its attempt count and next concrete
+        /// action seeded ahead of everything else. Off falls back to the digest's prose next-steps as the
+        /// only plan of record, which a utility model rewrites after every wake.
+        /// </summary>
+        public bool StepLedgerEnabled { get; set; } = Defaults.StepLedgerEnabled;
+
+        /// <summary>
+        /// Save constraint-shaped messages from Klives ("don't…", "never…", "keep …ing until I say") as
+        /// standing RULES rather than one-off steers, so they survive being acknowledged. Off means only an
+        /// explicit Rule send becomes durable policy.
+        /// </summary>
+        public bool AutoPromoteRules { get; set; } = Defaults.AutoPromoteRules;
+
+        /// <summary>
+        /// Refuse to open a second approval gate identical to one still awaiting Klives, and seed pending
+        /// and recently-resolved approvals into every wake. Off restores unconditional re-asking.
+        /// </summary>
+        public bool ApprovalDedupe { get; set; } = Defaults.ApprovalDedupe;
+
         public bool VisionEnabled { get; set; } = true;
         /// <summary>
         /// Stream model output so the Conversation panel can show who is generating and what. Turning
@@ -371,6 +406,13 @@ namespace Omnipotent.Services.Projects
             public const int ToolResultKeepRecent = 16;
             public const int RecentEventsBudget = ProjectsContextBudget.RecentEventsBudget;
             public const int RecentEventsConsidered = ProjectCommanderPrompts.RecentEventsConsidered;
+            // Awareness/anti-repetition machinery. All on by default; each is an independent revert if a
+            // change misbehaves against a live project.
+            public const bool AttemptLedgerEnabled = true;
+            public const bool ChronologicalRecentEvents = true;
+            public const bool StepLedgerEnabled = true;
+            public const bool AutoPromoteRules = true;
+            public const bool ApprovalDedupe = true;
             public const bool ContainersEnabled = true;
             public const bool LiveActivityStreaming = true;
             public const bool DesktopFirstWebsiteInteraction = true;

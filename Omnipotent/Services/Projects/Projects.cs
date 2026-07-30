@@ -299,6 +299,9 @@ namespace Omnipotent.Services.Projects
             };
             // The approved Grand Plan summary seeds every wake as the standing north star.
             WakeCycle.DescribeGrandPlan = pid => GrandPlans.DescribeForSeed(pid);
+            // The Commander's own outstanding approvals and Klives' recent decisions, so it can neither
+            // re-ask a pending question nor re-propose something he already refused.
+            WakeCycle.DescribeApprovals = pid => Settings.Get(pid).ApprovalDedupe ? Gates.DescribeForWake(pid) : "";
             // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
             retentionTimer = new System.Threading.Timer(async _ =>
             {
@@ -658,7 +661,9 @@ namespace Omnipotent.Services.Projects
             var scope = kind == ProjectDirectiveKind.Rule ? ProjectDirectiveScope.AllAgents : ProjectDirectiveScope.Commander;
             var receipt = CreateAndDeliverDirective(project, text, kind, scope, Array.Empty<string>(), "commander",
                 key, priority, expectedArtifactPaths, batchID);
-            if (receipt.Accepted && scope == ProjectDirectiveScope.AllAgents)
+            // Also covers a message auto-promoted to a Rule inside CreateAndDeliverDirective, which widens
+            // the scope to AllAgents after this local `scope` was computed.
+            if (receipt.Accepted && (scope == ProjectDirectiveScope.AllAgents || receipt.PromotedToRule))
             {
                 var directive = Directives.Get(project.ProjectID, receipt.DirectiveID);
                 if (directive != null) DeliverDirectiveToActiveWorkers(project, directive);
@@ -801,8 +806,35 @@ namespace Omnipotent.Services.Projects
             if (kind == ProjectDirectiveKind.Task && expected.Count == 0 &&
                 System.Text.RegularExpressions.Regex.IsMatch(text ?? "", @"\bPDF\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase))
                 expected.Add(".pdf");
-            var directive = Directives.Create(project.ProjectID, text, kind, scope, targetAgentIDs,
-                expected, priority, key, batchID);
+
+            // A standing constraint has no deliverable and is never "answered", so as a Task or a Steer it
+            // either sits on the books forever or disappears the moment the Commander replies to it. Save it
+            // as what it actually is. Only fires on unambiguous constraint grammar with no deliverable named.
+            bool promotedToRule = false;
+            if (kind != ProjectDirectiveKind.Rule && expected.Count == 0 && Settings.Get(project.ProjectID).AutoPromoteRules
+                && ProjectDirectiveClassifier.ClassifyStandingConstraint(text) == ProjectDirectiveKind.Rule)
+            {
+                kind = ProjectDirectiveKind.Rule;
+                scope = ProjectDirectiveScope.AllAgents;
+                promotedToRule = true;
+            }
+
+            ProjectDirective directive;
+            try
+            {
+                directive = Directives.Create(project.ProjectID, text, kind, scope, targetAgentIDs,
+                    expected, priority, key, batchID);
+            }
+            catch (InvalidOperationException) when (promotedToRule)
+            {
+                // Standing rules are capacity-checked so they can all be guaranteed in every prompt. An
+                // automatic promotion must never be the reason a message from Klives is rejected — record it
+                // as the kind he sent instead, and let him replace a rule deliberately if he wants this one.
+                ServiceLog($"Projects: rule promotion for {project.ProjectID} exceeded the standing-rule capacity; kept as the original kind.");
+                promotedToRule = false;
+                directive = Directives.Create(project.ProjectID, text, ProjectDirectiveKind.Steering,
+                    ProjectDirectiveScope.Commander, targetAgentIDs, expected, priority, key, batchID);
+            }
             var messageEvent = EventLog.Append(new ProjectEvent
             {
                 ProjectID = project.ProjectID,
@@ -842,7 +874,22 @@ namespace Omnipotent.Services.Projects
                 EventSequence = messageEvent.Sequence,
                 CreatedAt = directive.CreatedAt,
                 ExpectedArtifactPaths = directive.ExpectedArtifactPaths,
+                PromotedToRule = promotedToRule,
             };
+
+            // A new instruction sharing an earlier one's key retires it, so the seed carries one answer
+            // rather than two contradicting ones.
+            if (!string.IsNullOrWhiteSpace(directive.Key))
+            {
+                var replaced = Directives.List(project.ProjectID, includeResolved: false)
+                    .Where(x => x.SupersededBy == null
+                        && !string.Equals(x.DirectiveID, directive.DirectiveID, StringComparison.Ordinal)
+                        && string.Equals(x.Key, directive.Key, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                foreach (var old in replaced)
+                    Directives.Supersede(project.ProjectID, old.DirectiveID, directive.DirectiveID);
+                if (replaced.Count > 0) receipt.SupersededDirectiveID = replaced[0].DirectiveID;
+            }
 
             string? wakeID = null;
             if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
@@ -1209,6 +1256,7 @@ namespace Omnipotent.Services.Projects
                 Files = Files,
                 Observables = Observables,
                 RuntimeState = RuntimeState,
+                ApprovalDedupe = Settings.Get(project.ProjectID).ApprovalDedupe,
                 Directives = Directives,
                 NotifyDirectiveCompletedAsync = (directive, paths, summary) =>
                     NotifyDirectiveCompletionAsync(project, directive, paths, summary),
@@ -1813,8 +1861,11 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
+                // With open steps the ledger is the plan of record, so the rebuild is narrative-only.
+                bool preservePlan = false;
+                try { preservePlan = RuntimeState.HasOpenSteps(project.ProjectID); } catch { }
                 await Digests.RebuildDigestAsync(project, EventLog,
-                    prompt => QueryUtilityRoutesAsync(project.ProjectID, prompt));
+                    prompt => QueryUtilityRoutesAsync(project.ProjectID, prompt), preservePlan);
 
                 // Keep the budget line in the digest fresh even if the model didn't restate it.
                 var digest = Digests.GetDigest(project.ProjectID);

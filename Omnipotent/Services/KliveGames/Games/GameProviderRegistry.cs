@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveGames.Games.Minecraft;
+using Omnipotent.Services.KliveGames.Games.Rust;
 using Omnipotent.Services.KliveGames.Games.Terraria;
 using Omnipotent.Services.KliveGames.Models;
 
@@ -15,6 +16,7 @@ namespace Omnipotent.Services.KliveGames.Games
         {
             Register(new MinecraftProvider(logError));
             Register(new TerrariaProvider(logError));
+            Register(new RustProvider(logError));
             // Future: Register(new SatisfactoryProvider(...));
         }
 

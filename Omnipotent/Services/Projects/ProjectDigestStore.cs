@@ -90,10 +90,15 @@ namespace Omnipotent.Services.Projects
         /// Never called in the hot path of a wake's response — always after a wake completes,
         /// or from the periodic digest timer.
         /// </summary>
+        /// <param name="preservePlanOfRecord">
+        /// True when the step ledger holds open steps, in which case the rebuild must not overwrite the
+        /// digest's focus/next-steps with the utility model's paraphrase of them.
+        /// </param>
         public async Task<ProjectDigest?> RebuildDigestAsync(
             Project project,
             ProjectEventLogStore eventLog,
-            Func<string, Task<string?>> queryModelAsync)
+            Func<string, Task<string?>> queryModelAsync,
+            bool preservePlanOfRecord = false)
         {
             var digest = GetDigest(project.ProjectID);
             long watermark = digest.LastDigestedSequence;
@@ -111,7 +116,7 @@ namespace Omnipotent.Services.Projects
             string? response = await queryModelAsync(prompt);
             if (string.IsNullOrWhiteSpace(response)) return null;
 
-            var updated = ProjectCommanderPrompts.ParseDigestResponse(response, digest);
+            var updated = ProjectCommanderPrompts.ParseDigestResponse(response, digest, preservePlanOfRecord);
             if (updated == null) return null;
             updated.ProjectID = project.ProjectID;
             updated.LastDigestedSequence = newEvents[^1].Sequence;

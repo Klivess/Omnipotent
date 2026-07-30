@@ -17,6 +17,17 @@ namespace Omnipotent.Services.Projects
     public sealed class ProjectDirectiveStore
     {
         private const int OmissionNoticeReserveTokens = 64;
+
+        /// <summary>
+        /// How many recently-answered steers stay in the seed as still-in-force constraints. Bounded because
+        /// casual chat should not accumulate into policy — but non-zero because an answered steer is not a
+        /// discharged one, and dropping them is how a "don't do X yet" got re-proposed a wake later.
+        /// </summary>
+        public const int MaxAnsweredSteersInPrompt = 6;
+
+        /// <summary>Token slice the answered-steer band may occupy, so it can never crowd out an explicit rule.</summary>
+        private const int AnsweredSteerPromptTokens = 700;
+
         public const int MaxDirectivesPerProject = 256;
         public const int MaxRuleLength = 1_000;
         public const int MaxTaskLength = 4_000;
@@ -235,6 +246,21 @@ namespace Omnipotent.Services.Projects
             });
 
         /// <summary>
+        /// Mark a directive as replaced by a later one, so only the winner is seeded. Used when Klives sends
+        /// an instruction with the same <see cref="ProjectDirective.Key"/> as an existing one.
+        /// </summary>
+        public ProjectDirective? Supersede(string projectID, string directiveID, string bySupersedingID,
+            DateTime? nowUtc = null) =>
+            Mutate(projectID, directiveID, item =>
+            {
+                if (item.SupersededBy != null) return false;
+                if (string.Equals(item.DirectiveID, bySupersedingID, StringComparison.Ordinal)) return false;
+                item.SupersededBy = bySupersedingID;
+                item.SupersededAt = nowUtc ?? DateTime.UtcNow;
+                return true;
+            });
+
+        /// <summary>
         /// Always-injected, scope-filtered block for an agent's wake seed. This method owns the
         /// whole directives budget so callers never truncate through the middle of a rule/task.
         /// The currently-triggered directive is preferentially selected; every other queued task
@@ -242,11 +268,37 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public string DescribeForPrompt(string projectID, string agentID, string? preferredDirectiveID = null)
         {
-            var visible = List(projectID, includeResolved: false)
+            var open = List(projectID, includeResolved: false)
                 .Where(x => AppliesTo(x, agentID))
+                .Where(x => x.SupersededBy == null)
+                .ToList();
+
+            // Acknowledged steers are dropped from the seed on the theory that an answered chat message is
+            // history — which is right for a QUESTION ("what failed?"): the reply discharges it. It is wrong
+            // for a CONSTRAINT. "Keep digging, don't complete yet" was acknowledged in prose and then absent
+            // from every later seed, so the next wake re-proposed completion. An answer is not compliance.
+            //
+            // So the band keeps only the constraint-shaped ones. Most such messages are stored as Rules at
+            // creation time anyway; this catches the ones that reached the store as ordinary steering, and
+            // covers projects with rule auto-promotion turned off.
+            //
+            // Ordered by acknowledgement time, then by position in the store as a tiebreak: several steers
+            // answered inside the same millisecond must not select an arbitrary subset differently on each
+            // wake, or the seed would appear to change its mind about which of Klives' words still apply.
+            var answeredSteers = open
+                .Select((item, index) => (item, index))
+                .Where(x => x.item.Kind == ProjectDirectiveKind.Steering
+                    && x.item.Status == ProjectDirectiveStatus.Acknowledged
+                    && ProjectDirectiveClassifier.ClassifyStandingConstraint(x.item.Text) == ProjectDirectiveKind.Rule)
+                .OrderByDescending(x => x.item.AcknowledgedAt ?? x.item.UpdatedAt)
+                .ThenByDescending(x => x.index)
+                .Take(MaxAnsweredSteersInPrompt)
+                .Select(x => x.item)
+                .ToList();
+            var visible = open
                 .Where(x => x.Kind != ProjectDirectiveKind.Steering || x.Status != ProjectDirectiveStatus.Acknowledged)
                 .ToList();
-            if (visible.Count == 0) return "";
+            if (visible.Count == 0 && answeredSteers.Count == 0) return "";
 
             var rules = visible.Where(x => x.Kind == ProjectDirectiveKind.Rule)
                 .OrderByDescending(x => x.Priority).ThenBy(x => x.CreatedAt).ToList();
@@ -257,6 +309,22 @@ namespace Omnipotent.Services.Projects
             var renderedRules = new List<string>();
             foreach (var rule in rules)
                 renderedRules.Add(RenderForPrompt(rule));
+
+            // Answered steers sit with the rules — ahead of the work queue, because they constrain how the
+            // work is done — but inside their own token slice, so a chatty day cannot crowd out an explicit
+            // rule. Rules keep the guaranteed capacity EnsureRulePromptCapacity protects.
+            int steerBudget = Math.Max(0, Math.Min(AnsweredSteerPromptTokens,
+                ProjectsContextBudget.DirectivesBudget - OmissionNoticeReserveTokens
+                    - ProjectsContextBudget.EstimateTokens(string.Join("\n", renderedRules))));
+            int steerUsed = 0;
+            foreach (var steer in answeredSteers)
+            {
+                string text = RenderForPrompt(steer);
+                int cost = ProjectsContextBudget.EstimateTokens(text);
+                if (steerUsed + cost > steerBudget) break;
+                renderedRules.Add(text);
+                steerUsed += cost;
+            }
 
             var selectedWork = new List<string>();
             int omitted = 0;
@@ -293,18 +361,22 @@ namespace Omnipotent.Services.Projects
 
         private static string RenderForPrompt(ProjectDirective item)
         {
+            bool answeredSteer = item.Kind == ProjectDirectiveKind.Steering
+                && item.Status == ProjectDirectiveStatus.Acknowledged;
             string label = item.Kind switch
             {
                 ProjectDirectiveKind.Rule => "RULE — NON-NEGOTIABLE",
                 ProjectDirectiveKind.Task => "OPEN TASK",
-                _ => "UNANSWERED STEERING",
+                _ => answeredSteer ? "ANSWERED STEER — STILL IN FORCE unless Klives supersedes it" : "UNANSWERED STEERING",
             };
             var sb = new StringBuilder();
             sb.Append($"[{label} id={item.DirectiveID}; status={item.Status}; set {Data_Handling.TemporalFormat.StampMinute(item.CreatedAt)}] ");
             sb.AppendLine(item.Text);
             if (item.ExpectedArtifactPaths.Count > 0)
                 sb.AppendLine($"  Required deliverables: {string.Join(", ", item.ExpectedArtifactPaths)}. Do not mark complete until they exist in /project and are verified.");
-            if (item.Kind != ProjectDirectiveKind.Rule)
+            if (answeredSteer)
+                sb.AppendLine("  You have already replied to this. Replying did not discharge it — keep obeying it until Klives says otherwise, and do not re-raise the question it answered.");
+            else if (item.Kind != ProjectDirectiveKind.Rule)
                 sb.AppendLine($"  Use project_directive op:acknowledge then op:complete for id={item.DirectiveID}; a status sentence alone does not complete this instruction.");
             return sb.ToString().TrimEnd();
         }

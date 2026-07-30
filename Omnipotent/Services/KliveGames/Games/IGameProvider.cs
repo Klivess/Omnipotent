@@ -22,6 +22,10 @@ namespace Omnipotent.Services.KliveGames.Games
         /// <summary>Conventional default port (e.g. 25565 for Minecraft Java).</summary>
         int DefaultPort { get; }
 
+        /// <summary>All sockets that must be available or forwarded for the supplied primary join port.
+        /// The first item is the primary game port.</summary>
+        IReadOnlyList<GameNetworkPort> GetNetworkPorts(int primaryPort);
+
         IReadOnlyList<ServerFlavor> SupportedFlavors { get; }
 
         // ---- Capabilities (let the orchestrator/UI stay game-agnostic) ----
