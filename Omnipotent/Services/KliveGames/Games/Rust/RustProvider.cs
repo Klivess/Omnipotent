@@ -98,7 +98,6 @@ namespace Omnipotent.Services.KliveGames.Games.Rust
                     "+server.level", V("server.level", "Procedural Map"),
                     "+server.seed", V("server.seed", "0"),
                     "+server.worldsize", V("server.worldsize", "3500"),
-                    "-logfile", "rustserverlog.txt",
                 },
             };
             return Task.FromResult(spec);

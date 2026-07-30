@@ -68,6 +68,7 @@ public sealed class RustProviderTests
             AssertArgumentPair(spec.Arguments, "+server.queryport", "28016");
             AssertArgumentPair(spec.Arguments, "+server.identity", "klivegames-rusttest");
             AssertArgumentPair(spec.Arguments, "+server.worldsize", "4000");
+            Assert.DoesNotContain("-logfile", spec.Arguments);
         }
         finally
         {

@@ -444,7 +444,10 @@ namespace Omnipotent.Services.KliveGames
 
                 if (!suppress) _ = hub.BroadcastLineAsync(line);
 
-                if (inst.Status == GameServerStatus.Starting && provider.TryParseStarted(line))
+                // A server may be marked stalled after a quiet startup window and then finish loading.
+                // Always let a later provider-specific ready marker recover it to Running.
+                if ((inst.Status == GameServerStatus.Starting || inst.Status == GameServerStatus.Stalled)
+                    && provider.TryParseStarted(line))
                 {
                     inst.Status = GameServerStatus.Running;
                     inst.RunningSinceUtc = DateTime.UtcNow;
