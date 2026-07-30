@@ -717,9 +717,12 @@ namespace Omnipotent.Services.Projects
                         return new CommanderToolResult("Provide a concrete non-empty objective for the new agent.");
                     if (!Enum.TryParse<ProjectAgentTier>(tierStr, ignoreCase: true, out var tier))
                         return new CommanderToolResult($"Unknown tier '{tierStr}'. Use Text, TextImage, TextImageVideo, or TextImageVideoAudio.");
+                    string missionStr = ((string?)a["mission"] ?? "task").Trim();
+                    if (!Enum.TryParse<ProjectAgentMissionKind>(missionStr, ignoreCase: true, out var missionKind))
+                        return new CommanderToolResult($"Unknown mission '{missionStr}'. Use 'standing' for an ongoing beat or 'task' for a bounded deliverable.");
                     try
                     {
-                        var agent = subAgents.Spawn(project.ProjectID, actingAgentID, tier, role, objective);
+                        var agent = subAgents.Spawn(project.ProjectID, actingAgentID, tier, role, objective, missionKind);
                         eventLog.Append(new ProjectEvent
                         {
                             ProjectID = project.ProjectID, WakeID = wakeID, AgentID = agent.AgentID,
@@ -728,7 +731,11 @@ namespace Omnipotent.Services.Projects
                             Text = $"Objective assigned to {agent.AgentID}: {objective}",
                         });
                         if (StartAgentAsync != null) await StartAgentAsync(agent, objective);
-                        return new CommanderToolResult($"Spawned and started {tier} agent '{role}' with ID {agent.AgentID}.");
+                        return new CommanderToolResult(
+                            $"Spawned and started {tier} agent '{role}' with ID {agent.AgentID} on a {missionKind.ToString().ToLowerInvariant()} mission."
+                            + (missionKind == ProjectAgentMissionKind.Standing
+                                ? " It owns this beat until you retire or re-task it, and will keep reporting checkpoints."
+                                : " It will report its deliverable and then wait for you to retire it."));
                     }
                     catch (InvalidOperationException ex) { return new CommanderToolResult(ex.Message); }
                 }
@@ -767,7 +774,15 @@ namespace Omnipotent.Services.Projects
                     if (!subAgents.TryResolveActiveTarget(project.ProjectID, target, out var worker, out var error)
                         || worker == null || worker.AgentID == "commander")
                         return new CommanderToolResult("Work not assigned: " + (error.Length > 0 ? error : "choose an active worker, not the Commander."));
-                    if (!subAgents.AssignObjective(project.ProjectID, worker.AgentID, objective, new[] { ready.ID }, deliverables))
+                    ProjectAgentMissionKind? reassignMission = null;
+                    string reassignMissionStr = ((string?)a["mission"] ?? "").Trim();
+                    if (reassignMissionStr.Length > 0)
+                    {
+                        if (!Enum.TryParse<ProjectAgentMissionKind>(reassignMissionStr, ignoreCase: true, out var parsedMission))
+                            return new CommanderToolResult($"Unknown mission '{reassignMissionStr}'. Use 'standing' or 'task', or omit to leave it unchanged.");
+                        reassignMission = parsedMission;
+                    }
+                    if (!subAgents.AssignObjective(project.ProjectID, worker.AgentID, objective, new[] { ready.ID }, deliverables, reassignMission))
                         return new CommanderToolResult("Worker became unavailable before assignment.");
                     GrandPlans.UpdateMilestoneStatus(project.ProjectID, ready.ID, MilestoneStatus.InProgress,
                         ownerAgentID: worker.AgentID);
@@ -788,6 +803,37 @@ namespace Omnipotent.Services.Projects
                     string message = ((string?)a["message"] ?? "").Trim();
                     if (message.Length == 0)
                         return new CommanderToolResult("Message not sent: provide a non-empty message.");
+
+                    // 'team' fans out to every other active agent. Expressed as a target rather than a
+                    // separate tool because the offered surface is hard-capped at 64 definitions —
+                    // coordination primitives have to earn their place as ops, not new tools.
+                    if (string.Equals(target, "team", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(target, "all", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var peers = subAgents.ListActive(project.ProjectID)
+                            .Where(x => x.AgentID != actingAgentID)
+                            .ToList();
+                        if (peers.Count == 0)
+                            return new CommanderToolResult("Message not sent: there is nobody else on the roster yet.");
+                        foreach (var peer in peers)
+                        {
+                            if (SendAgentMessageAsync != null)
+                                await SendAgentMessageAsync(project.ProjectID, actingAgentID, peer.AgentID, message);
+                            else
+                                eventLog.Append(new ProjectEvent
+                                {
+                                    ProjectID = project.ProjectID,
+                                    WakeID = wakeID,
+                                    AgentID = peer.AgentID,
+                                    Type = ProjectEventTypes.AgentMessage,
+                                    Author = actingAgentID == "commander" ? "commander" : "agent",
+                                    Text = $"{actingAgentID} → {peer.AgentID}: {message}",
+                                });
+                        }
+                        return new CommanderToolResult(
+                            $"Message sent to all {peers.Count} other agent(s): {string.Join(", ", peers.Select(p => $"{p.Role} ({p.AgentID})"))}.");
+                    }
+
                     if (!subAgents.TryResolveActiveTarget(project.ProjectID, target, out var recipient, out var error))
                         return new CommanderToolResult($"Message not sent: {error}");
 

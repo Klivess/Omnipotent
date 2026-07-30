@@ -37,7 +37,8 @@ namespace Omnipotent.Services.Projects
             string? directivesBlock = null,
             int? recentEventsBudget = null,
             bool chronologicalEvents = true,
-            string? approvalsBlock = null)
+            string? approvalsBlock = null,
+            string? taskForceBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -74,6 +75,16 @@ namespace Omnipotent.Services.Projects
             {
                 sb.AppendLine("── GRAND PLAN (approved north star — read via grand_plan op:get, revise via op:amend) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
+            }
+
+            // Directly under the plan, because staffing is decided before the Commander picks up any
+            // work itself: the plan says what must happen, this says who is free to do it. The old
+            // one-line org chart carried no last-report, no silence age and no slot arithmetic, so a
+            // roster sitting at one worker with eleven slots free looked exactly like a full one.
+            if (!string.IsNullOrWhiteSpace(taskForceBlock))
+            {
+                sb.AppendLine("── YOUR TASK FORCE (muster this FIRST: retire finished workers, re-task idle ones, staff free slots) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(taskForceBlock, ProjectsContextBudget.TaskForceBudget));
             }
 
             // Typed state is authoritative for blockers, verified facts, canonical artifacts and

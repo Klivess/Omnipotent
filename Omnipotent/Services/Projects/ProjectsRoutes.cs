@@ -73,7 +73,7 @@ namespace Omnipotent.Services.Projects
                     double tokenBudget = (double?)body?.tokenBudgetUsd ?? 0;
                     double moneyBudget = (double?)body?.moneyBudgetUsd ?? 0;
                     double moneyThreshold = (double?)body?.moneyAutonomousThresholdUsd ?? 0;
-                    int agentCap = (int?)body?.subAgentCap ?? 5;
+                    int agentCap = (int?)body?.subAgentCap ?? 12;
                     string? initialUploadSessionID = ((string?)body?.initialUploadSessionID)?.Trim();
 
                     if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(goal))

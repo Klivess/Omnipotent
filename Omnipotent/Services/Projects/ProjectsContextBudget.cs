@@ -72,6 +72,13 @@ namespace Omnipotent.Services.Projects
         /// <summary>Pending and recently resolved approval gates.</summary>
         public const int ApprovalsBudget = 1200;
 
+        /// <summary>
+        /// The roster as an operational picture: each agent's mission, status, last report and silence,
+        /// plus free and reclaimable slots. Sized to hold a full-cap roster — truncating this is how a
+        /// Commander stops seeing the very workers it is supposed to be re-tasking.
+        /// </summary>
+        public const int TaskForceBudget = 2500;
+
         /// <summary>BM25 retrieval hits pulled from the deep log for the triggering stimulus.</summary>
         public const int RetrievalBudget = 8000;
 

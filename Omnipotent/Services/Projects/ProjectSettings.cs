@@ -174,6 +174,22 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public bool ApprovalDedupe { get; set; } = Defaults.ApprovalDedupe;
 
+        /// <summary>
+        /// Re-wake workers whose assignment is still open but which have gone quiet. Off restores the
+        /// push-only behaviour where a worker runs again only when the Commander, Klives, its own timer
+        /// hook or a slice rollover pushes it — the whole-cost revert for this feature.
+        /// </summary>
+        public bool WorkerHeartbeatEnabled { get; set; } = Defaults.WorkerHeartbeatEnabled;
+
+        /// <summary>Base quiet period before an open assignment is re-woken.</summary>
+        public int WorkerHeartbeatMinutes { get; set; } = Defaults.WorkerHeartbeatMinutes;
+
+        /// <summary>Ceiling for the geometric backoff applied to workers that keep waking unproductively.</summary>
+        public int WorkerHeartbeatMaxMinutes { get; set; } = Defaults.WorkerHeartbeatMaxMinutes;
+
+        /// <summary>Soft per-wake ceiling on outbound agent messages (advisory; never blocks a send).</summary>
+        public int WorkerMessagesPerWake { get; set; } = Defaults.WorkerMessagesPerWake;
+
         public bool VisionEnabled { get; set; } = true;
         /// <summary>
         /// Stream model output so the Conversation panel can show who is generating and what. Turning
@@ -288,6 +304,13 @@ namespace Omnipotent.Services.Projects
                 case "recenteventsconsidered":
                     RecentEventsConsidered = Math.Clamp(ParseInt(Text(value), Defaults.RecentEventsConsidered), 10, 500); break;
                 case "maxconsecutivecontinuations": break;
+                case "workerheartbeatenabled": WorkerHeartbeatEnabled = ParseBool(Text(value)); break;
+                case "workerheartbeatminutes":
+                    WorkerHeartbeatMinutes = Math.Clamp(ParseInt(Text(value), Defaults.WorkerHeartbeatMinutes), 5, 720); break;
+                case "workerheartbeatmaxminutes":
+                    WorkerHeartbeatMaxMinutes = Math.Clamp(ParseInt(Text(value), Defaults.WorkerHeartbeatMaxMinutes), 10, 1440); break;
+                case "workermessagesperwake":
+                    WorkerMessagesPerWake = Math.Clamp(ParseInt(Text(value), Defaults.WorkerMessagesPerWake), 1, 100); break;
                 case "visionenabled": VisionEnabled = ParseBool(Text(value)); break;
                 case "liveactivitystreaming": LiveActivityStreaming = ParseBool(Text(value)); break;
                 case "containersenabled": ContainersEnabled = ParseBool(Text(value)); break;
@@ -413,6 +436,15 @@ namespace Omnipotent.Services.Projects
             public const bool StepLedgerEnabled = true;
             public const bool AutoPromoteRules = true;
             public const bool ApprovalDedupe = true;
+            // Task-force liveness. Workers are otherwise push-only: one that reports and ends is never
+            // woken again unless the Commander happens to message it, which is why sub-agents used to
+            // die after a single wake. The heartbeat re-wakes agents whose assignment is still open,
+            // and backs off geometrically for any that keep waking with nothing productive to do.
+            public const bool WorkerHeartbeatEnabled = true;
+            public const int WorkerHeartbeatMinutes = 20;
+            public const int WorkerHeartbeatMaxMinutes = 240;
+            /// <summary>Soft per-wake ceiling on a worker's outbound agent messages (advisory, never blocking).</summary>
+            public const int WorkerMessagesPerWake = 6;
             public const bool ContainersEnabled = true;
             public const bool LiveActivityStreaming = true;
             public const bool DesktopFirstWebsiteInteraction = true;

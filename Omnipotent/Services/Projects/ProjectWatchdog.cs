@@ -161,6 +161,28 @@ namespace Omnipotent.Services.Projects
             if (staleAgentWake != null)
                 return ($"Sub-agent {staleAgentWake.AgentID} has been awake without finishing or emitting any activity for over {MaxWakeGap.TotalMinutes:0} minutes.", staleAgentWake.AgentID);
 
+            // 5. Under-staffed: free agent slots sitting against dependency-ready work nobody owns.
+            //    A Commander grinding solo through parallelisable work is healthy by every check above
+            //    — it emits activity, makes progress and never loops — while delivering a fraction of
+            //    the throughput the roster was budgeted for. Wake it to staff the work; the seed's
+            //    task-force block and staffing checkpoint tell it exactly what is unowned.
+            if (project.Status == ProjectStatus.Active && project.SubAgentCap > 1)
+            {
+                try
+                {
+                    var roster = parent.SubAgents.ListActive(project.ProjectID);
+                    var ready = parent.GrandPlans?.GetReadyMilestones(project.ProjectID) ?? new List<PlanMilestone>();
+                    if (ProjectStaffing.IsUnderStaffed(project, ready, roster))
+                    {
+                        int free = Math.Max(0, project.SubAgentCap - roster.Count);
+                        var unstaffed = ProjectStaffing.UnstaffedReady(ready, roster);
+                        return ($"{free} agent slot(s) are free while {unstaffed.Count} dependency-ready milestone(s) have no owner "
+                            + $"({string.Join(", ", unstaffed.Take(3).Select(m => m.ID))}). Staff the work or explain why it is indivisible.", null);
+                    }
+                }
+                catch { }
+            }
+
             return (null, null);
         }
 

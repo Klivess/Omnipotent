@@ -38,6 +38,19 @@ namespace Omnipotent.Services.Projects
     }
 
     /// <summary>
+    /// What kind of engagement an agent holds. A Task agent is bounded — it finishes a deliverable,
+    /// reports, and the Commander retires it. A Standing agent owns an ongoing beat and stays on the
+    /// roster across many wakes; reporting is a checkpoint, not an exit, and only the Commander
+    /// closes it (by retiring or re-tasking). Default is Task so existing agent JSON, which has no
+    /// mission field, deserializes to today's bounded behaviour.
+    /// </summary>
+    public enum ProjectAgentMissionKind
+    {
+        Task = 0,
+        Standing = 1,
+    }
+
+    /// <summary>
     /// A durable instruction from Klives. Unlike ordinary timeline messages, directives are
     /// injected into every applicable wake and never depend on digest compaction or retrieval.
     /// </summary>
@@ -186,8 +199,13 @@ namespace Omnipotent.Services.Projects
         public double MoneyBudgetUsd { get; set; }
         /// <summary>Single-action real-money spends at or below this are autonomous; above needs Discord approval. Stricter than, and independent of, the token budget (§8).</summary>
         public double MoneyAutonomousThresholdUsd { get; set; }
-        /// <summary>Maximum concurrent agents (Commander + sub-agents + one-level helpers).</summary>
-        public int SubAgentCap { get; set; } = 5;
+        /// <summary>
+        /// Maximum concurrent agents (Commander + sub-agents + one-level helpers). The Commander
+        /// occupies one slot, so this is worker headroom + 1. Sized for a task force that actually
+        /// runs in parallel: the ceiling should bind only when the plan genuinely has that much
+        /// dependency-ready work, never as the routine reason a project stays serial.
+        /// </summary>
+        public int SubAgentCap { get; set; } = 12;
 
         /// <summary>
         /// Every agent gets its own long-lived browser profile and desktop by default. Shared
@@ -224,11 +242,20 @@ namespace Omnipotent.Services.Projects
         /// <summary>Free-text role, e.g. "commander", "market-researcher".</summary>
         public string Role { get; set; } = "";
         public string Objective { get; set; } = "";
+        /// <summary>Bounded deliverable (Task) or an ongoing beat the agent owns (Standing).</summary>
+        public ProjectAgentMissionKind MissionKind { get; set; } = ProjectAgentMissionKind.Task;
         public ProjectAgentWorkStatus WorkStatus { get; set; } = ProjectAgentWorkStatus.Idle;
         public List<string> ActiveMilestoneIDs { get; set; } = new();
         public List<string> DeliverablePaths { get; set; } = new();
         public string? LastReport { get; set; }
         public DateTime? LastReportAt { get; set; }
+        /// <summary>
+        /// When this agent last began a wake. Distinct from LastReportAt, which only moves when the
+        /// agent produces a report: without this, a worker that has never been woken and one that is
+        /// working quietly are indistinguishable, so neither the Commander nor the heartbeat can tell
+        /// idle from busy.
+        /// </summary>
+        public DateTime? LastWakeAt { get; set; }
         public bool Retired { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime? RetiredAt { get; set; }

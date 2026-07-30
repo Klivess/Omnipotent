@@ -68,6 +68,14 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public Func<string, string>? DescribeApprovals;
 
+        /// <summary>
+        /// The live roster with slot arithmetic: who is working, who is idle, who can be retired and
+        /// how many slots are free. Set by the Projects service in ServiceMain
+        /// (ProjectSubAgentManager.DescribeTaskForce). Without it the Commander plans staffing from a
+        /// one-line org chart that cannot express "eight slots are sitting empty".
+        /// </summary>
+        public Func<string, string>? DescribeTaskForce;
+
         /// <summary>Optional live KliveAgent bridge summary: active services, registered capabilities,
         /// reusable shortcuts and a compact task-relevant repository map. This keeps Project wakes
         /// grounded in the same operating environment as interactive KliveAgent without copying a
@@ -165,6 +173,12 @@ namespace Omnipotent.Services.Projects
                 try { approvals = DescribeApprovals(project.ProjectID); } catch { approvals = null; }
             }
 
+            string? taskForce = null;
+            if (DescribeTaskForce != null)
+            {
+                try { taskForce = DescribeTaskForce(project.ProjectID); } catch { taskForce = null; }
+            }
+
             string? kliveAgentContext = null;
             if (DescribeKliveAgentContextAsync != null)
             {
@@ -174,7 +188,7 @@ namespace Omnipotent.Services.Projects
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
-                recentEventsBudget, chronologicalEvents, approvals);
+                recentEventsBudget, chronologicalEvents, approvals, taskForce);
         }
 
         private static string Truncate(string s, int max) =>

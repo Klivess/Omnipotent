@@ -85,7 +85,7 @@ public static class ProjectToolFacade
             }),
 
         ("manage_agents",
-            "Command your task force: spawn workers, assign them Grand Plan milestones, and retire them when they are done. Message an existing worker with send_agent_message instead.",
+            "Command your task force: spawn workers (a 'task' mission for a bounded deliverable, a 'standing' mission for an ongoing beat someone must keep owning), assign them Grand Plan milestones, and retire finished ones to free slots. Keep the roster near its cap while the plan has unowned dependency-ready work. Message an existing agent with send_agent_message instead.",
             new[]
             {
                 ("spawn", "spawn_sub_agent"),

@@ -20,6 +20,20 @@ public static class ProjectWorkSliceBoundary
     public static bool ShouldContinueAssignment(bool endedAtWorkSlice, bool wakeCompleted) =>
         endedAtWorkSlice && wakeCompleted;
 
+    /// <summary>
+    /// Whether a worker that reported a checkpoint and kept its assignment (WORK_STATUS: CONTINUING,
+    /// or any terminal status on a standing mission) should roll straight into a fresh wake instead of
+    /// waiting for the heartbeat.
+    ///
+    /// Gated on productive work in the slice just finished, which is what stops this from becoming a
+    /// spin loop: <c>ProjectWorkProgress.RecordIfNovel</c> only counts NOVEL actions, so an agent
+    /// repeating itself scores zero, drops out of immediate continuation, and falls back to the
+    /// heartbeat's geometric backoff. An agent genuinely making progress never has to sit out a
+    /// 20-minute quiet period to carry on.
+    /// </summary>
+    public static bool ShouldContinueOpenAssignment(bool assignmentStaysOpen, bool wakeCompleted, int productiveActions) =>
+        assignmentStaysOpen && wakeCompleted && productiveActions > 0;
+
     /// <summary>Whether a configured tool-call boundary has been reached. A zero limit explicitly
     /// disables this boundary; it must never be interpreted as "zero calls allowed".</summary>
     public static bool IsToolCallLimitReached(int toolCalls, int toolCallLimit) =>

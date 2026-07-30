@@ -46,6 +46,11 @@ namespace Omnipotent.Services.Projects
         private readonly ConcurrentDictionary<string, object> wakeGates = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, bool> cancelBeforeStart = new(StringComparer.Ordinal);
 
+        // Consecutive wakes that began with free agent slots sitting against unowned dependency-ready
+        // work. Only used to escalate the wording of the staffing checkpoint, so it is deliberately
+        // in-memory: losing the count on restart costs a firmer sentence, nothing more.
+        private readonly ConcurrentDictionary<string, int> underStaffedWakes = new(StringComparer.Ordinal);
+
         private object WakeGate(string projectID) => wakeGates.GetOrAdd(projectID, _ => new object());
 
         public ProjectCommanderRunner(Projects parent)
@@ -376,14 +381,24 @@ namespace Omnipotent.Services.Projects
                 }
                 var approvedPlan = parent.GrandPlans.GetCurrentApproved(projectID)?.Content;
                 var readyMilestones = parent.GrandPlans.GetReadyMilestones(projectID);
-                if (project.Status == ProjectStatus.Active && project.SubAgentCap > 1
-                    && parent.SubAgents.ListActive(projectID).Count <= 1
-                    && ((approvedPlan?.Workstreams.Count ?? 0) > 1 || (approvedPlan?.Milestones.Count ?? 0) > 1))
+                // Staffing pressure has to be CONTINUOUS. This previously fired only while the roster
+                // was `Count <= 1` — and ListActive counts the Commander, so one spawn took the count to
+                // 2 and the checkpoint never fired again for the life of the project. That single
+                // condition is why live projects sat at one worker with most of the cap unused.
+                var roster = parent.SubAgents.ListActive(projectID);
+                int underStaffedStreak = 0;
+                if (ProjectStaffing.IsUnderStaffed(project, readyMilestones, roster))
+                    underStaffedStreak = underStaffedWakes.AddOrUpdate(projectID, 1, (_, n) => n + 1);
+                else
+                    underStaffedWakes.TryRemove(projectID, out _);
+                // The streak counts this wake; the composer wants how many PRECEDING wakes were already
+                // under-staffed, so it can say "the 3rd consecutive wake" and mean it.
+                string? staffingCheckpoint = ProjectStaffing.ComposeCheckpoint(
+                    project, approvedPlan, readyMilestones, roster, DateTime.UtcNow,
+                    Math.Max(0, underStaffedStreak - 1));
+                if (staffingCheckpoint != null)
                 {
-                    llm.AppendUserMessageToToolSession(sessionId,
-                        $"DELEGATION CHECKPOINT: the approved plan has separable work and {project.SubAgentCap - 1} worker slot(s) are free. " +
-                        $"Dependency-ready milestones: {string.Join("; ", readyMilestones.Select(m => $"{m.ID} {m.Title}"))}. " +
-                        "Assign only dependency-ready work, set milestone owners, and require explicit deliverables unless the next step is genuinely indivisible.");
+                    llm.AppendUserMessageToToolSession(sessionId, staffingCheckpoint);
                     protectedBriefMessages++;
                 }
 

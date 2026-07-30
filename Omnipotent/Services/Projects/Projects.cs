@@ -302,6 +302,13 @@ namespace Omnipotent.Services.Projects
             // The Commander's own outstanding approvals and Klives' recent decisions, so it can neither
             // re-ask a pending question nor re-propose something he already refused.
             WakeCycle.DescribeApprovals = pid => Settings.Get(pid).ApprovalDedupe ? Gates.DescribeForWake(pid) : "";
+            // The live roster with slot arithmetic. Staffing is a decision the Commander makes every
+            // wake, so it is seeded from the store rather than inferred from digest prose.
+            WakeCycle.DescribeTaskForce = pid =>
+            {
+                var p = Store.GetProject(pid);
+                return p == null ? "" : SubAgents.DescribeTaskForce(pid, p.SubAgentCap);
+            };
             // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
             retentionTimer = new System.Threading.Timer(async _ =>
             {
@@ -507,9 +514,45 @@ namespace Omnipotent.Services.Projects
                             ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
                             : "Periodic keepalive: reassess the plan and make the next concrete progress toward the goal.",
                             queueIfBusy: false); // ephemeral nudge: never replay stale phase instructions behind a live wake
+
+                    HeartbeatWorkers(project);
                 }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
+        }
+
+        /// <summary>
+        /// Re-wakes workers whose assignment is still open but which have gone quiet. Before this, the
+        /// keepalive only ever woke the Commander: a worker was push-only, so one that reported and
+        /// ended its wake was never heard from again unless the Commander happened to message it. That
+        /// is why sub-agents worked for one wake and a staffed task force went silent within the hour.
+        ///
+        /// Only Active projects, and only agents the heartbeat predicate says are genuinely waiting on
+        /// a nudge. Fired ephemerally (queueIfBusy: false) exactly like the Commander keepalive — a
+        /// heartbeat is worth nothing replayed later behind a wake that already covered the same ground.
+        /// </summary>
+        private void HeartbeatWorkers(Project project)
+        {
+            if (project.Status != ProjectStatus.Active) return;
+            var settings = Settings.Get(project.ProjectID);
+            if (!settings.WorkerHeartbeatEnabled) return;
+            // A project already out of tokens should not be spending them on nudges.
+            if (!Budget.IsWithinTokenBudget(project.ProjectID)) return;
+
+            var now = DateTime.UtcNow;
+            foreach (var agent in SubAgents.ListActive(project.ProjectID))
+            {
+                try
+                {
+                    if (!ProjectWorkerHeartbeat.ShouldWake(agent,
+                            SubAgentRunner.IsAwake(project.ProjectID, agent.AgentID), now,
+                            settings.WorkerHeartbeatMinutes, settings.WorkerHeartbeatMaxMinutes,
+                            SubAgentRunner.UnproductiveStreak(project.ProjectID, agent.AgentID)))
+                        continue;
+                    SubAgentRunner.Wake(project, agent, ProjectWorkerHeartbeat.TriggerFor(agent), queueIfBusy: false);
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: worker heartbeat failed for {agent.AgentID}"); }
+            }
         }
 
         /// <summary>

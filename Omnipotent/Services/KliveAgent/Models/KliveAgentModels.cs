@@ -1023,7 +1023,7 @@ namespace Omnipotent.Services.KliveAgent.Models
         public double MoneyAutonomousThresholdUsd { get; set; }
 
         [JsonProperty("subAgentCap")]
-        public int SubAgentCap { get; set; } = 3;
+        public int SubAgentCap { get; set; } = 10;
 
         [JsonProperty("expectedArtifactPaths")]
         public List<string> ExpectedArtifactPaths { get; set; } = new();
