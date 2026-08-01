@@ -4,6 +4,7 @@ using Omnipotent.Services.OmniTrader.Analytics;
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Journal;
 using Omnipotent.Services.OmniTrader.Ledger;
+using Omnipotent.Services.OmniTrader.MarketData;
 using Omnipotent.Services.OmniTrader.Ops;
 using Omnipotent.Services.OmniTrader.OrderFlow;
 using Omnipotent.Services.OmniTrader.Persistence;
@@ -69,6 +70,8 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new
                 {
                     AsOfUtc = DateTime.UtcNow,
+                    // Every figure here is real money. Simulated totals travel in their own block so
+                    // the two can be shown side by side but never accidentally added together.
                     Portfolio = new
                     {
                         portfolio.ReportingCurrency,
@@ -82,8 +85,19 @@ namespace Omnipotent.Services.OmniTrader.Api
                         portfolio.UnrealizedPnL,
                         portfolio.RealizedPnLToday,
                         portfolio.CostsToday,
-                        Positions = portfolio.Lines.Count,
+                        Positions = portfolio.Real.Positions,
+                        portfolio.HasRealAccounts,
                         portfolio.Warnings
+                    },
+                    Simulated = new
+                    {
+                        portfolio.Simulated.TotalValue,
+                        portfolio.Simulated.Cash,
+                        portfolio.Simulated.InventoryValue,
+                        portfolio.Simulated.UnrealizedPnL,
+                        portfolio.Simulated.GrossExposure,
+                        portfolio.Simulated.Positions,
+                        RealizedPnLToday = portfolio.SimulatedRealizedPnLToday
                     },
                     Health = new { health.TradingPermitted, health.Summary, health.Blockers },
                     Controls = new
@@ -257,6 +271,142 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Firm.Watchlists.DeleteAsync(id);
                 await Json(req, new { Deleted = true });
             });
+
+            // ── live data for any symbol ──────────────────────────────────────────
+            // These take a *symbol* rather than an instrument id, so anything listed can be charted
+            // and quoted whether or not the firm has ever traded it.
+
+            await Get("/api/omnitrader/firm/candles", async req =>
+            {
+                string? symbol = req.userParameters.Get("symbol") ?? req.userParameters.Get("instrument");
+                if (string.IsNullOrWhiteSpace(symbol)) { await Bad(req, "symbol required"); return; }
+
+                var interval = ParseInterval(req.userParameters.Get("interval")) ?? TimeInterval.OneHour;
+                int count = ParseInt(req.userParameters.Get("count"), 300, 20, 2000);
+
+                var (marketSymbol, assetClass, instrument) = ResolveSymbol(symbol);
+                var candles = await parent.MarketData.GetHistoricalCandlesAsync(marketSymbol, interval, count, assetClass);
+
+                await Json(req, new
+                {
+                    Symbol = marketSymbol,
+                    InstrumentId = instrument?.Id,
+                    DisplayName = instrument?.DisplayName ?? marketSymbol,
+                    AssetClass = assetClass.ToString(),
+                    Interval = interval.ToString(),
+                    // The UI must be able to say whether "live" means a push feed or a poll.
+                    Streaming = MarketDataRouter.IsStreamingLive(marketSymbol, assetClass),
+                    Candles = candles.Select(c => new
+                    {
+                        Ts = c.Timestamp,
+                        c.Open, c.High, c.Low, c.Close, c.Volume
+                    })
+                });
+            });
+
+            await Get("/api/omnitrader/firm/quote", async req =>
+            {
+                string? symbol = req.userParameters.Get("symbol") ?? req.userParameters.Get("instrument");
+                if (string.IsNullOrWhiteSpace(symbol)) { await Bad(req, "symbol required"); return; }
+
+                var (marketSymbol, assetClass, instrument) = ResolveSymbol(symbol);
+                bool equity = MarketDataRouter.UsesEquityFeed(marketSymbol, assetClass);
+
+                if (equity)
+                {
+                    var quote = await parent.MarketData.Yahoo.GetQuoteAsync(marketSymbol);
+                    await Json(req, new
+                    {
+                        Symbol = marketSymbol,
+                        InstrumentId = instrument?.Id,
+                        DisplayName = instrument?.DisplayName ?? quote?.Symbol ?? marketSymbol,
+                        AssetClass = assetClass.ToString(),
+                        Price = quote?.Price,
+                        quote?.PreviousClose,
+                        ChangePercent = quote?.ChangePercent,
+                        Currency = quote?.Currency,
+                        Exchange = quote?.ExchangeName,
+                        // An equity chart that is flat because the exchange is shut is not a dead feed.
+                        MarketState = quote?.MarketState,
+                        AsOfUtc = quote?.AsOfUtc,
+                        Streaming = false
+                    });
+                    return;
+                }
+
+                decimal price = await parent.MarketData.GetLatestPriceAsync(marketSymbol, assetClass);
+                var recent = await parent.MarketData.GetHistoricalCandlesAsync(marketSymbol, TimeInterval.OneDay, 2, assetClass);
+                decimal previous = recent.Count > 1 ? recent[^2].Close : 0m;
+
+                await Json(req, new
+                {
+                    Symbol = marketSymbol,
+                    InstrumentId = instrument?.Id,
+                    DisplayName = instrument?.DisplayName ?? marketSymbol,
+                    AssetClass = assetClass.ToString(),
+                    Price = price,
+                    PreviousClose = previous,
+                    ChangePercent = previous > 0m ? Math.Round((price - previous) / previous * 100m, 2) : (decimal?)null,
+                    Currency = instrument?.QuoteCurrency ?? "USD",
+                    Exchange = (string?)null,
+                    MarketState = "REGULAR",  // crypto never closes
+                    AsOfUtc = DateTime.UtcNow,
+                    Streaming = true
+                });
+            });
+
+            await Get("/api/omnitrader/firm/search", async req =>
+            {
+                string query = req.userParameters.Get("q") ?? "";
+                if (string.IsNullOrWhiteSpace(query)) { await Json(req, Array.Empty<object>()); return; }
+
+                // The instrument master first — things the firm can actually trade outrank things it
+                // can merely look at — then every other listed symbol.
+                var known = Firm.Instruments.Search(query, 12).Select(i => new SymbolMatch
+                {
+                    Symbol = Firm.Instruments.EngineSymbolFor(i.Id),
+                    DisplayName = i.DisplayName,
+                    AssetClass = i.AssetClass,
+                    Source = "instrument-master",
+                    InstrumentId = i.Id,
+                    TradableOn = i.Venues.Where(v => v.Tradeable).Select(v => v.Venue.ToString()).ToList()
+                }).ToList();
+
+                var seen = known.Select(k => k.Symbol).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    foreach (var match in await parent.MarketData.Yahoo.SearchAsync(query, 20))
+                        if (seen.Add(match.Symbol)) known.Add(match);
+                }
+                catch { /* the master's own matches are still worth returning */ }
+
+                await Json(req, known.Select(m => new
+                {
+                    m.Symbol,
+                    m.DisplayName,
+                    m.Exchange,
+                    AssetClass = m.AssetClass.ToString(),
+                    m.Source,
+                    m.InstrumentId,
+                    m.TradableOn,
+                    Tradable = m.TradableOn.Count > 0
+                }));
+            });
+        }
+
+        /// <summary>
+        /// Turn whatever the caller passed — a canonical instrument id, an exchange ticker, a Yahoo
+        /// symbol — into the symbol the market-data feed understands, plus what we know about it.
+        /// </summary>
+        private (string Symbol, AssetClass AssetClass, Instruments.Instrument? Instrument) ResolveSymbol(string raw)
+        {
+            var instrument = Firm.Instruments.Resolve(raw);
+            if (instrument != null)
+                return (Firm.Instruments.EngineSymbolFor(instrument.Id), instrument.AssetClass, instrument);
+
+            // Not in the master: chart it anyway, inferring the feed from the symbol's own shape.
+            var inferred = MarketDataRouter.UsesEquityFeed(raw, AssetClass.Unknown) ? AssetClass.Equity : AssetClass.Crypto;
+            return (raw, inferred, null);
         }
 
         // ── portfolio ─────────────────────────────────────────────────────────────
@@ -1044,11 +1194,19 @@ namespace Omnipotent.Services.OmniTrader.Api
             => parent.CreateAPIRoute(path, handler, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
         private static Task Json(UserRequest req, object payload)
-            => req.ReturnResponse(JsonConvert.SerializeObject(payload, new JsonSerializerSettings
-            {
-                NullValueHandling = NullValueHandling.Include,
-                DateTimeZoneHandling = DateTimeZoneHandling.Utc
-            }));
+            => req.ReturnResponse(JsonConvert.SerializeObject(payload, JsonSettings));
+
+        /// <summary>
+        /// Enums serialise as their names, not their ordinals. A UI that renders "Classification 3"
+        /// has told the operator nothing, and a contract built on ordinals breaks silently the first
+        /// time a value is inserted into the middle of an enum.
+        /// </summary>
+        private static readonly JsonSerializerSettings JsonSettings = new()
+        {
+            NullValueHandling = NullValueHandling.Include,
+            DateTimeZoneHandling = DateTimeZoneHandling.Utc,
+            Converters = { new Newtonsoft.Json.Converters.StringEnumConverter() }
+        };
 
         private static Task Bad(UserRequest req, string message)
             => req.ReturnResponse(JsonConvert.SerializeObject(new { Error = message }), code: HttpStatusCode.BadRequest);

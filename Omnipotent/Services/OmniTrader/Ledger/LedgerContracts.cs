@@ -189,6 +189,13 @@ namespace Omnipotent.Services.OmniTrader.Ledger
         public List<ReconciliationBreak> Breaks { get; init; } = new();
         public int Checked { get; set; }
         public string? Error { get; set; }
+        /// <summary>Holdings the broker reported that the platform had never seen, and has now taken
+        /// onto its own book. These are assets, not problems.</summary>
+        public int Adopted { get; set; }
+        /// <summary>Sub-threshold exchange dust left alone rather than tracked.</summary>
+        public int DustIgnored { get; set; }
+        /// <summary>Re-detections of a condition that already has an open break.</summary>
+        public int SuppressedDuplicates { get; set; }
 
         public int MaterialBreaks => Breaks.Count(b => b.Material);
     }

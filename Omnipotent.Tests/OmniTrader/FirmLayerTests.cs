@@ -3,8 +3,10 @@ using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Instruments;
 using Omnipotent.Services.OmniTrader.Journal;
 using Omnipotent.Services.OmniTrader.Ledger;
+using Omnipotent.Services.OmniTrader.MarketData;
 using Omnipotent.Services.OmniTrader.Ops;
 using Omnipotent.Services.OmniTrader.Performance;
+using Omnipotent.Services.OmniTrader.Portfolio;
 using Omnipotent.Services.OmniTrader.Risk;
 using Omnipotent.Services.OmniTrader.Venues;
 
@@ -465,6 +467,48 @@ namespace Omnipotent.Tests.OmniTrader
             // A quiet day holds the running total rather than resetting or interpolating it.
             Assert.Equal(60m, daily[1].Cumulative);
             Assert.Equal(85m, daily[2].Cumulative);
+        }
+
+        // ── venues, feeds and money that is not real ──────────────────────────────
+
+        [Fact]
+        public void OnlyLiveAccountsHoldRealMoney()
+        {
+            Assert.True(PortfolioService.IsRealMoney(TradingEnvironment.Live));
+            // The built-in paper trader and a broker demo account are simulations. Counting either
+            // toward firm value would report wealth that does not exist.
+            Assert.False(PortfolioService.IsRealMoney(TradingEnvironment.Paper));
+            Assert.False(PortfolioService.IsRealMoney(TradingEnvironment.Demo));
+            Assert.False(PortfolioService.IsRealMoney(TradingEnvironment.Historical));
+        }
+
+        [Theory]
+        [InlineData("BTCUSDT", false)]
+        [InlineData("ETHGBP", false)]
+        [InlineData("AAPL", true)]
+        [InlineData("VOD.L", true)]
+        [InlineData("^FTSE", true)]
+        [InlineData("GBPUSD=X", true)]
+        public void SymbolShapeDecidesWhichFeedAnswers(string symbol, bool equityFeed)
+        {
+            Assert.Equal(equityFeed, MarketDataRouter.UsesEquityFeed(symbol, AssetClass.Unknown));
+        }
+
+        [Fact]
+        public void AnExplicitAssetClassOverridesTheSymbolShape()
+        {
+            // "SOL" looks like a ticker but is crypto; the caller knowing that must win.
+            Assert.False(MarketDataRouter.UsesEquityFeed("SOL", AssetClass.Crypto));
+            Assert.True(MarketDataRouter.UsesEquityFeed("BTCUSD", AssetClass.Equity));
+        }
+
+        [Theory]
+        [InlineData("AAPL_US_EQ", "AAPL")]
+        [InlineData("VUSAl_EQ", "VUSA.L")]
+        [InlineData("TSLA", "TSLA")]
+        public void Trading212TickersMapOntoMarketDataSymbols(string venueSymbol, string expected)
+        {
+            Assert.Equal(expected, Trading212VenueAdapter.ToMarketSymbol(venueSymbol));
         }
 
         private static JournalRecord ClosedTrade(DateTime ts, decimal pnl) => new()

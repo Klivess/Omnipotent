@@ -455,17 +455,31 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             return list;
         }
 
-        /// <summary>Realized P&amp;L and costs booked since a point in time, used by the risk engine's
-        /// daily-loss controls and by the performance page.</summary>
-        public async Task<(decimal Realized, decimal Costs)> SumSinceAsync(DateTime sinceUtc, string? strategyId = null, CancellationToken ct = default)
+        /// <summary>
+        /// Realized P&amp;L and costs booked since a point in time, used by the risk engine's
+        /// daily-loss controls and by the performance page. <paramref name="environments"/> keeps
+        /// simulated P&amp;L out of real-money figures — a paper profit is not income.
+        /// </summary>
+        public async Task<(decimal Realized, decimal Costs)> SumSinceAsync(DateTime sinceUtc, string? strategyId = null,
+            IReadOnlyCollection<string>? environments = null, CancellationToken ct = default)
         {
             CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
+
+            string envFilter = "";
+            if (environments is { Count: > 0 })
+            {
+                var names = environments.Select((_, i) => $"$e{i}").ToList();
+                envFilter = $" AND environment IN ({string.Join(",", names)})";
+                int index = 0;
+                foreach (var environment in environments) cmd.Parameters.AddWithValue($"$e{index++}", environment);
+            }
+
             cmd.CommandText = @"SELECT
                     COALESCE(SUM(CASE WHEN kind='RealizedPnL' THEN amount ELSE 0 END), 0),
                     COALESCE(SUM(CASE WHEN kind='Cost' THEN amount ELSE 0 END), 0)
-                FROM ledger_entries WHERE ts >= $s AND ($st IS NULL OR strategy_id = $st)";
+                FROM ledger_entries WHERE ts >= $s AND ($st IS NULL OR strategy_id = $st)" + envFilter;
             cmd.Parameters.AddWithValue("$s", sinceUtc.ToString("o"));
             cmd.Parameters.AddWithValue("$st", FirmJson.Nullable(strategyId));
             await using var reader = await cmd.ExecuteReaderAsync(ct);

@@ -3,7 +3,7 @@
 OmniTrader is the trading service inside Omnipotent. It has **two layers**:
 
 - **The strategy engine** (§1–§18) — a modular engine that runs the *same* strategy code across **backtest**, **paper** and **live**, over any symbol(s), single-asset or multi-asset. It knows nothing about any specific strategy.
-- **The firm layer** (§19–§29) — the trading *operating system* on top: venue adapters (Kraken spot + IG CFD), a canonical instrument master, a mandatory risk decision before every order, an audited order lifecycle, an immutable ledger reconciled against broker truth, a journal, alerting and operations.
+- **The firm layer** (§19–§31) — the trading *operating system* on top: venue adapters (Kraken spot + IG CFD), a canonical instrument master, a mandatory risk decision before every order, an audited order lifecycle, an immutable ledger reconciled against broker truth, a journal, alerting and operations.
 
 The engine answers *"what should we trade?"*. The firm layer answers *"is the firm allowed to, did it actually happen, and can we prove it?"*
 
@@ -46,7 +46,9 @@ The engine answers *"what should we trade?"*. The firm layer answers *"is the fi
 26. [Journal, research & performance](#26-journal-research--performance)
 27. [Operations, alerts & health](#27-operations-alerts--health)
 28. [Firm HTTP API](#28-firm-http-api)
-29. [The UI](#29-the-ui)
+29. [Any symbol, live data](#any-symbol-not-just-the-instrument-master)
+30. [Real money, simulated money, adopted holdings](#30-real-money-simulated-money-and-holdings-you-already-own)
+31. [The UI](#31-the-ui)
 
 ---
 
@@ -879,9 +881,67 @@ than fabricated when no snapshot exists.
 in the direction the bucket moved, so a spike survives rather than being averaged flat, and the final
 point is the exact latest price.
 
+### Any symbol, not just the instrument master
+
+Three routes work on *symbols*, so anything listed can be charted and quoted whether or not the firm
+has ever traded it:
+
+| Route | Returns |
+|---|---|
+| GET `candles` `?symbol&interval&count` | OHLCV bars, plus `Streaming` — whether "live" means a push feed or a poll |
+| GET `quote` `?symbol` | Price, previous close, change, currency, exchange and `MarketState` |
+| GET `search` `?q` | Instrument-master matches first, then every other listed symbol |
+
+Crypto is served by Binance/Kraken; **everything else — shares, ETFs, indices, FX, commodities — is
+served by `YahooMarketDataProvider`**, which is keyless and covers the listings IG and Trading 212
+deal in. `MarketDataRouter.UsesEquityFeed` picks the feed from an explicit `AssetClass` when the
+caller has one and from the symbol's own shape when it does not (`BTCUSDT` → exchange; `VOD.L`,
+`^FTSE`, `GBPUSD=X`, `AAPL` → equities). Equity "streaming" is polling at the bar interval and says
+so — only crypto is a real push stream.
+
+**Enums serialise as names, not ordinals**, via a `StringEnumConverter` on the shared settings. A UI
+that renders "Classification 3" has told the operator nothing.
+
 ---
 
-## 29. The UI
+## 30. Real money, simulated money, and holdings you already own
+
+Two rules learned on the first live run.
+
+**Only `Live` accounts hold real money.** `PortfolioService.IsRealMoney` is the single definition and
+`FirmPortfolioView` carries two totals, `Real` and `Simulated`. Every headline figure (`TotalValue`,
+`Cash`, `InventoryValue`, `DerivativeEquity`, `GrossExposure`, `RealizedPnLToday`) is the *real* one;
+the paper simulator and broker demo accounts are reported in their own block and never added in.
+`HasRealAccounts` is false when nothing live is connected, so the UI can say so instead of presenting
+£0 as a loss. Daily P&L is filtered by environment in SQL.
+
+**A holding the platform did not trade is an asset, not a discrepancy.** When reconciliation finds a
+venue position with no internal counterpart — an account that predates the platform, a manual top-up,
+an airdrop — it calls `FirmLedger.AdoptExternalHoldingAsync`: the broker's quantity becomes truth,
+the entry is marked `ExternalManual`, and the cost basis is recorded as the current mark because the
+real one is unknowable from here (which keeps unrealized P&L at zero rather than inventing a profit).
+Fragments below `ReconciliationService.DustThreshold` are left alone entirely. Raising a break per
+pre-existing coin produced a screen of red that said only "you own things", and tripped safe mode for
+the crime of holding assets.
+
+Breaks are still raised for real disagreements — a position we *do* track that does not match, an
+unprovable order, a cash difference — and they now **deduplicate on the condition**
+(`{venue}:{environment}:{kind}:{subject}`), so one unresolved problem is one row however many times
+the sweep re-detects it. `CollapseDuplicateBreaksAsync` runs at startup to fold away repeats left by
+earlier versions.
+
+### Venues
+
+| Venue | Exposure | Environments | Notes |
+|---|---|---|---|
+| Kraken | Inventory (spot crypto) | Live | Reuses the engine's order router |
+| IG | Derivative (CFD) | Demo · Live | Separate credentials per environment |
+| **Trading 212** | **Inventory (shares, ETFs)** | **Demo · Live** | `OmniTrader.Trading212.{Demo,Live}.ApiKey`. No historical-bar endpoint, so charts come from the equities feed; no client-reference field, so an ambiguous submission is reported `Unknown` rather than retried |
+| Internal | Inventory (simulated) | Paper | Never counted as value |
+
+---
+
+## 31. The UI
 
 `pages/omnitrader/` in the management website — ten pages over a shared component library in
 `components/OmniTrader/`, `composables/useOmniTrader.ts` and `assets/scss/omnitrader-os.scss`.
@@ -896,11 +956,13 @@ point is the exact latest price.
 | `DataTable` | sticky header, sort, search, column visibility, pinned first column, paging, filtered/total counts, keyboard row access |
 | `LineChart` | one y-axis, crosshair + tooltip, keyboard readout, direct-labelled last value, axis-truncation disclosure, table view |
 | `BarList` | sorted horizontal bars, diverging around zero, top-N with the tail folded into "Other" |
+| `CandleChart` | candlesticks + volume via `lightweight-charts`, with a UTC OHLC readout under the crosshair |
 | `Sparkline`, `Meter`, `RuleList`, `Drawer`, `StateBlock` | trend shape; bullet meter with its threshold; the rule-level decision record; right-side inspection; typed non-success states |
 
 | Page | Primary decision |
 |---|---|
 | **Command Centre** (`/omnitrader`) | assess the operation and find what needs action |
+| **Instrument** (`/omnitrader/instrument?symbol=`) | study one symbol: candlesticks, live quote, analytics, position |
 | **Markets** | discover and evaluate market conditions |
 | **Strategies** | control the strategy lifecycle and authority |
 | **Portfolio** | understand aggregate exposure and reconciliation |

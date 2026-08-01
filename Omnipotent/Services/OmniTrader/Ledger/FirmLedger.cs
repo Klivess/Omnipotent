@@ -167,6 +167,73 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             await repo.AppendAsync(entries, ct);
         }
 
+        /// <summary>
+        /// Adopt a holding the broker reports that the platform never traded.
+        ///
+        /// This is the normal case for an account that existed before OmniTrader did, or that its
+        /// owner tops up by hand: it is not a discrepancy to be explained, it is an asset the firm
+        /// owns and the book has simply never been told about. The broker's quantity is taken as
+        /// truth, the entry is marked <see cref="EntryOrigin.ExternalManual"/> so it can never be
+        /// mistaken for a platform decision, and the cost basis is recorded as the current mark
+        /// because the real one is unknowable from here — which keeps unrealized P&amp;L at zero
+        /// rather than inventing a profit the firm never made.
+        ///
+        /// Returns true when the book changed.
+        /// </summary>
+        public async Task<bool> AdoptExternalHoldingAsync(string accountId, VenueId venue, TradingEnvironment environment,
+            string instrumentId, ExposureKind exposure, decimal venueQuantity, decimal? markPrice, CancellationToken ct = default)
+        {
+            decimal existing = GetPosition(accountId, instrumentId)?.Quantity ?? 0m;
+            decimal delta = venueQuantity - existing;
+            if (Math.Abs(delta) < 0.00000001m) return false;
+
+            var instrument = instruments.Get(instrumentId);
+            decimal price = markPrice ?? 0m;
+
+            var entry = new LedgerEntry
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                Ts = DateTime.UtcNow,
+                AccountId = accountId,
+                Venue = venue,
+                Environment = environment,
+                InstrumentId = instrumentId,
+                Kind = exposure == ExposureKind.Inventory ? LedgerEntryKind.Inventory : LedgerEntryKind.Exposure,
+                Asset = instrument?.BaseAsset ?? instrumentId,
+                Amount = delta * price,
+                Quantity = delta,
+                Price = price > 0m ? price : null,
+                SourceType = "reconciliation",
+                Origin = EntryOrigin.ExternalManual,
+                ReconciliationState = ReconciliationState.Matched,
+                Note = existing == 0m
+                    ? $"Adopted {venueQuantity} {instrumentId} already held at {venue}. Cost basis unknown; marked at {price}."
+                    : $"Aligned {instrumentId} to the {venue} quantity ({existing} → {venueQuantity}) from an external change."
+            };
+
+            lock (bookLock)
+            {
+                ApplyToBook(entry);
+                var position = positions.GetOrAdd(PositionKey(accountId, instrumentId), _ => new FirmPosition
+                {
+                    InstrumentId = instrumentId,
+                    Venue = venue,
+                    Environment = environment,
+                    AccountId = accountId,
+                    Exposure = exposure,
+                    OpenedUtc = DateTime.UtcNow
+                });
+                position.Quantity = venueQuantity;
+                position.VenueQuantity = venueQuantity;
+                // With no traded cost basis, the mark is the only defensible average price.
+                if (existing == 0m && price > 0m) position.AveragePrice = price;
+                if (price > 0m) position.MarkPrice = price;
+            }
+
+            await repo.AppendAsync(new[] { entry }, ct);
+            return true;
+        }
+
         /// <summary>Import broker-originated activity we did not initiate. It lands in the ledger with
         /// its origin permanently marked so it can never be mistaken for a platform decision.</summary>
         public async Task ImportExternalActivityAsync(string accountId, VenueId venue, TradingEnvironment environment,
@@ -217,7 +284,7 @@ namespace Omnipotent.Services.OmniTrader.Ledger
         }
 
         public Task<(decimal Realized, decimal Costs)> PnLSinceAsync(DateTime sinceUtc, string? strategyId = null, CancellationToken ct = default)
-            => repo.SumSinceAsync(sinceUtc, strategyId, ct);
+            => repo.SumSinceAsync(sinceUtc, strategyId, null, ct);
 
         public Task<Dictionary<string, decimal>> DailyPnLByStrategyAsync(CancellationToken ct = default)
             => repo.DailyPnLByStrategyAsync(DateTime.UtcNow.Date, ct);

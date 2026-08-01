@@ -87,6 +87,17 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             // 3. Account balances.
             await ReconcileBalancesAsync(adapter, run, ct);
 
+            // A break describes a *condition*, not an occurrence. Re-detecting the same unresolved
+            // condition on the next sweep must not create a second row — otherwise a single
+            // unexplained difference becomes fifty identical rows by lunchtime and the operator
+            // stops reading any of them.
+            var alreadyOpen = (await repo.ListOpenBreaksAsync(ct))
+                .Select(BreakIdentity)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            int duplicates = run.Breaks.RemoveAll(b => !alreadyOpen.Add(BreakIdentity(b)));
+            run.SuppressedDuplicates = duplicates;
+
             run.FinishedUtc = DateTime.UtcNow;
             await repo.SaveRunAsync(run, ct);
             LastRun = run;
@@ -220,29 +231,45 @@ namespace Omnipotent.Services.OmniTrader.Ledger
                 });
             }
 
-            // Anything the venue holds that we do not track at all.
+            // Anything the venue holds that we do not track at all is *adopted*, not accused.
+            //
+            // An account that existed before this platform did — or that its owner tops up by hand —
+            // is the normal case, not a discrepancy. Raising a break for every pre-existing coin
+            // produced a screen full of red that said nothing except "you own things", and it
+            // tripped safe mode for the crime of holding assets. What the platform actually needs to
+            // know is that the holding exists, which is what adoption records.
+            string accountId = $"{adapter.Venue}-{adapter.Environment}".ToLowerInvariant();
             foreach (var (instrumentId, qty) in venueByInstrument)
             {
                 if (qty == 0m) continue;
                 if (internalPositions.Any(p => string.Equals(p.InstrumentId, instrumentId, StringComparison.OrdinalIgnoreCase))) continue;
 
-                run.Breaks.Add(new ReconciliationBreak
+                decimal mark = 0m;
+                try { mark = await adapter.GetLatestPriceAsync(instruments.VenueSymbolFor(instrumentId, adapter.Venue), ct); }
+                catch { /* an unpriceable holding is still a holding */ }
+
+                // Exchange dust — a fraction of a coin worth less than a coffee — is left alone.
+                // Tracking it costs an operator more attention than the position is worth.
+                if (mark > 0m && Math.Abs(qty * mark) < DustThreshold)
                 {
-                    Id = Guid.NewGuid().ToString("N"),
-                    RunId = run.Id,
-                    Venue = adapter.Venue,
-                    Environment = adapter.Environment,
-                    Kind = BreakKind.Position,
-                    // Pre-existing holdings are the normal case here, not an error — but they are
-                    // still exposure the platform did not create, so they must be visible.
-                    Classification = BreakClassification.ExternalManualActivity,
-                    Subject = instrumentId,
-                    InternalValue = 0m,
-                    VenueValue = qty,
-                    Detail = $"{adapter.Venue} holds {qty} of {instrumentId} with no internal position."
-                });
+                    run.DustIgnored++;
+                    continue;
+                }
+
+                var instrument = instruments.Get(instrumentId);
+                bool changed = await ledger.AdoptExternalHoldingAsync(accountId, adapter.Venue, adapter.Environment,
+                    instrumentId, instrument?.Exposure ?? ExposureKind.Inventory, qty, mark > 0m ? mark : null, ct);
+                if (changed)
+                {
+                    run.Adopted++;
+                    log?.Invoke($"adopted {qty} {instrumentId} already held at {adapter.Venue}");
+                }
             }
         }
+
+        /// <summary>Holdings worth less than this in their quote currency are ignored rather than
+        /// tracked. Exchanges leave dust behind constantly and it is never a decision.</summary>
+        public const decimal DustThreshold = 1.0m;
 
         private async Task ReconcileBalancesAsync(IVenueAdapter adapter, ReconciliationRun run, CancellationToken ct)
         {
@@ -285,6 +312,31 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             bool recentlyTraded = recent.Any(o => string.Equals(o.InstrumentId, instrumentId, StringComparison.OrdinalIgnoreCase)
                                                && o.Venue == adapter.Venue);
             return recentlyTraded ? BreakClassification.Timing : BreakClassification.Unexplained;
+        }
+
+        /// <summary>What makes two breaks "the same condition" for deduplication.</summary>
+        private static string BreakIdentity(ReconciliationBreak b)
+            => $"{b.Venue}:{b.Environment}:{b.Kind}:{b.Subject}";
+
+        /// <summary>
+        /// Collapse historical duplicates left by earlier runs: for each condition, keep the oldest
+        /// open break and close the rest as duplicates. Runs once at startup so an operator inheriting
+        /// a screen full of repeats gets one row per real problem.
+        /// </summary>
+        public async Task<int> CollapseDuplicateBreaksAsync(CancellationToken ct = default)
+        {
+            var open = await repo.ListOpenBreaksAsync(ct);
+            int collapsed = 0;
+            foreach (var group in open.GroupBy(BreakIdentity, StringComparer.OrdinalIgnoreCase))
+            {
+                foreach (var duplicate in group.OrderBy(b => b.DetectedUtc).Skip(1))
+                {
+                    await repo.ResolveBreakAsync(duplicate.Id, "duplicate of an existing open break (auto)", ct);
+                    collapsed++;
+                }
+            }
+            if (collapsed > 0) log?.Invoke($"collapsed {collapsed} duplicate reconciliation break(s)");
+            return collapsed;
         }
 
         /// <summary>Reclassify or resolve a break. Explaining a break is a recorded human judgement,

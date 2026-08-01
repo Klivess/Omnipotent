@@ -12,7 +12,9 @@ namespace Omnipotent.Services.OmniTrader.Venues
         Internal = 0,
         Kraken = 1,
         IG = 2,
-        Binance = 3
+        Binance = 3,
+        /// <summary>Trading 212 Invest/ISA — owned shares and ETFs, not derivatives.</summary>
+        Trading212 = 4
     }
 
     /// <summary>

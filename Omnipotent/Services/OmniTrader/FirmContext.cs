@@ -131,6 +131,11 @@ namespace Omnipotent.Services.OmniTrader
             await Watchlists.EnsureDefaultAsync(ct);
             await Ledger.RehydrateAsync(ct);
 
+            // Collapse repeats left by earlier versions before reconciling, so an operator inheriting
+            // a wall of identical rows gets one per real condition.
+            try { await Reconciliation.CollapseDuplicateBreaksAsync(ct); }
+            catch (Exception ex) { await parent.ServiceLogError(ex, "collapsing duplicate breaks failed"); }
+
             // Startup is one of the mandated reconciliation triggers.
             try { await Reconciliation.ReconcileAllAsync("startup", ct); }
             catch (Exception ex) { await parent.ServiceLogError(ex, "startup reconciliation failed"); }
@@ -176,6 +181,33 @@ namespace Omnipotent.Services.OmniTrader
 
             await RegisterIgAsync(TradingEnvironment.Demo, "OmniTrader.IG.Demo", ct);
             await RegisterIgAsync(TradingEnvironment.Live, "OmniTrader.IG.Live", ct);
+
+            await RegisterTrading212Async(TradingEnvironment.Demo, "OmniTrader.Trading212.Demo", ct);
+            await RegisterTrading212Async(TradingEnvironment.Live, "OmniTrader.Trading212.Live", ct);
+        }
+
+        /// <summary>Trading 212 Invest/ISA — owned shares. Demo and live take separate API keys, so a
+        /// practice key can never reach the real account.</summary>
+        private async Task RegisterTrading212Async(TradingEnvironment environment, string settingPrefix, CancellationToken ct)
+        {
+            try
+            {
+                string apiKey = await parent.GetStringOmniSetting($"{settingPrefix}.ApiKey", sensitive: true);
+                if (string.IsNullOrWhiteSpace(apiKey))
+                {
+                    await parent.ServiceLog($"Trading 212 {environment} key not configured — venue not registered.");
+                    return;
+                }
+
+                var adapter = new Trading212VenueAdapter(apiKey, environment, parent.MarketData);
+                Venues.Register(adapter);
+                bool connected = await adapter.ConnectAsync(ct);
+                await parent.ServiceLog($"Trading 212 {environment} venue registered ({(connected ? "authenticated" : "key rejected")}).");
+            }
+            catch (Exception ex)
+            {
+                await parent.ServiceLogError(ex, $"Trading 212 {environment} venue registration failed");
+            }
         }
 
         private async Task RegisterIgAsync(TradingEnvironment environment, string settingPrefix, CancellationToken ct)

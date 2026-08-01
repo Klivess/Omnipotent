@@ -8,6 +8,25 @@ using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.OmniTrader.Portfolio
 {
+    /// <summary>
+    /// One side of the book — real money or simulated. Every value figure the platform reports is
+    /// one of these, never a mixture, because a paper balance added to a real one is not a number
+    /// anybody can act on.
+    /// </summary>
+    public sealed class PortfolioTotals
+    {
+        public decimal Cash { get; set; }
+        public decimal InventoryValue { get; set; }
+        public decimal DerivativeEquity { get; set; }
+        public decimal DerivativeNotional { get; set; }
+        public decimal UnrealizedPnL { get; set; }
+        public decimal GrossExposure { get; set; }
+        public decimal NetExposure { get; set; }
+        public int Positions { get; set; }
+
+        public decimal TotalValue => Cash + InventoryValue + DerivativeEquity;
+    }
+
     /// <summary>The firm view. Owned inventory and derivative notional are reported separately and
     /// summed only where that is economically meaningful.</summary>
     public sealed class FirmPortfolioView
@@ -15,25 +34,32 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
         public required string ReportingCurrency { get; init; }
         public required DateTime AsOfUtc { get; init; }
 
-        /// <summary>Cash across all accounts, in the reporting currency.</summary>
-        public decimal Cash { get; set; }
-        /// <summary>Marked value of owned inventory (Kraken spot). This is an asset.</summary>
-        public decimal InventoryValue { get; set; }
-        /// <summary>IG account equity as the broker reports it (balance + open P&amp;L).</summary>
-        public decimal DerivativeEquity { get; set; }
-        /// <summary>Gross CFD notional. Deliberately NOT added to asset value — it is exposure, not
-        /// something the firm owns.</summary>
-        public decimal DerivativeNotional { get; set; }
+        /// <summary>Real money: live broker accounts only.</summary>
+        public PortfolioTotals Real { get; init; } = new();
+        /// <summary>The paper simulator and broker demo accounts. Never added to anything above.</summary>
+        public PortfolioTotals Simulated { get; init; } = new();
 
-        public decimal UnrealizedPnL { get; set; }
+        // The headline fields are the *real* ones. The internal paper trader holds no money, so
+        // counting it toward firm value would report wealth that does not exist.
+        public decimal Cash => Real.Cash;
+        public decimal InventoryValue => Real.InventoryValue;
+        public decimal DerivativeEquity => Real.DerivativeEquity;
+        public decimal DerivativeNotional => Real.DerivativeNotional;
+        public decimal UnrealizedPnL => Real.UnrealizedPnL;
+        public decimal GrossExposure => Real.GrossExposure;
+        public decimal NetExposure => Real.NetExposure;
+
         public decimal RealizedPnLToday { get; set; }
         public decimal CostsToday { get; set; }
+        public decimal SimulatedRealizedPnLToday { get; set; }
 
-        public decimal GrossExposure { get; set; }
-        public decimal NetExposure { get; set; }
-
-        /// <summary>Total firm value: cash + owned inventory + broker-reported derivative equity.</summary>
-        public decimal TotalValue => Cash + InventoryValue + DerivativeEquity;
+        /// <summary>Total firm value: cash + owned inventory + broker-reported derivative equity,
+        /// across live accounts only.</summary>
+        public decimal TotalValue => Real.TotalValue;
+        public decimal SimulatedTotalValue => Simulated.TotalValue;
+        /// <summary>True when nothing real is configured — the UI says "simulated only" rather than
+        /// presenting a £0 firm as a loss.</summary>
+        public bool HasRealAccounts { get; set; }
 
         public List<PortfolioLine> Lines { get; init; } = new();
         public Dictionary<string, decimal> ExposureByAssetClass { get; init; } = new(StringComparer.OrdinalIgnoreCase);
@@ -116,6 +142,7 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
 
                 decimal notionalNative = position.Notional;
                 decimal notionalReporting = notionalNative * rate;
+                var totals = IsRealMoney(position.Environment) ? view.Real : view.Simulated;
 
                 view.Lines.Add(new PortfolioLine
                 {
@@ -136,12 +163,13 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
                     Disagrees = position.Disagrees
                 });
 
-                view.UnrealizedPnL += position.UnrealizedPnL * rate;
-                view.GrossExposure += notionalReporting;
-                view.NetExposure += position.SignedNotional * rate;
+                totals.UnrealizedPnL += position.UnrealizedPnL * rate;
+                totals.GrossExposure += notionalReporting;
+                totals.NetExposure += position.SignedNotional * rate;
+                totals.Positions++;
 
-                if (position.Exposure == ExposureKind.Inventory) view.InventoryValue += position.SignedNotional * rate;
-                else view.DerivativeNotional += notionalReporting;
+                if (position.Exposure == ExposureKind.Inventory) totals.InventoryValue += position.SignedNotional * rate;
+                else totals.DerivativeNotional += notionalReporting;
 
                 Accumulate(view.ExposureByAssetClass, (instrument?.AssetClass ?? AssetClass.Unknown).ToString(), notionalReporting);
                 Accumulate(view.ExposureByCurrency, native, notionalReporting);
@@ -152,12 +180,14 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
                     view.Warnings.Add($"{position.InstrumentId}: internal {position.Quantity} vs venue {position.VenueQuantity}.");
             }
 
-            // Cash, converted but never overwritten in its native form.
+            // Cash, converted but never overwritten in its native form. The account id prefix carries
+            // the environment, so simulated cash lands on the simulated side.
             foreach (var (key, amount) in ledger.CashBalances)
             {
                 string currency = key.Contains('|') ? key[(key.IndexOf('|') + 1)..] : "USD";
+                string account = key.Contains('|') ? key[..key.IndexOf('|')] : key;
                 decimal rate = await GetRateAsync(currency, ct);
-                view.Cash += amount * rate;
+                (IsRealMoneyAccount(account) ? view.Real : view.Simulated).Cash += amount * rate;
                 if (amount != 0m)
                     view.Valuations.Add(new Valuation
                     {
@@ -178,18 +208,39 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
                 {
                     var account = await adapter.GetAccountAsync(ct);
                     decimal rate = await GetRateAsync(account.BaseCurrency, ct);
-                    view.DerivativeEquity += (account.Equity ?? account.Balance ?? 0m) * rate;
+                    (IsRealMoney(adapter.Environment) ? view.Real : view.Simulated).DerivativeEquity
+                        += (account.Equity ?? account.Balance ?? 0m) * rate;
                 }
                 catch (Exception ex) { view.Warnings.Add($"{adapter.Venue} account unavailable: {ex.Message}"); }
             }
 
-            var (realized, costs) = await ledgerRepo.SumSinceAsync(DateTime.UtcNow.Date, null, ct);
+            view.HasRealAccounts = venues.All.Any(a => IsRealMoney(a.Environment) && a.IsConfigured);
+
+            var (realized, costs) = await ledgerRepo.SumSinceAsync(DateTime.UtcNow.Date, null, RealEnvironments, ct);
             view.RealizedPnLToday = realized;
             view.CostsToday = costs;
+            var (simRealized, _) = await ledgerRepo.SumSinceAsync(DateTime.UtcNow.Date, null, SimulatedEnvironments, ct);
+            view.SimulatedRealizedPnLToday = simRealized;
 
             if (view.TotalValue > PeakEquity) PeakEquity = view.TotalValue;
             return view;
         }
+
+        /// <summary>
+        /// Only live broker accounts hold real money. The built-in paper trader and broker demo
+        /// accounts are simulations: useful for measuring a strategy, worthless as a statement of
+        /// what the firm is worth, and never summed into one.
+        /// </summary>
+        public static bool IsRealMoney(TradingEnvironment environment) => environment == TradingEnvironment.Live;
+
+        private static readonly string[] RealEnvironments = { nameof(TradingEnvironment.Live) };
+        private static readonly string[] SimulatedEnvironments =
+            { nameof(TradingEnvironment.Paper), nameof(TradingEnvironment.Demo), nameof(TradingEnvironment.Historical) };
+
+        /// <summary>Account ids are `{venue}-{environment}`, so the environment is recoverable without
+        /// a second lookup. An unparseable id is treated as simulated — the safe direction to fail.</summary>
+        private static bool IsRealMoneyAccount(string accountId)
+            => accountId.EndsWith($"-{nameof(TradingEnvironment.Live)}", StringComparison.OrdinalIgnoreCase);
 
         /// <summary>The compact state the risk engine measures proposals against.</summary>
         public async Task<RiskPortfolioState> BuildRiskStateAsync(CancellationToken ct = default)
