@@ -171,16 +171,30 @@ namespace Omnipotent.Services.OmniTrader.Instruments
                     Issue = "no data observed for this instrument in this process"
                 };
             }
-            var age = DateTime.UtcNow - seen.Ts;
+            var raw = DateTime.UtcNow - seen.Ts;
+
+            // A bar can be stamped ahead of the clock — providers stamp the *forming* bar with its
+            // close time, so a 4-hour candle arrives with a timestamp up to four hours in the future.
+            // Left signed, that produced a nonsensical "-171.3 min" on screen and, far worse, made
+            // `age > threshold` permanently false: nothing on this instrument could ever be judged
+            // stale, and the data-integrity layer had nothing to block on.
+            bool aheadOfClock = raw < TimeSpan.Zero;
+            var age = aheadOfClock ? TimeSpan.Zero : raw;
+
             var threshold = instrument?.FreshnessThreshold ?? TimeSpan.FromMinutes(15);
+            bool stale = age > threshold;
             return new DataFreshness
             {
                 InstrumentId = instrumentId,
                 LastUpdateUtc = seen.Ts,
                 Age = age,
-                Stale = age > threshold,
+                Stale = stale,
                 Source = seen.Source,
-                Issue = age > threshold ? $"last update {age.TotalMinutes:F1} min ago exceeds {threshold.TotalMinutes:F0} min threshold" : null
+                Issue = stale
+                    ? $"last update {age.TotalMinutes:F1} min ago exceeds {threshold.TotalMinutes:F0} min threshold"
+                    : aheadOfClock
+                        ? $"bar is stamped {(-raw).TotalMinutes:F0} min ahead of the clock — a forming bar, or a clock difference"
+                        : null
             };
         }
 

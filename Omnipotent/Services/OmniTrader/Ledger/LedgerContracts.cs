@@ -196,6 +196,14 @@ namespace Omnipotent.Services.OmniTrader.Ledger
         public int DustIgnored { get; set; }
         /// <summary>Re-detections of a condition that already has an open break.</summary>
         public int SuppressedDuplicates { get; set; }
+        /// <summary>Open breaks closed because the condition they described has gone away.</summary>
+        public int AutoResolved { get; set; }
+
+        /// <summary>
+        /// Which kinds of check actually completed. Only these may retire an existing break: a venue
+        /// that failed to answer must never have its breaks cleared on the strength of not looking.
+        /// </summary>
+        public HashSet<BreakKind> CheckedKinds { get; init; } = new();
 
         public int MaterialBreaks => Breaks.Count(b => b.Material);
     }

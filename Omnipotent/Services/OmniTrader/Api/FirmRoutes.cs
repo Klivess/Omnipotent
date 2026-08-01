@@ -455,8 +455,21 @@ namespace Omnipotent.Services.OmniTrader.Api
                         r.Checked,
                         Breaks = r.Breaks.Count,
                         r.MaterialBreaks,
+                        // What the run actually did, so "nothing to see" is a reported outcome
+                        // rather than an absence the operator has to take on trust.
+                        r.Adopted,
+                        r.DustIgnored,
+                        r.AutoResolved,
+                        r.SuppressedDuplicates,
                         r.Error
-                    })
+                    }),
+                    LastRun = runs.Count == 0 ? null : new
+                    {
+                        Adopted = runs.Sum(r => r.Adopted),
+                        DustIgnored = runs.Sum(r => r.DustIgnored),
+                        AutoResolved = runs.Sum(r => r.AutoResolved),
+                        Checked = runs.Sum(r => r.Checked)
+                    }
                 });
             });
 
@@ -1100,7 +1113,10 @@ namespace Omnipotent.Services.OmniTrader.Api
                         Channels = h.Channels.Select(c => new
                         {
                             c.Channel, c.Connected, c.LastOkUtc, c.LastErrorUtc, c.LastError,
-                            c.ConsecutiveFailures, c.QuotaRemaining, c.Degraded
+                            c.ConsecutiveFailures, c.QuotaRemaining, c.Degraded,
+                            // Up / Down / Unknown / Unsupported — "not yet used" and "not offered"
+                            // are not failures, and must not be rendered as any.
+                            State = c.State.ToString(), c.Probed, c.Unsupported
                         })
                     }),
                     DataFreshness = Firm.Instruments.AllFreshness().Take(50),

@@ -19,7 +19,9 @@ namespace Omnipotent.Services.OmniTrader.Venues
         private readonly IGRestClient client;
         private readonly ChannelHealth restHealth = new() { Channel = "ig-rest" };
         private readonly ChannelHealth sessionHealth = new() { Channel = "ig-session" };
-        private readonly ChannelHealth streamHealth = new() { Channel = "ig-lightstreamer" };
+        // Lightstreamer is not implemented, so this channel is *unsupported*, not broken. Reporting a
+        // feature the platform has never built as an outage is noise an operator can never clear.
+        private readonly ChannelHealth streamHealth = new() { Channel = "ig-lightstreamer", Unsupported = true };
         private readonly SemaphoreSlim instrumentLock = new(1, 1);
         private readonly Dictionary<string, VenueInstrumentDescriptor> instrumentCache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -81,9 +83,12 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         public async Task<bool> ConnectAsync(CancellationToken ct = default)
         {
+            // Reconnecting is the one action that can change a rejection's outcome, because it
+            // follows the operator fixing the credential. Give it a clean attempt.
+            client.Auth.Reset();
             try
             {
-                bool ok = await client.LoginAsync(force: !client.HasSession, ct: ct);
+                bool ok = await client.LoginAsync(force: true, ct: ct);
                 Mark(sessionHealth, ok, ok ? null : "login returned no tokens");
                 IsConfigured = ok;
                 return ok;

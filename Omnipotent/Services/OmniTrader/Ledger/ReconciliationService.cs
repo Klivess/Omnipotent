@@ -87,16 +87,28 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             // 3. Account balances.
             await ReconcileBalancesAsync(adapter, run, ct);
 
-            // A break describes a *condition*, not an occurrence. Re-detecting the same unresolved
-            // condition on the next sweep must not create a second row — otherwise a single
-            // unexplained difference becomes fifty identical rows by lunchtime and the operator
-            // stops reading any of them.
-            var alreadyOpen = (await repo.ListOpenBreaksAsync(ct))
-                .Select(BreakIdentity)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            // A break describes a *condition*, not an occurrence, and that cuts both ways.
+            //
+            // Re-detecting the same unresolved condition must not create a second row. And a
+            // condition that has stopped being true must close *itself* — a break that survives the
+            // thing it was describing is just a chore, and one left over from a rule the platform no
+            // longer even applies is worse than that: it blocks automation forever and teaches the
+            // operator that the whole screen is noise.
+            var detected = run.Breaks.Select(BreakIdentity).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var openHere = (await repo.ListOpenBreaksAsync(ct))
+                .Where(b => b.Venue == adapter.Venue && b.Environment == adapter.Environment)
+                .ToList();
 
-            int duplicates = run.Breaks.RemoveAll(b => !alreadyOpen.Add(BreakIdentity(b)));
+            int duplicates = run.Breaks.RemoveAll(b =>
+                openHere.Any(o => BreakIdentity(o).Equals(BreakIdentity(b), StringComparison.OrdinalIgnoreCase)));
             run.SuppressedDuplicates = duplicates;
+
+            foreach (var stale in openHere.Where(b => ShouldRetire(b, run.CheckedKinds, detected)))
+            {
+                await ResolveBreakAsync(stale.Id, "condition no longer present at the venue", "reconciliation", ct);
+                run.AutoResolved++;
+                log?.Invoke($"auto-resolved {stale.Kind} break on {stale.Subject}: no longer detected");
+            }
 
             run.FinishedUtc = DateTime.UtcNow;
             await repo.SaveRunAsync(run, ct);
@@ -165,6 +177,8 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             try { working = await adapter.GetWorkingOrdersAsync(ct); }
             catch { return; }
 
+            run.CheckedKinds.Add(BreakKind.Order);
+
             foreach (var snapshot in working)
             {
                 if (string.IsNullOrWhiteSpace(snapshot.VenueOrderId)) continue;
@@ -194,6 +208,8 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             IReadOnlyList<VenuePositionSnapshot> venuePositions;
             try { venuePositions = await adapter.GetPositionsAsync(ct); }
             catch (Exception ex) { run.Error = ex.Message; return; }
+
+            run.CheckedKinds.Add(BreakKind.Position);
 
             var venueByInstrument = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
             foreach (var p in venuePositions)
@@ -277,6 +293,8 @@ namespace Omnipotent.Services.OmniTrader.Ledger
             try { account = await adapter.GetAccountAsync(ct); }
             catch (Exception ex) { run.Error = ex.Message; return; }
 
+            run.CheckedKinds.Add(BreakKind.Balance);
+
             await accountRepo.RecordSnapshotAsync(account, ct);
             run.Checked++;
 
@@ -315,8 +333,21 @@ namespace Omnipotent.Services.OmniTrader.Ledger
         }
 
         /// <summary>What makes two breaks "the same condition" for deduplication.</summary>
-        private static string BreakIdentity(ReconciliationBreak b)
+        public static string BreakIdentity(ReconciliationBreak b)
             => $"{b.Venue}:{b.Environment}:{b.Kind}:{b.Subject}";
+
+        /// <summary>
+        /// Should an existing open break close itself?
+        ///
+        /// Yes when this run *looked* for its kind and did not find the condition — the difference
+        /// has gone away, whether because it settled, because someone fixed it, or because the
+        /// platform no longer treats it as a problem at all. No when the run could not check that
+        /// kind: not looking is not the same as finding nothing, and clearing a break on the
+        /// strength of a failed request is how you lose a real discrepancy.
+        /// </summary>
+        public static bool ShouldRetire(ReconciliationBreak open, IReadOnlyCollection<BreakKind> checkedKinds,
+            ICollection<string> detectedIdentities)
+            => checkedKinds.Contains(open.Kind) && !detectedIdentities.Contains(BreakIdentity(open));
 
         /// <summary>
         /// Collapse historical duplicates left by earlier runs: for each condition, keep the oldest

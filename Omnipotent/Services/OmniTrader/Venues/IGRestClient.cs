@@ -46,9 +46,17 @@ namespace Omnipotent.Services.OmniTrader.Venues
             BaseUrl = environment == TradingEnvironment.Live ? LiveBase : DemoBase;
         }
 
+        /// <summary>
+        /// Open while IG keeps rejecting these credentials. A wrong API key is not a transient fault,
+        /// so retrying it on every account poll only rate-limits us and floods the alert list.
+        /// </summary>
+        public AuthCircuitBreaker Auth { get; } = new();
+
         /// <summary>Create an authenticated session. Idempotent — returns immediately if one is live.</summary>
         public async Task<bool> LoginAsync(bool force = false, CancellationToken ct = default)
         {
+            if (Auth.IsOpen) throw new IGApiException(Auth.Reason, HttpStatusCode.Forbidden);
+
             await sessionLock.WaitAsync(ct);
             try
             {
@@ -63,8 +71,19 @@ namespace Omnipotent.Services.OmniTrader.Venues
                 if (!resp.IsSuccessStatusCode)
                 {
                     cst = securityToken = null;
-                    throw new IGApiException($"IG login failed ({(int)resp.StatusCode}): {ExtractErrorCode(text)}", resp.StatusCode);
+                    string detail = $"IG {Environment} login rejected ({(int)resp.StatusCode}): {ExtractErrorCode(text)}.";
+                    if (AuthCircuitBreaker.IsRejection(resp.StatusCode))
+                    {
+                        // `error.security.api-key-invalid` against the demo gateway almost always means
+                        // a live key: IG issues demo keys separately, on the demo platform.
+                        Auth.RecordRejection(Environment == TradingEnvironment.Demo
+                            ? detail + " IG demo needs its own API key, created while logged in to the demo platform."
+                            : detail);
+                    }
+                    throw new IGApiException(detail, resp.StatusCode);
                 }
+
+                Auth.RecordSuccess();
 
                 cst = FirstHeader(resp, "CST");
                 securityToken = FirstHeader(resp, "X-SECURITY-TOKEN");

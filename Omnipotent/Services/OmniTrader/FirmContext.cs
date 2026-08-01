@@ -195,35 +195,36 @@ namespace Omnipotent.Services.OmniTrader
         private readonly Dictionary<string, string> credentialSources = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
-        /// Resolve one credential from an environment-specific setting, falling back to a shared one.
+        /// Resolve one credential. The environment-specific setting is authoritative; the shared one
+        /// is only consulted for values that genuinely are shared.
         ///
-        /// The two brokers issue keys differently and the platform has to accommodate both rather
-        /// than imposing its own shape: IG allows only **one API key per account** (the demo
-        /// *username and password* are what differ), while Trading 212 issues a key that only works
-        /// in the environment it was generated in. Demanding a per-environment value for everything
-        /// meant an operator with a single IG key had to paste it into two settings and got silence
-        /// when they did not.
+        /// A previous version fell back across environments for API keys and it was wrong for both
+        /// brokers: IG's demo platform rejects a live key outright with
+        /// <c>error.security.api-key-invalid</c>, and a Trading 212 key only works in the environment
+        /// it was minted in. The fallback turned one working configuration into two venues failing
+        /// authentication several times a minute. A missing key now means the venue is simply not
+        /// registered — no red channel, no alert, no retry storm.
         /// </summary>
-        private async Task<(string Value, string Source)> ResolveCredentialAsync(string sharedKey, string environmentKey)
+        private async Task<(string Value, string Source)> ResolveCredentialAsync(string environmentKey, string? sharedKey = null)
         {
             string specific = await parent.GetStringOmniSetting(environmentKey, sensitive: true);
             if (!string.IsNullOrWhiteSpace(specific)) return (specific, environmentKey);
 
-            string shared = await parent.GetStringOmniSetting(sharedKey, sensitive: true);
-            return (shared ?? "", string.IsNullOrWhiteSpace(shared) ? "" : sharedKey);
+            if (string.IsNullOrWhiteSpace(sharedKey)) return ("", "");
+            string shared = await parent.GetStringOmniSetting(sharedKey!, sensitive: true);
+            return (shared ?? "", string.IsNullOrWhiteSpace(shared) ? "" : sharedKey!);
         }
 
         /// <summary>
         /// Trading 212 Invest/ISA — owned shares. A T212 key is bound to the environment it was
-        /// generated in (you switch the app to Practice mode to mint a demo key), so a shared key is
-        /// only a convenience for someone running one environment; using it for both will simply see
-        /// the other rejected, and the Systems page says so.
+        /// generated in: you switch the app to Practice mode to mint a demo key, and that key is
+        /// rejected by the live endpoint. There is deliberately no fallback between the two.
         /// </summary>
         private async Task RegisterTrading212Async(TradingEnvironment environment, string settingPrefix, CancellationToken ct)
         {
             try
             {
-                var (apiKey, source) = await ResolveCredentialAsync("OmniTrader.Trading212.ApiKey", $"{settingPrefix}.ApiKey");
+                var (apiKey, source) = await ResolveCredentialAsync($"{settingPrefix}.ApiKey");
                 if (string.IsNullOrWhiteSpace(apiKey))
                 {
                     await parent.ServiceLog($"Trading 212 {environment} key not configured — venue not registered.");
@@ -244,17 +245,23 @@ namespace Omnipotent.Services.OmniTrader
         }
 
         /// <summary>
-        /// IG CFD. IG issues one API key per account, so the key falls back to a shared setting; the
-        /// demo username and password are genuinely separate values that IG makes you create, so
-        /// those are per-environment first.
+        /// IG CFD. Demo and live are separate platforms with separate API keys *and* separate logins —
+        /// IG's demo gateway answers a live key with <c>error.security.api-key-invalid</c>. Live may
+        /// use the unprefixed settings as a convenience; demo must be configured explicitly.
         /// </summary>
         private async Task RegisterIgAsync(TradingEnvironment environment, string settingPrefix, CancellationToken ct)
         {
             try
             {
-                var (apiKey, keySource) = await ResolveCredentialAsync("OmniTrader.IG.ApiKey", $"{settingPrefix}.ApiKey");
-                var (identifier, _) = await ResolveCredentialAsync("OmniTrader.IG.Username", $"{settingPrefix}.Username");
-                var (password, _) = await ResolveCredentialAsync("OmniTrader.IG.Password", $"{settingPrefix}.Password");
+                // Live may use the unprefixed settings; demo must have its own of everything, because
+                // IG issues demo API keys on the demo platform and rejects a live key there.
+                string? sharedSuffix = environment == TradingEnvironment.Live ? "" : null;
+                var (apiKey, keySource) = await ResolveCredentialAsync($"{settingPrefix}.ApiKey",
+                    sharedSuffix == null ? null : "OmniTrader.IG.ApiKey");
+                var (identifier, _) = await ResolveCredentialAsync($"{settingPrefix}.Username",
+                    sharedSuffix == null ? null : "OmniTrader.IG.Username");
+                var (password, _) = await ResolveCredentialAsync($"{settingPrefix}.Password",
+                    sharedSuffix == null ? null : "OmniTrader.IG.Password");
                 if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(identifier) || string.IsNullOrWhiteSpace(password))
                 {
                     await parent.ServiceLog($"IG {environment} credentials not configured — venue not registered.");

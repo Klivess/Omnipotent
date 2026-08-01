@@ -941,22 +941,41 @@ earlier versions.
 
 ### Credentials: each broker issues them differently
 
-`FirmContext.ResolveCredentialAsync` reads the environment-specific setting first and falls back to a
-shared one. This exists because the two brokers genuinely differ, and forcing one shape on both left
-an operator pasting the same key into two settings — or, worse, getting silence when they didn't.
+**Both brokers scope their API keys per environment.** Demo and live are separate platforms with
+separate keys — IG's demo gateway answers a live key with `error.security.api-key-invalid`, and a
+Trading 212 key is rejected by the endpoint it was not minted for. There is deliberately **no
+fallback between environments**: an earlier version had one, and it turned a single working
+configuration into two venues failing authentication several times a minute.
 
 | Setting | Used by | Required? |
 |---|---|---|
 | `OmniTrader.Kraken.ApiKey` · `.ApiSecret` | Kraken live | Yes. Exclude withdrawal permission. |
-| `OmniTrader.IG.ApiKey` | **Both IG environments** | Yes — IG allows only **one API key per account** |
-| `OmniTrader.IG.Username` · `.Password` | IG live | Yes for live |
-| `OmniTrader.IG.Demo.Username` · `.Password` | IG demo | Yes for demo — IG makes you create *separate demo details*: log in live, switch to the demo account, then My Account → Settings → Web API |
-| `OmniTrader.IG.Demo.ApiKey` · `.Live.ApiKey` | Override | Optional; only if you somehow hold two keys |
-| `OmniTrader.Trading212.ApiKey` | T212 live (and demo, if nothing more specific) | Shared convenience |
-| `OmniTrader.Trading212.Demo.ApiKey` · `.Live.ApiKey` | Per environment | **A T212 key only works in the environment it was generated in** — switch the app to Practice mode *before* generating the demo key |
+| `OmniTrader.IG.ApiKey` · `.Username` · `.Password` | IG live | Yes for live (shorthand for `.Live.*`) |
+| `OmniTrader.IG.Demo.ApiKey` · `.Username` · `.Password` | IG demo | Yes for demo — generate the key **on the demo platform**: log in live, switch to the demo account, then My Account → Settings → Web API |
+| `OmniTrader.Trading212.Live.ApiKey` | T212 live | Generated from Settings → API in **Invest/ISA** mode |
+| `OmniTrader.Trading212.Demo.ApiKey` | T212 demo | Generated **after switching the app to Practice mode** |
 
-The Systems page renders this table live, including which setting actually supplied each connection's
-key, so a shared key doing the work of two is visible rather than inferred.
+A venue with no key is simply not registered: no red channel, no alert, no retry storm.
+
+### Rejected credentials stop being retried
+
+`AuthCircuitBreaker` opens after three consecutive 401/403s and stays open for fifteen minutes or
+until an explicit **Reconnect venues**. Without it, one wrong key produced a failed login per
+request forever — the command centre polls the firm view every fifteen seconds, each poll asks every
+derivative venue for its account, and each of those attempted a fresh login. One mis-scoped key
+reached 57 failed logins in eight minutes. Only authentication failures open it; a timeout or a 500
+is transient and keeps retrying.
+
+### Channel health is four states, not two
+
+`ChannelState` is `Unknown · Up · Down · Unsupported`. A channel nobody has called has not failed,
+and a feature the platform never built (IG Lightstreamer) is not an outage. Both previously rendered
+as red rows that no action could clear, and `OrderPathHealthy` — which required every order-carrying
+channel to be positively connected — reported Kraken's order path as broken purely because nothing
+had yet called its directory endpoint. It now fails only on a channel that has actually errored.
+
+The Systems page renders all of this live: every (venue, environment) pair with its required
+settings, which one supplied the key, and each channel's state.
 
 ---
 

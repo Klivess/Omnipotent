@@ -37,6 +37,10 @@ namespace Omnipotent.Services.OmniTrader.Venues
         private string? accountCurrency;
         private string? accountNumber;
 
+        /// <summary>Open while T212 keeps rejecting this key — usually a practice key pointed at the
+        /// live endpoint, or the reverse. Retrying cannot fix either.</summary>
+        public AuthCircuitBreaker Auth { get; } = new();
+
         public VenueId Venue => VenueId.Trading212;
         public TradingEnvironment Environment { get; }
         public bool IsConfigured { get; private set; }
@@ -91,6 +95,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
         public async Task<bool> ConnectAsync(CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(apiKey)) { IsConfigured = false; return false; }
+            Auth.Reset();
             try
             {
                 var info = await GetAsync("/equity/account/info", ct);
@@ -308,9 +313,17 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         private HttpRequestMessage Build(HttpMethod method, string path)
         {
+            if (Auth.IsOpen) throw new Trading212ApiException(Auth.Reason, HttpStatusCode.Forbidden);
             var request = new HttpRequestMessage(method, baseUrl + path);
             request.Headers.TryAddWithoutValidation("Authorization", apiKey);
             return request;
+        }
+
+        /// <summary>Record what the response means for the credential before surfacing it.</summary>
+        private void NoteOutcome(HttpResponseMessage response, string described)
+        {
+            if (response.IsSuccessStatusCode) { Auth.RecordSuccess(); return; }
+            if (AuthCircuitBreaker.IsRejection(response.StatusCode)) Auth.RecordRejection(described);
         }
 
         private async Task<JObject?> GetAsync(string path, CancellationToken ct)
@@ -318,6 +331,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
             using var request = Build(HttpMethod.Get, path);
             using var response = await http.SendAsync(request, ct);
             string text = await response.Content.ReadAsStringAsync(ct);
+            NoteOutcome(response, Describe(response.StatusCode, text));
             if (!response.IsSuccessStatusCode)
             {
                 MarkFailed("t212-rest", Describe(response.StatusCode, text));
@@ -332,6 +346,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
             using var request = Build(HttpMethod.Get, path);
             using var response = await http.SendAsync(request, ct);
             string text = await response.Content.ReadAsStringAsync(ct);
+            NoteOutcome(response, Describe(response.StatusCode, text));
             if (!response.IsSuccessStatusCode)
             {
                 MarkFailed("t212-rest", Describe(response.StatusCode, text));
@@ -357,7 +372,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
             string detail = body.Length > 300 ? body[..300] : body;
             return status switch
             {
-                HttpStatusCode.Unauthorized => "Trading 212 rejected the API key (401). Check the key and that it is enabled for this environment.",
+                HttpStatusCode.Unauthorized => "Trading 212 rejected the API key (401). A key only works in the environment it was generated in — switch the app to Practice mode before generating a demo key, and use an Invest/ISA key for live.",
                 HttpStatusCode.Forbidden => $"Trading 212 refused the request (403) — the API key is missing a required scope. {detail}",
                 HttpStatusCode.TooManyRequests => "Trading 212 rate limit hit (429). The adapter backs off rather than retrying immediately.",
                 _ => $"Trading 212 request failed ({(int)status}): {detail}"

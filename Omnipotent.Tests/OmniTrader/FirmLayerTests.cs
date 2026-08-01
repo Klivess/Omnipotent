@@ -469,6 +469,130 @@ namespace Omnipotent.Tests.OmniTrader
             Assert.Equal(85m, daily[2].Cumulative);
         }
 
+        // ── a channel nobody called is not a channel that failed ──────────────────
+
+        [Fact]
+        public void AnUnprobedChannelIsUnknownRatherThanDown()
+        {
+            var never = new ChannelHealth { Channel = "kraken-rest" };
+            Assert.Equal(ChannelState.Unknown, never.State);
+            Assert.False(never.Probed);
+            Assert.False(never.Degraded);
+
+            never.Connected = true;
+            never.LastOkUtc = DateTime.UtcNow;
+            Assert.Equal(ChannelState.Up, never.State);
+
+            never.Connected = false;
+            never.LastErrorUtc = DateTime.UtcNow;
+            Assert.Equal(ChannelState.Down, never.State);
+            Assert.True(never.Degraded);
+        }
+
+        [Fact]
+        public void AnUnsupportedChannelIsNeverAnOutage()
+        {
+            // IG's Lightstreamer is not implemented. Reporting a feature the platform never built as
+            // "down" is noise an operator can do nothing about.
+            var stream = new ChannelHealth { Channel = "ig-lightstreamer", Unsupported = true };
+            Assert.Equal(ChannelState.Unsupported, stream.State);
+            Assert.False(stream.Degraded);
+        }
+
+        [Fact]
+        public void TheOrderPathIsHealthyUntilSomethingActuallyFails()
+        {
+            var snapshot = new VenueHealthSnapshot
+            {
+                Venue = VenueId.Kraken,
+                Environment = TradingEnvironment.Live,
+                Configured = true,
+                Channels =
+                {
+                    new ChannelHealth { Channel = "kraken-rest" },                                  // never called
+                    new ChannelHealth { Channel = "kraken-private-rest", Connected = true, LastOkUtc = DateTime.UtcNow }
+                }
+            };
+
+            // Nothing has failed — an endpoint simply has not been exercised yet. Reporting an
+            // outage here is an outage invented from an absence of activity.
+            Assert.True(snapshot.OrderPathHealthy);
+
+            snapshot.Channels[0].LastErrorUtc = DateTime.UtcNow;
+            Assert.False(snapshot.OrderPathHealthy);
+        }
+
+        // ── rejected credentials stop being retried ───────────────────────────────
+
+        [Fact]
+        public void RepeatedCredentialRejectionsOpenTheBreaker()
+        {
+            var breaker = new AuthCircuitBreaker { RejectionsBeforeOpening = 3 };
+
+            breaker.RecordRejection("api-key-invalid");
+            breaker.RecordRejection("api-key-invalid");
+            Assert.False(breaker.IsOpen);
+
+            breaker.RecordRejection("api-key-invalid");
+            Assert.True(breaker.IsOpen);
+            Assert.Contains("Reconnect venues", breaker.Reason);
+
+            // Fixing the key and reconnecting is the only thing that can change the outcome.
+            breaker.Reset();
+            Assert.False(breaker.IsOpen);
+        }
+
+        [Fact]
+        public void OnlyAuthenticationFailuresOpenTheBreaker()
+        {
+            // A timeout or a server error is transient; taking the venue offline for those would
+            // turn a blip into an outage.
+            Assert.True(AuthCircuitBreaker.IsRejection(System.Net.HttpStatusCode.Unauthorized));
+            Assert.True(AuthCircuitBreaker.IsRejection(System.Net.HttpStatusCode.Forbidden));
+            Assert.False(AuthCircuitBreaker.IsRejection(System.Net.HttpStatusCode.InternalServerError));
+            Assert.False(AuthCircuitBreaker.IsRejection(System.Net.HttpStatusCode.TooManyRequests));
+            Assert.False(AuthCircuitBreaker.IsRejection(System.Net.HttpStatusCode.RequestTimeout));
+        }
+
+        [Fact]
+        public void ASuccessClearsTheRejectionCount()
+        {
+            var breaker = new AuthCircuitBreaker { RejectionsBeforeOpening = 3 };
+            breaker.RecordRejection("bad");
+            breaker.RecordRejection("bad");
+            breaker.RecordSuccess();
+            breaker.RecordRejection("bad");
+            Assert.False(breaker.IsOpen);
+        }
+
+        // ── breaks close themselves ───────────────────────────────────────────────
+
+        [Fact]
+        public void ABreakClosesItselfOnceTheConditionIsGone()
+        {
+            var stale = Break(BreakClassification.ExternalManualActivity);
+            var checkedKinds = new[] { BreakKind.Position };
+
+            // The sweep looked at positions and did not find this difference: it has gone away, so
+            // the operator should never be asked to explain it.
+            Assert.True(ReconciliationService.ShouldRetire(stale, checkedKinds, new HashSet<string>()));
+
+            // Still there — it stays open.
+            var stillDetected = new HashSet<string> { ReconciliationService.BreakIdentity(stale) };
+            Assert.False(ReconciliationService.ShouldRetire(stale, checkedKinds, stillDetected));
+        }
+
+        [Fact]
+        public void ABreakSurvivesWhenTheVenueCouldNotBeChecked()
+        {
+            var positionBreak = Break(BreakClassification.Unexplained);
+
+            // The venue failed to answer, so positions were never evaluated. Not looking is not the
+            // same as finding nothing — clearing it here would silently drop a real discrepancy.
+            Assert.False(ReconciliationService.ShouldRetire(positionBreak, Array.Empty<BreakKind>(), new HashSet<string>()));
+            Assert.False(ReconciliationService.ShouldRetire(positionBreak, new[] { BreakKind.Balance }, new HashSet<string>()));
+        }
+
         // ── venues, feeds and money that is not real ──────────────────────────────
 
         [Fact]
