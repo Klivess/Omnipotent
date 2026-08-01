@@ -28,10 +28,30 @@ namespace Omnipotent.Services.OmniTrader
         public BacktestJobQueue BacktestQueue { get; private set; } = null!;
 
         private OmniTraderRoutes routes = null!;
+        private FirmRoutes firmRoutes = null!;
         private KrakenOrderRouter? krakenRouter;
 
+        /// <summary>The trading operating system layered over the strategy engine: venues, instruments,
+        /// risk, order flow, ledger, reconciliation, journal, research and operations.</summary>
+        public FirmContext Firm { get; private set; } = null!;
+
         public bool IsKrakenConfigured => krakenRouter != null;
+        public KrakenOrderRouter? KrakenRouter => krakenRouter;
         public string GetDbPath() => Db?.DbPath ?? "(uninitialised)";
+
+        /// <summary>Route a message to Klives on Discord. Used by the alert service for High and
+        /// Critical severities; failures are swallowed because the alert is already durable.</summary>
+        public async Task PushToDiscordAsync(string message)
+        {
+            try
+            {
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", message);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to push OmniTrader alert to Discord");
+            }
+        }
 
         public OmniTrader()
         {
@@ -82,9 +102,26 @@ namespace Omnipotent.Services.OmniTrader
                 routes = new OmniTraderRoutes(this);
                 await routes.RegisterAsync();
 
+                // The firm layer comes up after the engine's stores and market data exist, and before
+                // sessions are recovered — a recovered deployment must find risk and reconciliation
+                // already in place rather than trading into an unguarded platform.
+                Firm = new FirmContext(this);
+                firmRoutes = new FirmRoutes(this);
+                await firmRoutes.RegisterAsync();
+                try
+                {
+                    await Firm.StartAsync();
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Firm layer failed to start — trading authority is unavailable");
+                }
+
                 await SessionManager.RecoverAsync();
 
-                await ServiceLog($"OmniTrader started. DB={Db.DbPath}. Strategies={StrategyRegistry.All.Count}. Kraken={(IsKrakenConfigured ? "configured" : "not configured")}.");
+                await ServiceLog($"OmniTrader started. DB={Db.DbPath}. Strategies={StrategyRegistry.All.Count}. "
+                    + $"Kraken={(IsKrakenConfigured ? "configured" : "not configured")}. "
+                    + $"Venues={Firm?.Venues.All.Count ?? 0}. Instruments={Firm?.Instruments.Count ?? 0}.");
             }
             catch (Exception ex)
             {

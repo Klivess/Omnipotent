@@ -127,6 +127,13 @@ namespace Omnipotent.Services.OmniTrader.Execution
             }
         }
 
+        /// <summary>
+        /// Signed call to any Kraken private endpoint. Exposed so the venue adapter can read account
+        /// state (Balance, OpenOrders, TradeBalance) without duplicating the HMAC signing scheme.
+        /// </summary>
+        public Task<JObject> QueryPrivateAsync(string path, Dictionary<string, string>? parameters = null, CancellationToken ct = default)
+            => SendPrivateAsync(path, parameters == null ? new Dictionary<string, string>() : new Dictionary<string, string>(parameters), ct);
+
         public async Task<JObject?> QueryOrdersAsync(IEnumerable<string> exchangeOrderIds, CancellationToken ct = default)
         {
             var parameters = new Dictionary<string, string>

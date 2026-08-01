@@ -1,12 +1,19 @@
 # OmniTrader
 
-OmniTrader is the algorithmic-trading service inside Omnipotent. It is a **modular strategy engine** that runs the *same* strategy code across three execution modes — **backtest**, **paper**, and **live** (real money on Kraken) — over **any symbol(s)**, single-asset or multi-asset.
+OmniTrader is the trading service inside Omnipotent. It has **two layers**:
 
-The guiding principle: **the engine knows nothing about any specific strategy.** A strategy declares what it trades and reacts to bars; the engine handles data, execution, accounting, risk, margin, and persistence generically. There are no `if (strategy is X)` branches in the core.
+- **The strategy engine** (§1–§18) — a modular engine that runs the *same* strategy code across **backtest**, **paper** and **live**, over any symbol(s), single-asset or multi-asset. It knows nothing about any specific strategy.
+- **The firm layer** (§19–§29) — the trading *operating system* on top: venue adapters (Kraken spot + IG CFD), a canonical instrument master, a mandatory risk decision before every order, an audited order lifecycle, an immutable ledger reconciled against broker truth, a journal, alerting and operations.
+
+The engine answers *"what should we trade?"*. The firm layer answers *"is the firm allowed to, did it actually happen, and can we prove it?"*
+
+> **Design principle that shapes the firm layer:** broker-reported orders and fills determine external reality; the internal ledger provides attribution, history and reconciliation. Where the two disagree, the platform raises a classified break rather than quietly adopting either side.
 
 ---
 
 ## Table of contents
+
+**Strategy engine**
 
 1. [Mental model](#1-mental-model)
 2. [Directory map](#2-directory-map)
@@ -26,6 +33,20 @@ The guiding principle: **the engine knows nothing about any specific strategy.**
 16. [Indicators](#16-indicators)
 17. [Testing](#17-testing)
 18. [Gotchas & conventions](#18-gotchas--conventions)
+
+**Firm layer**
+
+19. [Firm layer overview](#19-firm-layer-overview)
+20. [Venues & environments](#20-venues--environments)
+21. [Instrument master](#21-instrument-master)
+22. [Risk service](#22-risk-service)
+23. [Order flow](#23-order-flow)
+24. [Ledger & reconciliation](#24-ledger--reconciliation)
+25. [Portfolio & valuation](#25-portfolio--valuation)
+26. [Journal, research & performance](#26-journal-research--performance)
+27. [Operations, alerts & health](#27-operations-alerts--health)
+28. [Firm HTTP API](#28-firm-http-api)
+29. [The UI](#29-the-ui)
 
 ---
 
@@ -474,3 +495,472 @@ Existing coverage includes the TCN network (learnability/serialization/determini
 - **Backtest leakage** — the TCN strategy trains only on a warmup prefix and never loads a disk cache in backtest mode; follow that pattern for any learned model.
 - **Configs are JSON-persisted** — new config fields need no DB migration; old rows deserialize with defaults.
 - **Determinism** — seed RNGs; backtests must reproduce.
+
+---
+
+# The firm layer
+
+## 19. Firm layer overview
+
+Everything from here on is the *trading operating system* that sits on top of the strategy engine. It
+is organised by **operating function**, not by broker: a venue is an execution endpoint behind an
+adapter, and every higher-level component works on normalized internal records.
+
+```
+     Markets ── Strategies ── Research          (what to trade, and does it work)
+        │            │            │
+        ▼            ▼            ▼
+   ┌──────────────── TradeProposal ────────────────┐
+   │  instrument · venue · environment · authority │
+   └───────────────────┬───────────────────────────┘
+                       ▼
+                 ╔═══════════╗   7 layers, hard + soft controls,
+                 ║ RiskEngine║   evaluates the portfolio AFTER the trade
+                 ╚═════╤═════╝
+              RiskDecision (persisted, rule-level)
+                       ▼
+                ┌────────────┐   idempotency key · state machine
+                │OrderService│   approvals · Unknown never retried
+                └─────┬──────┘
+                      ▼
+        IVenueAdapter: Kraken (spot) · IG (CFD) · Internal (paper)
+                      │ broker truth
+                      ▼
+        FirmLedger ⇄ ReconciliationService ⇄ Portfolio · Journal · Performance
+                      │
+                 AlertService · HealthMonitor · AuditRepository
+```
+
+| Folder | What's in it |
+|---|---|
+| [`Venues/`](Venues) | `IVenueAdapter`, `VenueRegistry`, `VenueContracts` (capabilities, environments, health), `KrakenVenueAdapter`, `IGVenueAdapter` + `IGRestClient`, `InternalPaperVenueAdapter`. |
+| [`Instruments/`](Instruments) | `Instrument`/`VenueMapping` (canonical identity + dealing rules), `InstrumentMaster` (folding, resolution, freshness). |
+| [`Risk/`](Risk) | `RiskContracts` (proposal, decision, limits), `RiskEngine` (the 7 layers), `EmergencyControls` (safe mode + kill switches). |
+| [`OrderFlow/`](OrderFlow) | `FirmOrder` + `OrderStateMachine`, `OrderService` (the only path to a venue). |
+| [`Ledger/`](Ledger) | `LedgerContracts`, `FirmLedger` (immutable entries), `ReconciliationService` (classified breaks). |
+| [`Portfolio/`](Portfolio) | `PortfolioService` — firm view, exposure, FX valuation, risk state. |
+| [`Journal/`](Journal) | `JournalService` + `JournalRecord` — the automatic decision record. |
+| [`Research/`](Research) | `ExperimentRegistry` — experiments, strategy versions, the promotion gate. |
+| [`Performance/`](Performance) | `PerformanceService` — attribution, execution quality, behaviour analysis. |
+| [`Analytics/`](Analytics) | `MarketAnalytics` (regime/momentum/breakout/alignment/liquidity/breadth), `WatchlistService`. |
+| [`Ops/`](Ops) | `AlertService` (severity-routed, deduped, Discord), `HealthMonitor`, `OpsContracts`. |
+| [`FirmContext.cs`](FirmContext.cs) | Wires it all together and owns the background reconciliation/health/journal loops. |
+| [`Api/FirmRoutes.cs`](Api/FirmRoutes.cs) | The `/api/omnitrader/firm/*` surface. |
+
+`FirmContext` starts **after** the engine's stores and market data exist and **before** deployments
+are recovered — a recovered deployment must find risk and reconciliation already in place.
+
+Schema migration **v3** ([`OmniTraderSchema.cs`](Persistence/Schema/OmniTraderSchema.cs)) adds the
+firm tables: `firm_accounts`, `instruments`, `trade_proposals`, `risk_decisions`, `firm_orders`,
+`ledger_entries`, `reconciliation_runs`/`_breaks`, `journal_records`, `alerts`, `audit_events`,
+`experiments`, `strategy_versions`, `watchlists`, `firm_settings`, `account_snapshots`. Rich records
+go in a `json` column with the query-relevant fields lifted into indexed columns — the same convention
+the engine's `config_json` already uses, so adding a contract field needs no migration.
+
+---
+
+## 20. Venues and environments
+
+A venue is an external counterparty behind an adapter. The internal paper simulator is itself a venue
+(`VenueId.Internal`) so paper fills exercise the same order, ledger and reconciliation code path as
+real ones — and can never be confused with broker truth.
+
+| Venue | Product | Exposure | Shorting | Leverage | Demo |
+|---|---|---|---|---|---|
+| **Kraken** | Crypto spot | `Inventory` (owned) | no | no (1x) | no — use internal paper |
+| **IG** | CFDs | `Derivative` (notional) | yes | yes, per-instrument margin factor | yes, separate adapter |
+| **Internal** | Paper simulator | `Inventory` | yes | yes | n/a |
+
+**`VenueCapabilities`** is the contract everything else reads. Unsupported features are not simulated
+— they are disabled with a stated reason in `Limitations`, which the order ticket renders next to the
+disabled control and the risk engine quotes verbatim when it blocks an order.
+
+### Environments
+
+`TradingEnvironment` = `Historical | Paper | Demo | Live`. The registry keys adapters by
+**(venue, environment)**, so IG demo and IG live are genuinely distinct entries with separate
+credentials, base URLs, accounts, ledgers and audit scope. `ResolveUnambiguous` deliberately returns
+`null` when both are registered — the caller must be explicit, which is what stops a demo instruction
+reaching a live account.
+
+`ExecutionAuthority` is the progressive-authority ladder:
+`Observe → Paper → Demo → ApprovalRequired → Automated`. Live accounts are created at `Observe`;
+nothing gains real-money authority implicitly.
+
+### IG credentials
+
+Read from Omni settings, per environment, and never returned by the API:
+
+```
+OmniTrader.IG.Demo.ApiKey / .Username / .Password
+OmniTrader.IG.Live.ApiKey / .Username / .Password
+```
+
+`IGRestClient` owns the session (`CST` + `X-SECURITY-TOKEN`), refreshes it once on a 401, and captures
+IG's historical-price allowance so quota pressure is visible on the Systems page. `IGVenueAdapter`
+resolves **every** submission through `/confirms/{dealReference}` — a deal reference is not an
+accepted deal.
+
+> **Known limitation, stated rather than faked:** IG's Lightstreamer streaming is not implemented.
+> Prices and account state are polled over REST. The `ig-lightstreamer` channel reports itself as down
+> with that reason, and `Capabilities.SupportsStreamingPrices` is `false` with an explanation —
+> nothing pretends the feed is live.
+
+---
+
+## 21. Instrument master
+
+Every instrument gets an internal identity (`crypto:BTC/USD`, `index:UK100/GBP`) independent of any
+broker symbol. Strategies and analytics reference only that; venue symbols live inside adapters.
+
+```csharp
+Instrument {
+    Id, DisplayName, AssetClass, BaseAsset, QuoteCurrency, ContractMultiplier, Exposure
+    List<VenueMapping> Venues   // per venue: symbol, tick size, qty step, min/max size,
+                                //            margin factor, tradeable, status, hours
+    FreshnessThreshold          // how old a price may be before automated actions are blocked
+}
+```
+
+`InstrumentMaster.RefreshFromVenuesAsync()` folds each venue's directory into these records.
+Stablecoin quotes collapse onto `USD` for *identity* while the venue mapping keeps the real quote
+asset, so orders are still sized in the right currency. `VenueMapping.RoundQuantity` always rounds
+**down**, so rounding can never create size the caller did not ask for.
+
+**Freshness is tracked centrally.** `NoteDataUpdate` records when data was last observed;
+`GetFreshness` returns a verdict the risk engine's data-integrity layer blocks on and the UI
+underlines. An instrument never seen in this process is `Stale = true`, not silently fresh.
+
+---
+
+## 22. Risk service
+
+Mandatory. Every proposal — strategy or manual, paper or live — passes through `RiskEngine.Evaluate`,
+and `OrderService` refuses to submit anything without an approved decision id.
+
+The engine is **pure**: proposal + instrument + capabilities + freshness + portfolio state +
+operational state produce a decision. That makes every rule unit-testable and leaves the engine unable
+to rewrite strategy logic.
+
+### The seven layers
+
+| Layer | Checks |
+|---|---|
+| **DataIntegrity** | instrument known, decision-data age, feed freshness, usable price, proposal not expired |
+| **OrderValidity** | positive qty, order type supported, limit/stop present, protection supported, stop and target on the correct side of entry, venue mapping exists, market tradeable, min/max size, quantity precision |
+| **TradeRisk** | hard and soft notional caps, requested loss implied by the stop, missing protection (soft), limit distance from mark |
+| **StrategyRisk** | authority permits execution, strategy daily loss, concurrent position count |
+| **VenueRisk** | spot sell within free inventory (quoting the venue's own "cannot short" reason), spot buy within available cash, CFD margin within available funds |
+| **PortfolioRisk** | gross, net, per-instrument concentration, per-venue exposure, firm daily loss, drawdown — all measured on the **portfolio that would exist after** the trade |
+| **OperationalRisk** | safe mode, unknown orders outstanding, unreconciled breaks, repeated rejections, venue order path healthy |
+
+Every layer emits a rule result — passes included — so a rejection is explainable and a decision record
+proves which controls ran.
+
+**Verdicts:** `Approved`, `RequiresApproval` (a soft control fired, or the authority is
+`ApprovalRequired`), `Rejected` (any hard control failed).
+
+### Emergency controls
+
+`EmergencyControls` owns **safe mode** (firm-wide stop on new automated proposals) and scoped
+**kill switches** (`Firm | Venue | Account | Strategy`). `EvaluateAutomaticTriggers` trips safe mode on
+daily loss, drawdown, unknown orders, unresolved breaks or repeated rejections.
+
+It deliberately **does not close positions**. Killing automation and unwinding a book are different
+decisions with different blast radii; exposure reduction is a separate, preview-then-confirm action
+(section 28).
+
+---
+
+## 23. Order flow
+
+```
+Proposed → AwaitingApproval → RiskApproved → Submitting → Acknowledged → Working
+         ↘ RiskRejected                    ↘ Rejected   ↘ PartiallyFilled → Filled
+                                           ↘ Unknown ──(reconciliation only)──┘
+```
+
+`OrderStateMachine` enumerates the legal transitions; anything else is refused and logged. Three
+invariants hold the whole thing together:
+
+1. **No order bypasses risk.** `Proposed → Submitting` is not a legal transition. Submission requires
+   an approved `RiskDecisionId`.
+2. **Idempotency is structural.** `OrderService.BuildClientReference` hashes the proposal's identity
+   (not a clock or an RNG), so resubmitting the same proposal yields the same key — and
+   `firm_orders.client_reference` is `UNIQUE`, making a duplicate broker order impossible rather than
+   merely unlikely. The key is 24 characters of `[A-Za-z0-9]`, which fits IG's 30-character
+   deal-reference rule and doubles as Kraken's `cl_ord_id`.
+3. **`Unknown` is never retried.** A submission whose outcome cannot be proven parks in `Unknown`,
+   trips safe mode, raises a Critical alert, and can only leave via reconciliation proving what the
+   broker actually did. Absence of a confirmation is *not* proof of rejection.
+
+Fills are booked to the ledger **only as increments** (`newlyFilled = venueFilled - alreadyBooked`), so
+replaying a reconciliation pass cannot double-count.
+
+---
+
+## 24. Ledger and reconciliation
+
+`FirmLedger` appends **immutable** `LedgerEntry` records — cash, inventory, exposure, cost, realized
+P&L, adjustment. A mistake is corrected by posting an `Adjustment` that references the original; the
+original is never overwritten, so the audit trail survives every correction.
+
+Each fill books up to four entries: the cash leg (spot only — a CFD deal posts margin, not cash), the
+quantity change, the cost with its `CostKind` **and `CostQuality`** (`Observed | Estimated |
+Unavailable`), and realized P&L on whatever portion closed. Performance reports surface that quality
+split, because an estimated cost presented as observed is a lie about the P&L.
+
+`RehydrateAsync` rebuilds the in-memory book from the entry log at startup, so a restart never invents
+or loses a position.
+
+### Reconciliation
+
+Runs at **startup, after reconnect, after ambiguous outcomes, after fills, and every 5 minutes**.
+Orders are reconciled before positions, because an unbooked fill explains most position differences
+and resolving it first avoids raising breaks that are pure timing.
+
+Every difference becomes a classified `ReconciliationBreak`:
+
+| Classification | Meaning | Material? |
+|---|---|---|
+| `Timing` | a real event not yet booked — expected to clear | no |
+| `MissingEvent` | the venue reports something we never received | yes |
+| `MappingError` | our symbol or account mapping is wrong | yes |
+| `ExternalManualActivity` | someone traded this account outside the platform | yes |
+| `Unexplained` | needs a human | yes |
+
+Material breaks block new automated exposure and trip safe mode. Resolving one is a recorded human
+judgement, not an edit to the ledger.
+
+---
+
+## 25. Portfolio and valuation
+
+`PortfolioService.BuildAsync()` produces the firm view under two rules:
+
+- **Native values are never overwritten.** Conversion into the reporting currency is recorded
+  alongside the native amount with its rate and source (`Valuation`).
+- **CFD notional is never added to owned inventory as though both were assets.** `TotalValue` is
+  `Cash + InventoryValue + DerivativeEquity` (the broker's own equity figure); `DerivativeNotional` is
+  reported separately as exposure.
+
+`BuildRiskStateAsync()` compresses the same picture into what the risk engine measures against —
+including free inventory per asset (quantity minus reserved) and available funds. An unreachable venue
+contributes no free inventory, which fails safe.
+
+FX is derived from the venues' own crypto pairs (a BTC cross) rather than requiring another data
+provider; an unresolvable rate returns 1 and records its source as `identity` rather than silently
+distorting the total.
+
+---
+
+## 26. Journal, research and performance
+
+**Journal** — a `JournalRecord` is written automatically when an order reaches a terminal state, and
+carries the whole decision trail: signal time, data snapshot, risk verdict and rule failures, approval
+and its delay, intended-versus-actual size and price, slippage, protection, fees, realized P&L,
+maximum favourable and adverse excursion (computed from candles, so a restart cannot lose it), holding
+period, and every manual intervention with the state either side of it.
+
+**Research** — `ExperimentRegistry` records a hypothesis *before* the test, attaches backtest jobs and
+folds their headline metrics in, and owns immutable `StrategyVersionRecord`s.
+
+**The promotion gate** is a gate, not a suggestion. `AssessPromotionAsync` returns named requirements
+and says exactly which are unmet:
+
+- the version exists, and the request moves **one rung** on the ladder;
+- at least one completed experiment documents the strategy;
+- for `Demo` and above: at least 30 trades, positive Sharpe, drawdown under 50%;
+- for `Automated`: the version must already have run under `ApprovalRequired`.
+
+**Performance** — attribution by firm, venue, strategy, instrument and context tag, plus execution
+quality (fill and rejection rates, median and worst slippage, latency, rejection reasons) and a
+behaviour analysis comparing trades that were intervened on against those left alone. All from the
+same ledger and journal the accounting uses, so a performance number and a balance can never disagree.
+
+---
+
+## 27. Operations, alerts and health
+
+`AlertService` deduplicates on the **condition**, not the occurrence — a flapping feed produces one
+open alert with a rising `OccurrenceCount`. Severity routes the delivery:
+
+| Severity | Examples | Delivery |
+|---|---|---|
+| **Critical** | unknown live order, material reconciliation mismatch, hard risk breach, safe mode engaged | store + Discord, **requires acknowledgement** |
+| **High** | stale data, venue channel down, execution authority changed | store + Discord |
+| **Medium** | order awaiting approval, broker rejection | store |
+| **Informational** | routine events | store |
+
+Acknowledging records who looked at it. It does **not** close the alert — only the code that fixes the
+underlying state resolves it (`ResolveByDedupeAsync`).
+
+`HealthMonitor` reports six areas independently (connections, sessions, market data, order flow,
+reconciliation, controls) and answers one question: is the firm allowed to trade, and if not, why?
+Read-only analytics may be degraded while the order path is perfectly healthy — stale data blocks the
+*affected instruments* (enforced per-order by the risk engine) rather than the whole firm.
+
+Background loops in `FirmContext`: reconciliation plus automatic risk triggers every 5 minutes, a
+health sweep every minute, and the journal writer every 2 minutes.
+
+---
+
+## 28. Firm HTTP API
+
+All under `/api/omnitrader/firm/`. Reads are `Guest`; mutations are `Klives`. The engine's original
+`/api/omnitrader/*` routes (section 14) are unchanged and still serve strategies, deployments and
+backtests.
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `overview` | command centre: value, exposure, health, exceptions, alerts, venues |
+| GET | `environments` | accounts, authorities and every venue's capability matrix |
+| GET | `markets`, `markets/watchlists` | evaluated market rows plus breadth; watchlists |
+| POST | `markets/watchlist/save`, `markets/watchlist/delete` | manage watchlists |
+| GET | `instruments` | canonical instruments, venue mappings, freshness |
+| POST | `instruments/refresh` | fold venue directories into the master |
+| GET | `portfolio`, `portfolio/value-series`, `ledger` | firm view, value history, ledger entries |
+| GET | `reconciliation` | open breaks and recent runs |
+| POST | `reconciliation/run`, `reconciliation/resolve` | reconcile now; explain a break |
+| GET | `risk` | limits, utilisation, portfolio and operational state, recent decisions |
+| POST | `risk/limits`, `risk/safe-mode`, `risk/killswitch` | change the risk budget and controls |
+| POST | `risk/reduce/preview` then `risk/reduce/execute` | **two-step** exposure reduction |
+| GET | `orders`, `order`, `ticket` | blotter; order with decision and lifecycle; capability-driven ticket |
+| POST | `order/propose`, `order/approve`, `order/reject`, `order/cancel` | the order lifecycle |
+| POST | `orders/reconcile` | resolve outstanding and unknown orders |
+| GET | `experiments`, `strategy-versions`, `promotion/assess` | research and the promotion gate |
+| POST | `experiment/create`, `experiment/attach`, `experiment/update`, `strategy-version/create`, `promotion/promote` | research mutations |
+| GET | `performance` | attribution, execution quality, behaviour |
+| GET | `journal`, `journal/record` | trade records |
+| POST | `journal/annotate`, `journal/intervention` | review workflow |
+| GET | `systems`, `alerts` | health, venue channels, freshness, audit; alerts |
+| POST | `alert/acknowledge`, `alert/resolve`, `venues/connect`, `account/authority` | operations |
+
+**Confirmation tokens.** `risk/reduce/execute` requires a token derived from the exact preview the
+operator saw (`REDUCE-{positions}-{notional}`); if the book moves before they confirm, the token stops
+matching and they are sent back to the preview. Granting live authority to a live account requires
+`confirm=<accountId>`.
+
+### Query, counts and comparison
+
+Three routes answer more than "here are some rows", because a dashboard that cannot state its scope
+cannot be trusted with it.
+
+**`orders`** and **`journal`** return an envelope rather than a bare array:
+
+```jsonc
+{
+  "Rows":     [ /* the page you asked for */ ],
+  "Filtered": 42,      // matched the filters
+  "Total":    417,     // in the scanned recent set
+  "Offset":   0,
+  "StateCounts": { "Filled": 380, "Unknown": 2 },   // orders: facet counts for the filter chips
+  "ReviewCounts": { "Unreviewed": 11 }              // journal: the same, per review state
+}
+```
+
+Both accept `q` (substring over the identifying fields), `venue`, `environment`, `from`, `limit` and
+`offset`; `orders` additionally takes `state` (comma-separated) and `strategy`, and `journal` takes
+`review`, `strategy`, `tag` and `outcome` (`wins` · `losses` · `open` · `intervened`). Filtering runs
+on the server so the counts describe the whole set, not the page.
+
+**`performance`** carries its own baseline. Alongside the current window it returns `Previous` and
+`PreviousExecution` over the immediately preceding window of equal length, `PreviousFromUtc`/`ToUtc`,
+and `HasBaseline` — false when there is nothing to compare against, so the UI says "no baseline"
+instead of presenting a comparison against zero as growth. It also returns `Daily` (one point per
+calendar day including quiet ones, with the running total), `PnLDistribution` and
+`SlippageDistribution` (equal-width histograms, empty rather than degenerate when there is no spread).
+
+**`overview`** returns `Trend`: the firm value series over `trendDays` (default 30, downsampled to
+≤120 points), `Change24h`, `ChangePercent24h`, `PeakValue` and `TroughValue`. `Points` is empty rather
+than fabricated when no snapshot exists.
+
+**`markets`** rows carry `Spark`, ~48 downsampled closes. The downsampler keeps each bucket's extreme
+in the direction the bucket moved, so a spike survives rather than being averaged flat, and the final
+point is the exact latest price.
+
+---
+
+## 29. The UI
+
+`pages/omnitrader/` in the management website — ten pages over a shared component library in
+`components/OmniTrader/`, `composables/useOmniTrader.ts` and `assets/scss/omnitrader-os.scss`.
+
+**Components.** Nuxt registers these path-prefixed, so a page uses `<OmniTraderShell>`, not `<Shell>`:
+
+| Component | Responsibility |
+|---|---|
+| `Shell` | environment band, scope selector, freshness, grouped nav with exception badges, blocker banners, density toggle, ⌘K palette |
+| `Card` | card frame with a question subtitle, local controls, and the loading / empty / filtered / stale / partial / error states |
+| `Kpi` | label, value, unit, comparison **with its baseline named**, target, spark, drill-down |
+| `DataTable` | sticky header, sort, search, column visibility, pinned first column, paging, filtered/total counts, keyboard row access |
+| `LineChart` | one y-axis, crosshair + tooltip, keyboard readout, direct-labelled last value, axis-truncation disclosure, table view |
+| `BarList` | sorted horizontal bars, diverging around zero, top-N with the tail folded into "Other" |
+| `Sparkline`, `Meter`, `RuleList`, `Drawer`, `StateBlock` | trend shape; bullet meter with its threshold; the rule-level decision record; right-side inspection; typed non-success states |
+
+| Page | Primary decision |
+|---|---|
+| **Command Centre** (`/omnitrader`) | assess the operation and find what needs action |
+| **Markets** | discover and evaluate market conditions |
+| **Strategies** | control the strategy lifecycle and authority |
+| **Portfolio** | understand aggregate exposure and reconciliation |
+| **Risk** | prevent or reduce unacceptable exposure |
+| **Execution** | manage broker interaction and investigate fills |
+| **Research** | validate strategy logic and build promotion evidence |
+| **Performance** | measure outcomes and detect deterioration |
+| **Journal** | review the complete decision record |
+| **Systems** | operate and troubleshoot the platform |
+
+Six design rules run through all of it:
+
+- **Environment is never ambiguous.** A coloured band sits above every page (live red, demo amber,
+  paper blue, historical grey), the selector in the header names it, and the same colours label every
+  order, position and venue row. `All environments` is a real scope with its own striped band and an
+  `includes live` chip — never the absence of a choice.
+- **Degraded state is visible, not implied.** Blockers are banner-level on *every* page, not just Risk.
+  Stale prices are underlined with their reason. Unsupported venue controls are disabled with the
+  venue's own explanation beside them. `Unknown` orders get the loudest treatment in the UI.
+- **Every number carries its context** — unit, window, baseline and freshness. A comparison is only
+  rendered when a real baseline exists, and a direction is only coloured when the caller has said
+  which way is good (rising slippage is not a win).
+- **Unknown never renders as zero, and never renders as green.** Empty, filtered-empty, stale, partial,
+  failed and no-permission are six different states with six different treatments.
+- **Exceptions are loud; normality is quiet.** Colour is reserved for status, selection, thresholds and
+  anomalies; the default card is neutral.
+- **Progressive disclosure, in order.** Value → hover detail → drawer → page. Inspecting a row never
+  costs you the table's scroll, sort, filters or selection.
+
+Charts follow the shared data-viz rules: one y-axis (never a dual axis), position and length before
+area or angle, a fixed categorical palette assigned in order and never re-assigned by rank, gridlines
+quieter than the data, a crosshair with exact values, keyboard readout via arrow keys, and a table
+view on every chart. The eight categorical slots are validated for the dark surface — inside the
+lightness band, above the chroma floor, ≥3:1 against the surface, worst adjacent CVD ΔE 8.4.
+
+Filters live in the URL, so a view can be linked, bookmarked and returned to. Density (standard or
+compact) and the environment scope persist per operator.
+
+`/schemery/omnitrader` redirects here; the dashboard and schemes cards point at `/omnitrader`.
+
+### Firm-layer testing
+
+```bash
+DOTNET_ROLL_FORWARD=Major dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj \
+    --filter "FullyQualifiedName~RiskEngineTests|FullyQualifiedName~OrderFlowTests|FullyQualifiedName~FirmLayerTests"
+```
+
+`RiskEngineTests` asserts the blocking behaviour rule by rule; `OrderFlowTests` covers the state
+machine and the idempotency-key invariants; `FirmLayerTests` covers emergency controls, break
+classification, the exposure model, venue capabilities and the shared analytics.
+
+### Firm-layer gotchas
+
+- **Never write to a venue outside `OrderService`.** It is the only component allowed to submit, and
+  the only one that assigns idempotency keys.
+- **Never resolve an `Unknown` order by resubmitting.** Query the broker by client reference.
+- **Book fills as increments, not totals** — `ReconcileOrderAsync` already diffs against
+  `FilledQuantity`.
+- **Never correct a ledger entry in place.** Post an `Adjustment` that references it.
+- **A capability you cannot support gets a `Limitations` entry**, not a silent simulation. The UI and
+  the risk engine both surface that text to the operator.
+- **Live authority is never implicit.** New live accounts start at `Observe`, and raising them
+  requires a typed confirmation.
