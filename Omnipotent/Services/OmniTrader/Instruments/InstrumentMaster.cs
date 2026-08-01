@@ -231,18 +231,40 @@ namespace Omnipotent.Services.OmniTrader.Instruments
             var mapping = instrument?.MappingFor(venue);
             if (mapping != null) return mapping.VenueSymbol;
             if (instrument == null) return instrumentId;
+
+            // Only crypto venues take a concatenated pair. A share on Trading 212 or an epic on IG
+            // is a ticker, and "AAPLUSDT" is not a thing anyone can trade.
+            if (instrument.AssetClass != AssetClass.Crypto) return instrument.BaseAsset;
+
             return venue == VenueId.Kraken
                 ? Execution.KrakenSymbolMap.ToKrakenPair(instrument.BaseAsset + instrument.QuoteCurrency)
                 : instrument.BaseAsset + (instrument.QuoteCurrency == "USD" ? "USDT" : instrument.QuoteCurrency);
         }
 
-        /// <summary>The engine symbol (Binance-style pair) used by the candle cache and strategies.</summary>
+        /// <summary>
+        /// The symbol the market-data feed knows this instrument by: a Binance-style pair for crypto,
+        /// an exchange ticker for everything else.
+        ///
+        /// The asset class matters here. Building a crypto pair for a share produces `AAPLUSDT`,
+        /// which the equities feed cannot resolve and the crypto feed does not have — so the chart
+        /// silently comes back empty.
+        /// </summary>
         public string EngineSymbolFor(string instrumentId)
         {
             var instrument = Get(instrumentId);
             if (instrument == null) return instrumentId;
+
             var binance = instrument.MappingFor(VenueId.Binance);
             if (binance != null) return binance.VenueSymbol;
+
+            if (instrument.AssetClass != AssetClass.Crypto)
+            {
+                // Trading 212 tickers carry a venue/currency suffix that the data feed does not use.
+                var t212 = instrument.MappingFor(VenueId.Trading212);
+                if (t212 != null) return Venues.Trading212VenueAdapter.ToMarketSymbol(t212.VenueSymbol);
+                return instrument.BaseAsset;
+            }
+
             return instrument.BaseAsset + (instrument.QuoteCurrency == "USD" ? "USDT" : instrument.QuoteCurrency);
         }
 

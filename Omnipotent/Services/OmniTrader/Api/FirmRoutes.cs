@@ -1111,10 +1111,36 @@ namespace Omnipotent.Services.OmniTrader.Api
                         DbPath = parent.GetDbPath(),
                         Uptime = parent.GetServiceUptime().ToString(),
                         Strategies = parent.StrategyRegistry.All.Count,
-                        Instruments = Firm.Instruments.Count,
-                        KrakenConfigured = parent.IsKrakenConfigured,
-                        IGConfigured = Firm.Venues.All.Any(v => v.Venue == VenueId.IG && v.IsConfigured)
-                    }
+                        Instruments = Firm.Instruments.Count
+                    },
+                    // Every venue the deployment knows about, whether or not it is configured —
+                    // a hardcoded pair of flags stopped being the truth the moment a third venue
+                    // existed, and an unconfigured venue must be visible as *unconfigured* rather
+                    // than absent.
+                    Connections = AllVenues.Select(v =>
+                    {
+                        var registered = Firm.Venues.All.FirstOrDefault(a => a.Venue == v.Venue && a.Environment == v.Environment);
+                        Firm.CredentialSources.TryGetValue(VenueRegistry.Key(v.Venue, v.Environment), out var source);
+                        return new
+                        {
+                            Venue = v.Venue.ToString(),
+                            Environment = v.Environment.ToString(),
+                            v.DisplayName,
+                            Registered = registered != null,
+                            Configured = registered?.IsConfigured ?? false,
+                            OrderPathHealthy = registered != null && SafeOrderPath(registered),
+                            Exposure = registered?.Capabilities.Exposure.ToString() ?? v.Exposure,
+                            AssetClasses = registered?.Capabilities.AssetClasses.Select(a => a.ToString()).ToArray()
+                                           ?? v.AssetClasses,
+                            v.SharedKeys,
+                            v.EnvironmentKeys,
+                            v.Guidance,
+                            // Which setting actually supplied the key — so a shared key doing the work
+                            // of two is visible rather than guessed at.
+                            CredentialSource = string.IsNullOrWhiteSpace(source) ? null : source,
+                            RealMoney = v.Environment == TradingEnvironment.Live
+                        };
+                    })
                 });
             });
 
@@ -1302,6 +1328,53 @@ namespace Omnipotent.Services.OmniTrader.Api
         };
 
         private static decimal Pct(decimal value, decimal limit) => limit <= 0m ? 0m : Math.Round(value / limit * 100m, 1);
+
+        /// <summary>
+        /// Every (venue, environment) this build can connect to, and the Omni settings each one
+        /// needs. The Systems page renders this, so an operator can see that Trading 212 exists and
+        /// what key it wants without reading the source.
+        /// </summary>
+        /// <summary>
+        /// `Shared` settings are read when the environment-specific one is unset, which is what lets
+        /// each broker be configured the way it actually issues credentials rather than the way the
+        /// platform would prefer. `Guidance` is shown verbatim, because "which key goes where" is
+        /// the single most confusing part of connecting either broker.
+        /// </summary>
+        private static readonly (VenueId Venue, TradingEnvironment Environment, string DisplayName,
+            string Exposure, string[] AssetClasses, string[] SharedKeys, string[] EnvironmentKeys,
+            string Guidance)[] AllVenues =
+        {
+            (VenueId.Internal, TradingEnvironment.Paper, "Paper simulator", "Inventory",
+                new[] { "Crypto" }, Array.Empty<string>(), Array.Empty<string>(),
+                "Built in. Holds no money and never counts toward firm value."),
+            (VenueId.Kraken, TradingEnvironment.Live, "Kraken (spot crypto)", "Inventory",
+                new[] { "Crypto" },
+                new[] { "OmniTrader.Kraken.ApiKey", "OmniTrader.Kraken.ApiSecret" }, Array.Empty<string>(),
+                "One key pair. Exclude withdrawal permission when you create it."),
+            (VenueId.IG, TradingEnvironment.Demo, "IG (CFD demo)", "Derivative",
+                new[] { "Index", "Equity", "Forex", "Commodity" },
+                new[] { "OmniTrader.IG.ApiKey" },
+                new[] { "OmniTrader.IG.Demo.Username", "OmniTrader.IG.Demo.Password" },
+                "IG issues one API key per account, so the shared key covers demo too. What differs is the "
+                + "username and password: log in live, switch to the demo account, then My Account → Settings → "
+                + "Web API and create demo details."),
+            (VenueId.IG, TradingEnvironment.Live, "IG (CFD live)", "Derivative",
+                new[] { "Index", "Equity", "Forex", "Commodity" },
+                new[] { "OmniTrader.IG.ApiKey", "OmniTrader.IG.Username", "OmniTrader.IG.Password" },
+                Array.Empty<string>(),
+                "Your live API key and live platform login. A demo account cannot create an API key on its own."),
+            (VenueId.Trading212, TradingEnvironment.Demo, "Trading 212 (practice)", "Inventory",
+                new[] { "Equity" }, Array.Empty<string>(),
+                new[] { "OmniTrader.Trading212.Demo.ApiKey" },
+                "A Trading 212 key only works in the environment it was generated in. Switch the app to "
+                + "Practice mode *before* generating this one, or it will be rejected here."),
+            (VenueId.Trading212, TradingEnvironment.Live, "Trading 212 (invest/ISA)", "Inventory",
+                new[] { "Equity" },
+                new[] { "OmniTrader.Trading212.ApiKey" },
+                new[] { "OmniTrader.Trading212.Live.ApiKey" },
+                "Generated from Settings → API while in Invest/ISA mode. If you only run live, the shared "
+                + "key is all you need.")
+        };
 
         /// <summary>Case-insensitive substring match across a record's identifying fields — the one
         /// search box an operator uses when they only remember part of a reference.</summary>

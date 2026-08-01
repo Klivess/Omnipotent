@@ -186,13 +186,44 @@ namespace Omnipotent.Services.OmniTrader
             await RegisterTrading212Async(TradingEnvironment.Live, "OmniTrader.Trading212.Live", ct);
         }
 
-        /// <summary>Trading 212 Invest/ISA — owned shares. Demo and live take separate API keys, so a
-        /// practice key can never reach the real account.</summary>
+        /// <summary>
+        /// Where each registered venue's credentials actually came from, keyed by
+        /// `{venue}:{environment}`. Surfaced on the Systems page: when a shared key is doing the work
+        /// of two, the operator should be able to see that rather than infer it.
+        /// </summary>
+        public IReadOnlyDictionary<string, string> CredentialSources => credentialSources;
+        private readonly Dictionary<string, string> credentialSources = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Resolve one credential from an environment-specific setting, falling back to a shared one.
+        ///
+        /// The two brokers issue keys differently and the platform has to accommodate both rather
+        /// than imposing its own shape: IG allows only **one API key per account** (the demo
+        /// *username and password* are what differ), while Trading 212 issues a key that only works
+        /// in the environment it was generated in. Demanding a per-environment value for everything
+        /// meant an operator with a single IG key had to paste it into two settings and got silence
+        /// when they did not.
+        /// </summary>
+        private async Task<(string Value, string Source)> ResolveCredentialAsync(string sharedKey, string environmentKey)
+        {
+            string specific = await parent.GetStringOmniSetting(environmentKey, sensitive: true);
+            if (!string.IsNullOrWhiteSpace(specific)) return (specific, environmentKey);
+
+            string shared = await parent.GetStringOmniSetting(sharedKey, sensitive: true);
+            return (shared ?? "", string.IsNullOrWhiteSpace(shared) ? "" : sharedKey);
+        }
+
+        /// <summary>
+        /// Trading 212 Invest/ISA — owned shares. A T212 key is bound to the environment it was
+        /// generated in (you switch the app to Practice mode to mint a demo key), so a shared key is
+        /// only a convenience for someone running one environment; using it for both will simply see
+        /// the other rejected, and the Systems page says so.
+        /// </summary>
         private async Task RegisterTrading212Async(TradingEnvironment environment, string settingPrefix, CancellationToken ct)
         {
             try
             {
-                string apiKey = await parent.GetStringOmniSetting($"{settingPrefix}.ApiKey", sensitive: true);
+                var (apiKey, source) = await ResolveCredentialAsync("OmniTrader.Trading212.ApiKey", $"{settingPrefix}.ApiKey");
                 if (string.IsNullOrWhiteSpace(apiKey))
                 {
                     await parent.ServiceLog($"Trading 212 {environment} key not configured — venue not registered.");
@@ -201,8 +232,10 @@ namespace Omnipotent.Services.OmniTrader
 
                 var adapter = new Trading212VenueAdapter(apiKey, environment, parent.MarketData);
                 Venues.Register(adapter);
+                credentialSources[VenueRegistry.Key(VenueId.Trading212, environment)] = source;
                 bool connected = await adapter.ConnectAsync(ct);
-                await parent.ServiceLog($"Trading 212 {environment} venue registered ({(connected ? "authenticated" : "key rejected")}).");
+                await parent.ServiceLog($"Trading 212 {environment} venue registered from {source} "
+                    + $"({(connected ? "authenticated" : "key rejected — a Trading 212 key only works in the environment it was generated in")}).");
             }
             catch (Exception ex)
             {
@@ -210,18 +243,24 @@ namespace Omnipotent.Services.OmniTrader
             }
         }
 
+        /// <summary>
+        /// IG CFD. IG issues one API key per account, so the key falls back to a shared setting; the
+        /// demo username and password are genuinely separate values that IG makes you create, so
+        /// those are per-environment first.
+        /// </summary>
         private async Task RegisterIgAsync(TradingEnvironment environment, string settingPrefix, CancellationToken ct)
         {
             try
             {
-                string apiKey = await parent.GetStringOmniSetting($"{settingPrefix}.ApiKey", sensitive: true);
-                string identifier = await parent.GetStringOmniSetting($"{settingPrefix}.Username", sensitive: true);
-                string password = await parent.GetStringOmniSetting($"{settingPrefix}.Password", sensitive: true);
+                var (apiKey, keySource) = await ResolveCredentialAsync("OmniTrader.IG.ApiKey", $"{settingPrefix}.ApiKey");
+                var (identifier, _) = await ResolveCredentialAsync("OmniTrader.IG.Username", $"{settingPrefix}.Username");
+                var (password, _) = await ResolveCredentialAsync("OmniTrader.IG.Password", $"{settingPrefix}.Password");
                 if (string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(identifier) || string.IsNullOrWhiteSpace(password))
                 {
                     await parent.ServiceLog($"IG {environment} credentials not configured — venue not registered.");
                     return;
                 }
+                credentialSources[VenueRegistry.Key(VenueId.IG, environment)] = keySource;
 
                 var client = new IGRestClient(apiKey, identifier, password, environment);
                 var adapter = new IGVenueAdapter(client);
@@ -245,13 +284,24 @@ namespace Omnipotent.Services.OmniTrader
                 string id = $"{adapter.Venue}-{adapter.Environment}".ToLowerInvariant();
                 if (existing.Any(a => a.Id == id)) continue;
 
+                // Ask the broker what currency the account is actually denominated in. Guessing it
+                // from the venue was wrong the moment a third venue existed, and a mis-set base
+                // currency silently mis-converts every value the account reports.
+                string baseCurrency = "USD";
+                try
+                {
+                    var snapshot = await adapter.GetAccountAsync(ct);
+                    if (!string.IsNullOrWhiteSpace(snapshot.BaseCurrency)) baseCurrency = snapshot.BaseCurrency;
+                }
+                catch { /* an unreachable venue keeps the default until it next connects */ }
+
                 await Accounts.UpsertAsync(new TradingAccount
                 {
                     Id = id,
                     Venue = adapter.Venue,
                     Environment = adapter.Environment,
                     DisplayName = adapter.Capabilities.DisplayName,
-                    BaseCurrency = adapter.Venue == VenueId.IG ? "GBP" : "USD",
+                    BaseCurrency = baseCurrency,
                     // Nothing gains real-money authority implicitly; it must be granted explicitly.
                     Authority = adapter.Environment switch
                     {

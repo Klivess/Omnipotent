@@ -935,9 +935,28 @@ earlier versions.
 | Venue | Exposure | Environments | Notes |
 |---|---|---|---|
 | Kraken | Inventory (spot crypto) | Live | Reuses the engine's order router |
-| IG | Derivative (CFD) | Demo · Live | Separate credentials per environment |
-| **Trading 212** | **Inventory (shares, ETFs)** | **Demo · Live** | `OmniTrader.Trading212.{Demo,Live}.ApiKey`. No historical-bar endpoint, so charts come from the equities feed; no client-reference field, so an ambiguous submission is reported `Unknown` rather than retried |
+| IG | Derivative (CFD) | Demo · Live | No Lightstreamer — prices polled over REST |
+| **Trading 212** | **Inventory (shares, ETFs)** | **Demo · Live** | No historical-bar endpoint, so charts come from the equities feed; no client-reference field, so an ambiguous submission is reported `Unknown` rather than retried |
 | Internal | Inventory (simulated) | Paper | Never counted as value |
+
+### Credentials: each broker issues them differently
+
+`FirmContext.ResolveCredentialAsync` reads the environment-specific setting first and falls back to a
+shared one. This exists because the two brokers genuinely differ, and forcing one shape on both left
+an operator pasting the same key into two settings — or, worse, getting silence when they didn't.
+
+| Setting | Used by | Required? |
+|---|---|---|
+| `OmniTrader.Kraken.ApiKey` · `.ApiSecret` | Kraken live | Yes. Exclude withdrawal permission. |
+| `OmniTrader.IG.ApiKey` | **Both IG environments** | Yes — IG allows only **one API key per account** |
+| `OmniTrader.IG.Username` · `.Password` | IG live | Yes for live |
+| `OmniTrader.IG.Demo.Username` · `.Password` | IG demo | Yes for demo — IG makes you create *separate demo details*: log in live, switch to the demo account, then My Account → Settings → Web API |
+| `OmniTrader.IG.Demo.ApiKey` · `.Live.ApiKey` | Override | Optional; only if you somehow hold two keys |
+| `OmniTrader.Trading212.ApiKey` | T212 live (and demo, if nothing more specific) | Shared convenience |
+| `OmniTrader.Trading212.Demo.ApiKey` · `.Live.ApiKey` | Per environment | **A T212 key only works in the environment it was generated in** — switch the app to Practice mode *before* generating the demo key |
+
+The Systems page renders this table live, including which setting actually supplied each connection's
+key, so a shared key doing the work of two is visible rather than inferred.
 
 ---
 

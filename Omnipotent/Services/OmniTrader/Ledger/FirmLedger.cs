@@ -129,7 +129,11 @@ namespace Omnipotent.Services.OmniTrader.Ledger
                     Kind = LedgerEntryKind.Cost,
                     Asset = string.IsNullOrWhiteSpace(order.FeeCurrency) ? quoteCurrency : order.FeeCurrency,
                     Amount = -Math.Abs(fee),
-                    CostKind = order.Venue == VenueId.IG ? CostKind.Commission : CostKind.MakerTakerFee,
+                    // Exchange venues charge a maker/taker fee; brokers charge commission. Deriving
+                    // it from the exposure kind keeps this right for every venue rather than for
+                    // the two that happened to exist when it was written.
+                    CostKind = exposure == ExposureKind.Derivative || order.Venue == VenueId.Trading212
+                        ? CostKind.Commission : CostKind.MakerTakerFee,
                     CostQuality = order.Venue == VenueId.Internal ? CostQuality.Estimated : CostQuality.Observed,
                     SourceType = "fill",
                     SourceId = order.Id,
