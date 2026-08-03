@@ -1,4 +1,5 @@
 using Omnipotent.Services.KliveGames.Models;
+using Omnipotent.Services.KliveGames.Runtime;
 
 namespace Omnipotent.Services.KliveGames.Games
 {
@@ -59,6 +60,11 @@ namespace Omnipotent.Services.KliveGames.Games
         Task<LaunchSpec> BuildLaunchSpecAsync(GameServerInstance inst, CancellationToken ct);
 
         string GetGracefulStopCommand();
+
+        /// <summary>An out-of-band console for games that ignore stdin (Rust ⇒ RCON). Returned null by
+        /// games driven through stdin, which is the default. Created once per start, after the process is
+        /// spawned, and disposed when it exits — commands and the graceful stop go here when present.</summary>
+        IRemoteConsole? CreateRemoteConsole(GameServerInstance inst) => null;
 
         // ---- Console parsing ----
         bool TryParseStarted(string line);

@@ -38,9 +38,11 @@ namespace Omnipotent.Services.KliveGames
         private readonly ConcurrentDictionary<string, GameServerInstance> _instances = new();
         private readonly ConcurrentDictionary<string, ManagedGameProcess> _processes = new();
         private readonly ConcurrentDictionary<string, GameConsoleHub> _consoleHubs = new();
+        private readonly ConcurrentDictionary<string, IRemoteConsole> _remoteConsoles = new();
         private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
         private readonly ConcurrentDictionary<string, List<DateTime>> _restartHistory = new();
         private readonly ConcurrentDictionary<string, DateTime> _pendingListPoll = new();
+        private readonly ConcurrentDictionary<string, string> _unreadableRosterReply = new();
 
         private GameProviderRegistry _providers = null!;
         private readonly BackupManager _backups = new();
@@ -296,6 +298,7 @@ namespace Omnipotent.Services.KliveGames
 
                 await proc.StartAsync(cancellationToken.Token);
                 _processes[id] = proc;
+                AttachRemoteConsole(inst, hub, provider);
                 inst.ChildPid = proc.Pid;
                 inst.LastStartedUtc = DateTime.UtcNow;
                 await SaveInstanceAsync(inst);
@@ -324,8 +327,18 @@ namespace Omnipotent.Services.KliveGames
                 inst.Status = GameServerStatus.Stopping;
                 await BroadcastStatus(inst);
 
+                // Games with a remote console cannot be stopped through stdin — deliver the stop command
+                // there first, then let the process wrapper do nothing but wait.
+                string stopCommand = provider.GetGracefulStopCommand();
+                if (_remoteConsoles.ContainsKey(id))
+                {
+                    try { await SendCommandAsync(id, stopCommand, echo: false); } catch { }
+                    stopCommand = "";
+                }
+
                 int grace = await GetIntOmniSetting("KliveGames_StopGraceSeconds", 90);
-                await proc.StopGracefullyAsync(provider.GetGracefulStopCommand(), TimeSpan.FromSeconds(grace), killOnExpiry: true);
+                await proc.StopGracefullyAsync(stopCommand, TimeSpan.FromSeconds(grace), killOnExpiry: true);
+                DetachRemoteConsole(id);
 
                 inst.Status = GameServerStatus.Stopped;
                 inst.ChildPid = null;
@@ -354,6 +367,7 @@ namespace Omnipotent.Services.KliveGames
             try
             {
                 if (_processes.TryGetValue(id, out var proc)) proc.Kill();
+                DetachRemoteConsole(id);
                 inst.Status = GameServerStatus.Stopped;
                 inst.ChildPid = null;
                 inst.OnlinePlayers = new();
@@ -373,9 +387,11 @@ namespace Omnipotent.Services.KliveGames
 
             _instances.TryRemove(id, out _);
             _processes.TryRemove(id, out var p); p?.Dispose();
+            DetachRemoteConsole(id);
             _consoleHubs.TryRemove(id, out _);
             _locks.TryRemove(id, out _);
             _restartHistory.TryRemove(id, out _);
+            _unreadableRosterReply.TryRemove(id, out _);
 
             try { if (Directory.Exists(InstanceDir(id))) Directory.Delete(InstanceDir(id), true); } catch { }
             try
@@ -390,12 +406,25 @@ namespace Omnipotent.Services.KliveGames
 
         public async Task SendCommandAsync(string id, string command, bool echo = true)
         {
-            if (_processes.TryGetValue(id, out var proc) && proc.IsRunning)
+            if (string.IsNullOrWhiteSpace(command)) return;
+            _consoleHubs.TryGetValue(id, out var hub);
+
+            bool sent;
+            if (_remoteConsoles.TryGetValue(id, out var console))
             {
-                await proc.SendCommandAsync(command);
-                if (echo && _consoleHubs.TryGetValue(id, out var hub))
-                    await hub.BroadcastLineAsync($"> {command}");
+                // Silent commands are internal polls: their replies are parsed, never echoed.
+                sent = await console.SendAsync(command, silent: !echo);
             }
+            else
+            {
+                sent = _processes.TryGetValue(id, out var proc) && proc.IsRunning;
+                if (sent) await proc!.SendCommandAsync(command);
+            }
+
+            if (!echo || hub == null) return;
+            await hub.BroadcastLineAsync(sent
+                ? $"> {command}"
+                : $"> {command}    [not sent — the server console is not connected yet]");
         }
 
         public async Task<string?> SendPlayerActionAsync(string id, string action, string player)
@@ -419,11 +448,76 @@ namespace Omnipotent.Services.KliveGames
 
         // ----------------------------------------------------------------- console + exit handling
 
-        private void HandleConsoleLine(GameServerInstance inst, GameConsoleHub hub, IGameProvider provider, string line)
+        /// <summary>Opens the provider's out-of-band console, if it has one (Rust: RCON). Everything the
+        /// orchestrator sends then travels down it instead of stdin, which that server ignores.</summary>
+        private void AttachRemoteConsole(GameServerInstance inst, GameConsoleHub hub, IGameProvider provider)
+        {
+            DetachRemoteConsole(inst.Id);
+
+            IRemoteConsole? console;
+            try { console = provider.CreateRemoteConsole(inst); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, $"[KliveGames] Could not open the remote console for '{inst.Name}'.");
+                return;
+            }
+            if (console == null) return;
+
+            console.OnMessage += message => HandleRemoteConsoleMessage(inst, hub, provider, message);
+            console.OnNotice += notice => _ = hub.BroadcastLineAsync(notice);
+            _remoteConsoles[inst.Id] = console;
+            _ = console.StartAsync(cancellationToken.Token);
+        }
+
+        private void DetachRemoteConsole(string id)
+        {
+            if (_remoteConsoles.TryRemove(id, out var console))
+            {
+                try { console.Dispose(); } catch { }
+            }
+        }
+
+        /// <summary>
+        /// A reply from the remote console. Unlike stdout this arrives a whole message at a time, which is
+        /// what makes the roster readable — Rust answers <c>playerlist</c> with a multi-line JSON document.
+        /// </summary>
+        private void HandleRemoteConsoleMessage(GameServerInstance inst, GameConsoleHub hub, IGameProvider provider, RemoteConsoleMessage message)
         {
             try
             {
-                bool suppress = false;
+                if (string.IsNullOrWhiteSpace(message.Text)) return;
+                bool broadcast = message.Kind == RemoteConsoleMessageKind.Reply;
+
+                if (provider.TryParseListReply(message.Text, out _, out int max, out var names))
+                {
+                    inst.OnlinePlayers = names.ToList();
+                    if (max > 0) inst.MaxPlayers = max;
+                    _unreadableRosterReply.TryRemove(inst.Id, out _);
+                    if (!broadcast) return;
+                }
+                else if (message.Kind == RemoteConsoleMessageKind.InternalReply)
+                {
+                    // The roster poll answered with something we cannot read (an unsupported command, an
+                    // error). Show it once per distinct reply: swallowing it would leave an empty players
+                    // panel with nothing anywhere to explain it.
+                    if (!_unreadableRosterReply.TryGetValue(inst.Id, out var previous) || previous != message.Text)
+                    {
+                        _unreadableRosterReply[inst.Id] = message.Text;
+                        broadcast = true;
+                    }
+                }
+
+                foreach (string line in message.Text.Split('\n'))
+                    HandleConsoleLine(inst, hub, provider, line.TrimEnd('\r'), broadcast);
+            }
+            catch { }
+        }
+
+        private void HandleConsoleLine(GameServerInstance inst, GameConsoleHub hub, IGameProvider provider, string line, bool broadcast = true)
+        {
+            try
+            {
+                bool suppress = !broadcast;
 
                 if (provider.TryParseListReply(line, out _, out int max, out var names))
                 {
@@ -435,11 +529,16 @@ namespace Omnipotent.Services.KliveGames
                 }
                 else if (provider.TryParsePlayerJoin(line, out var joined))
                 {
-                    if (!inst.OnlinePlayers.Contains(joined)) inst.OnlinePlayers.Add(joined);
+                    // Copy-on-write: console output and the remote console arrive on different threads,
+                    // and the routes serialize this list concurrently. A lost update is corrected by the
+                    // next authoritative roster poll; a torn list is not.
+                    var roster = inst.OnlinePlayers;
+                    if (!roster.Contains(joined)) inst.OnlinePlayers = new List<string>(roster) { joined };
                 }
                 else if (provider.TryParsePlayerLeave(line, out var left))
                 {
-                    inst.OnlinePlayers.Remove(left);
+                    var roster = inst.OnlinePlayers;
+                    if (roster.Contains(left)) inst.OnlinePlayers = roster.Where(player => player != left).ToList();
                 }
 
                 if (!suppress) _ = hub.BroadcastLineAsync(line);
@@ -463,6 +562,7 @@ namespace Omnipotent.Services.KliveGames
             if (!_instances.TryGetValue(id, out var inst)) return;
             bool expected = _processes.TryGetValue(id, out var proc) && proc.StopRequested;
 
+            DetachRemoteConsole(id); // nothing to talk to once the process is gone
             inst.ChildPid = null;
             inst.OnlinePlayers = new();
             inst.CpuPercent = 0;
