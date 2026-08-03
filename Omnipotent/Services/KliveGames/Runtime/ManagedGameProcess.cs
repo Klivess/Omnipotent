@@ -26,6 +26,7 @@ namespace Omnipotent.Services.KliveGames.Runtime
 
         private Process? _process;
         private volatile bool _stopRequested;
+        private volatile bool _adopted;
         private DateTime _lastOutputUtc = DateTime.UtcNow;
 
         /// <summary>Raised for every console line (stdout and stderr merged), in arrival order.</summary>
@@ -39,6 +40,27 @@ namespace Omnipotent.Services.KliveGames.Runtime
             _spec = spec;
             _ringCapacity = Math.Max(50, ringCapacity);
             _logError = logError;
+        }
+
+        /// <summary>
+        /// Wraps a server process that outlived the app — an orphan left behind when Omnipotent was
+        /// killed rather than shut down. Resource sampling, exit detection, stop and kill all work; only
+        /// stdio does not, because those pipes belonged to the previous host process and cannot be
+        /// reattached. Such a server is driven through its remote console instead (see
+        /// <see cref="ConsoleAttached"/>).
+        /// </summary>
+        public static ManagedGameProcess Adopt(Process process, int ringCapacity = 500, Func<string, Task>? logError = null)
+        {
+            var wrapper = new ManagedGameProcess(new LaunchSpec(), ringCapacity, logError) { _adopted = true };
+            process.EnableRaisingEvents = true;
+            process.Exited += (_, _) =>
+            {
+                int code;
+                try { code = process.ExitCode; } catch { code = -1; }
+                try { wrapper.OnExited?.Invoke(code); } catch { }
+            };
+            wrapper._process = process;
+            return wrapper;
         }
 
         public bool IsRunning
@@ -62,6 +84,22 @@ namespace Omnipotent.Services.KliveGames.Runtime
         /// <summary>True once a graceful stop or kill has been requested — lets the orchestrator tell an
         /// expected exit from a crash.</summary>
         public bool StopRequested => _stopRequested;
+
+        /// <summary>False for an adopted process: its stdout never reaches us and nothing can be written
+        /// to its stdin, so console output and commands must come from a remote console (or not at all)
+        /// until the server is restarted under this host.</summary>
+        public bool ConsoleAttached => !_adopted;
+
+        /// <summary>When the process was created. With the PID this is the only process identity Windows
+        /// guarantees across an app restart, since PIDs are recycled.</summary>
+        public DateTime? StartTimeUtc
+        {
+            get
+            {
+                try { return _process?.StartTime.ToUniversalTime(); }
+                catch { return null; }
+            }
+        }
 
         /// <summary>UTC time the last console line arrived — used by the stall watchdog.</summary>
         public DateTime LastOutputUtc => _lastOutputUtc;
@@ -115,12 +153,17 @@ namespace Omnipotent.Services.KliveGames.Runtime
             try { OnConsoleLine?.Invoke(line); } catch { }
         }
 
+        /// <summary>Records a line as though the process had printed it — used to explain out-of-band
+        /// events (an adoption, a stop we could not deliver) in the live console and its replay buffer.</summary>
+        public void AppendConsoleLine(string line) => HandleLine(line);
+
         /// <summary>Sends a single console command (a line written to the process's stdin).</summary>
         public async Task SendCommandAsync(string command)
         {
             if (command == null) return;
             var process = _process;
             if (process == null || !IsRunning) return;
+            if (_adopted) return; // no stdin to write to — the caller reports this to the user
             try
             {
                 await process.StandardInput.WriteLineAsync(command);

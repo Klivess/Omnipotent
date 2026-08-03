@@ -78,9 +78,17 @@ namespace Omnipotent.Services.KliveGames
 
                 _ = MonitorLoopAsync(cancellationToken.Token);
 
-                // Auto-start flagged servers.
+                // Auto-start flagged servers — skipping any that were just adopted, which StartAsync
+                // already treats as running. A failure here is invisible unless it is logged.
                 foreach (var inst in _instances.Values.Where(i => i.AutoStart))
-                    _ = StartAsync(inst.Id);
+                {
+                    string id = inst.Id;
+                    _ = Task.Run(async () =>
+                    {
+                        try { await StartAsync(id); }
+                        catch (Exception ex) { await ServiceLogError(ex, $"[KliveGames] Auto-start of '{inst.Name}' failed."); }
+                    });
+                }
 
                 await ServiceLog($"[KliveGames] Ready. {_instances.Count} instance(s) loaded.");
             }
@@ -132,38 +140,24 @@ namespace Omnipotent.Services.KliveGames
                     var inst = JsonConvert.DeserializeObject<GameServerInstance>(File.ReadAllText(meta));
                     if (inst == null || string.IsNullOrEmpty(inst.Id)) continue;
 
-                    // Reconcile: an app restart loses control of any prior child process. Only reclaim the
-                    // PID when its process name still matches this instance's expected runtime.
-                    if (inst.ChildPid is int pid)
+                    _instances[inst.Id] = inst;
+                    _consoleHubs.GetOrAdd(inst.Id, _ => new GameConsoleHub());
+
+                    // A game server outlives the app that launched it. If its process is still up, take it
+                    // back rather than starting a second copy on top of it (which would leave the first
+                    // one running unmanaged, holding the port, with players still on it).
+                    if (!await TryAdoptRunningProcessAsync(inst))
                     {
-                        try
-                        {
-                            var p = Process.GetProcessById(pid);
-                            string expected = Path.GetFileNameWithoutExtension(inst.LaunchTarget ?? "");
-                            bool matches = !string.IsNullOrWhiteSpace(expected)
-                                && p.ProcessName.Equals(expected, StringComparison.OrdinalIgnoreCase);
-                            matches |= inst.GameType == GameType.Minecraft
-                                && p.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase);
-                            matches |= inst.GameType == GameType.Terraria && inst.Flavor == ServerFlavor.TModLoader
-                                && p.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase);
-                            if (matches)
-                            {
-                                p.Kill(entireProcessTree: true);
-                                await ServiceLog($"[KliveGames] Reclaimed orphaned process {pid} for '{inst.Name}'.");
-                            }
-                        }
-                        catch { /* no such process — fine */ }
+                        inst.Status = GameServerStatus.Stopped;
+                        inst.ChildPid = null;
+                        inst.ChildStartedUtc = null;
+                        inst.Adopted = false;
+                        inst.OnlinePlayers = new();
+                        inst.CpuPercent = 0;
+                        inst.RamUsedBytes = 0;
+                        inst.RunningSinceUtc = null;
                     }
 
-                    inst.Status = GameServerStatus.Stopped;
-                    inst.ChildPid = null;
-                    inst.OnlinePlayers = new();
-                    inst.CpuPercent = 0;
-                    inst.RamUsedBytes = 0;
-                    inst.RunningSinceUtc = null;
-
-                    _instances[inst.Id] = inst;
-                    _consoleHubs[inst.Id] = new GameConsoleHub();
                     await SaveInstanceAsync(inst);
                 }
                 catch (Exception ex)
@@ -171,6 +165,96 @@ namespace Omnipotent.Services.KliveGames
                     await ServiceLogError(ex, $"[KliveGames] Failed to load instance from {dir}.");
                 }
             }
+        }
+
+        /// <summary>
+        /// Re-attaches to this instance's process if it is still running after an Omnipotent restart.
+        /// Everything is restored except stdio, which belonged to the dead host: resource sampling, exit
+        /// handling, auto-restart, and — for games with a remote console (Rust/RCON) — the live console,
+        /// the player roster and the graceful stop. Returns false when there is nothing to adopt.
+        /// </summary>
+        private async Task<bool> TryAdoptRunningProcessAsync(GameServerInstance inst)
+        {
+            if (inst.ChildPid is not int pid || inst.Status == GameServerStatus.Provisioning) return false;
+            if (_processes.TryGetValue(inst.Id, out var owned) && owned.IsRunning) return true; // already managed
+
+            Process process;
+            try
+            {
+                process = Process.GetProcessById(pid);
+                if (process.HasExited || !IsRecordedProcess(process, inst)) { process.Dispose(); return false; }
+            }
+            catch { return false; } // the process died with the app, or the PID now belongs to a stranger
+
+            try
+            {
+                var provider = _providers.Get(inst.GameType);
+                var hub = _consoleHubs.GetOrAdd(inst.Id, _ => new GameConsoleHub());
+                var proc = ManagedGameProcess.Adopt(process, ringCapacity: 500,
+                    logError: async m => await ServiceLogError($"[KliveGames:{inst.Name}] {m}"));
+                proc.OnConsoleLine += line => HandleConsoleLine(inst, hub, provider, line);
+                proc.OnExited += code => { _ = OnProcessExitedAsync(inst.Id, code); };
+                _processes[inst.Id] = proc;
+
+                // It may have exited in the moment between the liveness check and subscribing, in which
+                // case nothing was listening for the Exited event — treat it as never adopted.
+                if (!proc.IsRunning)
+                {
+                    _processes.TryRemove(inst.Id, out _);
+                    proc.Dispose();
+                    return false;
+                }
+
+                inst.Status = GameServerStatus.Running;
+                inst.Adopted = true;
+                inst.ChildStartedUtc = proc.StartTimeUtc;
+                inst.RunningSinceUtc = proc.StartTimeUtc;
+                inst.OnlinePlayers = new();
+                inst.LastError = null;
+
+                AttachRemoteConsole(inst, hub, provider);
+
+                proc.AppendConsoleLine($"[KliveGames] Re-attached to this server (pid {pid}) after an Omnipotent restart — it never stopped running. Console history from before the restart is not available.");
+                proc.AppendConsoleLine(_remoteConsoles.ContainsKey(inst.Id)
+                    ? "[KliveGames] Reconnecting its RCON console; commands and the player list come back in a moment."
+                    : "[KliveGames] Console output and commands stay unavailable for this server until it is restarted from KliveGames.");
+
+                if (inst.Public) _ = EnsurePublicAsync(inst, true);
+                await ServiceLog($"[KliveGames] Adopted the still-running '{inst.Name}' (pid {pid}) instead of starting a second copy.");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"[KliveGames] Failed to adopt the running process for '{inst.Name}'.");
+                _processes.TryRemove(inst.Id, out _);
+                DetachRemoteConsole(inst.Id);
+                return false;
+            }
+        }
+
+        /// <summary>Is this really the process this instance started? PIDs are recycled, so adopting on a
+        /// PID alone could hand a stranger's process the stop/kill button.</summary>
+        internal static bool IsRecordedProcess(Process process, GameServerInstance inst)
+        {
+            DateTime startedUtc;
+            try { startedUtc = process.StartTime.ToUniversalTime(); }
+            catch { return false; }
+
+            if (inst.ChildStartedUtc is DateTime recorded)
+                return Math.Abs((startedUtc - recorded).TotalSeconds) <= 2;
+
+            // Instances written before the creation time was recorded: fall back to matching the runtime
+            // by name, and require the process to be no older than the launch this instance remembers.
+            if (inst.LastStartedUtc is DateTime lastStarted && startedUtc < lastStarted.AddMinutes(-5)) return false;
+
+            string expected = Path.GetFileNameWithoutExtension(inst.LaunchTarget ?? "");
+            bool matches = !string.IsNullOrWhiteSpace(expected)
+                && process.ProcessName.Equals(expected, StringComparison.OrdinalIgnoreCase);
+            matches |= inst.GameType == GameType.Minecraft
+                && process.ProcessName.Contains("java", StringComparison.OrdinalIgnoreCase);
+            matches |= inst.GameType == GameType.Terraria && inst.Flavor == ServerFlavor.TModLoader
+                && process.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase);
+            return matches;
         }
 
         // ----------------------------------------------------------------- accessors for routes
@@ -286,6 +370,7 @@ namespace Omnipotent.Services.KliveGames
                     throw new InvalidOperationException("Server is still provisioning.");
 
                 var hub = _consoleHubs.GetOrAdd(id, _ => new GameConsoleHub());
+                await EnsurePortsAvailableAsync(inst, provider, hub);
                 var spec = await provider.BuildLaunchSpecAsync(inst, cancellationToken.Token);
 
                 var proc = new ManagedGameProcess(spec, ringCapacity: 500, logError: async m => await ServiceLogError($"[KliveGames:{inst.Name}] {m}"));
@@ -300,6 +385,8 @@ namespace Omnipotent.Services.KliveGames
                 _processes[id] = proc;
                 AttachRemoteConsole(inst, hub, provider);
                 inst.ChildPid = proc.Pid;
+                inst.ChildStartedUtc = proc.StartTimeUtc; // with the PID, this is what lets a later Omnipotent re-adopt it
+                inst.Adopted = false;
                 inst.LastStartedUtc = DateTime.UtcNow;
                 await SaveInstanceAsync(inst);
                 await hub.BroadcastEventAsync("status", new { status = inst.Status.ToString() });
@@ -330,18 +417,31 @@ namespace Omnipotent.Services.KliveGames
                 // Games with a remote console cannot be stopped through stdin — deliver the stop command
                 // there first, then let the process wrapper do nothing but wait.
                 string stopCommand = provider.GetGracefulStopCommand();
+                bool canRequestStop = true;
                 if (_remoteConsoles.ContainsKey(id))
                 {
                     try { await SendCommandAsync(id, stopCommand, echo: false); } catch { }
                     stopCommand = "";
                 }
+                else if (!proc.ConsoleAttached)
+                {
+                    // Adopted after an Omnipotent restart with no remote console: there is no way left to
+                    // ask this server to shut down, so waiting out the grace window would only delay a
+                    // termination. Say so rather than letting it look like a clean stop.
+                    stopCommand = "";
+                    canRequestStop = false;
+                    proc.AppendConsoleLine("[KliveGames] This server was re-attached after an Omnipotent restart, so its shutdown command cannot be delivered — terminating the process instead.");
+                    await ServiceLogError($"[KliveGames] Stopping adopted '{inst.Name}' by termination: no console to send '{provider.GetGracefulStopCommand()}' to.");
+                }
 
                 int grace = await GetIntOmniSetting("KliveGames_StopGraceSeconds", 90);
-                await proc.StopGracefullyAsync(stopCommand, TimeSpan.FromSeconds(grace), killOnExpiry: true);
+                await proc.StopGracefullyAsync(stopCommand, TimeSpan.FromSeconds(canRequestStop ? grace : 5), killOnExpiry: true);
                 DetachRemoteConsole(id);
 
                 inst.Status = GameServerStatus.Stopped;
                 inst.ChildPid = null;
+                inst.ChildStartedUtc = null;
+                inst.Adopted = false;
                 inst.OnlinePlayers = new();
                 inst.CpuPercent = 0;
                 inst.RamUsedBytes = 0;
@@ -370,6 +470,8 @@ namespace Omnipotent.Services.KliveGames
                 DetachRemoteConsole(id);
                 inst.Status = GameServerStatus.Stopped;
                 inst.ChildPid = null;
+                inst.ChildStartedUtc = null;
+                inst.Adopted = false;
                 inst.OnlinePlayers = new();
                 await SaveInstanceAsync(inst);
                 await BroadcastStatus(inst);
@@ -417,14 +519,18 @@ namespace Omnipotent.Services.KliveGames
             }
             else
             {
-                sent = _processes.TryGetValue(id, out var proc) && proc.IsRunning;
+                sent = _processes.TryGetValue(id, out var proc) && proc.IsRunning && proc.ConsoleAttached;
                 if (sent) await proc!.SendCommandAsync(command);
             }
 
             if (!echo || hub == null) return;
-            await hub.BroadcastLineAsync(sent
-                ? $"> {command}"
-                : $"> {command}    [not sent — the server console is not connected yet]");
+            if (sent) { await hub.BroadcastLineAsync($"> {command}"); return; }
+
+            bool adopted = _processes.TryGetValue(id, out var running) && running.IsRunning && !running.ConsoleAttached;
+            string reason = adopted
+                ? "this server was re-attached after an Omnipotent restart and its console input is gone — restart the server to get it back"
+                : "the server console is not connected yet";
+            await hub.BroadcastLineAsync($"> {command}    [not sent — {reason}]");
         }
 
         public async Task<string?> SendPlayerActionAsync(string id, string action, string player)
@@ -486,7 +592,12 @@ namespace Omnipotent.Services.KliveGames
             try
             {
                 if (string.IsNullOrWhiteSpace(message.Text)) return;
-                bool broadcast = message.Kind == RemoteConsoleMessageKind.Reply;
+
+                // Server-pushed log lines normally duplicate stdout and are dropped. An adopted server has
+                // no stdout to duplicate, so there they are the only console output there is.
+                bool stdoutAttached = !_processes.TryGetValue(inst.Id, out var proc) || proc.ConsoleAttached;
+                bool broadcast = message.Kind == RemoteConsoleMessageKind.Reply
+                    || (message.Kind == RemoteConsoleMessageKind.Broadcast && !stdoutAttached);
 
                 if (provider.TryParseListReply(message.Text, out _, out int max, out var names))
                 {
@@ -508,7 +619,13 @@ namespace Omnipotent.Services.KliveGames
                 }
 
                 foreach (string line in message.Text.Split('\n'))
-                    HandleConsoleLine(inst, hub, provider, line.TrimEnd('\r'), broadcast);
+                {
+                    string text = line.TrimEnd('\r');
+                    // For an adopted server this is the console log, so it belongs in the replay buffer
+                    // too — AppendConsoleLine stores it and raises the same handling as stdout would.
+                    if (broadcast && !stdoutAttached && proc != null) proc.AppendConsoleLine(text);
+                    else HandleConsoleLine(inst, hub, provider, text, broadcast);
+                }
             }
             catch { }
         }
@@ -564,6 +681,8 @@ namespace Omnipotent.Services.KliveGames
 
             DetachRemoteConsole(id); // nothing to talk to once the process is gone
             inst.ChildPid = null;
+            inst.ChildStartedUtc = null;
+            inst.Adopted = false;
             inst.OnlinePlayers = new();
             inst.CpuPercent = 0;
             inst.RamUsedBytes = 0;
@@ -681,6 +800,34 @@ namespace Omnipotent.Services.KliveGames
                     return candidate;
             }
             throw new InvalidOperationException("No free port available.");
+        }
+
+        /// <summary>
+        /// Refuses to spawn a server onto a port something else is already holding. That something is
+        /// usually this server's own earlier process — one that outlived an Omnipotent restart and could
+        /// not be identified for adoption. Starting on top of it yields one server that cannot bind and
+        /// one that nothing is managing, which is worse than not starting at all.
+        /// </summary>
+        private async Task EnsurePortsAvailableAsync(GameServerInstance inst, IGameProvider provider, GameConsoleHub hub)
+        {
+            List<GameNetworkPort> taken = new();
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                if (attempt > 0) await Task.Delay(1000); // a process that just died may still be releasing its sockets
+                taken = provider.GetNetworkPorts(inst.Port)
+                    .Where(binding => !IsPortFree(binding, ignoreInstanceId: inst.Id))
+                    .ToList();
+                if (taken.Count == 0) return;
+            }
+
+            string ports = string.Join(", ", taken.Select(binding => $"{binding.Port}/{binding.Protocol}"));
+            string message = $"Port {ports} is already in use, so '{inst.Name}' was not started. This is usually the server's own "
+                + "previous process, still running from before Omnipotent restarted — end that process (or reboot) and start again.";
+            inst.LastError = message;
+            _ = SaveInstanceAsync(inst);
+            await hub.BroadcastLineAsync($"[KliveGames] {message}");
+            await ServiceLogError($"[KliveGames] {message}");
+            throw new InvalidOperationException(message);
         }
 
         private bool IsPortFree(GameNetworkPort binding, string? ignoreInstanceId = null)

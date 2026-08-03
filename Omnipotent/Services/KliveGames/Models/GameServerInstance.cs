@@ -43,8 +43,15 @@ namespace Omnipotent.Services.KliveGames.Models
 
         // ---- State ----
         public GameServerStatus Status { get; set; } = GameServerStatus.Stopped;
-        /// <summary>PID of the last spawned game process, used to reconcile orphans on app restart.</summary>
+        /// <summary>PID of the last spawned game process, used to re-adopt it on app restart.</summary>
         public int? ChildPid { get; set; }
+        /// <summary>Creation time of <see cref="ChildPid"/>. Windows recycles PIDs, so only the pair
+        /// identifies the process for certain — without it a restart could adopt (or kill) a stranger.</summary>
+        public DateTime? ChildStartedUtc { get; set; }
+        /// <summary>True while this server is one Omnipotent re-attached to after a restart rather than
+        /// started itself: it keeps running with its players, but its stdio is gone, so console output and
+        /// commands only work for games with a remote console (Rust/RCON) until it is restarted.</summary>
+        public bool Adopted { get; set; }
 
         // ---- Paths (relative to AppDomain base via OmniPaths.GetPath) ----
         /// <summary>Absolute path to the server's working directory (where the jar + world live).</summary>
