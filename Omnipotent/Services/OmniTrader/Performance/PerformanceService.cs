@@ -114,15 +114,15 @@ namespace Omnipotent.Services.OmniTrader.Performance
         private readonly LedgerRepository ledgerRepo;
         private readonly FirmOrderRepository orderRepo;
         private readonly JournalRepository journalRepo;
-        private readonly AccountRepository accountRepo;
+        private readonly FirmValueRepository valueRepo;
 
         public PerformanceService(LedgerRepository ledgerRepo, FirmOrderRepository orderRepo,
-            JournalRepository journalRepo, AccountRepository accountRepo)
+            JournalRepository journalRepo, FirmValueRepository valueRepo)
         {
             this.ledgerRepo = ledgerRepo;
             this.orderRepo = orderRepo;
             this.journalRepo = journalRepo;
-            this.accountRepo = accountRepo;
+            this.valueRepo = valueRepo;
         }
 
         public async Task<PerformanceReport> BuildAsync(DateTime? fromUtc = null, CancellationToken ct = default)
@@ -185,8 +185,10 @@ namespace Omnipotent.Services.OmniTrader.Performance
                                         .GroupBy(x => x.tag))
                 report.ByRegimeTag.Add(BuildSlice(group.Key, group.Key, group.Select(x => x.j).ToList(), new List<LedgerEntry>()));
 
-            var series = await accountRepo.SnapshotSeriesAsync(from, ct);
-            var curve = series.GroupBy(s => s.Ts).Select(g => (g.Key, g.Sum(x => x.Value))).OrderBy(p => p.Key).ToList();
+            // Real firm value, already whole-firm and in the reporting currency — one recorded point
+            // per valuation, so there is nothing to group or sum here.
+            var series = await valueRepo.SeriesAsync(from, ct);
+            var curve = series.Select(p => (p.Ts, p.TotalValue)).ToList();
             report.EquityCurve.AddRange(curve);
 
             return new PerformanceReport

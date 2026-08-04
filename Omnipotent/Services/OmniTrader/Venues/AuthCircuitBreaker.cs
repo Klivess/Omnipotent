@@ -98,5 +98,19 @@ namespace Omnipotent.Services.OmniTrader.Venues
         /// </summary>
         public static bool IsRejection(System.Net.HttpStatusCode status)
             => status is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden;
+
+        /// <summary>
+        /// The same question, when the broker also said *why*.
+        ///
+        /// IG answers an exhausted request quota with 403 and an `exceeded-…-allowance` code — the
+        /// same status as a bad key. Treating that as a credential rejection takes a perfectly good
+        /// venue offline for the cooldown precisely when it is busiest, and no amount of fixing the
+        /// key would have helped. A quota is transient; waiting is the fix.
+        /// </summary>
+        public static bool IsRejection(System.Net.HttpStatusCode status, string? errorCode)
+        {
+            if (!IsRejection(status)) return false;
+            return errorCode == null || !errorCode.Contains("allowance", StringComparison.OrdinalIgnoreCase);
+        }
     }
 }

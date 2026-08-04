@@ -161,20 +161,146 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             CacheDeps.Bump(CacheKey);
         }, ct);
 
-        public async Task<List<(DateTime Ts, VenueId Venue, decimal Value)>> SnapshotSeriesAsync(DateTime? fromUtc = null, CancellationToken ct = default)
+        /// <summary>
+        /// Per-account broker balances over time, in each account's own currency. This is broker
+        /// truth for one account — it is deliberately *not* a firm value, and must never be summed
+        /// into one: the rows span environments and currencies, and omit owned inventory. Firm value
+        /// lives in <see cref="FirmValueRepository"/>.
+        /// </summary>
+        public async Task<List<(DateTime Ts, VenueId Venue, string Environment, string AccountId, string Currency, decimal Value)>>
+            SnapshotSeriesAsync(DateTime? fromUtc = null, CancellationToken ct = default)
         {
             CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"SELECT ts, venue, COALESCE(equity, balance, 0) FROM account_snapshots
+            cmd.CommandText = @"SELECT ts, venue, environment, account_id, COALESCE(equity, balance, 0), json
+                                FROM account_snapshots
                                 WHERE ($f IS NULL OR ts >= $f) ORDER BY ts";
             cmd.Parameters.AddWithValue("$f", FirmJson.Nullable(fromUtc));
             await using var reader = await cmd.ExecuteReaderAsync(ct);
-            var list = new List<(DateTime, VenueId, decimal)>();
+            var list = new List<(DateTime, VenueId, string, string, string, decimal)>();
             while (await reader.ReadAsync(ct))
+            {
+                var snapshot = FirmJson.Read<VenueAccountSnapshot>(reader.GetString(5));
                 list.Add((FirmJson.Utc(reader.GetString(0)),
                           Enum.TryParse<VenueId>(reader.GetString(1), out var v) ? v : VenueId.Internal,
-                          (decimal)reader.GetDouble(2)));
+                          reader.GetString(2),
+                          reader.GetString(3),
+                          snapshot?.BaseCurrency ?? "USD",
+                          (decimal)reader.GetDouble(4)));
+            }
+            return list;
+        }
+    }
+
+    // ── firm value history ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// One valuation of the whole firm at one instant: real-money accounts only, already converted
+    /// to the reporting currency, owned inventory included. This is the series the firm value chart
+    /// reads, and it is the same arithmetic as the live figure beside it — so the two agree.
+    /// </summary>
+    public sealed class FirmValuePoint
+    {
+        public required DateTime Ts { get; init; }
+        public required string Currency { get; init; }
+
+        /// <summary>Cash + marked owned inventory + broker-reported derivative equity, live only.</summary>
+        public required decimal TotalValue { get; init; }
+        public decimal Cash { get; init; }
+        public decimal InventoryValue { get; init; }
+        public decimal DerivativeEquity { get; init; }
+        /// <summary>Exposure, never an asset — carried for context, never summed into value.</summary>
+        public decimal DerivativeNotional { get; init; }
+        public decimal GrossExposure { get; init; }
+        public decimal UnrealizedPnL { get; init; }
+        public decimal RealizedPnLToday { get; init; }
+        public int Positions { get; init; }
+
+        /// <summary>False when no live venue is connected, so a flat £0 reads as "nothing real is
+        /// hooked up" rather than as a wiped-out book.</summary>
+        public bool HasRealAccounts { get; init; }
+        /// <summary>Paper and demo, recorded alongside for research. Never part of firm value.</summary>
+        public decimal SimulatedValue { get; init; }
+    }
+
+    public sealed class FirmValueRepository
+    {
+        private const string CacheKey = "omnitrader:firm-value";
+
+        /// <summary>Two years of five-minute points is a few hundred thousand rows at worst — small
+        /// for SQLite, and long enough that no chart window can outrun it.</summary>
+        private static readonly TimeSpan Retention = TimeSpan.FromDays(730);
+
+        private readonly OmniTraderDb db;
+        public FirmValueRepository(OmniTraderDb db) => this.db = db;
+
+        public Task RecordAsync(FirmValuePoint point, CancellationToken ct = default)
+            => db.WithWriteLockAsync(async conn =>
+        {
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"INSERT INTO firm_value_points
+                    (ts, currency, total_value, cash, inventory_value, derivative_equity, derivative_notional,
+                     gross_exposure, unrealized_pnl, realized_pnl_today, positions, has_real_accounts, simulated_value)
+                    VALUES ($ts,$c,$tv,$cash,$inv,$de,$dn,$ge,$up,$rp,$pos,$hra,$sim)
+                    ON CONFLICT(ts) DO NOTHING";
+                cmd.Parameters.AddWithValue("$ts", point.Ts.ToString("o"));
+                cmd.Parameters.AddWithValue("$c", point.Currency);
+                cmd.Parameters.AddWithValue("$tv", (double)point.TotalValue);
+                cmd.Parameters.AddWithValue("$cash", (double)point.Cash);
+                cmd.Parameters.AddWithValue("$inv", (double)point.InventoryValue);
+                cmd.Parameters.AddWithValue("$de", (double)point.DerivativeEquity);
+                cmd.Parameters.AddWithValue("$dn", (double)point.DerivativeNotional);
+                cmd.Parameters.AddWithValue("$ge", (double)point.GrossExposure);
+                cmd.Parameters.AddWithValue("$up", (double)point.UnrealizedPnL);
+                cmd.Parameters.AddWithValue("$rp", (double)point.RealizedPnLToday);
+                cmd.Parameters.AddWithValue("$pos", point.Positions);
+                cmd.Parameters.AddWithValue("$hra", point.HasRealAccounts ? 1 : 0);
+                cmd.Parameters.AddWithValue("$sim", (double)point.SimulatedValue);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+
+            await using (var prune = conn.CreateCommand())
+            {
+                prune.CommandText = "DELETE FROM firm_value_points WHERE ts < $cutoff";
+                prune.Parameters.AddWithValue("$cutoff", (DateTime.UtcNow - Retention).ToString("o"));
+                await prune.ExecuteNonQueryAsync(ct);
+            }
+
+            CacheDeps.Bump(CacheKey);
+        }, ct);
+
+        public async Task<List<FirmValuePoint>> SeriesAsync(DateTime? fromUtc = null, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await db.OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT ts, currency, total_value, cash, inventory_value, derivative_equity,
+                                       derivative_notional, gross_exposure, unrealized_pnl, realized_pnl_today,
+                                       positions, has_real_accounts, simulated_value
+                                FROM firm_value_points
+                                WHERE ($f IS NULL OR ts >= $f) ORDER BY ts";
+            cmd.Parameters.AddWithValue("$f", FirmJson.Nullable(fromUtc));
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var list = new List<FirmValuePoint>();
+            while (await reader.ReadAsync(ct))
+                list.Add(new FirmValuePoint
+                {
+                    Ts = FirmJson.Utc(reader.GetString(0)),
+                    Currency = reader.GetString(1),
+                    TotalValue = (decimal)reader.GetDouble(2),
+                    Cash = (decimal)reader.GetDouble(3),
+                    InventoryValue = (decimal)reader.GetDouble(4),
+                    DerivativeEquity = (decimal)reader.GetDouble(5),
+                    DerivativeNotional = (decimal)reader.GetDouble(6),
+                    GrossExposure = (decimal)reader.GetDouble(7),
+                    UnrealizedPnL = (decimal)reader.GetDouble(8),
+                    RealizedPnLToday = (decimal)reader.GetDouble(9),
+                    Positions = reader.GetInt32(10),
+                    HasRealAccounts = reader.GetInt32(11) != 0,
+                    SimulatedValue = (decimal)reader.GetDouble(12)
+                });
             return list;
         }
     }

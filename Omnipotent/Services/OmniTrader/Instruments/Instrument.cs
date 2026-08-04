@@ -76,8 +76,21 @@ namespace Omnipotent.Services.OmniTrader.Instruments
     {
         public required string InstrumentId { get; init; }
         public DateTime? LastUpdateUtc { get; init; }
+
+        /// <summary>How old the newest data itself is. On a bar series this is at least one bar by
+        /// definition, so it is only meaningful next to <see cref="Cadence"/>.</summary>
         public required TimeSpan Age { get; init; }
+        /// <summary>How long since the feed last answered at all — the platform-health half of
+        /// freshness, and the only half that is a fault on its own.</summary>
+        public TimeSpan ObservationAge { get; init; }
+        /// <summary>How often new data is expected, when the caller knew. Null for live ticks.</summary>
+        public TimeSpan? Cadence { get; init; }
+
         public required bool Stale { get; init; }
+        /// <summary>The feed is healthy but has stopped producing bars on a market that keeps
+        /// session hours. Reported instead of staleness, because a shut exchange is not a fault.</summary>
+        public bool MarketLikelyClosed { get; init; }
+
         public string? Source { get; init; }
         public string? Issue { get; init; }
     }

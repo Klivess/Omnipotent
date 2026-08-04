@@ -41,6 +41,7 @@ namespace Omnipotent.Services.OmniTrader
         public StrategyVersionRepository VersionRepo { get; }
         public WatchlistRepository WatchlistRepo { get; }
         public FirmSettingsRepository Settings { get; }
+        public FirmValueRepository FirmValueRepo { get; }
 
         // ── services ──────────────────────────────────────────────────────────────
         public VenueRegistry Venues { get; }
@@ -78,6 +79,7 @@ namespace Omnipotent.Services.OmniTrader
             VersionRepo = new StrategyVersionRepository(db);
             WatchlistRepo = new WatchlistRepository(db);
             Settings = new FirmSettingsRepository(db);
+            FirmValueRepo = new FirmValueRepository(db);
 
             Venues = new VenueRegistry();
             Instruments = new InstrumentMaster(InstrumentRepo, Venues);
@@ -101,7 +103,8 @@ namespace Omnipotent.Services.OmniTrader
 
             Risk = new RiskEngine(() => limits);
             Ledger = new FirmLedger(LedgerRepo, ReconRepo, Instruments);
-            Portfolio = new PortfolioService(Ledger, Instruments, Venues, parent.MarketData, LedgerRepo, Accounts);
+            Portfolio = new PortfolioService(Ledger, Instruments, Venues, parent.MarketData, LedgerRepo,
+                Accounts, FirmValueRepo);
 
             Orders = new OrderService(Venues, Instruments, Risk, Emergency, OrderRepo, RiskRepo, Ledger,
                 Alerts, Audit, () => Portfolio.BuildRiskStateAsync(), m => _ = parent.ServiceLog($"[orders] {m}"));
@@ -112,7 +115,7 @@ namespace Omnipotent.Services.OmniTrader
             Journal = new JournalService(JournalRepo, RiskRepo, Instruments, parent.MarketData);
             Watchlists = new WatchlistService(WatchlistRepo, Instruments, parent.MarketData);
             Research = new ExperimentRegistry(ExperimentRepo, VersionRepo, parent.BacktestJobRepo);
-            PerformanceService = new PerformanceService(LedgerRepo, OrderRepo, JournalRepo, Accounts);
+            PerformanceService = new PerformanceService(LedgerRepo, OrderRepo, JournalRepo, FirmValueRepo);
             Health = new HealthMonitor(Venues, Instruments, OrderRepo, ReconRepo, Emergency, Alerts,
                 () => Reconciliation.LastRunUtc);
         }
@@ -139,6 +142,11 @@ namespace Omnipotent.Services.OmniTrader
             // Startup is one of the mandated reconciliation triggers.
             try { await Reconciliation.ReconcileAllAsync("startup", ct); }
             catch (Exception ex) { await parent.ServiceLogError(ex, "startup reconciliation failed"); }
+
+            // Open the value history with a point as soon as the book is trustworthy, so the chart is
+            // not blank until the first scheduled sweep.
+            try { await Portfolio.RecordValuePointAsync(await Portfolio.BuildAsync(ct), ct); }
+            catch (Exception ex) { await parent.ServiceLogError(ex, "recording startup firm value failed"); }
 
             await Audit.AppendAsync("system", "firm.started", "firm",
                 $"{Venues.All.Count} venue(s), {Instruments.Count} instrument(s)", ct: ct);
@@ -231,7 +239,11 @@ namespace Omnipotent.Services.OmniTrader
                     return;
                 }
 
-                var adapter = new Trading212VenueAdapter(apiKey, environment, parent.MarketData);
+                // Current T212 keys are a key/secret pair sent as HTTP Basic. The secret is optional
+                // here only so an older single-token key keeps working; without it the adapter falls
+                // back to the legacy header rather than sending half a credential.
+                var (apiSecret, _) = await ResolveCredentialAsync($"{settingPrefix}.ApiSecret");
+                var adapter = new Trading212VenueAdapter(apiKey, apiSecret, environment, parent.MarketData);
                 Venues.Register(adapter);
                 credentialSources[VenueRegistry.Key(VenueId.Trading212, environment)] = source;
                 bool connected = await adapter.ConnectAsync(ct);
@@ -338,7 +350,12 @@ namespace Omnipotent.Services.OmniTrader
                         await Task.Delay(TimeSpan.FromMinutes(5), ct);
                         await Orders.ReconcileOutstandingAsync(ct);
                         await Reconciliation.ReconcileAllAsync("scheduled", ct);
-                        var state = await Portfolio.BuildRiskStateAsync(ct);
+
+                        // One valuation serves both jobs: it is what risk measures against, and it is
+                        // the point that goes into firm value history.
+                        var view = await Portfolio.BuildAsync(ct);
+                        await Portfolio.RecordValuePointAsync(view, ct);
+                        var state = await Portfolio.BuildRiskStateAsync(view, ct);
                         var operations = await Orders.BuildOperationalStateAsync(null, ct);
                         Emergency.EvaluateAutomaticTriggers(state, operations, limits);
                     }

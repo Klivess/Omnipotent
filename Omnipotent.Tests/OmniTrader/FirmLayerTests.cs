@@ -1,4 +1,5 @@
 using Omnipotent.Services.OmniTrader.Analytics;
+using Omnipotent.Services.OmniTrader.Api;
 using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Instruments;
 using Omnipotent.Services.OmniTrader.Journal;
@@ -6,6 +7,7 @@ using Omnipotent.Services.OmniTrader.Ledger;
 using Omnipotent.Services.OmniTrader.MarketData;
 using Omnipotent.Services.OmniTrader.Ops;
 using Omnipotent.Services.OmniTrader.Performance;
+using Omnipotent.Services.OmniTrader.Persistence;
 using Omnipotent.Services.OmniTrader.Portfolio;
 using Omnipotent.Services.OmniTrader.Risk;
 using Omnipotent.Services.OmniTrader.Venues;
@@ -606,6 +608,198 @@ namespace Omnipotent.Tests.OmniTrader
             Assert.False(PortfolioService.IsRealMoney(TradingEnvironment.Historical));
         }
 
+        // ── data freshness ────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// The bug this locks down: a bar series' newest bar is at least one bar old the moment it
+        /// closes, but freshness judged it against a flat 15-minute threshold meant for live ticks.
+        /// Every instrument on hourly bars was therefore permanently "stale" — and staleness is a
+        /// *hard* rule in the risk engine, so it silently blocked every order as well.
+        /// </summary>
+        [Fact]
+        public void AnHourlyBarIsNotStaleForBeingAnHourOld()
+        {
+            var (stale, _, _, _) = InstrumentMaster.Judge(
+                dataAge: TimeSpan.FromMinutes(19),
+                observationAge: TimeSpan.Zero,
+                cadence: TimeSpan.FromHours(1),
+                continuous: true,
+                feedThreshold: TimeSpan.FromMinutes(15));
+
+            Assert.False(stale);
+        }
+
+        [Fact]
+        public void AContinuousMarketThatSkipsBarsIsStale()
+        {
+            // Crypto never closes, so a gap of several hourly bars is a real fault.
+            var (stale, marketClosed, _, dataOld) = InstrumentMaster.Judge(
+                dataAge: TimeSpan.FromHours(5),
+                observationAge: TimeSpan.Zero,
+                cadence: TimeSpan.FromHours(1),
+                continuous: true,
+                feedThreshold: TimeSpan.FromMinutes(15));
+
+            Assert.True(dataOld);
+            Assert.True(stale);
+            Assert.False(marketClosed);
+        }
+
+        [Fact]
+        public void AShutExchangeIsReportedClosedRatherThanStale()
+        {
+            // The feed answered just now; it simply has no newer bar because the market is shut.
+            // Blocking trading on that would block every evening and every weekend.
+            var (stale, marketClosed, _, _) = InstrumentMaster.Judge(
+                dataAge: TimeSpan.FromHours(16),
+                observationAge: TimeSpan.FromSeconds(3),
+                cadence: TimeSpan.FromHours(1),
+                continuous: false,
+                feedThreshold: TimeSpan.FromMinutes(15));
+
+            Assert.False(stale);
+            Assert.True(marketClosed);
+        }
+
+        [Fact]
+        public void AnUnreachableFeedIsStaleWhateverTheMarketIsDoing()
+        {
+            // The one failure that is always ours: we have not managed to read anything.
+            var (stale, marketClosed, feedSilent, _) = InstrumentMaster.Judge(
+                dataAge: TimeSpan.FromMinutes(1),
+                observationAge: TimeSpan.FromHours(2),
+                cadence: TimeSpan.FromHours(1),
+                continuous: false,
+                feedThreshold: TimeSpan.FromMinutes(15));
+
+            Assert.True(feedSilent);
+            Assert.True(stale);
+            Assert.False(marketClosed);
+        }
+
+        [Fact]
+        public void ALiveTickWithNoCadenceStillUsesTheTickThreshold()
+        {
+            // No cadence means this was a live price, not a bar: 40 minutes old really is stale.
+            var (fresh, _, _, _) = InstrumentMaster.Judge(
+                TimeSpan.FromMinutes(4), TimeSpan.Zero, null, true, TimeSpan.FromMinutes(15));
+            var (stale, _, _, _) = InstrumentMaster.Judge(
+                TimeSpan.FromMinutes(40), TimeSpan.Zero, null, true, TimeSpan.FromMinutes(15));
+
+            Assert.False(fresh);
+            Assert.True(stale);
+        }
+
+        [Fact]
+        public void ToleranceAllowsForOpenVersusCloseStampedBars()
+        {
+            // Providers disagree about whether a bar carries its open or its close time, so one
+            // interval of the difference is convention rather than lateness.
+            Assert.True(InstrumentMaster.ToleranceFor(TimeSpan.FromHours(1)) > TimeSpan.FromHours(2));
+            Assert.True(InstrumentMaster.ToleranceFor(TimeSpan.FromMinutes(15)) > TimeSpan.FromMinutes(30));
+        }
+
+        // ── firm value history ────────────────────────────────────────────────────
+
+        /// <summary>
+        /// The bug this locks down: firm value used to be assembled by summing per-account broker
+        /// snapshots at each timestamp. Because every venue writes its snapshot at its own instant,
+        /// each "total" was really one account — and the chart sawtoothed between a demo account's
+        /// £10,000 opening balance and a live account's cash. A value point is now the whole firm at
+        /// one instant, so a demo balance has nowhere to enter the total.
+        /// </summary>
+        [Fact]
+        public void SimulatedMoneyNeverReachesFirmValue()
+        {
+            var view = new FirmPortfolioView { ReportingCurrency = "GBP", AsOfUtc = DateTime.UtcNow };
+            view.Real.Cash = 11m;
+            view.Real.Positions = 1;
+            // An IG demo account opens at £10,000 and the built-in paper trader at another 10,000.
+            view.Simulated.Cash = 10_000m;
+            view.Simulated.InventoryValue = 2_500m;
+
+            var point = PortfolioService.ToValuePoint(view);
+
+            Assert.Equal(11m, point.TotalValue);
+            Assert.Equal(11m, point.Cash);
+            Assert.Equal(12_500m, point.SimulatedValue);
+        }
+
+        [Fact]
+        public void ATrendPointIsOneWholeFirmValuation()
+        {
+            var start = new DateTime(2026, 8, 1, 0, 0, 0, DateTimeKind.Utc);
+            var series = new List<FirmValuePoint>
+            {
+                ValuePoint(start, 100m),
+                ValuePoint(start.AddMinutes(5), 120m),
+                ValuePoint(start.AddMinutes(10), 90m)
+            };
+
+            var trend = FirmRoutes.BuildValueTrend(series, 30);
+
+            // Three valuations in, three points out: nothing is grouped, summed or interleaved.
+            Assert.Equal(3, trend.Points.Count);
+            Assert.Equal(new[] { 100m, 120m, 90m }, trend.Points.Select(p => p.Value));
+            Assert.Equal(120m, trend.PeakValue);
+            Assert.Equal(90m, trend.TroughValue);
+        }
+
+        [Fact]
+        public void NoValuationsMeansNoNumbersRatherThanZeroes()
+        {
+            var trend = FirmRoutes.BuildValueTrend(new List<FirmValuePoint>(), 30);
+
+            // A firm whose value has never been measured is not a firm worth £0.
+            Assert.Empty(trend.Points);
+            Assert.Null(trend.PeakValue);
+            Assert.Null(trend.TroughValue);
+            Assert.Null(trend.Change24h);
+        }
+
+        [Fact]
+        public void TheTwentyFourHourChangeComparesLikeWithLike()
+        {
+            var now = DateTime.UtcNow;
+            var series = new List<FirmValuePoint>
+            {
+                ValuePoint(now.AddHours(-48), 800m),
+                ValuePoint(now.AddHours(-25), 1_000m),
+                ValuePoint(now.AddHours(-1), 1_250m)
+            };
+
+            var trend = FirmRoutes.BuildValueTrend(series, 30);
+
+            Assert.Equal(250m, trend.Change24h);
+            Assert.Equal(25m, trend.ChangePercent24h);
+        }
+
+        [Fact]
+        public void DownsamplingAlwaysKeepsTheLatestValue()
+        {
+            var start = new DateTime(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+            // Five-minute valuations over 30 days — far more than a chart can draw.
+            var series = Enumerable.Range(0, 2_000)
+                .Select(i => ValuePoint(start.AddMinutes(5 * i), 1_000m + i))
+                .ToList();
+
+            var trend = FirmRoutes.BuildValueTrend(series, 30);
+
+            Assert.True(trend.Points.Count <= 120);
+            // The right-hand end of the chart is the number the operator reads as "now".
+            Assert.Equal(series[^1].TotalValue, trend.Points[^1].Value);
+            Assert.Equal(series[^1].Ts, trend.LastUtc);
+        }
+
+        private static FirmValuePoint ValuePoint(DateTime ts, decimal total) => new()
+        {
+            Ts = ts,
+            Currency = "GBP",
+            TotalValue = total,
+            Cash = total,
+            HasRealAccounts = true
+        };
+
         [Theory]
         [InlineData("BTCUSDT", false)]
         [InlineData("ETHGBP", false)]
@@ -633,6 +827,92 @@ namespace Omnipotent.Tests.OmniTrader
         public void Trading212TickersMapOntoMarketDataSymbols(string venueSymbol, string expected)
         {
             Assert.Equal(expected, Trading212VenueAdapter.ToMarketSymbol(venueSymbol));
+        }
+
+        // ── Trading 212 wire contract ─────────────────────────────────────────────
+
+        [Fact]
+        public void ATrading212KeyPairIsSentAsHttpBasic()
+        {
+            // Documented scheme: the key is the username and the secret the password.
+            string header = Trading212VenueAdapter.BuildAuthorization("key-id", "the-secret");
+            Assert.StartsWith("Basic ", header);
+            Assert.Equal("key-id:the-secret",
+                System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(header["Basic ".Length..])));
+        }
+
+        [Fact]
+        public void AKeyWithNoSecretFallsBackToTheLegacyHeader()
+        {
+            // Older single-token keys are still accepted by T212; half a Basic credential is not.
+            Assert.Equal("legacy-token", Trading212VenueAdapter.BuildAuthorization("legacy-token", null));
+            Assert.Equal("legacy-token", Trading212VenueAdapter.BuildAuthorization("legacy-token", "   "));
+        }
+
+        [Fact]
+        public void PlacingAnOrderIsNeverPacedLikeListingOne()
+        {
+            // The two share a path prefix but differ by a factor of four in their allowance, and
+            // throttling execution to the speed of a report is the bug this guards.
+            var place = Trading212VenueAdapter.LimitFor("/equity/orders/market");
+            var list = Trading212VenueAdapter.LimitFor("/equity/orders");
+            var read = Trading212VenueAdapter.LimitFor("/equity/orders/987654321");
+
+            Assert.NotNull(place); Assert.NotNull(list); Assert.NotNull(read);
+            Assert.True(place!.Value.MinInterval < list!.Value.MinInterval);
+            Assert.NotEqual(list.Value.Bucket, place.Value.Bucket);
+            // Resolving an ambiguous submission walks several ids; five seconds each would time out
+            // the reconciliation before it finished.
+            Assert.True(read!.Value.MinInterval <= TimeSpan.FromSeconds(1));
+        }
+
+        [Fact]
+        public void TheOrderSideComesFromTheVenueRatherThanTheSignOfTheQuantity()
+        {
+            // T212 takes a negative quantity to mean "sell" on the way *in*, but reports the side
+            // explicitly on the way out — and reports the quantity unsigned. Inferring from the sign
+            // would read every sell back as a buy.
+            var sell = Newtonsoft.Json.Linq.JObject.Parse(
+                @"{ 'id': 1, 'quantity': 10, 'side': 'SELL', 'status': 'FILLED',
+                    'filledQuantity': 10, 'filledValue': 2500,
+                    'instrument': { 'ticker': 'AAPL_US_EQ' } }".Replace('\'', '"'));
+
+            var snapshot = Trading212VenueAdapter.ToOrderSnapshot(sell);
+
+            Assert.NotNull(snapshot);
+            Assert.Equal(OrderSide.Sell, snapshot!.Side);
+            Assert.Equal("AAPL_US_EQ", snapshot.VenueSymbol);
+            // There is no average-fill field: it is the value over the quantity.
+            Assert.Equal(250m, snapshot.AverageFillPrice);
+        }
+
+        [Theory]
+        [InlineData("NEW")]
+        [InlineData("CONFIRMED")]
+        [InlineData("CANCELLING")]
+        [InlineData("REPLACING")]
+        public void AnOrderStillOnTheBookIsOpenWhateverItIsCalled(string status)
+        {
+            // T212 has eleven statuses. Everything that is not a terminal outcome is still live, and
+            // must not be read as resolved — an order treated as gone is an order that gets re-sent.
+            var order = Newtonsoft.Json.Linq.JObject.Parse(
+                $"{{ 'id': 1, 'quantity': 1, 'status': '{status}' }}".Replace('\'', '"'));
+
+            Assert.Equal(OrderStatus.Open, Trading212VenueAdapter.ToOrderSnapshot(order)!.Status);
+        }
+
+        [Fact]
+        public void AnExhaustedQuotaIsNotABadCredential()
+        {
+            // IG answers a spent request allowance with 403 — the same status as a wrong key. Opening
+            // the auth breaker there takes a working venue offline for the cooldown, and no amount of
+            // fixing the credential would have helped.
+            Assert.False(AuthCircuitBreaker.IsRejection(
+                System.Net.HttpStatusCode.Forbidden, "error.public-api.exceeded-account-allowance"));
+            Assert.True(AuthCircuitBreaker.IsRejection(
+                System.Net.HttpStatusCode.Forbidden, "error.security.api-key-invalid"));
+            Assert.True(AuthCircuitBreaker.IsRejection(
+                System.Net.HttpStatusCode.Unauthorized, null));
         }
 
         private static JournalRecord ClosedTrade(DateTime ts, decimal pnl) => new()

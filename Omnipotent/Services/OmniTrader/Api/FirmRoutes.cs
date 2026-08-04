@@ -272,6 +272,21 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Deleted = true });
             });
 
+            // Add or remove a single instrument. Saving the whole list to add one row makes two
+            // browser tabs overwrite each other, and it forces the UI into an edit-then-commit
+            // ceremony for what should be one gesture.
+            await Post("/api/omnitrader/firm/markets/watchlist/instrument", async req =>
+            {
+                var dto = Body<WatchlistInstrumentDto>(req);
+                if (dto == null || string.IsNullOrWhiteSpace(dto.InstrumentId))
+                { await Bad(req, "instrumentId required"); return; }
+
+                var updated = await Firm.Watchlists.ToggleInstrumentAsync(
+                    dto.WatchlistId, dto.InstrumentId!, dto.Remove);
+                if (updated == null) { await Bad(req, "no such watchlist"); return; }
+                await Json(req, updated);
+            });
+
             // ── live data for any symbol ──────────────────────────────────────────
             // These take a *symbol* rather than an instrument id, so anything listed can be charted
             // and quoted whether or not the firm has ever traded it.
@@ -360,27 +375,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string query = req.userParameters.Get("q") ?? "";
                 if (string.IsNullOrWhiteSpace(query)) { await Json(req, Array.Empty<object>()); return; }
 
-                // The instrument master first — things the firm can actually trade outrank things it
-                // can merely look at — then every other listed symbol.
-                var known = Firm.Instruments.Search(query, 12).Select(i => new SymbolMatch
-                {
-                    Symbol = Firm.Instruments.EngineSymbolFor(i.Id),
-                    DisplayName = i.DisplayName,
-                    AssetClass = i.AssetClass,
-                    Source = "instrument-master",
-                    InstrumentId = i.Id,
-                    TradableOn = i.Venues.Where(v => v.Tradeable).Select(v => v.Venue.ToString()).ToList()
-                }).ToList();
-
-                var seen = known.Select(k => k.Symbol).ToHashSet(StringComparer.OrdinalIgnoreCase);
-                try
-                {
-                    foreach (var match in await parent.MarketData.Yahoo.SearchAsync(query, 20))
-                        if (seen.Add(match.Symbol)) known.Add(match);
-                }
-                catch { /* the master's own matches are still worth returning */ }
-
-                await Json(req, known.Select(m => new
+                await Json(req, (await SearchSymbolsAsync(query, 12)).Select(m => new
                 {
                     m.Symbol,
                     m.DisplayName,
@@ -392,6 +387,125 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Tradable = m.TradableOn.Count > 0
                 }));
             });
+
+            // Search that answers with *evaluated* instruments rather than a list of names. Deciding
+            // whether to watch something is a judgement about its price action, and a ticker alone
+            // cannot support it — so each match comes back as a full market row, ready to render as
+            // the same card the watchlist shows.
+            await Get("/api/omnitrader/firm/markets/search", async req =>
+            {
+                string query = req.userParameters.Get("q") ?? "";
+                if (string.IsNullOrWhiteSpace(query)) { await Json(req, Array.Empty<object>()); return; }
+
+                var interval = ParseInterval(req.userParameters.Get("interval")) ?? TimeInterval.OneHour;
+                // Every match costs a candle fetch, so the limit is small on purpose: this runs on
+                // each keystroke pause, and eight considered options beat forty unusable ones.
+                int limit = ParseInt(req.userParameters.Get("limit"), 8, 1, 16);
+
+                var matches = (await SearchSymbolsAsync(query, limit)).Take(limit).ToList();
+                var keys = matches.Select(m => m.InstrumentId ?? m.Symbol).ToList();
+                var rows = await Firm.Watchlists.EvaluateAsync(keys, interval);
+                var byKey = rows.ToDictionary(r => r.InstrumentId, StringComparer.OrdinalIgnoreCase);
+
+                await Json(req, matches.Select(m =>
+                {
+                    string key = m.InstrumentId ?? m.Symbol;
+                    byKey.TryGetValue(key, out var row);
+                    return new
+                    {
+                        Row = row,
+                        m.Symbol,
+                        m.Exchange,
+                        m.Source,
+                        m.InstrumentId,
+                        DisplayName = row?.DisplayName ?? m.DisplayName,
+                        AssetClass = (row?.AssetClass ?? m.AssetClass).ToString(),
+                        // The id a watchlist should store: canonical when the firm knows the
+                        // instrument, the raw feed symbol when it is chart-only.
+                        WatchKey = key,
+                        m.TradableOn,
+                        Tradable = m.TradableOn.Count > 0
+                    };
+                }));
+            });
+        }
+
+        /// <summary>
+        /// Symbol lookup, master first. Things the firm can actually trade outrank things it can
+        /// merely look at, and a Yahoo outage still leaves the master's own matches worth returning.
+        /// </summary>
+        private async Task<List<SymbolMatch>> SearchSymbolsAsync(string query, int mastered)
+        {
+            var known = Firm.Instruments.Search(query, mastered).Select(i => new SymbolMatch
+            {
+                Symbol = Firm.Instruments.EngineSymbolFor(i.Id),
+                DisplayName = i.DisplayName,
+                AssetClass = i.AssetClass,
+                Source = "instrument-master",
+                InstrumentId = i.Id,
+                TradableOn = i.Venues.Where(v => v.Tradeable).Select(v => v.Venue.ToString()).ToList()
+            }).ToList();
+
+            var seen = known.Select(k => k.Symbol).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (var match in await parent.MarketData.Yahoo.SearchAsync(query, 20))
+                    if (seen.Add(match.Symbol)) known.Add(match);
+            }
+            catch { /* the master's own matches are still worth returning */ }
+
+            return known;
+        }
+
+        /// <summary>
+        /// The firm's accounts on a venue, each with what it can actually spend right now.
+        ///
+        /// Spending power is asked of the venue rather than inferred: a cash balance is not the same
+        /// as buying power (a margin account has more, an account with reserved cash has less), and
+        /// sizing an order against the wrong one is how a ticket gets rejected at the broker. When
+        /// the venue cannot be reached the figure is null — not zero, which would read as "you have
+        /// nothing" rather than "we do not know".
+        /// </summary>
+        private async Task<List<object>> SpendingPowerAsync(VenueId venue)
+        {
+            var accounts = (await Firm.Accounts.ListAsync()).Where(a => a.Venue == venue).ToList();
+            var results = new List<object>(accounts.Count);
+
+            foreach (var account in accounts)
+            {
+                decimal? power = null, balance = null;
+                string currency = account.BaseCurrency;
+                string? issue = null;
+
+                var adapter = Firm.Venues.Resolve(venue, account.Environment);
+                if (adapter == null) issue = $"{venue} {account.Environment} is not connected.";
+                else
+                {
+                    try
+                    {
+                        var snapshot = await adapter.GetAccountAsync();
+                        // Fall back to the balance only when the venue reports no separate available
+                        // figure — for a cash account the two are the same number.
+                        power = snapshot.AvailableFunds ?? snapshot.Balance;
+                        balance = snapshot.Balance;
+                        if (!string.IsNullOrWhiteSpace(snapshot.BaseCurrency)) currency = snapshot.BaseCurrency;
+                    }
+                    catch (Exception ex) { issue = ex.Message; }
+                }
+
+                results.Add(new
+                {
+                    account.Id,
+                    account.DisplayName,
+                    Environment = account.Environment.ToString(),
+                    Authority = account.Authority.ToString(),
+                    Currency = currency,
+                    SpendingPower = power,
+                    Balance = balance,
+                    Issue = issue
+                });
+            }
+            return results;
         }
 
         /// <summary>
@@ -419,11 +533,49 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, view);
             });
 
+            // Firm value history and what it is made of. Every figure is real money in the reporting
+            // currency: the composition adds up to the total, so a mark moving in owned inventory can
+            // be told apart from cash arriving.
             await Get("/api/omnitrader/firm/portfolio/value-series", async req =>
             {
                 var from = ParseUtc(req.userParameters.Get("from")) ?? DateTime.UtcNow.AddDays(-30);
                 var series = await Firm.Portfolio.ValueSeriesAsync(from);
-                await Json(req, series.Select(s => new { s.Ts, Venue = s.Venue.ToString(), s.Value }));
+                await Json(req, new
+                {
+                    Firm.Portfolio.ReportingCurrency,
+                    Points = series.Select(p => new
+                    {
+                        p.Ts,
+                        Total = p.TotalValue,
+                        p.Cash,
+                        p.InventoryValue,
+                        p.DerivativeEquity,
+                        p.UnrealizedPnL,
+                        p.Positions,
+                        p.HasRealAccounts
+                    })
+                });
+            });
+
+            // Per-account broker balances, in each account's own currency and labelled with it.
+            // Deliberately separate from value history: these are not addable to each other, and the
+            // simulated ones are not money at all.
+            await Get("/api/omnitrader/firm/portfolio/account-balances", async req =>
+            {
+                var from = ParseUtc(req.userParameters.Get("from")) ?? DateTime.UtcNow.AddDays(-30);
+                var series = await Firm.Accounts.SnapshotSeriesAsync(from);
+                bool includeSimulated = req.userParameters.Get("includeSimulated") == "true";
+                await Json(req, series
+                    .Where(s => includeSimulated || s.Environment == nameof(TradingEnvironment.Live))
+                    .Select(s => new
+                    {
+                        s.Ts,
+                        Venue = s.Venue.ToString(),
+                        s.Environment,
+                        s.AccountId,
+                        s.Currency,
+                        s.Value
+                    }));
             });
 
             await Get("/api/omnitrader/firm/ledger", async req =>
@@ -803,10 +955,17 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Limits = Firm.Limits,
                     FreeInventory = riskState.FreeInventory.TryGetValue(instrument.BaseAsset, out var free) ? free : 0m,
                     riskState.AvailableFunds,
-                    Accounts = (await Firm.Accounts.ListAsync())
-                        .Where(a => a.Venue == venue)
-                        .Select(a => new { a.Id, a.DisplayName, Environment = a.Environment.ToString(), Authority = a.Authority.ToString() })
+                    Accounts = await SpendingPowerAsync(venue)
                 });
+            });
+
+            // Spending power on its own, for when the ticket only needs to re-price the account
+            // rather than re-derive every dealing rule.
+            await Get("/api/omnitrader/firm/ticket/accounts", async req =>
+            {
+                string? venueRaw = req.userParameters.Get("venue");
+                if (!Enum.TryParse<VenueId>(venueRaw, true, out var venue)) { await Bad(req, "venue required"); return; }
+                await Json(req, await SpendingPowerAsync(venue));
             });
 
             await Post("/api/omnitrader/firm/order/propose", async req =>
@@ -1381,15 +1540,16 @@ namespace Omnipotent.Services.OmniTrader.Api
                 "Your live API key and live platform login. A demo account cannot create an API key on its own."),
             (VenueId.Trading212, TradingEnvironment.Demo, "Trading 212 (practice)", "Inventory",
                 new[] { "Equity" }, Array.Empty<string>(),
-                new[] { "OmniTrader.Trading212.Demo.ApiKey" },
-                "A Trading 212 key only works in the environment it was generated in. Switch the app to "
-                + "Practice mode *before* generating this one, or it will be rejected here."),
+                new[] { "OmniTrader.Trading212.Demo.ApiKey", "OmniTrader.Trading212.Demo.ApiSecret" },
+                "Trading 212 issues an API key *and* a secret — both are needed. A key only works in the "
+                + "environment it was generated in, so switch the app to Practice mode *before* generating "
+                + "this one, or it will be rejected here."),
             (VenueId.Trading212, TradingEnvironment.Live, "Trading 212 (invest/ISA)", "Inventory",
                 new[] { "Equity" },
                 new[] { "OmniTrader.Trading212.ApiKey" },
-                new[] { "OmniTrader.Trading212.Live.ApiKey" },
-                "Generated from Settings → API while in Invest/ISA mode. If you only run live, the shared "
-                + "key is all you need.")
+                new[] { "OmniTrader.Trading212.Live.ApiKey", "OmniTrader.Trading212.Live.ApiSecret" },
+                "Generated from Settings → API while in Invest/ISA mode; you get a key and a secret, and "
+                + "both are required. The API is enabled only for Invest and Stocks ISA accounts.")
         };
 
         /// <summary>Case-insensitive substring match across a record's identifying fields — the one
@@ -1399,19 +1559,21 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         /// <summary>
         /// Firm value over time, downsampled for display, with the 24-hour comparison the command
-        /// centre reads. <c>Points</c> is empty rather than fabricated when no snapshot exists —
-        /// an unknown value must never render as zero.
+        /// centre reads. Each recorded point is already a whole-firm valuation in the reporting
+        /// currency, so this only thins and compares — it never sums across venues, which is what
+        /// previously turned a set of per-account balances into a sawtooth. <c>Points</c> is empty
+        /// rather than fabricated when nothing has been recorded: an unknown value must never render
+        /// as zero.
         /// </summary>
-        private static object BuildValueTrend(List<(DateTime Ts, VenueId Venue, decimal Value)> series, int windowDays)
+        internal static FirmValueTrend BuildValueTrend(List<FirmValuePoint> series, int windowDays)
         {
             var totals = series
-                .GroupBy(s => s.Ts)
-                .Select(g => (Ts: g.Key, Value: g.Sum(x => x.Value)))
+                .Select(p => new FirmValueTrendPoint { Ts = p.Ts, Value = p.TotalValue })
                 .OrderBy(p => p.Ts)
                 .ToList();
 
             if (totals.Count == 0)
-                return new { WindowDays = windowDays, Points = Array.Empty<object>(), Change24h = (decimal?)null, ChangePercent24h = (decimal?)null, PeakValue = (decimal?)null, TroughValue = (decimal?)null };
+                return new FirmValueTrend { WindowDays = windowDays };
 
             // Keep at most ~120 points: enough shape for a wide chart, small enough to stay cheap.
             const int MaxPoints = 120;
@@ -1427,15 +1589,15 @@ namespace Omnipotent.Services.OmniTrader.Api
 
             decimal latest = totals[^1].Value;
             var dayAgo = totals.LastOrDefault(p => p.Ts <= DateTime.UtcNow.AddHours(-24));
-            decimal? change = dayAgo.Ts == default ? null : latest - dayAgo.Value;
+            decimal? change = dayAgo == null ? null : latest - dayAgo.Value;
 
-            return new
+            return new FirmValueTrend
             {
                 WindowDays = windowDays,
-                Points = points.Select(p => new { p.Ts, p.Value }),
+                Points = points,
                 Change24h = change,
-                ChangePercent24h = change.HasValue && dayAgo.Value != 0m
-                    ? Math.Round(change.Value / Math.Abs(dayAgo.Value) * 100m, 2) : (decimal?)null,
+                ChangePercent24h = change.HasValue && dayAgo!.Value != 0m
+                    ? Math.Round(change.Value / Math.Abs(dayAgo.Value) * 100m, 2) : null,
                 PeakValue = totals.Max(p => p.Value),
                 TroughValue = totals.Min(p => p.Value),
                 FirstUtc = totals[0].Ts,
@@ -1465,6 +1627,31 @@ namespace Omnipotent.Services.OmniTrader.Api
             => Enum.TryParse<TimeInterval>(raw, true, out var v) ? v : null;
     }
 
+    // ── response DTOs ─────────────────────────────────────────────────────────────
+
+    public sealed class FirmValueTrendPoint
+    {
+        public required DateTime Ts { get; init; }
+        public required decimal Value { get; init; }
+    }
+
+    /// <summary>
+    /// Firm value over a window, shaped for the chart that reads it. Every field is nullable rather
+    /// than zeroed: with no recorded valuations the honest answer is "not known yet", and a £0 peak
+    /// would read as a wiped-out book.
+    /// </summary>
+    public sealed class FirmValueTrend
+    {
+        public required int WindowDays { get; init; }
+        public IReadOnlyList<FirmValueTrendPoint> Points { get; init; } = Array.Empty<FirmValueTrendPoint>();
+        public decimal? Change24h { get; init; }
+        public decimal? ChangePercent24h { get; init; }
+        public decimal? PeakValue { get; init; }
+        public decimal? TroughValue { get; init; }
+        public DateTime? FirstUtc { get; init; }
+        public DateTime? LastUtc { get; init; }
+    }
+
     // ── request DTOs ──────────────────────────────────────────────────────────────
 
     public sealed class WatchlistDto
@@ -1472,6 +1659,15 @@ namespace Omnipotent.Services.OmniTrader.Api
         public string? Id { get; set; }
         public string? Name { get; set; }
         public List<string>? InstrumentIds { get; set; }
+    }
+
+    public sealed class WatchlistInstrumentDto
+    {
+        /// <summary>Blank targets the first watchlist — the common case, and one fewer thing for the
+        /// caller to know when there is only one list.</summary>
+        public string? WatchlistId { get; set; }
+        public string? InstrumentId { get; set; }
+        public bool Remove { get; set; }
     }
 
     public sealed class KillSwitchDto

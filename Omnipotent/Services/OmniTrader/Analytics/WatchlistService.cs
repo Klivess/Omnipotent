@@ -34,6 +34,9 @@ namespace Omnipotent.Services.OmniTrader.Analytics
         public List<string> TradableOn { get; init; } = new();
         public DateTime? DataAsOfUtc { get; init; }
         public bool Stale { get; init; }
+        /// <summary>The feed is healthy but the exchange is shut. A separate fact from staleness —
+        /// nothing is wrong, and nothing is blocked.</summary>
+        public bool MarketClosed { get; init; }
         public string? DataIssue { get; init; }
         /// <summary>Downsampled recent closes for the row's sparkline. A momentum score says how
         /// strong the move is; only the shape says whether it is one clean trend or a whipsaw that
@@ -62,6 +65,41 @@ namespace Omnipotent.Services.OmniTrader.Analytics
         public Task<List<Watchlist>> ListAsync(CancellationToken ct = default) => repo.ListAsync(ct);
         public Task SaveAsync(Watchlist watchlist, CancellationToken ct = default) => repo.UpsertAsync(watchlist, ct);
         public Task DeleteAsync(string id, CancellationToken ct = default) => repo.DeleteAsync(id, ct);
+
+        /// <summary>
+        /// Add or remove one instrument, read-modify-write on the server. Returns the saved list, or
+        /// null when the id names no list. Adding something already present is a no-op rather than an
+        /// error — the gesture's intent is "this should be on the list", and repeating it is harmless.
+        /// </summary>
+        public async Task<Watchlist?> ToggleInstrumentAsync(string? watchlistId, string instrumentId,
+            bool remove, CancellationToken ct = default)
+        {
+            var lists = await repo.ListAsync(ct);
+            var target = string.IsNullOrWhiteSpace(watchlistId)
+                ? lists.FirstOrDefault()
+                : lists.FirstOrDefault(w => w.Id == watchlistId);
+            if (target == null) return null;
+
+            // Store the canonical id when the firm knows the instrument, so the same thing added by
+            // ticker and by id does not end up on the list twice.
+            string id = instruments.Resolve(instrumentId)?.Id ?? instrumentId.Trim();
+            if (id.Length == 0) return target;
+
+            bool present = target.InstrumentIds.Any(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase));
+            if (remove)
+            {
+                if (!present) return target;
+                target.InstrumentIds.RemoveAll(x => string.Equals(x, id, StringComparison.OrdinalIgnoreCase));
+            }
+            else
+            {
+                if (present) return target;
+                target.InstrumentIds.Add(id);
+            }
+
+            await repo.UpsertAsync(target, ct);
+            return target;
+        }
 
         /// <summary>Create the default watchlist the first time the platform runs, so the Markets page
         /// is never an empty shell.</summary>
@@ -110,7 +148,13 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                     continue;
                 }
 
-                instruments.NoteDataUpdate(instrument?.Id ?? instrumentId, "market-data-router", candles[^1].Timestamp);
+                // The bar's own stamp, plus the cadence it arrives at. Without the cadence an hourly
+                // series was measured against a 15-minute threshold and every instrument on the page
+                // was permanently "stale" — which the risk engine treats as a hard block.
+                instruments.NoteDataUpdate(instrument?.Id ?? instrumentId, "market-data-router",
+                    dataUtc: candles[^1].Timestamp,
+                    cadence: TimeSpan.FromMinutes((int)interval),
+                    continuousMarket: TradesContinuously(instrument?.AssetClass, engineSymbol));
 
                 var regime = MarketAnalytics.ClassifyRegime(candles);
                 var breakout = MarketAnalytics.AnalyseBreakout(candles);
@@ -151,6 +195,7 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                                  ?? new List<string>(),
                     DataAsOfUtc = candles[^1].Timestamp,
                     Stale = freshness.Stale,
+                    MarketClosed = freshness.MarketLikelyClosed,
                     DataIssue = freshness.Issue,
                     Spark = Downsample(candles.Select(c => c.Close).ToList(), 48)
                 });
@@ -216,6 +261,19 @@ namespace Omnipotent.Services.OmniTrader.Analytics
 
         private static int BarsPerDay(TimeInterval interval)
             => Math.Max(1, 1440 / (int)interval);
+
+        /// <summary>
+        /// Whether this market produces bars around the clock. Crypto does; an exchange listing stops
+        /// overnight and at weekends, and calling that a stale feed would block trading every evening
+        /// for a feed that is working. An unrecognised symbol is judged by the feed it routes to.
+        /// </summary>
+        private static bool TradesContinuously(AssetClass? assetClass, string engineSymbol)
+            => assetClass switch
+            {
+                AssetClass.Crypto => true,
+                null or AssetClass.Unknown => !MarketDataRouter.UsesEquityFeed(engineSymbol, AssetClass.Unknown),
+                _ => false
+            };
 
         private static TimeInterval HigherTimeframe(TimeInterval interval) => interval switch
         {

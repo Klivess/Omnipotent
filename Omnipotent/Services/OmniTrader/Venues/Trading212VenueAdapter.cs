@@ -25,7 +25,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
         public const string DemoBase = "https://demo.trading212.com/api/v0";
 
         private readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(30) };
-        private readonly string apiKey;
+        private readonly string authorization;
         private readonly string baseUrl;
         private readonly MarketDataRouter marketData;
         private readonly VenueHealthSnapshot health;
@@ -37,6 +37,54 @@ namespace Omnipotent.Services.OmniTrader.Venues
         private string? accountCurrency;
         private string? accountNumber;
 
+        private readonly SemaphoreSlim paceLock = new(1, 1);
+        private readonly Dictionary<string, DateTime> lastCallUtc = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>The value of the <c>Authorization</c> header for a key, with or without a secret.</summary>
+        internal static string BuildAuthorization(string apiKey, string? apiSecret)
+            => string.IsNullOrWhiteSpace(apiSecret)
+                ? apiKey
+                : "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes($"{apiKey}:{apiSecret}"));
+
+        /// <summary>
+        /// The documented limit for an endpoint, and the bucket it shares with its siblings.
+        ///
+        /// The limits are strict enough that a naive poll trips them — the instrument directory
+        /// allows one call every fifty seconds — and a 429 costs a whole refresh cycle, so the
+        /// adapter paces itself rather than discovering the limit by hitting it. They vary by an
+        /// order of magnitude *within* a path, though: listing orders is one call per five seconds
+        /// while placing a market order is fifty a minute. Matching on a prefix alone would throttle
+        /// execution to the speed of a report, so each endpoint is classified on its own.
+        /// </summary>
+        internal static (string Bucket, TimeSpan MinInterval)? LimitFor(string path)
+        {
+            if (path.StartsWith("/equity/metadata/instruments", StringComparison.OrdinalIgnoreCase))
+                return ("instruments", TimeSpan.FromSeconds(50));
+            if (path.StartsWith("/equity/metadata/exchanges", StringComparison.OrdinalIgnoreCase))
+                return ("exchanges", TimeSpan.FromSeconds(30));
+            if (path.StartsWith("/equity/account/summary", StringComparison.OrdinalIgnoreCase))
+                return ("summary", TimeSpan.FromSeconds(5));
+            if (path.StartsWith("/equity/positions", StringComparison.OrdinalIgnoreCase))
+                return ("positions", TimeSpan.FromSeconds(1));
+
+            if (path.StartsWith("/equity/orders", StringComparison.OrdinalIgnoreCase))
+            {
+                string tail = path["/equity/orders".Length..].Trim('/');
+                return tail switch
+                {
+                    // Placing an order: fast, and never queued behind a listing call.
+                    "market" => ("order-place", TimeSpan.FromMilliseconds(1250)),
+                    "limit" or "stop" or "stop_limit" => ("order-place", TimeSpan.FromSeconds(2)),
+                    // The whole book.
+                    "" => ("order-list", TimeSpan.FromSeconds(5)),
+                    // A single order by id — how an ambiguous submission gets resolved, so it has
+                    // to stay quick enough to walk a handful of them.
+                    _ => ("order-read", TimeSpan.FromSeconds(1))
+                };
+            }
+            return null;
+        }
+
         /// <summary>Open while T212 keeps rejecting this key — usually a practice key pointed at the
         /// live endpoint, or the reverse. Retrying cannot fix either.</summary>
         public AuthCircuitBreaker Auth { get; } = new();
@@ -46,9 +94,16 @@ namespace Omnipotent.Services.OmniTrader.Venues
         public bool IsConfigured { get; private set; }
         public VenueHealthSnapshot Health => health;
 
-        public Trading212VenueAdapter(string apiKey, TradingEnvironment environment, MarketDataRouter marketData)
+        /// <summary>
+        /// Trading 212 authenticates with an API key *pair*: the key is the username and the secret is
+        /// the password of an HTTP Basic header. Older keys were a single opaque token sent raw, and
+        /// T212 still accepts that (their `legacyApiKeyHeader` scheme), so a configuration with no
+        /// secret falls back to it rather than failing — but a key/secret pair is what the current
+        /// documentation describes and what new keys are issued as.
+        /// </summary>
+        public Trading212VenueAdapter(string apiKey, string? apiSecret, TradingEnvironment environment, MarketDataRouter marketData)
         {
-            this.apiKey = apiKey;
+            authorization = BuildAuthorization(apiKey, apiSecret);
             this.marketData = marketData;
             Environment = environment;
             baseUrl = environment == TradingEnvironment.Live ? LiveBase : DemoBase;
@@ -94,12 +149,14 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         public async Task<bool> ConnectAsync(CancellationToken ct = default)
         {
-            if (string.IsNullOrWhiteSpace(apiKey)) { IsConfigured = false; return false; }
+            if (string.IsNullOrWhiteSpace(authorization)) { IsConfigured = false; return false; }
             Auth.Reset();
             try
             {
-                var info = await GetAsync("/equity/account/info", ct);
-                accountCurrency = info?["currencyCode"]?.Value<string>() ?? "GBP";
+                // The account summary is the documented identity call: it is the cheapest endpoint
+                // that proves the key works *and* tells us the primary currency every figure is in.
+                var info = await GetAsync("/equity/account/summary", ct);
+                accountCurrency = info?["currency"]?.Value<string>() ?? "GBP";
                 accountNumber = info?["id"]?.Value<string>() ?? $"t212-{Environment}".ToLowerInvariant();
                 IsConfigured = true;
                 MarkOk("t212-rest");
@@ -132,8 +189,12 @@ namespace Omnipotent.Services.OmniTrader.Venues
                         AssetClass = AssetClass.Equity,
                         BaseAsset = item["shortName"]?.Value<string>() ?? ticker.Split('_')[0],
                         QuoteCurrency = item["currencyCode"]?.Value<string>() ?? accountCurrency ?? "GBP",
-                        QuantityStep = item["minTradeQuantity"]?.Value<decimal?>() ?? 0.0001m,
-                        MinQuantity = item["minTradeQuantity"]?.Value<decimal?>() ?? 0.0001m,
+                        // T212 publishes no minimum or step size — only a maximum. Fractional shares
+                        // are supported, so the step is the smallest fraction the API will accept
+                        // rather than a venue-declared figure we do not actually have.
+                        QuantityStep = 0.0001m,
+                        MinQuantity = 0.0001m,
+                        MaxQuantity = item["maxOpenQuantity"]?.Value<decimal?>(),
                         Tradeable = true,
                         TradingStatus = item["type"]?.Value<string>()
                     });
@@ -151,11 +212,27 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         public async Task<VenueAccountSnapshot> GetAccountAsync(CancellationToken ct = default)
         {
-            var cash = await GetAsync("/equity/account/cash", ct);
+            var summary = await GetAsync("/equity/account/summary", ct);
             var positions = await GetPositionsAsync(ct);
 
             var inventory = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
             foreach (var position in positions) inventory[position.VenueSymbol] = position.Quantity;
+
+            var cash = summary?["cash"];
+            var investments = summary?["investments"];
+
+            // T212 splits cash three ways and only one of them can actually be spent. Adding them
+            // into a single "balance" would overstate what an order can draw on, so the spendable
+            // part is reported as available funds and the whole as the balance.
+            decimal? available = cash?["availableToTrade"]?.Value<decimal?>();
+            decimal? inPies = cash?["inPies"]?.Value<decimal?>();
+            decimal? reserved = cash?["reservedForOrders"]?.Value<decimal?>();
+            decimal? totalCash = available.HasValue || inPies.HasValue || reserved.HasValue
+                ? (available ?? 0m) + (inPies ?? 0m) + (reserved ?? 0m)
+                : null;
+
+            if (!string.IsNullOrWhiteSpace(summary?["currency"]?.Value<string>()))
+                accountCurrency = summary!["currency"]!.Value<string>();
 
             return new VenueAccountSnapshot
             {
@@ -164,34 +241,41 @@ namespace Omnipotent.Services.OmniTrader.Venues
                 Environment = Environment,
                 AsOfUtc = DateTime.UtcNow,
                 BaseCurrency = accountCurrency ?? "GBP",
-                // `free` is uninvested cash; `total` includes the value of the shares, so the two are
-                // reported in their own fields rather than conflated into one "balance".
-                Balance = cash?["free"]?.Value<decimal?>(),
-                Equity = cash?["total"]?.Value<decimal?>(),
-                AvailableFunds = cash?["free"]?.Value<decimal?>(),
-                UnrealizedPnL = cash?["ppl"]?.Value<decimal?>(),
+                Balance = totalCash,
+                // `totalValue` is cash plus the market value of the holdings — the whole account.
+                Equity = summary?["totalValue"]?.Value<decimal?>()
+                         ?? (totalCash + investments?["currentValue"]?.Value<decimal?>()),
+                AvailableFunds = available,
+                UnrealizedPnL = investments?["unrealizedProfitLoss"]?.Value<decimal?>(),
                 Inventory = inventory
             };
         }
 
         public async Task<IReadOnlyList<VenuePositionSnapshot>> GetPositionsAsync(CancellationToken ct = default)
         {
-            var array = await GetArrayAsync("/equity/portfolio", ct);
+            var array = await GetArrayAsync("/equity/positions", ct);
             var list = new List<VenuePositionSnapshot>();
             foreach (var item in array)
             {
                 decimal quantity = item["quantity"]?.Value<decimal?>() ?? 0m;
-                if (quantity == 0m) continue;
+                // The ticker moved inside `instrument` in the public API; the flat form is kept as a
+                // fallback so a response from either shape still identifies the holding.
+                string ticker = item["instrument"]?["ticker"]?.Value<string>()
+                                ?? item["ticker"]?.Value<string>() ?? "";
+                if (quantity == 0m || string.IsNullOrWhiteSpace(ticker)) continue;
                 list.Add(new VenuePositionSnapshot
                 {
                     Venue = VenueId.Trading212,
-                    VenueSymbol = item["ticker"]?.Value<string>() ?? "",
+                    VenueSymbol = ticker,
                     Quantity = quantity,
                     Exposure = ExposureKind.Inventory,
-                    AveragePrice = item["averagePrice"]?.Value<decimal?>(),
+                    // Both prices are in the *instrument's* currency, not the account's.
+                    AveragePrice = item["averagePricePaid"]?.Value<decimal?>(),
                     MarkPrice = item["currentPrice"]?.Value<decimal?>(),
-                    UnrealizedPnL = item["ppl"]?.Value<decimal?>(),
-                    VenuePositionId = item["ticker"]?.Value<string>()
+                    // walletImpact is the same figure converted into the account currency, which is
+                    // the only one that can be added to anything else the firm holds.
+                    UnrealizedPnL = item["walletImpact"]?["unrealizedProfitLoss"]?.Value<decimal?>(),
+                    VenuePositionId = ticker
                 });
             }
             return list;
@@ -315,7 +399,8 @@ namespace Omnipotent.Services.OmniTrader.Venues
         {
             if (Auth.IsOpen) throw new Trading212ApiException(Auth.Reason, HttpStatusCode.Forbidden);
             var request = new HttpRequestMessage(method, baseUrl + path);
-            request.Headers.TryAddWithoutValidation("Authorization", apiKey);
+            request.Headers.TryAddWithoutValidation("Authorization", authorization);
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
             return request;
         }
 
@@ -328,6 +413,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         private async Task<JObject?> GetAsync(string path, CancellationToken ct)
         {
+            await PaceAsync(path, ct);
             using var request = Build(HttpMethod.Get, path);
             using var response = await http.SendAsync(request, ct);
             string text = await response.Content.ReadAsStringAsync(ct);
@@ -343,6 +429,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         private async Task<JArray> GetArrayAsync(string path, CancellationToken ct)
         {
+            await PaceAsync(path, ct);
             using var request = Build(HttpMethod.Get, path);
             using var response = await http.SendAsync(request, ct);
             string text = await response.Content.ReadAsStringAsync(ct);
@@ -358,6 +445,7 @@ namespace Omnipotent.Services.OmniTrader.Venues
 
         private async Task<JObject?> PostAsync(string path, JObject body, CancellationToken ct)
         {
+            await PaceAsync(path, ct);
             using var request = Build(HttpMethod.Post, path);
             request.Content = new StringContent(body.ToString(), Encoding.UTF8, "application/json");
             using var response = await http.SendAsync(request, ct);
@@ -379,34 +467,70 @@ namespace Omnipotent.Services.OmniTrader.Venues
             };
         }
 
-        private static VenueOrderSnapshot? ToOrderSnapshot(JToken item)
+        internal static VenueOrderSnapshot? ToOrderSnapshot(JToken item)
         {
             string? id = item["id"]?.Value<string>();
             if (string.IsNullOrWhiteSpace(id)) return null;
             decimal quantity = item["quantity"]?.Value<decimal?>() ?? 0m;
             decimal filled = item["filledQuantity"]?.Value<decimal?>() ?? 0m;
+            decimal filledValue = item["filledValue"]?.Value<decimal?>() ?? 0m;
             string status = item["status"]?.Value<string>() ?? "";
+            string? side = item["side"]?.Value<string>();
 
             return new VenueOrderSnapshot
             {
                 Venue = VenueId.Trading212,
                 VenueOrderId = id!,
-                VenueSymbol = item["ticker"]?.Value<string>() ?? "",
-                Side = quantity >= 0m ? OrderSide.Buy : OrderSide.Sell,
+                VenueSymbol = item["instrument"]?["ticker"]?.Value<string>()
+                              ?? item["ticker"]?.Value<string>() ?? "",
+                // T212 states the side explicitly; the sign of the quantity is only the *request*
+                // convention, so trust the field and fall back to the sign only if it is absent.
+                Side = side != null
+                    ? (side.Equals("SELL", StringComparison.OrdinalIgnoreCase) ? OrderSide.Sell : OrderSide.Buy)
+                    : (quantity >= 0m ? OrderSide.Buy : OrderSide.Sell),
                 Quantity = Math.Abs(quantity),
                 FilledQuantity = Math.Abs(filled),
-                AverageFillPrice = item["fillPrice"]?.Value<decimal?>(),
+                // There is no average-fill field: it is the filled value over the filled quantity.
+                AverageFillPrice = filled != 0m && filledValue != 0m ? Math.Abs(filledValue / filled) : null,
                 Status = status.ToUpperInvariant() switch
                 {
                     "FILLED" => OrderStatus.Filled,
                     "CANCELLED" or "CANCELED" => OrderStatus.Cancelled,
                     "REJECTED" => OrderStatus.Rejected,
                     "PARTIALLY_FILLED" => OrderStatus.PartiallyFilled,
+                    // LOCAL, UNCONFIRMED, CONFIRMED, NEW, CANCELLING, REPLACING, REPLACED are all
+                    // still live on the book: the order exists and has not resolved either way.
                     _ => OrderStatus.Open
                 },
-                CreatedUtc = item["dateCreated"]?.Value<DateTime?>(),
-                Reason = item["status"]?.Value<string>()
+                CreatedUtc = item["createdAt"]?.Value<DateTime?>(),
+                Reason = status
             };
+        }
+
+        /// <summary>
+        /// Hold the caller until this endpoint's documented limit allows another call. T212 counts
+        /// per account rather than per key, so waiting is the only way to stay inside the limit —
+        /// and a short wait is always cheaper than the 429 it prevents.
+        /// </summary>
+        private async Task PaceAsync(string path, CancellationToken ct)
+        {
+            if (LimitFor(path) is not { } limit) return;
+
+            TimeSpan wait;
+            await paceLock.WaitAsync(ct);
+            try
+            {
+                var now = DateTime.UtcNow;
+                wait = lastCallUtc.TryGetValue(limit.Bucket, out var last)
+                    ? limit.MinInterval - (now - last)
+                    : TimeSpan.Zero;
+                if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+                // Book the slot before releasing, so two concurrent callers queue rather than collide.
+                lastCallUtc[limit.Bucket] = now + wait;
+            }
+            finally { paceLock.Release(); }
+
+            if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
         }
 
         private void MarkOk(string channel)

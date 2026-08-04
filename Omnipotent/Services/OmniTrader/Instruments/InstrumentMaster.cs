@@ -18,7 +18,16 @@ namespace Omnipotent.Services.OmniTrader.Instruments
         private readonly VenueRegistry venues;
         private readonly ConcurrentDictionary<string, Instrument> byId = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> venueSymbolToId = new(StringComparer.OrdinalIgnoreCase);
-        private readonly ConcurrentDictionary<string, (DateTime Ts, string Source)> lastSeen = new(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, Observation> lastSeen = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// One successful read of an instrument's data. <c>DataUtc</c> and <c>ObservedUtc</c> are
+        /// deliberately separate: a feed that answers instantly with an hour-old bar is healthy if
+        /// the bars are hourly, and broken if they are meant to be by the minute. Collapsing the two
+        /// into one timestamp is what made every instrument permanently stale.
+        /// </summary>
+        private sealed record Observation(DateTime DataUtc, DateTime ObservedUtc, string Source,
+            TimeSpan? Cadence, bool? ContinuousMarket);
         private readonly SemaphoreSlim refreshLock = new(1, 1);
 
         public DateTime? LastRefreshUtc { get; private set; }
@@ -146,16 +155,59 @@ namespace Omnipotent.Services.OmniTrader.Instruments
             return created;
         }
 
-        /// <summary>Record that fresh data was observed for an instrument. Freshness is what the risk
-        /// engine's data-integrity layer blocks on, so it is tracked centrally rather than per caller.</summary>
-        public void NoteDataUpdate(string instrumentId, string source, DateTime? tsUtc = null)
+        /// <summary>
+        /// Record that data was successfully observed for an instrument. Freshness is what the risk
+        /// engine's data-integrity layer blocks on, so it is tracked centrally rather than per caller.
+        ///
+        /// <paramref name="dataUtc"/> is the timestamp *of the data* (a bar's stamp); omit it for a
+        /// live tick. <paramref name="cadence"/> is how often new data is expected — pass the bar
+        /// interval when reading candles, so an hourly series is not judged against a threshold meant
+        /// for ticks. <paramref name="continuousMarket"/> says whether this market trades around the
+        /// clock; a session-bound market that stops producing bars overnight is shut, not broken.
+        /// </summary>
+        public void NoteDataUpdate(string instrumentId, string source, DateTime? dataUtc = null,
+            TimeSpan? cadence = null, bool? continuousMarket = null)
         {
-            lastSeen[instrumentId] = (tsUtc ?? DateTime.UtcNow, source);
+            var now = DateTime.UtcNow;
+            lastSeen[instrumentId] = new Observation(dataUtc ?? now, now, source, cadence, continuousMarket);
             if (byId.TryGetValue(instrumentId, out var instrument))
             {
-                instrument.LastUpdatedUtc = tsUtc ?? DateTime.UtcNow;
+                instrument.LastUpdatedUtc = dataUtc ?? now;
                 instrument.DataSource = source;
             }
+        }
+
+        /// <summary>
+        /// How late data may be before it is stale, given how often it arrives. Two intervals of
+        /// slack: providers disagree about whether a bar carries its open or its close time, so one
+        /// interval of the difference is a convention rather than lateness, and the second covers the
+        /// bar that is still forming. Past that, a bar has genuinely been missed.
+        /// </summary>
+        internal static TimeSpan ToleranceFor(TimeSpan cadence)
+            => cadence + cadence + TimeSpan.FromMinutes(2);
+
+        /// <summary>
+        /// The freshness verdict, as a pure decision so it can be reasoned about and tested on its
+        /// own — it is a hard block in the risk engine, so getting it wrong stops all trading.
+        ///
+        /// Two distinct failures, and conflating them is what made every instrument permanently
+        /// stale: <paramref name="observationAge"/> says whether the feed is reachable at all, which
+        /// is always a fault; <paramref name="dataAge"/> says how old the newest data is, which is
+        /// only a fault when newer data was actually due. On a bar series the newest bar is at least
+        /// one bar old by definition, so it is meaningless without <paramref name="cadence"/>.
+        /// </summary>
+        internal static (bool Stale, bool MarketClosed, bool FeedSilent, bool DataOld) Judge(
+            TimeSpan dataAge, TimeSpan observationAge, TimeSpan? cadence, bool continuous,
+            TimeSpan feedThreshold)
+        {
+            var dataThreshold = cadence is { } c ? ToleranceFor(c) : feedThreshold;
+            bool feedSilent = observationAge > feedThreshold;
+            bool dataOld = dataAge > dataThreshold;
+
+            // A session-bound market that has stopped producing bars is shut, not broken. Calling
+            // that stale would block trading every evening and every weekend on a healthy feed.
+            bool stale = feedSilent || (dataOld && continuous);
+            return (stale, dataOld && !continuous && !feedSilent, feedSilent, dataOld);
         }
 
         public DataFreshness GetFreshness(string instrumentId)
@@ -167,11 +219,14 @@ namespace Omnipotent.Services.OmniTrader.Instruments
                 {
                     InstrumentId = instrumentId,
                     Age = TimeSpan.MaxValue,
+                    ObservationAge = TimeSpan.MaxValue,
                     Stale = true,
                     Issue = "no data observed for this instrument in this process"
                 };
             }
-            var raw = DateTime.UtcNow - seen.Ts;
+
+            var now = DateTime.UtcNow;
+            var raw = now - seen.DataUtc;
 
             // A bar can be stamped ahead of the clock — providers stamp the *forming* bar with its
             // close time, so a 4-hour candle arrives with a timestamp up to four hours in the future.
@@ -180,22 +235,48 @@ namespace Omnipotent.Services.OmniTrader.Instruments
             // stale, and the data-integrity layer had nothing to block on.
             bool aheadOfClock = raw < TimeSpan.Zero;
             var age = aheadOfClock ? TimeSpan.Zero : raw;
+            var observationAge = now - seen.ObservedUtc;
+            if (observationAge < TimeSpan.Zero) observationAge = TimeSpan.Zero;
 
-            var threshold = instrument?.FreshnessThreshold ?? TimeSpan.FromMinutes(15);
-            bool stale = age > threshold;
+            var feedThreshold = instrument?.FreshnessThreshold ?? DefaultFreshnessThreshold;
+            bool continuous = seen.ContinuousMarket ?? true;
+            var (stale, marketClosed, feedSilent, dataOld) =
+                Judge(age, observationAge, seen.Cadence, continuous, feedThreshold);
+
             return new DataFreshness
             {
                 InstrumentId = instrumentId,
-                LastUpdateUtc = seen.Ts,
+                LastUpdateUtc = seen.DataUtc,
                 Age = age,
+                ObservationAge = observationAge,
+                Cadence = seen.Cadence,
                 Stale = stale,
+                MarketLikelyClosed = marketClosed,
                 Source = seen.Source,
-                Issue = stale
-                    ? $"last update {age.TotalMinutes:F1} min ago exceeds {threshold.TotalMinutes:F0} min threshold"
-                    : aheadOfClock
-                        ? $"bar is stamped {(-raw).TotalMinutes:F0} min ahead of the clock — a forming bar, or a clock difference"
-                        : null
+                Issue = feedSilent
+                    ? $"no successful read for {observationAge.TotalMinutes:F0} min "
+                      + $"(expected every {feedThreshold.TotalMinutes:F0} min)"
+                    : dataOld && continuous
+                        ? $"newest data is {age.TotalMinutes:F1} min old — a "
+                          + $"{Describe(seen.Cadence, feedThreshold)} series should not be that far behind"
+                        : dataOld
+                            ? $"no new bars for {age.TotalHours:F1} h — the market is closed or between bars"
+                            : aheadOfClock
+                                ? $"bar is stamped {(-raw).TotalMinutes:F0} min ahead of the clock — a forming bar, or a clock difference"
+                                : null
             };
+        }
+
+        /// <summary>Default for instruments that never declared one — the right threshold for a live
+        /// tick, and the fallback when a caller did not say how often its data arrives.</summary>
+        public static readonly TimeSpan DefaultFreshnessThreshold = TimeSpan.FromMinutes(15);
+
+        private static string Describe(TimeSpan? cadence, TimeSpan fallback)
+        {
+            var span = cadence ?? fallback;
+            return span >= TimeSpan.FromDays(1) ? $"{span.TotalDays:F0}-day"
+                 : span >= TimeSpan.FromHours(1) ? $"{span.TotalHours:F0}-hour"
+                 : $"{span.TotalMinutes:F0}-minute";
         }
 
         public IReadOnlyList<DataFreshness> AllFreshness()

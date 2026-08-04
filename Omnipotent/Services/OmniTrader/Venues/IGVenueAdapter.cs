@@ -356,10 +356,16 @@ namespace Omnipotent.Services.OmniTrader.Venues
             // our idempotency key so the same intent always maps to the same reference.
             string dealReference = SanitiseReference(clientReference);
 
+            // `currencyCode` and `expiry` are both required, and both are properties of the
+            // instrument rather than of the order. Guessing them is how you earn
+            // CONTACT_SUPPORT_INSTRUMENT_ERROR, so ask the venue what this epic actually deals in.
+            var detail = await GetDealingTermsAsync(request.Symbol, ct);
+
             var body = new JObject
             {
                 ["epic"] = request.Symbol,
-                ["expiry"] = "-",
+                ["expiry"] = detail.Expiry,
+                ["currencyCode"] = detail.Currency,
                 ["direction"] = request.Side == OrderSide.Buy ? "BUY" : "SELL",
                 ["size"] = request.Qty.ToString(CultureInfo.InvariantCulture),
                 ["orderType"] = request.Type switch
@@ -407,6 +413,39 @@ namespace Omnipotent.Services.OmniTrader.Venues
             if (confirmation.Status == OrderStatus.Rejected)
                 return VenueSubmissionResult.Rejected(confirmation.Reason ?? "IG rejected the deal");
             return VenueSubmissionResult.Accepted(confirmation.VenueOrderId, returnedReference);
+        }
+
+        /// <summary>
+        /// The dealing currency and expiry for an epic, which IG requires on every order.
+        ///
+        /// Both come from the market's own details: the currency is the instrument's default (an epic
+        /// may quote in several, and dealing in the wrong one is rejected), and the expiry is `DFB`
+        /// for a daily funded bet, a contract month for a future, or `-` where there is none. Falling
+        /// back to the account currency and `-` keeps an order possible when the lookup fails, which
+        /// is the same pair the adapter used to hard-code.
+        /// </summary>
+        private async Task<(string Currency, string Expiry)> GetDealingTermsAsync(string epic, CancellationToken ct)
+        {
+            try
+            {
+                var resp = await client.GetAsync($"/markets/{Uri.EscapeDataString(epic)}", "3", ct);
+                Mark(restHealth, true, null);
+                var instrument = resp["instrument"] as JObject;
+                var currencies = instrument?["currencies"] as JArray;
+
+                string? currency = currencies?.OfType<JObject>()
+                                       .FirstOrDefault(c => (bool?)c["isDefault"] == true)?["code"]?.Value<string>()
+                                   ?? currencies?.OfType<JObject>().FirstOrDefault()?["code"]?.Value<string>();
+                string? expiry = (string?)instrument?["expiry"];
+
+                return (string.IsNullOrWhiteSpace(currency) ? "GBP" : currency!,
+                        string.IsNullOrWhiteSpace(expiry) ? "-" : expiry!);
+            }
+            catch (Exception ex)
+            {
+                Mark(restHealth, false, ex.Message);
+                return ("GBP", "-");
+            }
         }
 
         public async Task<bool> CancelOrderAsync(string venueOrderId, CancellationToken ct = default)

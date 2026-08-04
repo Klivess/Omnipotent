@@ -559,6 +559,22 @@ firm tables: `firm_accounts`, `instruments`, `trade_proposals`, `risk_decisions`
 go in a `json` column with the query-relevant fields lifted into indexed columns — the same convention
 the engine's `config_json` already uses, so adding a contract field needs no migration.
 
+Migration **v4** adds `firm_value_points`. The two value tables answer different questions and must
+not be confused:
+
+| Table | One row is | Currency | Environments |
+|---|---|---|---|
+| `account_snapshots` | what one broker said about one account at one instant | that account's own | all, labelled |
+| `firm_value_points` | one valuation of the whole firm | the reporting currency | live only |
+
+`account_snapshots` is broker truth and the right input for reconciliation. It is **not** a firm
+value: summing it produced a chart that sawtoothed between a demo account's £10,000 opening balance
+and a live account's cash, because each venue writes its snapshot at its own instant, simulated money
+was added to real, currencies were added raw, and owned inventory — which no venue reports as
+`balance` — was missing. Firm value is computed by `PortfolioService.BuildAsync` and recorded whole
+by `RecordValuePointAsync`, so the chart and the headline figure are the same arithmetic. A sweep in
+which a live venue could not be reached records nothing, leaving a gap rather than a fictional dip.
+
 ---
 
 ## 20. Venues and environments
@@ -632,6 +648,27 @@ asset, so orders are still sized in the right currency. `VenueMapping.RoundQuant
 **Freshness is tracked centrally.** `NoteDataUpdate` records when data was last observed;
 `GetFreshness` returns a verdict the risk engine's data-integrity layer blocks on and the UI
 underlines. An instrument never seen in this process is `Stale = true`, not silently fresh.
+
+Freshness is **two facts, not one**, and conflating them made every instrument permanently stale —
+which, because staleness is a *hard* rule, silently blocked every order as well:
+
+| Fact | Field | Fault? |
+|---|---|---|
+| the feed answered at all | `ObservationAge` vs `FreshnessThreshold` | always |
+| the newest data is recent | `Age` vs `2 × Cadence + 2 min` | only if newer data was due |
+
+A bar series' newest bar is at least one bar old the moment it closes, so judging an hourly series
+against a 15-minute threshold meant for live ticks marks it stale forever. Callers reading candles
+pass the bar interval as `cadence`; callers reading a live price pass none and get the tick
+threshold. The tolerance is two intervals because providers disagree about whether a bar carries its
+open or its close time — one interval of the difference is convention, and the second covers the bar
+still forming.
+
+Markets that keep session hours get one further distinction: a healthy feed with no new bars means
+the exchange is **shut**, reported as `MarketLikelyClosed` rather than staleness. Without it, every
+equity blocked trading each evening and all weekend. Crypto is continuous, so a missed bar there is
+a genuine fault. `InstrumentMaster.Judge` is the whole decision as a pure function, so it can be
+tested directly.
 
 ---
 
@@ -818,16 +855,20 @@ backtests.
 | GET | `overview` | command centre: value, exposure, health, exceptions, alerts, venues |
 | GET | `environments` | accounts, authorities and every venue's capability matrix |
 | GET | `markets`, `markets/watchlists` | evaluated market rows plus breadth; watchlists |
+| GET | `markets/search` | symbol search returning **evaluated** market rows, for the add-instrument cards |
 | POST | `markets/watchlist/save`, `markets/watchlist/delete` | manage watchlists |
+| POST | `markets/watchlist/instrument` | add/remove one instrument; server-side read-modify-write |
 | GET | `instruments` | canonical instruments, venue mappings, freshness |
 | POST | `instruments/refresh` | fold venue directories into the master |
-| GET | `portfolio`, `portfolio/value-series`, `ledger` | firm view, value history, ledger entries |
+| GET | `portfolio`, `portfolio/value-series`, `ledger` | firm view, firm value history + composition, ledger entries |
+| GET | `portfolio/account-balances` | per-account broker balances in their own currency (live only unless `includeSimulated=true`) |
 | GET | `reconciliation` | open breaks and recent runs |
 | POST | `reconciliation/run`, `reconciliation/resolve` | reconcile now; explain a break |
 | GET | `risk` | limits, utilisation, portfolio and operational state, recent decisions |
 | POST | `risk/limits`, `risk/safe-mode`, `risk/killswitch` | change the risk budget and controls |
 | POST | `risk/reduce/preview` then `risk/reduce/execute` | **two-step** exposure reduction |
 | GET | `orders`, `order`, `ticket` | blotter; order with decision and lifecycle; capability-driven ticket |
+| GET | `ticket/accounts` | the venue's accounts with live spending power, for sizing an order as a share of buying power |
 | POST | `order/propose`, `order/approve`, `order/reject`, `order/cancel` | the order lifecycle |
 | POST | `orders/reconcile` | resolve outstanding and unknown orders |
 | GET | `experiments`, `strategy-versions`, `promotion/assess` | research and the promotion gate |
@@ -874,8 +915,10 @@ calendar day including quiet ones, with the running total), `PnLDistribution` an
 `SlippageDistribution` (equal-width histograms, empty rather than degenerate when there is no spread).
 
 **`overview`** returns `Trend`: the firm value series over `trendDays` (default 30, downsampled to
-≤120 points), `Change24h`, `ChangePercent24h`, `PeakValue` and `TroughValue`. `Points` is empty rather
-than fabricated when no snapshot exists.
+≤120 points), `Change24h`, `ChangePercent24h`, `PeakValue` and `TroughValue`. One recorded valuation
+is one point — nothing is grouped or summed. `Points` is empty and every figure null rather than
+fabricated when nothing has been recorded: a firm whose value has never been measured is not a firm
+worth £0.
 
 **`markets`** rows carry `Spark`, ~48 downsampled closes. The downsampler keeps each bucket's extreme
 in the direction the bucket moved, so a spike survives rather than being averaged flat, and the final
@@ -935,8 +978,8 @@ earlier versions.
 | Venue | Exposure | Environments | Notes |
 |---|---|---|---|
 | Kraken | Inventory (spot crypto) | Live | Reuses the engine's order router |
-| IG | Derivative (CFD) | Demo · Live | No Lightstreamer — prices polled over REST |
-| **Trading 212** | **Inventory (shares, ETFs)** | **Demo · Live** | No historical-bar endpoint, so charts come from the equities feed; no client-reference field, so an ambiguous submission is reported `Unknown` rather than retried |
+| IG | Derivative (CFD) | Demo · Live | No Lightstreamer — prices polled over REST; every deal carries the epic's own dealing currency and expiry |
+| **Trading 212** | **Inventory (shares, ETFs)** | **Demo · Live** | No historical-bar endpoint, so charts come from the equities feed; no client-reference field, so an ambiguous submission is reported `Unknown` rather than retried; per-endpoint rate limits are paced |
 | Internal | Inventory (simulated) | Paper | Never counted as value |
 
 ### Credentials: each broker issues them differently
@@ -952,10 +995,15 @@ configuration into two venues failing authentication several times a minute.
 | `OmniTrader.Kraken.ApiKey` · `.ApiSecret` | Kraken live | Yes. Exclude withdrawal permission. |
 | `OmniTrader.IG.ApiKey` · `.Username` · `.Password` | IG live | Yes for live (shorthand for `.Live.*`) |
 | `OmniTrader.IG.Demo.ApiKey` · `.Username` · `.Password` | IG demo | Yes for demo — generate the key **on the demo platform**: log in live, switch to the demo account, then My Account → Settings → Web API |
-| `OmniTrader.Trading212.Live.ApiKey` | T212 live | Generated from Settings → API in **Invest/ISA** mode |
-| `OmniTrader.Trading212.Demo.ApiKey` | T212 demo | Generated **after switching the app to Practice mode** |
+| `OmniTrader.Trading212.Live.ApiKey` · `.ApiSecret` | T212 live | Generated from Settings → API in **Invest/ISA** mode. T212 issues a **key and a secret**; both are needed |
+| `OmniTrader.Trading212.Demo.ApiKey` · `.ApiSecret` | T212 demo | Generated **after switching the app to Practice mode** |
 
 A venue with no key is simply not registered: no red channel, no alert, no retry storm.
+
+Trading 212 authenticates with **HTTP Basic**, the key as the username and the secret as the
+password. A configuration with no secret falls back to sending the key raw — T212's older
+`legacyApiKeyHeader` scheme — so an existing single-token key keeps working rather than being sent
+as half a credential. The API is enabled for **Invest and Stocks ISA accounts only**.
 
 ### Rejected credentials stop being retried
 
@@ -965,6 +1013,29 @@ request forever — the command centre polls the firm view every fifteen seconds
 derivative venue for its account, and each of those attempted a fresh login. One mis-scoped key
 reached 57 failed logins in eight minutes. Only authentication failures open it; a timeout or a 500
 is transient and keeps retrying.
+
+**A spent quota is not a bad credential.** IG answers an exhausted request allowance with 403 and an
+`exceeded-…-allowance` code — the same status as a wrong key. Opening the breaker on that took a
+perfectly good venue offline for the cooldown exactly when it was busiest, and no amount of fixing
+the key would have helped, so `IsRejection` also reads the error code.
+
+### IG deals in the instrument's currency, not the account's
+
+`POST /positions/otc` requires `currencyCode` and `expiry`, and both are properties of the **epic**
+rather than of the order: an epic may be dealt in several currencies, and dealing in one it does not
+offer is refused with `CONTACT_SUPPORT_INSTRUMENT_ERROR` — an error whose text says nothing about
+currency. The adapter reads the market's own details and sends the default currency and the declared
+expiry (`DFB` for a daily funded bet, a contract month for a future, `-` where there is none) rather
+than assuming GBP and `-`.
+
+### Rate limits are paced, not discovered
+
+Trading 212 publishes a per-endpoint limit and enforces it **per account**, so a second API key does
+not buy more headroom — waiting is the only remedy. The adapter holds each call until its endpoint's
+documented interval has passed. The limits vary by an order of magnitude *within* a path (listing
+orders is one call per five seconds; placing a market order is fifty a minute), so endpoints are
+classified individually: throttling execution to the speed of a report would be a self-inflicted
+delay on every trade.
 
 ### Channel health is four states, not two
 

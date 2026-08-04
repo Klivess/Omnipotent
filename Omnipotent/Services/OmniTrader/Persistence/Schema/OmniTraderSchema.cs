@@ -346,6 +346,36 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                     json TEXT NOT NULL
                 );
                 CREATE INDEX idx_account_snapshots_ts ON account_snapshots(ts);
+            "),
+
+            // `account_snapshots` records what one broker said about one account at one instant, in
+            // that account's own currency. It is broker truth, and it is the right record for
+            // reconciliation — but it is not a firm value, and reading it as one produced a chart that
+            // sawtoothed between a demo account's opening balance and a live account's cash: each
+            // point was a single venue, simulated money was summed with real, currencies were added
+            // raw, and owned inventory (which no venue reports as `balance`) was missing entirely.
+            //
+            // Firm value is a computed, whole-firm figure, so it is now stored as one: one row per
+            // valuation, real-money accounts only, already converted to the reporting currency. A row
+            // exists only when every live venue answered, so a broker outage leaves a gap rather than
+            // a fictional crash to zero.
+            (4, @"
+                CREATE TABLE firm_value_points (
+                    ts TEXT PRIMARY KEY,
+                    currency TEXT NOT NULL,
+                    total_value REAL NOT NULL,
+                    cash REAL NOT NULL,
+                    inventory_value REAL NOT NULL,
+                    derivative_equity REAL NOT NULL,
+                    derivative_notional REAL NOT NULL,
+                    gross_exposure REAL NOT NULL,
+                    unrealized_pnl REAL NOT NULL,
+                    realized_pnl_today REAL NOT NULL,
+                    positions INTEGER NOT NULL,
+                    has_real_accounts INTEGER NOT NULL,
+                    simulated_value REAL NOT NULL
+                );
+                CREATE INDEX idx_firm_value_points_ts ON firm_value_points(ts);
             ")
         };
     }

@@ -71,8 +71,9 @@ namespace Omnipotent.Services.OmniTrader.Venues
                 if (!resp.IsSuccessStatusCode)
                 {
                     cst = securityToken = null;
-                    string detail = $"IG {Environment} login rejected ({(int)resp.StatusCode}): {ExtractErrorCode(text)}.";
-                    if (AuthCircuitBreaker.IsRejection(resp.StatusCode))
+                    string code = ExtractErrorCode(text);
+                    string detail = $"IG {Environment} login rejected ({(int)resp.StatusCode}): {code}.";
+                    if (AuthCircuitBreaker.IsRejection(resp.StatusCode, code))
                     {
                         // `error.security.api-key-invalid` against the demo gateway almost always means
                         // a live key: IG issues demo keys separately, on the demo platform.

@@ -61,6 +61,13 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
         /// presenting a £0 firm as a loss.</summary>
         public bool HasRealAccounts { get; set; }
 
+        /// <summary>
+        /// False when a live venue could not be reached, so part of the firm's money is unaccounted
+        /// for in these totals. The figure is still shown (with its warning), but it must never be
+        /// written to the value history: a broker outage would otherwise be recorded as a crash.
+        /// </summary>
+        public bool ValuationComplete { get; set; } = true;
+
         public List<PortfolioLine> Lines { get; init; } = new();
         public Dictionary<string, decimal> ExposureByAssetClass { get; init; } = new(StringComparer.OrdinalIgnoreCase);
         public Dictionary<string, decimal> ExposureByCurrency { get; init; } = new(StringComparer.OrdinalIgnoreCase);
@@ -104,13 +111,15 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
         private readonly MarketDataRouter marketData;
         private readonly LedgerRepository ledgerRepo;
         private readonly AccountRepository accountRepo;
+        private readonly FirmValueRepository valueRepo;
         private readonly ConcurrentDictionary<string, (decimal Rate, DateTime AsOf, string Source)> fxCache = new(StringComparer.OrdinalIgnoreCase);
 
         public string ReportingCurrency { get; set; } = "GBP";
         public decimal PeakEquity { get; private set; }
 
         public PortfolioService(FirmLedger ledger, InstrumentMaster instruments, VenueRegistry venues,
-            MarketDataRouter marketData, LedgerRepository ledgerRepo, AccountRepository accountRepo)
+            MarketDataRouter marketData, LedgerRepository ledgerRepo, AccountRepository accountRepo,
+            FirmValueRepository valueRepo)
         {
             this.ledger = ledger;
             this.instruments = instruments;
@@ -118,6 +127,7 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
             this.marketData = marketData;
             this.ledgerRepo = ledgerRepo;
             this.accountRepo = accountRepo;
+            this.valueRepo = valueRepo;
         }
 
         public async Task<FirmPortfolioView> BuildAsync(CancellationToken ct = default)
@@ -211,7 +221,11 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
                     (IsRealMoney(adapter.Environment) ? view.Real : view.Simulated).DerivativeEquity
                         += (account.Equity ?? account.Balance ?? 0m) * rate;
                 }
-                catch (Exception ex) { view.Warnings.Add($"{adapter.Venue} account unavailable: {ex.Message}"); }
+                catch (Exception ex)
+                {
+                    view.Warnings.Add($"{adapter.Venue} account unavailable: {ex.Message}");
+                    if (IsRealMoney(adapter.Environment)) view.ValuationComplete = false;
+                }
             }
 
             view.HasRealAccounts = venues.All.Any(a => IsRealMoney(a.Environment) && a.IsConfigured);
@@ -244,8 +258,12 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
 
         /// <summary>The compact state the risk engine measures proposals against.</summary>
         public async Task<RiskPortfolioState> BuildRiskStateAsync(CancellationToken ct = default)
+            => await BuildRiskStateAsync(await BuildAsync(ct), ct);
+
+        /// <summary>Overload for callers that have already built the portfolio — valuing the whole
+        /// firm hits every venue, and doing it twice in one sweep is pure latency.</summary>
+        public async Task<RiskPortfolioState> BuildRiskStateAsync(FirmPortfolioView view, CancellationToken ct = default)
         {
-            var view = await BuildAsync(ct);
             var exposureByInstrument = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase);
             foreach (var line in view.Lines)
                 exposureByInstrument[line.InstrumentId] =
@@ -296,8 +314,48 @@ namespace Omnipotent.Services.OmniTrader.Portfolio
             };
         }
 
-        public Task<List<(DateTime Ts, VenueId Venue, decimal Value)>> ValueSeriesAsync(DateTime? fromUtc = null, CancellationToken ct = default)
-            => accountRepo.SnapshotSeriesAsync(fromUtc, ct);
+        /// <summary>
+        /// Firm value over time — real money only, in the reporting currency, one point per
+        /// valuation. Recorded by <see cref="RecordValuePointAsync"/> rather than derived from broker
+        /// balances, because "what is the firm worth" is a whole-firm question and no single account
+        /// snapshot answers it.
+        /// </summary>
+        public Task<List<FirmValuePoint>> ValueSeriesAsync(DateTime? fromUtc = null, CancellationToken ct = default)
+            => valueRepo.SeriesAsync(fromUtc, ct);
+
+        /// <summary>
+        /// Write one point of firm value history. An incomplete valuation is skipped rather than
+        /// recorded: a venue that failed to answer means money is missing from the total, and a dip
+        /// caused by an outage is indistinguishable from a real one once it is in the chart.
+        /// </summary>
+        public async Task<bool> RecordValuePointAsync(FirmPortfolioView view, CancellationToken ct = default)
+        {
+            if (!view.ValuationComplete) return false;
+            await valueRepo.RecordAsync(ToValuePoint(view), ct);
+            return true;
+        }
+
+        /// <summary>
+        /// The one place a portfolio view becomes a value point. Every money field is taken from the
+        /// <em>real</em> side; the simulated total rides along in its own field so research can see it
+        /// without any arithmetic being able to pull it into firm value.
+        /// </summary>
+        public static FirmValuePoint ToValuePoint(FirmPortfolioView view) => new()
+        {
+            Ts = view.AsOfUtc,
+            Currency = view.ReportingCurrency,
+            TotalValue = view.TotalValue,
+            Cash = view.Cash,
+            InventoryValue = view.InventoryValue,
+            DerivativeEquity = view.DerivativeEquity,
+            DerivativeNotional = view.DerivativeNotional,
+            GrossExposure = view.GrossExposure,
+            UnrealizedPnL = view.UnrealizedPnL,
+            RealizedPnLToday = view.RealizedPnLToday,
+            Positions = view.Real.Positions,
+            HasRealAccounts = view.HasRealAccounts,
+            SimulatedValue = view.SimulatedTotalValue
+        };
 
         /// <summary>Mark for an instrument, preferring the venue it is held on and falling back to the
         /// shared market-data router so a venue outage does not blank the whole portfolio.</summary>
