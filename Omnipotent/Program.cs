@@ -87,10 +87,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGram());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTumblr());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveChat.KliveChatService());
-                if (KliveTechHub.CheckIfBluetoothProtocolExistsOnDevice())
-                {
-                    //omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
-                }
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Stratum.Stratum());

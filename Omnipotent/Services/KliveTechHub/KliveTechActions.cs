@@ -14,20 +14,26 @@
         {
             ExecuteAction,
             GetActions,
-            Ping
+            Ping,
+            BeginFirmwareUpdate,
+            FirmwareUpdateChunk,
+            CompleteFirmwareUpdate,
+            AbortFirmwareUpdate,
+            GetStreamables,
+            ConfigureStreamable
         }
 
         public struct KliveTechActionRequest
         {
             public string ActionName;
-            public string Param;
+            public object? Param;
         }
 
         public class KliveTechAction
         {
-            public string name;
+            public string name = string.Empty;
             public ActionParameterType parameters;
-            public string paramDescription;
+            public string paramDescription = string.Empty;
         }
     }
 }

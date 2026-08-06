@@ -53,6 +53,8 @@ namespace Omnipotent.Data_Handling
             //KliveTechHub
             public static string KliveTechHubDirectory = $"{SavedDataDirectory}/KliveTechHub";
             public static string KliveTechHubGadgetsDirectory = $"{KliveTechHubDirectory}/KliveTechGadgets";
+            public static string KliveTechFirmwareInboxDirectory = $"{KliveTechHubDirectory}/FirmwareInbox";
+            public static string KliveTechFirmwareBuildsDirectory = $"{KliveTechHubDirectory}/FirmwareBuilds";
 
             //OmnipotentProcessMonitor
             public static string ProcessMonitorLogs = $"{SavedDataDirectory}/ProcessMonitorLogs"; // (hardcoded into OP monitor, do not change value)
