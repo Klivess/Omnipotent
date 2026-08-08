@@ -27,6 +27,7 @@ namespace Omnipotent.Services.KliveTechHub
         private const int LiveSubscriberQueueCapacity = 8;
         private const int MaximumLiveSubscribers = 32;
         private static readonly TimeSpan IncompleteFrameLifetime = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan LiveKeepaliveInterval = TimeSpan.FromSeconds(20);
 
         private readonly object streamableStateLock = new();
         private readonly Dictionary<string, StreamableState> streamableStates =
@@ -1045,14 +1046,67 @@ namespace Omnipotent.Services.KliveTechHub
             };
         }
 
+        /// <summary>
+        /// A browser cannot set an Authorization header on a WebSocket, so KliveAPI's
+        /// header-based gate can never pass for a viewer in a page: the route registers as
+        /// Anybody and the password arrives as ?authorization= to be checked here instead.
+        /// This mirrors Projects.AuthorizeWsAsKlivesAsync, where the same mismatch was the
+        /// reason its live view never connected.
+        /// </summary>
+        private async Task<bool> AuthorizeStreamViewerAsync(
+            NameValueCollection query,
+            KMProfileManager.KMProfile? user)
+        {
+            KMProfileManager.KMProfile? resolved = user;
+            if (resolved == null)
+            {
+                string? password = query["authorization"];
+                if (!string.IsNullOrEmpty(password))
+                {
+                    resolved = await ExecuteServiceMethod<KMProfileManager>(
+                        "GetProfileByPassword",
+                        password) as KMProfileManager.KMProfile;
+                }
+            }
+            return resolved != null &&
+                resolved.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives;
+        }
+
         internal async Task RegisterStreamableLiveRouteAsync()
         {
-            await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>(
-                "CreateWebSocketRoute",
+            // Registered against a typed KliveAPI rather than by reflection so an absent
+            // API service is reported instead of silently leaving the page without telemetry.
+            Omnipotent.Service_Manager.OmniService[] apis =
+                await GetServicesByType<Omnipotent.Services.KliveAPI.KliveAPI>();
+            if (apis == null || apis.Length == 0)
+            {
+                await ServiceLogError(
+                    new InvalidOperationException("KliveAPI service not available."),
+                    "KliveTech could not register the Streamables live route; " +
+                    "live telemetry will not connect.");
+                return;
+            }
+
+            await ((Omnipotent.Services.KliveAPI.KliveAPI)apis[0]).CreateWebSocketRoute(
                 "/klivetech/streamables/live",
-                (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)
-                    (async (_, socket, query, _) => await HandleStreamLiveConnectionAsync(socket, query)),
-                KMProfileManager.KMPermissions.Klives);
+                async (_, socket, query, user) =>
+                {
+                    if (!await AuthorizeStreamViewerAsync(query, user))
+                    {
+                        await ServiceLogError("Rejected an unauthorized Streamables viewer.");
+                        try
+                        {
+                            await socket.CloseAsync(
+                                WebSocketCloseStatus.PolicyViolation,
+                                "Unauthorized",
+                                CancellationToken.None);
+                        }
+                        catch { }
+                        return;
+                    }
+                    await HandleStreamLiveConnectionAsync(socket, query);
+                },
+                KMProfileManager.KMPermissions.Anybody);
         }
 
         private async Task HandleStreamLiveConnectionAsync(WebSocket socket, NameValueCollection query)
@@ -1139,15 +1193,45 @@ namespace Omnipotent.Services.KliveTechHub
             StreamLiveSubscriber subscriber,
             CancellationToken token)
         {
-            await foreach (string message in subscriber.Messages.Reader.ReadAllAsync(token))
+            ChannelReader<string> reader = subscriber.Messages.Reader;
+            while (!token.IsCancellationRequested)
             {
-                byte[] bytes = Encoding.UTF8.GetBytes(message);
-                await subscriber.Socket.SendAsync(
-                    bytes.AsMemory(),
-                    WebSocketMessageType.Text,
-                    endOfMessage: true,
-                    token);
+                Task<bool> waitToRead = reader.WaitToReadAsync(token).AsTask();
+                Task completed = await Task.WhenAny(
+                    waitToRead,
+                    Task.Delay(LiveKeepaliveInterval, token));
+
+                // A gadget with every Streamable disabled is legitimately silent, which
+                // leaves a socket that never writes for intermediaries to reap. The viewer
+                // then reconnects forever against a connection that was never broken.
+                if (!ReferenceEquals(completed, waitToRead))
+                {
+                    await SendStreamLiveTextAsync(subscriber.Socket, "{\"type\":\"ping\"}", token);
+                    continue;
+                }
+
+                if (!await waitToRead)
+                {
+                    return;
+                }
+                while (reader.TryRead(out string? message))
+                {
+                    await SendStreamLiveTextAsync(subscriber.Socket, message, token);
+                }
             }
+        }
+
+        private static ValueTask SendStreamLiveTextAsync(
+            WebSocket socket,
+            string message,
+            CancellationToken token)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(message);
+            return socket.SendAsync(
+                bytes.AsMemory(),
+                WebSocketMessageType.Text,
+                endOfMessage: true,
+                token);
         }
 
         private static async Task ReceiveStreamLiveCloseAsync(
