@@ -490,8 +490,9 @@ namespace Omnipotent.Services.Projects
                 {
                     if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
                     var runtime = RuntimeState.Get(project.ProjectID);
+                    var now = DateTime.UtcNow;
                     if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open
-                        && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > DateTime.UtcNow))
+                        && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > now))
                         continue;
                     var tail = EventLog.ReadTail(project.ProjectID, 30);
 
@@ -504,12 +505,13 @@ namespace Omnipotent.Services.Projects
                     if (consecutiveFailures >= 2)
                     {
                         var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
-                        if (DateTime.UtcNow - outcomes[^1].Timestamp < backoff) continue; // still backing off
+                        if (now - outcomes[^1].Timestamp < backoff) continue; // still backing off
                     }
 
                     var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
                     // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
-                    if (lastWake == null || DateTime.UtcNow - lastWake.Timestamp > TimeSpan.FromMinutes(14))
+                    if (!ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
+                        && (lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
                         CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
                             ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
                             : "Periodic keepalive: reassess the plan and make the next concrete progress toward the goal.",
@@ -540,6 +542,7 @@ namespace Omnipotent.Services.Projects
             if (!Budget.IsWithinTokenBudget(project.ProjectID)) return;
 
             var now = DateTime.UtcNow;
+            var agentResumes = RuntimeState.Get(project.ProjectID).Checkpoint.AgentResumeActions;
             foreach (var agent in SubAgents.ListActive(project.ProjectID))
             {
                 try
@@ -547,7 +550,8 @@ namespace Omnipotent.Services.Projects
                     if (!ProjectWorkerHeartbeat.ShouldWake(agent,
                             SubAgentRunner.IsAwake(project.ProjectID, agent.AgentID), now,
                             settings.WorkerHeartbeatMinutes, settings.WorkerHeartbeatMaxMinutes,
-                            SubAgentRunner.UnproductiveStreak(project.ProjectID, agent.AgentID)))
+                            SubAgentRunner.UnproductiveStreak(project.ProjectID, agent.AgentID),
+                            agentResumes.GetValueOrDefault(agent.AgentID)))
                         continue;
                     SubAgentRunner.Wake(project, agent, ProjectWorkerHeartbeat.TriggerFor(agent), queueIfBusy: false);
                 }

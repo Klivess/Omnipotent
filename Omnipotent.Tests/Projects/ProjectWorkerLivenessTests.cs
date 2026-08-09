@@ -42,6 +42,24 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void Heartbeat_RespectsALoopRecoveryDeadline()
+        {
+            var now = DateTime.UtcNow;
+            var agent = Worker(lastWakeAt: now.AddHours(-4));
+            var recovery = new ProjectResumeAction
+            {
+                Kind = "loop-recovery",
+                RecordedAt = now,
+                NotBefore = now.AddHours(1),
+            };
+
+            Assert.False(ProjectWorkerHeartbeat.ShouldWake(
+                agent, isAwake: false, now, Base, Max, 0, recovery));
+            Assert.True(ProjectWorkerHeartbeat.ShouldWake(
+                agent, isAwake: false, now.AddHours(2), Base, Max, 0, recovery));
+        }
+
+        [Fact]
         public void Heartbeat_SkipsAgentsThatAreAlreadyAwake()
         {
             var now = DateTime.UtcNow;

@@ -40,11 +40,13 @@ namespace Omnipotent.Services.Projects
             DateTime nowUtc,
             int baseMinutes,
             int maxMinutes,
-            int unproductiveStreak)
+            int unproductiveStreak,
+            ProjectResumeAction? resumeAction = null)
         {
             if (agent.Retired) return false;
             if (ProjectSubAgentManager.IsCommander(agent)) return false;  // the Commander has its own keepalive
             if (isAwake) return false;
+            if (ProjectLoopRecovery.DefersAutomaticWake(resumeAction, nowUtc)) return false;
 
             // A bounded worker that has delivered is genuinely finished — waking it would just make it
             // re-report. Its slot is the Commander's to reclaim, and the task-force block says so.

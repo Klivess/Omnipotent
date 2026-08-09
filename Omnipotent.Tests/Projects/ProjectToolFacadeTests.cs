@@ -122,18 +122,55 @@ public class ProjectToolFacadeTests
     }
 
     [Fact]
-    public void FoldedCallRejectsNonEmptyArgumentFromAnotherOperation()
+    public void FoldedCallDropsTypedDefaultsFromAnotherOperation()
     {
         var unfolded = ProjectToolFacade.Unfold("manage_agents",
             "{\"op\":\"retire\",\"agentID\":\"0678f5fb5060\",\"role\":\"replacement-worker\"}");
 
-        Assert.False(unfolded.IsValid);
-        Assert.Contains("does not apply", unfolded.ErrorText);
-        Assert.Contains("role", unfolded.ErrorText);
+        Assert.True(unfolded.IsValid, unfolded.ErrorText);
+        Assert.Equal("retire_sub_agent", unfolded.ToolName);
+        Assert.Equal(["agentID"], JObject.Parse(unfolded.ArgumentsJson).Properties().Select(p => p.Name));
+        Assert.Contains(unfolded.Warnings, warning => warning.Contains("role", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void EveryFoldedOperationProjectsEmptyUnionFieldsOntoItsCanonicalSchema()
+    public void FoldedCallStillRejectsUnknownProperties()
+    {
+        var unfolded = ProjectToolFacade.Unfold("manage_agents",
+            "{\"op\":\"retire\",\"agentID\":\"0678f5fb5060\",\"agnetID\":null}");
+
+        Assert.False(unfolded.IsValid);
+        Assert.Contains("agnetID", unfolded.ErrorText);
+    }
+
+    public static IEnumerable<object[]> LunaSaturatedPayloads()
+    {
+        yield return ["project_directive", "{\"op\":\"acknowledge\",\"directiveID\":\"d1\",\"note\":\"accepted\",\"includeResolved\":false,\"summary\":\"\",\"artifactPaths\":[]}", "acknowledge_project_directive"];
+        yield return ["checkpoint", "{\"op\":\"get\",\"result\":\"done\",\"evidenceEventSequence\":0,\"grandPlanVersion\":0}", "get_checkpoint"];
+        yield return ["desktop", "{\"op\":\"terminal\",\"command\":\"pwd\",\"maxItems\":120}", "computer_terminal"];
+        yield return ["desktop", "{\"op\":\"window_state\",\"maxItems\":0}", "computer_window_state"];
+        yield return ["observable", "{\"op\":\"list\",\"value\":0}", "list_observables"];
+        yield return ["manage_files", "{\"op\":\"stat\",\"path\":\"report.md\",\"recursive\":false}", "stat_file"];
+        yield return ["browser", "{\"op\":\"open\",\"newTab\":false}", "computer_open_browser"];
+    }
+
+    [Theory]
+    [MemberData(nameof(LunaSaturatedPayloads))]
+    public void ObservedLunaDefaultsNormalizeToValidCanonicalCalls(
+        string foldedTool, string payload, string expectedCanonicalTool)
+    {
+        var unfolded = ProjectToolFacade.Unfold(foldedTool, payload);
+
+        Assert.True(unfolded.IsValid, unfolded.ErrorText);
+        Assert.Equal(expectedCanonicalTool, unfolded.ToolName);
+        Assert.NotEmpty(unfolded.Warnings);
+        var contract = ProjectToolContract.ValidateAndNormalize(
+            unfolded.ToolName, unfolded.ArgumentsJson, CommanderCanonical());
+        Assert.True(contract.IsValid, contract.ErrorText);
+    }
+
+    [Fact]
+    public void EveryFoldedOperationProjectsSaturatedUnionFieldsOntoItsCanonicalSchema()
     {
         var canonical = CommanderCanonical();
         var canonicalSchemas = canonical.ToDictionary(tool => tool.function.name,
@@ -150,7 +187,7 @@ public class ProjectToolFacadeTests
             {
                 var payload = new JObject { ["op"] = op };
                 foreach (var property in unionProperties.Properties().Where(property => property.Name != "op"))
-                    payload[property.Name] = JValue.CreateNull();
+                    payload[property.Name] = ProviderDefault(property.Value);
 
                 var unfolded = ProjectToolFacade.Unfold(folded.function.name, payload.ToString());
 
@@ -164,6 +201,22 @@ public class ProjectToolFacadeTests
                     $"{folded.function.name} op={op} leaked cross-operation fields: {string.Join(", ", unexpected)}");
             }
         }
+    }
+
+    private static JToken ProviderDefault(JToken propertySchema)
+    {
+        if (propertySchema["enum"] is JArray values && values.Count > 0)
+            return values[0]!.DeepClone();
+        string? type = propertySchema["type"]?.Value<string>();
+        return type switch
+        {
+            "boolean" => false,
+            "integer" => 0,
+            "number" => 0.0,
+            "array" => new JArray(),
+            "object" => new JObject(),
+            _ => "provider-default",
+        };
     }
 
     [Fact]

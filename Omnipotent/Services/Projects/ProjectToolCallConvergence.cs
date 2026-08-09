@@ -16,7 +16,8 @@ internal static class ProjectToolCallConvergence
 
     public static int RegisterRejectedCall(IDictionary<string, int> recentSignatures,
         string toolName, string? argumentsJson, string rejection) =>
-        Register(recentSignatures, "rejected", toolName, argumentsJson, rejection.Trim());
+        Register(recentSignatures, "rejected", toolName, OperationOf(argumentsJson),
+            RejectionIdentity(rejection));
 
     private static int Register(IDictionary<string, int> recentSignatures, string kind,
         string toolName, string? argumentsJson, string? rejection)
@@ -41,6 +42,49 @@ internal static class ProjectToolCallConvergence
         {
             return value;
         }
+    }
+
+    /// <summary>
+    /// Rejected-call convergence is structural: changing an otherwise valid note, summary, or other
+    /// payload value does not repair the same validation error. Keep only the folded/canonical op as
+    /// the call discriminator and let the validation reason identify the actual defect. This still
+    /// separates different operations and different error paths while closing the loophole where a
+    /// model regenerated prose to evade the guard indefinitely.
+    /// </summary>
+    private static string OperationOf(string? argumentsJson)
+    {
+        if (string.IsNullOrWhiteSpace(argumentsJson)) return "{}";
+        try
+        {
+            var root = JToken.Parse(argumentsJson);
+            if (root is not JObject obj || obj["op"] is not JValue op
+                || op.Type is JTokenType.Null or JTokenType.Undefined)
+                return "{}";
+            return new JObject { ["op"] = op.DeepClone() }.ToString(Formatting.None);
+        }
+        catch (JsonException)
+        {
+            return "{}";
+        }
+    }
+
+    /// <summary>Contract failures already carry a stable machine-readable code and JSON path.
+    /// Those identify the defect; prose can change without representing a corrected call.</summary>
+    private static string RejectionIdentity(string rejection)
+    {
+        string value = rejection.Trim();
+        const string prefix = "TOOL_ARGUMENT_ERROR ";
+        if (!value.StartsWith(prefix, StringComparison.Ordinal)) return value;
+        try
+        {
+            var error = JObject.Parse(value[prefix.Length..]);
+            string? code = error["code"]?.Value<string>();
+            string? path = error["path"]?.Value<string>();
+            if (!string.IsNullOrWhiteSpace(code) && !string.IsNullOrWhiteSpace(path))
+                return $"{code}|{path}";
+        }
+        catch (JsonException) { }
+        return value;
     }
 
     private static JToken Sort(JToken token) => token switch

@@ -103,8 +103,7 @@ namespace Omnipotent.Services.Projects
                 // A durable resume action with a future not-before time is an intentional sleep,
                 // not a wedge. The keepalive owns the scheduled wake; force-waking here burns a
                 // model turn and defeats the commander's explicit timing decision.
-                if (runtime.Checkpoint.ResumeAction?.NotBefore is DateTime notBefore
-                    && notBefore.ToUniversalTime() > now)
+                if (ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now))
                     return (null, null);
             }
 

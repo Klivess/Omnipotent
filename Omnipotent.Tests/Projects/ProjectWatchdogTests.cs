@@ -104,6 +104,28 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void LegacyLoopRecoveryGetsAnImplicitCooldownInsteadOfAWatchdogRestart()
+        {
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddMinutes(-1));
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, Type = ProjectEventTypes.ToolCall, Author = "commander", Text = "x" });
+            svc.RuntimeState.SetResumeAction(pid, new ProjectResumeAction
+            {
+                Kind = "loop-recovery",
+                Summary = "Change strategy after the convergence guard stopped the wake.",
+                RecordedAt = DateTime.UtcNow,
+                RecordedBy = "commander",
+            });
+            var digest = svc.Digests.GetDigest(pid);
+            digest.RecentStuckLoopTrips = 5;
+            svc.Digests.SaveDigest(digest);
+
+            var wd = new ProjectWatchdog(svc, _ => { });
+
+            Assert.Null(wd.Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
         public void ExpiredResumeNotBefore_DoesNotSuppressRealStall()
         {
             var (svc, pid) = NewProjectService();

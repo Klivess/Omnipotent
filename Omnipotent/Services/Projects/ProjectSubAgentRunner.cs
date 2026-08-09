@@ -205,9 +205,11 @@ namespace Omnipotent.Services.Projects
                     var project = parent.Store.GetProject(state.ProjectID);
                     var agent = parent.SubAgents.ListActive(state.ProjectID).FirstOrDefault(x => x.AgentID == agentID);
                     if (project?.Status != ProjectStatus.Active || agent == null) continue;
-                    string resume = state.Checkpoint.AgentResumeActions.GetValueOrDefault(agentID)?.Summary
+                    var resumeAction = state.Checkpoint.AgentResumeActions.GetValueOrDefault(agentID);
+                    string resume = resumeAction?.Summary
                         ?? "Resume the interrupted assignment from the latest durable project events.";
-                    Wake(project, agent, $"Recovery after process restart. Exact resume action: {resume}", queueIfBusy: false);
+                    if (!ProjectLoopRecovery.DefersAutomaticWake(resumeAction, DateTime.UtcNow))
+                        Wake(project, agent, $"Recovery after process restart. Exact resume action: {resume}", queueIfBusy: false);
                 }
             }
         }
@@ -245,10 +247,13 @@ namespace Omnipotent.Services.Projects
             string? initialModel = null;
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
+            ProjectResumeAction? startingResumeAction = null;
             try
             {
                 var running = parent.RuntimeState.MarkAgentWakeRunning(projectID, agent.AgentID, wakeID, leaseGeneration);
                 if (!running.Applied) throw new OperationCanceledException(running.Reason);
+                startingResumeAction = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions
+                    .GetValueOrDefault(agent.AgentID);
                 var llmServices = await parent.GetServicesByType<KliveLLM.KliveLLM>();
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
@@ -570,14 +575,13 @@ namespace Omnipotent.Services.Projects
                                 });
                                 if (loopTrips >= maxLoopTrips)
                                 {
+                                    assignmentNeedsCommanderFollowup = true;
                                     outcomeText = $"Agent {agent.AgentID} stopped after {loopTrips} repeated invalid-call loop trips.";
-                                    parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
-                                    {
-                                        Kind = "loop-recovery",
-                                        RecordedBy = agent.AgentID,
-                                        ToolName = toolName,
-                                        Summary = $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."
-                                    });
+                                    var previousResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions
+                                        .GetValueOrDefault(agent.AgentID);
+                                    parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID,
+                                        ProjectLoopRecovery.Create(previousResume, agent.AgentID, toolName,
+                                            $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."));
                                     stop = true;
                                 }
                             }
@@ -632,14 +636,13 @@ namespace Omnipotent.Services.Projects
                             });
                             if (loopTrips >= maxLoopTrips)
                             {
+                                assignmentNeedsCommanderFollowup = true;
                                 outcomeText = $"Agent {agent.AgentID} stopped after {loopTrips} repeated-call loop trips.";
-                                parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
-                                {
-                                    Kind = "loop-recovery",
-                                    RecordedBy = agent.AgentID,
-                                    ToolName = toolName,
-                                    Summary = $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the obstacle to the commander."
-                                });
+                                var previousResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions
+                                    .GetValueOrDefault(agent.AgentID);
+                                parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID,
+                                    ProjectLoopRecovery.Create(previousResume, agent.AgentID, toolName,
+                                        $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the obstacle to the commander."));
                                 goto done;
                             }
                             continue;
@@ -866,6 +869,9 @@ namespace Omnipotent.Services.Projects
                 parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
                 parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
             }
+            if (ProjectLoopRecovery.ShouldClearAfterProgress(startingResumeAction,
+                    outcome == ProjectEventTypes.WakeCompleted, productiveActions, loopTrips))
+                parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, startingResumeAction!.ActionID);
             var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agent.AgentID);
             if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                 parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, consumedResume!.ActionID);

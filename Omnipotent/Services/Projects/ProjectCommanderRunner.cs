@@ -271,6 +271,7 @@ namespace Omnipotent.Services.Projects
             string? initialModel = null;
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
+            ProjectResumeAction? startingResumeAction = null;
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
             bool klivesInvolved = TriggeredByKlives(triggerDescription);
@@ -286,6 +287,7 @@ namespace Omnipotent.Services.Projects
             {
                 var running = parent.RuntimeState.MarkWakeRunning(projectID, wakeID, leaseGeneration);
                 if (!running.Applied) throw new OperationCanceledException(running.Reason);
+                startingResumeAction = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
                 var llmServices = await parent.GetServicesByType<KliveLLM.KliveLLM>();
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
@@ -668,13 +670,10 @@ namespace Omnipotent.Services.Projects
                                 if (stuckTrips >= maxLoopTrips)
                                 {
                                     outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated invalid-call loop trips.";
-                                    parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
-                                    {
-                                        Kind = "loop-recovery",
-                                        RecordedBy = "commander",
-                                        ToolName = toolName,
-                                        Summary = $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."
-                                    });
+                                    var previousResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
+                                    parent.RuntimeState.SetResumeAction(projectID, ProjectLoopRecovery.Create(
+                                        previousResume, "commander", toolName,
+                                        $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."));
                                     parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander",
                                         $"Stopped after {stuckTrips} repeated invalid-call detections. The next attempt must correct the arguments or use a different operation."));
                                     stop = true;
@@ -715,13 +714,10 @@ namespace Omnipotent.Services.Projects
                             if (stuckTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated-call loop trips.";
-                                parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
-                                {
-                                    Kind = "loop-recovery",
-                                    RecordedBy = "commander",
-                                    ToolName = toolName,
-                                    Summary = $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the durable obstacle."
-                                });
+                                var previousResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
+                                parent.RuntimeState.SetResumeAction(projectID, ProjectLoopRecovery.Create(
+                                    previousResume, "commander", toolName,
+                                    $"The previous wake hit the convergence guard after repeatedly attempting {DescribeCall(toolName, argsJson)}. Inspect current external state, do not repeat those inputs, and use a materially different strategy or report the durable obstacle."));
                                 parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander",
                                     $"Stopped after {stuckTrips} repeated-call detections. The next attempt must use a different strategy, not repeat the same tool inputs."));
                                 goto done;
@@ -1051,6 +1047,9 @@ namespace Omnipotent.Services.Projects
                 // otherwise a fresh wake resumes immediately from the durable checkpoint.
                 bool continueAfterSlice = ProjectWorkSliceBoundary.ShouldContinueAssignment(
                     endedAtWorkSlice, outcome == ProjectEventTypes.WakeCompleted);
+                if (ProjectLoopRecovery.ShouldClearAfterProgress(startingResumeAction,
+                        outcome == ProjectEventTypes.WakeCompleted, productiveActions, stuckTrips))
+                    parent.RuntimeState.ClearResumeAction(projectID, startingResumeAction!.ActionID);
                 var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
                 if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                     parent.RuntimeState.ClearResumeAction(projectID, consumedResume!.ActionID);
@@ -1192,7 +1191,8 @@ namespace Omnipotent.Services.Projects
                         parent.Digests.SaveDigest(legacyDigest);
                     }
                     var project = parent.Store.GetProject(runtime.ProjectID);
-                    if (project?.Status is ProjectStatus.Active or ProjectStatus.Planning)
+                    if (project?.Status is (ProjectStatus.Active or ProjectStatus.Planning)
+                        && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, DateTime.UtcNow))
                     {
                         string resume = runtime.Checkpoint.ResumeAction?.Summary
                             ?? "Rehydrate committed state and continue from the last verified action without re-discovery.";

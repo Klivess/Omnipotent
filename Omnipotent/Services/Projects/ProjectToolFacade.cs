@@ -432,10 +432,12 @@ public static class ProjectToolFacade
     }
 
     /// <summary>
-    /// Projects a folded union payload onto the selected canonical operation. Empty placeholders for
-    /// other operations are harmless provider artefacts and are discarded with an audit warning;
-    /// non-empty cross-operation arguments remain errors so a genuinely confused call cannot be
-    /// silently routed to the wrong capability.
+    /// Projects a folded union payload onto the selected canonical operation. Some providers fill
+    /// every property in the flat union schema, including sibling-operation fields with typed
+    /// defaults such as false, zero, or the first enum value. Once an explicit op has selected the
+    /// canonical member those sibling fields are provider artefacts, regardless of their value, and
+    /// are discarded with an audit warning. Names that no member declares still fail so typos are
+    /// never silently swallowed.
     /// </summary>
     private static ProjectToolUnfoldResult NormalizeArgumentsForMember(
         FoldGroup group, FoldMember member, JObject args, List<string> warnings, string? canonicalOp)
@@ -457,9 +459,10 @@ public static class ProjectToolFacade
         {
             if (SchemaAcceptsProperty(schema, property.Name)) continue;
 
-            // Only tolerate placeholders for real fields from another member of this folded tool.
-            // Unknown names still receive the normal typo/error treatment even when their value is empty.
-            if (GroupDeclaresProperty(group, property.Name) && IsEmptyPlaceholder(property.Value))
+            // The outer op is the discriminator. Any real field belonging only to another member
+            // came from the provider's saturated union payload and cannot apply to this operation.
+            // Unknown names still receive the normal typo/error treatment for every value.
+            if (GroupDeclaresProperty(group, property.Name))
             {
                 dropped.Add(property.Name);
                 property.Remove();
@@ -476,7 +479,7 @@ public static class ProjectToolFacade
         }
 
         if (dropped.Count > 0)
-            warnings.Add($"Ignored empty arguments not used by '{group.Name}' op '{member.Op}': {string.Join(", ", dropped)}.");
+            warnings.Add($"Ignored arguments not used by '{group.Name}' op '{member.Op}': {string.Join(", ", dropped)}.");
 
         return ProjectToolUnfoldResult.Ok(member.CanonicalTool,
             canonicalArgs.ToString(Formatting.None), warnings);
@@ -515,7 +518,7 @@ public static class ProjectToolFacade
             {
                 ["type"] = "string",
                 ["enum"] = new JArray(opValues),
-                ["description"] = "Which operation to perform. The tool description lists the arguments each op takes; arguments belonging to another op are rejected.",
+                ["description"] = "Which operation to perform. Only arguments belonging to the selected op are forwarded; provider-populated fields for other ops are ignored.",
             },
         };
 
