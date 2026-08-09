@@ -53,8 +53,15 @@ public class ModelParameterCatalogTests
     public void Normalize_AcceptsEnumOptionsCaseInsensitivelyAndRejectsOthers()
     {
         var accepted = ModelParameterCatalog.Normalize(
-            new Dictionary<string, JToken> { ["reasoning"] = "HIGH" });
+            new Dictionary<string, JToken>
+            {
+                ["reasoning"] = "HIGH",
+                ["service_tier"] = "FLEX",
+                ["provider"] = new JArray("AZURE", "openai", "azure"),
+            });
         Assert.Equal("high", accepted["reasoning"].Value<string>());
+        Assert.Equal("flex", accepted["service_tier"].Value<string>());
+        Assert.Equal(new[] { "azure", "openai" }, accepted["provider"].Values<string>());
 
         Assert.Empty(ModelParameterCatalog.Normalize(
             new Dictionary<string, JToken> { ["reasoning"] = "maximum" }));
@@ -91,6 +98,40 @@ public class ModelParameterCatalogTests
         Assert.Equal(20, parameters.TopK);
         Assert.Null(parameters.TopP);
         Assert.Null(parameters.Seed);
+        Assert.Null(parameters.ServiceTier);
+        Assert.Null(parameters.ProviderOnly);
+    }
+
+    [Fact]
+    public void ToSamplingParameters_CarriesOpenRouterRoutingDropdowns()
+    {
+        var parameters = ModelParameterCatalog.ToSamplingParameters(
+            ModelParameterCatalog.Normalize(new Dictionary<string, JToken>
+            {
+                ["service_tier"] = "priority",
+                ["provider"] = new JArray("openai", "azure"),
+            }));
+
+        Assert.NotNull(parameters);
+        Assert.Equal("priority", parameters!.ServiceTier);
+        Assert.Equal(new[] { "openai", "azure" }, parameters.ProviderOnly);
+        Assert.Null(parameters.Temperature);
+    }
+
+    [Fact]
+    public void OpenRouterRoutingDropdowns_AreGatewayLevelEnums()
+    {
+        var serviceTier = ModelParameterCatalog.Find("service_tier");
+        var provider = ModelParameterCatalog.Find("provider");
+
+        Assert.NotNull(serviceTier);
+        Assert.NotNull(provider);
+        Assert.Equal(ModelParameterKind.Enum, serviceTier!.Kind);
+        Assert.Equal(new[] { "default", "flex", "priority" }, serviceTier.Options);
+        Assert.False(serviceTier.ModelCapabilityGated);
+        Assert.Equal(ModelParameterKind.MultiEnum, provider!.Kind);
+        Assert.Null(provider.Options); // populated live from the configured models' endpoint catalogs
+        Assert.False(provider.ModelCapabilityGated);
     }
 
     [Fact]
@@ -120,12 +161,14 @@ public class ModelParameterCatalogTests
         var settings = new ProjectSettings { ProjectID = "p1" };
 
         Assert.True(settings.TrySet("commanderParameters",
-            JObject.Parse("{\"temperature\":0.15,\"top_p\":5,\"bogus\":1}")));
+            JObject.Parse("{\"temperature\":0.15,\"top_p\":5,\"service_tier\":\"flex\",\"provider\":[\"azure\",\"openai\"],\"bogus\":1}")));
         Assert.True(settings.TrySet("tierTextParameters", JObject.Parse("{\"seed\":42}")));
 
         var commander = settings.ParametersForRoute(ProjectSettings.RouteNames.Commander);
         Assert.Equal(0.15, commander["temperature"].Value<double>());
         Assert.Equal(1d, commander["top_p"].Value<double>());
+        Assert.Equal("flex", commander["service_tier"].Value<string>());
+        Assert.Equal(new[] { "azure", "openai" }, commander["provider"].Values<string>());
         Assert.False(commander.ContainsKey("bogus"));
 
         // Routes are independent — one route's parameters never leak into another.

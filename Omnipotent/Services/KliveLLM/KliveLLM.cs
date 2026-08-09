@@ -104,9 +104,10 @@ namespace Omnipotent.Services.KliveLLM
     /// did before this type existed. Callers (Projects' per-route parameter configuration) are
     /// responsible for range validation — see <c>ModelParameterCatalog</c>.
     ///
-    /// <see cref="TopK"/>, <see cref="RepetitionPenalty"/>, <see cref="MinP"/> and <see cref="TopA"/>
-    /// are OpenRouter extensions rather than vanilla OpenAI fields, and are dropped for any other
-    /// provider so a strict OpenAI-compatible endpoint can never 400 on a parameter it doesn't know.
+    /// <see cref="TopK"/>, <see cref="RepetitionPenalty"/>, <see cref="MinP"/>, <see cref="TopA"/>,
+    /// <see cref="ServiceTier"/> and <see cref="ProviderOnly"/> are OpenRouter extensions rather
+    /// than vanilla OpenAI fields, and are dropped for any other provider so a strict
+    /// OpenAI-compatible endpoint can never 400 on a parameter it doesn't know.
     /// </summary>
     public sealed record ModelSamplingParameters(
         double? Temperature = null,
@@ -117,11 +118,14 @@ namespace Omnipotent.Services.KliveLLM
         double? RepetitionPenalty = null,
         double? MinP = null,
         double? TopA = null,
-        int? Seed = null)
+        int? Seed = null,
+        string? ServiceTier = null,
+        IReadOnlyList<string>? ProviderOnly = null)
     {
         public bool IsEmpty => Temperature is null && TopP is null && TopK is null
             && FrequencyPenalty is null && PresencePenalty is null && RepetitionPenalty is null
-            && MinP is null && TopA is null && Seed is null;
+            && MinP is null && TopA is null && Seed is null && ServiceTier is null
+            && (ProviderOnly == null || ProviderOnly.Count == 0);
     }
 
     public class KliveLLM : OmniService
@@ -1713,6 +1717,20 @@ namespace Omnipotent.Services.KliveLLM
             payload.repetition_penalty = parameters.RepetitionPenalty;
             payload.min_p = parameters.MinP;
             payload.top_a = parameters.TopA;
+            // Route-level values are applied after the global OpenRouter configuration. An explicit
+            // `default` service tier therefore resets a globally pinned flex/priority tier for this route.
+            if (!string.IsNullOrWhiteSpace(parameters.ServiceTier))
+                payload.service_tier = parameters.ServiceTier;
+
+            // OpenRouter's `provider.only` is deliberately restrictive: once Klives selects one or
+            // more model-aware provider tags, every unselected endpoint is excluded for this request.
+            if (parameters.ProviderOnly is { Count: > 0 })
+            {
+                payload.provider = new HFWrapper.HFProviderRouting
+                {
+                    only = parameters.ProviderOnly.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                };
+            }
         }
 
         /// <summary>

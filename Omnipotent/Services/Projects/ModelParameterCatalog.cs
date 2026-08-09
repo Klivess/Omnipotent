@@ -8,6 +8,7 @@ public enum ModelParameterKind
     Number,
     Integer,
     Enum,
+    MultiEnum,
 }
 
 /// <summary>
@@ -25,13 +26,15 @@ public sealed record ModelParameterDefinition(
     string Description,
     string DefaultHint,
     bool OpenRouterOnly,
-    IReadOnlyList<string>? Options = null);
+    IReadOnlyList<string>? Options = null,
+    bool ModelCapabilityGated = true);
 
 /// <summary>
 /// The tunable request parameters Projects exposes per LLM route, and the validation that keeps a
 /// stored value inside its legal range.
 ///
-/// SCOPE: sampling/decoding knobs only. Protocol-owned fields OpenRouter also lists under
+/// SCOPE: sampling/decoding knobs plus safe OpenRouter routing controls. Protocol-owned fields
+/// OpenRouter also lists under
 /// <c>supported_parameters</c> — tools, tool_choice, response_format, structured_outputs, logprobs,
 /// include_reasoning, stop — are deliberately absent: the agent loop owns those, and letting a saved
 /// setting overwrite them would break tool calling rather than tune it. <c>max_tokens</c> is likewise
@@ -50,6 +53,7 @@ public static class ModelParameterCatalog
     /// still clamped by the global ThinkingType ceiling at dispatch — a route can ask for less thinking
     /// than the global setting, never more.</summary>
     public static readonly string[] ReasoningLevels = ["off", "low", "medium", "high"];
+    public static readonly string[] ServiceTiers = ["default", "flex", "priority"];
 
     public static readonly IReadOnlyList<ModelParameterDefinition> Definitions =
     [
@@ -83,6 +87,14 @@ public static class ModelParameterCatalog
         new("reasoning", "Reasoning effort", ModelParameterKind.Enum, null, null, null,
             "How hard a reasoning-capable model thinks before answering. Clamped by the global ThinkingType ceiling.",
             "the global ThinkingType setting", OpenRouterOnly: true, Options: ReasoningLevels),
+        new("service_tier", "Service tier", ModelParameterKind.Enum, null, null, null,
+            "OpenRouter processing tier. Flex favours lower cost; priority favours lower latency.",
+            "the global OpenRouter service tier", OpenRouterOnly: true, Options: ServiceTiers,
+            ModelCapabilityGated: false),
+        new("provider", "Providers", ModelParameterKind.MultiEnum, null, null, null,
+            "The OpenRouter hosting providers allowed to serve this route. Every provider not selected is excluded.",
+            "all providers available to the model", OpenRouterOnly: true,
+            ModelCapabilityGated: false),
     ];
 
     private static readonly Dictionary<string, ModelParameterDefinition> byName =
@@ -105,6 +117,22 @@ public static class ModelParameterCatalog
         var definition = Find(name);
         if (definition == null || value == null || value.Type is JTokenType.Null or JTokenType.Undefined) return false;
         normalizedName = definition.Name;
+
+        if (definition.Kind == ModelParameterKind.MultiEnum)
+        {
+            IEnumerable<string?> candidates = value.Type == JTokenType.Array
+                ? value.Values<string?>()
+                : [value.Type == JTokenType.String ? value.Value<string>() : null];
+            var selected = candidates
+                .Select(x => (x ?? string.Empty).Trim().ToLowerInvariant())
+                .Where(IsValidProviderTag)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(32)
+                .ToList();
+            if (selected.Count == 0) return false;
+            normalizedValue = new JArray(selected);
+            return true;
+        }
 
         if (definition.Kind == ModelParameterKind.Enum)
         {
@@ -165,6 +193,10 @@ public static class ModelParameterCatalog
                 ? (int)Math.Clamp(v.Value<double>(), int.MinValue, int.MaxValue) : null;
         string? Text(string name) =>
             values.TryGetValue(name, out var v) && v.Type == JTokenType.String ? v.Value<string>() : null;
+        IReadOnlyList<string>? TextList(string name) =>
+            values.TryGetValue(name, out var v) && v.Type == JTokenType.Array
+                ? v.Values<string>().Where(x => !string.IsNullOrWhiteSpace(x)).ToList()
+                : null;
 
         var parameters = new ModelSamplingParameters(
             Temperature: Number("temperature"),
@@ -175,7 +207,9 @@ public static class ModelParameterCatalog
             RepetitionPenalty: Number("repetition_penalty"),
             MinP: Number("min_p"),
             TopA: Number("top_a"),
-            Seed: Integer("seed"));
+            Seed: Integer("seed"),
+            ServiceTier: Text("service_tier"),
+            ProviderOnly: TextList("provider"));
         return parameters.IsEmpty ? null : parameters;
     }
 
@@ -185,4 +219,8 @@ public static class ModelParameterCatalog
     public static string? ReasoningEffort(IReadOnlyDictionary<string, JToken>? values) =>
         values != null && values.TryGetValue("reasoning", out var v) && v.Type == JTokenType.String
             ? v.Value<string>() : null;
+
+    private static bool IsValidProviderTag(string value) =>
+        value.Length is > 0 and <= 100
+        && value.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or '/');
 }

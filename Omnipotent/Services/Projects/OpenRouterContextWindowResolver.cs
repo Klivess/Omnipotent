@@ -29,6 +29,16 @@ public sealed record OpenRouterModelParameterSupport(
     IReadOnlyList<string> SupportedParameters,
     bool FromCatalog);
 
+/// <summary>One concrete OpenRouter endpoint provider that can host a model. <see cref="Tag"/> is
+/// the stable slug accepted by <c>provider.only</c>; <see cref="Name"/> is its display label.</summary>
+public sealed record OpenRouterProviderOption(string Tag, string Name);
+
+/// <summary>The endpoint providers advertised for one configured model.</summary>
+public sealed record OpenRouterModelProviderSupport(
+    string RequestedModel,
+    IReadOnlyList<OpenRouterProviderOption> Providers,
+    bool FromCatalog);
+
 /// <summary>
 /// Fetches OpenRouter's live model catalog and resolves the context constraints for the complete
 /// model fallback set used by a Projects request. The smallest route window is authoritative: until
@@ -50,12 +60,19 @@ public sealed class OpenRouterContextWindowResolver
     private readonly SemaphoreSlim refreshGate = new(1, 1);
     private Dictionary<string, CatalogEntry>? cachedCatalog;
     private DateTime cachedAtUtc;
+    private readonly object providerCacheLock = new();
+    private readonly Dictionary<string, ProviderCacheEntry> providerCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, Task<ProviderCacheEntry?>> providerRequests = new(StringComparer.OrdinalIgnoreCase);
 
     internal sealed record CatalogEntry(
         string Model,
         int ContextWindowTokens,
         int MaxCompletionTokens,
         IReadOnlyList<string>? SupportedParameters = null);
+
+    private sealed record ProviderCacheEntry(
+        DateTime FetchedAtUtc,
+        IReadOnlyList<OpenRouterProviderOption> Providers);
 
     public OpenRouterContextWindowResolver(
         Func<Task<string?>> tokenProvider,
@@ -141,6 +158,89 @@ public sealed class OpenRouterContextWindowResolver
                     route, route, Array.Empty<string>(), FromCatalog: false));
         }
         return resolved;
+    }
+
+    /// <summary>
+    /// Fetches each model's live endpoint list. Provider tags are model-specific and cannot safely be
+    /// hard-coded: the returned values are the exact slugs accepted by OpenRouter's
+    /// <c>provider.only</c> request field. Successful responses, including an empty endpoint list, are
+    /// cached for the same TTL as the model catalog and concurrent lookups share one request per model.
+    /// </summary>
+    public async Task<IReadOnlyList<OpenRouterModelProviderSupport>> ResolveProvidersAsync(
+        IReadOnlyList<string> modelRoutes,
+        CancellationToken ct = default)
+    {
+        var routes = (modelRoutes ?? Array.Empty<string>())
+            .Select(x => (x ?? string.Empty).Trim())
+            .Where(x => x.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (routes.Count == 0) return Array.Empty<OpenRouterModelProviderSupport>();
+
+        var resolved = await Task.WhenAll(routes.Select(route => ResolveProvidersForModelAsync(route, ct)));
+        return resolved;
+    }
+
+    private async Task<OpenRouterModelProviderSupport> ResolveProvidersForModelAsync(string model, CancellationToken ct)
+    {
+        Task<ProviderCacheEntry?> pending;
+        lock (providerCacheLock)
+        {
+            if (providerCache.TryGetValue(model, out var cached)
+                && DateTime.UtcNow - cached.FetchedAtUtc < CacheTtl)
+                return new OpenRouterModelProviderSupport(model, cached.Providers, FromCatalog: true);
+
+            if (!providerRequests.TryGetValue(model, out pending!))
+            {
+                pending = FetchProvidersForModelAsync(model, ct);
+                providerRequests[model] = pending;
+            }
+        }
+
+        ProviderCacheEntry? fetched;
+        try { fetched = await pending; }
+        finally
+        {
+            lock (providerCacheLock)
+                if (providerRequests.TryGetValue(model, out var current) && ReferenceEquals(current, pending))
+                    providerRequests.Remove(model);
+        }
+
+        if (fetched == null)
+            return new OpenRouterModelProviderSupport(model, Array.Empty<OpenRouterProviderOption>(), FromCatalog: false);
+
+        lock (providerCacheLock) providerCache[model] = fetched;
+        return new OpenRouterModelProviderSupport(model, fetched.Providers, FromCatalog: true);
+    }
+
+    private async Task<ProviderCacheEntry?> FetchProvidersForModelAsync(string model, CancellationToken ct)
+    {
+        try
+        {
+            string encodedModel = string.Join("/", model.Split('/').Select(Uri.EscapeDataString));
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                $"https://openrouter.ai/api/v1/models/{encodedModel}/endpoints");
+            string? token = await tokenProvider();
+            if (!string.IsNullOrWhiteSpace(token))
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+
+            using var response = await http.SendAsync(request, ct);
+            if (!response.IsSuccessStatusCode)
+            {
+                log($"OpenRouter provider catalog for {model} returned HTTP {(int)response.StatusCode}.");
+                return null;
+            }
+
+            string body = await response.Content.ReadAsStringAsync(ct);
+            return new ProviderCacheEntry(DateTime.UtcNow, ParseProviders(body));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            log($"OpenRouter provider catalog fetch for {model} failed ({ex.Message}).");
+            return null;
+        }
     }
 
     private async Task<Dictionary<string, CatalogEntry>?> GetCatalogAsync(CancellationToken ct)
@@ -238,5 +338,22 @@ public sealed class OpenRouterContextWindowResolver
             long value = token?.Value<long?>() ?? 0;
             return value is > 0 and <= int.MaxValue ? (int)value : 0;
         }
+    }
+
+    internal static IReadOnlyList<OpenRouterProviderOption> ParseProviders(string body)
+    {
+        var root = JObject.Parse(body);
+        return ((root["data"]?["endpoints"] as JArray) ?? new JArray())
+            .Select(item => new OpenRouterProviderOption(
+                ((string?)item["tag"] ?? string.Empty).Trim(),
+                ((string?)item["provider_name"] ?? string.Empty).Trim()))
+            .Where(option => option.Tag.Length > 0)
+            .GroupBy(option => option.Tag, StringComparer.OrdinalIgnoreCase)
+            .Select(group => new OpenRouterProviderOption(
+                group.First().Tag,
+                group.Select(x => x.Name).FirstOrDefault(name => name.Length > 0) ?? group.First().Tag))
+            .OrderBy(option => option.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(option => option.Tag, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 }

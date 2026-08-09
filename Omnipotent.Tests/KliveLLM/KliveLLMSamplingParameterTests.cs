@@ -14,7 +14,8 @@ namespace Omnipotent.Tests.KliveLLM
             var payload = Payload();
             LlmService.ApplySamplingParameters(ref payload, OpenRouter(), new ModelSamplingParameters(
                 Temperature: 0.25, TopP: 0.8, TopK: 40, FrequencyPenalty: 0.5, PresencePenalty: -0.25,
-                RepetitionPenalty: 1.1, MinP: 0.05, TopA: 0.2, Seed: 7));
+                RepetitionPenalty: 1.1, MinP: 0.05, TopA: 0.2, Seed: 7,
+                ServiceTier: "priority", ProviderOnly: new[] { "openai", "azure" }));
 
             var json = Serialize(payload);
             Assert.Equal(0.25, json["temperature"]!.Value<double>());
@@ -26,6 +27,8 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(0.05, json["min_p"]!.Value<double>());
             Assert.Equal(0.2, json["top_a"]!.Value<double>());
             Assert.Equal(7, json["seed"]!.Value<int>());
+            Assert.Equal("priority", json["service_tier"]!.Value<string>());
+            Assert.Equal(new[] { "openai", "azure" }, json["provider"]!["only"]!.Values<string>());
         }
 
         [Fact]
@@ -40,12 +43,13 @@ namespace Omnipotent.Tests.KliveLLM
         {
             var payload = Payload();
             LlmService.ApplySamplingParameters(ref payload, Provider(provider), new ModelSamplingParameters(
-                Temperature: 0.4, TopK: 40, RepetitionPenalty: 1.1, MinP: 0.05, TopA: 0.2, Seed: 3));
+                Temperature: 0.4, TopK: 40, RepetitionPenalty: 1.1, MinP: 0.05, TopA: 0.2, Seed: 3,
+                ServiceTier: "flex", ProviderOnly: new[] { "openai" }));
 
             var json = Serialize(payload);
             Assert.Equal(0.4, json["temperature"]!.Value<double>());
             Assert.Equal(3, json["seed"]!.Value<int>());
-            foreach (string extension in new[] { "top_k", "repetition_penalty", "min_p", "top_a" })
+            foreach (string extension in new[] { "top_k", "repetition_penalty", "min_p", "top_a", "service_tier", "provider" })
                 Assert.Null(json[extension]);
         }
 
@@ -59,8 +63,22 @@ namespace Omnipotent.Tests.KliveLLM
             var json = Serialize(payload);
             Assert.Equal(0.7, json["temperature"]!.Value<double>());
             foreach (string absent in new[]
-                     { "top_p", "top_k", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a", "seed" })
+                     { "top_p", "top_k", "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a", "seed", "service_tier", "provider" })
                 Assert.Null(json[absent]);
+        }
+
+        [Fact]
+        public void RouteServiceTierOverridesGlobalWhenProviderFilterIsUnpinned()
+        {
+            var payload = Payload();
+            payload.service_tier = "priority";
+
+            LlmService.ApplySamplingParameters(ref payload, OpenRouter(),
+                new ModelSamplingParameters(ServiceTier: "default"));
+
+            var json = Serialize(payload);
+            Assert.Equal("default", json["service_tier"]!.Value<string>());
+            Assert.Null(json["provider"]);
         }
 
         [Fact]

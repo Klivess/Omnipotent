@@ -259,6 +259,9 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("service_tier", NullValueHandling = NullValueHandling.Ignore)]
             public string service_tier;
 
+            [JsonProperty("provider", NullValueHandling = NullValueHandling.Ignore)]
+            public HFProviderRouting provider;
+
             // ── Sampling / decoding parameters ──
             // Every one is nullable + Ignore, so a request that pins none serializes byte-identically to
             // the pre-parameter payload and the provider's own defaults apply. temperature/top_p/the two
@@ -375,6 +378,14 @@ namespace Omnipotent.Services.KliveLLM
                 }
                 messages = list.ToArray();
             }
+        }
+
+        /// <summary>OpenRouter provider-routing preferences. Projects fills <c>only</c> from the
+        /// selected endpoints advertised for the configured model route.</summary>
+        public sealed class HFProviderRouting
+        {
+            [JsonProperty("only")]
+            public List<string> only;
         }
 
         public class HFLLMInferenceResponse

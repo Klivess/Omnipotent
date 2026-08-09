@@ -1007,11 +1007,30 @@ namespace Omnipotent.Services.Projects
                         .Select(m => m.Trim()).Where(m => m.Length > 0)
                         .Distinct(StringComparer.OrdinalIgnoreCase).Take(8).ToList();
 
-                    IReadOnlyList<OpenRouterModelParameterSupport> support =
+                    Task<IReadOnlyList<OpenRouterModelParameterSupport>> parameterSupportTask =
                         models.Count == 0 || parent.ProviderContexts == null
-                            ? Array.Empty<OpenRouterModelParameterSupport>()
-                            : await parent.ProviderContexts.ResolveParametersAsync(models);
+                            ? Task.FromResult<IReadOnlyList<OpenRouterModelParameterSupport>>([])
+                            : parent.ProviderContexts.ResolveParametersAsync(models);
+                    Task<IReadOnlyList<OpenRouterModelProviderSupport>> providerSupportTask =
+                        models.Count == 0 || parent.ProviderContexts == null
+                            ? Task.FromResult<IReadOnlyList<OpenRouterModelProviderSupport>>([])
+                            : parent.ProviderContexts.ResolveProvidersAsync(models);
+                    await Task.WhenAll(parameterSupportTask, providerSupportTask);
+                    IReadOnlyList<OpenRouterModelParameterSupport> support = await parameterSupportTask;
+                    IReadOnlyList<OpenRouterModelProviderSupport> providerSupport = await providerSupportTask;
                     var resolved = support.Where(s => s.FromCatalog).ToList();
+                    var providerOptions = providerSupport
+                        .Where(s => s.FromCatalog)
+                        .SelectMany(s => s.Providers)
+                        .GroupBy(p => p.Tag, StringComparer.OrdinalIgnoreCase)
+                        .Select(group => new
+                        {
+                            value = group.First().Tag,
+                            label = group.First().Name,
+                        })
+                        .OrderBy(p => p.label, StringComparer.OrdinalIgnoreCase)
+                        .ThenBy(p => p.value, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
 
                     // Every definition is returned so the UI can render a value already saved against a
                     // model the catalog no longer lists; `supportedBy` is what drives the dropdown.
@@ -1019,20 +1038,28 @@ namespace Omnipotent.Services.Projects
                     {
                         name = d.Name,
                         label = d.Label,
-                        kind = d.Kind.ToString().ToLowerInvariant(),
+                        kind = d.Kind == ModelParameterKind.MultiEnum
+                            ? "multi-enum"
+                            : d.Kind.ToString().ToLowerInvariant(),
                         min = d.Min,
                         max = d.Max,
                         step = d.Step,
                         description = d.Description,
                         defaultHint = d.DefaultHint,
                         openRouterOnly = d.OpenRouterOnly,
-                        options = d.Options,
-                        supportedBy = resolved
-                            .Where(s => s.SupportedParameters.Contains(d.Name, StringComparer.OrdinalIgnoreCase))
-                            .Select(s => s.RequestedModel).ToList(),
+                        // Endpoint provider choices are fetched live for this exact model/fallback
+                        // set. Their stored values are provider tags, while labels remain human-friendly.
+                        options = string.Equals(d.Name, "provider", StringComparison.OrdinalIgnoreCase)
+                            ? (object)providerOptions
+                            : d.Options,
+                        supportedBy = !d.ModelCapabilityGated
+                            ? models
+                            : resolved
+                                .Where(s => s.SupportedParameters.Contains(d.Name, StringComparer.OrdinalIgnoreCase))
+                                .Select(s => s.RequestedModel).ToList(),
                         // With no catalog answer at all, "unknown" is reported as supported so the
                         // parameter stays configurable rather than vanishing on a transient fetch failure.
-                        supportedByAll = resolved.Count == 0 || resolved.All(
+                        supportedByAll = !d.ModelCapabilityGated || resolved.Count == 0 || resolved.All(
                             s => s.SupportedParameters.Contains(d.Name, StringComparer.OrdinalIgnoreCase)),
                     }).ToList();
 
