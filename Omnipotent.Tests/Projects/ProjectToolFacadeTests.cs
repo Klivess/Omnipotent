@@ -1,3 +1,4 @@
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.Projects;
@@ -85,6 +86,84 @@ public class ProjectToolFacadeTests
         var contract = ProjectToolContract.ValidateAndNormalize(unfolded.ToolName, unfolded.ArgumentsJson,
             ProjectCommanderAgent.BuildCoreToolDefinitions());
         Assert.True(contract.IsValid, contract.ErrorText);
+    }
+
+    [Fact]
+    public void FoldedCallDropsEmptyPlaceholdersFromOtherOperations()
+    {
+        const string lunaStylePayload = """
+            {"op":"retire","role":"","tier":"","objective":"","mission":"","milestoneId":"","agentID":"0678f5fb5060","deliverablePaths":[]}
+            """;
+
+        var unfolded = ProjectToolFacade.Unfold("manage_agents", lunaStylePayload);
+
+        Assert.True(unfolded.IsValid, unfolded.ErrorText);
+        Assert.Equal("retire_sub_agent", unfolded.ToolName);
+        Assert.Equal(["agentID"], JObject.Parse(unfolded.ArgumentsJson).Properties().Select(p => p.Name));
+        Assert.Contains(unfolded.Warnings, warning => warning.Contains("role", StringComparison.Ordinal));
+
+        var contract = ProjectToolContract.ValidateAndNormalize(unfolded.ToolName, unfolded.ArgumentsJson,
+            ProjectCommanderAgent.BuildCoreToolDefinitions());
+        Assert.True(contract.IsValid, contract.ErrorText);
+    }
+
+    [Fact]
+    public void MissingSelectorCanBeInferredDespiteEmptyUnionPlaceholders()
+    {
+        const string payload = """
+            {"role":"","tier":"","objective":"","mission":"","milestoneId":"","agentID":"0678f5fb5060","deliverablePaths":[]}
+            """;
+
+        var unfolded = ProjectToolFacade.Unfold("manage_agents", payload);
+
+        Assert.True(unfolded.IsValid, unfolded.ErrorText);
+        Assert.Equal("retire_sub_agent", unfolded.ToolName);
+        Assert.Equal(["agentID"], JObject.Parse(unfolded.ArgumentsJson).Properties().Select(p => p.Name));
+    }
+
+    [Fact]
+    public void FoldedCallRejectsNonEmptyArgumentFromAnotherOperation()
+    {
+        var unfolded = ProjectToolFacade.Unfold("manage_agents",
+            "{\"op\":\"retire\",\"agentID\":\"0678f5fb5060\",\"role\":\"replacement-worker\"}");
+
+        Assert.False(unfolded.IsValid);
+        Assert.Contains("does not apply", unfolded.ErrorText);
+        Assert.Contains("role", unfolded.ErrorText);
+    }
+
+    [Fact]
+    public void EveryFoldedOperationProjectsEmptyUnionFieldsOntoItsCanonicalSchema()
+    {
+        var canonical = CommanderCanonical();
+        var canonicalSchemas = canonical.ToDictionary(tool => tool.function.name,
+            tool => tool.function.parameters is JObject schema
+                ? schema
+                : JObject.Parse(JsonConvert.SerializeObject(tool.function.parameters)), StringComparer.Ordinal);
+
+        foreach (var folded in ProjectToolFacade.Fold(canonical)
+                     .Where(tool => ProjectToolFacade.FoldedToolNames.Contains(tool.function.name)))
+        {
+            var foldedSchema = (JObject)folded.function.parameters;
+            var unionProperties = (JObject)foldedSchema["properties"]!;
+            foreach (string op in OpsOf(folded))
+            {
+                var payload = new JObject { ["op"] = op };
+                foreach (var property in unionProperties.Properties().Where(property => property.Name != "op"))
+                    payload[property.Name] = JValue.CreateNull();
+
+                var unfolded = ProjectToolFacade.Unfold(folded.function.name, payload.ToString());
+
+                Assert.True(unfolded.IsValid,
+                    $"{folded.function.name} op={op} failed to unfold: {unfolded.ErrorText}");
+                var allowed = ((JObject?)canonicalSchemas[unfolded.ToolName]["properties"])?
+                    .Properties().Select(property => property.Name).ToHashSet(StringComparer.Ordinal) ?? [];
+                var unexpected = JObject.Parse(unfolded.ArgumentsJson).Properties()
+                    .Select(property => property.Name).Where(name => !allowed.Contains(name)).ToList();
+                Assert.True(unexpected.Count == 0,
+                    $"{folded.function.name} op={op} leaked cross-operation fields: {string.Join(", ", unexpected)}");
+            }
+        }
     }
 
     [Fact]

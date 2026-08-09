@@ -617,32 +617,10 @@ namespace Omnipotent.Services.Projects
                             ? ProjectToolContract.ValidateAndNormalize(toolName, argsJson, canonicalToolDefs)
                             : null;
                         string? rejection = unfolded.ErrorText ?? (contract!.IsValid ? null : contract.ErrorText);
-                        if (rejection != null)
-                        {
-                            parent.EventLog.Append(new ProjectEvent
-                            {
-                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                                Type = ProjectEventTypes.ToolCall, Author = "commander",
-                                Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
-                                PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
-                            });
-                            parent.EventLog.Append(new ProjectEvent
-                            {
-                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                                Type = ProjectEventTypes.ToolResult, Author = "system",
-                                Text = rejection, ToolName = toolName, ToolCallId = call.id,
-                                PayloadJson = "{\"succeeded\":false}",
-                            });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: toolResultKeepRecent);
-                            liveContextTokens += AddedContextTokens(rejection);
-                            lastCommittedTool = toolName;
-                            lastCommittedResult = rejection;
-                            continue;
-                        }
-                        argsJson = contract!.NormalizedArgumentsJson!;
+                        if (rejection == null) argsJson = contract!.NormalizedArgumentsJson!;
 
-                        // Commit intent before any guard or dispatch. Every subsequent path must
-                        // commit a matching result so restart recovery can detect uncertainty.
+                        // Commit intent before every result, including validation failures. Every
+                        // subsequent path owes this call a matching result for restart recovery.
                         parent.EventLog.Append(new ProjectEvent
                         {
                             ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
@@ -651,14 +629,74 @@ namespace Omnipotent.Services.Projects
                             PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
                         });
 
+                        void RecordRejectedResult(string text)
+                        {
+                            parent.EventLog.Append(new ProjectEvent
+                            {
+                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                Type = ProjectEventTypes.ToolResult, Author = "system",
+                                Text = text, ToolName = toolName, ToolCallId = call.id,
+                                PayloadJson = "{\"succeeded\":false}",
+                            });
+                            llm.AppendToolResult(sessionId, call.id, offeredName, text, keepRecentFull: toolResultKeepRecent);
+                            liveContextTokens += AddedContextTokens(text);
+                            lastCommittedTool = toolName;
+                            lastCommittedResult = text;
+                        }
+
+                        bool RejectBeforeDispatch(string reason)
+                        {
+                            int repeats = ProjectToolCallConvergence.RegisterRejectedCall(
+                                recentSignatures, toolName, argsJson, reason);
+                            bool stop = false;
+                            string resultText = reason;
+                            if (repeats >= StuckIdenticalCallThreshold)
+                            {
+                                stuckTrips++;
+                                resultText = $"LOOP DETECTED: identical invalid {toolName} call {repeats}x was rejected before dispatch. Change the arguments or choose a different operation. Last validation error: {reason}";
+                                parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
+                                {
+                                    Key = $"rejected-call:{toolName}",
+                                    Approach = DescribeCall(toolName, argsJson),
+                                    Outcome = $"Rejected {repeats}x before dispatch with an unchanged validation result: {reason}",
+                                    Instead = "Correct the arguments from the validation error or choose a materially different operation; unchanged invalid calls will never dispatch.",
+                                    Evidence = new List<ProjectEvidenceReference>
+                                    {
+                                        new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
+                                    },
+                                });
+                                if (stuckTrips >= maxLoopTrips)
+                                {
+                                    outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated invalid-call loop trips.";
+                                    parent.RuntimeState.SetResumeAction(projectID, new ProjectResumeAction
+                                    {
+                                        Kind = "loop-recovery",
+                                        RecordedBy = "commander",
+                                        ToolName = toolName,
+                                        Summary = $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."
+                                    });
+                                    parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander",
+                                        $"Stopped after {stuckTrips} repeated invalid-call detections. The next attempt must correct the arguments or use a different operation."));
+                                    stop = true;
+                                }
+                            }
+                            RecordRejectedResult(resultText);
+                            return stop;
+                        }
+
+                        if (rejection != null)
+                        {
+                            if (RejectBeforeDispatch(rejection)) goto done;
+                            continue;
+                        }
+
                         parent.Activity.BeginTool(projectID, "commander", toolName, DescribeCall(toolName, argsJson));
 
-                        string sig = toolName + "|" + argsJson;
-                        recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
-                        if (recentSignatures[sig] >= StuckIdenticalCallThreshold)
+                        int signatureCount = ProjectToolCallConvergence.RegisterCall(recentSignatures, toolName, argsJson);
+                        if (signatureCount >= StuckIdenticalCallThreshold)
                         {
                             stuckTrips++;
-                            string loopResult = $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.";
+                            string loopResult = $"LOOP DETECTED: identical {toolName} call {signatureCount}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.";
                             // Durably record the dead end. A loop trip is a machine-certain signal that this
                             // exact approach does not work, and it must outlive this wake's context: without
                             // it the next wake re-derives the same failure from scratch.
@@ -666,24 +704,14 @@ namespace Omnipotent.Services.Projects
                             {
                                 Key = $"repeated-call:{toolName}",
                                 Approach = DescribeCall(toolName, argsJson),
-                                Outcome = $"Repeated {recentSignatures[sig]}× with an unchanged result; the convergence guard tripped.",
+                                Outcome = $"Repeated {signatureCount}× with an unchanged result; the convergence guard tripped.",
                                 Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
                                 Evidence = new List<ProjectEvidenceReference>
                                 {
                                     new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
                                 },
                             });
-                            parent.EventLog.Append(new ProjectEvent
-                            {
-                                ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
-                                Type = ProjectEventTypes.ToolResult, Author = "system",
-                                Text = loopResult, ToolName = toolName, ToolCallId = call.id,
-                                PayloadJson = "{\"succeeded\":false}",
-                            });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, loopResult, keepRecentFull: toolResultKeepRecent);
-                            liveContextTokens += AddedContextTokens(loopResult);
-                            lastCommittedTool = toolName;
-                            lastCommittedResult = loopResult;
+                            RecordRejectedResult(loopResult);
                             if (stuckTrips >= maxLoopTrips)
                             {
                                 outcomeText = $"Wake stopped by the convergence guard after {stuckTrips} repeated-call loop trips.";

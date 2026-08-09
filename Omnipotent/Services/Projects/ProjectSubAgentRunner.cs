@@ -522,29 +522,7 @@ namespace Omnipotent.Services.Projects
                             ? ProjectToolContract.ValidateAndNormalize(toolName, argsJson, canonicalToolDefs)
                             : null;
                         string? rejection = unfolded.ErrorText ?? (contract!.IsValid ? null : contract.ErrorText);
-                        if (rejection != null)
-                        {
-                            parent.EventLog.Append(new ProjectEvent
-                            {
-                                ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
-                                Type = ProjectEventTypes.ToolCall, Author = "agent",
-                                Text = DescribeCall(toolName, argsJson), ToolName = toolName, ToolCallId = call.id,
-                                PayloadJson = ProjectCommanderTools.AuditPayload(toolName, argsJson),
-                            });
-                            parent.EventLog.Append(new ProjectEvent
-                            {
-                                ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
-                                Type = ProjectEventTypes.ToolResult, Author = "system",
-                                Text = rejection, ToolName = toolName, ToolCallId = call.id,
-                                PayloadJson = "{\"succeeded\":false}",
-                            });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, rejection, keepRecentFull: toolResultKeepRecent);
-                            liveContextTokens += AddedContextTokens(rejection);
-                            lastCommittedTool = toolName;
-                            lastCommittedResult = rejection;
-                            continue;
-                        }
-                        argsJson = contract!.NormalizedArgumentsJson!;
+                        if (rejection == null) argsJson = contract!.NormalizedArgumentsJson!;
 
                         parent.EventLog.Append(new ProjectEvent
                         {
@@ -569,32 +547,75 @@ namespace Omnipotent.Services.Projects
                             lastCommittedResult = text;
                         }
 
+                        bool RejectBeforeDispatch(string reason)
+                        {
+                            int repeats = ProjectToolCallConvergence.RegisterRejectedCall(
+                                recentSignatures, toolName, argsJson, reason);
+                            bool stop = false;
+                            string resultText = reason;
+                            if (repeats >= StuckIdenticalCallThreshold)
+                            {
+                                loopTrips++;
+                                resultText = $"LOOP DETECTED: identical invalid {toolName} call {repeats}x was rejected before dispatch. Change the arguments or report the obstacle to the commander. Last validation error: {reason}";
+                                parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
+                                {
+                                    Key = $"rejected-call:{toolName}",
+                                    Approach = DescribeCall(toolName, argsJson),
+                                    Outcome = $"Worker {agent.AgentID} was rejected {repeats}x before dispatch with an unchanged result: {reason}",
+                                    Instead = "Correct the arguments from the validation error or choose a materially different operation; unchanged invalid calls will never dispatch.",
+                                    Evidence = new List<ProjectEvidenceReference>
+                                    {
+                                        new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
+                                    },
+                                });
+                                if (loopTrips >= maxLoopTrips)
+                                {
+                                    outcomeText = $"Agent {agent.AgentID} stopped after {loopTrips} repeated invalid-call loop trips.";
+                                    parent.RuntimeState.SetAgentResumeAction(projectID, agent.AgentID, new ProjectResumeAction
+                                    {
+                                        Kind = "loop-recovery",
+                                        RecordedBy = agent.AgentID,
+                                        ToolName = toolName,
+                                        Summary = $"The previous wake repeatedly submitted invalid arguments for {DescribeCall(toolName, argsJson)}. Read the validation error, change the call shape or operation, and do not resubmit the same payload."
+                                    });
+                                    stop = true;
+                                }
+                            }
+                            RecordRejectedResult(resultText);
+                            return stop;
+                        }
+
+                        if (rejection != null)
+                        {
+                            if (RejectBeforeDispatch(rejection)) goto done;
+                            continue;
+                        }
+
                         // Tier gating enforced at dispatch too, not just in the offered tool list.
                         if (ProjectTierRouter.IsCommanderOnly(toolName))
                         {
-                            RecordRejectedResult($"'{toolName}' is the commander's decision, not yours. Recommend it via send_agent_message instead.");
+                            if (RejectBeforeDispatch($"'{toolName}' is the commander's decision, not yours. Recommend it via send_agent_message instead.")) goto done;
                             continue;
                         }
                         if (!parent.TierRouter.IsToolAllowed(agent.Tier, toolName, visionEnabled) && !toolName.StartsWith("computer_"))
                         {
-                            RecordRejectedResult($"Tool '{toolName}' is not available at your tier ({agent.Tier}).");
+                            if (RejectBeforeDispatch($"Tool '{toolName}' is not available at your tier ({agent.Tier}).")) goto done;
                             continue;
                         }
                         if (toolName.StartsWith("computer_") && !parent.TierRouter.IsToolAllowed(agent.Tier, toolName, visionEnabled))
                         {
-                            RecordRejectedResult($"'{toolName}' requires raw image input, which is not enabled for this agent/model route. Use browser/desktop structured inspection, OCR, window state and CLI tools; ask the commander for an image-capable route only if the content is inherently pixel-only.");
+                            if (RejectBeforeDispatch($"'{toolName}' requires raw image input, which is not enabled for this agent/model route. Use browser/desktop structured inspection, OCR, window state and CLI tools; ask the commander for an image-capable route only if the content is inherently pixel-only.")) goto done;
                             continue;
                         }
 
                         parent.Activity.BeginTool(projectID, agent.AgentID, toolName, DescribeCall(toolName, argsJson));
 
-                        string sig = toolName + "|" + argsJson;
-                        recentSignatures[sig] = recentSignatures.TryGetValue(sig, out var n) ? n + 1 : 1;
-                        if (recentSignatures[sig] >= StuckIdenticalCallThreshold)
+                        int signatureCount = ProjectToolCallConvergence.RegisterCall(recentSignatures, toolName, argsJson);
+                        if (signatureCount >= StuckIdenticalCallThreshold)
                         {
                             loopTrips++;
                             RecordRejectedResult(
-                                $"LOOP DETECTED: identical {toolName} call {recentSignatures[sig]}×. Change approach or report the obstacle and a recommended next action to the commander.");
+                                $"LOOP DETECTED: identical {toolName} call {signatureCount}×. Change approach or report the obstacle and a recommended next action to the commander.");
                             // Project-scoped, not agent-scoped: a worker's proven dead end is the whole
                             // project's knowledge. Recording only an agent resume action (as this did)
                             // meant the Commander and every future worker re-discovered it from scratch.
@@ -602,7 +623,7 @@ namespace Omnipotent.Services.Projects
                             {
                                 Key = $"repeated-call:{toolName}",
                                 Approach = DescribeCall(toolName, argsJson),
-                                Outcome = $"Worker {agent.AgentID} repeated this {recentSignatures[sig]}× with an unchanged result; the convergence guard tripped.",
+                                Outcome = $"Worker {agent.AgentID} repeated this {signatureCount}× with an unchanged result; the convergence guard tripped.",
                                 Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
                                 Evidence = new List<ProjectEvidenceReference>
                                 {

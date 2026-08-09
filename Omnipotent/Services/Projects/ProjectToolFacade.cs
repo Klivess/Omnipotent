@@ -385,11 +385,10 @@ public static class ProjectToolFacade
                     $"'{group.Name}' requires 'op' — it selects which operation to perform. Allowed: {allowed}."));
             if (inferred.CanonicalOwnsOp)
             {
-                // The canonical tool owns its own op vocabulary; hand it the arguments untouched and
-                // let its established normalization/validation resolve the operation.
-                var passthrough = (JObject)args.DeepClone();
-                passthrough.Remove("op");
-                return ProjectToolUnfoldResult.Ok(inferred.CanonicalTool, passthrough.ToString(Formatting.None));
+                // The canonical tool owns its own op vocabulary. Preserve the missing selector so
+                // its established normalization can infer the operation, while still removing empty
+                // placeholders that belong to other members of the folded union.
+                return NormalizeArgumentsForMember(group, inferred, args, warnings, canonicalOp: null);
             }
             op = inferred.Op;
             warnings.Add($"Assumed op '{op}' for '{group.Name}' from the arguments supplied; pass 'op' explicitly.");
@@ -403,17 +402,20 @@ public static class ProjectToolFacade
                 group.Members.Select(m => m.Op).FirstOrDefault(o =>
                     o.Contains(op!, StringComparison.OrdinalIgnoreCase) || op!.Contains(o, StringComparison.OrdinalIgnoreCase))));
 
-        var canonicalArgs = (JObject)args.DeepClone();
-        if (member.CanonicalOwnsOp) canonicalArgs["op"] = member.Op;
-        else canonicalArgs.Remove("op");
-        return ProjectToolUnfoldResult.Ok(member.CanonicalTool, canonicalArgs.ToString(Formatting.None), warnings);
+        return NormalizeArgumentsForMember(group, member, args, warnings,
+            member.CanonicalOwnsOp ? member.Op : null);
     }
 
     /// <summary>Picks the only member whose argument contract the supplied arguments can satisfy.</summary>
     private static FoldMember? InferMember(FoldGroup group, JObject args)
     {
-        var supplied = args.Properties().Select(p => p.Name)
-            .Where(n => !string.Equals(n, "op", StringComparison.Ordinal)).ToList();
+        // Some providers populate every optional property in a union-shaped tool schema with an
+        // empty placeholder. Those placeholders cannot identify an operation and must not make an
+        // otherwise unambiguous call look ambiguous.
+        var supplied = args.Properties()
+            .Where(p => !string.Equals(p.Name, "op", StringComparison.Ordinal)
+                        && !IsEmptyPlaceholder(p.Value))
+            .Select(p => p.Name).ToList();
         var candidates = new List<FoldMember>();
         foreach (var byTool in group.Members.GroupBy(m => m.CanonicalTool, StringComparer.Ordinal))
         {
@@ -422,11 +424,86 @@ public static class ProjectToolFacade
             var required = (schema["required"] as JArray)?.Values<string>()
                 .Where(r => !string.IsNullOrEmpty(r) && r != "op") ?? Enumerable.Empty<string>();
             if (supplied.Any(name => properties?.Property(name, StringComparison.Ordinal) == null)) continue;
-            if (required.Any(name => args.Property(name!, StringComparison.Ordinal) == null)) continue;
+            if (required.Any(name => args.Property(name!, StringComparison.Ordinal) is not { } property
+                                     || IsEmptyPlaceholder(property.Value))) continue;
             candidates.Add(byTool.First());
         }
         return candidates.Count == 1 ? candidates[0] : null;
     }
+
+    /// <summary>
+    /// Projects a folded union payload onto the selected canonical operation. Empty placeholders for
+    /// other operations are harmless provider artefacts and are discarded with an audit warning;
+    /// non-empty cross-operation arguments remain errors so a genuinely confused call cannot be
+    /// silently routed to the wrong capability.
+    /// </summary>
+    private static ProjectToolUnfoldResult NormalizeArgumentsForMember(
+        FoldGroup group, FoldMember member, JObject args, List<string> warnings, string? canonicalOp)
+    {
+        var canonicalArgs = (JObject)args.DeepClone();
+        if (member.CanonicalOwnsOp)
+        {
+            if (canonicalOp == null) canonicalArgs.Remove("op");
+            else canonicalArgs["op"] = canonicalOp;
+        }
+        else canonicalArgs.Remove("op");
+
+        if (!canonicalSchemas.Value.TryGetValue(member.CanonicalTool, out var schema))
+            return ProjectToolUnfoldResult.Ok(member.CanonicalTool,
+                canonicalArgs.ToString(Formatting.None), warnings);
+
+        var dropped = new List<string>();
+        foreach (var property in canonicalArgs.Properties().ToList())
+        {
+            if (SchemaAcceptsProperty(schema, property.Name)) continue;
+
+            // Only tolerate placeholders for real fields from another member of this folded tool.
+            // Unknown names still receive the normal typo/error treatment even when their value is empty.
+            if (GroupDeclaresProperty(group, property.Name) && IsEmptyPlaceholder(property.Value))
+            {
+                dropped.Add(property.Name);
+                property.Remove();
+                continue;
+            }
+
+            var names = (schema["properties"] as JObject)?.Properties()
+                .Select(p => p.Name).Where(name => name != "op").ToList() ?? new List<string>();
+            string allowed = names.Count == 0 ? "none" : string.Join(", ", names);
+            return ProjectToolUnfoldResult.Fail(new ProjectToolContractError(
+                ProjectToolContract.UnknownProperty,
+                "$." + property.Name,
+                $"Argument '{property.Name}' does not apply to '{group.Name}' op '{member.Op}'. Allowed arguments: {allowed}."));
+        }
+
+        if (dropped.Count > 0)
+            warnings.Add($"Ignored empty arguments not used by '{group.Name}' op '{member.Op}': {string.Join(", ", dropped)}.");
+
+        return ProjectToolUnfoldResult.Ok(member.CanonicalTool,
+            canonicalArgs.ToString(Formatting.None), warnings);
+    }
+
+    private static bool GroupDeclaresProperty(FoldGroup group, string name) =>
+        group.Members.Select(m => m.CanonicalTool).Distinct(StringComparer.Ordinal)
+            .Any(tool => canonicalSchemas.Value.TryGetValue(tool, out var schema)
+                         && (schema["properties"] as JObject)?.Property(name, StringComparison.Ordinal) != null);
+
+    private static bool SchemaAcceptsProperty(JObject schema, string name)
+    {
+        if ((schema["properties"] as JObject)?.Property(name, StringComparison.Ordinal) != null) return true;
+        var additional = schema["additionalProperties"];
+        if (additional is JObject) return true;
+        if (additional?.Type == JTokenType.Boolean) return additional.Value<bool>();
+        return schema["properties"] == null;
+    }
+
+    private static bool IsEmptyPlaceholder(JToken token) => token.Type switch
+    {
+        JTokenType.Null or JTokenType.Undefined => true,
+        JTokenType.String => string.IsNullOrWhiteSpace(token.Value<string>()),
+        JTokenType.Array => token.Children().All(IsEmptyPlaceholder),
+        JTokenType.Object => token.Children<JProperty>().All(p => IsEmptyPlaceholder(p.Value)),
+        _ => false,
+    };
 
     private static HFWrapper.HFTool BuildFoldedTool(FoldGroup group, IReadOnlyList<FoldMember> members,
         IReadOnlyDictionary<string, HFWrapper.HFTool> available)
