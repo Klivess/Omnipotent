@@ -1,12 +1,12 @@
 # Omnipotent
 
-**Omnipotent is the Windows system I built to run AI agents, scheduled jobs, web services, simulations, and custom hardware from one place.**
+**A self-hosted .NET automation platform and modular service runtime that coordinates 31 long-running modules through shared API, permissions, monitoring, persistence and AI orchestration infrastructure.**
 
-**31 services started by `Program.cs` · 380 API routes defined in code · 1,363 passing tests · 135,905 non-empty lines of C# · in development since 2024**
+**31 modules · 380 permission-gated API routes · 1,363 passing tests · 136k lines of C# · in development since 2024**
 
 Built by [Nourdin "Klivess"](https://github.com/Klivess), a University of Bath CS & AI student.
 
-[Private production dashboard](https://klive.uk) · [Nuxt/Vue website](https://github.com/Klivess/Klives-Management-Website) · [Architecture](#architecture) · [Code and test metrics](#code-and-test-metrics)
+[Service runtime](Docs/service-runtime.md) · [API and security](Docs/api-and-security.md) · [Agents and retrieval](Docs/agent-and-rag.md) · [Metrics](#code-and-test-metrics) · [Private production dashboard](https://klive.uk)
 
 <a href="Docs/assets/readme/dashboard-overview.png">
   <img src="Docs/assets/readme/dashboard-overview.png" alt="Omnipotent dashboard showing service health, CPU and RAM use, task count, and active services" width="100%">
@@ -14,137 +14,193 @@ Built by [Nourdin "Klivess"](https://github.com/Klivess), a University of Bath C
 
 <p align="center"><em>The live dashboard is private. This screenshot hides log and error contents, task arguments, identities, and account details.</em></p>
 
-## Overview
+## What this is
 
-Most of the backend runs in one .NET 9 process. A separate [Nuxt 3 / Vue 3 website](https://github.com/Klivess/Klives-Management-Website) talks to it over REST and WebSockets. Other programs handle process monitoring, KliveLink, Docker desktops, and embedded devices.
+Omnipotent is a **modular service platform**, not a bot and not a microservice deployment. Every
+module is an `OmniService` subclass running on its own dedicated thread inside **one .NET 9 process**,
+sharing a service graph, a logger, a settings store, a scheduler and a single HTTP listener.
 
-This is a personal research and development project, not a packaged product. Running it requires Windows, private configuration, service credentials, local data, and supported hardware for the device features.
+That choice is the design. Modules hold live references to each other instead of exchanging
+serialised messages, so a new module gets persistence, configuration, scheduling, authenticated HTTP
+routes and health monitoring by subclassing one base class — and the embedded agent can operate any
+of them without a tool definition being written for it. The cost is blast radius, and most of the
+runtime exists to pay that down: per-thread exception isolation, automatic restart of critical
+modules, and an external watchdog process for whole-process death.
 
-The main pieces are:
+A separate [Nuxt 3 / Vue 3 dashboard](https://github.com/Klivess/Klives-Management-Website) talks to
+it over REST and WebSockets. Docker desktops, embedded devices and the watchdog run as separate
+programs.
 
-- **KliveAgent:** plans tasks, runs C# scripts, saves memories, schedules work, and indexes the codebase.
-- **Projects:** splits larger jobs between agents, records their work, tracks budgets, and recovers interrupted jobs.
-- **Shared runtime:** starts services, registers routes, runs schedules, records health, and works with a separate watchdog process.
-- **Live interfaces:** project events, computer-control frames, hardware telemetry, and dashboard updates travel over WebSockets.
-- **Hardware tools:** connects Omnipotent to embedded devices, CAD scripts, firmware builds, and engineering simulations.
-
-## Architecture
-
-Most backend services share one process and common code. The website, watchdog, KliveLink client, Docker desktops, and hardware devices are separate programs.
+This is a personal research and development project, not a packaged product. Running it requires
+Windows, private configuration, service credentials, local data and supported hardware.
 
 ```mermaid
 flowchart TB
-    Website["Nuxt 3 / Vue 3 website"]
-    Messaging["Discord and mail"]
-    KliveLink["KliveLink client<br/>experimental socket"]
-    Devices["Embedded devices<br/>direct or relay connection"]
-    API["KliveAPI<br/>HTTPS · REST · WebSockets"]
-    Main["Main .NET 9 process<br/>service manager · scheduler"]
-    AI["AI services<br/>KliveAgent · Projects · KliveRAG"]
-    Services["Other services<br/>data · trading · storage · chat"]
-    Hardware["Hardware services<br/>KliveTech · Stratum · host control"]
-    Data["Data stores<br/>SQLite/FTS5 · JSONL · files"]
-    Docker["Docker desktops<br/>Python tools"]
-    External["External APIs and hardware"]
+    Clients["Dashboard · Discord · Mail · Embedded devices"]
 
-    Website --> API
-    API --> Main
-    Messaging --> Services
-    KliveLink --> Main
-    Devices --> Hardware
-    Main --> AI
-    Main --> Services
-    Main --> Hardware
-    AI --> Data
-    Services --> Data
-    AI --> Docker
-    AI --> External
-    Services --> External
-    Hardware --> External
+    subgraph proc ["One .NET 9 process"]
+        API["KliveAPI — 380 routes<br/>permissions · caching · body limits · statistics"]
+        Runtime["OmniService runtime<br/>per-module threads · crash recovery · monitoring"]
+        Shared["Logging · settings · scheduling · persistence"]
+        Modules["31 modules<br/>AI · data · trading · hardware · apps"]
+    end
+
+    Watchdog["Process watchdog<br/>separate executable"]
+    Data["SQLite/FTS5 · JSONL · files"]
+    External["Docker desktops · external APIs · hardware"]
+
+    Clients --> API
+    API --> Runtime
+    Runtime --> Modules
+    Runtime --> Shared
+    Modules --> Data
+    Modules --> External
+    Watchdog -.->|relaunches on crash| proc
 ```
 
-[`Program.cs`](Omnipotent/Program.cs) shows what starts. [`OmniService.cs`](Omnipotent/Service%20Manager/OmniService.cs) contains the shared service and route code.
+## Three systems worth reading
 
-## Code highlights
+### 1. The service runtime
 
-### KliveAgent and Projects (active, credentials required)
+[`Service Manager/`](Omnipotent/Service%20Manager) · **[Full write-up →](Docs/service-runtime.md)**
 
-KliveAgent manages token budgets, remembers past work, schedules tasks, maps the repository, and can run C# through Roslyn. Projects adds commander and worker agents, action logs, budget tracking, recovery code, and isolated Docker desktops over VNC.
+Custom lifecycle management for in-process modules. Each module declares a priority
+(`Low → Standard → High → Critical`) and gets a named OS thread at matching priority. A per-thread
+`SynchronizationContext` catches exceptions escaping `async void` handlers and attributes them to the
+module that caused them rather than letting them kill the process. Crashes funnel through one
+idempotent handler that logs, alerts the owner, terminates cleanly, and self-restarts modules marked
+Critical. Boot order is dependency-ordered with a bounded 30-second gate so a stuck prerequisite
+cannot freeze startup. `OmniServiceMonitor` samples per-thread CPU and memory, system CPU and RAM, and
+persists uptime periods so outage history survives restarts.
 
-Code: [`KliveAgentBrain`](Omnipotent/Services/KliveAgent/KliveAgentBrain.cs), [`KliveAgentScriptEngine`](Omnipotent/Services/KliveAgent/KliveAgentScriptEngine.cs), [`ProjectCommanderRunner`](Omnipotent/Services/Projects/ProjectCommanderRunner.cs), [`ProjectSubAgentManager`](Omnipotent/Services/Projects/ProjectSubAgentManager.cs), and [`ContainerOrchestrator`](Omnipotent/Services/Projects/Containers/ContainerOrchestrator.cs).
+Recovery works in three widening tiers: thread, process, and an external watchdog executable that
+relaunches the host and posts the crash log to Discord as an attachment.
 
-### Service runtime (active)
+Key files: [`OmniService.cs`](Omnipotent/Service%20Manager/OmniService.cs) ·
+[`OmniServiceManager.cs`](Omnipotent/Service%20Manager/OmniServiceManager.cs) ·
+[`OmniServiceMonitor.cs`](Omnipotent/Service%20Manager/OmniServiceMonitor.cs) ·
+[`OmnipotentProcessMonitor`](OmnipotentProcessMonitor/Program.cs)
 
-The shared runtime handles service startup, route registration, logging, schedules, settings, health checks, and recovery. The separate process monitor watches the main program.
+### 2. The permissioned API control plane
 
-Code: [`OmniServiceManager`](Omnipotent/Service%20Manager/OmniServiceManager.cs), [`OmniServiceMonitor`](Omnipotent/Service%20Manager/OmniServiceMonitor.cs), [`TimeManager`](Omnipotent/Service%20Manager/TimeManager.cs), and the [`process monitor`](OmnipotentProcessMonitor/Program.cs).
+[`Services/KliveAPI/`](Omnipotent/Services/KliveAPI) · **[Full write-up →](Docs/api-and-security.md)**
 
-### Stratum (active, local tools required)
+One HTTP/WebSocket surface for the whole platform. Modules register their own routes at startup, and
+**every registration must state a required permission** — the parameter is not optional, so no route
+exists without a deliberate access decision. Ranks form an ordered ladder
+(`Anybody → Guest → Manager → Associate → Admin → Klives`) checked by comparison, with a separate
+`CanLogin` flag so access can be revoked without demoting a profile.
 
-Stratum stores hardware designs as revisions. It can generate CadQuery geometry, check parts and assembly constraints, manage electronics files, build PlatformIO firmware, and run gmsh/CalculiX simulations. Results are saved for review.
+Four registration forms cover buffered, byte-capped, streamed and WebSocket routes, with limits
+enforced as bytes arrive rather than after buffering. A `/batch` endpoint collapses a dashboard's
+request burst into one round trip, still permission-checked per sub-request.
 
-Code: [`StratumContractEngine`](Omnipotent/Services/Stratum/StratumContractEngine.cs), [`StratumEngineerTools`](Omnipotent/Services/Stratum/StratumEngineerTools.cs), [`StratumGeometryVerifier`](Omnipotent/Services/Stratum/StratumGeometryVerifier.cs), and [`StratumSimulationOps`](Omnipotent/Services/Stratum/StratumSimulationOps.cs).
+The response cache is **dependency-versioned rather than TTL-based**: each request runs in a scope
+that records which stores it read, and writes to those stores invalidate the entries — so a cached
+response is never stale. Two throughput fixes are load-bearing and were bugs first: running
+`max(4, ProcessorCount)` concurrent accept loops, and offloading request handling before the pipeline's
+synchronous prologue could block the accept thread and serialise the entire site.
 
-### KliveTech (active, hardware required)
+Key files: [`KliveAPI.cs`](Omnipotent/Services/KliveAPI/KliveAPI.cs) ·
+[`Caching/`](Omnipotent/Services/KliveAPI/Caching) ·
+[`KliveApiStatisticsStore.cs`](Omnipotent/Services/KliveAPI/KliveApiStatisticsStore.cs) ·
+[`KMProfileManager.cs`](Omnipotent/Klives%20Management/KMProfileManager.cs)
 
-KliveTech connects embedded devices directly or through a relay. It decodes device actions, streams binary telemetry, tracks device state, and stores firmware files.
+### 3. KliveAgent, Projects and cross-system retrieval
 
-Code: [`KliveTechHub`](Omnipotent/Services/KliveTechHub/KliveTechHub.cs), [`KliveTechProtocol`](Omnipotent/Services/KliveTechHub/KliveTechProtocol.cs), [`KliveTechStreamProtocol`](Omnipotent/Services/KliveTechHub/KliveTechStreamProtocol.cs), and [`KliveTechFirmware`](Omnipotent/Services/KliveTechHub/KliveTechFirmware.cs).
+[`Services/KliveAgent/`](Omnipotent/Services/KliveAgent) · **[Full write-up →](Docs/agent-and-rag.md)** · [Architecture notes](Omnipotent/Services/KliveAgent/AGENT_ARCHITECTURE.md)
 
-## Service groups
+A ReAct-style agent whose action surface is **the compiler, not a tool list**. It emits C# that Roslyn
+compiles and executes in-process against the live service graph, using the same reflective handles any
+module uses to reach its neighbours. The consequence: adding a module adds agent capability with no
+tool schema, no registration and no glue. Around that loop sit a per-category context budget, BM25
+persistent memory, compaction of the oldest turns, token streaming, self-scheduled future work, and a
+per-run token and wall-clock budget that force-finalises rather than capping iterations.
 
-"Active" means the code is enabled in my private setup. It does not mean the feature is finished, supported for other users, or security-hardened.
+**Projects** extends this to autonomous work lasting weeks: a commander delegating to staffed workers,
+durable event logs and digests so each wake reconstructs state, cross-wake repeat detection, budget
+ledgers, model-tier routing, a hard 64-tool cap enforced by folding related tools behind an `op`
+parameter, and isolated Docker desktops over VNC that the owner can take over live to clear a CAPTCHA.
 
-| Area | What is included | Status |
+**KliveRAG** serves both: MiniLM ONNX embeddings and SQLite FTS5 fused by Reciprocal Rank Fusion,
+incremental connectors over agent history, distilled knowledge and repository docs, plus self-hosted
+SearXNG web search. Auto-injection races a ~300–400 ms timeout and fails soft — retrieval degrading
+must never stall a turn.
+
+Key files: [`KliveAgentBrain.cs`](Omnipotent/Services/KliveAgent/KliveAgentBrain.cs) ·
+[`KliveAgentScriptEngine.cs`](Omnipotent/Services/KliveAgent/KliveAgentScriptEngine.cs) ·
+[`ProjectCommanderRunner.cs`](Omnipotent/Services/Projects/ProjectCommanderRunner.cs) ·
+[`ContainerOrchestrator.cs`](Omnipotent/Services/Projects/Containers/ContainerOrchestrator.cs) ·
+[`HybridRetriever.cs`](Omnipotent/Services/KliveRAG/HybridRetriever.cs)
+
+## What the platform is used for
+
+The modules below are evidence that the runtime above is genuinely extensible — they are applications
+of it, not the point of it. "Active" means enabled in my private deployment; it does not mean finished,
+supported for other users, or security-hardened.
+
+| Area | Includes | Status |
 |---|---|---|
-| **AI and agents** | KliveAgent, Projects, KliveLLM, KliveRAG, local models, and hosted model APIs | **Active; some features need credentials** |
-| **Runtime** | Service startup, API routes, schedules, notifications, health checks, and process monitoring | **Active** |
-| **Data and search** | Data import, SQLite/FTS5 search, retrieval, behavioural statistics, and deductions | **Active; needs linked data** |
-| **Trading and simulation** | Backtests, paper simulation, market analysis, portfolio and risk code, and marketplace analysis | **Paper and backtest features active; external adapters need credentials; some execution and settlement code is experimental** |
-| **Hardware and design** | Device actions, telemetry, relays, firmware, CAD, electronics, and FEA | **Active with supported hardware and local tools** |
-| **Apps and communication** | KliveCloud, mail, chat, Discord, games, workout tools, and social posting | **Mixed; OmniTube is experimental** |
+| **AI and agents** | KliveAgent, Projects, KliveLLM, KliveRAG, local and hosted models | Active; some features need credentials |
+| **Data and search** | Import, SQLite/FTS5 search, retrieval, behavioural statistics, deductions | Active; needs linked data |
+| **Hardware and design** | Device control, telemetry, relays, firmware builds, CAD, electronics, FEA | Active with supported hardware and local tools |
+| **Trading and simulation** | Backtests, paper trading, market analysis, portfolio and risk | Paper and backtest active; adapters need credentials; execution and settlement partly experimental |
+| **Apps and communication** | KliveCloud, mail, chat, Discord, games, workout tools, social posting | Mixed; OmniTube is experimental |
 
-Omniscience runs locally. It imports linked data, indexes it for search, and produces aggregate behavioural statistics and deductions. The public screenshots hide people and source data.
+Two of these reach past the software boundary and are worth a note:
+
+**Stratum** treats hardware designs as revisioned artefacts — generating CadQuery geometry, checking
+part and assembly constraints, managing electronics files, building PlatformIO firmware, and running
+gmsh/CalculiX simulations with results persisted for review.
+([`StratumContractEngine`](Omnipotent/Services/Stratum/StratumContractEngine.cs),
+[`StratumGeometryVerifier`](Omnipotent/Services/Stratum/StratumGeometryVerifier.cs))
+
+**KliveTech** connects embedded devices directly or through a relay, decoding device actions, streaming
+binary telemetry, tracking device state and storing firmware.
+([`KliveTechHub`](Omnipotent/Services/KliveTechHub/KliveTechHub.cs),
+[`KliveTechStreamProtocol`](Omnipotent/Services/KliveTechHub/KliveTechStreamProtocol.cs))
+
+Omniscience runs locally, importing linked data and producing aggregate behavioural statistics and
+deductions. Public screenshots hide people and source data.
 
 ## Screenshots
 
-These images came from the live private dashboard and show aggregate data only. They omit chats, memories, project names, identities, device identifiers, file paths, account data, balances, and error details.
+These came from the live private dashboard and show aggregate data only. They omit chats, memories,
+project names, identities, device identifiers, file paths, account data, balances and error details.
 
 <table>
   <tr>
     <td width="50%" valign="top">
       <a href="Docs/assets/readme/kliveagent-analytics.png"><img src="Docs/assets/readme/kliveagent-analytics.png" alt="KliveAgent 30-day statistics for tokens, script results, iterations, latency, and daily use"></a><br>
-      <sub><strong>KliveAgent, last 30 days.</strong> Usage, script results, iterations, latency, and token counts. Conversations and memories are hidden.</sub>
+      <sub><strong>KliveAgent, last 30 days.</strong> Usage, script results, iterations, latency and token counts. Conversations and memories are hidden.</sub>
     </td>
     <td width="50%" valign="top">
       <a href="Docs/assets/readme/omnitrader-systems.png"><img src="Docs/assets/readme/omnitrader-systems.png" alt="OmniTrader status for its paper venue, sessions, market data, order flow, reconciliation, and controls"></a><br>
-      <sub><strong>OmniTrader system status.</strong> Health checks for the internal paper venue, sessions, market data, order flow, reconciliation, and controls.</sub>
+      <sub><strong>OmniTrader system status.</strong> Health checks for the internal paper venue, sessions, market data, order flow, reconciliation and controls.</sub>
     </td>
   </tr>
   <tr>
     <td colspan="2" valign="top">
       <a href="Docs/assets/readme/omniscience-command-center.png"><img src="Docs/assets/readme/omniscience-command-center.png" alt="Omniscience aggregate deduction counts with people and source data hidden"></a><br>
-      <sub><strong>Omniscience.</strong> Aggregate deduction counts. People, source material, suggestions, and individual records are hidden.</sub>
+      <sub><strong>Omniscience.</strong> Aggregate deduction counts. People, source material, suggestions and individual records are hidden.</sub>
     </td>
   </tr>
 </table>
 
 ## Code and test metrics
 
-These counts were taken from commit `139b9b7` on 11 August 2026.
+Measured at commit `139b9b7` on 11 August 2026.
 
 | Measurement | Result |
 |---|---:|
-| Services started directly by `Program.cs` | **31** |
-| `CreateAPIRoute(...)` calls | **380 across 36 files** |
+| Modules started by `Program.cs` | **31** |
+| `CreateAPIRoute(...)` registrations | **380 across 36 files** |
 | Main C# project | **506 files · 135,905 non-empty lines** |
-| Test source | **105 files · 1,129 xUnit Fact/Theory declarations** |
+| Test source | **105 files · 1,129 xUnit `Fact`/`Theory` declarations** |
 | Tests run | **1,363 passed · 0 failed · 0 skipped** |
-| Solution build | **0 errors; 8 package warnings; one non-fatal XGBoost extraction message** |
+| Solution build | **0 errors; 8 package warnings** |
 | Projects in the solution | **4** |
 | Git history | **936 commits; work began in 2024** |
-
-Commands used:
 
 ```powershell
 dotnet build Omnipotent.sln --nologo --verbosity minimal
@@ -152,31 +208,33 @@ $env:DOTNET_ROLL_FORWARD='Major'
 dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj --no-build --no-restore
 ```
 
-The tests target `net9.0`. This machine had .NET 8 and 10 runtimes, so the test run used major-version roll-forward. A .NET 9 runtime does not need that setting. The build succeeded but printed eight package compatibility warnings and an XGBoost `libxgboost.so already exists` message.
+Tests target `net9.0`. The measuring machine had only .NET 8 and 10 runtimes installed, so the run used
+major-version roll-forward; a .NET 9 runtime does not need it. The build printed eight package
+compatibility warnings and a non-fatal XGBoost `libxgboost.so already exists` message.
 
 ## Repository map
 
 | Area | Path |
 |---|---|
 | Startup | [`Omnipotent/Program.cs`](Omnipotent/Program.cs) |
-| Shared service code | [`Omnipotent/Service Manager/`](Omnipotent/Service%20Manager) |
-| Services | [`Omnipotent/Services/`](Omnipotent/Services) |
+| Runtime and shared base class | [`Omnipotent/Service Manager/`](Omnipotent/Service%20Manager) |
+| Modules | [`Omnipotent/Services/`](Omnipotent/Services) |
 | Tests | [`Omnipotent.Tests/`](Omnipotent.Tests) |
 | KliveLink client | [`KliveLink/`](KliveLink) |
 | Watchdog | [`OmnipotentProcessMonitor/`](OmnipotentProcessMonitor) |
-| Notes | [`Docs/`](Docs) |
+| Documentation | [`Docs/`](Docs) |
 
-## Main tools
+## Built with
 
-- **Backend:** C# 13, .NET 9, ASP.NET hosting, SQLite, JSON/JSONL files, and WebSockets.
-- **AI and search:** Microsoft.Extensions.AI, Roslyn, LLamaSharp, ONNX Runtime, local embeddings, SQLite FTS5/BM25, and Tesseract.
-- **Agent environments:** Docker, VNC, Python, and file-based action logs.
-- **Website:** Nuxt 3, Vue 3, TypeScript, REST, and WebSockets.
-- **Hardware and engineering:** Bluetooth, relay protocols, CadQuery, PlatformIO, gmsh, and CalculiX.
-- **Connected services:** Discord, mail, messaging platforms, model APIs, and market data providers.
+- **Backend:** C# 13, .NET 9, `HttpListener`, SQLite, JSON/JSONL, WebSockets
+- **AI and search:** Microsoft.Extensions.AI, Roslyn, LLamaSharp, ONNX Runtime, local embeddings, SQLite FTS5/BM25, Tesseract
+- **Agent environments:** Docker, VNC, Python, file-based action logs
+- **Dashboard:** Nuxt 3, Vue 3, TypeScript
+- **Hardware and engineering:** Bluetooth, relay protocols, CadQuery, PlatformIO, gmsh, CalculiX
+- **Connected services:** Discord, mail, model providers, market data providers
 
-## Related projects
+## Related repositories
 
-- [Klives Management Website](https://github.com/Klivess/Klives-Management-Website): Nuxt 3 / Vue 3 website for Omnipotent
-- [KliveTech-Ecosystem](https://github.com/Klivess/KliveTech-Ecosystem): Arduino/C++ library for connecting hardware devices
-- [HevySharp](https://github.com/Klivess/HevySharp): .NET wrapper for the Hevy API
+- [Klives Management Website](https://github.com/Klivess/Klives-Management-Website) — Nuxt 3 / Vue 3 dashboard
+- [KliveTech-Ecosystem](https://github.com/Klivess/KliveTech-Ecosystem) — Arduino/C++ library for connecting hardware devices
+- [HevySharp](https://github.com/Klivess/HevySharp) — .NET wrapper for the Hevy API
