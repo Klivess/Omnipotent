@@ -1,6 +1,7 @@
 using Newtonsoft.Json;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveAgent.Models;
+using System.Globalization;
 using System.Net;
 using System.Text;
 using static Omnipotent.Profiles.KMProfileManager;
@@ -442,7 +443,11 @@ namespace Omnipotent.Services.KliveAgent
         {
             await CreateDurableRoute("/kliveagent/jobs", async req =>
             {
-                await req.ReturnResponse(JsonConvert.SerializeObject(service.GetLongTermJobs()));
+                bool activeOnly = string.Equals(
+                    req.userParameters["activeOnly"], "true", StringComparison.OrdinalIgnoreCase);
+                int? limit = ParseOptionalLimit(req.userParameters["limit"]);
+                await req.ReturnResponse(JsonConvert.SerializeObject(
+                    service.GetLongTermJobs(activeOnly, limit)));
             }, HttpMethod.Get, KMPermissions.Klives);
 
             await CreateDurableRoute("/kliveagent/jobs/get", async req =>
@@ -536,8 +541,9 @@ namespace Omnipotent.Services.KliveAgent
             {
                 bool unreadOnly = string.Equals(
                     req.userParameters["unreadOnly"], "true", StringComparison.OrdinalIgnoreCase);
+                int? limit = ParseOptionalLimit(req.userParameters["limit"]);
                 await req.ReturnResponse(
-                    JsonConvert.SerializeObject(service.GetNotifications(unreadOnly)));
+                    JsonConvert.SerializeObject(service.GetNotifications(unreadOnly, limit)));
             }, HttpMethod.Get, KMPermissions.Klives);
 
             await CreateDurableRoute("/kliveagent/notifications/read", async req =>
@@ -645,6 +651,20 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterStatsRoutes()
         {
+            await CreateRoute("/kliveagent/stats/summary", async (req) =>
+            {
+                try
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.BuildFlatSummary()));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             await CreateRoute("/kliveagent/stats", async (req) =>
             {
                 try
@@ -658,6 +678,16 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
+        }
+
+        internal static int? ParseOptionalLimit(string? value)
+        {
+            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+            {
+                return null;
+            }
+
+            return Math.Clamp(parsed, 1, 50);
         }
 
         private async Task RegisterIndexRoutes()

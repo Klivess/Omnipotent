@@ -288,6 +288,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         public double LifetimeScriptSuccessRatePct { get; set; }
         public long TodayScriptsRun { get; set; }
         public long TodayScriptFailures { get; set; }
+        public long TodayMessages { get; set; }
+        public long TodayPromptTokens { get; set; }
+        public long TodayCompletionTokens { get; set; }
+        public long TodayTotalTokens { get; set; }
+        public long TodayIterations { get; set; }
+        public double TodayEstimatedCostUsd { get; set; }
         public long LifetimeMessages { get; set; }
         public long LifetimeIterations { get; set; }
         public double AvgIterationsPerMessage { get; set; }

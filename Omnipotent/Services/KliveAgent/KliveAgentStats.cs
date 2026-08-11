@@ -457,6 +457,13 @@ namespace Omnipotent.Services.KliveAgent
                 LifetimeScriptSuccessRatePct = lifeScripts > 0 ? Math.Round((double)(lifeScripts - lifeFailures) / lifeScripts * 100.0, 1) : 100.0,
                 TodayScriptsRun = today?.Scripts ?? 0,
                 TodayScriptFailures = today?.ScriptFailures ?? 0,
+                TodayMessages = today?.Messages ?? 0,
+                TodayPromptTokens = today?.PromptTokens ?? 0,
+                TodayCompletionTokens = today?.CompletionTokens ?? 0,
+                TodayTotalTokens = (today?.PromptTokens ?? 0) + (today?.CompletionTokens ?? 0),
+                TodayIterations = today?.Iterations ?? 0,
+                TodayEstimatedCostUsd = Math.Round(
+                    EstimateCost(today?.PromptTokens ?? 0, today?.CompletionTokens ?? 0), 4),
                 LifetimeMessages = TotalMessages,
                 LifetimeIterations = TotalIterations,
                 AvgIterationsPerMessage = TotalMessages > 0 ? Math.Round((double)TotalIterations / TotalMessages, 2) : 0.0,

@@ -1766,11 +1766,26 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        public List<AgentLongTermJobView> GetLongTermJobs() =>
-            longTermJobs.Values
-                .OrderByDescending(x => x.CreatedAt)
-                .Select(BuildLongTermJobView)
-                .ToList();
+        public List<AgentLongTermJobView> GetLongTermJobs(bool activeOnly = false, int? limit = null) =>
+            ApplyLongTermJobQuery(
+                longTermJobs.Values.Select(BuildLongTermJobView),
+                activeOnly,
+                limit);
+
+        internal static List<AgentLongTermJobView> ApplyLongTermJobQuery(
+            IEnumerable<AgentLongTermJobView> jobs,
+            bool activeOnly,
+            int? limit)
+        {
+            var query = jobs.Where(job => !activeOnly
+                || (!string.Equals(job.Status, "Completed", StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(job.Status, "Archived", StringComparison.OrdinalIgnoreCase)))
+                .OrderByDescending(job => job.CreatedAt);
+
+            return limit.HasValue
+                ? query.Take(Math.Clamp(limit.Value, 1, 50)).ToList()
+                : query.ToList();
+        }
 
         public AgentLongTermJobView GetLongTermJob(string jobId) =>
             !string.IsNullOrWhiteSpace(jobId) && longTermJobs.TryGetValue(jobId, out var link)
@@ -2044,11 +2059,22 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        public List<AgentNotification> GetNotifications(bool unreadOnly = false) =>
-            notifications.Values
+        public List<AgentNotification> GetNotifications(bool unreadOnly = false, int? limit = null) =>
+            ApplyNotificationQuery(notifications.Values, unreadOnly, limit);
+
+        internal static List<AgentNotification> ApplyNotificationQuery(
+            IEnumerable<AgentNotification> source,
+            bool unreadOnly,
+            int? limit)
+        {
+            var query = source
                 .Where(x => !unreadOnly || x.ReadAt == null)
-                .OrderByDescending(x => x.CreatedAt)
-                .ToList();
+                .OrderByDescending(x => x.CreatedAt);
+
+            return limit.HasValue
+                ? query.Take(Math.Clamp(limit.Value, 1, 50)).ToList()
+                : query.ToList();
+        }
 
         public async Task<bool> MarkNotificationReadAsync(string notificationId)
         {

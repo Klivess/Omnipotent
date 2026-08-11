@@ -32,6 +32,23 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }
         }
 
+        private static bool GetOnlyIfInactive(string requestBody)
+        {
+            if (string.IsNullOrWhiteSpace(requestBody)) return false;
+
+            try
+            {
+                var body = Newtonsoft.Json.Linq.JObject.Parse(requestBody);
+                return body.Value<bool?>("onlyIfInactive")
+                    ?? body.Value<bool?>("OnlyIfInactive")
+                    ?? false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private async Task HandleServiceAction(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string actionName, Func<OmniService, Task<bool>> action)
         {
             try
@@ -52,6 +69,18 @@ namespace Omnipotent.Klives_Management.General_Analytics
 
                 string resolvedServiceName = service.GetName();
                 string actionDisplay = actionName.Equals("restart", StringComparison.OrdinalIgnoreCase) ? "Restart" : "Quit";
+                bool onlyIfInactive = actionName.Equals("restart", StringComparison.OrdinalIgnoreCase)
+                    && GetOnlyIfInactive(req.userMessageContent);
+
+                if (onlyIfInactive && service.IsServiceActive())
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        Success = false,
+                        Error = $"Service '{resolvedServiceName}' is already active."
+                    }), code: System.Net.HttpStatusCode.Conflict);
+                    return;
+                }
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
@@ -67,6 +96,11 @@ namespace Omnipotent.Klives_Management.General_Analytics
                     try
                     {
                         await g.ServiceLog($"{requesterName} requested {actionName} for service {resolvedServiceName}.");
+                        if (onlyIfInactive && service.IsServiceActive())
+                        {
+                            await g.ServiceLog($"Skipped dashboard restart for {resolvedServiceName} because it recovered before execution.");
+                            return;
+                        }
                         bool succeeded = await action(service);
                         if (!succeeded)
                         {
