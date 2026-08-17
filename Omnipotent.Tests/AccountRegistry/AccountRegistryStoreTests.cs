@@ -162,8 +162,15 @@ namespace Omnipotent.Tests.AccountRegistry
             finally { Directory.Delete(dir, recursive: true); }
         }
 
+        /// <summary>
+        /// A lost root key used to brick the registry: every later write threw, so an agent that had
+        /// just created an account could neither store it nor recover it, signed up a second time,
+        /// and dead-ended in a password-reset loop. Ciphertext that can never be decrypted again is
+        /// parked (with its plaintext metadata kept so the account is still findable and resettable)
+        /// and the store re-keys itself so new work proceeds.
+        /// </summary>
         [Fact]
-        public void CorruptRootKey_IsPreserved_WhenCiphertextAlreadyExists()
+        public void CorruptRootKey_QuarantinesUnreadableSecrets_AndKeepsWorking()
         {
             string dir = Path.Combine(Path.GetTempPath(), "account-key-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(dir);
@@ -176,11 +183,20 @@ namespace Omnipotent.Tests.AccountRegistry
                 File.WriteAllBytes(key, Array.Empty<byte>());
                 var restarted = new AccountRegistryStore(_ => { }, index, key);
 
-                var error = Assert.Throws<InvalidOperationException>(() => restarted.Register("second.test", "bot", null,
-                    new() { ["password"] = "another" }, null, "test", null, false, null));
+                restarted.Register("second.test", "bot", null,
+                    new() { ["password"] = "another" }, null, "test", null, false, null);
 
-                Assert.Contains("encrypted data exists", error.Message, StringComparison.OrdinalIgnoreCase);
-                Assert.Empty(File.ReadAllBytes(key));
+                // The registry re-keyed, kept a copy of what could not be read, and stored the new secret.
+                Assert.Equal(32, File.ReadAllBytes(key).Length);
+                Assert.Single(Directory.GetFiles(dir, "*.unreadable-*.json"));
+                Assert.Equal("another", restarted.GetDecryptedSecret(
+                    restarted.FindByService("second.test").Single().AccountID, "password"));
+
+                // The old account survives as metadata so it can be recovered by password reset,
+                // but its undecryptable secret is gone rather than silently returning garbage.
+                var stranded = restarted.FindByService("first.test").Single();
+                Assert.DoesNotContain(stranded.Secrets, secret => secret.Name == "password");
+                Assert.Contains("reset", stranded.Notes ?? "", StringComparison.OrdinalIgnoreCase);
             }
             finally { Directory.Delete(dir, recursive: true); }
         }

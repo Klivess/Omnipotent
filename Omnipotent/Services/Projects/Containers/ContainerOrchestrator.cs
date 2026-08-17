@@ -222,6 +222,35 @@ namespace Omnipotent.Services.Projects.Containers
             flock -w 20 9 || { echo 'Timed out waiting for the browser profile owner to exit; singleton markers were not removed.' >&2; exit 1; }
             rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
             : > /tmp/chromium.log
+            # Chromium's own UI is a source of blocked clicks: the "Save password?" bubble lands on
+            # top of the submit button of the very form that triggered it, and notification/translate
+            # prompts steal focus mid-flow. Seed the profile so none of them ever appear. Merged into
+            # the existing preferences (never overwriting them) so a persistent profile keeps its state.
+            python3 - "$OMNIPOTENT_BROWSER_PROFILE/Default/Preferences" <<'PREFS' || true
+            import json, os, sys
+            path = sys.argv[1]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path, 'r', encoding='utf-8') as handle: prefs = json.load(handle)
+            except Exception:
+                prefs = {}
+            if not isinstance(prefs, dict): prefs = {}
+            def branch(root, *names):
+                node = root
+                for name in names:
+                    child = node.get(name)
+                    if not isinstance(child, dict): child = {}; node[name] = child
+                    node = child
+                return node
+            prefs['credentials_enable_service'] = False
+            prefs['credentials_enable_autosignin'] = False
+            branch(prefs, 'profile')['password_manager_enabled'] = False
+            branch(prefs, 'profile', 'default_content_setting_values')['notifications'] = 2
+            branch(prefs, 'profile', 'default_content_setting_values')['geolocation'] = 2
+            branch(prefs, 'translate')['enabled'] = False
+            branch(prefs, 'bookmark_bar')['show_on_all_tabs'] = False
+            with open(path, 'w', encoding='utf-8') as handle: json.dump(prefs, handle)
+            PREFS
             # Assemble the per-desktop fingerprint extension into a writable dir: the baked template
             # (manifest + patch.js) plus a one-line persona.js carrying this desktop's values. This is
             # a main-world, document_start content script that normalises the page-visible environment

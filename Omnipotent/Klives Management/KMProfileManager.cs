@@ -251,6 +251,12 @@ namespace Omnipotent.Profiles
             {
                 try
                 {
+                    // An authorization decision must never be replayed from cache: this
+                    // answers "may this credential log in right now?", and a stale
+                    // "Allowed" would outlive a disabled profile. The in-memory profile
+                    // index makes it O(1) anyway, so there is nothing to gain by caching.
+                    Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("live authorization decision");
+
                     if (req.user == null)
                     {
                         await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);

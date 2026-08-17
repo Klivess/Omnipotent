@@ -35,9 +35,69 @@ namespace Omnipotent.Services.KliveAPI.Caching
         private static readonly AsyncLocal<DependencyScope?> _current = new();
         private static readonly ConcurrentDictionary<string, long> _versions = new(StringComparer.Ordinal);
 
+        /// <summary>
+        /// Prefix marking a *virtual* dependency whose version comes from the clock
+        /// rather than the registry. See <see cref="NoteTimeBucket"/>.
+        /// </summary>
+        private const string ClockKeyPrefix = "clock:";
+
+        /// <summary>Clock source — overridable so tests can pin bucket boundaries.</summary>
+        internal static Func<DateTime> UtcNowProvider = static () => DateTime.UtcNow;
+
         /// <summary>Current monotonic version of a dataset key (0 if never bumped).</summary>
         public static long CurrentVersion(string key)
-            => _versions.TryGetValue(key, out long v) ? v : 0;
+        {
+            if (key != null && key.StartsWith(ClockKeyPrefix, StringComparison.Ordinal))
+            {
+                return CurrentBucket(key);
+            }
+            return _versions.TryGetValue(key ?? string.Empty, out long v) ? v : 0;
+        }
+
+        /// <summary>
+        /// Declares that the current fill's payload is anchored to wall-clock time,
+        /// valid for <paramref name="bucket"/>.
+        ///
+        /// A sliding window ("last 30 days", "facts fresh as of now") cannot be
+        /// expressed as a stored version: the data need not change for the answer to
+        /// go wrong, because the *question* moves with the clock. Rather than give up
+        /// and mark such a fill uncacheable, we quantize the clock and note the
+        /// bucket as an ordinary dependency: version = floor(nowUtc / bucket). The
+        /// entry then self-invalidates the moment the window advances, and until then
+        /// it is exactly correct for the window it was built for.
+        ///
+        /// Pick the bucket to match how precise the answer must be, not how often the
+        /// route is called — a 24-hour digest is honest at a 60s bucket; a countdown
+        /// is not. Reach for <see cref="MarkUncacheable"/> only when no bucket is
+        /// tolerable.
+        /// </summary>
+        public static void NoteTimeBucket(TimeSpan bucket)
+        {
+            try
+            {
+                long ticks = bucket.Ticks;
+                if (ticks <= 0) { MarkUncacheable("non-positive time bucket"); return; }
+                NoteRead(ClockKeyPrefix + ticks.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            catch { }
+        }
+
+        private static long CurrentBucket(string key)
+        {
+            try
+            {
+                string span = key.Substring(ClockKeyPrefix.Length);
+                if (!long.TryParse(span, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out long ticks) || ticks <= 0)
+                {
+                    // Unparseable bucket: return an always-changing version so the
+                    // entry can never be served. Fail closed, never stale.
+                    return UtcNowProvider().Ticks;
+                }
+                return UtcNowProvider().Ticks / ticks;
+            }
+            catch { return UtcNowProvider().Ticks; }
+        }
 
         /// <summary>
         /// Record that the current fill depends on <paramref name="key"/>. No-op
@@ -105,7 +165,11 @@ namespace Omnipotent.Services.KliveAPI.Caching
         }
 
         // Test-only hooks (InternalsVisibleTo Omnipotent.Tests).
-        internal static void ResetForTests() => _versions.Clear();
+        internal static void ResetForTests()
+        {
+            _versions.Clear();
+            UtcNowProvider = static () => DateTime.UtcNow;
+        }
         internal static DependencyScope? CurrentScopeForTests => _current.Value;
     }
 

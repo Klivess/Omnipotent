@@ -45,12 +45,20 @@ namespace Omnipotent.Services.KliveAPI.Caching
         // ── key construction ──
 
         /// <summary>
-        /// Canonical cache key: <c>GET|{route}|{sorted-query}|{user}</c>. Route is
+        /// Canonical cache key: <c>GET|{route}|{sorted-query}|{user}[|range]</c>. Route is
         /// lowercased (the route table is case-insensitive); query params are ordinal
         /// sorted by name with values preserved verbatim; entries vary by user because
         /// handlers routinely read <c>req.user</c>.
+        ///
+        /// <paramref name="rangeHeader"/> participates because a ranged GET is a request
+        /// for a *different body* than the same URL without one. The hit path reproduces
+        /// stored responses verbatim and has no partial-content support, so without this
+        /// a ranged request could be answered from a stored full-body 200 — breaking
+        /// media seeking. Ranged fills are never stored (they return 206, and only 200 is
+        /// cacheable), so in practice this makes ranged requests bypass rather than
+        /// collide.
         /// </summary>
-        public static string BuildKey(string route, NameValueCollection? query, string? userId)
+        public static string BuildKey(string route, NameValueCollection? query, string? userId, string? rangeHeader = null)
         {
             var sb = new System.Text.StringBuilder(64);
             sb.Append("GET|").Append((route ?? "/").ToLowerInvariant()).Append('|');
@@ -71,6 +79,10 @@ namespace Omnipotent.Services.KliveAPI.Caching
                 }
             }
             sb.Append('|').Append(string.IsNullOrEmpty(userId) ? "anon" : userId);
+            if (!string.IsNullOrEmpty(rangeHeader))
+            {
+                sb.Append("|range=").Append(rangeHeader);
+            }
             return sb.ToString();
         }
 

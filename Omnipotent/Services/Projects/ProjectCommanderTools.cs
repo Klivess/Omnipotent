@@ -771,9 +771,27 @@ namespace Omnipotent.Services.Projects
                         .FirstOrDefault(m => string.Equals(m.ID, milestoneRef, StringComparison.OrdinalIgnoreCase)
                             || string.Equals(m.Title, milestoneRef, StringComparison.OrdinalIgnoreCase));
                     if (ready == null) return new CommanderToolResult($"Milestone '{milestoneRef}' is not dependency-ready.");
+
+                    // Some work is genuinely indivisible or must stay with whoever holds the live
+                    // browser session. Taking it yourself is a legitimate staffing decision, and
+                    // refusing it left the milestone permanently unowned — which is what kept the
+                    // watchdog reporting an under-staffed project while everyone was busy.
+                    if (target.Length == 0 || string.Equals(target, "commander", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(target, "self", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(target, "me", StringComparison.OrdinalIgnoreCase))
+                    {
+                        GrandPlans.UpdateMilestoneStatus(project.ProjectID, ready.ID, MilestoneStatus.InProgress,
+                            ownerAgentID: "commander");
+                        subAgents.SetActiveMilestones(project.ProjectID, "commander", new[] { ready.ID });
+                        eventLog.Append(Evt(ProjectEventTypes.GrandPlanProgress, "commander",
+                            $"Commander took milestone {ready.ID} '{ready.Title}' itself."));
+                        return new CommanderToolResult(
+                            $"You now own milestone {ready.ID} '{ready.Title}'. Work it directly; close it with checkpoint evidence when done.");
+                    }
+
                     if (!subAgents.TryResolveActiveTarget(project.ProjectID, target, out var worker, out var error)
                         || worker == null || worker.AgentID == "commander")
-                        return new CommanderToolResult("Work not assigned: " + (error.Length > 0 ? error : "choose an active worker, not the Commander."));
+                        return new CommanderToolResult("Work not assigned: " + (error.Length > 0 ? error : "no active worker matched that ID."));
                     ProjectAgentMissionKind? reassignMission = null;
                     string reassignMissionStr = ((string?)a["mission"] ?? "").Trim();
                     if (reassignMissionStr.Length > 0)
@@ -999,7 +1017,7 @@ namespace Omnipotent.Services.Projects
                         return FailedResult(
                             "UPLOAD_IS_NOT_HUMAN_ONLY: a browser file dialog is a tool call, not an obstacle for Klives. " +
                             "Call computer_upload_file with the file's container path (path:'/project/...'): if the native chooser is already open it types the path into that dialog's location bar and confirms it, and otherwise it attaches the file to the page's own file input — including the hidden input behind a styled upload button. " +
-                            "Do it yourself, then finish the site's submit/publish step. Only CAPTCHA and SMS/phone verification are human-only.");
+                            "Do it yourself, then finish the site's submit/publish step. Even a CAPTCHA is yours now (browser op=solve_challenge); only SMS/phone and identity verification are human-only.");
                     if (title.Length > 0) what = title + ": " + what;
                     if (rationale.Length > 0) what += "\nWhy a human is required: " + rationale;
                     if (RequestHumanAsync == null)
@@ -1050,9 +1068,40 @@ namespace Omnipotent.Services.Projects
                         createdBy: "project:" + project.ProjectID, owner: "project:" + project.ProjectID,
                         allowDuplicate, reason);
                     if (registration.Created)
+                    {
                         AppendAccountEvent(registration.Account?.ServiceKey ?? service,
                             registration.Account?.Username ?? username, allowDuplicate ? "register-duplicate" : "register");
+                        ProjectExternalActions.Record(eventLog, project.ProjectID, wakeID, actingAgentID,
+                            "agent", "account_created", registration.Account?.ServiceKey ?? service,
+                            $"username {registration.Account?.Username ?? username}"
+                                + (string.IsNullOrWhiteSpace(email) ? "" : $", email {email}"),
+                            "account_register persisted the account in the shared registry.");
+                    }
                     return new CommanderToolResult(registration.Message) { Succeeded = !registration.Failed };
+                }
+
+                case "record_external_action":
+                {
+                    string kind = ProjectExternalActions.NormalizeKind((string?)a["kind"]);
+                    string target = ((string?)a["target"] ?? "").Trim();
+                    string summary = ((string?)a["summary"] ?? "").Trim();
+                    string evidence = ((string?)a["evidence"] ?? "").Trim();
+                    if (target.Length == 0)
+                        return FailedResult("Provide 'target' — the site, address, listing or account the action landed on.");
+                    if (evidence.Length < 12)
+                        return FailedResult(
+                            "Provide 'evidence': the concrete proof this happened — the tool call and its result, a "
+                            + "confirmation page's text, a message id, a URL that now exists. An external action with no "
+                            + "evidence is a claim, and claims do not belong in this ledger.");
+                    if (ProjectExternalActions.AlreadyRecorded(eventLog, project.ProjectID, kind, target))
+                        return new CommanderToolResult(
+                            $"'{kind}' on '{target}' is ALREADY on the external-action ledger — it was done before, so do "
+                            + "not do it again. Move to the next step instead.");
+                    ProjectExternalActions.Record(eventLog, project.ProjectID, wakeID, actingAgentID,
+                        "agent", kind, target, summary, evidence);
+                    return new CommanderToolResult(
+                        $"Recorded external action: {kind} @ {target}. It is now durable across wakes and compaction, and "
+                        + "is what future wakes will treat as proof this was done.");
                 }
 
                 case "account_list":
@@ -1322,6 +1371,65 @@ namespace Omnipotent.Services.Projects
                     {
                         RecordKliveMailHealth(false, ex.GetType().Name, ex.Message);
                         return new CommanderToolResult($"klivemail_get_message failed: {ex.Message}") { Succeeded = false };
+                    }
+                }
+
+                case "klivemail_send":
+                {
+                    var mailService = GetKliveMailService(out var sendErr);
+                    if (mailService == null) return FailedResult(sendErr!);
+                    string to = ((string?)a["to"] ?? "").Trim();
+                    string subject = ((string?)a["subject"] ?? "").Trim();
+                    string mailBody = (string?)a["body"] ?? "";
+                    string fromAddress = ((string?)a["from"] ?? "").Trim();
+                    string ccAddresses = ((string?)a["cc"] ?? "").Trim();
+                    string replyTo = ((string?)a["replyTo"] ?? "").Trim();
+                    bool isHtml = (bool?)a["html"] ?? false;
+                    var attachmentPaths = new List<string>();
+                    if (a["attachments"] is JArray attachmentList)
+                    {
+                        if (Files == null && attachmentList.Count > 0)
+                            return FailedResult("Attachments are unavailable: the project file volume is not mounted.");
+                        foreach (var item in attachmentList.Take(10))
+                        {
+                            string relative = (item?.ToString() ?? "").Trim();
+                            if (relative.Length == 0) continue;
+                            try
+                            {
+                                attachmentPaths.Add(Files!.GetPhysicalFilePath(project.ProjectID, relative));
+                            }
+                            catch (Exception ex)
+                            {
+                                return FailedResult($"Attachment '{relative}' could not be resolved in the project volume: {ex.Message}");
+                            }
+                        }
+                    }
+                    try
+                    {
+                        string outcome = await mailService.SendMailAsync(
+                            fromAddress.Length == 0 ? null : fromAddress, to, subject, mailBody, isHtml,
+                            ccAddresses.Length == 0 ? null : ccAddresses,
+                            replyTo.Length == 0 ? null : replyTo,
+                            attachmentPaths, "project:" + project.ProjectID, ct);
+                        RecordKliveMailHealth(true, "RelayReachable", "An outbound message was accepted by the mail relay.");
+                        ProjectExternalActions.Record(eventLog, project.ProjectID, wakeID, actingAgentID,
+                            "agent", "email_sent", to,
+                            $"Subject: {Trunc(subject, 120)}",
+                            "klivemail_send returned success from the relay; a copy is filed in the sending mailbox.");
+                        return new CommanderToolResult(
+                            outcome + " A copy is filed in the sending mailbox: that copy is the evidence this send happened.")
+                        {
+                            AuditText = $"KliveMail sent a message to [{to}]"
+                                + (ccAddresses.Length == 0 ? "" : $" cc [{ccAddresses}]")
+                                + $" from {(fromAddress.Length == 0 ? "the registered relay sender" : fromAddress)}"
+                                + $"; subject and body omitted from durable history. Attachments: {attachmentPaths.Count}.",
+                        };
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        RecordKliveMailHealth(false, ex.GetType().Name, ex.Message);
+                        return FailedResult($"klivemail_send failed: {ex.Message}");
                     }
                 }
 
@@ -2980,6 +3088,29 @@ namespace Omnipotent.Services.Projects
             }
             RecordKliveMailHealth(true, "RepositoryReady", "The in-process KliveMail repository is ready.");
             return repo;
+        }
+
+        /// <summary>The live KliveMail service itself, needed for outbound sends (the repository
+        /// only covers the inbound store).</summary>
+        private Omnipotent.Services.KliveMail.KliveMail? GetKliveMailService(out string? error)
+        {
+            error = null;
+            if (KliveAgentService == null)
+            {
+                error = "KliveMail is unavailable (the KliveAgent service bridge is down on this host).";
+                RecordKliveMailHealth(false, "ServiceBridgeUnavailable", error);
+                return null;
+            }
+            var svc = KliveAgentService.GetActiveServices()
+                .OfType<Omnipotent.Services.KliveMail.KliveMail>()
+                .FirstOrDefault(s => s.IsServiceActive());
+            if (svc == null)
+            {
+                error = "The KliveMail service is not running on this host.";
+                RecordKliveMailHealth(false, "ServiceNotRunning", error);
+                return null;
+            }
+            return svc;
         }
 
         private void RecordKliveMailHealth(bool healthy, string code, string summary)

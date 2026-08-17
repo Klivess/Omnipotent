@@ -37,6 +37,27 @@ namespace Omnipotent.Services.Omniscience
         private static readonly int ReadGateSize = Math.Clamp(Environment.ProcessorCount / 2, 3, 8);
         private static readonly SemaphoreSlim ReadGate = new(initialCount: ReadGateSize, maxCount: ReadGateSize);
 
+        // The warmer gets its own single slot rather than sharing ReadGate. Sharing it
+        // meant background refreshes competed with live requests for the same scarce
+        // slots — and because a warm sweep of every target takes longer than the sweep
+        // interval on a large DB, the warmer was effectively resident, permanently
+        // holding a slot it was supposed to be freeing up for readers.
+        private static readonly SemaphoreSlim WarmGate = new(initialCount: 1, maxCount: 1);
+
+        // Nothing here waits indefinitely. Unbounded waits are what turned a slow query
+        // into a 100-minute request: the browser gave up after 8s, but the server kept
+        // the handler queued and holding its slot, so abandoned work crowded out live
+        // work and the queue could never drain. Every wait now has a deadline, and
+        // exceeding it returns "try again" instead of joining the back of the queue.
+        private static readonly TimeSpan GateWaitBudget = TimeSpan.FromSeconds(3);
+        private static readonly TimeSpan ColdBuildBudget = TimeSpan.FromSeconds(6);
+
+        /// <summary>Raised when a read cannot be served inside its deadline. Surfaces as 503.</summary>
+        internal sealed class ReadBusyException : Exception
+        {
+            public ReadBusyException(string message) : base(message) { }
+        }
+
         // ── Per-route TTL response cache ──
         // The Omniscience DB grows into the millions of rows. The dashboard routes do
         // unavoidable full-table aggregates (COUNT(*) FROM messages, GROUP BY
@@ -83,12 +104,17 @@ namespace Omnipotent.Services.Omniscience
             }
         }
 
-        // Must be called under lock(entry). Starts the single-flight rebuild task.
-        private static Task<string> StartBuild(CacheEntry entry, TimeSpan ttl, Func<string> buildPayload)
+        // Must be called under lock(entry). Starts the single-flight rebuild task on the
+        // given gate — ReadGate for live requests, WarmGate for background refreshes.
+        private static Task<string> StartBuild(CacheEntry entry, TimeSpan ttl, Func<string> buildPayload, SemaphoreSlim gate)
         {
             var task = Task.Run(async () =>
             {
-                await ReadGate.WaitAsync();
+                if (!await gate.WaitAsync(GateWaitBudget))
+                {
+                    lock (entry) { entry.InFlight = null; }
+                    throw new ReadBusyException("Omniscience read gate saturated.");
+                }
                 try
                 {
                     string payload = buildPayload();
@@ -105,7 +131,7 @@ namespace Omnipotent.Services.Omniscience
                     lock (entry) { entry.InFlight = null; }
                     throw;
                 }
-                finally { ReadGate.Release(); }
+                finally { gate.Release(); }
             });
             entry.InFlight = task;
             return task;
@@ -128,7 +154,7 @@ namespace Omnipotent.Services.Omniscience
                 {
                     return entry.Payload;
                 }
-                task = entry.InFlight ?? StartBuild(entry, ttl, buildPayload);
+                task = entry.InFlight ?? StartBuild(entry, ttl, buildPayload, ReadGate);
 
                 // Stale-while-revalidate: an expired entry still holds the last good
                 // payload — serve it instantly and let the refresh land in the
@@ -138,6 +164,15 @@ namespace Omnipotent.Services.Omniscience
                 {
                     return entry.Payload;
                 }
+            }
+
+            // Cold key: bounded wait. The build is deliberately NOT cancelled on timeout —
+            // it keeps running so the next caller finds a warm entry — but this caller
+            // stops waiting, which is what prevents abandoned requests from piling up.
+            Task finished = await Task.WhenAny(task, Task.Delay(ColdBuildBudget));
+            if (finished != task)
+            {
+                throw new ReadBusyException("Omniscience read still building; retry shortly.");
             }
             return await task;
         }
@@ -150,7 +185,7 @@ namespace Omnipotent.Services.Omniscience
             lock (entry)
             {
                 if (entry.Payload != null && entry.ExpiresAtTicks > DateTime.UtcNow.Ticks) return;
-                task = entry.InFlight ?? StartBuild(entry, target.Ttl, target.Build);
+                task = entry.InFlight ?? StartBuild(entry, target.Ttl, target.Build, WarmGate);
             }
             await task;
         }
@@ -161,19 +196,52 @@ namespace Omnipotent.Services.Omniscience
         // use GetOrComputeAsync for list/aggregate routes that re-run the same query.
         internal static async Task GatedRead(UserRequest req, Func<string> buildPayload)
         {
-            await ReadGate.WaitAsync();
+            if (!await ReadGate.WaitAsync(GateWaitBudget))
+            {
+                await RespondBusy(req);
+                return;
+            }
+
+            string payload;
             try
             {
-                string payload = await Task.Run(buildPayload);
-                await req.ReturnResponse(payload);
+                payload = await Task.Run(buildPayload);
             }
-            finally { ReadGate.Release(); }
+            finally
+            {
+                // Released before writing the response: holding a scarce read slot while
+                // streaming bytes to a possibly-slow client wastes it on socket I/O.
+                ReadGate.Release();
+            }
+            await req.ReturnResponse(payload);
         }
 
         internal static async Task CachedRead(UserRequest req, string cacheKey, TimeSpan ttl, Func<string> buildPayload)
         {
-            string payload = await GetOrComputeAsync(cacheKey, ttl, buildPayload);
+            string payload;
+            try
+            {
+                payload = await GetOrComputeAsync(cacheKey, ttl, buildPayload);
+            }
+            catch (ReadBusyException)
+            {
+                await RespondBusy(req);
+                return;
+            }
             await req.ReturnResponse(payload);
+        }
+
+        /// <summary>
+        /// Tells the caller to come back rather than holding the connection open. A short
+        /// Retry-After is honest here: the work that would have served this request is
+        /// usually still running and will have populated the cache by then.
+        /// </summary>
+        private static async Task RespondBusy(UserRequest req)
+        {
+            var headers = new System.Collections.Specialized.NameValueCollection { { "Retry-After", "2" } };
+            await req.ReturnResponse(
+                "{\"error\":\"busy\",\"detail\":\"Omniscience read is warming; retry shortly.\"}",
+                "application/json", headers, HttpStatusCode.ServiceUnavailable);
         }
 
         public OmniscienceRoutes(Omniscience service) { this.service = service; }
@@ -219,8 +287,18 @@ namespace Omnipotent.Services.Omniscience
                 try { await Task.Delay(TimeSpan.FromSeconds(2)); } catch { }
                 while (true)
                 {
+                    // Only rebuild targets that have actually expired. The old loop swept
+                    // every target every pass; on a large DB one sweep outlasts the sweep
+                    // interval, so the warmer ran continuously and its entries were always
+                    // expired anyway — pure background load for no freshness gain.
+                    long now = DateTime.UtcNow.Ticks;
                     foreach (var target in WarmTargets.Values)
                     {
+                        bool due = !ResponseCache.TryGetValue(target.Key, out var entry)
+                                   || entry.Payload == null
+                                   || entry.ExpiresAtTicks <= now;
+                        if (!due) continue;
+
                         try { await EnsureFreshAsync(target); }
                         catch { /* swallow — next tick will retry */ }
                     }

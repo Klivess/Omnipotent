@@ -185,10 +185,14 @@ namespace Omnipotent.Services.Projects
                 try { kliveAgentContext = await DescribeKliveAgentContextAsync(project.ProjectID); } catch { kliveAgentContext = null; }
             }
 
+            string? externalActions = null;
+            try { externalActions = ProjectExternalActions.DescribeForPrompt(eventLog, project.ProjectID); }
+            catch { externalActions = null; }
+
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
-                recentEventsBudget, chronologicalEvents, approvals, taskForce);
+                recentEventsBudget, chronologicalEvents, approvals, taskForce, externalActions);
         }
 
         private static string Truncate(string s, int max) =>

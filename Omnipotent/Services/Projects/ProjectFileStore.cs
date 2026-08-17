@@ -1078,6 +1078,12 @@ public sealed class ProjectFileStore
         if (driveProject.Success) value = driveProject.Groups[1].Success ? driveProject.Groups[1].Value : "";
         else if (value.Equals("/project", StringComparison.OrdinalIgnoreCase)) value = "";
         else if (value.StartsWith("/project/", StringComparison.OrdinalIgnoreCase)) value = value[9..];
+        // A model that has been told its files live at /project routinely drops the leading slash
+        // and writes "project/work/x.md". Left alone that silently forks the workspace into a second
+        // tree, so a teammate reading "work/x.md" gets "not found" and redoes delivered work. The
+        // project root is never itself named "project", so this spelling is unambiguous.
+        else if (value.Equals("project", StringComparison.OrdinalIgnoreCase)) value = "";
+        else if (value.StartsWith("project/", StringComparison.OrdinalIgnoreCase)) value = value[8..];
 
         if (value.Length == 0 || value == ".")
         {

@@ -181,16 +181,27 @@ namespace Omnipotent.Services.OmniDefence
                     return;
                 }
                 var record = parent.Tracker.Get(ip) ?? await parent.Store.GetIpRecordAsync(ip);
-                var recentReqs = await parent.Store.QueryAsync(
+
+                // Three independent indexed lookups. They used to run back-to-back, each
+                // re-acquiring the store's single lock; on the read pool they overlap.
+                var recentReqsTask = parent.Store.QueryAsync(
                     RequestSelectSql + " WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
                     new() { ["$ip"] = ip });
-                var events = await parent.Store.QueryAsync(
+                var eventsTask = parent.Store.QueryAsync(
                     "SELECT * FROM ip_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
                     new() { ["$ip"] = ip });
-                var auth = await parent.Store.QueryAsync(
+                var authTask = parent.Store.QueryAsync(
                     "SELECT * FROM auth_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
                     new() { ["$ip"] = ip });
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { record, recentRequests = recentReqs, events, auth }), "application/json");
+                await Task.WhenAll(recentReqsTask, eventsTask, authTask);
+
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    record,
+                    recentRequests = recentReqsTask.Result,
+                    events = eventsTask.Result,
+                    auth = authTask.Result
+                }), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
             // Block

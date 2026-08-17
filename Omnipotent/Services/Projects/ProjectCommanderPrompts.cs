@@ -38,7 +38,8 @@ namespace Omnipotent.Services.Projects
             int? recentEventsBudget = null,
             bool chronologicalEvents = true,
             string? approvalsBlock = null,
-            string? taskForceBlock = null)
+            string? taskForceBlock = null,
+            string? externalActionsBlock = null)
         {
             var sb = new StringBuilder();
 
@@ -94,6 +95,16 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine("── TYPED EXECUTION STATE (authoritative; update with checkpoint tools) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                     ProjectPromptHygiene.ScrubState(runtimeStateBlock), ProjectsContextBudget.DigestBudget));
+            }
+
+            // The ledger of real side effects sits above the digest for the same reason typed state
+            // does: prose can claim an email was sent, this cannot. It is also the duplicate guard —
+            // a wake that lost its context would otherwise sign up or apply a second time.
+            if (!string.IsNullOrWhiteSpace(externalActionsBlock))
+            {
+                sb.AppendLine("── EXTERNAL ACTION LEDGER (evidenced side effects in the real world; authoritative) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
+                    externalActionsBlock, ProjectsContextBudget.ObservablesBudget));
             }
 
             sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampWithAge(digest.UpdatedAt)}) ──");

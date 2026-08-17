@@ -9,8 +9,17 @@ internal static class AtomicSecretRootKey
     private static readonly ConcurrentDictionary<string, object> Gates =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <param name="quarantineProtectedData">
+    /// Optional recovery hook invoked when the key is unusable but ciphertext exists. It must move
+    /// the undecryptable payloads aside (preserving them for offline recovery) and return a short
+    /// human description of what it parked. Supplying it converts a permanently bricked store into
+    /// a self-healing one: the ciphertext was already unrecoverable without the key, so refusing to
+    /// continue only blocks all future writes as well. Omit it to keep the strict, throwing
+    /// behaviour for stores where a stale-but-present key may still be restorable from backup.
+    /// </param>
     public static byte[] LoadOrCreate(string path, int expectedBytes, Func<bool> hasProtectedData,
-        Action<string> hardenPermissions, Action<string> log, string label)
+        Action<string> hardenPermissions, Action<string> log, string label,
+        Func<string>? quarantineProtectedData = null)
     {
         string fullPath = Path.GetFullPath(path);
         lock (Gates.GetOrAdd(fullPath, _ => new object()))
@@ -25,16 +34,24 @@ internal static class AtomicSecretRootKey
                     return existing;
                 }
 
-                // Regenerating over ciphertext would make every existing secret unrecoverable.
-                // If inspection itself fails, propagate that failure and preserve the bad key.
+                // Regenerating over ciphertext would make every existing secret unrecoverable, so
+                // the ciphertext is parked first and only then is a fresh key minted. Without a
+                // recovery hook the store stays strict and refuses rather than guessing.
                 if (hasProtectedData())
-                    throw new InvalidOperationException(
-                        $"{label} root key is corrupt ({existing.Length} bytes) and encrypted data exists. " +
-                        "The key was preserved; restore it from backup before using protected data.");
+                {
+                    if (quarantineProtectedData == null)
+                        throw new InvalidOperationException(
+                            $"{label} root key is corrupt ({existing.Length} bytes) and encrypted data exists. " +
+                            "The key was preserved; restore it from backup before using protected data.");
+
+                    string parked = quarantineProtectedData();
+                    log($"{label}: root key was unusable ({existing.Length} bytes) and its ciphertext could " +
+                        $"never be decrypted again. Parked {parked} and re-keyed so new secrets can be stored.");
+                }
 
                 string quarantine = fullPath + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}";
                 File.Move(fullPath, quarantine, overwrite: false);
-                log($"{label}: quarantined an unusable {existing.Length}-byte root key at {quarantine}; no encrypted data existed.");
+                log($"{label}: quarantined an unusable {existing.Length}-byte root key at {quarantine}.");
             }
 
             byte[] created = RandomNumberGenerator.GetBytes(expectedBytes);

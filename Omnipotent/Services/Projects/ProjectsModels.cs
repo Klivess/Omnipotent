@@ -318,6 +318,7 @@ namespace Omnipotent.Services.Projects
         public const string DirectiveAcknowledged = "directive-acknowledged";
         public const string DirectiveCompleted = "directive-completed";
         public const string DirectiveRevoked = "directive-revoked";
+        public const string ExternalAction = "external-action";        // a confirmed side effect in the outside world (account created, email sent, form submitted)
     }
 
     /// <summary>

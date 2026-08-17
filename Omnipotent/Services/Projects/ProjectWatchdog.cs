@@ -76,8 +76,22 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>
+        /// Marks a diagnosis as advice about how the project is being run rather than evidence that
+        /// it is wedged. Advisory diagnoses are delivered into the live wake and never cancel it.
+        /// </summary>
+        private const string AdvisoryPrefix = "advisory";
+
+        private static bool IsAdvisory(string diagnosis) => diagnosis.StartsWith(AdvisoryPrefix, StringComparison.Ordinal);
+        private static string StripAdvisory(string diagnosis) =>
+            IsAdvisory(diagnosis) ? diagnosis[AdvisoryPrefix.Length..] : diagnosis;
+
         /// <summary>Returns a stall diagnosis string, or null if the project looks healthy.</summary>
-        public string? Diagnose(Project project) => DiagnoseCore(project).diagnosis;
+        public string? Diagnose(Project project)
+        {
+            string? diagnosis = DiagnoseCore(project).diagnosis;
+            return diagnosis == null ? null : StripAdvisory(diagnosis);
+        }
 
         private (string? diagnosis, string? wedgedAgentID) DiagnoseCore(Project project)
         {
@@ -136,12 +150,14 @@ namespace Omnipotent.Services.Projects
                         or ProjectEventTypes.AccountChanged or ProjectEventTypes.AgentSpawned
                         or ProjectEventTypes.MoneySpent));
                 if (!anyProgress)
-                    return ($"No verified progress across the last {ZeroProgressWakes} wakes (no artifacts, file/checkpoint/plan changes, spawns, or spend).", null);
+                    return (AdvisoryPrefix + $"No verified progress across the last {ZeroProgressWakes} wakes (no artifacts, file/checkpoint/plan changes, spawns, or spend).", null);
             }
 
-            // 3. Repeated-action loops: the last wake tripped the stuck-loop guard heavily.
+            // 3. Repeated-action loops: the last wake tripped the stuck-loop guard heavily. This
+            //    describes a wake that has already ended, so it is advice for whatever is running
+            //    now — not grounds to cancel it.
             if (digest.RecentStuckLoopTrips >= 3)
-                return ($"Commander tripped its stuck-loop guard {digest.RecentStuckLoopTrips}× in its last wake.", null);
+                return (AdvisoryPrefix + $"Commander tripped its stuck-loop guard {digest.RecentStuckLoopTrips}× in its last wake.", null);
 
             // 4. Wedged sub-agent: it woke, never finished within MaxWakeGap, AND has gone silent
             //    (a live worker emits tool calls constantly — silence, not duration, is the wedge
@@ -175,7 +191,8 @@ namespace Omnipotent.Services.Projects
                     {
                         int free = Math.Max(0, project.SubAgentCap - roster.Count);
                         var unstaffed = ProjectStaffing.UnstaffedReady(ready, roster);
-                        return ($"{free} agent slot(s) are free while {unstaffed.Count} dependency-ready milestone(s) have no owner "
+                        return (AdvisoryPrefix
+                            + $"{free} agent slot(s) are free while {unstaffed.Count} dependency-ready milestone(s) have no owner "
                             + $"({string.Join(", ", unstaffed.Take(3).Select(m => m.ID))}). Staff the work or explain why it is indivisible.", null);
                     }
                 }
@@ -236,6 +253,27 @@ namespace Omnipotent.Services.Projects
             if (rechecked.diagnosis == null) return;
             diagnosis = rechecked.diagnosis;
             wedgedAgentID = rechecked.wedgedAgentID;
+
+            bool advisory = IsAdvisory(diagnosis);
+            diagnosis = StripAdvisory(diagnosis).TrimStart();
+
+            // Advice for a Commander that is visibly working goes INTO the running wake. Force-waking
+            // here used to cancel mid-action — in one run it killed a wake three seconds after a
+            // signup form had been filled and was about to be submitted — and every cancellation
+            // pays again to rediscover the state it threw away.
+            if (advisory && wedgedAgentID == null &&
+                parent.CommanderRunner.NudgeActiveWake(current, diagnosis))
+            {
+                parent.EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = current.ProjectID,
+                    Type = ProjectEventTypes.WatchdogReminder,
+                    Author = "system",
+                    AgentID = "commander",
+                    Text = $"Watchdog: {diagnosis} Delivered into the running wake (no cancellation).",
+                });
+                return;
+            }
 
             // Consume the stuck-loop signal so one bad wake can't re-trigger this diagnosis forever.
             var digest = parent.Digests.GetDigest(project.ProjectID);

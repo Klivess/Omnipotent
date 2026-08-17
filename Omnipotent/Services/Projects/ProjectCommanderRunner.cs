@@ -405,6 +405,10 @@ namespace Omnipotent.Services.Projects
                 }
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
+                // Advances on every dispatched action that can change external state, so an
+                // observation repeated after a navigation/click is judged against the new world
+                // rather than counted as a loop.
+                int worldEpoch = 0;
 
                 while (true)
                 {
@@ -691,25 +695,29 @@ namespace Omnipotent.Services.Projects
 
                         parent.Activity.BeginTool(projectID, "commander", toolName, DescribeCall(toolName, argsJson));
 
-                        int signatureCount = ProjectToolCallConvergence.RegisterCall(recentSignatures, toolName, argsJson);
+                        int signatureCount = ProjectToolCallConvergence.RegisterCall(
+                            recentSignatures, toolName, argsJson, worldEpoch);
                         if (signatureCount >= StuckIdenticalCallThreshold)
                         {
                             stuckTrips++;
-                            string loopResult = $"LOOP DETECTED: identical {toolName} call {signatureCount}× — the result won't change. Change strategy and gather different evidence; context rollover will not make repetition productive.";
+                            string loopResult = $"LOOP DETECTED: identical {toolName} call {signatureCount}× with nothing changed in between — the result won't change. Take an action that changes the page/screen first, or gather different evidence.";
                             // Durably record the dead end. A loop trip is a machine-certain signal that this
                             // exact approach does not work, and it must outlive this wake's context: without
-                            // it the next wake re-derives the same failure from scratch.
-                            parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
-                            {
-                                Key = $"repeated-call:{toolName}",
-                                Approach = DescribeCall(toolName, argsJson),
-                                Outcome = $"Repeated {signatureCount}× with an unchanged result; the convergence guard tripped.",
-                                Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
-                                Evidence = new List<ProjectEvidenceReference>
+                            // it the next wake re-derives the same failure from scratch. Pure observations are
+                            // exempt: "you inspected twice" is not an obstacle a future agent needs warning
+                            // about, and recording it buries the real dead ends under noise.
+                            if (!ProjectToolCallConvergence.IsReadOnlyObservation(toolName))
+                                parent.RuntimeState.RecordFailedApproach(projectID, new ProjectFailedApproach
                                 {
-                                    new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
-                                },
-                            });
+                                    Key = $"repeated-call:{toolName}",
+                                    Approach = DescribeCall(toolName, argsJson),
+                                    Outcome = $"Repeated {signatureCount}× with an unchanged result; the convergence guard tripped.",
+                                    Instead = "Gather different evidence or use a materially different strategy; identical inputs will keep producing this result.",
+                                    Evidence = new List<ProjectEvidenceReference>
+                                    {
+                                        new() { Kind = ProjectEvidenceKind.ToolResult, Reference = call.id ?? toolName },
+                                    },
+                                });
                             RecordRejectedResult(loopResult);
                             if (stuckTrips >= maxLoopTrips)
                             {
@@ -753,6 +761,7 @@ namespace Omnipotent.Services.Projects
                             result = new CommanderToolResult($"TOOL_EXECUTION_FAILED: {toolName}: {Trunc(ex.Message, 500)}")
                             { Succeeded = false };
                         }
+                        if (ProjectToolCallConvergence.IsWorldChanging(toolName)) worldEpoch++;
                         result = ProjectToolContract.AttachWarnings(unfolded.Warnings, result);
                         result = ProjectToolContract.AttachWarnings(contract, result);
                         if (!visionEnabled && result.Jpeg != null)
@@ -1135,6 +1144,27 @@ namespace Omnipotent.Services.Projects
         /// there is no in-memory state to corrupt, so clearing the stale marker and waking again is
         /// indistinguishable from any other wake. Never a hard kill.
         /// </summary>
+        /// <summary>
+        /// Delivers watchdog advice to a Commander that is already working, without cancelling it.
+        /// Cancelling a live wake discards everything it had in flight — a half-filled signup form,
+        /// an unread worker report — and the next wake pays to re-derive all of it. Advisory
+        /// diagnoses (understaffing, pacing) are exactly the kind that must never do that.
+        /// Returns false when no wake is live, in which case the caller should force-wake instead.
+        /// </summary>
+        public bool NudgeActiveWake(Project project, string advice)
+        {
+            lock (WakeGate(project.ProjectID))
+            {
+                var activeWakeID = parent.RuntimeState.Get(project.ProjectID).ActiveWakeLease?.WakeID
+                    ?? parent.Digests.GetDigest(project.ProjectID).ActiveWakeID;
+                if (string.IsNullOrWhiteSpace(activeWakeID)) return false;
+                var queue = agentSteerQueue.GetOrAdd(project.ProjectID, _ => new ConcurrentQueue<string>());
+                if (queue.Count >= MaxPendingTriggers) return true; // already saturated with advice
+                queue.Enqueue($"[watchdog] {advice}");
+                return true;
+            }
+        }
+
         public string ForceWake(Project project, string reason)
         {
             string trigger = $"[watchdog recovery] {reason}";

@@ -58,6 +58,10 @@ namespace Omnipotent.Services.OmniDefence
                 store = new OmniDefenceStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDatabaseFile));
                 await store.InitializeAsync();
 
+                // Audit rows are batched, so a shutdown between flushes would drop the
+                // tail of the log. Commit what is queued on the way out.
+                ServiceQuitRequest += () => { try { store.ShutdownAsync().GetAwaiter().GetResult(); } catch { } };
+
                 tracker = new IpThreatTracker(store);
                 await tracker.LoadAsync();
                 await BackfillProfileAssociationsAsync();
@@ -148,7 +152,10 @@ namespace Omnipotent.Services.OmniDefence
                     _ = EnrichIpRecordAsync(rec);
                     if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId)) _ = MaybeAlertAsync(rec, row);
                 }
-                await store.InsertRequestAsync(row);
+                // Queued, not inserted: this runs in the finally of every API request, so
+                // a per-row transaction here sets the write lock's arrival rate to the
+                // site's total traffic and every reader queues behind it.
+                store.EnqueueRequest(row);
             }
             catch (Exception ex)
             {

@@ -73,6 +73,7 @@ public static class ProjectToolFacade
             new[]
             {
                 ("get", "get_checkpoint"),
+                ("record_external_action", "record_external_action"),
                 ("*", "update_checkpoint"),
             }),
 
@@ -111,13 +112,14 @@ public static class ProjectToolFacade
             }),
 
         ("klivemail",
-            "Built-in catch-all @klive.dev email, driven in-process against the live KliveMail service: no HTTP call, auth header, password, reflection or DNS diagnosis.",
+            "Built-in @klive.dev email, driven in-process against the live KliveMail service: no HTTP call, auth header, password, reflection or DNS diagnosis. It both receives (catch-all) and sends (op:send, through the registered relay).",
             new[]
             {
                 ("create_mailbox", "klivemail_create_mailbox"),
                 ("list_messages", "klivemail_list_messages"),
                 ("get_message", "klivemail_get_message"),
                 ("wait_for_code", "klivemail_wait_for_code"),
+                ("send", "klivemail_send"),
             }),
 
         ("memory",
@@ -376,6 +378,8 @@ public static class ProjectToolFacade
         string allowed = string.Join(", ", group.Members.Select(m => m.Op).Distinct(StringComparer.Ordinal));
         string? op = args["op"]?.Type == JTokenType.String ? args["op"]!.Value<string>()?.Trim() : null;
 
+        UnwrapOpNamedPayload(args, op, warnings);
+
         if (string.IsNullOrEmpty(op))
         {
             var inferred = InferMember(group, args);
@@ -406,6 +410,128 @@ public static class ProjectToolFacade
             member.CanonicalOwnsOp ? member.Op : null);
     }
 
+    /// <summary>
+    /// Models routinely nest an operation's arguments under a property named after the operation —
+    /// <c>{op:"click", click:{x:1,y:2}}</c> or <c>{op:"find_text", find_text:"Sign in"}</c> — because
+    /// the folded union schema reads like a discriminated union. Flatten that shape instead of
+    /// rejecting it: the intent is unambiguous, and the rejection previously cost several turns and
+    /// counted toward the loop guard.
+    /// </summary>
+    private static void UnwrapOpNamedPayload(JObject args, string? op, List<string> warnings)
+    {
+        foreach (var property in args.Properties().ToList())
+        {
+            if (string.Equals(property.Name, "op", StringComparison.Ordinal)) continue;
+            // Only a property that names an operation is a wrapper. Without an explicit op, accept
+            // any property whose value is an object of scalars — the same serialization mistake.
+            bool namesTheOp = op != null && string.Equals(property.Name, op, StringComparison.OrdinalIgnoreCase);
+            if (!namesTheOp) continue;
+
+            if (property.Value is JObject nested)
+            {
+                property.Remove();
+                foreach (var inner in nested.Properties())
+                    if (args.Property(inner.Name, StringComparison.Ordinal) == null)
+                        args[inner.Name] = inner.Value.DeepClone();
+                warnings.Add($"Flattened '{property.Name}' — arguments for an op go at the top level, not nested under the op name.");
+            }
+            else if (property.Value.Type is JTokenType.String or JTokenType.Integer or JTokenType.Float
+                     or JTokenType.Boolean && !IsEmptyPlaceholder(property.Value))
+            {
+                // {op:"find_text", find_text:"x"} — the value belongs to the op's own primary
+                // argument. Resolved against the member schema in NormalizeArgumentsForMember.
+                args["__opValue"] = property.Value.DeepClone();
+                property.Remove();
+                warnings.Add($"Moved the value supplied as '{property.Name}' onto this op's own argument.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Interchangeable spellings that models pick between freely. Repaired only when the target
+    /// name is genuinely accepted by the selected operation and is not already present, so no
+    /// supplied value is ever overwritten or guessed at.
+    /// </summary>
+    private static readonly string[][] SynonymGroups =
+    {
+        new[] { "evidence", "evidenceReference" },
+        new[] { "text", "value" },
+        new[] { "url", "link", "href" },
+        new[] { "command", "script", "code" },
+        new[] { "max", "maxResults", "limit" },
+        new[] { "query", "q", "search" },
+        new[] { "path", "file", "filePath" },
+        new[] { "message", "note", "summary" },
+        new[] { "condition", "waitFor" },
+        new[] { "name", "title" },
+    };
+
+    /// <summary>
+    /// Last-chance repair for a property the selected operation does not declare: exact-name
+    /// casing, a known synonym, the op-value placeholder, or a single-character typo. Returns the
+    /// canonical name to rename to, or null when the property is genuinely wrong.
+    /// </summary>
+    private static string? ResolveMisnamedProperty(JObject schema, JObject args, string supplied)
+    {
+        if (schema["properties"] is not JObject properties) return null;
+        var names = properties.Properties().Select(p => p.Name)
+            .Where(n => !string.Equals(n, "op", StringComparison.Ordinal)).ToList();
+
+        bool Available(string name) =>
+            names.Contains(name, StringComparer.Ordinal) &&
+            args.Property(name, StringComparison.Ordinal) == null;
+
+        // 1. Casing only ("agentId" → "agentID", "maxitems" → "maxItems").
+        string? casing = names.FirstOrDefault(n =>
+            string.Equals(n, supplied, StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(n, supplied, StringComparison.Ordinal));
+        if (casing != null && args.Property(casing, StringComparison.Ordinal) == null) return casing;
+
+        // 2. The value lifted out of an op-named wrapper goes to the op's single required argument,
+        //    or failing that its single string argument.
+        if (string.Equals(supplied, "__opValue", StringComparison.Ordinal))
+        {
+            var required = ((schema["required"] as JArray)?.Values<string>() ?? Enumerable.Empty<string>())
+                .Where(r => !string.IsNullOrEmpty(r) && r != "op").Select(r => r!).Where(Available).ToList();
+            if (required.Count == 1) return required[0];
+            var strings = names.Where(n =>
+                (properties[n] as JObject)?["type"]?.Value<string>() == "string" && Available(n)).ToList();
+            return strings.Count == 1 ? strings[0] : null;
+        }
+
+        // 3. A known interchangeable spelling.
+        foreach (var synonyms in SynonymGroups)
+        {
+            if (!synonyms.Contains(supplied, StringComparer.OrdinalIgnoreCase)) continue;
+            string? target = synonyms.FirstOrDefault(s =>
+                !string.Equals(s, supplied, StringComparison.OrdinalIgnoreCase) && Available(s));
+            if (target != null) return target;
+        }
+
+        // 4. A single-character slip on a name long enough that the match cannot be coincidental.
+        if (supplied.Length >= 5)
+        {
+            var close = names.Where(n => Available(n) && EditDistanceAtMostOne(n, supplied)).ToList();
+            if (close.Count == 1) return close[0];
+        }
+        return null;
+    }
+
+    private static bool EditDistanceAtMostOne(string a, string b)
+    {
+        if (Math.Abs(a.Length - b.Length) > 1) return false;
+        int i = 0, j = 0, edits = 0;
+        while (i < a.Length && j < b.Length)
+        {
+            if (char.ToLowerInvariant(a[i]) == char.ToLowerInvariant(b[j])) { i++; j++; continue; }
+            if (++edits > 1) return false;
+            if (a.Length > b.Length) i++;
+            else if (a.Length < b.Length) j++;
+            else { i++; j++; }
+        }
+        return edits + (a.Length - i) + (b.Length - j) <= 1;
+    }
+
     /// <summary>Picks the only member whose argument contract the supplied arguments can satisfy.</summary>
     private static FoldMember? InferMember(FoldGroup group, JObject args)
     {
@@ -428,7 +554,25 @@ public static class ProjectToolFacade
                                      || IsEmptyPlaceholder(property.Value))) continue;
             candidates.Add(byTool.First());
         }
-        return candidates.Count == 1 ? candidates[0] : null;
+        if (candidates.Count == 1) return candidates[0];
+        if (candidates.Count == 0) return null;
+
+        // Several operations accept the same arguments (desktop key / key_down / key_up all take
+        // 'key'). Naming one of them as a property is the model saying which it meant, and the
+        // plain form is the overwhelmingly common intent otherwise. Guessing here beats refusing:
+        // the alternative was a bare "requires 'op'" rejection that the model then retried verbatim.
+        var named = candidates.FirstOrDefault(c =>
+            supplied.Any(name => string.Equals(name, c.Op, StringComparison.OrdinalIgnoreCase)));
+        if (named != null) return named;
+
+        var shortest = candidates
+            .OrderBy(c => c.Op.Count(ch => ch == '_'))
+            .ThenBy(c => c.Op.Length)
+            .ToList();
+        bool unambiguous = shortest.Count == 1
+            || shortest[0].Op.Length < shortest[1].Op.Length
+            || shortest[0].Op.Count(ch => ch == '_') < shortest[1].Op.Count(ch => ch == '_');
+        return unambiguous ? shortest[0] : null;
     }
 
     /// <summary>
@@ -459,6 +603,19 @@ public static class ProjectToolFacade
         {
             if (SchemaAcceptsProperty(schema, property.Name)) continue;
 
+            // Repair before rejecting. Casing slips, interchangeable spellings and single-character
+            // typos are unambiguous once resolved against this op's own schema, and a rejection here
+            // costs a full model turn plus a step toward the convergence guard.
+            string? repaired = ResolveMisnamedProperty(schema, canonicalArgs, property.Name);
+            if (repaired != null)
+            {
+                canonicalArgs[repaired] = property.Value.DeepClone();
+                property.Remove();
+                if (!string.Equals(property.Name, "__opValue", StringComparison.Ordinal))
+                    warnings.Add($"Read '{property.Name}' as '{repaired}' for '{group.Name}' op '{member.Op}'; use '{repaired}'.");
+                continue;
+            }
+
             // The outer op is the discriminator. Any real field belonging only to another member
             // came from the provider's saturated union payload and cannot apply to this operation.
             // Unknown names still receive the normal typo/error treatment for every value.
@@ -472,10 +629,14 @@ public static class ProjectToolFacade
             var names = (schema["properties"] as JObject)?.Properties()
                 .Select(p => p.Name).Where(name => name != "op").ToList() ?? new List<string>();
             string allowed = names.Count == 0 ? "none" : string.Join(", ", names);
+            string message = $"Argument '{property.Name}' does not apply to '{group.Name}' op '{member.Op}'. Allowed arguments: {allowed}.";
+            // Screen pixels versus page elements is the single most repeated confusion in the logs,
+            // and the generic message left the model guessing which tool it wanted.
+            if (property.Name is "x" or "y" && group.Name.Contains("browser", StringComparison.OrdinalIgnoreCase))
+                message += " Browser ops target elements, not pixels: pass a ref/name/text/css locator here, " +
+                           "or use the desktop click tool if you really do mean screen coordinates.";
             return ProjectToolUnfoldResult.Fail(new ProjectToolContractError(
-                ProjectToolContract.UnknownProperty,
-                "$." + property.Name,
-                $"Argument '{property.Name}' does not apply to '{group.Name}' op '{member.Op}'. Allowed arguments: {allowed}."));
+                ProjectToolContract.UnknownProperty, "$." + property.Name, message));
         }
 
         if (dropped.Count > 0)

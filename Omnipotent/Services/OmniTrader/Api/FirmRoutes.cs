@@ -29,6 +29,46 @@ namespace Omnipotent.Services.OmniTrader.Api
     /// </summary>
     public sealed class FirmRoutes
     {
+        /// <summary>
+        /// How far behind wall-clock a firm figure is allowed to be.
+        ///
+        /// Firm reads mix two kinds of time dependence the response cache cannot see on
+        /// its own: sliding windows (<c>from = now - 30d</c>) and clock-derived flags
+        /// (<c>LondonOpen</c>). Neither is a stored version — no write happens when the
+        /// window slides or the session closes — so a cached entry could stay pinned to
+        /// a window it no longer describes. Anchoring these fills to a clock bucket makes
+        /// them self-invalidating, which is what lets them be cached at all.
+        /// </summary>
+        private static readonly TimeSpan FirmFreshness = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// Wall-clock for a firm read. Returns the true instant of computation — a cached
+        /// body therefore reports when it was actually built, not when it was served, so
+        /// an <c>AsOfUtc</c> never claims to be fresher than the figures beneath it.
+        /// </summary>
+        private static DateTime FirmNowUtc()
+        {
+            KliveAPI.Caching.CacheDeps.NoteTimeBucket(FirmFreshness);
+            return DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// Market-session flags, stamped with the instant they were evaluated. Whether
+        /// London is open is a pure function of the clock, so it carries its own
+        /// <c>UtcNow</c> rather than being read as current by whoever receives it.
+        /// </summary>
+        private static object SessionStamp()
+        {
+            DateTime now = FirmNowUtc();
+            return new
+            {
+                UtcNow = now,
+                // Crypto never closes; the equity/index session drives the IG side.
+                CryptoOpen = true,
+                LondonOpen = IsLondonSessionOpen(now)
+            };
+        }
+
         private readonly OmniTrader parent;
         private FirmContext Firm => parent.Firm;
 
@@ -64,12 +104,13 @@ namespace Omnipotent.Services.OmniTrader.Api
                 // The command centre needs a baseline, not just a level: a firm value with no
                 // reference point cannot be read as good, bad or unremarkable.
                 int trendDays = ParseInt(req.userParameters.Get("trendDays"), 30, 1, 365);
+                DateTime asOf = FirmNowUtc();
                 var trend = BuildValueTrend(
-                    await Firm.Portfolio.ValueSeriesAsync(DateTime.UtcNow.AddDays(-trendDays)), trendDays);
+                    await Firm.Portfolio.ValueSeriesAsync(asOf.AddDays(-trendDays)), trendDays);
 
                 await Json(req, new
                 {
-                    AsOfUtc = DateTime.UtcNow,
+                    AsOfUtc = asOf,
                     // Every figure here is real money. Simulated totals travel in their own block so
                     // the two can be shown side by side but never accidentally added together.
                     Portfolio = new
@@ -205,13 +246,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Interval = interval.ToString(),
                     Rows = rows,
                     Breadth = breadth,
-                    Session = new
-                    {
-                        UtcNow = DateTime.UtcNow,
-                        // Crypto never closes; the equity/index session drives the IG side.
-                        CryptoOpen = true,
-                        LondonOpen = IsLondonSessionOpen(DateTime.UtcNow)
-                    }
+                    Session = SessionStamp()
                 });
             });
 
@@ -538,7 +573,9 @@ namespace Omnipotent.Services.OmniTrader.Api
             // be told apart from cash arriving.
             await Get("/api/omnitrader/firm/portfolio/value-series", async req =>
             {
-                var from = ParseUtc(req.userParameters.Get("from")) ?? DateTime.UtcNow.AddDays(-30);
+                // An explicit `from` is a fixed window and needs no clock anchor; the
+                // default one slides, so it takes the bucket (see FirmNowUtc).
+                var from = ParseUtc(req.userParameters.Get("from")) ?? FirmNowUtc().AddDays(-30);
                 var series = await Firm.Portfolio.ValueSeriesAsync(from);
                 await Json(req, new
                 {
@@ -562,7 +599,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // simulated ones are not money at all.
             await Get("/api/omnitrader/firm/portfolio/account-balances", async req =>
             {
-                var from = ParseUtc(req.userParameters.Get("from")) ?? DateTime.UtcNow.AddDays(-30);
+                var from = ParseUtc(req.userParameters.Get("from")) ?? FirmNowUtc().AddDays(-30);
                 var series = await Firm.Accounts.SnapshotSeriesAsync(from);
                 bool includeSimulated = req.userParameters.Get("includeSimulated") == "true";
                 await Json(req, series

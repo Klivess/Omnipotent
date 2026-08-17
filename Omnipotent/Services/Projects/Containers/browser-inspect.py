@@ -997,6 +997,47 @@ def collect_world(session, tab, world, query, limit, only_matches):
     }
 
 
+def nearby_controls(tab, worlds, locator, limit=8):
+    """The visible controls most similar to what the agent was looking for."""
+    wanted = " ".join(str(locator.get(key) or "") for key in
+                      ("name", "text", "label", "placeholder", "testId")).strip().lower()
+    wanted_role = str(locator.get("role") or "").strip().lower()
+    wanted_tag = str(locator.get("tag") or "").strip().lower()
+    found = []
+    for world in worlds:
+        try:
+            result = collect_world(world["session"], tab, world, {}, 40, False)
+        except Exception:
+            continue
+        found.extend(result["items"])
+        if len(found) >= 120:
+            break
+
+    def score(item):
+        label = " ".join(str(item.get(key) or "") for key in
+                         ("name", "text", "label", "placeholder", "testId")).lower()
+        points = 0
+        if wanted:
+            for token in {t for t in re.split(r"\W+", wanted) if len(t) > 2}:
+                if token in label:
+                    points += 3
+        if wanted_role and str(item.get("role") or "").lower() == wanted_role:
+            points += 2
+        if wanted_tag and str(item.get("tag") or "").lower() == wanted_tag:
+            points += 2
+        if item.get("visible"):
+            points += 1
+        if item.get("inViewport"):
+            points += 1
+        return points
+
+    ranked = sorted(found, key=score, reverse=True)[:limit]
+    return [{key: item.get(key) for key in
+             ("ref", "role", "tag", "name", "text", "label", "placeholder", "visible", "inViewport", "disabled")
+             if item.get(key) is not None}
+            for item in ranked]
+
+
 def inspect_controls(tab, index, tabs, limit):
     session = session_for(tab)
     worlds = []
@@ -1104,9 +1145,14 @@ def select_control(tab, worlds, payload, decoded_ref=None):
         total += result["total"]
         matches.extend((world, item) for item in result["items"])
     if total == 0:
+        # A bare "not found" costs a re-inspect round trip every time, and agents answer it by
+        # guessing another locator against the same unseen page. Return what IS on the page so the
+        # very next call can target a real control.
         return None, None, error_result(
-            "not-found", "No element matched the structured locator.",
-            locator=locator)
+            "not-found",
+            "No element matched the structured locator. The page's closest visible controls are "
+            "listed in 'nearby' — target one of those by its ref instead of guessing another locator.",
+            locator=locator, nearby=nearby_controls(tab, worlds, locator))
     candidates = [item for _, item in matches[:8]]
     if not occurrence_supplied and total > 1:
         return None, None, error_result(
@@ -1264,6 +1310,125 @@ def selected_geometry(top_session, world):
 
 def insert_text(session, text):
     session.call("Input." + "insertText", {"text": text}, timeout=30)
+
+
+# A programmatic value assignment is silently discarded by some frameworks and by fields that
+# re-render on focus, so every text entry is read back and re-entered as real input events before
+# it is reported as done. A field the agent believes it filled but did not is the single most
+# expensive failure in a signup flow: it is only discovered after submit, by which point the form
+# has usually reset.
+FILL_APPLY_JS = r"""
+  const text=%s, tag=el.tagName.toLowerCase(), type=(el.getAttribute('type')||'').toLowerCase();
+  if(tag==='input'&&type==='file')return {error:'Use computer_upload_file for file inputs.'};
+  if(!(tag==='input'||tag==='textarea'||el.isContentEditable))return {error:'The target is not editable.'};
+  if(el.disabled)return {error:'The field is disabled. Satisfy whatever enables it (an earlier field, a checkbox, a step) before filling.'};
+  if(el.readOnly)return {error:'The field is read-only. It is probably driven by a picker or an overlay widget: open that control and choose the value instead of typing.'};
+  el.focus({preventScroll:true});
+  if(el.isContentEditable){el.textContent=text;}
+  else {
+    const proto=tag==='textarea'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+    const setter=Object.getOwnPropertyDescriptor(proto,'value').set; setter.call(el,text);
+  }
+  el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));
+  el.dispatchEvent(new Event('change',{bubbles:true}));
+  return {applied:true,type:type,tag:tag,actual:String(el.isContentEditable?el.textContent:el.value||'')};
+"""
+
+FILL_SELECT_ALL_JS = """
+  el.focus({preventScroll:true});
+  if(el.isContentEditable){
+    const range=document.createRange(); range.selectNodeContents(el);
+    const selection=getSelection(); selection.removeAllRanges(); selection.addRange(range);
+  } else if(typeof el.setSelectionRange==='function'){
+    try{el.setSelectionRange(0,String(el.value||'').length);}catch(e){if(el.select)el.select();}
+  } else if(el.select){el.select();}
+  return {selected:true};
+"""
+
+FILL_READBACK_JS = """
+  return {actual:String(el.isContentEditable?el.textContent:el.value||''),
+          type:(el.getAttribute('type')||'').toLowerCase(),
+          focused:document.activeElement===el};
+"""
+
+
+def entry_is_secret(payload, field_type):
+    return bool(payload.get("secret")) or field_type == "password"
+
+
+def describe_text(text, secret):
+    """Never echo a credential back to the model; length is enough to diagnose a bad fill."""
+    if secret:
+        return None
+    return text[:200]
+
+
+def fill_and_verify(session, world, text, payload):
+    applied = selected_eval(world, FILL_APPLY_JS % json.dumps(text, ensure_ascii=False))
+    if applied.get("error") or applied.get("missing"):
+        return applied
+    field_type = str(applied.get("type") or "")
+    actual = applied.get("actual") if isinstance(applied.get("actual"), str) else ""
+    mechanism = "value-setter"
+    if actual != text:
+        # Controlled React/Vue inputs reject the assignment and restore their own state. Real
+        # CDP text input is indistinguishable from a human typing and survives that.
+        selected_eval(world, FILL_SELECT_ALL_JS)
+        try:
+            insert_text(session, text)
+        except Exception:
+            pass
+        time.sleep(0.08)
+        readback = selected_eval(world, FILL_READBACK_JS)
+        if isinstance(readback.get("actual"), str):
+            actual = readback["actual"]
+        if readback.get("type"):
+            field_type = str(readback["type"])
+        mechanism = "insert-text"
+    secret = entry_is_secret(payload, field_type)
+    verified = actual == text
+    data = {"filled": verified, "verified": verified, "mechanism": mechanism,
+            "expectedLength": len(text), "actualLength": len(actual)}
+    if not secret:
+        data["actual"] = actual[:200]
+    if not verified:
+        data["error"] = (
+            "The field did not keep the value after two entry mechanisms (expected %d characters, "
+            "field holds %d). The page is rewriting or masking input: check for an input mask, a "
+            "maxlength, an overlay stealing focus, or a widget that wants clicks instead of typing. "
+            "Do NOT submit this form as if it were filled." % (len(text), len(actual)))
+    return data
+
+
+def type_and_verify(session, world, text, payload):
+    focused = selected_eval(
+        world,
+        "if(!(el.matches('input,textarea')||el.isContentEditable))"
+        "return {error:'The target is not editable.'};"
+        "if(el.disabled||el.readOnly)return {error:'The field is disabled or read-only.'};"
+        "el.focus({preventScroll:true});"
+        "return {focused:document.activeElement===el,before:String(el.isContentEditable?el.textContent:el.value||''),"
+        "type:(el.getAttribute('type')||'').toLowerCase()};")
+    if focused.get("error") or focused.get("missing"):
+        return focused
+    before = focused.get("before") if isinstance(focused.get("before"), str) else ""
+    insert_text(session, text)
+    time.sleep(0.08)
+    readback = selected_eval(world, FILL_READBACK_JS)
+    actual = readback.get("actual") if isinstance(readback.get("actual"), str) else ""
+    field_type = str(readback.get("type") or focused.get("type") or "")
+    # type() appends at the caret rather than replacing, so growth by the typed text is the check.
+    verified = text in actual and len(actual) >= len(before)
+    data = {"typed": verified, "verified": verified,
+            "expectedLength": len(text), "actualLength": len(actual)}
+    if not entry_is_secret(payload, field_type):
+        data["actual"] = actual[:200]
+    if not verified:
+        data["error"] = (
+            "The typed text did not land in the field (field holds %d characters, %d were typed). "
+            "Focus was probably stolen by an overlay or the field rejects keystrokes. Re-inspect, "
+            "dismiss anything covering the field, and prefer op=fill." % (len(actual), len(text)))
+    return data
 
 
 KEY_DATA = {
@@ -1661,6 +1826,235 @@ def add_control_state(result, session, tab, index, before_tab_ids):
     return result
 
 
+# Cookie walls, newsletter modals and app-install interstitials sit between the agent and every
+# control underneath them. Reporting "intercepted" and stopping turned a two-second nuisance into a
+# dead end, so an interception is cleared and the action retried before it is ever called a failure.
+DISMISS_LABELS_JS = r"""
+  const ACCEPT = ['accept all','accept all cookies','allow all','accept cookies','i accept','i agree',
+    'agree and continue','agree','accept','got it','ok','okay','understood','continue','close',
+    'dismiss','no thanks','not now','maybe later','reject all','decline','skip','x'];
+  const norm = t => String(t == null ? '' : t).replace(/\s+/g, ' ').trim().toLowerCase();
+  const labelOf = node => norm(node.getAttribute('aria-label') || node.getAttribute('title') || node.textContent || '');
+  const clickableIn = root => {
+    const candidates = [...root.querySelectorAll('button,[role="button"],a[href="#"],a:not([href]),[class*="close"],[id*="close"],input[type="button"],input[type="submit"]')];
+    for (const wanted of ACCEPT) {
+      for (const node of candidates) {
+        const text = labelOf(node);
+        if (!text) continue;
+        if (text === wanted || (wanted.length > 3 && text.includes(wanted))) {
+          const rect = node.getBoundingClientRect();
+          if (rect.width > 2 && rect.height > 2) return {node: node, label: text};
+        }
+      }
+    }
+    return null;
+  };
+  const unlockScroll = () => {
+    for (const node of [document.documentElement, document.body]) {
+      if (!node) continue;
+      const style = getComputedStyle(node);
+      if (style.overflow === 'hidden' || style.position === 'fixed') {
+        node.style.setProperty('overflow', 'auto', 'important');
+        if (style.position === 'fixed') node.style.setProperty('position', 'static', 'important');
+      }
+    }
+  };
+"""
+
+INTERCEPTOR_DISMISS_JS = DISMISS_LABELS_JS + r"""
+  const rect = el.getBoundingClientRect();
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  let hit = document.elementFromPoint(x, y);
+  if (!hit || el === hit || el.contains(hit) || hit.contains(el)) return {needed: false};
+  // Climb to the outermost wrapper that still does not contain the target: hiding a mid-level
+  // child of a cookie wall usually leaves its backdrop in place.
+  let blocker = hit;
+  while (blocker.parentElement && blocker.parentElement !== document.body
+         && blocker.parentElement !== document.documentElement
+         && !blocker.parentElement.contains(el)) {
+    blocker = blocker.parentElement;
+  }
+  if (blocker.contains(el) || blocker === document.body || blocker === document.documentElement)
+    return {needed: true, dismissed: false, reason: 'The blocker could not be isolated from the target.'};
+  const describe = node => (node.tagName || '').toLowerCase()
+    + (node.id ? '#' + node.id : '')
+    + (typeof node.className === 'string' && node.className ? '.' + node.className.trim().split(/\s+/)[0] : '');
+  const description = describe(blocker);
+  const button = clickableIn(blocker);
+  if (button) {
+    button.node.click();
+    unlockScroll();
+    return {needed: true, dismissed: true, method: 'clicked', label: button.label, blocker: description};
+  }
+  blocker.style.setProperty('display', 'none', 'important');
+  unlockScroll();
+  return {needed: true, dismissed: true, method: 'hidden', blocker: description};
+"""
+
+OVERLAY_SWEEP_JS = DISMISS_LABELS_JS + r"""
+  const CONSENT = /cookie|consent|gdpr|privacy|subscribe|newsletter|sign ?up for|notification|app is better|open in app|paywall|survey/i;
+  const viewportArea = innerWidth * innerHeight;
+  const handled = [];
+  const nodes = [...document.querySelectorAll('body *')].filter(node => {
+    const style = getComputedStyle(node);
+    if (style.position !== 'fixed' && style.position !== 'sticky') return false;
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const rect = node.getBoundingClientRect();
+    if (rect.width < 40 || rect.height < 24) return false;
+    const area = rect.width * rect.height;
+    const covering = area > viewportArea * 0.12;
+    const dialog = node.getAttribute('role') === 'dialog' || node.getAttribute('aria-modal') === 'true';
+    const named = CONSENT.test((node.id || '') + ' ' + (typeof node.className === 'string' ? node.className : ''))
+      || CONSENT.test(String(node.textContent || '').slice(0, 400));
+    return (covering || dialog) && named;
+  }).slice(0, 6);
+  for (const node of nodes) {
+    if (!node.isConnected) continue;
+    const description = (node.tagName || '').toLowerCase() + (node.id ? '#' + node.id : '');
+    const button = clickableIn(node);
+    if (button) { button.node.click(); handled.push({blocker: description, method: 'clicked', label: button.label}); }
+    else { node.style.setProperty('display', 'none', 'important'); handled.push({blocker: description, method: 'hidden'}); }
+  }
+  unlockScroll();
+  return {dismissed: handled.length, overlays: handled};
+"""
+
+
+def main_world_eval(session, expression, timeout=20):
+    """Challenge widgets live in the page's own world: their sitekeys, response fields and
+    completion callbacks are page globals that an isolated world cannot see or invoke."""
+    outcome = session.call("Runtime.evaluate", {
+        "expression": expression, "returnByValue": True, "awaitPromise": True,
+        "userGesture": True}, timeout=timeout)
+    if outcome.get("exceptionDetails"):
+        details = outcome["exceptionDetails"]
+        raise RuntimeError(details.get("text")
+                           or ((details.get("exception") or {}).get("description"))
+                           or "Runtime.evaluate failed")
+    value = (outcome.get("result") or {}).get("value")
+    return value if isinstance(value, dict) else {}
+
+
+CHALLENGE_PROBE_JS = r"""
+(() => {
+  const visible = x => {
+    const r = x.getBoundingClientRect(), s = getComputedStyle(x);
+    return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
+  };
+  const param = (url, name) => { try { return new URL(url, location.href).searchParams.get(name); } catch (e) { return null; } };
+  const widgets = [];
+  const push = w => { if (w.sitekey && !widgets.some(x => x.sitekey === w.sitekey && x.provider === w.provider)) widgets.push(w); };
+  for (const frame of document.querySelectorAll('iframe[src]')) {
+    const src = frame.getAttribute('src') || '';
+    if (/recaptcha\/(api2|enterprise)\/(anchor|bframe)/.test(src)) {
+      push({provider: /enterprise/.test(src) ? 'recaptcha_enterprise' : 'recaptcha_v2',
+            sitekey: param(src, 'k'), invisible: (param(src, 'size') || '') === 'invisible',
+            visible: visible(frame), source: 'iframe'});
+    } else if (/hcaptcha\.com\/captcha/.test(src)) {
+      push({provider: 'hcaptcha', sitekey: param(src, 'sitekey'),
+            invisible: false, visible: visible(frame), source: 'iframe'});
+    } else if (/challenges\.cloudflare\.com/.test(src)) {
+      push({provider: 'turnstile', sitekey: param(src, 'sitekey'),
+            invisible: false, visible: visible(frame), source: 'iframe'});
+    }
+  }
+  const attributed = [
+    ['.g-recaptcha', 'recaptcha_v2'], ['.h-captcha', 'hcaptcha'],
+    ['.cf-turnstile', 'turnstile'], ['[data-sitekey]', null]];
+  for (const [selector, provider] of attributed) {
+    for (const node of document.querySelectorAll(selector)) {
+      const key = node.getAttribute('data-sitekey');
+      if (!key) continue;
+      let kind = provider;
+      if (!kind) {
+        const cls = node.className && node.className.baseVal !== undefined ? node.className.baseVal : String(node.className || '');
+        kind = /h-captcha|hcaptcha/i.test(cls) ? 'hcaptcha'
+             : /turnstile/i.test(cls) ? 'turnstile' : 'recaptcha_v2';
+      }
+      push({provider: kind, sitekey: key,
+            invisible: (node.getAttribute('data-size') || '') === 'invisible',
+            visible: visible(node), source: 'attribute',
+            action: node.getAttribute('data-action') || null});
+    }
+  }
+  const text = (document.body ? document.body.innerText || '' : '').slice(0, 4000).toLowerCase();
+  const title = (document.title || '').toLowerCase();
+  // A Cloudflare/Akamai interstitial has no token to buy: it clears itself, or it does not.
+  const interstitial = /just a moment|checking your browser|verifying you are human|attention required/.test(title + ' ' + text)
+    && !widgets.length;
+  const responseFields = document.querySelectorAll(
+    'textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"],input[name="cf-turnstile-response"]').length;
+  return {
+    detected: widgets.length > 0 || interstitial,
+    widgets: widgets.slice(0, 5),
+    interstitial: interstitial,
+    responseFields: responseFields,
+    url: location.href,
+    title: (document.title || '').slice(0, 200),
+  };
+})()
+"""
+
+CHALLENGE_INJECT_JS = r"""
+(() => {
+  const token = %s, provider = %s;
+  let fields = 0;
+  const names = provider === 'hcaptcha'
+    ? ['textarea[name="h-captcha-response"]', 'textarea[name="g-recaptcha-response"]', 'input[name="h-captcha-response"]']
+    : provider === 'turnstile'
+      ? ['input[name="cf-turnstile-response"]', 'textarea[name="cf-turnstile-response"]', 'input[name="cf_challenge_response"]']
+      : ['textarea[name="g-recaptcha-response"]', 'textarea#g-recaptcha-response', 'input[name="g-recaptcha-response"]'];
+  const seen = new Set();
+  for (const selector of names) {
+    for (const node of document.querySelectorAll(selector)) {
+      if (seen.has(node)) continue;
+      seen.add(node);
+      node.value = token;
+      node.dispatchEvent(new Event('input', {bubbles: true}));
+      node.dispatchEvent(new Event('change', {bubbles: true}));
+      fields++;
+    }
+  }
+  if (!fields) {
+    // Some widgets create their response field only on completion; make one the form can post.
+    const form = document.querySelector('form');
+    if (form) {
+      const created = document.createElement('textarea');
+      created.name = provider === 'hcaptcha' ? 'h-captcha-response'
+                   : provider === 'turnstile' ? 'cf-turnstile-response' : 'g-recaptcha-response';
+      created.style.display = 'none';
+      created.value = token;
+      form.appendChild(created);
+      fields++;
+    }
+  }
+  // The page usually acts on its completion callback, not on the field. Invoke every callback the
+  // widget registered so the site behaves exactly as if the human had passed the challenge.
+  let callbacks = 0;
+  const invoke = fn => { try { fn(token); callbacks++; } catch (e) {} };
+  try {
+    const cfg = window.___grecaptcha_cfg;
+    if (cfg && cfg.clients) {
+      const walk = (node, depth) => {
+        if (!node || depth > 6) return;
+        for (const key of Object.keys(node)) {
+          let value;
+          try { value = node[key]; } catch (e) { continue; }
+          if (typeof value === 'function' && /callback/i.test(key)) invoke(value);
+          else if (value && typeof value === 'object') walk(value, depth + 1);
+        }
+      };
+      for (const id of Object.keys(cfg.clients)) walk(cfg.clients[id], 0);
+    }
+  } catch (e) {}
+  for (const name of ['captchaCallback', 'onCaptchaSuccess', 'hcaptchaCallback', 'turnstileCallback', 'onTurnstileSuccess']) {
+    if (typeof window[name] === 'function') invoke(window[name]);
+  }
+  return {injected: fields, callbacks: callbacks, url: location.href};
+})()
+"""
+
+
 def do_control(payload):
     op = str(payload.get("op") or "").strip().lower()
     aliases = {
@@ -1672,6 +2066,7 @@ def do_control(payload):
         "locate", "click", "fill", "type", "select", "check", "uncheck", "focus",
         "hover", "scroll_into_view", "scroll", "press", "wait", "back", "forward",
         "reload", "activate_tab", "close_tab", "script",
+        "challenge_probe", "challenge_inject", "dismiss_overlays",
     }
     if op not in allowed:
         return error_result(
@@ -1781,12 +2176,65 @@ def do_control(payload):
             waited["op"] = op
             return add_control_state(waited, session, tab, index, before_tab_ids)
 
+        if op == "challenge_probe":
+            try:
+                probe = main_world_eval(session, CHALLENGE_PROBE_JS)
+            except Exception as ex:
+                result = error_result("probe-failed", bounded_text(ex, 800))
+                return add_control_state(result, session, tab, index, before_tab_ids)
+            probe["ok"] = True
+            probe["op"] = op
+            return add_control_state(probe, session, tab, index, before_tab_ids)
+
+        if op == "challenge_inject":
+            token = payload.get("value") if isinstance(payload.get("value"), str) else ""
+            provider = str(payload.get("provider") or "recaptcha_v2").strip().lower()
+            if not token:
+                result = error_result("missing-token", "challenge_inject requires the solved token in 'value'.")
+                return add_control_state(result, session, tab, index, before_tab_ids)
+            try:
+                injected = main_world_eval(session, CHALLENGE_INJECT_JS % (
+                    json.dumps(token, ensure_ascii=False), json.dumps(provider)))
+            except Exception as ex:
+                result = error_result("inject-failed", bounded_text(ex, 800))
+                return add_control_state(result, session, tab, index, before_tab_ids)
+            if not injected.get("injected") and not injected.get("callbacks"):
+                result = error_result(
+                    "inject-nowhere",
+                    "The solved token had no response field or callback to land in. The page may "
+                    "render its widget in a frame that is not loaded yet, or the challenge already cleared.")
+                return add_control_state(result, session, tab, index, before_tab_ids)
+            time.sleep(0.25)
+            injected["ok"] = True
+            injected["op"] = op
+            return add_control_state(injected, session, tab, index, before_tab_ids)
+
         worlds, world_warnings = isolated_worlds(session, tab)
         if not worlds:
             result = error_result(
                 "no-frame", "No isolated frame world is available for structured control.",
                 warnings=world_warnings[:20])
             return add_control_state(result, session, tab, index, before_tab_ids)
+
+        if op == "dismiss_overlays":
+            swept = {"dismissed": 0, "overlays": []}
+            for world_candidate in worlds:
+                try:
+                    outcome = world_candidate["session"].evaluate_in_context(
+                        "(() => { " + OVERLAY_SWEEP_JS + " })()",
+                        world_candidate.get("contextId"), timeout=15, return_by_value=True).get("value")
+                except Exception:
+                    continue
+                if isinstance(outcome, dict) and outcome.get("dismissed"):
+                    swept["dismissed"] += int(outcome.get("dismissed") or 0)
+                    swept["overlays"].extend(outcome.get("overlays") or [])
+            swept["ok"] = True
+            swept["op"] = op
+            if not swept["dismissed"]:
+                swept["note"] = ("No consent or interstitial overlay was found. If a control is still "
+                                 "unreachable it is not an overlay: re-inspect mode=controls.")
+            time.sleep(0.2)
+            return add_control_state(swept, session, tab, index, before_tab_ids)
 
         if op == "script":
             result = run_guarded_script(payload, worlds)
@@ -1881,21 +2329,7 @@ def do_control(payload):
                 result = error_result("text-too-large", "fill text is limited to 100,000 characters.")
                 result["op"] = op
                 return add_control_state(result, session, tab, index, before_tab_ids)
-            encoded = json.dumps(text, ensure_ascii=False)
-            action_data = selected_eval(world, r"""
-              const text=%s, tag=el.tagName.toLowerCase(), type=(el.getAttribute('type')||'').toLowerCase();
-              if(tag==='input'&&type==='file')return {error:'Use computer_upload_file for file inputs.'};
-              if(!(tag==='input'||tag==='textarea'||el.isContentEditable))return {error:'The target is not editable.'};
-              el.focus({preventScroll:true});
-              if(el.isContentEditable){el.textContent=text;}
-              else {
-                const proto=tag==='textarea'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
-                const setter=Object.getOwnPropertyDescriptor(proto,'value').set; setter.call(el,text);
-              }
-              el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:null}));
-              el.dispatchEvent(new Event('change',{bubbles:true}));
-              return {filled:true};
-            """ % encoded)
+            action_data = fill_and_verify(session, world, text, payload)
         elif op == "type":
             text = payload.get("value") if "value" in payload else payload.get("text", "")
             if not isinstance(text, str):
@@ -1904,15 +2338,7 @@ def do_control(payload):
                 result = error_result("text-too-large", "type text is limited to 100,000 characters.")
                 result["op"] = op
                 return add_control_state(result, session, tab, index, before_tab_ids)
-            focused = selected_eval(world,
-                                    "if(!(el.matches('input,textarea')||el.isContentEditable))"
-                                    "return {error:'The target is not editable.'};"
-                                    "el.focus({preventScroll:true});return {focused:true};")
-            if not focused.get("error"):
-                insert_text(session, text)
-            action_data = focused
-            if not action_data.get("error"):
-                action_data["typed"] = True
+            action_data = type_and_verify(session, world, text, payload)
         elif op == "select":
             option_index = payload.get("optionIndex")
             option_text = payload.get("optionText")
@@ -2076,19 +2502,33 @@ def do_control(payload):
                 action_data = {"pressed": True}
         elif op == "click":
             geometry = selected_geometry(session, world)
+            cleared = None
+            if geometry and geometry.get("intercepted") and payload.get("dismissOverlays") is not False:
+                # Clear whatever is on top and re-measure before calling this a failure.
+                cleared = selected_eval(world, INTERCEPTOR_DISMISS_JS)
+                if cleared.get("dismissed"):
+                    time.sleep(0.25)
+                    geometry = selected_geometry(session, world)
             if geometry and geometry.get("intercepted"):
                 result = error_result(
-                    "intercepted", "The click point is covered by another element.",
-                    control=item, geometry=geometry)
+                    "intercepted",
+                    "The click point is covered by another element and the cover could not be cleared "
+                    "automatically. Inspect mode=controls, close the overlay through its own control, "
+                    "or target the overlay itself.",
+                    control=item, geometry=geometry,
+                    detail={"dismissAttempt": cleared} if cleared else None)
                 result["op"] = op
                 return add_control_state(result, session, tab, index, before_tab_ids)
             click_geometry(
                 session, geometry, str(payload.get("button") or "left").lower(),
                 max(1, min(2, int(payload.get("clicks") or 1))))
             action_data = {"clicked": True, "geometry": geometry}
+            if cleared and cleared.get("dismissed"):
+                action_data["clearedOverlay"] = cleared
 
         if action_data.get("error"):
-            result = error_result("action-not-supported", action_data.get("error"),
+            code = "not-applied" if action_data.get("verified") is False else "action-not-supported"
+            result = error_result(code, action_data.get("error"),
                                   control=item, detail={
                                       key: value for key, value in action_data.items() if key != "error"})
             result["op"] = op

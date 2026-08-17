@@ -210,6 +210,25 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>
+        /// Records which milestones an agent — including the Commander — is personally working.
+        /// Ownership is what makes a milestone "staffed"; without a way to record that the Commander
+        /// took something itself, indivisible work stayed permanently unowned and the staffing
+        /// heuristic reported an under-staffed project forever.
+        /// </summary>
+        public bool SetActiveMilestones(string projectID, string agentID, IEnumerable<string> milestoneIDs)
+        {
+            lock (LockFor(projectID))
+            {
+                var agents = LoadLocked(projectID);
+                var agent = agents.FirstOrDefault(a => a.AgentID == agentID && !a.Retired);
+                if (agent == null) return false;
+                agent.ActiveMilestoneIDs = milestoneIDs.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().ToList();
+                SaveLocked(projectID, agents);
+                return true;
+            }
+        }
+
         public bool AssignObjective(string projectID, string agentID, string objective,
             IEnumerable<string> milestoneIDs, IEnumerable<string>? deliverablePaths = null,
             ProjectAgentMissionKind? missionKind = null)

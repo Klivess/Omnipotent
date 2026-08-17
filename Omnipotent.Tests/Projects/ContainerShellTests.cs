@@ -234,13 +234,16 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
-        public void BrowserInspection_HumanChallengeIsElevatedBeforeAgentRetries()
+        public void BrowserInspection_ChallengeIsElevatedWithTheToolThatClearsIt()
         {
+            // A captcha used to end the run on a human. The banner must now name the op that solves
+            // it, or the agent falls back to request_human and the project stalls for hours.
             string result = ContainerToolAdapter.AnnotateInspection(
                 "{\"title\":\"Verify\",\"humanChallenge\":{\"detected\":true,\"signals\":[\"captcha\"]}}");
 
-            Assert.StartsWith("HUMAN_CHALLENGE_DETECTED", result);
+            Assert.StartsWith("CHALLENGE_DETECTED", result);
             Assert.Contains("Do not retry", result);
+            Assert.Contains("solve_challenge", result);
         }
 
         [Fact]

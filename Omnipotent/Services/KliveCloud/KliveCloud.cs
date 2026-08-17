@@ -2,6 +2,7 @@ using FFMpegCore;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
 using System.Runtime.Serialization;
 using static Omnipotent.Profiles.KMProfileManager;
@@ -69,10 +70,19 @@ namespace Omnipotent.Services.KliveCloud
             }
         }
 
+        // Response-cache dataset keys. CloudItems and ShareLinks are held in memory and
+        // read directly by route handlers, so the DataUtil file bump behind SaveMetadata /
+        // SaveShareLinks is NOT enough on its own: a handler that reads the in-memory list
+        // notes no dependency on it, and a cached response would then survive a revocation.
+        // These keys make the in-memory reads visible to the dependency tracker.
+        internal const string ItemsCacheKey = "klivecloud:items";
+        internal const string ShareLinksCacheKey = "klivecloud:sharelinks";
+
         public async Task SaveMetadata()
         {
             string json = JsonConvert.SerializeObject(CloudItems, Formatting.Indented);
             await GetDataHandler().WriteToFile(metadataFilePath, json);
+            CacheDeps.Bump(ItemsCacheKey); // after the write is visible
         }
 
         public class ShareLink
@@ -127,6 +137,7 @@ namespace Omnipotent.Services.KliveCloud
         {
             string json = JsonConvert.SerializeObject(ShareLinks, Formatting.Indented);
             await GetDataHandler().WriteToFile(shareLinksFilePath, json);
+            CacheDeps.Bump(ShareLinksCacheKey); // revocations/permission changes invalidate cached share responses
         }
 
         public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly, bool reuseExisting = true)
@@ -193,6 +204,7 @@ namespace Omnipotent.Services.KliveCloud
 
         public ShareLink GetShareLinkByCode(string shareCode)
         {
+            CacheDeps.NoteRead(ShareLinksCacheKey);
             return ShareLinks.FirstOrDefault(k => k.ShareCode == shareCode);
         }
 
@@ -252,11 +264,13 @@ namespace Omnipotent.Services.KliveCloud
 
         public CloudItem GetItemByID(string itemID)
         {
+            CacheDeps.NoteRead(ItemsCacheKey);
             return CloudItems.FirstOrDefault(k => k.ItemID == itemID);
         }
 
         public List<CloudItem> GetItemsInFolder(string folderID, KMPermissions userPermission)
         {
+            CacheDeps.NoteRead(ItemsCacheKey);
             return CloudItems
                 .Where(k => k.ParentFolderID == folderID && CanAccessItem(k, userPermission))
                 .Select(CloneWithEffectivePermission)
@@ -617,6 +631,7 @@ namespace Omnipotent.Services.KliveCloud
 
         public CloudItem GetFolderTree(string folderID, KMPermissions userPermission)
         {
+            CacheDeps.NoteRead(ItemsCacheKey);
             var folder = GetItemByID(folderID);
             if (folder == null || folder.ItemType != CloudItemType.Folder) return null;
             if (folder.MinimumPermissionLevel > userPermission) return null;

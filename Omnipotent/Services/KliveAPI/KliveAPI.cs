@@ -680,6 +680,11 @@ namespace Omnipotent.Services.KliveAPI
                 // Counts pings the handler actually served — the watchdog compares this
                 // across a failed ping to tell "server answered but client starved" apart
                 // from "server never processed it".
+                //
+                // Never cache this: a served-from-cache "Pong" is proof of nothing. The
+                // watchdog would read liveness from a process that had stopped running
+                // handlers, and _pingsServed would stop advancing under it.
+                CacheDeps.MarkUncacheable("liveness probe");
                 Interlocked.Increment(ref _pingsServed);
                 await req.ReturnResponse("Pong", "text/html");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
@@ -1760,7 +1765,7 @@ namespace Omnipotent.Services.KliveAPI
             }
 
             string? userId = request.user?.UserID;
-            string key = ResponseCache.BuildKey(route, request.userParameters, userId);
+            string key = ResponseCache.BuildKey(route, request.userParameters, userId, request.req.Headers["Range"]);
 
             bool forceBypass = request.user != null
                 && request.user.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives

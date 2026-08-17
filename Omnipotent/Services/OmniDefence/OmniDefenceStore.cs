@@ -8,8 +8,14 @@ namespace Omnipotent.Services.OmniDefence
     /// <summary>
     /// SQLite-backed persistence for OmniDefence: requests, auth events,
     /// profile actions, IP records and IP events.
-    /// All access funnels through a single connection serialized by a
-    /// SemaphoreSlim to keep things simple and avoid SQLITE_BUSY.
+    ///
+    /// Writes funnel through a single connection serialized by <c>writeLock</c> to keep
+    /// things simple and avoid SQLITE_BUSY. Reads deliberately do NOT take that lock:
+    /// every API request queues an audit row here, so the write lock is fed at the rate
+    /// of total site traffic. A reader sharing it waits behind the whole backlog — which
+    /// is what made <c>/omnidefence/ip</c> (four separate acquisitions) one of the
+    /// slowest routes on the server despite being fully indexed. WAL permits concurrent
+    /// readers, so reads run on their own connections against a small semaphore instead.
     /// </summary>
     public class OmniDefenceStore
     {
@@ -17,6 +23,13 @@ namespace Omnipotent.Services.OmniDefence
         private readonly string connectionString;
         private readonly SemaphoreSlim writeLock = new(1, 1);
         private SqliteConnection? sharedConnection;
+
+        // ── read path ──
+        // Separate connections so a SELECT never queues behind the audit-write backlog.
+        // Bounded because unbounded readers would just move thread-pool pressure around.
+        private static readonly int ReadPoolSize = Math.Clamp(Environment.ProcessorCount / 2, 2, 6);
+        private readonly SemaphoreSlim readGate = new(ReadPoolSize, ReadPoolSize);
+        private readonly string readConnectionString;
 
         public OmniDefenceStore(string dbPath)
         {
@@ -29,6 +42,18 @@ namespace Omnipotent.Services.OmniDefence
             {
                 DataSource = dbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
+                Pooling = true,
+                DefaultTimeout = 30,
+            }.ToString();
+
+            // ReadWrite rather than ReadOnly: the file always exists by the time reads
+            // start (InitializeAsync creates it), and a ReadOnly handle cannot create the
+            // -shm file if it is ever missing, which would turn a cold read into a hard
+            // failure. Pooling makes acquiring one of these effectively free.
+            readConnectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath,
+                Mode = SqliteOpenMode.ReadWrite,
                 Pooling = true,
                 DefaultTimeout = 30,
             }.ToString();
@@ -187,6 +212,22 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("ip_records", "associated_profile_name", "TEXT");
             await EnsureColumnAsync("ip_records", "associated_profile_rank", "INTEGER");
             await EnsureColumnAsync("ip_records", "associated_profile_last_seen_utc", "INTEGER");
+
+            StartAuditFlusher();
+        }
+
+        /// <summary>
+        /// Stops the flusher and commits whatever is still queued, so a clean shutdown
+        /// does not discard the tail of the audit log.
+        /// </summary>
+        public async Task ShutdownAsync()
+        {
+            try { flushCts?.Cancel(); } catch { }
+            if (flushLoop != null)
+            {
+                try { await flushLoop; } catch { }
+            }
+            try { await FlushRequestsAsync(); } catch { }
         }
 
         private async Task EnsureColumnAsync(string table, string column, string type)
@@ -235,14 +276,184 @@ namespace Omnipotent.Services.OmniDefence
             }
         }
 
+        /// <summary>
+        /// Runs a read on its own connection, never touching <c>writeLock</c>. Use this
+        /// for every SELECT: it is what keeps read latency independent of how much audit
+        /// traffic is queued behind the writer.
+        /// </summary>
+        public async Task<T> WithReadAsync<T>(Func<SqliteConnection, Task<T>> work)
+        {
+            await readGate.WaitAsync();
+            try
+            {
+                using var conn = new SqliteConnection(readConnectionString);
+                await conn.OpenAsync();
+                return await work(conn);
+            }
+            finally
+            {
+                readGate.Release();
+            }
+        }
+
+        // ---------- Request audit queue ----------
+        // Every API request records one row here. Inserting them one at a time meant one
+        // lock acquisition, transaction and WAL fsync per request, feeding the write lock
+        // at the rate of total site traffic and starving readers behind it. Rows are
+        // queued instead and committed in batches: the same durability for the audit log
+        // (it is telemetry, not a ledger), a fraction of the lock pressure.
+
+        private readonly ConcurrentQueue<RequestRow> pendingRequests = new();
+        private readonly SemaphoreSlim flushSignal = new(0);
+        private CancellationTokenSource? flushCts;
+        private Task? flushLoop;
+        private long droppedAuditRows;
+
+        /// <summary>Cap on unflushed rows; beyond this the oldest are dropped rather than
+        /// letting a stalled writer grow the queue without bound.</summary>
+        private const int MaxPendingRequests = 20_000;
+
+        /// <summary>Rows committed per transaction.</summary>
+        private const int FlushBatchSize = 256;
+
+        /// <summary>How long a row may sit unflushed when traffic is light.</summary>
+        private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(250);
+
+        /// <summary>Audit rows discarded because the queue was saturated.</summary>
+        public long DroppedAuditRows => Interlocked.Read(ref droppedAuditRows);
+
+        /// <summary>Rows waiting to be committed.</summary>
+        public int PendingAuditRows => pendingRequests.Count;
+
+        /// <summary>
+        /// Queues an audit row. Returns immediately — never touches the write lock, so a
+        /// slow or backed-up writer cannot show up as request latency.
+        /// </summary>
+        public void EnqueueRequest(RequestRow row)
+        {
+            if (row == null) return;
+            if (pendingRequests.Count >= MaxPendingRequests)
+            {
+                if (pendingRequests.TryDequeue(out _)) Interlocked.Increment(ref droppedAuditRows);
+            }
+            pendingRequests.Enqueue(row);
+            try { flushSignal.Release(); } catch (SemaphoreFullException) { }
+        }
+
+        private void StartAuditFlusher()
+        {
+            flushCts = new CancellationTokenSource();
+            CancellationToken ct = flushCts.Token;
+            flushLoop = Task.Run(async () =>
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        // Wake on either a queued row or the idle interval, so a lone row
+                        // during quiet traffic still lands promptly.
+                        await flushSignal.WaitAsync(FlushInterval, ct);
+                        await FlushRequestsAsync();
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch { /* a failed batch must never kill the flusher */ }
+                }
+            }, ct);
+        }
+
+        /// <summary>Drains the queue into batched transactions. Safe to call directly (tests).</summary>
+        public async Task FlushRequestsAsync()
+        {
+            while (!pendingRequests.IsEmpty)
+            {
+                var batch = new List<RequestRow>(FlushBatchSize);
+                while (batch.Count < FlushBatchSize && pendingRequests.TryDequeue(out RequestRow? queued))
+                {
+                    batch.Add(queued);
+                }
+                if (batch.Count == 0) return;
+                await InsertRequestsAsync(batch);
+            }
+        }
+
+        /// <summary>Commits a batch of audit rows in one transaction on one prepared command.</summary>
+        public Task InsertRequestsAsync(IReadOnlyCollection<RequestRow> rows) => WithLockAsync(async conn =>
+        {
+            if (rows == null || rows.Count == 0) return;
+
+            using var transaction = (SqliteTransaction)await conn.BeginTransactionAsync();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = RequestInsertSql;
+            BindRequestParameters(cmd, rows.First());
+            foreach (var row in rows)
+            {
+                SetRequestParameters(cmd, row);
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await transaction.CommitAsync();
+        });
+
+        private const string RequestInsertSql = @"INSERT INTO requests
+                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page, body_text, body_truncated, headers_json)
+                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page,$btext,$btrunc,$hdrs)";
+
+        private static void BindRequestParameters(SqliteCommand cmd, RequestRow row)
+        {
+            cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);
+            cmd.Parameters.AddWithValue("$ip", (object?)row.Ip ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$method", (object?)row.Method ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$route", (object?)row.Route ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$query", (object?)row.Query ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$status", row.StatusCode);
+            cmd.Parameters.AddWithValue("$dur", row.DurationMs);
+            cmd.Parameters.AddWithValue("$pid", (object?)row.ProfileId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$pname", (object?)row.ProfileName ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$prank", (object?)row.ProfileRank ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$perm", row.PermRequired);
+            cmd.Parameters.AddWithValue("$matched", row.MatchedRoute ? 1 : 0);
+            cmd.Parameters.AddWithValue("$bh", (object?)row.BodyHash ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$blen", row.BodyLength);
+            cmd.Parameters.AddWithValue("$ua", (object?)row.UserAgent ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$deny", (object?)row.DenyReason ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$origin", (object?)row.RequestOrigin ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$page", (object?)row.ClientPage ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$btext", (object?)row.BodyText ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$btrunc", row.BodyTruncated ? 1 : 0);
+            cmd.Parameters.AddWithValue("$hdrs", (object?)row.HeadersJson ?? DBNull.Value);
+        }
+
+        private static void SetRequestParameters(SqliteCommand cmd, RequestRow row)
+        {
+            cmd.Parameters["$ts"].Value = row.UtcTimestamp;
+            cmd.Parameters["$ip"].Value = (object?)row.Ip ?? DBNull.Value;
+            cmd.Parameters["$method"].Value = (object?)row.Method ?? DBNull.Value;
+            cmd.Parameters["$route"].Value = (object?)row.Route ?? DBNull.Value;
+            cmd.Parameters["$query"].Value = (object?)row.Query ?? DBNull.Value;
+            cmd.Parameters["$status"].Value = row.StatusCode;
+            cmd.Parameters["$dur"].Value = row.DurationMs;
+            cmd.Parameters["$pid"].Value = (object?)row.ProfileId ?? DBNull.Value;
+            cmd.Parameters["$pname"].Value = (object?)row.ProfileName ?? DBNull.Value;
+            cmd.Parameters["$prank"].Value = (object?)row.ProfileRank ?? DBNull.Value;
+            cmd.Parameters["$perm"].Value = row.PermRequired;
+            cmd.Parameters["$matched"].Value = row.MatchedRoute ? 1 : 0;
+            cmd.Parameters["$bh"].Value = (object?)row.BodyHash ?? DBNull.Value;
+            cmd.Parameters["$blen"].Value = row.BodyLength;
+            cmd.Parameters["$ua"].Value = (object?)row.UserAgent ?? DBNull.Value;
+            cmd.Parameters["$deny"].Value = (object?)row.DenyReason ?? DBNull.Value;
+            cmd.Parameters["$origin"].Value = (object?)row.RequestOrigin ?? DBNull.Value;
+            cmd.Parameters["$page"].Value = (object?)row.ClientPage ?? DBNull.Value;
+            cmd.Parameters["$btext"].Value = (object?)row.BodyText ?? DBNull.Value;
+            cmd.Parameters["$btrunc"].Value = row.BodyTruncated ? 1 : 0;
+            cmd.Parameters["$hdrs"].Value = (object?)row.HeadersJson ?? DBNull.Value;
+        }
+
         // ---------- Insert helpers ----------
 
         public Task InsertRequestAsync(RequestRow row) => WithLockAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO requests
-                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page, body_text, body_truncated, headers_json)
-                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page,$btext,$btrunc,$hdrs)";
+            cmd.CommandText = RequestInsertSql;
             cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);
             cmd.Parameters.AddWithValue("$ip", (object?)row.Ip ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$method", (object?)row.Method ?? DBNull.Value);
@@ -267,7 +478,7 @@ namespace Omnipotent.Services.OmniDefence
             await cmd.ExecuteNonQueryAsync();
         });
 
-        public Task<Dictionary<string, object?>?> GetRequestByIdAsync(long id) => WithLockAsync(async conn =>
+        public Task<Dictionary<string, object?>?> GetRequestByIdAsync(long id) => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM requests WHERE id=$id";
@@ -505,7 +716,7 @@ namespace Omnipotent.Services.OmniDefence
             await transaction.CommitAsync();
         });
 
-        public Task<IpRecord?> GetIpRecordAsync(string ip) => WithLockAsync(async conn =>
+        public Task<IpRecord?> GetIpRecordAsync(string ip) => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM ip_records WHERE ip=$ip";
@@ -516,7 +727,7 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         public Task<List<IpRecord>> ListIpRecordsAsync(string? statusFilter, double minScore, string? query, int limit, int offset)
-            => WithLockAsync(async conn =>
+            => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             var sb = new System.Text.StringBuilder("SELECT * FROM ip_records WHERE threat_score >= $min");
@@ -541,7 +752,7 @@ namespace Omnipotent.Services.OmniDefence
             return list;
         });
 
-        public Task<List<IpRecord>> LoadAllIpRecordsAsync() => WithLockAsync(async conn =>
+        public Task<List<IpRecord>> LoadAllIpRecordsAsync() => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT * FROM ip_records";
@@ -553,7 +764,7 @@ namespace Omnipotent.Services.OmniDefence
 
         // ---------- Generic filtered selects ----------
         public Task<List<Dictionary<string, object?>>> QueryAsync(string sql, Dictionary<string, object?> parameters)
-            => WithLockAsync(async conn =>
+            => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
@@ -577,7 +788,7 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         public Task<long> ScalarLongAsync(string sql, Dictionary<string, object?> parameters)
-            => WithLockAsync(async conn =>
+            => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = sql;
@@ -591,7 +802,7 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         // ---------- Honeypot routes ----------
-        public Task<List<HoneypotRouteRow>> ListHoneypotRoutesAsync() => WithLockAsync(async conn =>
+        public Task<List<HoneypotRouteRow>> ListHoneypotRoutesAsync() => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT route, created_utc, response_kind, note FROM honeypot_routes";
@@ -632,7 +843,7 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         // ---------- Blocked regions ----------
-        public Task<List<BlockedRegionRow>> ListBlockedRegionsAsync() => WithLockAsync(async conn =>
+        public Task<List<BlockedRegionRow>> ListBlockedRegionsAsync() => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT id, lat_min, lat_max, lon_min, lon_max, reason, created_utc, created_by FROM blocked_regions ORDER BY id DESC";

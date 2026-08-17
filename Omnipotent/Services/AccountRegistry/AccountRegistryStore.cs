@@ -79,6 +79,53 @@ namespace Omnipotent.Services.AccountRegistry
             return s.TrimEnd('/');
         }
 
+        // ── secret generation ──
+
+        /// <summary>
+        /// The sentinel an agent writes instead of authoring a credential itself. The model never
+        /// sees, transmits, or has to remember the value: it is minted here, encrypted immediately,
+        /// and thereafter only ever referenced as {account:service/field}.
+        /// </summary>
+        public const string GenerateSentinel = "{generate}";
+
+        /// <summary>
+        /// A strong credential that satisfies the usual signup complexity rules on the first try
+        /// (upper, lower, digit, symbol; no ambiguous glyphs that break OCR verification or manual
+        /// re-entry). Uniform selection from the alphabet via <see cref="RandomNumberGenerator"/>.
+        /// </summary>
+        public static string GeneratePassword(int length = 20)
+        {
+            const string upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";   // no I/O
+            const string lower = "abcdefghijkmnopqrstuvwxyz";  // no l
+            const string digit = "23456789";                   // no 0/1
+            const string symbol = "!@#$%^&*-_=+";              // widely accepted by signup validators
+            string all = upper + lower + digit + symbol;
+            length = Math.Clamp(length, 12, 64);
+
+            // One guaranteed character per class, then fill, then shuffle — so complexity rules are
+            // met deterministically without biasing the remaining positions.
+            var chars = new List<char>(length)
+            {
+                upper[RandomNumberGenerator.GetInt32(upper.Length)],
+                lower[RandomNumberGenerator.GetInt32(lower.Length)],
+                digit[RandomNumberGenerator.GetInt32(digit.Length)],
+                symbol[RandomNumberGenerator.GetInt32(symbol.Length)],
+            };
+            while (chars.Count < length) chars.Add(all[RandomNumberGenerator.GetInt32(all.Length)]);
+            for (int i = chars.Count - 1; i > 0; i--)
+            {
+                int j = RandomNumberGenerator.GetInt32(i + 1);
+                (chars[i], chars[j]) = (chars[j], chars[i]);
+            }
+            return new string(chars.ToArray());
+        }
+
+        /// <summary>Expands the {generate} sentinel; every other value is stored verbatim.</summary>
+        internal static string MaterializeSecret(string? supplied) =>
+            string.Equals(supplied?.Trim(), GenerateSentinel, StringComparison.OrdinalIgnoreCase)
+                ? GeneratePassword()
+                : supplied ?? "";
+
         // ── public API (all lock-guarded; readers return deep clones) ──
 
         public record RegisterResult(bool Created, RegisteredAccount? Account, List<RegisteredAccount> Existing);
@@ -126,7 +173,7 @@ namespace Omnipotent.Services.AccountRegistry
                             account.Secrets.Add(new AccountSecret
                             {
                                 Name = kv.Key.Trim(),
-                                CipherB64 = Encrypt(account.AccountID, kv.Value ?? ""),
+                                CipherB64 = Encrypt(account.AccountID, MaterializeSecret(kv.Value)),
                             });
 
                 all.Add(account);
@@ -258,7 +305,7 @@ namespace Omnipotent.Services.AccountRegistry
                 var a = all.FirstOrDefault(x => x.AccountID == accountID);
                 if (a == null) return false;
                 a.Secrets.RemoveAll(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase));
-                a.Secrets.Add(new AccountSecret { Name = name.Trim(), CipherB64 = Encrypt(accountID, plaintext ?? "") });
+                a.Secrets.Add(new AccountSecret { Name = name.Trim(), CipherB64 = Encrypt(accountID, MaterializeSecret(plaintext)) });
                 a.UpdatedAt = DateTime.UtcNow;
                 SaveLocked(all);
                 return true;
@@ -395,7 +442,8 @@ namespace Omnipotent.Services.AccountRegistry
             {
                 if (rootKey != null) return rootKey;
                 rootKey = AtomicSecretRootKey.LoadOrCreate(rootKeyPath, RootKeyBytes,
-                    HasEncryptedSecretsOnDisk, RestrictKeyFilePermissions, log, "AccountRegistry");
+                    HasEncryptedSecretsOnDisk, RestrictKeyFilePermissions, log, "AccountRegistry",
+                    QuarantineUndecryptableSecrets);
                 return rootKey;
             }
         }
@@ -407,6 +455,53 @@ namespace Omnipotent.Services.AccountRegistry
                 ?? new List<RegisteredAccount>();
             return accounts.Any(a => a.Secrets.Any(s => !string.IsNullOrWhiteSpace(s.CipherB64)));
         }
+
+        /// <summary>
+        /// Recovery path for a lost/corrupt root key. The ciphertext is already unrecoverable at
+        /// this point — the key that produced it is gone — so refusing to continue would brick every
+        /// future registration too (an agent that successfully creates an account could never store
+        /// it). Instead: snapshot the whole index for offline forensics, then strip the dead
+        /// ciphertext while KEEPING the plaintext account metadata. Agents keep the far more
+        /// valuable knowledge that "an account already exists on this service with this username and
+        /// email" and can recover it through the site's own password-reset flow into KliveMail,
+        /// instead of blindly creating duplicates.
+        /// </summary>
+        private string QuarantineUndecryptableSecrets()
+        {
+            if (!File.Exists(indexPath)) return "no account index";
+
+            string snapshot = indexPath + $".unreadable-{DateTime.UtcNow:yyyyMMddHHmmss}.json";
+            File.Copy(indexPath, snapshot, overwrite: false);
+
+            var accounts = JsonConvert.DeserializeObject<List<RegisteredAccount>>(File.ReadAllText(indexPath))
+                ?? new List<RegisteredAccount>();
+            int clearedSecrets = 0, touchedAccounts = 0;
+            foreach (var account in accounts)
+            {
+                var dead = account.Secrets.Where(s => !string.IsNullOrWhiteSpace(s.CipherB64)).ToList();
+                if (dead.Count == 0) continue;
+                clearedSecrets += dead.Count;
+                touchedAccounts++;
+                account.Secrets.RemoveAll(s => !string.IsNullOrWhiteSpace(s.CipherB64));
+                account.Notes = Append(account.Notes,
+                    $"[{DateTime.UtcNow:yyyy-MM-dd}] Stored secret(s) ({string.Join(", ", dead.Select(s => s.Name))}) " +
+                    "became unreadable when the registry root key was lost. The account itself may still exist — " +
+                    "recover it with the site's password-reset flow to this account's email, then account_update the new secret.");
+                account.UpdatedAt = DateTime.UtcNow;
+            }
+
+            // Written directly rather than through SaveLocked: the caller is inside RootKey() and
+            // any re-entrant encryption here would deadlock on the root-key gate.
+            string tmp = indexPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(tmp, JsonConvert.SerializeObject(accounts, Formatting.Indented));
+            File.Move(tmp, indexPath, overwrite: true);
+
+            return $"{clearedSecrets} unreadable secret(s) across {touchedAccounts} account(s); " +
+                   $"full snapshot at {Path.GetFileName(snapshot)}";
+        }
+
+        private static string Append(string? existing, string line) =>
+            string.IsNullOrWhiteSpace(existing) ? line : existing.TrimEnd() + "\n" + line;
 
         private byte[] DeriveAccountKey(string accountID)
         {
@@ -494,6 +589,10 @@ namespace Omnipotent.Services.AccountRegistry
 
         private List<RegisteredAccount> LoadLocked()
         {
+            // Resolve the root key BEFORE reading the index. Key recovery can rewrite the index
+            // (parking ciphertext that can never be decrypted again), and a caller holding a list
+            // read beforehand would save that stale copy straight back over the repair.
+            RootKey();
             if (!File.Exists(indexPath)) return new();
             try { return JsonConvert.DeserializeObject<List<RegisteredAccount>>(File.ReadAllText(indexPath)) ?? new(); }
             catch (Exception ex)

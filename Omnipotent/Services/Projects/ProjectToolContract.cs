@@ -150,7 +150,7 @@ public static class ProjectToolContract
         if (aliasError != null) return ProjectToolContractResult.Invalid(aliasError);
 
         var warnings = new List<string>();
-        ApplyToolSpecificNormalizations(toolName, arguments, warnings);
+        ApplyToolSpecificNormalizations(toolName, arguments, schema, warnings);
         NormalizeSafeScalarTypes(arguments, schema);
 
         var error = ValidateToken(arguments, schema, "$", schemaIsToolRoot: true);
@@ -193,7 +193,8 @@ public static class ProjectToolContract
     /// Repairs common, unambiguous model serialization variants before schema validation. This is
     /// deliberately narrow: it never invents business data or guesses between conflicting values.
     /// </summary>
-    private static void ApplyToolSpecificNormalizations(string toolName, JObject arguments, List<string> warnings)
+    private static void ApplyToolSpecificNormalizations(string toolName, JObject arguments, JObject schema,
+        List<string> warnings)
     {
         if (toolName == "read_file" && arguments.Property("run_as_cwd", StringComparison.Ordinal) is { } misplacedExecution)
         {
@@ -201,10 +202,40 @@ public static class ProjectToolContract
             warnings.Add("Ignored legacy read_file argument 'run_as_cwd': read_file never executes a file. Use run_bash or computer_terminal as a separate tool call if execution is actually intended.");
         }
 
-        if (toolName == "update_observable" && arguments.Property("op", StringComparison.Ordinal) == null &&
-            (arguments.Property("value", StringComparison.Ordinal) != null ||
-             arguments.Property("textValue", StringComparison.Ordinal) != null))
-            arguments["op"] = "set";
+        if (toolName == "update_observable")
+        {
+            if (arguments.Property("op", StringComparison.Ordinal) == null &&
+                (arguments.Property("value", StringComparison.Ordinal) != null ||
+                 arguments.Property("textValue", StringComparison.Ordinal) != null))
+                arguments["op"] = "set";
+
+            // Supplying both spellings of the same reading was a hard refusal that cost a turn every
+            // time. They are not in conflict — the model is describing one value twice — so keep the
+            // numeric form (the one that can be charted) and say which was used.
+            if (arguments.Property("value", StringComparison.Ordinal) is { } numeric &&
+                arguments.Property("textValue", StringComparison.Ordinal) is { } textual)
+            {
+                if (IsEmpty(numeric.Value)) { numeric.Remove(); }
+                else
+                {
+                    textual.Remove();
+                    warnings.Add("Both 'value' and 'textValue' were supplied; used the numeric 'value'. Pass exactly one.");
+                }
+            }
+        }
+
+        // A worker with no declared tier could not be spawned at all, and the tier that matters for
+        // real work (one that can see a screen) is never the cheapest guess. Default to the capable
+        // one: an over-provisioned researcher still finishes, a blind GUI worker cannot.
+        if (toolName is "manage_agents" or "spawn_sub_agent" &&
+            SchemaDeclares(schema, "tier") && arguments.Property("tier", StringComparison.Ordinal) == null &&
+            arguments.Property("objective", StringComparison.Ordinal) != null)
+        {
+            arguments["tier"] = "TextImageVideo";
+            warnings.Add("No 'tier' was given; spawned at TextImageVideo so the worker can use browser and desktop tools. Pass 'tier' explicitly to choose.");
+        }
+
+        NormalizeWaitCondition(toolName, arguments, schema, warnings);
 
         if (toolName != "update_plan" || arguments["nextSteps"] is not { } supplied) return;
 
@@ -233,6 +264,69 @@ public static class ProjectToolContract
                 arguments["nextSteps"] = new JArray(steps);
             }
         }
+    }
+
+    private static bool IsEmpty(JToken token) => token.Type switch
+    {
+        JTokenType.Null or JTokenType.Undefined => true,
+        JTokenType.String => string.IsNullOrWhiteSpace(token.Value<string>()),
+        _ => false,
+    };
+
+    private static bool SchemaDeclares(JObject schema, string property) =>
+        (schema["properties"] as JObject)?.Property(property, StringComparison.Ordinal) != null;
+
+    /// <summary>
+    /// Waiting is how an agent synchronises with a page, and getting the condition vocabulary wrong
+    /// stalled entire flows. Every spelling below means one of the supported conditions
+    /// unambiguously, and a bare 'waitFor' implies its own condition from the shape of the value.
+    /// </summary>
+    private static void NormalizeWaitCondition(string toolName, JObject arguments, JObject schema,
+        List<string> warnings)
+    {
+        if (!SchemaDeclares(schema, "condition")) return;
+
+        var allowed = ((schema["properties"] as JObject)?["condition"] as JObject)?["enum"] as JArray;
+        bool Allowed(string value) => allowed == null ||
+            allowed.Values<string>().Any(v => string.Equals(v, value, StringComparison.Ordinal));
+
+        string? condition = arguments["condition"]?.Value<string>()?.Trim();
+        string? waitFor = arguments["waitFor"]?.Value<string>()?.Trim();
+
+        if (!string.IsNullOrEmpty(condition))
+        {
+            string? mapped = condition.ToLowerInvariant() switch
+            {
+                "loaded" or "load" or "complete" or "domcontentloaded" or "networkidle" or "idle" => "ready",
+                "visible" or "present" or "exists" or "element" => string.IsNullOrEmpty(waitFor) ? null : "selector",
+                "absent" or "hidden" or "removed" or "disappeared" => "gone",
+                "contains" or "hastext" => "text",
+                "navigation" or "urlchange" => "url",
+                _ => null,
+            };
+            if (mapped != null && !Allowed(condition) && Allowed(mapped))
+            {
+                arguments["condition"] = mapped;
+                warnings.Add($"Read wait condition '{condition}' as '{mapped}'.");
+            }
+            return;
+        }
+
+        // A value with no condition: infer it rather than refusing. Selector and URL shapes are
+        // unmistakable; anything else a page can be waited on for is visible text.
+        if (string.IsNullOrEmpty(waitFor))
+        {
+            if (Allowed("ready")) arguments["condition"] = "ready";
+            return;
+        }
+        string inferred =
+            waitFor.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            waitFor.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? "url"
+            : waitFor.StartsWith('.') || waitFor.StartsWith('#') || waitFor.StartsWith('[') ? "selector"
+            : "text";
+        if (!Allowed(inferred)) return;
+        arguments["condition"] = inferred;
+        warnings.Add($"No wait condition was given; inferred condition='{inferred}' from the value supplied.");
     }
 
     private static JToken NormalizePlanStep(JObject item)

@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Profiles;
+using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Specialized;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
@@ -10,6 +11,13 @@ namespace Omnipotent.Services.KliveCloud
     public class KliveCloudRoutes
     {
         private KliveCloud parent;
+
+        /// <summary>
+        /// How far past its expiry a cached share response may still be served. Share
+        /// revocation is exact (it bumps <see cref="KliveCloud.ShareLinksCacheKey"/>);
+        /// only unattended lapsing is quantized.
+        /// </summary>
+        private static readonly TimeSpan ShareExpiryPrecision = TimeSpan.FromSeconds(15);
 
         public KliveCloudRoutes(KliveCloud parent)
         {
@@ -62,11 +70,20 @@ namespace Omnipotent.Services.KliveCloud
                 return null;
             }
 
-            if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < DateTime.Now)
+            if (link.ExpirationDate.HasValue)
             {
-                await parent.DeleteShareLink(shareCode);
-                await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
-                return null;
+                // Expiry is wall-clock: no write happens when a link lapses, so nothing
+                // would bump a version and a cached 200 could outlive the link. Anchor
+                // the fill to a short clock bucket instead — a cached share response can
+                // then survive at most one bucket past its expiry.
+                CacheDeps.NoteTimeBucket(ShareExpiryPrecision);
+
+                if (link.ExpirationDate.Value < DateTime.Now)
+                {
+                    await parent.DeleteShareLink(shareCode);
+                    await req.ReturnResponse("ShareLinkExpired", code: HttpStatusCode.Gone);
+                    return null;
+                }
             }
 
             var root = parent.GetItemByID(link.ItemID);

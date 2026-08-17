@@ -1333,7 +1333,7 @@ namespace Omnipotent.Services.Projects
                 SearchKnowledgeAsync = RagSearchKnowledgeAsync,
                 ReadKnowledgeDocAsync = RagReadKnowledgeDocAsync,
                 WebSearchAsync = RagWebSearchAsync,
-                WebFetchAsync = RagWebFetchAsync,
+                WebFetchAsync = url => RagWebFetchAsync(url, project, actingAgentID, ct),
             };
             return await tools.DispatchAsync(toolName, argsJson, ct);
         }
@@ -1451,17 +1451,78 @@ namespace Omnipotent.Services.Projects
         private async Task<string> RagWebSearchAsync(string query, int maxResults, int fetchTop, string? timeRange)
         {
             var rag = GetRagService();
-            if (rag == null) return "Web search unavailable (KliveRAG not running).";
-            try { return await rag.WebSearchAsync(query, maxResults, fetchTop, timeRange); }
-            catch (Exception ex) { return $"Web search failed: {ex.Message}"; }
+            if (rag == null)
+                return "Web search unavailable (KliveRAG not running). Research on the desktop instead: "
+                    + "computer_navigate to a search engine, then computer_browser_inspect mode=dom.";
+            string result;
+            try { result = await rag.WebSearchAsync(query, maxResults, fetchTop, timeRange); }
+            catch (Exception ex)
+            {
+                return $"Web search failed: {ex.Message}. This is a backend failure, not an absence of "
+                    + "information: search from your desktop browser instead (computer_navigate to a search "
+                    + "engine, then computer_browser_inspect mode=dom) before concluding anything about the topic.";
+            }
+            // Silent degradation is how a project concludes "there is nothing out there" from a broken
+            // backend. Say plainly that the search returned nothing and name the working alternative.
+            if (ProjectWebResearch.LooksEmpty(result))
+                return result.TrimEnd() + "\n\nSEARCH_RETURNED_NOTHING: treat this as a tool failure, not as "
+                    + "evidence the topic has no sources. Repeat the search from your desktop browser "
+                    + "(computer_navigate to a search engine, then computer_browser_inspect mode=dom), or "
+                    + "fetch a known URL directly with web_fetch.";
+            return result;
         }
 
-        private async Task<string> RagWebFetchAsync(string url)
+        /// <summary>
+        /// Fetches a page, and when the plain HTTP fetch is refused (403/429/bot wall) re-fetches it
+        /// through the agent's own logged-in browser instead of returning a dead end. Sites that block
+        /// datacentre HTTP clients serve the same page to a real browser, so a blocked fetch was never
+        /// a reason to abandon a research thread.
+        /// </summary>
+        private async Task<string> RagWebFetchAsync(string url, Project project, string actingAgentID, CancellationToken ct)
         {
             var rag = GetRagService();
-            if (rag == null) return "Web fetch unavailable (KliveRAG not running).";
-            try { return await rag.WebFetchAsync(url); }
-            catch (Exception ex) { return $"Web fetch failed: {ex.Message}"; }
+            string? failure = null;
+            if (rag == null) failure = "KliveRAG is not running.";
+            else
+            {
+                try
+                {
+                    string fetched = await rag.WebFetchAsync(url);
+                    if (!ProjectWebResearch.LooksBlocked(fetched))
+                        return ProjectWebResearch.DecodeObfuscatedEmails(fetched);
+                    failure = ProjectWebResearch.Summarize(fetched);
+                }
+                catch (Exception ex) { failure = ex.Message; }
+            }
+
+            var browserResult = await FetchThroughDesktopBrowserAsync(project, actingAgentID, url, ct);
+            if (browserResult != null)
+                return $"The direct fetch of {url} was refused ({failure}), so the page was read through "
+                    + $"your desktop browser instead:\n\n{ProjectWebResearch.DecodeObfuscatedEmails(browserResult)}";
+            return $"Web fetch failed: {failure} The desktop-browser fallback was also unavailable. "
+                + "Open the URL yourself with computer_navigate and read it with computer_browser_inspect mode=dom.";
+        }
+
+        /// <summary>Navigates the acting agent's desktop browser to a URL and returns its DOM text.</summary>
+        private async Task<string?> FetchThroughDesktopBrowserAsync(
+            Project project, string actingAgentID, string url, CancellationToken ct)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                return null;
+            if (!Settings.Get(project.ProjectID).ContainersEnabled || Desktops == null || !OperatingSystem.IsWindows())
+                return null;
+            try
+            {
+                var navigation = await DispatchComputerToolAsync(project, actingAgentID, "computer_navigate",
+                    JsonConvert.SerializeObject(new { url = uri.AbsoluteUri }), ct);
+                if (!navigation.Succeeded) return null;
+                var dom = await DispatchComputerToolAsync(project, actingAgentID, "computer_browser_inspect",
+                    JsonConvert.SerializeObject(new { mode = "dom", maxItems = 120 }), ct);
+                return dom.Succeeded ? dom.ResultText : null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return null; }
         }
 
         private async Task<CommanderToolResult> DispatchComputerToolAsync(
