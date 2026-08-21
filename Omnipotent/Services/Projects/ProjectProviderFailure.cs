@@ -12,17 +12,33 @@ namespace Omnipotent.Services.Projects
     {
         public const string DependencyKey = "llm-provider";
 
+        /// <summary>How long a rate limit on a fixed-window router can possibly need to clear. The
+        /// windows are measured over a rolling minute, so waiting one out is always enough.</summary>
+        private static readonly TimeSpan FlatFeeRateLimitRetry = TimeSpan.FromSeconds(60);
+
         /// <summary>
         /// Projects never permanently stop because an autonomous model route is unavailable or
         /// misconfigured. Even failures providers classify as non-retryable get a bounded
         /// automatic retry window, allowing a changed route, restored credit, or repaired
         /// configuration to recover without an agent having to unblock the project.
+        ///
+        /// <paramref name="flatFeeProvider"/> shortens exactly one case: a rate limit on a flat-fee
+        /// router. There, the limit is a rolling-minute fair-use window rather than a spent balance
+        /// or a degraded upstream, so the default 15-minute stand-down would idle the project for
+        /// fourteen minutes longer than the condition actually lasts. KliveLLM normally absorbs
+        /// these inside the wake (see AIRouterFairUseLimiter); this is the backstop for one that
+        /// outlived even that.
         /// </summary>
-        public static DateTime AutomaticRetryAt(RemoteLLMException ex, DateTime? nowUtc = null)
+        public static DateTime AutomaticRetryAt(RemoteLLMException ex, DateTime? nowUtc = null,
+            bool flatFeeProvider = false)
         {
             DateTime now = nowUtc ?? DateTime.UtcNow;
+            bool rateLimited = ex.Kind == RemoteLLMFailureKind.RateLimited;
+            TimeSpan fallback = flatFeeProvider && rateLimited ? FlatFeeRateLimitRetry : TimeSpan.FromMinutes(15);
             TimeSpan delay = ex.RetryAfter is { } requested && requested > TimeSpan.Zero
-                ? requested : TimeSpan.FromMinutes(15);
+                ? requested : fallback;
+            // A flat-fee rate limit never needs longer than one window, whatever the header claims.
+            if (flatFeeProvider && rateLimited && delay > FlatFeeRateLimitRetry) delay = FlatFeeRateLimitRetry;
             return now + delay;
         }
 

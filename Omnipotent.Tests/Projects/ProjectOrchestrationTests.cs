@@ -391,6 +391,82 @@ namespace Omnipotent.Tests.Projects
             Assert.NotNull(second); // no provider-call-wide project lock
             Assert.Null(third);     // the remaining budget is already reserved
         }
+
+        // ── Flat-fee router (AIRouter) ──
+        // The whole point of these: under a flat fee there is no per-token bill, so none of the
+        // budget machinery may stop work. A denied turn lease or a BudgetPaused status is exactly
+        // what surfaces as a deferred wake, which a flat-fee router must never cause.
+
+        [Fact]
+        public async Task FlatFee_BooksZeroSpendWhileStillCountingTokens()
+        {
+            var (ledger, _, _, pid) = NewSetup(tokenBudget: 1.0);
+            ledger.IsFlatFeeProvider = () => true;
+
+            await ledger.RecordTokenSpendAsync(pid, promptTokens: 500_000, completionTokens: 500_000);
+
+            var book = ledger.GetLedger(pid);
+            Assert.Equal(0, book.TokenSpendUsd);          // no money moved
+            Assert.Equal(500_000, book.PromptTokens);     // …but the telemetry is intact
+            Assert.Equal(500_000, book.CompletionTokens);
+            Assert.Equal(0, ledger.EstimateCost(500_000, 500_000));
+        }
+
+        [Fact]
+        public async Task FlatFee_NeverWarnsAndNeverPausesTheProject()
+        {
+            var (ledger, store, log, pid) = NewSetup(tokenBudget: 1.0);
+            ledger.IsFlatFeeProvider = () => true;
+
+            // Far past what would exhaust a $1 budget under per-token pricing.
+            await ledger.RecordTokenSpendAsync(pid, 0, 10_000_000);
+
+            Assert.Equal(ProjectStatus.Active, store.GetProject(pid)!.Status);
+            Assert.DoesNotContain(log.ReadSince(pid, 0), e => e.Type == ProjectEventTypes.BudgetWarning);
+            Assert.DoesNotContain(log.ReadSince(pid, 0), e => e.Type == ProjectEventTypes.BudgetPaused);
+            Assert.True(ledger.IsWithinTokenBudget(pid));
+        }
+
+        [Fact]
+        public async Task FlatFee_GrantsEveryTurnLeaseSoNoWakeIsEverDeferredOnBudget()
+        {
+            // A $0 budget is the harshest case: under per-token billing every lease is refused.
+            var (ledger, _, _, pid) = NewSetup(tokenBudget: 0);
+            ledger.IsFlatFeeProvider = () => true;
+
+            await using var first = await ledger.TryAcquireLlmTurnAsync(pid);
+            await using var second = await ledger.TryAcquireLlmTurnAsync(pid);
+            await using var third = await ledger.TryAcquireLlmTurnAsync(pid);
+
+            Assert.NotNull(first);
+            Assert.NotNull(second);
+            Assert.NotNull(third);
+        }
+
+        [Fact]
+        public async Task FlatFee_StillRefusesTurnsForAProjectThatIsNotRunnable()
+        {
+            // Unmetered tokens are not a licence to run a paused or archived project.
+            var (ledger, store, _, pid) = NewSetup(tokenBudget: 100);
+            ledger.IsFlatFeeProvider = () => true;
+            var project = store.GetProject(pid)!;
+            project.Status = ProjectStatus.Archived;
+            store.SaveProject(project);
+
+            Assert.Null(await ledger.TryAcquireLlmTurnAsync(pid));
+        }
+
+        [Fact]
+        public async Task PerTokenBilling_IsCompletelyUnaffectedByTheFlatFeeHook()
+        {
+            // The hook defaults to unset, and an explicit "false" must behave exactly as before.
+            var (ledger, store, _, pid) = NewSetup(tokenBudget: 1.0);
+            ledger.IsFlatFeeProvider = () => false;
+
+            await ledger.RecordTokenSpendAsync(pid, 0, 80_000); // $1.20 provisional > $1 budget
+            Assert.Equal(ProjectStatus.BudgetPaused, store.GetProject(pid)!.Status);
+            Assert.True(ledger.GetLedger(pid).TokenSpendUsd > 1.0);
+        }
     }
 
     public class ProjectGateManagerTests

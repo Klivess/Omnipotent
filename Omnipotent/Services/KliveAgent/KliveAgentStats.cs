@@ -1,4 +1,4 @@
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAgent.Models;
 using System.Collections.Concurrent;
@@ -31,6 +31,10 @@ namespace Omnipotent.Services.KliveAgent
         public long TotalIterations { get; private set; }
         public long TotalPromptTokens { get; private set; }
         public long TotalCompletionTokens { get; private set; }
+        /// <summary>The share of the totals above that was served by a flat-fee router and therefore
+        /// carries no per-token charge. Subtracted before the cost estimate — see <see cref="EstimateCost"/>.</summary>
+        public long TotalFlatFeePromptTokens { get; private set; }
+        public long TotalFlatFeeCompletionTokens { get; private set; }
         public long TotalScriptsRun { get; private set; }
         public long TotalScriptFailures { get; private set; }
         public long TotalCapabilityCalls { get; private set; }
@@ -73,6 +77,8 @@ namespace Omnipotent.Services.KliveAgent
                     TotalIterations = snapshot.TotalIterations;
                     TotalPromptTokens = snapshot.TotalPromptTokens;
                     TotalCompletionTokens = snapshot.TotalCompletionTokens;
+                    TotalFlatFeePromptTokens = snapshot.TotalFlatFeePromptTokens;
+                    TotalFlatFeeCompletionTokens = snapshot.TotalFlatFeeCompletionTokens;
                     TotalScriptsRun = snapshot.TotalScriptsRun;
                     TotalScriptFailures = snapshot.TotalScriptFailures;
                     TotalCapabilityCalls = snapshot.TotalCapabilityCalls;
@@ -119,8 +125,12 @@ namespace Omnipotent.Services.KliveAgent
         private static string WeekKey(DateTime utc) =>
             $"{ISOWeek.GetYear(utc):D4}-W{ISOWeek.GetWeekOfYear(utc):D2}";
 
+        /// <param name="flatFee">True when this turn was served by a flat-fee router (AIRouter), whose
+        /// tokens are real telemetry but carry no per-token charge. Recorded alongside the ordinary
+        /// counts so <c>estimatedCostUsd</c> can exclude them without distorting the token history —
+        /// and, crucially, without retroactively rewriting spend that WAS billed per token.</param>
         public void Record(int promptTokens, int completionTokens, int iterations, int scripts, int scriptFailures,
-            long latencyMs = 0, AgentSourceChannel channel = AgentSourceChannel.API)
+            long latencyMs = 0, AgentSourceChannel channel = AgentSourceChannel.API, bool flatFee = false)
         {
             lock (_lock)
             {
@@ -128,6 +138,11 @@ namespace Omnipotent.Services.KliveAgent
                 TotalIterations += iterations;
                 TotalPromptTokens += promptTokens;
                 TotalCompletionTokens += completionTokens;
+                if (flatFee)
+                {
+                    TotalFlatFeePromptTokens += promptTokens;
+                    TotalFlatFeeCompletionTokens += completionTokens;
+                }
                 TotalScriptsRun += scripts;
                 TotalScriptFailures += scriptFailures;
                 TotalLatencyMs += latencyMs;
@@ -137,23 +152,28 @@ namespace Omnipotent.Services.KliveAgent
 
             var now = DateTime.UtcNow;
             AccumulateMessage(_days.GetOrAdd(DayKey(now), k => new DayBucket { Date = k }),
-                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel);
+                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel, flatFee);
             AccumulateMessage(_weeks.GetOrAdd(WeekKey(now), k => new WeekBucket { Week = k }),
-                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel);
+                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel, flatFee);
             AccumulateMessage(_months.GetOrAdd(MonthKey(now), k => new MonthBucket { Month = k }),
-                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel);
+                promptTokens, completionTokens, iterations, scripts, scriptFailures, latencyMs, channel, flatFee);
 
             QueueSave();
         }
 
         private static void AccumulateMessage(MetricBucket b, int promptTokens, int completionTokens, int iterations,
-            int scripts, int scriptFailures, long latencyMs, AgentSourceChannel channel)
+            int scripts, int scriptFailures, long latencyMs, AgentSourceChannel channel, bool flatFee)
         {
             lock (b)
             {
                 b.Messages++;
                 b.PromptTokens += promptTokens;
                 b.CompletionTokens += completionTokens;
+                if (flatFee)
+                {
+                    b.FlatFeePromptTokens += promptTokens;
+                    b.FlatFeeCompletionTokens += completionTokens;
+                }
                 b.Iterations += iterations;
                 b.Scripts += scripts;
                 b.ScriptFailures += scriptFailures;
@@ -285,6 +305,8 @@ namespace Omnipotent.Services.KliveAgent
                     TotalIterations = TotalIterations,
                     TotalPromptTokens = TotalPromptTokens,
                     TotalCompletionTokens = TotalCompletionTokens,
+                    TotalFlatFeePromptTokens = TotalFlatFeePromptTokens,
+                    TotalFlatFeeCompletionTokens = TotalFlatFeeCompletionTokens,
                     TotalScriptsRun = TotalScriptsRun,
                     TotalScriptFailures = TotalScriptFailures,
                     TotalCapabilityCalls = TotalCapabilityCalls,
@@ -326,9 +348,13 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        private static double EstimateCost(long promptTokens, long completionTokens)
-            => promptTokens / 1_000_000.0 * PromptCostPerMillion
-             + completionTokens / 1_000_000.0 * CompletionCostPerMillion;
+        /// <summary>The per-million yardstick, applied only to tokens that were actually billed that
+        /// way. Flat-fee tokens are subtracted first: under a flat subscription they cost nothing
+        /// marginal, so including them would invent spend that never happened.</summary>
+        private static double EstimateCost(long promptTokens, long completionTokens,
+            long flatFeePromptTokens = 0, long flatFeeCompletionTokens = 0)
+            => Math.Max(0, promptTokens - flatFeePromptTokens) / 1_000_000.0 * PromptCostPerMillion
+             + Math.Max(0, completionTokens - flatFeeCompletionTokens) / 1_000_000.0 * CompletionCostPerMillion;
 
         /// <summary>Projects a time bucket into the JSON shape the UI charts consume. The period key
         /// name varies (date/week/month) so day/week/month series each carry their own label.</summary>
@@ -354,7 +380,8 @@ namespace Omnipotent.Services.KliveAgent
                 ["maxLatencyMs"] = b.MaxLatencyMs,
                 ["memorySaves"] = b.MemorySaves,
                 ["memoryRecalls"] = b.MemoryRecalls,
-                ["estimatedCostUsd"] = Math.Round(EstimateCost(b.PromptTokens, b.CompletionTokens), 4)
+                ["estimatedCostUsd"] = Math.Round(EstimateCost(b.PromptTokens, b.CompletionTokens,
+                    b.FlatFeePromptTokens, b.FlatFeeCompletionTokens), 4)
             };
         }
 
@@ -420,7 +447,8 @@ namespace Omnipotent.Services.KliveAgent
                     avgCapabilityDurationMs = Math.Round(avgCapabilityDurationMs, 0),
                     scriptSuccessRatePct = Math.Round(scriptSuccessRate, 1),
                     capabilitySuccessRatePct = Math.Round(capabilitySuccessRate, 1),
-                    estimatedCostUsd = Math.Round(EstimateCost(TotalPromptTokens, TotalCompletionTokens), 4)
+                    estimatedCostUsd = Math.Round(EstimateCost(TotalPromptTokens, TotalCompletionTokens,
+                        TotalFlatFeePromptTokens, TotalFlatFeeCompletionTokens), 4)
                 },
                 today = today == null ? null : ProjectBucket("date", today.Date ?? todayKey, today),
                 historyWindow = new
@@ -463,13 +491,15 @@ namespace Omnipotent.Services.KliveAgent
                 TodayTotalTokens = (today?.PromptTokens ?? 0) + (today?.CompletionTokens ?? 0),
                 TodayIterations = today?.Iterations ?? 0,
                 TodayEstimatedCostUsd = Math.Round(
-                    EstimateCost(today?.PromptTokens ?? 0, today?.CompletionTokens ?? 0), 4),
+                    EstimateCost(today?.PromptTokens ?? 0, today?.CompletionTokens ?? 0,
+                        today?.FlatFeePromptTokens ?? 0, today?.FlatFeeCompletionTokens ?? 0), 4),
                 LifetimeMessages = TotalMessages,
                 LifetimeIterations = TotalIterations,
                 AvgIterationsPerMessage = TotalMessages > 0 ? Math.Round((double)TotalIterations / TotalMessages, 2) : 0.0,
                 LifetimePromptTokens = TotalPromptTokens,
                 LifetimeCompletionTokens = TotalCompletionTokens,
-                EstimatedCostUsd = Math.Round(EstimateCost(TotalPromptTokens, TotalCompletionTokens), 4),
+                EstimatedCostUsd = Math.Round(EstimateCost(TotalPromptTokens, TotalCompletionTokens,
+                    TotalFlatFeePromptTokens, TotalFlatFeeCompletionTokens), 4),
                 CapabilityCalls = TotalCapabilityCalls,
                 CapabilitySuccessRatePct = TotalCapabilityCalls > 0
                     ? Math.Round((double)(TotalCapabilityCalls - TotalCapabilityFailures) / TotalCapabilityCalls * 100.0, 1)
@@ -512,6 +542,8 @@ namespace Omnipotent.Services.KliveAgent
             public long TotalIterations { get; set; }
             public long TotalPromptTokens { get; set; }
             public long TotalCompletionTokens { get; set; }
+            public long TotalFlatFeePromptTokens { get; set; }
+            public long TotalFlatFeeCompletionTokens { get; set; }
             public long TotalScriptsRun { get; set; }
             public long TotalScriptFailures { get; set; }
             public long TotalCapabilityCalls { get; set; }
@@ -538,6 +570,11 @@ namespace Omnipotent.Services.KliveAgent
             public long Messages { get; set; }
             public long PromptTokens { get; set; }
             public long CompletionTokens { get; set; }
+            /// <summary>The subset of the token counts above that was served by a FLAT-FEE router
+            /// (AIRouter), where tokens carry no per-token charge. Held separately rather than simply
+            /// omitted so the token graphs stay complete while the cost estimate stays honest.</summary>
+            public long FlatFeePromptTokens { get; set; }
+            public long FlatFeeCompletionTokens { get; set; }
             public long Iterations { get; set; }
             public long Scripts { get; set; }
             public long ScriptFailures { get; set; }

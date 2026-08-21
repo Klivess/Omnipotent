@@ -279,6 +279,11 @@ namespace Omnipotent.Services.Projects
             // owed but never sent is how the Commander reads as unresponsive: every exit path below
             // must either carry prose to him or leave this false for the closing backstop.
             bool repliedToKlives = false;
+            // Set once the provider is resolved; read by the RemoteLLMException handler below, which
+            // is outside the scope the LLM service is declared in. A flat-fee router's rate limit is a
+            // one-minute fair-use window, not a spent balance, and must not stand the project down for
+            // fifteen minutes.
+            bool flatFeeProvider = false;
             using var cts = new CancellationTokenSource();
             activeWakeCts[projectID] = cts; // registered so Klives can halt this wake
             if (cancelBeforeStart.TryRemove(projectID, out _)) cts.Cancel();
@@ -292,6 +297,7 @@ namespace Omnipotent.Services.Projects
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
+                flatFeeProvider = await llm.IsFlatFeeProviderAsync();
                 if (!await llm.SupportsNativeToolCallingAsync())
                     throw new InvalidOperationException("The Commander requires a remote LLM provider with native tool calling.");
                 if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
@@ -356,7 +362,7 @@ namespace Omnipotent.Services.Projects
                 string sessionId = $"projects-commander-{projectID}";
                 string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
                     settings.RecentEventsConsidered, settings.RecentEventsBudget,
-                    settings.ChronologicalRecentEvents);
+                    settings.ChronologicalRecentEvents, flatFeeProvider);
                 llm.ResetSession(sessionId);
                 llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled));
                 llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
@@ -899,7 +905,7 @@ namespace Omnipotent.Services.Projects
                 var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
                 string providerDetail = ProjectProviderFailure.Describe(ex);
                 outcomePayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
-                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex);
+                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex, flatFeeProvider: flatFeeProvider);
                 // A provider failure is telemetry, never an autonomous project veto. Keep the
                 // circuit finite so a restored provider or adjusted route can recover itself.
                 failure.Retryable = true;

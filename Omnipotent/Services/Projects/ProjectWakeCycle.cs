@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.Projects
+﻿namespace Omnipotent.Services.Projects
 {
     /// <summary>
     /// The rehydrate-on-wake assembler (§7). The Commander has NO persistent conversation:
@@ -89,9 +89,11 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         /// <param name="recentEventsConsidered">Overrides how many recent events are considered (project setting).</param>
         /// <param name="recentEventsBudget">Overrides the token budget for the recent-event block (project setting).</param>
+        /// <param name="tokensUnmetered">True when the active router bills a flat fee, so the seed
+        /// states that model calls are unmetered instead of quoting a token budget nobody is spending.</param>
         public async Task<string> BuildWakeSeed(Project project, string triggerDescription,
             int? recentEventsConsidered = null, int? recentEventsBudget = null,
-            bool chronologicalEvents = true)
+            bool chronologicalEvents = true, bool tokensUnmetered = false)
         {
             var digest = digests.GetDigest(project.ProjectID);
 
@@ -192,7 +194,8 @@ namespace Omnipotent.Services.Projects
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
-                recentEventsBudget, chronologicalEvents, approvals, taskForce, externalActions);
+                recentEventsBudget, chronologicalEvents, approvals, taskForce, externalActions,
+                tokensUnmetered);
         }
 
         private static string Truncate(string s, int max) =>

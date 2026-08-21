@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 
 namespace Omnipotent.Services.Projects
 {
@@ -39,7 +39,8 @@ namespace Omnipotent.Services.Projects
             bool chronologicalEvents = true,
             string? approvalsBlock = null,
             string? taskForceBlock = null,
-            string? externalActionsBlock = null)
+            string? externalActionsBlock = null,
+            bool tokensUnmetered = false)
         {
             var sb = new StringBuilder();
 
@@ -48,7 +49,13 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"Name: {project.Name}");
             sb.AppendLine($"Goal: {project.Goal}");
             sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampWithAge(project.CreatedAt)}");
-            sb.AppendLine($"Budgets: tokens ${project.TokenBudgetUsd:0.##} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
+            // Under a flat-fee router the token budget is not a live constraint, and stating one
+            // invites the Commander to ration model calls it is not actually paying for. The MONEY
+            // budget is unaffected: that governs real purchases, not inference.
+            string tokenBudgetLine = tokensUnmetered
+                ? "tokens unmetered (flat-fee router — do not ration model calls to save money)"
+                : $"tokens ${project.TokenBudgetUsd:0.##}";
+            sb.AppendLine($"Budgets: {tokenBudgetLine} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
             sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
 

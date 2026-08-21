@@ -1216,6 +1216,13 @@ namespace Omnipotent.Services.KliveAgent
                 try { useToolCalling = await llm.SupportsNativeToolCallingAsync(); }
                 catch { useToolCalling = false; }
 
+                // Whether this turn's tokens carry a per-token price. A flat-fee router (AIRouter)
+                // still produces real token counts, but no money moves with them, so the stats
+                // yardstick must not bill them — see KliveAgentStats.EstimateCost.
+                bool flatFeeProvider;
+                try { flatFeeProvider = await llm.IsFlatFeeProviderAsync(); }
+                catch { flatFeeProvider = false; }
+
                 // Per-token streaming: when on (and we have a live progress channel), the model's output
                 // is surfaced token-by-token as it generates. Configurable so it can be turned off.
                 bool streamTokens = onProgress != null && await agentService.GetBoolOmniSetting("KliveAgent_StreamTokens", defaultValue: true);
@@ -1418,7 +1425,7 @@ namespace Omnipotent.Services.KliveAgent
                     try { llm.ResetSession(llmSessionId); } catch { }
                     agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                         allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
-                        turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                        turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
                     return new AgentChatResponse
                     {
                         ConversationId = conversation.ConversationId,
@@ -1553,7 +1560,7 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
-                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
                         return new AgentChatResponse
                         {
                             ConversationId = conversation.ConversationId,
@@ -1681,7 +1688,7 @@ namespace Omnipotent.Services.KliveAgent
                             llm.ResetSession(llmSessionId);
                             agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                                 allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
-                                turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                                turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
                             return new AgentChatResponse
                             {
                                 ConversationId = conversation.ConversationId,
@@ -1728,7 +1735,7 @@ namespace Omnipotent.Services.KliveAgent
 
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
-                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel);
+                            turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
 
                         // NOTE: We deliberately do NOT auto-save "task completed" summaries here.
                         // Memory is for durable facts about reality (who Klives is, how a service

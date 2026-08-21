@@ -41,6 +41,30 @@ namespace Omnipotent.Services.Projects
         /// <summary>Raised (projectID) when a project crosses 100% and is auto-paused, so a surface can alert Klives.</summary>
         public event Action<string>? BudgetPausedRaised;
 
+        /// <summary>
+        /// True while the active router bills a FLAT FEE (AIRouter) rather than per token. Everything
+        /// this ledger exists to police — turn reservations, the 80% warning, the 100% auto-pause —
+        /// is arithmetic on money that, under a flat fee, is never actually charged. Metering it
+        /// anyway would stop a project on a bill that does not exist, and a stopped project is
+        /// exactly the wake deferral we are trying to make impossible.
+        ///
+        /// Token COUNTS are still recorded in full: they are real telemetry the analytics and usage
+        /// views need. Only the USD attribution is zeroed.
+        ///
+        /// Wired by <c>Projects</c> to KliveLLM's provider setting; unset (null) means per-token
+        /// billing, so behaviour is unchanged for every existing provider.
+        /// </summary>
+        public Func<bool>? IsFlatFeeProvider { get; set; }
+
+        private bool FlatFee
+        {
+            get
+            {
+                try { return IsFlatFeeProvider?.Invoke() ?? false; }
+                catch { return false; }
+            }
+        }
+
         public ProjectBudgetLedger(ProjectStore projectStore, ProjectEventLogStore eventLog,
             OpenRouterCostFetcher costFetcher, Action<string> log,
             ProjectTokenUsageStore? tokenUsage = null)
@@ -137,6 +161,14 @@ namespace Omnipotent.Services.Projects
             try
             {
                 var project = projectStore.GetProject(projectID);
+                // Under a flat fee there is nothing to reserve against: the turn is admitted on the
+                // project being runnable alone. Returning null here is what makes a wake report
+                // WakeDeferred, so a flat-fee router must never reach that path.
+                if (FlatFee)
+                {
+                    bool flatFeeRunnable = project?.Status is ProjectStatus.Active or ProjectStatus.Planning;
+                    return flatFeeRunnable ? new LlmTurnLease(this, projectID, 0) : null;
+                }
                 double reservation = 0;
                 lock (LockFor(projectID))
                 {
@@ -175,7 +207,9 @@ namespace Omnipotent.Services.Projects
         public bool IsWithinTokenBudget(string projectID)
         {
             var project = projectStore.GetProject(projectID);
-            if (project == null || project.TokenBudgetUsd <= 0) return false;
+            if (project == null) return false;
+            if (FlatFee) return true; // no per-token bill to exceed
+            if (project.TokenBudgetUsd <= 0) return false;
             lock (LockFor(projectID)) return LoadLocked(projectID).TokenSpendUsd < project.TokenBudgetUsd;
         }
 
@@ -201,13 +235,21 @@ namespace Omnipotent.Services.Projects
             // flat provisional, which the /generation fetch later reconciles when a generation ID exists.
             promptTokens = Math.Max(0, promptTokens);
             completionTokens = Math.Max(0, completionTokens);
-            bool haveActual = actualCostUsd.HasValue
-                && double.IsFinite(actualCostUsd.Value)
-                && actualCostUsd.Value >= 0;
-            double amount = haveActual
-                ? actualCostUsd!.Value
-                : promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
-                + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
+            // A flat-fee router charges nothing per token, so there is no real figure to book and no
+            // estimate worth making: the cost IS zero, and it is recorded as authoritative ("actual")
+            // rather than provisional so nothing later tries to reconcile it against a per-token
+            // pricing endpoint that knows nothing about this generation.
+            bool flatFee = FlatFee;
+            bool haveActual = flatFee
+                || (actualCostUsd.HasValue
+                    && double.IsFinite(actualCostUsd.Value)
+                    && actualCostUsd.Value >= 0);
+            double amount = flatFee
+                ? 0
+                : haveActual
+                    ? actualCostUsd!.Value
+                    : promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
+                    + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
 
             lock (LockFor(projectID))
             {
@@ -236,7 +278,9 @@ namespace Omnipotent.Services.Projects
                 CompletionTokens = completionTokens,
                 CachedPromptTokens = Math.Clamp(cachedPromptTokens, 0, promptTokens),
                 CostUsd = amount,
-                CostBasis = haveActual ? "actual" : "provisional",
+                // "flat-fee" rather than "actual" so the usage view can say WHY a turn cost nothing,
+                // instead of leaving a reader to wonder whether the figure simply failed to arrive.
+                CostBasis = flatFee ? "flat-fee" : haveActual ? "actual" : "provisional",
                 GenerationID = generationId,
             });
 
@@ -389,6 +433,10 @@ namespace Omnipotent.Services.Projects
 
         private void CheckTokenThresholds(string projectID)
         {
+            // The 80% warning and the 100% auto-pause both measure spend that a flat fee never
+            // incurs. Skipping them is what guarantees a flat-fee project can never be paused —
+            // and therefore never deferred — by a budget it is not actually consuming.
+            if (FlatFee) return;
             var project = projectStore.GetProject(projectID);
             if (project == null || project.TokenBudgetUsd <= 0) return;
 
@@ -431,9 +479,12 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Provisional USD cost for a token count (the same yardstick applied per turn), for
-        /// per-wake cost attribution in the timeline. The reconciled OpenRouter figure supersedes it cumulatively.</summary>
+        /// per-wake cost attribution in the timeline. The reconciled OpenRouter figure supersedes it
+        /// cumulatively. Zero under a flat fee — the tokens are real, the charge is not.</summary>
         public double EstimateCost(long promptTokens, long completionTokens)
-            => promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
+            => FlatFee
+             ? 0
+             : promptTokens / 1_000_000.0 * ProvisionalPromptPerMillion
              + completionTokens / 1_000_000.0 * ProvisionalCompletionPerMillion;
 
         /// <summary>
@@ -465,6 +516,11 @@ namespace Omnipotent.Services.Projects
             var project = projectStore.GetProject(projectID);
             var ledger = GetLedger(projectID);
             if (project == null) return "unknown project";
+            // Under a flat fee the token budget is not a constraint the agent should reason about —
+            // saying "$0.00/$50 (0%)" every wake would invite it to economise for no reason.
+            if (FlatFee)
+                return $"tokens unmetered (flat-fee router; {ledger.PromptTokens + ledger.CompletionTokens:N0} tokens used, no per-token charge), " +
+                       $"money ${ledger.MoneySpendUsd:0.##}/${project.MoneyBudgetUsd:0.##}";
             return $"tokens ${ledger.TokenSpendUsd:0.##}/${project.TokenBudgetUsd:0.##} " +
                    $"({(project.TokenBudgetUsd > 0 ? ledger.TokenSpendUsd / project.TokenBudgetUsd : 0):P0}), " +
                    $"money ${ledger.MoneySpendUsd:0.##}/${project.MoneyBudgetUsd:0.##}";

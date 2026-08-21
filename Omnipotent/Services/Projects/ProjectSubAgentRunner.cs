@@ -248,6 +248,10 @@ namespace Omnipotent.Services.Projects
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
             ProjectResumeAction? startingResumeAction = null;
+            // Set once the provider is resolved; read by the RemoteLLMException handler, which sits
+            // outside the scope the LLM service is declared in. Parity with the Commander: a flat-fee
+            // router's rate limit is a one-minute fair-use window, not an exhausted balance.
+            bool flatFeeProvider = false;
             try
             {
                 var running = parent.RuntimeState.MarkAgentWakeRunning(projectID, agent.AgentID, wakeID, leaseGeneration);
@@ -258,6 +262,7 @@ namespace Omnipotent.Services.Projects
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
+                flatFeeProvider = await llm.IsFlatFeeProviderAsync();
                 if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
                 {
                     var credit = await parent.ProviderCredit.CheckAsync(cts.Token);
@@ -811,7 +816,7 @@ namespace Omnipotent.Services.Projects
             catch (RemoteLLMException ex)
             {
                 string providerDetail = ProjectProviderFailure.Describe(ex);
-                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex);
+                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex, flatFeeProvider: flatFeeProvider);
                 var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
                 // Provider labels describe the failed attempt, not permission to permanently
                 // block an autonomous project. Keep retry telemetry truthful but recoverable.

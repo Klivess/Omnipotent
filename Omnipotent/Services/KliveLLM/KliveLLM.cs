@@ -144,7 +144,20 @@ namespace Omnipotent.Services.KliveLLM
         private const string DefaultCustomOpenAIEndpoint = "https://agentrouter.org/v1/";
         private const string DefaultCustomOpenAIModel = "openai/gpt-4.1-mini";
 
-        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", CustomOpenAIProviderOption };
+        // AIRouter (api.airouter.ch) — a Swiss OpenAI-compatible router sold as a FLAT FEE: unlimited
+        // access, no per-token price. It gets its own provider rather than riding the generic custom
+        // endpoint because two of its behaviours are not generic:
+        //   • no pricing — every cost meter (the Projects budget ledger above all) must book ZERO for
+        //     it, or a project would budget-pause against money that is never actually charged;
+        //   • a hard fair-use envelope (3 parallel / 240 req-min / 10M token-min) that we stay under
+        //     by client-side admission control (AIRouterFairUseLimiter) instead of by handling 429s.
+        // The wire format itself is vanilla OpenAI chat-completions, so every OpenRouter-proprietary
+        // extra stays gated on LLMProvider.OpenRouter exactly as it is for CustomOpenAI.
+        private const string AIRouterProviderOption = "AIRouter";
+        private const string AIRouterEndpoint = "https://api.airouter.ch/v1";
+        private const string DefaultAIRouterModel = "Qwen3.8";
+
+        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", CustomOpenAIProviderOption, AIRouterProviderOption };
         private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
         private static readonly string[] ThinkingTypeOptions = new[] { "Off", "Low", "Medium", "High" };
 
@@ -182,7 +195,27 @@ namespace Omnipotent.Services.KliveLLM
             HuggingFace,
             OpenRouter,
             CustomOpenAI,
+            AIRouter,
         }
+
+        /// <summary>
+        /// True for providers billed as a flat subscription rather than per token. Callers that meter
+        /// spend (the Projects budget ledger, KliveAgent's stats estimate) must book zero for these:
+        /// their token counts are still real telemetry, but no money moves with them, so a budget
+        /// must never pause work on account of them.
+        /// </summary>
+        internal static bool IsFlatFee(LLMProvider provider) => provider == LLMProvider.AIRouter;
+
+        // One process-wide limiter: the fair-use envelope is per KEY, and every subsystem
+        // (KliveAgent, Projects Commander + sub-agents + councils + utility routes, Omniscience,
+        // Stratum) shares the one configured AIRouter key, so they must share one queue.
+        private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new();
+
+        /// <summary>The fair-use queue this instance admits AIRouter requests through. Defaults to the
+        /// process-wide one — the live service must share a queue with every other caller of the same
+        /// key. A test-constructed instance gets its own so a deliberate 429 in one test cannot stall
+        /// the shared queue for the rest of the run.</summary>
+        internal AIRouterFairUseLimiter FairUse { get; set; } = sharedAIRouterFairUse;
 
         internal sealed class RemoteLLMProviderConfiguration
         {
@@ -214,6 +247,9 @@ namespace Omnipotent.Services.KliveLLM
         internal KliveLLM(HttpClient httpClient) : this()
         {
             client = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
+            // Never share the live fair-use queue with a test instance: a test that deliberately
+            // provokes a 429 would otherwise penalise every other caller in the process.
+            FairUse = new AIRouterFairUseLimiter();
         }
 
         protected override async void ServiceMain()
@@ -248,6 +284,7 @@ namespace Omnipotent.Services.KliveLLM
 
             if (e.Setting.Name == "RemoteLLMProvider" && valueChanged)
             {
+                cachedActiveProvider = (int)ParseProvider(e.Setting.Value);
                 if (ParseProvider(e.Setting.Value) == LLMProvider.Local)
                 {
                     await SetupLocalLLM();
@@ -291,6 +328,14 @@ namespace Omnipotent.Services.KliveLLM
                 return LLMProvider.CustomOpenAI;
             }
 
+            // Accept the spaced spelling too — it is how the service brands itself, and a setting
+            // typed by hand should not silently fall through to HuggingFace.
+            if (string.Equals(configuredProvider, AIRouterProviderOption, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(configuredProvider, "AI Router", StringComparison.OrdinalIgnoreCase))
+            {
+                return LLMProvider.AIRouter;
+            }
+
             return LLMProvider.HuggingFace;
         }
 
@@ -310,11 +355,30 @@ namespace Omnipotent.Services.KliveLLM
                 : trimmed + "/chat/completions";
         }
 
+        // Last provider the dropdown resolved to. GetActiveProviderAsync is async (it reads an
+        // OmniSetting) but the cost meters that must know "is this router flat-fee?" run on
+        // synchronous hot paths — a budget check per model turn. This cache is refreshed on every
+        // resolution and on the settings-changed event, so it is never more than one turn stale.
+        private volatile int cachedActiveProvider = (int)LLMProvider.HuggingFace;
+
         private async Task<LLMProvider> GetActiveProviderAsync()
         {
             string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", ProviderOptions, false, false);
-            return ParseProvider(configuredProvider);
+            var provider = ParseProvider(configuredProvider);
+            cachedActiveProvider = (int)provider;
+            return provider;
         }
+
+        /// <summary>
+        /// Whether the active router charges a flat fee rather than per token — the question every
+        /// cost meter in Omnipotent has to answer before it books spend. Synchronous by design: it
+        /// serves the per-turn budget check in Projects, which cannot await a settings read.
+        /// </summary>
+        public bool IsFlatFeeProviderNow() => IsFlatFee((LLMProvider)cachedActiveProvider);
+
+        /// <summary>Authoritative (settings-reading) form of <see cref="IsFlatFeeProviderNow"/>, for
+        /// callers that are already on an async path and want to prime the cache.</summary>
+        public async Task<bool> IsFlatFeeProviderAsync() => IsFlatFee(await GetActiveProviderAsync());
 
         private async Task EnsureProviderSettingsExistAsync()
         {
@@ -348,6 +412,9 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("CustomOpenAIEndpointURL", DefaultCustomOpenAIEndpoint, false, false);
             await GetStringOmniSetting("CustomOpenAILLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, false);
+            // AIRouter needs no endpoint setting: it is one fixed service, not a generic gateway.
+            await GetStringOmniSetting("AIRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
+            await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
             await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
@@ -543,6 +610,7 @@ namespace Omnipotent.Services.KliveLLM
                 {
                     LLMProvider.OpenRouter => await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true),
                     LLMProvider.CustomOpenAI => await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true),
+                    LLMProvider.AIRouter => await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true),
                     _ => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
                 };
             }
@@ -1435,6 +1503,24 @@ namespace Omnipotent.Services.KliveLLM
                     customModel);
             }
 
+            if (ParseProvider(configuredProvider) == LLMProvider.AIRouter)
+            {
+                string aiRouterToken = await GetOmniSetting("AIRouterLLMToken", OmniSettingType.String, true, false);
+                string aiRouterModel = await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true);
+
+                if (string.IsNullOrWhiteSpace(aiRouterToken))
+                {
+                    throw new InvalidOperationException("AIRouterLLMToken is missing.");
+                }
+
+                return new RemoteLLMProviderConfiguration(
+                    LLMProvider.AIRouter,
+                    AIRouterProviderOption,
+                    ResolveChatCompletionsEndpoint(AIRouterEndpoint),
+                    aiRouterToken,
+                    aiRouterModel);
+            }
+
             if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
             {
                 throw new InvalidOperationException("Remote provider configuration was requested while RemoteLLMProvider is set to Local.");
@@ -1470,6 +1556,158 @@ namespace Omnipotent.Services.KliveLLM
         private const int RateLimitBaseDelayMs = 3000;
         private const int RateLimitMaxDelayMs = 20000;
         private const double AffordableTokenSafetyFraction = 0.90;
+
+        // AIRouter's limits are all measured over a ROLLING MINUTE, which makes a 429 there a wait
+        // rather than a wall: one cool-off inside the wake always clears it. So instead of the
+        // ordinary policy — a few short retries, then surface a RateLimited failure that opens the
+        // project circuit and defers the wake — we hold the whole shared queue off for the cool-off
+        // and keep going. Bounded: at most this many attempts, each waiting at most one window.
+        private const int AIRouterRateLimitMaxAttempts = 6;
+        private static readonly TimeSpan AIRouterMaxCoolOff = TimeSpan.FromSeconds(75);
+        private static readonly TimeSpan AIRouterDefaultCoolOff = TimeSpan.FromSeconds(10);
+
+        // What a request with no explicit max_tokens is assumed to be allowed to generate, for
+        // fair-use token accounting only. Uncapped requests routinely default to tens of thousands
+        // of completion tokens, so reserving a small number would under-count the window.
+        private const int FairUseDefaultCompletionReserve = 16_384;
+
+        /// <summary>
+        /// Pessimistic token size of one outbound request: everything being sent plus the entire
+        /// completion being permitted. Over-counting is deliberate — the reservation is reconciled
+        /// DOWN to the provider's own figure once the response lands, so the per-minute token window
+        /// can never be over-committed during the gap between admission and reply.
+        /// </summary>
+        internal static long EstimateRequestTokens(HFWrapper.HFLLMInferenceRequest payload)
+        {
+            long total = 0;
+            if (payload.messages != null)
+                foreach (var message in payload.messages)
+                    if (message != null)
+                        total += EstimateMessageTokens(message);
+            total += EstimateToolDefinitionTokens(payload.tools);
+            total += payload.max_tokens is > 0 ? payload.max_tokens.Value : FairUseDefaultCompletionReserve;
+            return total;
+        }
+
+        /// <summary>Queue behind the flat-fee router's fair-use envelope, or pass straight through for
+        /// every other provider. Null means "no limiter applies", not "denied" — this never rejects.</summary>
+        private async Task<AIRouterFairUseLease?> AcquireFairUseAsync(
+            RemoteLLMProviderConfiguration remoteProvider,
+            HFWrapper.HFLLMInferenceRequest payload,
+            CancellationToken cancellationToken)
+        {
+            if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
+            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), cancellationToken);
+        }
+
+        // ── AIRouter model resolution ──
+        // AIRouter serves a small catalogue under its OWN names ("Qwen3.8", "DeepSeek-V4-Flash"),
+        // not the "vendor/model" slugs OpenRouter uses. Every Projects role and KliveAgent route is
+        // configured in slug form, so pointing the provider dropdown at AIRouter would send it a
+        // model it has never heard of — a 404, classified ModelUnavailable, which opens the project
+        // circuit and DEFERS the wake. That is the exact failure this integration exists to remove,
+        // and it would hit on the very first turn after switching provider. So a request whose model
+        // AIRouter does not serve is redirected to the configured AIRouterModelID instead.
+        private static readonly HttpClient aiRouterCatalogHttp = new() { Timeout = TimeSpan.FromSeconds(10) };
+        private readonly object aiRouterCatalogLock = new();
+        private HashSet<string>? aiRouterModels;
+        private DateTime aiRouterModelsFetchedUtc = DateTime.MinValue;
+        private static readonly TimeSpan AIRouterCatalogTtl = TimeSpan.FromHours(6);
+
+        /// <summary>
+        /// A model id in "vendor/model" form is an OpenRouter/HuggingFace slug, which AIRouter's flat
+        /// namespace never uses. Used as the offline verdict when the live catalogue is unreachable:
+        /// better to serve the configured AIRouter model than to send a slug we can already tell is
+        /// foreign and take a deferral for it.
+        /// </summary>
+        internal static bool LooksLikeForeignModelSlug(string? model) =>
+            !string.IsNullOrWhiteSpace(model) && model.Contains('/', StringComparison.Ordinal);
+
+        /// <summary>Chooses the model to actually send AIRouter: the caller's, when AIRouter serves it,
+        /// otherwise the configured <c>AIRouterModelID</c>. Non-AIRouter providers are untouched.</summary>
+        private async Task<string> ResolveAIRouterModelAsync(
+            string? requested, RemoteLLMProviderConfiguration remoteProvider, CancellationToken cancellationToken)
+        {
+            string fallback = remoteProvider.Model;
+            string model = (requested ?? string.Empty).Trim();
+            if (model.Length == 0) return fallback;
+
+            var catalog = await GetAIRouterCatalogAsync(remoteProvider, cancellationToken);
+            bool served = catalog != null
+                ? catalog.Contains(model)
+                : !LooksLikeForeignModelSlug(model);
+            if (served) return model;
+
+            try
+            {
+                await ServiceLog($"AIRouter does not serve '{model}'; using the configured AIRouter model '{fallback}' " +
+                    "instead of failing the turn on an unknown model.");
+            }
+            catch { }
+            return fallback;
+        }
+
+        /// <summary>Fetches + caches AIRouter's advertised model ids. Returns null on any failure so the
+        /// caller falls back to the slug heuristic — a catalogue probe must never break a request.</summary>
+        private async Task<HashSet<string>?> GetAIRouterCatalogAsync(
+            RemoteLLMProviderConfiguration remoteProvider, CancellationToken cancellationToken)
+        {
+            lock (aiRouterCatalogLock)
+            {
+                if (aiRouterModels != null && DateTime.UtcNow - aiRouterModelsFetchedUtc < AIRouterCatalogTtl)
+                    return aiRouterModels;
+            }
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, AIRouterEndpoint.TrimEnd('/') + "/models");
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
+                using var response = await aiRouterCatalogHttp.SendAsync(request, cancellationToken);
+                if (!response.IsSuccessStatusCode) return null;
+
+                var json = JObject.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+                var ids = ((json["data"] as JArray) ?? new JArray())
+                    .Select(entry => (string?)entry["id"])
+                    .Where(id => !string.IsNullOrWhiteSpace(id))
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase)!;
+                if (ids.Count == 0) return null;
+
+                lock (aiRouterCatalogLock)
+                {
+                    aiRouterModels = ids;
+                    aiRouterModelsFetchedUtc = DateTime.UtcNow;
+                }
+                return ids;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                try { await ServiceLog($"AIRouter model catalogue unavailable ({ex.Message}); using the slug heuristic."); } catch { }
+                return null;
+            }
+        }
+
+        /// <summary>Reconcile a fair-use reservation against the provider's reported usage. A response
+        /// without a usage block leaves the pessimistic reservation standing — under-counting the
+        /// window is the one failure mode this whole mechanism exists to prevent.</summary>
+        private static void ReportFairUseUsage(AIRouterFairUseLease? lease, HFWrapper.HFLLMInferenceResponse.UsageDetails? usage)
+        {
+            if (lease == null || usage == null) return;
+            long total = usage.total_tokens > 0
+                ? usage.total_tokens
+                : (long)usage.prompt_tokens + usage.completion_tokens;
+            if (total > 0) lease.ReportActualTokens(total);
+        }
+
+        /// <summary>The cool-off to hold the shared AIRouter queue for after a 429 that slipped through
+        /// admission control (another client on the same key, or a window boundary landing badly).</summary>
+        private static TimeSpan ResolveAIRouterCoolOff(TimeSpan? providerRetryAfter)
+        {
+            var coolOff = providerRetryAfter is { } requested && requested > TimeSpan.Zero
+                ? requested
+                : AIRouterDefaultCoolOff;
+            return coolOff > AIRouterMaxCoolOff ? AIRouterMaxCoolOff : coolOff;
+        }
 
         private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
         {
@@ -1519,6 +1757,12 @@ namespace Omnipotent.Services.KliveLLM
                 : (modelRoutes != null && modelRoutes.Count > 0 && !string.IsNullOrWhiteSpace(modelRoutes[0])
                     ? modelRoutes[0].Trim()
                     : remoteProvider.Model);
+
+            // AIRouter names its models in its own flat namespace, so a caller's OpenRouter-style
+            // route would 404 there. Redirect to the configured AIRouter model rather than let an
+            // unknown-model failure defer the wake. Every other provider keeps the caller's route.
+            if (remoteProvider.Provider == LLMProvider.AIRouter)
+                primaryModel = await ResolveAIRouterModelAsync(primaryModel, remoteProvider, cancellationToken);
 
             HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
             {
@@ -1893,6 +2137,11 @@ namespace Omnipotent.Services.KliveLLM
             payload.stream_options = new { include_usage = true };
             string payloadJson = JsonConvert.SerializeObject(payload);
 
+            // A streamed generation occupies a parallel slot for its WHOLE duration, not just the
+            // request/response round-trip, so the lease is method-scoped: it is released when the SSE
+            // body ends. Non-flat-fee providers get null and pass straight through.
+            using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
+
             using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
             {
                 Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
@@ -1908,6 +2157,12 @@ namespace Omnipotent.Services.KliveLLM
             if (!response.IsSuccessStatusCode)
             {
                 string body = await response.Content.ReadAsStringAsync(cancellationToken);
+                // The caller falls back to the buffered path on any streaming failure. If this was a
+                // fair-use rejection, hold the shared queue first so that fallback waits out the
+                // cool-off instead of immediately reproducing the same 429.
+                if (remoteProvider.Provider == LLMProvider.AIRouter
+                    && ((int)response.StatusCode == 429 || IsUpstreamRateLimitBody(body)))
+                    FairUse.Penalize(ResolveAIRouterCoolOff(GetProviderRetryAfter(response)));
                 throw new HttpRequestException(
                     $"{remoteProvider.DisplayName} streaming request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {body}");
             }
@@ -2029,6 +2284,9 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
 
+            // The final SSE chunk carries usage; reconcile the reservation before returning.
+            ReportFairUseUsage(fairUse, usage);
+
             return new HFWrapper.HFLLMInferenceResponse
             {
                 id = generationId,
@@ -2106,8 +2364,13 @@ namespace Omnipotent.Services.KliveLLM
             {
                 HttpResponseMessage response;
                 string responseContent;
+                // Every ATTEMPT is another request against the per-minute windows, so admission is
+                // re-acquired per attempt rather than once per call. The lease holds the parallel slot
+                // only for the HTTP exchange; its window entry outlives disposal for the full minute.
+                AIRouterFairUseLease? fairUse = null;
                 try
                 {
+                    fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
                     using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
                     {
                         Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
@@ -2149,6 +2412,13 @@ namespace Omnipotent.Services.KliveLLM
                     await DelayBeforeRetryAsync(attempt, null, cancellationToken);
                     continue;
                 }
+                finally
+                {
+                    // The HTTP exchange is over (body fully read, or it failed) — hand the parallel
+                    // slot back immediately so a queued caller can use it while we parse. The window
+                    // entry survives disposal, so the per-minute limits still count this request.
+                    fairUse?.Dispose();
+                }
 
                 // TEMP DIAGNOSTIC (harness-leak hunt, Jul 2026): detect Claude-Code / Agent-SDK harness
                 // scaffolding in this exchange. In the OUTBOUND payload => it was echoed from a poisoned
@@ -2183,6 +2453,36 @@ namespace Omnipotent.Services.KliveLLM
                         bool rateLimited = status == 429 || IsUpstreamRateLimitBody(responseContent);
                         bool transient = status == 408 || status >= 500 || rateLimited;
                         if (rateLimited) maxAttempts = Math.Max(maxAttempts, RateLimitMaxAttempts);
+
+                        // A 429 from a flat-fee router means our client-side admission control drifted
+                        // out of step with the router's own windows — another client on the same key, a
+                        // window boundary, a restart that lost the in-memory window. It is not a reason
+                        // to give up the wake: the windows are per-minute, so hold the WHOLE shared queue
+                        // for the cool-off (every other agent would otherwise walk straight into the same
+                        // wall) and keep retrying. The sleep happens inside the limiter on the next
+                        // admission, so no extra backoff is added here.
+                        if (rateLimited && remoteProvider.Provider == LLMProvider.AIRouter)
+                        {
+                            var coolOff = ResolveAIRouterCoolOff(GetProviderRetryAfter(response));
+                            FairUse.Penalize(coolOff);
+                            maxAttempts = Math.Max(maxAttempts, AIRouterRateLimitMaxAttempts);
+                            if (attempt < maxAttempts)
+                            {
+                                try
+                                {
+                                    // The window state is the diagnostic that matters here: it says
+                                    // whether our own admission control drifted, or whether something
+                                    // outside this process is spending the same key.
+                                    var window = FairUse.Describe();
+                                    await ServiceLog($"AIRouter fair-use limit reached (attempt {attempt}/{maxAttempts}); " +
+                                        $"queue held for {coolOff.TotalSeconds:0.#}s, then retrying in-wake. " +
+                                        $"Our window: {window.RequestsInWindow}/{window.RequestCeiling} requests, " +
+                                        $"{window.TokensInWindow:N0}/{window.TokenCeiling:N0} tokens, {window.InFlight} in flight.");
+                                }
+                                catch { }
+                                continue;
+                            }
+                        }
 
                         // OpenRouter's 402 response includes the maximum completion length the current
                         // account can fund. A missing max_tokens lets a model default to a very large
@@ -2254,6 +2554,9 @@ namespace Omnipotent.Services.KliveLLM
                         throw emptyEx;
                     }
 
+                    // Swap our pessimistic reservation for what the router actually counted, releasing
+                    // the difference to the callers queued behind us.
+                    ReportFairUseUsage(fairUse, hfResponse.usage);
                     return hfResponse;
                 }
             }

@@ -97,6 +97,9 @@ namespace Omnipotent.Services.Projects
         public ProjectCouncilRunner CouncilRunner { get; private set; } = null!;
         public ProjectSubAgentRunner SubAgentRunner { get; private set; } = null!;
         private System.Threading.Timer? retentionTimer;
+        /// <summary>KliveLLM, resolved once, so the per-turn budget check can ask whether the active
+        /// router bills per token without awaiting a service lookup on a hot path.</summary>
+        private KliveLLM.KliveLLM? llmForBudget;
 
         public Projects()
         {
@@ -177,6 +180,24 @@ namespace Omnipotent.Services.Projects
             ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
             ProviderContexts = new OpenRouterContextWindowResolver(openRouterToken, msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg), TokenUsage);
+            // Whether tokens cost money at all is a property of the router Klives has selected. Under a
+            // flat-fee router (AIRouter) the ledger must book zero, or a project would warn, pause and
+            // defer its wakes against a bill nobody is being sent. The check runs per model turn, so it
+            // reads a cached service reference rather than resolving the service each time.
+            Budget.IsFlatFeeProvider = () => llmForBudget?.IsFlatFeeProviderNow() ?? false;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var llm = await GetKliveLLM();
+                    if (llm == null) return;
+                    // Force one authoritative settings read so the synchronous check above is never
+                    // answering from an unprimed default during the first wake after a restart.
+                    await llm.IsFlatFeeProviderAsync();
+                    llmForBudget = llm;
+                }
+                catch (Exception ex) { await ServiceLogError(ex, "Projects: could not resolve the LLM provider billing mode"); }
+            });
             // Alert Klives when a project auto-pauses on budget exhaustion (checks DiscordManager at
             // fire time, so it works even if Discord came up after the ledger was created).
             Budget.BudgetPausedRaised += pid =>

@@ -277,6 +277,143 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
+        public void ProviderDropdown_RecognisesAIRouterInEitherSpelling()
+        {
+            Assert.Equal(LlmService.LLMProvider.AIRouter, LlmService.ParseProvider("AIRouter"));
+            Assert.Equal(LlmService.LLMProvider.AIRouter, LlmService.ParseProvider("airouter"));
+            // The service brands itself "AI Router"; a hand-typed setting must not fall through
+            // to HuggingFace and quietly bill a different account.
+            Assert.Equal(LlmService.LLMProvider.AIRouter, LlmService.ParseProvider("AI Router"));
+        }
+
+        [Fact]
+        public void FlatFee_IsTrueOnlyForTheFlatFeeRouter()
+        {
+            // This flag is what stops the Projects budget ledger metering spend that never happens.
+            Assert.True(LlmService.IsFlatFee(LlmService.LLMProvider.AIRouter));
+            Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.OpenRouter));
+            Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.CustomOpenAI));
+            Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.HuggingFace));
+            Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.Local));
+        }
+
+        [Fact]
+        public async Task AIRouter_PostsToItsOwnEndpointWithItsOwnKeyAndNoOpenRouterHeaders()
+        {
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            await service.SendPayloadWithRetryAsync(AIRouter(), Payload(maxTokens: 256));
+
+            var request = Assert.Single(handler.Requests);
+            Assert.Equal("https://api.airouter.ch/v1/chat/completions", request.Uri);
+            Assert.Equal("airouter-token", request.AuthParameter);
+            Assert.DoesNotContain("HTTP-Referer", request.HeaderNames);
+            Assert.DoesNotContain("X-Title", request.HeaderNames);
+
+            // AIRouter is a VANILLA OpenAI endpoint: none of the OpenRouter-proprietary extras may
+            // be sent, or a strict endpoint 400s on a parameter it does not know.
+            var body = JObject.Parse(handler.RequestBodies[0]);
+            Assert.Null(body["models"]);
+            Assert.Null(body["usage"]);
+            Assert.Null(body["reasoning"]);
+            Assert.Null(body["provider"]);
+            Assert.Null(body["service_tier"]);
+        }
+
+        [Fact]
+        public void AIRouter_NeverReceivesOpenRouterOnlyParameters()
+        {
+            var fallback = Payload(null);
+            fallback.model = "Qwen3.8";
+            LlmService.ApplyModelFallback(ref fallback, AIRouter(), new[] { "Qwen3.8", "DeepSeek-V4-Flash" });
+            Assert.Null(fallback.models);
+
+            var sampling = Payload(null);
+            LlmService.ApplySamplingParameters(ref sampling, AIRouter(),
+                new ModelSamplingParameters(Temperature: 0.4, TopK: 40, MinP: 0.05, ServiceTier: "flex"));
+            Assert.Equal(0.4, sampling.temperature);   // vanilla OpenAI fields still apply…
+            Assert.Null(sampling.top_k);               // …the OpenRouter extensions do not
+            Assert.Null(sampling.min_p);
+            Assert.Null(sampling.service_tier);
+
+            var compression = Payload(null);
+            LlmService.ApplyContextCompression(ref compression, AIRouter(), enabled: true);
+            Assert.Null(compression.plugins);
+        }
+
+        [Fact]
+        public async Task AIRouter402_FailsFastWithoutTheOpenRouterAffordableRetry()
+        {
+            // A flat-fee router has no per-request affordability to negotiate down to.
+            var handler = new RecordingHandler(
+                _ => JsonResponse(HttpStatusCode.PaymentRequired, PaymentBody(10_000)),
+                _ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(
+                () => service.SendPayloadWithRetryAsync(AIRouter(), Payload(maxTokens: null)));
+
+            Assert.Single(handler.RequestBodies);
+            Assert.Equal("AIRouter", error.Provider);
+        }
+
+        [Fact]
+        public async Task AIRouterRateLimit_IsWaitedOutInWakeRatherThanSurfacedAsAFailure()
+        {
+            // The fair-use windows are per minute, so a 429 is a pause, not a wall. The whole point
+            // is that Projects never sees a RateLimited exception it would defer a wake on.
+            var handler = new RecordingHandler(
+                _ => RateLimitResponse(),
+                _ => RateLimitResponse(),
+                _ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http)
+            {
+                // Instant cool-offs: the retry policy is under test, not the wall clock.
+                FairUse = new AIRouterFairUseLimiter(delay: (_, _) => Task.CompletedTask),
+            };
+
+            var response = await service.SendPayloadWithRetryAsync(AIRouter(), Payload(maxTokens: 256));
+
+            Assert.Single(response.choices);
+            Assert.Equal(3, handler.RequestBodies.Count);
+            Assert.True(service.FairUse.Describe().TotalPenalties >= 2,
+                "each 429 must hold the shared queue, not just back off the caller that hit it");
+        }
+
+        [Theory]
+        // OpenRouter/HuggingFace slugs — AIRouter has never heard of these, and sending one is a
+        // 404 → ModelUnavailable → opened circuit → deferred wake.
+        [InlineData("anthropic/claude-sonnet-4.5", true)]
+        [InlineData("openai/gpt-4.1-mini", true)]
+        [InlineData("meta-llama/Llama-3.1-8B-Instruct:cerebras", true)]
+        // AIRouter's own flat namespace.
+        [InlineData("Qwen3.8", false)]
+        [InlineData("DeepSeek-V4-Flash", false)]
+        [InlineData("", false)]
+        public void ForeignModelSlug_IsRecognisedByItsVendorPrefix(string model, bool foreign)
+        {
+            Assert.Equal(foreign, LlmService.LooksLikeForeignModelSlug(model));
+        }
+
+        [Fact]
+        public void RequestTokenEstimate_CountsThePromptPlusTheWholeCompletionReserve()
+        {
+            // Deliberately pessimistic: the reservation is reconciled down once real usage lands, so
+            // under-counting here is the only outcome that could overrun the router's token window.
+            var withCap = Payload(maxTokens: 4_096);
+            long capped = LlmService.EstimateRequestTokens(withCap);
+            Assert.True(capped > 4_096, "the prompt must be counted on top of the completion reserve");
+
+            // No explicit cap means the model may run to its own (large) default.
+            var uncapped = Payload(maxTokens: null);
+            Assert.True(LlmService.EstimateRequestTokens(uncapped) > capped);
+        }
+
+        [Fact]
         public void ModelFallback_RespectsOpenRouterThreeBackupMaximum()
         {
             var payload = Payload(maxTokens: null);
@@ -318,6 +455,21 @@ namespace Omnipotent.Tests.KliveLLM
             LlmService.ResolveChatCompletionsEndpoint("https://agentrouter.org/v1/"),
             "custom-endpoint-token",
             "openai/gpt-4.1-mini");
+
+        private static LlmService.RemoteLLMProviderConfiguration AIRouter() => new(
+            LlmService.LLMProvider.AIRouter,
+            "AIRouter",
+            LlmService.ResolveChatCompletionsEndpoint("https://api.airouter.ch/v1"),
+            "airouter-token",
+            "Qwen3.8");
+
+        private static HttpResponseMessage RateLimitResponse()
+        {
+            var response = JsonResponse(HttpStatusCode.TooManyRequests,
+                "{\"error\":{\"code\":429,\"message\":\"rate limited\"}}");
+            response.Headers.TryAddWithoutValidation("Retry-After", "2");
+            return response;
+        }
 
         private static HFWrapper.HFLLMInferenceRequest Payload(int? maxTokens) => new()
         {
