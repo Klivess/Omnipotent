@@ -30,11 +30,9 @@ public class ProjectToolFacadeTests
     }
 
     [Fact]
-    public void CommanderOfferedSurfaceStaysUnderTheLimit()
+    public void CommanderOfferedSurfaceNamesEachToolOnce()
     {
         var offered = ProjectToolFacade.Fold(CommanderCanonical());
-        Assert.True(offered.Count <= ProjectToolFacade.OfferedToolLimit,
-            $"Commander is offered {offered.Count} tools, over the {ProjectToolFacade.OfferedToolLimit} limit.");
         Assert.Equal(offered.Count, offered.Select(t => t.function.name).Distinct(StringComparer.Ordinal).Count());
     }
 
@@ -43,11 +41,10 @@ public class ProjectToolFacadeTests
     [InlineData(ProjectAgentTier.TextImage)]
     [InlineData(ProjectAgentTier.TextImageVideo)]
     [InlineData(ProjectAgentTier.TextImageVideoAudio)]
-    public void WorkerOfferedSurfaceStaysUnderTheLimit(ProjectAgentTier tier)
+    public void WorkerOfferedSurfaceNamesEachToolOnce(ProjectAgentTier tier)
     {
         var offered = ProjectToolFacade.Fold(WorkerCanonical(tier));
-        Assert.True(offered.Count <= ProjectToolFacade.OfferedToolLimit,
-            $"{tier} worker is offered {offered.Count} tools, over the {ProjectToolFacade.OfferedToolLimit} limit.");
+        Assert.Equal(offered.Count, offered.Select(t => t.function.name).Distinct(StringComparer.Ordinal).Count());
     }
 
     [Fact]

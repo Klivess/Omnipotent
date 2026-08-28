@@ -85,10 +85,12 @@ action across wakes, which is invisible within any single wake.
 `ProjectTierRouter` routes work to a model tier proportional to its difficulty rather than sending
 everything to the largest model.
 
-**A bounded tool surface.** Offered tools are hard-capped at 64
-([`ProjectToolFacade`](../Omnipotent/Services/Projects/ProjectToolFacade.cs)); related tools fold into
-one definition with an `op` parameter. New capabilities are added as operations, not as new tools,
-because tool-list bloat degrades selection accuracy.
+**A coherent tool surface.** Related tools fold into one definition with an `op` parameter
+([`ProjectToolFacade`](../Omnipotent/Services/Projects/ProjectToolFacade.cs)), so a capability group
+reads as one vocabulary rather than a dozen sibling names. Folding is presentation only: every call
+is unfolded back to its canonical `(name, arguments)` pair before contract validation, tier gating,
+auditing and dispatch. There is no cap on the number of offered definitions — a new capability is
+added as whichever shape fits it, a new tool or an op on an existing group.
 
 **Real environments.** [`Containers/`](../Omnipotent/Services/Projects/Containers) gives each project
 an isolated Docker desktop, reachable over VNC. Agents get a browser and a shell; the owner can take

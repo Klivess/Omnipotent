@@ -830,7 +830,7 @@ namespace Omnipotent.Services.KliveLLM
         /// to a tiny text placeholder, to keep the vision/computer-use context window from overflowing. Only
         /// touches standalone screenshot messages — assistant tool_calls and their tool results are untouched,
         /// so the tool-call protocol stays intact.</summary>
-        private static void PruneOldToolImages(KliveLLMSession s, int keepRecent)
+        internal static void PruneOldToolImages(KliveLLMSession s, int keepRecent)
         {
             if (keepRecent < 1) keepRecent = 1;
             var imageIdx = new List<int>();
@@ -839,7 +839,12 @@ namespace Omnipotent.Services.KliveLLM
                 var m = s.structuredMessages[i];
                 if (m.role == "user" && MessageHasImage(m)) imageIdx.Add(i);
             }
+            // Batched for prefix-cache stability (see PromptPrefixStability): a flattened message is
+            // one an earlier request already sent, so doing it one frame per turn re-prefills the
+            // whole tail behind it every turn. An already-flattened message no longer carries an
+            // image, so imageIdx counts exactly the frames still outstanding.
             int toPrune = imageIdx.Count - keepRecent;
+            if (toPrune < PromptPrefixStability.MediaPruneBatch(keepRecent)) return;
             for (int k = 0; k < toPrune; k++)
             {
                 s.structuredMessages[imageIdx[k]] = new HFWrapper.HFMessage
@@ -912,7 +917,10 @@ namespace Omnipotent.Services.KliveLLM
                 var m = s.structuredMessages[i];
                 if (m.role == "user" && MessageHasAudio(m)) audioIdx.Add(i);
             }
+            // Batched for the same reason as PruneOldToolImages: rewriting one already-sent message
+            // per turn pins the prefix-cache match rate low for the whole session.
             int toPrune = audioIdx.Count - keepRecent;
+            if (toPrune < PromptPrefixStability.MediaPruneBatch(keepRecent)) return;
             for (int k = 0; k < toPrune; k++)
             {
                 s.structuredMessages[audioIdx[k]] = new HFWrapper.HFMessage
@@ -962,30 +970,61 @@ namespace Omnipotent.Services.KliveLLM
         /// replacing a long output with a tiny stub. The message and its tool_call_id/name pairing are KEPT (so the
         /// tool-call protocol stays valid) — only the bulky, now-stale text is dropped. The model can always re-run a
         /// tool to fetch fresh data. This is the text analog of <see cref="PruneOldToolImages"/>.</summary>
-        private static void PruneOldToolResults(KliveLLMSession s, int keepRecent, int stubOverChars = 240)
+        /// <remarks>
+        /// BATCHED ON PURPOSE — see <see cref="PromptPrefixStability"/>. Stubbing one newly-old tool
+        /// result per turn rewrites a message the previous request already sent, every turn, which
+        /// moves the first differing byte permanently into the middle of the transcript and forces
+        /// the provider to re-prefill everything behind it on every single turn. So we wait until a
+        /// whole batch of results is due, then stub them together: most turns leave history
+        /// byte-identical and extend a cached prefix, and the cost of the rewrite is amortised.
+        /// </remarks>
+        internal static void PruneOldToolResults(KliveLLMSession s, int keepRecent, int stubOverChars = 240)
         {
             if (keepRecent < 1) keepRecent = 1;
             var toolIdx = new List<int>();
             for (int i = 0; i < s.structuredMessages.Count; i++)
                 if (s.structuredMessages[i].role == "tool") toolIdx.Add(i);
 
-            int toPrune = toolIdx.Count - keepRecent;
-            for (int k = 0; k < toPrune; k++)
+            // Only results that still hold their full text are actually rewritable; the ones stubbed
+            // by an earlier batch are already at their final bytes and cost nothing to leave alone.
+            // Counting those separately is what makes the hysteresis work: it measures OUTSTANDING
+            // work, which resets after each batch, rather than transcript length, which never does.
+            //
+            // "Already stubbed" is decided by the notice, NOT by length: a stub is ~265 chars, which
+            // is longer than stubOverChars, so a length test re-stubs its own output. That silently
+            // re-trimmed every old result a second time (reporting a wrong trimmed-chars count) and,
+            // worse here, meant the batch could never drain and history churned on every turn.
+            int overLimit = toolIdx.Count - keepRecent;
+            var due = new List<int>();
+            for (int k = 0; k < overLimit; k++)
             {
-                var m = s.structuredMessages[toolIdx[k]];
-                if (m.content is string str && str.Length > stubOverChars)
+                var candidate = s.structuredMessages[toolIdx[k]];
+                if (candidate.content is string text
+                    && text.Length > stubOverChars
+                    && !text.Contains(ToolResultTrimNotice, StringComparison.Ordinal))
                 {
-                    s.structuredMessages[toolIdx[k]] = new HFWrapper.HFMessage
-                    {
-                        role = "tool",
-                        tool_call_id = m.tool_call_id,
-                        name = m.name,
-                        content = str.Substring(0, 160).TrimEnd() +
-                            $"\n[…{str.Length - 160} chars of this earlier tool output trimmed to save context — re-run the tool if you still need it.]"
-                    };
+                    due.Add(toolIdx[k]);
                 }
             }
+            if (due.Count < PromptPrefixStability.ToolResultPruneBatch(keepRecent)) return;
+
+            foreach (int idx in due)
+            {
+                var m = s.structuredMessages[idx];
+                if (m.content is not string str) continue;
+                s.structuredMessages[idx] = new HFWrapper.HFMessage
+                {
+                    role = "tool",
+                    tool_call_id = m.tool_call_id,
+                    name = m.name,
+                    content = str.Substring(0, 160).TrimEnd() +
+                        $"\n[…{str.Length - 160} {ToolResultTrimNotice} — re-run the tool if you still need it.]"
+                };
+            }
         }
+
+        /// <summary>Marks a tool result as already stubbed, so a later pass leaves it alone.</summary>
+        private const string ToolResultTrimNotice = "chars of this earlier tool output trimmed to save context";
 
         // ── In-task context compaction ──
         // A long agentic task adds one assistant+tool exchange per step; left unbounded the request grows into
@@ -1084,7 +1123,15 @@ namespace Omnipotent.Services.KliveLLM
             // caller can never protect the whole conversation and defeat compaction entirely.
             int protectedEnd = Math.Clamp(headStart + Math.Max(0, protectPrefixMessages), headStart, Math.Max(headStart, msgs.Count - 1));
 
+            // Compaction rewrites the middle of a transcript every request behind it has already
+            // sent, so it is the most expensive thing we can do to a provider's prefix cache. Aim
+            // BELOW the trigger rather than at it: landing just under the line means the next tool
+            // result puts the session straight back over it and a long wake re-compacts — and so
+            // re-prefills itself — on essentially every turn. See PromptPrefixStability.
+            int target = PromptPrefixStability.CompactionTarget(aboveTokens);
+
             List<HFWrapper.HFMessage>? rebuilt = null;
+            List<HFWrapper.HFMessage>? underTrigger = null;
             List<HFWrapper.HFMessage>? bestCompaction = null;
             int bestCompactionTokens = int.MaxValue;
             int availableTail = Math.Max(1, msgs.Count - protectedEnd);
@@ -1104,7 +1151,11 @@ namespace Omnipotent.Services.KliveLLM
                         bestCompaction = candidate;
                         bestCompactionTokens = candidateTokens;
                     }
-                    if (candidateTokens <= aboveTokens)
+                    // The loop walks tails largest-first, so the first candidate to fit each bar is
+                    // the most history that bar allows. Remember the one that merely clears the
+                    // trigger in case nothing reaches the headroom target.
+                    if (underTrigger == null && candidateTokens <= aboveTokens) underTrigger = candidate;
+                    if (candidateTokens <= target)
                     {
                         rebuilt = candidate;
                         break;
@@ -1112,12 +1163,17 @@ namespace Omnipotent.Services.KliveLLM
                 }
 
                 if (tailToKeep == 1) break;
-                int next = Math.Max(1, tailToKeep / 2);
+                // Step down in quarters rather than halves. Halving overshoots the target and throws
+                // away verbatim history the budget would have paid for; a finer walk keeps the
+                // largest tail that still leaves the session room to grow before the next rewrite.
+                int next = Math.Max(1, tailToKeep - Math.Max(1, tailToKeep / 4));
                 if (next == tailToKeep) break;
                 tailToKeep = next;
             }
 
-            rebuilt ??= bestCompaction ?? new List<HFWrapper.HFMessage>(msgs);
+            // Falling back to `underTrigger` preserves the old contract — get under the trigger by
+            // whatever means — for the sessions whose protected prefix alone leaves no headroom.
+            rebuilt ??= underTrigger ?? bestCompaction ?? new List<HFWrapper.HFMessage>(msgs);
             TrimStringMessagesToBudget(rebuilt, headStart, aboveTokens);
             s.structuredMessages = rebuilt;
             return true;
@@ -1690,13 +1746,24 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Reconcile a fair-use reservation against the provider's reported usage. A response
         /// without a usage block leaves the pessimistic reservation standing — under-counting the
         /// window is the one failure mode this whole mechanism exists to prevent.</summary>
-        private static void ReportFairUseUsage(AIRouterFairUseLease? lease, HFWrapper.HFLLMInferenceResponse.UsageDetails? usage)
+        private void ReportFairUseUsage(AIRouterFairUseLease? lease, HFWrapper.HFLLMInferenceResponse.UsageDetails? usage)
         {
             if (lease == null || usage == null) return;
             long total = usage.total_tokens > 0
                 ? usage.total_tokens
                 : (long)usage.prompt_tokens + usage.completion_tokens;
             if (total > 0) lease.ReportActualTokens(total);
+
+            // A lease only exists for AIRouter, so this meters exactly the traffic whose prefill we
+            // are responsible for. The router already tells us how much of each prompt it served from
+            // cache; until now nothing read it, which is why a prompt-assembly regression could run
+            // for hours and reach us only as a suspension notice. See PrefixCacheMeter.
+            string? warning = PrefixCacheMeter.Shared.Record(
+                usage.prompt_tokens, usage.prompt_tokens_details?.cached_tokens ?? 0);
+            if (warning != null)
+            {
+                try { _ = ServiceLog(warning); } catch { }
+            }
         }
 
         /// <summary>The cool-off to hold the shared AIRouter queue for after a 429 that slipped through

@@ -114,8 +114,6 @@ public class NonVisionProjectCapabilityTests
         {
             var offered = ProjectToolFacade.Fold(profile.Canonical);
             var offeredNames = offered.Select(t => t.function.name).ToArray();
-            Assert.True(offered.Count <= ProjectToolFacade.OfferedToolLimit,
-                $"{profile.Name} offers {offered.Count} tools; limit is {ProjectToolFacade.OfferedToolLimit}.");
             Assert.Equal(offeredNames.Length,
                 offeredNames.Distinct(StringComparer.Ordinal).Count());
 

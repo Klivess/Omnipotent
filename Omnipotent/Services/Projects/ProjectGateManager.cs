@@ -234,7 +234,11 @@ namespace Omnipotent.Services.Projects
             var sb = new StringBuilder();
             foreach (var gate in gates.Where(g => !g.Resolved).OrderBy(g => g.CreatedAt))
             {
-                sb.AppendLine($"PENDING: \"{gate.Title}\" ({gate.Kind}) opened {TemporalFormat.StampWithAge(gate.CreatedAt)}" +
+                // Absolute stamps throughout this block: it is seeded high in every wake, so a
+                // recomputed relative age would change its bytes on every wake and cost a re-prefill
+                // of the whole seed behind it even when no approval had moved. The agent reads
+                // staleness off the seed's 'Now:' line. See PromptPrefixStability.
+                sb.AppendLine($"PENDING: \"{gate.Title}\" ({gate.Kind}) opened {TemporalFormat.StampMinute(gate.CreatedAt)}" +
                     (gate.DiscussionCount > 0
                         ? $"; Klives has commented {gate.DiscussionCount}× without deciding: \"{string.Join("\" / \"", gate.DiscussionComments.TakeLast(2))}\""
                         : "; no response from Klives yet"));
@@ -243,7 +247,7 @@ namespace Omnipotent.Services.Projects
             foreach (var gate in gates.Where(g => g.Resolved)
                 .OrderByDescending(g => g.ResolvedAt ?? g.CreatedAt).Take(SeededResolvedGates))
             {
-                sb.AppendLine($"RESOLVED: \"{gate.Title}\" — {gate.Decision} {TemporalFormat.StampWithAge(gate.ResolvedAt ?? gate.CreatedAt)}" +
+                sb.AppendLine($"RESOLVED: \"{gate.Title}\" — {gate.Decision} {TemporalFormat.StampMinute(gate.ResolvedAt ?? gate.CreatedAt)}" +
                     (string.IsNullOrWhiteSpace(gate.Comment) ? "" : $": \"{gate.Comment}\""));
             }
             return sb.ToString().TrimEnd();

@@ -44,11 +44,16 @@ namespace Omnipotent.Services.Projects
         {
             var sb = new StringBuilder();
 
+            // PREFIX-CACHE ORDER (see PromptPrefixStability). This header used to open with the
+            // wall-clock and a recomputed relative age, which made the seed's SECOND line differ on
+            // every wake — so the project header, capability truth, directives and grand plan behind
+            // it were re-prefilled from scratch every time even when their text had not changed.
+            // Absolute stamps here (they mean the same thing and never churn); the live clock is
+            // stated with the trigger at the end, where the genuinely per-wake content lives.
             sb.AppendLine("── PROJECT ──");
-            sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — every timestamp in this seed and in your messages is UTC; measure staleness and elapsed time against this clock.");
             sb.AppendLine($"Name: {project.Name}");
             sb.AppendLine($"Goal: {project.Goal}");
-            sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampWithAge(project.CreatedAt)}");
+            sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampMinute(project.CreatedAt)}");
             // Under a flat-fee router the token budget is not a live constraint, and stating one
             // invites the Commander to ration model calls it is not actually paying for. The MONEY
             // budget is unaffected: that governs real purchases, not inference.
@@ -85,6 +90,23 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
             }
 
+            // These two are REFERENCE, not news: the account registry only moves when someone signs up
+            // somewhere, and the bridge is deliberately task-independent. Grouping them here with the
+            // other rarely-changing blocks — rather than leaving them buried behind the roster, typed
+            // state and digest — is what lets a provider's prefix cache carry them from one wake to the
+            // next, since the match ends at the first block that churned. See PromptPrefixStability.
+            if (!string.IsNullOrWhiteSpace(accountsBlock))
+            {
+                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
+            }
+
+            if (!string.IsNullOrWhiteSpace(kliveAgentContextBlock))
+            {
+                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same service graph/capabilities/recipes available to this agent) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveAgentContextBlock, ProjectsContextBudget.KnowledgeBudget));
+            }
+
             // Directly under the plan, because staffing is decided before the Commander picks up any
             // work itself: the plan says what must happen, this says who is free to do it. The old
             // one-line org chart carried no last-report, no silence age and no slot arithmetic, so a
@@ -114,7 +136,10 @@ namespace Omnipotent.Services.Projects
                     externalActionsBlock, ProjectsContextBudget.ObservablesBudget));
             }
 
-            sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampWithAge(digest.UpdatedAt)}) ──");
+            // Absolute, not StampWithAge: a relative age recomputes every wake, so an UNCHANGED digest
+            // would still hand the provider a different byte here and cost a re-prefill of everything
+            // after it. The clock line at the end of the seed is what the age was for.
+            sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampMinute(digest.UpdatedAt)}) ──");
             string digestBlock = ComposeDigestBlock(digest);
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digestBlock, ProjectsContextBudget.DigestBudget));
 
@@ -126,29 +151,12 @@ namespace Omnipotent.Services.Projects
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observablesBlock, ProjectsContextBudget.ObservablesBudget));
             }
 
-            // Shared account registry (global across every project + KliveAgent). Reuse before
-            // creating a duplicate; account_list for details, account_register after any signup.
-            if (!string.IsNullOrWhiteSpace(accountsBlock))
-            {
-                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
-                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
-            }
-
             // Persistent project volume shared by Klive, the Commander and every worker. The
             // summary is intentionally small; list_files/stat_file provide paged detail on demand.
             if (!string.IsNullOrWhiteSpace(filesBlock))
             {
                 sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(filesBlock, ProjectsContextBudget.SharedFilesBudget));
-            }
-
-            // The interactive KliveAgent and Project agents share the same live service graph and
-            // operating recipes. Keep this compact and task-independent; source/data detail remains
-            // discoverable through the parity script globals and direct code tools.
-            if (!string.IsNullOrWhiteSpace(kliveAgentContextBlock))
-            {
-                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same service graph/capabilities/recipes available to this agent) ──");
-                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveAgentContextBlock, ProjectsContextBudget.KnowledgeBudget));
             }
 
             // Cross-system knowledge (other projects, KliveAgent memory, Omniscience, repo docs). The
@@ -206,7 +214,11 @@ namespace Omnipotent.Services.Projects
                     sb.AppendLine(DescribeEvent(x.evt));
             }
 
+            // The clock lives here, at the very end of the seed, rather than in the header. It is the
+            // most volatile line in the whole prompt — second precision — so anything placed after it
+            // can never be served from a provider's prefix cache on a later wake.
             sb.AppendLine("── THIS WAKE'S TRIGGER ──");
+            sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — every timestamp in this seed and in your messages is UTC; measure staleness and elapsed time against this clock.");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(triggerDescription, ProjectsContextBudget.StimulusBudget));
 
             return sb.ToString();

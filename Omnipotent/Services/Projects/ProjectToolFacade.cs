@@ -38,14 +38,13 @@ public sealed class ProjectToolUnfoldResult
 /// validation, tier gating, auditing and dispatch — so the event log, the audit redaction rules,
 /// the desktop-interaction policy and the dispatcher continue to see canonical tool names only.
 ///
-/// The offered surface must stay at or below <see cref="OfferedToolLimit"/>: several providers
-/// reject or silently degrade requests carrying more tool definitions than that.
+/// Folding is no longer a budget: there is no cap on how many tool definitions may be offered.
+/// It survives purely as ergonomics — a coherent 'op' vocabulary reads better to a model than
+/// two dozen sibling tool names, and it keeps related capabilities discoverable together. Add a
+/// new capability as whichever shape genuinely fits: a new canonical tool, or an op on a group.
 /// </summary>
 public static class ProjectToolFacade
 {
-    /// <summary>Hard cap on the number of tool definitions offered to any project agent.</summary>
-    public const int OfferedToolLimit = 64;
-
     /// <summary>A member capability of a folded tool: one 'op' value bound to one canonical tool.</summary>
     private sealed record FoldMember(string Op, string CanonicalTool, bool CanonicalOwnsOp);
 

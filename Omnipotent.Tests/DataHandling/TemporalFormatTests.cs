@@ -76,14 +76,14 @@ namespace Omnipotent.Tests.DataHandling
         }
 
         [Fact]
-        public void CommanderWakeSeed_AnchorsOnCurrentClockAndProjectAge()
+        public void CommanderWakeSeed_AnchorsOnCurrentClockAndProjectCreation()
         {
             var project = new Project
             {
                 ProjectID = "p1",
                 Name = "Test",
                 Goal = "Do the thing",
-                CreatedAt = DateTime.UtcNow.AddDays(-3),
+                CreatedAt = KnownUtc,
             };
             string seed = ProjectCommanderPrompts.BuildWakeSeed(
                 project,
@@ -94,8 +94,10 @@ namespace Omnipotent.Tests.DataHandling
 
             Assert.Contains("Now: ", seed);
             Assert.Contains("UTC", seed);
-            Assert.Contains("project created", seed);
-            Assert.Contains("ago", seed);
+            // The creation stamp is ABSOLUTE, not "(3d 4h ago)". A recomputed age in the seed header
+            // changes bytes on every wake and costs the provider's prefix cache the entire seed behind
+            // it — see PromptPrefixStabilityTests. Elapsed time is read off the 'Now:' line instead.
+            Assert.Contains("project created 2026-07-12 18:04 UTC", seed);
         }
     }
 }

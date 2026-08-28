@@ -906,7 +906,6 @@ namespace Omnipotent.Services.Projects
                 : "RAW SCREENSHOTS ARE NOT VISIBLE TO THIS MODEL. This is not a blocker: use desktop op=window_state/read_screen for OCR text and bounds, browser op=inspect mode=controls for cross-frame/shadow-DOM refs, and terminal/structured action results. Never wait for or claim to inspect a screenshot/grid.";
             string desktopNote = @"
 - YOUR DESKTOP is a real computer that's yours — use it. desktop op=terminal runs reliable CLI work inside this isolated Linux desktop and defaults to /project; keep Linux virtualenvs/node_modules under $KLIVE_AGENT_RUNTIME (/agent-runtime). Browser and desktop are folded tools with an op selector; canonical computer_* names remain accepted.
-- " + perception + @"
 - WEBSITE WORK: use the first-party browser tool against the same persistent visible Chromium: open/navigate/inspect/click/fill/type/select/check/hover/scroll/wait/history/tab actions, with script as a bounded last resort. It returns text postconditions and can run without a framebuffer. Raw Playwright/Selenium/headless/CDP/xdotool automation remains blocked.
 - UPLOADS: browser op=upload accepts /project paths and handles both native GTK choosers and hidden file inputs. A file dialog is never a human blocker.
 - TABS: browser op=navigate reuses the active tab and prunes blank/duplicate/cold tabs. Inspect/activate the intended tab before acting.";
@@ -915,12 +914,15 @@ namespace Omnipotent.Services.Projects
                 ? @"YOUR MISSION IS STANDING: you own this beat continuously. It is yours until the commander retires or re-tasks you — reporting a result does not end it, and there is no such thing as finishing it early. Each wake, advance it, report the checkpoint, and end with WORK_STATUS: CONTINUING."
                 : @"YOUR MISSION IS A BOUNDED TASK: deliver it, verify it, report it, and end with WORK_STATUS: COMPLETE. If it turns out to be larger than one wake, keep going across wakes with WORK_STATUS: CONTINUING rather than declaring it done early.";
 
+            // PREFIX-CACHE ORDER (see PromptPrefixStability): everything above the cache breakpoint is
+            // byte-identical for every worker in the fleet, so one worker's cached prefill serves all of
+            // them and a respawned worker inherits its predecessor's. Identity, mission and goal — the
+            // parts that differ per worker and would otherwise invalidate the ~4KB of doctrine behind
+            // them — are stated in ASSIGNMENT at the end, mirroring the Commander's PROJECT PARAMETERS.
             return
-$@"You are a {agent.Tier}-tier SUB-AGENT (role: {agent.Role}, ID: {agent.AgentID}) in an autonomous project task force. The COMMANDER assigns you work; you do focused legwork and report back. You are a standing member of a team, not a one-shot job: you keep your mission across many wakes, and your peers and commander are people you talk to.
+$@"You are a SUB-AGENT in an autonomous project task force. The COMMANDER assigns you work; you do focused legwork and report back. You are a standing member of a team, not a one-shot job: you keep your mission across many wakes, and your peers and commander are people you talk to.
 
-{missionNote}
-
-THE PROJECT'S GOAL (context, not your whole job): {project.Goal}
+Your tier, role, agent ID, mission and the project's goal are stated in ASSIGNMENT at the end of this prompt.
 
 YOUR TOOLBOX:
 - Related capabilities are grouped behind one tool with an 'op' selector — memory, web, knowledge, account, klivemail, vault, stimulus_hook, project_directive, checkpoint, observable, manage_files, repo, run_shell, browser and desktop. Always pass 'op'; each description lists its operations and arguments. Canonical computer_* names remain accepted for resumed guidance.
@@ -946,14 +948,24 @@ RULES:
 - NEVER report an outside-world action you have not actually completed. An email is sent only when klivemail op:send returned success; a form is submitted only when the page said so afterwards. Record anything else you really did with checkpoint op:record_external_action and its evidence, then cite the ledger in your report. Writing 'sent ✅' next to work you attempted, planned, or intend to do is the single most damaging thing you can do here: the commander builds on it, and the whole project proceeds on something that never happened.
 - If your assignment is part of an ongoing operation, maintain its durable queue/ledger under /project, record external IDs before retries, and ensure a recurring timer hook owns future due work. Account creation or one successful publication is not completion of an ongoing assignment unless the commander explicitly bounded it that way.
 - TIME: every message, tool result and event line you see carries a UTC timestamp, and your wake seed's 'Now:' line is the current wall-clock. Trust the stamps (not your training cutoff) for what day it is, and reason about elapsed time — how old data is, how long an action took, whether something you're watching has gone quiet. Report with absolute dates, never 'today'. query_events answers time-window questions about the project's own history ('what happened since 24h'); memory op:recall takes since/until for time-scoped memory.
-- Be concise and factual. Everything you do is on a timeline Klives watches.";
+- Be concise and factual. Everything you do is on a timeline Klives watches.
+
+PERCEPTION: {perception}
+{KliveLLM.KliveLLM.CacheBreakpointMarker}
+ASSIGNMENT:
+You are a {agent.Tier}-tier sub-agent. Role: {agent.Role}. Your agent ID is {agent.AgentID} — peers and the commander address you by it.
+{missionNote}
+THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
         }
 
         private async Task<string> BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
             var sb = new StringBuilder();
-            sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps below and in your messages are UTC.");
+            // PREFIX-CACHE ORDER (see PromptPrefixStability): the wall-clock used to be this seed's
+            // first line, so the capability truth, directives and plan behind it could never be served
+            // from cache on a later wake even when they were unchanged. It now sits with the trigger
+            // at the end, where the rest of the per-wake content already lives.
             sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
             string directives = "";
@@ -1120,6 +1132,7 @@ RULES:
             if (teamActivity.Length > 0) sb.AppendLine(teamActivity);
 
             sb.AppendLine("── YOUR TASK (this wake's trigger) ──");
+            sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps above and in your messages are UTC.");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                 ProjectPromptHygiene.ScrubTrigger(ProjectsContextBudget.ScrubHarnessLeak(
                     trigger, "(trigger text omitted — contained non-project agent scaffolding)")),

@@ -822,9 +822,9 @@ namespace Omnipotent.Services.Projects
                     if (message.Length == 0)
                         return new CommanderToolResult("Message not sent: provide a non-empty message.");
 
-                    // 'team' fans out to every other active agent. Expressed as a target rather than a
-                    // separate tool because the offered surface is hard-capped at 64 definitions —
-                    // coordination primitives have to earn their place as ops, not new tools.
+                    // 'team' fans out to every other active agent. Expressed as a target rather than
+                    // a separate tool because a broadcast is the same act as a message, addressed
+                    // differently — not because the offered surface is rationed.
                     if (string.Equals(target, "team", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(target, "all", StringComparison.OrdinalIgnoreCase))
                     {

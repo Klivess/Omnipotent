@@ -417,7 +417,12 @@ namespace Omnipotent.Services.Projects
         {
             var v = GetCurrentApproved(projectID);
             if (v == null) return "";
-            string when = Data_Handling.TemporalFormat.StampWithAge(v.ResolvedAt ?? v.SubmittedAt);
+            // Absolute, not StampWithAge. This line sits near the TOP of every wake seed, and a
+            // recomputed relative age would hand the provider a different byte there on every wake —
+            // discarding the prefix cache for the whole seed behind an approved plan that had not
+            // changed at all. The agent measures staleness against the seed's 'Now:' line, which both
+            // system prompts instruct it to do. See PromptPrefixStability.
+            string when = Data_Handling.TemporalFormat.StampMinute(v.ResolvedAt ?? v.SubmittedAt);
             var ready = GetReadyMilestones(projectID);
             string readyText = ready.Count == 0 ? "" : $" Ready now: {string.Join(", ", ready.Take(5).Select(m => $"{m.ID} {m.Title}"))}.";
             return $"GRAND PLAN v{v.Version} (approved {when}): {v.Summary}{DescribeProgress(v.Content)}{readyText}";
