@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 
@@ -369,7 +369,7 @@ namespace Omnipotent.Services.Projects
                 return "  ⚑ NEVER WOKEN — spawned but never given work";
             var quiet = nowUtc - LastActivity(a);
             if (quiet >= SilenceThreshold)
-                return $"  ⚑ SILENT {Data_Handling.TemporalFormat.Age(LastActivity(a))} — check on it or re-task it";
+                return $"  ⚑ SILENT since {Data_Handling.TemporalFormat.StampMinute(LastActivity(a))} — check on it or re-task it";
             return "";
         }
 
@@ -397,7 +397,7 @@ namespace Omnipotent.Services.Projects
                 if (!string.IsNullOrWhiteSpace(a.Objective))
                     sb.AppendLine($"  objective: {Clip(a.Objective, 200)}");
                 if (!string.IsNullOrWhiteSpace(a.LastReport) && a.LastReportAt.HasValue)
-                    sb.AppendLine($"  last report {Data_Handling.TemporalFormat.Age(a.LastReportAt.Value)}: {Clip(a.LastReport!, 240)}");
+                    sb.AppendLine($"  last report {Data_Handling.TemporalFormat.StampMinute(a.LastReportAt.Value)}: {Clip(a.LastReport!, 240)}");
                 else if (!IsCommander(a))
                     sb.AppendLine("  last report: (none yet)");
                 string flag = StatusFlag(a, now);

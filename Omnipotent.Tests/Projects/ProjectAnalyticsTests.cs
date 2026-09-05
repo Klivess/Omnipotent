@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.Projects;
 
 namespace Omnipotent.Tests.Projects;
@@ -6,6 +7,63 @@ namespace Omnipotent.Tests.Projects;
 public class ProjectAnalyticsTests
 {
     private static readonly DateTime Now = new(2026, 7, 23, 12, 0, 0, DateTimeKind.Utc);
+
+    [Fact]
+    public void SnapshotCacheKey_QuantizesMovingEndButSeparatesDifferentStarts()
+    {
+        var first = ProjectAnalyticsCalculator.ResolveRange("30d", Now.AddYears(-1), Now);
+        var sameDay = ProjectAnalyticsCalculator.ResolveRange(
+            "30d", Now.AddYears(-1), Now.AddMinutes(1));
+        var nextDay = ProjectAnalyticsCalculator.ResolveRange(
+            "30d", Now.AddYears(-1), Now.AddDays(1));
+        var differentAllTimeStart = ProjectAnalyticsCalculator.ResolveRange(
+            "all", Now.AddYears(-2), Now);
+        var firstAllTimeStart = ProjectAnalyticsCalculator.ResolveRange(
+            "all", Now.AddYears(-1), Now);
+
+        Assert.Equal(
+            ProjectAnalyticsService.SnapshotCacheKey("project", first),
+            ProjectAnalyticsService.SnapshotCacheKey("project", sameDay));
+        Assert.NotEqual(
+            ProjectAnalyticsService.SnapshotCacheKey("project", first),
+            ProjectAnalyticsService.SnapshotCacheKey("project", nextDay));
+        Assert.NotEqual(
+            ProjectAnalyticsService.SnapshotCacheKey("project", firstAllTimeStart),
+            ProjectAnalyticsService.SnapshotCacheKey("project", differentAllTimeStart));
+    }
+
+    [Fact]
+    public void SnapshotFreshness_UsesOneAbsoluteFiveMinuteBucket()
+    {
+        DateTime beforeBoundary = new(2026, 7, 23, 12, 4, 59, DateTimeKind.Utc);
+        Assert.Equal(
+            ProjectAnalyticsService.SnapshotTimeBucket(beforeBoundary.AddMinutes(-4)),
+            ProjectAnalyticsService.SnapshotTimeBucket(beforeBoundary));
+        Assert.NotEqual(
+            ProjectAnalyticsService.SnapshotTimeBucket(beforeBoundary),
+            ProjectAnalyticsService.SnapshotTimeBucket(beforeBoundary.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void ForcedRefresh_MarksTheOuterResponseFillUncacheable()
+    {
+        var projects = new ProjectStore(_ => { });
+        var events = new ProjectEventLogStore(_ => { });
+        var fetcher = new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { });
+        var budgets = new ProjectBudgetLedger(projects, events, fetcher, _ => { });
+        var service = new ProjectAnalyticsService(
+            projects,
+            budgets,
+            events,
+            new ProjectSubAgentManager(projects, events),
+            new ProjectCouncilStore(_ => { }));
+
+        var scope = CacheFillProbe.Fill(() =>
+            service.GetProject("missing-project", "30d", Now, forceRefresh: true));
+
+        Assert.NotNull(scope.UncacheableReason);
+        Assert.False(scope.WouldBeCached());
+    }
 
     [Fact]
     public void BuildProject_UsesLedgerForLifetimeAndAttributedRecordsForTheRange()

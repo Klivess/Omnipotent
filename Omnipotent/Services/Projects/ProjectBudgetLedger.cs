@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
@@ -277,6 +277,24 @@ namespace Omnipotent.Services.Projects
                 PromptTokens = promptTokens,
                 CompletionTokens = completionTokens,
                 CachedPromptTokens = Math.Clamp(cachedPromptTokens, 0, promptTokens),
+                CacheMetricsAvailable = usageContext?.CacheMetricsAvailable ?? false,
+                CacheWritePromptTokens = usageContext?.CacheWritePromptTokens ?? 0,
+                Provider = usageContext?.Provider,
+                RoutedProvider = usageContext?.RoutedProvider,
+                UpstreamInferenceCostUsd = usageContext?.UpstreamInferenceCostUsd,
+                TurnIndex = usageContext?.TurnIndex ?? 0,
+                RequestDurationMs = usageContext?.RequestDurationMs ?? 0,
+                RouterStrategy = usageContext?.RouterStrategy,
+                RouterAttempt = usageContext?.RouterAttempt,
+                ContextWasCompacted = usageContext?.ContextWasCompacted ?? false,
+                CacheEpochID = usageContext?.CacheEpochID,
+                CacheEpochTurnIndex = usageContext?.CacheEpochTurnIndex ?? 0,
+                PromptAssemblyStatus = usageContext?.PromptAssemblyStatus,
+                AppendedBriefTokens = usageContext?.AppendedBriefTokens ?? 0,
+                FullBriefTokens = usageContext?.FullBriefTokens ?? 0,
+                CacheSessionID = usageContext?.CacheSessionID,
+                ResponseCacheStatus = usageContext?.ResponseCacheStatus,
+                PromptCacheTelemetryVersion = usageContext?.PromptCacheTelemetryVersion,
                 CostUsd = amount,
                 // "flat-fee" rather than "actual" so the usage view can say WHY a turn cost nothing,
                 // instead of leaving a reader to wonder whether the figure simply failed to arrive.

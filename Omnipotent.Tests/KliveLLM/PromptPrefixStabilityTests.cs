@@ -295,6 +295,55 @@ public class PromptPrefixStabilityTests
         Assert.DoesNotContain(" ago)", header, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void CacheStableWakeAppend_DoesNotPutASecondClockAtByteZero()
+    {
+        var llm = new LlmService();
+        const string sessionId = "projects-commander-prefix-test";
+        const string seed = "PROJECT: Test\n── THIS WAKE'S TRIGGER ──\nNow: 2026-09-04 12:00:00 UTC\nkeepalive";
+
+        llm.StartToolSession(sessionId, "SYSTEM");
+        llm.AppendCacheStableWakeSeedToToolSession(sessionId, seed);
+
+        var sessionsField = typeof(LlmService).GetField(
+            "sessions", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var sessions = Assert.IsType<Dictionary<string, LlmService.KliveLLMSession>>(
+            sessionsField!.GetValue(llm));
+        var appended = Assert.IsType<string>(sessions[sessionId].structuredMessages[1].content);
+
+        Assert.StartsWith("PROJECT: Test", appended, StringComparison.Ordinal);
+        Assert.False(appended.StartsWith("[", StringComparison.Ordinal),
+            "a receipt timestamp at byte zero invalidates the whole provider prefix cache");
+        Assert.Equal(1, appended.Split("Now:", StringSplitOptions.None).Length - 1);
+
+        // Ordinary messages still need receipt-time grounding; only the already-grounded wake seed
+        // uses the cache-stable append path.
+        llm.AppendUserMessageToToolSession(sessionId, "steering");
+        Assert.StartsWith("[", Assert.IsType<string>(sessions[sessionId].structuredMessages[2].content));
+    }
+
+    [Fact]
+    public void ProjectsAppendMode_NeverRewritesAnAlreadySentToolResult()
+    {
+        var llm = new LlmService();
+        const string sessionId = "projects-prefix-immutable-test";
+        llm.StartToolSession(sessionId, "SYSTEM");
+
+        for (int index = 0; index < 40; index++)
+            llm.AppendToolResult(
+                sessionId, $"call-{index}", "test_tool", new string('x', 4_000),
+                keepRecentFull: 16, preservePromptPrefix: true);
+
+        var sessionsField = typeof(LlmService).GetField(
+            "sessions", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        var sessions = Assert.IsType<Dictionary<string, LlmService.KliveLLMSession>>(
+            sessionsField!.GetValue(llm));
+        var first = sessions[sessionId].structuredMessages.First(message => message.role == "tool");
+
+        Assert.True(HFWrapper.ContentToText(first.content).Count(character => character == 'x') >= 4_000,
+            "Projects mode rewrote a prior tool result; the next provider request would lose its prefix hit.");
+    }
+
     /// Serialises a session the way a provider sees it: one flat byte sequence, roles included, in
     /// order. The prefix cache matches a leading run of THIS.
     private static string Wire(LlmService.KliveLLMSession s) =>

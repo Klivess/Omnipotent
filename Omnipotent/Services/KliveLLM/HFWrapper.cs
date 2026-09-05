@@ -245,6 +245,19 @@ namespace Omnipotent.Services.KliveLLM
             public HFMessage[] messages;
             public string model;
 
+            // OpenRouter sticky-routing key. Projects supplies the same value for every turn of a
+            // Commander/worker session so the router keeps the conversation on the provider that
+            // owns its prompt cache. Omitted for every other OpenAI-compatible provider.
+            [JsonProperty("session_id", NullValueHandling = NullValueHandling.Ignore)]
+            public string session_id;
+
+            // OpenRouter's top-level automatic prompt-caching switch. This complements the explicit
+            // per-block breakpoints below: providers with automatic caching advance the reusable
+            // boundary to the latest cacheable block, while explicit-caching providers continue to
+            // honour the content-part markers.
+            [JsonProperty("cache_control", NullValueHandling = NullValueHandling.Ignore)]
+            public object cache_control;
+
             // OpenRouter model routing / fallback: ordered backups after `model`. OpenRouter attempts them
             // in turn if the primary fails, so provider-side fallback replaces app-side route loops.
             // Only sent for OpenRouter and only when a distinct backup route is configured; ignored otherwise.
@@ -414,6 +427,20 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("time_info")]
             public TimeInfo time_info { get; set; }
 
+            [JsonProperty("openrouter_metadata")]
+            public OpenRouterMetadata openrouter_metadata { get; set; }
+
+            // Transport-only telemetry attached after deserialisation. JsonIgnore keeps retries and
+            // provider payloads byte-for-byte clean while allowing callers to journal what happened.
+            [JsonIgnore]
+            public string request_provider { get; set; }
+
+            [JsonIgnore]
+            public long request_duration_ms { get; set; }
+
+            [JsonIgnore]
+            public string response_cache_status { get; set; }
+
             public class Choice
             {
                 [JsonProperty("finish_reason")]
@@ -436,6 +463,9 @@ namespace Omnipotent.Services.KliveLLM
                 // so the streaming path surfaces it with no extra work.
                 [JsonProperty("cost")]
                 public double? cost { get; set; }
+
+                [JsonProperty("cost_details")]
+                public CostDetails cost_details { get; set; }
 
                 [JsonProperty("total_tokens")]
                 public int total_tokens { get; set; }
@@ -467,8 +497,29 @@ namespace Omnipotent.Services.KliveLLM
 
             public class PromptTokensDetails
             {
+                private int cachedTokens;
                 [JsonProperty("cached_tokens")]
-                public int cached_tokens { get; set; }
+                public int cached_tokens
+                {
+                    get => cachedTokens;
+                    set { cachedTokens = value; HasCacheReadMetrics = true; }
+                }
+
+                // An object containing only audio/image token details is not cache telemetry.
+                [JsonIgnore]
+                public bool HasCacheReadMetrics { get; private set; }
+
+                // Reported for providers/models with priced explicit cache writes. Null is distinct
+                // from zero: automatic caches commonly omit this field even when cached_tokens proves
+                // that later reads are working.
+                [JsonProperty("cache_write_tokens")]
+                public int? cache_write_tokens { get; set; }
+            }
+
+            public class CostDetails
+            {
+                [JsonProperty("upstream_inference_cost")]
+                public double? upstream_inference_cost { get; set; }
             }
 
             public class TimeInfo
@@ -488,6 +539,51 @@ namespace Omnipotent.Services.KliveLLM
                 [JsonProperty("created")]
                 public double created { get; set; }
             }
+        }
+
+        public class OpenRouterMetadata
+        {
+            [JsonProperty("strategy")]
+            public string strategy { get; set; }
+
+            [JsonProperty("attempt")]
+            public int? attempt { get; set; }
+
+            [JsonProperty("endpoints")]
+            public OpenRouterEndpoints endpoints { get; set; }
+
+            [JsonProperty("attempts")]
+            public List<OpenRouterAttempt> attempts { get; set; }
+        }
+
+        public class OpenRouterEndpoints
+        {
+            [JsonProperty("available")]
+            public List<OpenRouterEndpoint> available { get; set; }
+        }
+
+        public class OpenRouterEndpoint
+        {
+            [JsonProperty("provider")]
+            public string provider { get; set; }
+
+            [JsonProperty("model")]
+            public string model { get; set; }
+
+            [JsonProperty("selected")]
+            public bool selected { get; set; }
+        }
+
+        public class OpenRouterAttempt
+        {
+            [JsonProperty("provider")]
+            public string provider { get; set; }
+
+            [JsonProperty("model")]
+            public string model { get; set; }
+
+            [JsonProperty("status")]
+            public object status { get; set; }
         }
 
         // ── Streaming (stream=true) chunk shapes ──
@@ -510,6 +606,9 @@ namespace Omnipotent.Services.KliveLLM
 
             [JsonProperty("usage")]
             public HFLLMInferenceResponse.UsageDetails usage { get; set; }
+
+            [JsonProperty("openrouter_metadata")]
+            public OpenRouterMetadata openrouter_metadata { get; set; }
 
             public class StreamChoice
             {

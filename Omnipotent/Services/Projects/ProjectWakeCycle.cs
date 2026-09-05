@@ -1,11 +1,11 @@
-﻿namespace Omnipotent.Services.Projects
+﻿using Omnipotent.Services.KliveLLM;
+
+namespace Omnipotent.Services.Projects
 {
     /// <summary>
-    /// The rehydrate-on-wake assembler (§7). The Commander has NO persistent conversation:
-    /// each wake rebuilds its context from the standing digest + budget-fitted recent events +
-    /// BM25 retrieval into the full log, so a process restart is indistinguishable from a wake.
-    /// Phase 3's ProjectCommanderRunner calls <see cref="BuildWakeSeed"/> and hands the result
-    /// to a fresh KliveLLM tool session; nothing survives between wakes except what's on disk.
+    /// Rehydrates current project state from durable stores. The runner can append changed
+    /// sections to a compatible bounded conversation; cold starts, expired sessions and context
+    /// rotations use this same full seed. No correctness depends on process-local conversation state.
     /// </summary>
     public class ProjectWakeCycle
     {
@@ -93,7 +93,8 @@
         /// states that model calls are unmetered instead of quoting a token budget nobody is spending.</param>
         public async Task<string> BuildWakeSeed(Project project, string triggerDescription,
             int? recentEventsConsidered = null, int? recentEventsBudget = null,
-            bool chronologicalEvents = true, bool tokensUnmetered = false)
+            bool chronologicalEvents = true, bool tokensUnmetered = false,
+            List<ToolSessionBriefSection>? briefSections = null)
         {
             var digest = digests.GetDigest(project.ProjectID);
 
@@ -195,7 +196,7 @@
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
                 recentEventsBudget, chronologicalEvents, approvals, taskForce, externalActions,
-                tokensUnmetered);
+                tokensUnmetered, briefSections);
         }
 
         private static string Truncate(string s, int max) =>

@@ -247,6 +247,50 @@ namespace Omnipotent.Tests.Projects
             Assert.Equal(0, reader.FullIndexBuilds);
         }
 
+        [Fact]
+        public void AnalyticsRange_RetainsPriorLifecycleButDropsPriorPayloadHistory()
+        {
+            string pid = NewProjectId();
+            var store = NewStore();
+            DateTime from = new(2026, 7, 1, 0, 0, 0, DateTimeKind.Utc);
+            store.Append(new ProjectEvent
+            {
+                ProjectID = pid,
+                Timestamp = from.AddDays(-5),
+                Type = ProjectEventTypes.ToolResult,
+                Text = "old payload",
+                PayloadJson = new string('x', 20_000),
+            });
+            store.Append(new ProjectEvent
+            {
+                ProjectID = pid,
+                Timestamp = from.AddDays(-2),
+                Type = ProjectEventTypes.Status,
+                Author = "klives",
+                Text = "Project paused by Klives",
+            });
+            store.Append(new ProjectEvent
+            {
+                ProjectID = pid,
+                Timestamp = from.AddHours(1),
+                Type = ProjectEventTypes.ToolCall,
+                Text = "in range",
+            });
+            store.Append(new ProjectEvent
+            {
+                ProjectID = pid,
+                Timestamp = from.AddDays(8),
+                Type = ProjectEventTypes.ToolCall,
+                Text = "after range",
+            });
+
+            var result = store.EnumerateForAnalytics(pid, from, from.AddDays(7)).ToList();
+
+            Assert.Equal(new[] { 2L, 3L }, result.Select(item => item.Sequence));
+            Assert.Equal(new[] { ProjectEventTypes.Status, ProjectEventTypes.ToolCall },
+                result.Select(item => item.Type));
+        }
+
         /// <summary>A hard stop can leave a partial trailing record. The tail read must fall back to
         /// the last intact one rather than restarting the sequence and overwriting history.</summary>
         [Fact]

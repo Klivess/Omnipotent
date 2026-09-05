@@ -1,4 +1,4 @@
-using Omnipotent.Services.KliveLLM;
+﻿using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.ComputerControl;
 using System.Collections.Concurrent;
 using Newtonsoft.Json;
@@ -352,32 +352,33 @@ namespace Omnipotent.Services.Projects
                 var canonicalToolDefs = ProjectAgentToolCatalog.BuildCommanderCanonical(visionEnabled);
                 var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
-                // Every wake starts a FRESH session. The seed is a full rehydration from disk (digest,
-                // directives, grand plan, typed state, verified facts, dead ends, retrieval, recent
-                // events), so continuing the previous wake's session carried its entire transcript AND
-                // then appended a second full seed on top — re-billing tens of thousands of tokens on
-                // every turn for context the seed already restores. What the seed cannot restore
-                // verbatim is how the last wake was mid-thought when it stopped; that is carried
-                // separately as a bounded prose tail below.
+                // Rehydrate current state every wake, then append only changed sections to a
+                // bounded, compatible transcript. A rotation uses the full seed from durable stores.
                 string sessionId = $"projects-commander-{projectID}";
-                string wakeSeed = await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
+                var briefSections = new List<ToolSessionBriefSection>();
+                await parent.WakeCycle.BuildWakeSeed(project, triggerDescription,
                     settings.RecentEventsConsidered, settings.RecentEventsBudget,
-                    settings.ChronologicalRecentEvents, flatFeeProvider);
-                llm.ResetSession(sessionId);
-                llm.StartToolSession(sessionId, ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled));
-                llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
+                    settings.ChronologicalRecentEvents, flatFeeProvider, briefSections);
+                var promptStart = llm.StartOrContinueBriefedToolSession(sessionId,
+                    ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled), ProjectPromptContinuity.FitReferences(briefSections),
+                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(),
+                        modelRoutes, toolDefs, commanderParameters),
+                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy));
+                parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
+                    $"Prompt continuity: {promptStart.Reason}; appended ~{promptStart.AppendedTokens:N0} tokens " +
+                    $"(full brief ~{promptStart.FullBriefTokens:N0})."));
 
                 // Messages the compactor must never summarise. These carry the wake's whole brief; the
                 // generic compactor clips a user turn to 240 chars, which would silently erase it.
                 int protectedBriefMessages = 1;
 
                 string? previousWakeTail = parent.RuntimeState.Get(projectID).Checkpoint.LastWakeTail;
-                if (!string.IsNullOrWhiteSpace(previousWakeTail))
+                if (!promptStart.Continued && !string.IsNullOrWhiteSpace(previousWakeTail))
                 {
                     llm.AppendUserMessageToToolSession(sessionId,
                         "── HOW YOUR PREVIOUS WAKE ENDED (verbatim; the event log and query_events hold the rest) ──\n"
                         + previousWakeTail);
-                    protectedBriefMessages++;
+                    if (!promptStart.Continued) protectedBriefMessages++;
                 }
 
                 if (klivesInvolved)
@@ -385,7 +386,7 @@ namespace Omnipotent.Services.Projects
                     llm.AppendUserMessageToToolSession(sessionId,
                         "Klives is waiting on an answer. Call reply_to_klives on your FIRST turn, then get on with the work — " +
                         "this wake may run for hours and he should not have to wait that long to hear from you.");
-                    protectedBriefMessages++;
+                    if (!promptStart.Continued) protectedBriefMessages++;
                 }
                 var approvedPlan = parent.GrandPlans.GetCurrentApproved(projectID)?.Content;
                 var readyMilestones = parent.GrandPlans.GetReadyMilestones(projectID);
@@ -407,7 +408,7 @@ namespace Omnipotent.Services.Projects
                 if (staffingCheckpoint != null)
                 {
                     llm.AppendUserMessageToToolSession(sessionId, staffingCheckpoint);
-                    protectedBriefMessages++;
+                    if (!promptStart.Continued) protectedBriefMessages++;
                 }
 
                 var recentSignatures = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -535,6 +536,24 @@ namespace Omnipotent.Services.Projects
                                 Model = finalModel,
                                 SourceReference = $"{wakeID}:turn:{modelTurns}",
                                 Label = $"Commander model turn {modelTurns}",
+                                Provider = resp.Provider,
+                                RoutedProvider = resp.RoutedProvider,
+                                CacheMetricsAvailable = resp.CacheMetricsAvailable,
+                                CacheWritePromptTokens = resp.CacheWritePromptTokens,
+                                UpstreamInferenceCostUsd = resp.UpstreamInferenceCostUsd,
+                                TurnIndex = modelTurns,
+                                RequestDurationMs = resp.RequestDurationMs,
+                                RouterStrategy = resp.RouterStrategy,
+                                RouterAttempt = resp.RouterAttempt,
+                                ContextWasCompacted = resp.ContextWasCompacted,
+                                CacheEpochID = resp.CacheEpochID,
+                                CacheEpochTurnIndex = resp.CacheEpochTurnIndex,
+                                PromptAssemblyStatus = modelTurns == 1 ? promptStart.Reason : null,
+                                AppendedBriefTokens = modelTurns == 1 ? promptStart.AppendedTokens : 0,
+                                FullBriefTokens = modelTurns == 1 ? promptStart.FullBriefTokens : 0,
+                                CacheSessionID = sessionId,
+                                ResponseCacheStatus = resp.ResponseCacheStatus,
+                                PromptCacheTelemetryVersion = ProjectPromptCacheTelemetry.CurrentVersion,
                             },
                             cachedPromptTokens: resp.CachedPromptTokens);
                     }
@@ -597,7 +616,7 @@ namespace Omnipotent.Services.Projects
                                 RecordedBy = "commander",
                                 ToolName = "resume",
                             });
-                            llm.ResetSession(sessionId);
+                            // The next wake rotates only if its context budget requires it.
                         }
                         parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", final));
                         // When Klives spoke to the Commander, the answer must reach him where he
@@ -650,7 +669,8 @@ namespace Omnipotent.Services.Projects
                                 Text = text, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, text, keepRecentFull: toolResultKeepRecent);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, text,
+                                keepRecentFull: toolResultKeepRecent, preservePromptPrefix: true);
                             liveContextTokens += AddedContextTokens(text);
                             lastCommittedTool = toolName;
                             lastCommittedResult = text;
@@ -814,7 +834,8 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: toolResultKeepRecent);
+                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText,
+                            keepRecentFull: toolResultKeepRecent, preservePromptPrefix: true);
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;
@@ -834,7 +855,7 @@ namespace Omnipotent.Services.Projects
                                 : new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") };
                             llm.AppendUserContentToToolSession(sessionId,
                                 $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify it before acting further.",
-                                frames);
+                                frames, preservePromptPrefix: true);
                             // Charge what the provider will actually bill, from the real frame size. The
                             // old flat 1200/frame under-counted a 1920x1080 screenshot by 40-60%, so the
                             // work-slice boundary consistently let context overshoot its ceiling.
@@ -866,7 +887,7 @@ namespace Omnipotent.Services.Projects
                             RecordedBy = "commander",
                             ToolName = "resume",
                         });
-                        llm.ResetSession(sessionId);
+                        // The next wake rotates only if its context budget requires it.
                         outcomeText = rollover;
                         break;
                     }

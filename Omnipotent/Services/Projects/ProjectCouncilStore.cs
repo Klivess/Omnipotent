@@ -192,6 +192,14 @@ namespace Omnipotent.Services.Projects
                 return LoadLocked(projectID).OrderByDescending(s => s.CreatedAt).Select(Clone).ToList();
         }
 
+        /// <summary>Analytics only reads the result. LoadLocked already creates a detached object
+        /// graph, so cloning every transcript through JSON a second time is redundant hot-path work.</summary>
+        internal List<CouncilSession> ListForAnalytics(string projectID)
+        {
+            lock (LockFor(projectID))
+                return LoadLocked(projectID).OrderByDescending(s => s.CreatedAt).ToList();
+        }
+
         public CouncilSession? Get(string projectID, string councilID)
         {
             lock (LockFor(projectID))

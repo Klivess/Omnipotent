@@ -1,4 +1,4 @@
-using Omnipotent.Services.KliveLLM;
+﻿using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.Projects;
 using LlmService = Omnipotent.Services.KliveLLM.KliveLLM;
 
@@ -211,21 +211,22 @@ public sealed class ProjectDeadEndLedgerTests : IDisposable
             },
         };
 
-        LlmService.ApplyConversationCacheBreakpoint(payload);
+        LlmService.ApplyConversationCacheBreakpoint(payload, previousCacheMessageCount: payload.messages.Length - 1);
 
         // The session's own list and its parts are untouched — no cache_control leaked back into
         // stored history, so the next request rebuilds from identical source material.
         Assert.Single(sessionOwnedParts);
         Assert.Null(originalPart.cache_control);
 
-        // The breakpoint lands on the PREVIOUS user turn, not the live one: marking the live turn
-        // would write a fresh cache entry every request and never read one back.
+        // Pin the prior request's write boundary and write the new growing frontier too.
+        // The next request can find this write without recaching only the original seed.
         var tagged = Assert.IsType<List<object>>(payload.messages[3].content);
         Assert.NotSame(sessionOwnedParts, tagged);
         Assert.NotNull(Assert.IsType<HFWrapper.HFTextPart>(tagged[0]).cache_control);
 
-        // The live turn is left untouched.
-        Assert.IsType<string>(payload.messages[4].content);
+        // The new frontier gets its own write without changing the text.
+        Assert.Equal("the live turn", HFWrapper.ContentToText(payload.messages[4].content));
+        Assert.NotNull(Assert.IsType<HFWrapper.HFTextPart>(Assert.IsType<List<object>>(payload.messages[4].content)[0]).cache_control);
     }
 
     [Fact]
@@ -241,7 +242,7 @@ public sealed class ProjectDeadEndLedgerTests : IDisposable
             },
         };
 
-        LlmService.ApplyConversationCacheBreakpoint(payload);
+        LlmService.ApplyConversationCacheBreakpoint(payload, previousCacheMessageCount: payload.messages.Length - 1);
 
         var parts = Assert.IsType<List<object>>(payload.messages[1].content);
         var text = Assert.IsType<HFWrapper.HFTextPart>(parts[0]);
@@ -250,7 +251,7 @@ public sealed class ProjectDeadEndLedgerTests : IDisposable
     }
 
     [Fact]
-    public void ConversationCacheBreakpoint_NoOpsWithASingleUserTurn()
+    public void ConversationCacheBreakpoint_TagsTheSoleWakeSeed()
     {
         var payload = new HFWrapper.HFLLMInferenceRequest
         {
@@ -263,7 +264,10 @@ public sealed class ProjectDeadEndLedgerTests : IDisposable
 
         LlmService.ApplyConversationCacheBreakpoint(payload);
 
-        Assert.IsType<string>(payload.messages[1].content);
+        var parts = Assert.IsType<List<object>>(payload.messages[1].content);
+        var text = Assert.IsType<HFWrapper.HFTextPart>(Assert.Single(parts));
+        Assert.Equal("only turn", text.text);
+        Assert.NotNull(text.cache_control);
     }
 
     public void Dispose()

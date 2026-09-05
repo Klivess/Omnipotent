@@ -28,13 +28,7 @@ public static class ProjectLifecycleEvents
 
     internal static bool TryReadToStatus(ProjectEvent evt, out ProjectStatus status)
     {
-        bool lifecycleCapableType =
-            string.Equals(evt.Type, ProjectEventTypes.Status, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(evt.Type, ProjectEventTypes.BudgetPaused, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(evt.Type, ProjectEventTypes.ProjectBlocked, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(evt.Type, ProjectEventTypes.ProjectUnblocked, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(evt.Type, ProjectEventTypes.KlivesMessage, StringComparison.OrdinalIgnoreCase);
-        if (!lifecycleCapableType)
+        if (!IsLifecycleCapableType(evt.Type))
         {
             status = default;
             return false;
@@ -139,6 +133,15 @@ public static class ProjectLifecycleEvents
         status = default;
         return false;
     }
+
+    /// <summary>Cheap type-only prefilter used by analytics while scanning old JSONL rows. The
+    /// full payload/text reader above remains authoritative for whether a candidate is a transition.</summary>
+    internal static bool IsLifecycleCapableType(string? type)
+        => string.Equals(type, ProjectEventTypes.Status, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, ProjectEventTypes.BudgetPaused, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, ProjectEventTypes.ProjectBlocked, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, ProjectEventTypes.ProjectUnblocked, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(type, ProjectEventTypes.KlivesMessage, StringComparison.OrdinalIgnoreCase);
 
     private static bool TryReadStructuredStatus(string? payloadJson, out ProjectStatus status)
     {

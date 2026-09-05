@@ -265,8 +265,10 @@ namespace Omnipotent.Services.KliveAgent
             sb.AppendLine("foreach (var m in await RecallMemoriesByTag(\"preferences\")) Log($\"{m.Id.Substring(0,8)} {m.Content}\");");
             sb.AppendLine("// Get today's run-time stats (no codebase search needed):");
             sb.AppendLine("var st = GetAgentStats(); Log(System.Text.Json.JsonSerializer.Serialize(st));");
-            sb.AppendLine("// Discover an unknown object's shape (when you don't remember the field names):");
-            sb.AppendLine("var info = GetService(\"Omniscience\"); Log(System.Text.Json.JsonSerializer.Serialize(info, new System.Text.Json.JsonSerializerOptions{WriteIndented=true,MaxDepth=3}));");
+            sb.AppendLine("// Discover an unknown object's shape (when you don't remember the field names).");
+            sb.AppendLine("// NOTE: to READ OR DRIVE a service, do NOT do this — use its tool, or omniservice (describe/call).");
+            sb.AppendLine("// This is only for inspecting a live object's internals that no operation exposes:");
+            sb.AppendLine("var info = GetService(\"SeleniumManager\"); Log(System.Text.Json.JsonSerializer.Serialize(info, new System.Text.Json.JsonSerializerOptions{WriteIndented=true,MaxDepth=3}));");
             sb.AppendLine("// MULTI-STEP PIPELINE in ONE script (output of step N → input of step N+1, with logs at each gate):");
             sb.AppendLine("var errs = GetRecentErrors(50);");
             sb.AppendLine("if (errs.Count == 0) { Log(\"no errors today\"); return; } // empty-premise short-circuit");
@@ -314,6 +316,21 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("- GAMES: you CAN play them. Keys are sent as hardware scan codes, so games (Spelunky 2, emulators, etc.) DO receive them — use computer_key for menus/taps (e.g. computer_key({key:\"down\", repeats:3}) to move a menu cursor, computer_key({key:\"enter\"}) to confirm; raise holdMs to ~120 if a press doesn't take). HOLD movement with computer_key_down(\"right\")/…(\"z\"), screenshot to see the result, then computer_key_up — don't expect a single tap to walk far. For 3D/FPS look/aim use computer_mouse_move_relative({dx,dy}) (absolute computer_move won't turn the camera). FOCUS the game window first (computer_focus_window), and prefer BORDERLESS/windowed mode — true exclusive-fullscreen can capture as black and won't take background input. Read the on-screen control hints; if a game truly needs a gamepad it can't be driven yet — say so.");
                 sb.AppendLine("- STUCK ON A CAPTCHA / LOGIN / 2FA? HAND OFF — DON'T QUIT. If you hit a captcha, a login wall, a 2FA or email/SMS verification code, or you genuinely can't tell which element is correct, call request_human(reason). Klive gets a remote-desktop link, takes over the real screen, solves it, and you AUTO-RESUME exactly where you left off. NEVER end your turn telling the user to solve it themselves, never abandon the task, and never spin a retry loop. (For a plain image-grid captcha you may try it yourself ~twice first, then hand off.)");
                 sb.AppendLine();
+            }
+
+            // The Service Surface index — which services exist and what each is for. It belongs ABOVE the
+            // cache breakpoint because it is identical on every run: the whole point is that the agent
+            // never spends a call discovering that a service exists, only how to call it.
+            if (agentService.ServiceTools != null)
+            {
+                string surfaceBlock = string.Empty;
+                try { surfaceBlock = await agentService.ServiceTools.BuildPromptBlockAsync(); }
+                catch { /* best-effort: a missing index must never break the prompt build */ }
+                if (!string.IsNullOrWhiteSpace(surfaceBlock))
+                {
+                    sb.AppendLine();
+                    sb.Append(surfaceBlock);
+                }
             }
 
             // Cache breakpoint: everything ABOVE is the STABLE skeleton (personality + rules + patterns +
@@ -520,18 +537,24 @@ namespace Omnipotent.Services.KliveAgent
 
         /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
         /// tools plus memory tools plus computer-use tools plus wait_for. Anything else is routed to execute_csharp.</summary>
-        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name) || IsWaitTool(name);
+        private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name) || IsWaitTool(name)
+            // Service Surface tools are generated at startup, so no static set can list them. Claiming
+            // them here is load-bearing: the caller's fallback treats any unrecognised name as
+            // execute_csharp and would compile the arguments JSON as C#.
+            || KliveAgentServiceTools.IsHandled(name);
 
         /// <summary>Read-only native tools have no side effects and never touch the Roslyn session, so
         /// several of them in one turn can run concurrently (their I/O latency overlaps). Write tools
         /// (save_*/delete_*) and execute_csharp are excluded — they run serially, in order.</summary>
-        private static bool IsParallelSafeNativeTool(string name) => name switch
+        /// <param name="argsJson">Needed for Service Surface tools: one generated tool covers several
+        /// operations, so whether the call reads or writes is decided by its 'op', not by its name.</param>
+        private static bool IsParallelSafeNativeTool(string name, string? argsJson = null) => name switch
         {
             "grep" or "read_file" or "list_directory" or "get_global_path"
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
                 or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch"
                 or "account_list" or "list_scheduled_tasks" => true,
-            _ => false
+            _ => KliveAgentServiceTools.IsParallelSafe(name, argsJson)
         };
 
         /// <summary>Trim a turn's accumulated clip frames to a total budget, preserving chronological order.
@@ -839,6 +862,17 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         private static async Task<string> DispatchNativeToolAsync(ScriptGlobals globals, string toolName, string? argsJson)
         {
+            // Service Surface (omniservice / omni_api / any generated per-service tool). Handled first:
+            // these are the only tools whose names are not known at compile time, and the bridge owns
+            // their argument contract, approval gate and audit.
+            if (KliveAgentServiceTools.IsHandled(toolName))
+            {
+                var bridge = globals.AgentService?.ServiceTools;
+                if (bridge == null)
+                    return $"'{toolName}' is unavailable: the agent is still starting up. Try again in a moment.";
+                return await bridge.DispatchAsync(toolName, argsJson, globals.CancellationToken);
+            }
+
             System.Text.Json.JsonElement root = default;
             bool hasArgs = false;
             if (!string.IsNullOrWhiteSpace(argsJson))
@@ -1245,6 +1279,17 @@ namespace Omnipotent.Services.KliveAgent
                 var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;
 
+                // The Service Surface: dedicated tools for the pinned services plus the two universals,
+                // so every OmniService is directly callable. Appended (never interleaved) and built from
+                // an immutable catalogue, so the offered array stays byte-stable between runs with the
+                // same settings — a churning tools array misses the provider's prefix cache on every
+                // request.
+                if (toolDefinitions != null && agentService.ServiceTools != null)
+                {
+                    try { toolDefinitions.AddRange(await agentService.ServiceTools.BuildToolDefinitionsAsync()); }
+                    catch (Exception ex) { await agentService.ServiceLogError(ex, "Failed to build service tools; continuing without them."); }
+                }
+
                 llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
@@ -1507,7 +1552,7 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         var name = tc?.function?.name;
                         if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tc!.id)) return;
-                        if (!IsParallelSafeNativeTool(name)) return;   // only read-only native tools are safe to start early
+                        if (!IsParallelSafeNativeTool(name, tc.function?.arguments)) return;   // only read-only native tools are safe to start early
                         speculativeTasks.TryAdd(tc.id, RunNativeToolAsync(sharedGlobals, name, tc.function?.arguments));
                     }
 
@@ -1780,7 +1825,7 @@ namespace Omnipotent.Services.KliveAgent
                     var prelaunchedTools = new Dictionary<ResponseSegment, Task<(bool ok, string output)>>();
                     foreach (var seg in segments)
                     {
-                        if (!seg.IsScript && seg.ToolName != null && IsParallelSafeNativeTool(seg.ToolName))
+                        if (!seg.IsScript && seg.ToolName != null && IsParallelSafeNativeTool(seg.ToolName, seg.Content))
                         {
                             // Reuse the task already started mid-stream (#9) when available; otherwise start it now.
                             if (seg.ToolCallId != null && speculativeTasks.TryGetValue(seg.ToolCallId, out var specTask))

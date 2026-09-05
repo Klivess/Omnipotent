@@ -5,6 +5,7 @@ using System.Globalization;
 using System.Net;
 using System.Text;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Services.ServiceTools;
 
 namespace Omnipotent.Services.KliveAgent
 {
@@ -31,6 +32,7 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterMemoryRoutes();
             await RegisterStatsRoutes();
             await RegisterIndexRoutes();
+            await RegisterServiceToolRoutes();
         }
 
         private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
@@ -648,6 +650,84 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         // ── Stats ──
+
+        /// <summary>The Service Surface: what the agent can do to the rest of the platform, and what it
+        /// has actually done. The audit is a durable answer to "what did it just change".</summary>
+        private async Task RegisterServiceToolRoutes()
+        {
+            // Durable: worth reading precisely when the agent is wedged or warming up.
+            await CreateDurableRoute("/kliveagent/servicetools", async (req) =>
+            {
+                try
+                {
+                    var registry = service.ServiceTools?.Registry;
+                    if (registry == null)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new { ready = false, services = Array.Empty<object>() }));
+                        return;
+                    }
+
+                    var payload = registry.Services.Select(s => new
+                    {
+                        key = s.Key,
+                        displayName = s.DisplayName,
+                        summary = s.Summary,
+                        annotated = s.Annotated,
+                        tools = s.Groups.Select(g => g.ToolName).ToList(),
+                        operations = s.Operations.Select(o => new
+                        {
+                            op = o.Op,
+                            tool = o.ToolName,
+                            description = o.Description,
+                            mutating = o.Mutating,
+                            destructive = o.Destructive,
+                            verified = o.Verified,
+                        }).ToList(),
+                    }).ToList();
+
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        ready = true,
+                        serviceCount = registry.Services.Count,
+                        operationCount = registry.Operations.Count,
+                        services = payload,
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/servicetools/audit", async (req) =>
+            {
+                try
+                {
+                    int limit = int.TryParse(req.userParameters?.Get("limit"), out var parsed) ? Math.Clamp(parsed, 1, 500) : 100;
+                    var entries = service.ServiceTools?.Audit.Recent(limit) ?? new List<OmniToolAuditEntry>();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(entries.Select(e => new
+                    {
+                        atUtc = e.AtUtc,
+                        tool = e.Tool,
+                        op = e.Op,
+                        service = e.Service,
+                        mutating = e.Mutating,
+                        success = e.Success,
+                        durationMs = e.DurationMs,
+                        arguments = e.RedactedArguments,
+                        error = e.Error,
+                    })));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+        }
 
         private async Task RegisterStatsRoutes()
         {

@@ -13,6 +13,11 @@ namespace Omnipotent.Services.Projects;
 /// </summary>
 public sealed class ProjectAnalyticsService
 {
+    // The overview polls once per minute and aborts its request after 12 seconds. A 30-second
+    // bucket guaranteed a rebuild on every poll and could not even retain a cold build that crossed
+    // a boundary. Five minutes bounds staleness while the explicit Refresh action remains exact.
+    internal static readonly TimeSpan SnapshotTtl = TimeSpan.FromMinutes(5);
+
     private readonly ProjectStore projects;
     private readonly ProjectBudgetLedger budgets;
     private readonly ProjectEventLogStore events;
@@ -20,11 +25,11 @@ public sealed class ProjectAnalyticsService
     private readonly ProjectCouncilStore councils;
     private readonly ProjectTokenUsageStore? tokenUsage;
     private readonly ConcurrentDictionary<string, CachedProjectSnapshot> cache = new(StringComparer.Ordinal);
+    // Fixed lock striping coalesces cold fills without retaining one lock forever for every
+    // project/range/date combination the process has ever seen.
+    private readonly object[] cacheLocks = Enumerable.Range(0, 64).Select(_ => new object()).ToArray();
 
     private sealed record CachedProjectSnapshot(
-        long LastSequence,
-        long LastUsageSequence,
-        DateTime LedgerUpdatedAt,
         double TokenBudgetUsd,
         ProjectStatus Status,
         ProjectAnalyticsSnapshot Snapshot);
@@ -45,58 +50,80 @@ public sealed class ProjectAnalyticsService
         this.tokenUsage = tokenUsage;
     }
 
-    public ProjectAnalyticsSnapshot? GetProject(string projectID, string? rangeKey, DateTime? utcNow = null)
+    public ProjectAnalyticsSnapshot? GetProject(
+        string projectID,
+        string? rangeKey,
+        DateTime? utcNow = null,
+        bool forceRefresh = false)
     {
-        CacheDeps.MarkUncacheable("project analytics uses a rolling time window");
+        // Analytics is deliberately a five-minute snapshot. Manual refresh must bypass both the
+        // internal snapshot and KliveAPI's outer response cache.
+        if (forceRefresh) CacheDeps.MarkUncacheable("forced project analytics refresh");
         var project = projects.GetProject(projectID);
         if (project == null) return null;
 
         DateTime now = (utcNow ?? DateTime.UtcNow).ToUniversalTime();
         var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, project.CreatedAt, now);
-        return GetProject(project, range, now);
-    }
-
-    private ProjectAnalyticsSnapshot GetProject(Project project, AnalyticsRange range, DateTime now)
-    {
-        string projectID = project.ProjectID;
-        var ledger = budgets.GetLedger(projectID);
-        long lastSequence = events.GetLastSequence(projectID);
-        long lastUsageSequence = tokenUsage?.GetLastSequence(projectID) ?? 0;
-        DateTime? usageCutoverUtc = tokenUsage?.GetCutoverUtc(projectID);
-        string cacheKey = projectID + "|" + range.Key + "|" + range.FromUtc.Ticks + "|" + range.Bucket;
-
-        if (cache.TryGetValue(cacheKey, out var cached)
-            && cached.LastSequence == lastSequence
-            && cached.LastUsageSequence == lastUsageSequence
-            && cached.LedgerUpdatedAt == ledger.UpdatedAt
-            && Math.Abs(cached.TokenBudgetUsd - project.TokenBudgetUsd) < 0.0000001
-            && cached.Status == project.Status
-            && now - cached.Snapshot.GeneratedAt < TimeSpan.FromSeconds(15))
-            return cached.Snapshot;
-
-        var snapshot = ProjectAnalyticsCalculator.BuildProject(
-            project,
-            ledger,
-            // Lifecycle reconstruction needs the status immediately before the selected range.
-            // Read from creation through the range end once; BuildProject still limits every
-            // ordinary activity/spend metric to the requested window.
-            events.EnumerateRange(projectID, project.CreatedAt, range.ToUtc),
-            agents.ListActive(projectID),
-            councils.List(projectID),
-            range,
-            now,
-            tokenUsage?.EnumerateRange(projectID, range.FromUtc, range.ToUtc),
-            usageCutoverUtc);
-
-        cache[cacheKey] = new CachedProjectSnapshot(
-            lastSequence, lastUsageSequence, ledger.UpdatedAt, project.TokenBudgetUsd, project.Status, snapshot);
-        TrimCache(now);
+        var snapshot = GetProject(project, range, now, forceRefresh, useWallClockCompletion: !utcNow.HasValue);
+        // Anchor the outer cache after a potentially slow fill. If the build crosses a bucket
+        // boundary, store-time validation still succeeds and the next request can reuse it.
+        if (!forceRefresh) CacheDeps.NoteTimeBucket(SnapshotTtl);
         return snapshot;
     }
 
-    public PortfolioAnalyticsSnapshot GetPortfolio(string? rangeKey, DateTime? utcNow = null)
+    private ProjectAnalyticsSnapshot GetProject(
+        Project project,
+        AnalyticsRange range,
+        DateTime now,
+        bool forceRefresh = false,
+        bool useWallClockCompletion = true)
     {
-        CacheDeps.MarkUncacheable("project analytics uses a rolling time window");
+        string projectID = project.ProjectID;
+        string cacheKey = SnapshotCacheKey(projectID, range);
+
+        if (!forceRefresh && TryGetFresh(cacheKey, project, now, out var cached))
+            return cached.Snapshot;
+
+        // KliveAPI does not coalesce concurrent cache misses. Serialise a cold rebuild per
+        // project/range so the analytics page and dashboard cannot scan the same JSONL files twice.
+        lock (CacheLock(cacheKey))
+        {
+            if (!forceRefresh && TryGetFresh(cacheKey, project, now, out cached))
+                return cached.Snapshot;
+
+            var ledger = budgets.GetLedger(projectID);
+            DateTime? usageCutoverUtc = tokenUsage?.GetCutoverUtc(projectID);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var snapshot = ProjectAnalyticsCalculator.BuildProject(
+                project,
+                ledger,
+                // Lifecycle reconstruction needs the status immediately before the selected range.
+                // Read from creation through the range end once; BuildProject still limits every
+                // ordinary activity/spend metric to the requested window.
+                events.EnumerateForAnalytics(projectID, range.FromUtc, range.ToUtc),
+                agents.ListActive(projectID),
+                councils.ListForAnalytics(projectID),
+                range,
+                now,
+                tokenUsage?.EnumerateRange(projectID, range.FromUtc, range.ToUtc),
+                usageCutoverUtc);
+            stopwatch.Stop();
+            snapshot.BuildDurationMs = stopwatch.ElapsedMilliseconds;
+            if (useWallClockCompletion) snapshot.GeneratedAt = DateTime.UtcNow;
+
+            cache[cacheKey] = new CachedProjectSnapshot(
+                project.TokenBudgetUsd, project.Status, snapshot);
+            TrimCache(now);
+            return snapshot;
+        }
+    }
+
+    public PortfolioAnalyticsSnapshot GetPortfolio(
+        string? rangeKey,
+        DateTime? utcNow = null,
+        bool forceRefresh = false)
+    {
+        if (forceRefresh) CacheDeps.MarkUncacheable("forced portfolio analytics refresh");
         DateTime now = (utcNow ?? DateTime.UtcNow).ToUniversalTime();
         var allProjects = projects.ListProjects();
         DateTime earliest = allProjects.Count == 0
@@ -104,11 +131,58 @@ public sealed class ProjectAnalyticsService
             : allProjects.Min(p => p.CreatedAt).ToUniversalTime();
         var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, earliest, now);
 
-        var snapshots = new List<ProjectAnalyticsSnapshot>(allProjects.Count);
-        foreach (var project in allProjects)
-            snapshots.Add(GetProject(project, range, now));
+        // Project logs are independent files. Bound concurrency so a cold fleet report uses the
+        // machine without turning one large project into head-of-line blocking for every other one.
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var snapshots = new ProjectAnalyticsSnapshot[allProjects.Count];
+        Parallel.For(0, allProjects.Count, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
+        }, index => snapshots[index] = GetProject(
+            allProjects[index], range, now, forceRefresh, useWallClockCompletion: !utcNow.HasValue));
 
-        return ProjectAnalyticsCalculator.BuildPortfolio(snapshots, range, now);
+        var portfolio = ProjectAnalyticsCalculator.BuildPortfolio(snapshots, range, now);
+        stopwatch.Stop();
+        portfolio.BuildDurationMs = stopwatch.ElapsedMilliseconds;
+        if (!utcNow.HasValue) portfolio.GeneratedAt = DateTime.UtcNow;
+        if (!forceRefresh) CacheDeps.NoteTimeBucket(SnapshotTtl);
+        return portfolio;
+    }
+
+    internal static string SnapshotCacheKey(string projectID, AnalyticsRange range)
+        // ToUtc moves continuously and is intentionally quantized by SnapshotTtl, but FromUtc is
+        // part of the question. It changes at UTC midnight for rolling windows and differs between
+        // a direct project's all-time range and that project's slice inside a fleet-wide range.
+        => projectID + "|" + range.Key + "|"
+            + range.FromUtc.ToUniversalTime().Ticks + "|" + range.Bucket;
+
+    private object CacheLock(string cacheKey)
+    {
+        uint hash = unchecked((uint)StringComparer.Ordinal.GetHashCode(cacheKey));
+        return cacheLocks[(int)(hash % (uint)cacheLocks.Length)];
+    }
+
+    internal static long SnapshotTimeBucket(DateTime timestamp)
+        => timestamp.ToUniversalTime().Ticks / SnapshotTtl.Ticks;
+
+    private bool TryGetFresh(
+        string cacheKey,
+        Project project,
+        DateTime now,
+        out CachedProjectSnapshot cached)
+    {
+        DateTime generatedAt = cache.TryGetValue(cacheKey, out cached!)
+            ? cached.Snapshot.GeneratedAt.ToUniversalTime()
+            : default;
+        if (cached != null
+            && Math.Abs(cached.TokenBudgetUsd - project.TokenBudgetUsd) < 0.0000001
+            && cached.Status == project.Status
+            && generatedAt <= now
+            && SnapshotTimeBucket(generatedAt) == SnapshotTimeBucket(now))
+            return true;
+
+        cached = null!;
+        return false;
     }
 
     private void TrimCache(DateTime now)
@@ -145,6 +219,7 @@ public sealed class ProjectAnalyticsSnapshot
 {
     public string Scope { get; set; } = "project";
     public DateTime GeneratedAt { get; set; }
+    public long BuildDurationMs { get; set; }
     public AnalyticsRange Range { get; set; } = new();
     public AnalyticsProjectIdentity Project { get; set; } = new();
     public AnalyticsSummary Summary { get; set; } = new();
@@ -156,6 +231,7 @@ public sealed class ProjectAnalyticsSnapshot
     public List<AnalyticsHeatmapCell> Heatmap { get; set; } = new();
     public AnalyticsBudgetForecast Budget { get; set; } = new();
     public AnalyticsCoverage Coverage { get; set; } = new();
+    public AnalyticsPromptCacheSnapshot PromptCache { get; set; } = new();
     [Newtonsoft.Json.JsonIgnore]
     public Dictionary<string, int> FullEventTypeCounts { get; set; } =
         new(StringComparer.OrdinalIgnoreCase);
@@ -169,6 +245,7 @@ public sealed class PortfolioAnalyticsSnapshot
 {
     public string Scope { get; set; } = "all";
     public DateTime GeneratedAt { get; set; }
+    public long BuildDurationMs { get; set; }
     public AnalyticsRange Range { get; set; } = new();
     public AnalyticsSummary Summary { get; set; } = new();
     public List<AnalyticsSeriesPoint> Series { get; set; } = new();
@@ -180,6 +257,7 @@ public sealed class PortfolioAnalyticsSnapshot
     public List<AnalyticsCountItem> Statuses { get; set; } = new();
     public AnalyticsBudgetForecast Budget { get; set; } = new();
     public AnalyticsCoverage Coverage { get; set; } = new();
+    public AnalyticsPromptCacheSnapshot PromptCache { get; set; } = new();
 }
 
 public sealed class AnalyticsProjectIdentity
@@ -731,6 +809,13 @@ internal static class ProjectAnalyticsCalculator
 
         int councilCount = 0;
         var consumedCouncilUsage = new HashSet<string>(StringComparer.Ordinal);
+        var councilUsageByReference = usageList
+            .Where(usage => string.Equals(usage.Source, "council", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(usage.SourceReference)
+                && !string.Equals(usage.RecordKind, "cost-adjustment", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(usage.CostBasis, "reconciliation", StringComparison.OrdinalIgnoreCase))
+            .GroupBy(usage => usage.SourceReference!, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.ToList(), StringComparer.OrdinalIgnoreCase);
         foreach (var council in councilList)
         {
             bool counted = false;
@@ -741,22 +826,16 @@ internal static class ProjectAnalyticsCalculator
                 counted = true;
                 string statementReference =
                     $"{council.CouncilID}:{statement.Round}:{UsageSlug(statement.Role)}";
-                bool IsCandidate(ProjectTokenUsageRecord usage) =>
-                    string.Equals(usage.Source, "council", StringComparison.OrdinalIgnoreCase)
-                    && !consumedCouncilUsage.Contains(UsageIdentity(usage))
-                    && usage.PromptTokens == statement.PromptTokens
-                    && usage.CompletionTokens == statement.CompletionTokens
-                    && Math.Abs((usage.OccurredAt.ToUniversalTime() - timestamp).TotalSeconds) < 1
-                    && !string.Equals(usage.RecordKind, "cost-adjustment", StringComparison.OrdinalIgnoreCase)
-                    && !string.Equals(usage.CostBasis, "reconciliation", StringComparison.OrdinalIgnoreCase);
-                var journalStatement = usageList.FirstOrDefault(usage =>
-                        IsCandidate(usage)
-                        && string.Equals(
-                            usage.SourceReference, statementReference, StringComparison.OrdinalIgnoreCase))
-                    ?? usageList.FirstOrDefault(usage =>
-                        IsCandidate(usage)
-                        && string.Equals(
-                            usage.SourceReference, council.CouncilID, StringComparison.OrdinalIgnoreCase));
+                ProjectTokenUsageRecord? FindCandidate(string reference)
+                    => councilUsageByReference.TryGetValue(reference, out var candidates)
+                        ? candidates.FirstOrDefault(usage =>
+                            !consumedCouncilUsage.Contains(UsageIdentity(usage))
+                            && usage.PromptTokens == statement.PromptTokens
+                            && usage.CompletionTokens == statement.CompletionTokens
+                            && Math.Abs((usage.OccurredAt.ToUniversalTime() - timestamp).TotalSeconds) < 1)
+                        : null;
+                var journalStatement = FindCandidate(statementReference)
+                    ?? FindCandidate(council.CouncilID);
                 bool journalBackedStatement = journalStatement != null;
                 if (journalStatement != null)
                     consumedCouncilUsage.Add(UsageIdentity(journalStatement));
@@ -978,6 +1057,7 @@ internal static class ProjectAnalyticsCalculator
                         + Math.Max(0, ledger.CompletionTokens) - rangeTokens)
                     : null,
             },
+            PromptCache = ProjectPromptCacheAnalytics.Build(usageList, range),
             FullEventTypeCounts = new Dictionary<string, int>(
                 eventTypeCounts, StringComparer.OrdinalIgnoreCase),
             ActiveDateKeys = activeDates
@@ -1290,6 +1370,8 @@ internal static class ProjectAnalyticsCalculator
                     ? projects.Sum(p => p.Coverage.LifetimeUnattributedTokens ?? 0)
                     : null,
             },
+            PromptCache = ProjectPromptCacheAnalytics.Aggregate(
+                projects.Select(project => project.PromptCache), range),
         };
     }
 

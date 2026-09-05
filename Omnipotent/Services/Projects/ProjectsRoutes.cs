@@ -615,7 +615,8 @@ namespace Omnipotent.Services.Projects
                 {
                     if (!RequireProject(req, out var project)) return;
                     string range = req.userParameters?.Get("range") ?? "30d";
-                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range);
+                    bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
+                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range, forceRefresh: fresh);
                     if (snapshot == null)
                     {
                         await req.ReturnResponse("unknown projectID", code: HttpStatusCode.NotFound);
@@ -631,7 +632,8 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     string range = req.userParameters?.Get("range") ?? "30d";
-                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range)));
+                    bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
+                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range, forceRefresh: fresh)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);

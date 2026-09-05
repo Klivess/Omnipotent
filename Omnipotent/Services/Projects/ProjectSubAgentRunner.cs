@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Text;
 using Newtonsoft.Json;
 using Omnipotent.Services.ComputerControl;
@@ -11,7 +11,7 @@ namespace Omnipotent.Services.Projects
     /// stimulus (usually a Commander message riding the bus), runs renewable context slices on the
     /// model its TIER routes to, with only the tools its tier gates open, and reports back to the
     /// Commander via send_agent_message when done. Same rehydrate-on-wake discipline as the
-    /// Commander: no persistent conversation, seeded fresh from the log each wake.
+    /// Commander: durable state is refreshed each wake, with bounded conversation reuse between wakes.
     ///
     /// Single-flight per agent is durably generation-fenced; restart recovery resumes from the
     /// worker's typed checkpoint and reconciles the durable stimulus queue.
@@ -321,14 +321,18 @@ namespace Omnipotent.Services.Projects
                 // never shown an operation it may not perform.
                 var toolDefs = ProjectToolFacade.Fold(canonicalToolDefs);
 
-                // Fresh session every wake, for the same reason as the Commander: the seed is a full
-                // rehydration from disk, so continuing the old session carried the previous wake's whole
-                // transcript and then stacked another seed on top of it.
+                // Preserve a bounded transcript between wakes; refresh changed state at its tail.
                 string sessionId = $"projects-agent-{projectID}-{agent.AgentID}";
-                string wakeSeed = await BuildWakeSeed(project, agent, trigger);
-                llm.ResetSession(sessionId);
-                llm.StartToolSession(sessionId, BuildSystemPrompt(project, agent, visionEnabled));
-                llm.AppendUserMessageToToolSession(sessionId, wakeSeed);
+                var briefSections = new List<ToolSessionBriefSection>();
+                await BuildWakeSeed(project, agent, trigger, briefSections);
+                var promptStart = llm.StartOrContinueBriefedToolSession(sessionId,
+                    BuildSystemPrompt(project, agent, visionEnabled), ProjectPromptContinuity.FitReferences(briefSections),
+                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(),
+                        modelRoutes, toolDefs, tierParameters),
+                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy));
+                parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
+                    $"Prompt continuity: {promptStart.Reason}; appended ~{promptStart.AppendedTokens:N0} tokens " +
+                    $"(full brief ~{promptStart.FullBriefTokens:N0})."));
                 // The seed carries this worker's whole brief; the compactor clips a user turn to 240
                 // chars, so it must never be summarised.
                 const int protectedBriefMessages = 1;
@@ -439,6 +443,24 @@ namespace Omnipotent.Services.Projects
                                 Model = finalModel,
                                 SourceReference = $"{wakeID}:turn:{modelTurns}",
                                 Label = $"{agent.Role} model turn {modelTurns}",
+                                Provider = resp.Provider,
+                                RoutedProvider = resp.RoutedProvider,
+                                CacheMetricsAvailable = resp.CacheMetricsAvailable,
+                                CacheWritePromptTokens = resp.CacheWritePromptTokens,
+                                UpstreamInferenceCostUsd = resp.UpstreamInferenceCostUsd,
+                                TurnIndex = modelTurns,
+                                RequestDurationMs = resp.RequestDurationMs,
+                                RouterStrategy = resp.RouterStrategy,
+                                RouterAttempt = resp.RouterAttempt,
+                                ContextWasCompacted = resp.ContextWasCompacted,
+                                CacheEpochID = resp.CacheEpochID,
+                                CacheEpochTurnIndex = resp.CacheEpochTurnIndex,
+                                PromptAssemblyStatus = modelTurns == 1 ? promptStart.Reason : null,
+                                AppendedBriefTokens = modelTurns == 1 ? promptStart.AppendedTokens : 0,
+                                FullBriefTokens = modelTurns == 1 ? promptStart.FullBriefTokens : 0,
+                                CacheSessionID = sessionId,
+                                ResponseCacheStatus = resp.ResponseCacheStatus,
+                                PromptCacheTelemetryVersion = ProjectPromptCacheTelemetry.CurrentVersion,
                             },
                             cachedPromptTokens: resp.CachedPromptTokens);
                     }
@@ -509,7 +531,7 @@ namespace Omnipotent.Services.Projects
                                 RecordedBy = agent.AgentID,
                                 ToolName = "resume",
                             });
-                            llm.ResetSession(sessionId);
+                            // The next wake rotates only if its context budget requires it.
                         }
                         parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.AgentMessage, final));
                         break;
@@ -554,7 +576,8 @@ namespace Omnipotent.Services.Projects
                                 Text = text, ToolName = toolName, ToolCallId = call.id,
                                 PayloadJson = "{\"succeeded\":false}",
                             });
-                            llm.AppendToolResult(sessionId, call.id, offeredName, text, keepRecentFull: toolResultKeepRecent);
+                            llm.AppendToolResult(sessionId, call.id, offeredName, text,
+                                keepRecentFull: toolResultKeepRecent, preservePromptPrefix: true);
                             liveContextTokens += AddedContextTokens(text);
                             lastCommittedTool = toolName;
                             lastCommittedResult = text;
@@ -742,7 +765,8 @@ namespace Omnipotent.Services.Projects
                             ArtifactIDs = result.ArtifactIDs,
                             PayloadJson = Newtonsoft.Json.JsonConvert.SerializeObject(new { succeeded = result.Succeeded }),
                         });
-                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText, keepRecentFull: toolResultKeepRecent);
+                        llm.AppendToolResult(sessionId, call.id, offeredName, result.ResultText,
+                            keepRecentFull: toolResultKeepRecent, preservePromptPrefix: true);
                         liveContextTokens += AddedContextTokens(result.ResultText);
                         lastCommittedTool = toolName;
                         lastCommittedResult = result.ResultText;
@@ -754,7 +778,7 @@ namespace Omnipotent.Services.Projects
                                 : new List<(byte[] data, string mimeType)> { (result.Jpeg, "image/jpeg") };
                             llm.AppendUserContentToToolSession(sessionId,
                                 $"Visual result after {toolName} (oldest to newest). The final frame is current and gridded; verify before continuing.",
-                                frames);
+                                frames, preservePromptPrefix: true);
                             liveContextTokens += 1200L * Math.Max(1, frames.Count);
                         }
                         if (result.EndWake) goto done;
@@ -778,7 +802,7 @@ namespace Omnipotent.Services.Projects
                             RecordedBy = agent.AgentID,
                             ToolName = "resume",
                         });
-                        llm.ResetSession(sessionId);
+                        // The next wake rotates only if its context budget requires it.
                         finalReport = rollover;
                         outcomeText = rollover;
                         break;
@@ -958,25 +982,26 @@ You are a {agent.Tier}-tier sub-agent. Role: {agent.Role}. Your agent ID is {age
 THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
         }
 
-        private async Task<string> BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger)
+        private async Task<string> BuildWakeSeed(Project project, ProjectAgentRecord agent, string trigger,
+            List<ToolSessionBriefSection>? briefSections = null)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
-            var sb = new StringBuilder();
+            var sb = new ToolSessionBriefBuilder();
             // PREFIX-CACHE ORDER (see PromptPrefixStability): the wall-clock used to be this seed's
             // first line, so the capability truth, directives and plan behind it could never be served
             // from cache on a later wake even when they were unchanged. It now sits with the trigger
             // at the end, where the rest of the per-wake content already lives.
-            sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
+            sb.BeginSection("capabilities","── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
             string directives = "";
             try { directives = parent.Directives.DescribeForPrompt(project.ProjectID, agent.AgentID,
                 ProjectDirectiveStore.TryExtractDirectiveID(trigger)); } catch { }
             if (!string.IsNullOrWhiteSpace(directives))
             {
-                sb.AppendLine("── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before the assignment) ──");
+                sb.BeginSection("directives","── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before the assignment) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(directives, ProjectsContextBudget.DirectivesBudget));
             }
-            sb.AppendLine("── PROJECT PLAN (commander's, for context) ──");
+            sb.BeginSection("project-plan","── PROJECT PLAN (commander's, for context) ──");
             string planSeed = ProjectPromptHygiene.ScrubState(ProjectsContextBudget.ScrubHarnessLeak(
                 digest.CurrentPlan is { Length: > 0 } p ? p : "(none)",
                 "(plan omitted — contained non-project agent scaffolding)"));
@@ -990,7 +1015,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 string externalActions = ProjectExternalActions.DescribeForPrompt(parent.EventLog, project.ProjectID, 15);
                 if (!string.IsNullOrWhiteSpace(externalActions))
                 {
-                    sb.AppendLine("── EXTERNAL ACTION LEDGER (evidenced side effects in the real world; authoritative) ──");
+                    sb.BeginSection("external-actions","── EXTERNAL ACTION LEDGER (evidenced side effects in the real world; authoritative) ──");
                     sb.AppendLine(ProjectsContextBudget.TruncateToTokens(externalActions, ProjectsContextBudget.ObservablesBudget));
                 }
             }
@@ -1004,7 +1029,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 string team = parent.SubAgents.DescribeTaskForce(project.ProjectID, project.SubAgentCap, agent.AgentID);
                 if (!string.IsNullOrWhiteSpace(team))
                 {
-                    sb.AppendLine("── YOUR TEAM (message anyone here with send_agent_message by ID or role; 'team' reaches all) ──");
+                    sb.BeginSection("team","── YOUR TEAM (message anyone here with send_agent_message by ID or role; 'team' reaches all) ──");
                     sb.AppendLine(ProjectsContextBudget.TruncateToTokens(team, ProjectsContextBudget.TaskForceBudget));
                     sb.AppendLine("If your mission has a separable chunk and slots are free, you may spawn ONE level of helpers yourself; helpers cannot spawn further.");
                 }
@@ -1020,7 +1045,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                     .GetValueOrDefault(agent.AgentID);
                 if (resume != null && (!resume.NotBefore.HasValue || resume.NotBefore.Value <= DateTime.UtcNow))
                 {
-                    sb.AppendLine("── EXACT RESUME ACTION (durable checkpoint) ──");
+                    sb.BeginSection("resume","── EXACT RESUME ACTION (durable checkpoint) ──");
                     sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                         ProjectPromptHygiene.ScrubState(resume.Summary), 500));
                 }
@@ -1035,7 +1060,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 string knowledge = parent.RuntimeState.DescribeProjectKnowledgeForWorker(project.ProjectID);
                 if (!string.IsNullOrWhiteSpace(knowledge))
                 {
-                    sb.AppendLine("── WHAT THE PROJECT ALREADY KNOWS (verified facts, dead ends, failed attempts — do not re-derive or retry these) ──");
+                    sb.BeginSection("project-knowledge","── WHAT THE PROJECT ALREADY KNOWS (verified facts, dead ends, failed attempts — do not re-derive or retry these) ──");
                     sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                         ProjectPromptHygiene.ScrubState(knowledge), ProjectsContextBudget.WorkerKnowledgeBudget));
                 }
@@ -1047,7 +1072,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
             try { observables = parent.Observables.DescribeAll(project.ProjectID); } catch { }
             if (!string.IsNullOrWhiteSpace(observables))
             {
-                sb.AppendLine("── OBSERVABLES (live values shown to Klives; keep yours current via observable op:set) ──");
+                sb.BeginSection("observables","── OBSERVABLES (live values shown to Klives; keep yours current via observable op:set) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observables, ProjectsContextBudget.ObservablesBudget));
             }
 
@@ -1056,7 +1081,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
             try { accounts = parent.WakeCycle.DescribeAccounts?.Invoke(project.ProjectID) ?? ""; } catch { }
             if (!string.IsNullOrWhiteSpace(accounts))
             {
-                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
+                sb.BeginSection("accounts","── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accounts, ProjectsContextBudget.AccountsBudget));
             }
 
@@ -1068,7 +1093,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 files = "(shared-file summary omitted — contained non-project agent scaffolding; use list_files)";
             if (!string.IsNullOrWhiteSpace(files))
             {
-                sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
+                sb.BeginSection("files","── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(files, ProjectsContextBudget.SharedFilesBudget));
             }
 
@@ -1077,7 +1102,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 ? "" : await parent.WakeCycle.DescribeKliveAgentContextAsync(project.ProjectID); } catch { }
             if (!string.IsNullOrWhiteSpace(kliveContext))
             {
-                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same services/capabilities/shortcuts available to this worker) ──");
+                sb.BeginSection("kliveagent","── KLIVEAGENT LIVE BRIDGE (same services/capabilities/shortcuts available to this worker) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveContext, ProjectsContextBudget.KnowledgeBudget));
             }
 
@@ -1093,7 +1118,7 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                         kHits = kHits.Where(h => !ProjectsContextBudget.LooksLikeHarnessLeak(h.Text)).ToList();
                     if (kHits is { Count: > 0 })
                     {
-                        sb.AppendLine("── RELEVANT KNOWLEDGE (Klives' knowledge base) ──");
+                        sb.BeginSection("knowledge","── RELEVANT KNOWLEDGE (Klives' knowledge base) ──");
                         var fitted = ProjectsContextBudget.FitItemsInBudget(
                             kHits, ProjectsContextBudget.SubAgentKnowledgeBudget, h => h.Text, h => h.Score);
                         foreach (var h in fitted)
@@ -1112,9 +1137,10 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                 .Where(e => e.AgentID == agent.AgentID)
                 .TakeLast(RecentEventsForSeed * ProjectsContextBudget.CompactHistoryMultiplier)
                 .ToList();
+            var activityEntries = new List<ToolSessionBriefEntry>();
             string activity = ProjectCommanderPrompts.RenderHistoryBlock(
-                "── YOUR RECENT ACTIVITY ──", mine, ProjectsContextBudget.RecentEventsBudget / 2);
-            if (activity.Length > 0) sb.AppendLine(activity);
+                "── YOUR RECENT ACTIVITY ──", mine, ProjectsContextBudget.RecentEventsBudget / 2, activityEntries);
+            sb.AppendJournal("recent-activity", activity, activityEntries);
 
             // A thin view of what the REST of the team has been doing. Not their tool-by-tool traffic —
             // just the events that change what this worker should do: who said what to whom, who joined
@@ -1127,16 +1153,18 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
                         or ProjectEventTypes.GrandPlanProgress)
                 .TakeLast(RecentEventsForSeed)
                 .ToList();
+            var teamEntries = new List<ToolSessionBriefEntry>();
             string teamActivity = ProjectCommanderPrompts.RenderHistoryBlock(
-                "── WHAT THE REST OF THE TEAM HAS BEEN DOING ──", teamEvents, ProjectsContextBudget.TaskForceBudget);
-            if (teamActivity.Length > 0) sb.AppendLine(teamActivity);
+                "── WHAT THE REST OF THE TEAM HAS BEEN DOING ──", teamEvents, ProjectsContextBudget.TaskForceBudget, teamEntries);
+            sb.AppendJournal("team-activity", teamActivity, teamEntries);
 
-            sb.AppendLine("── YOUR TASK (this wake's trigger) ──");
+            sb.BeginSection("trigger","── YOUR TASK (this wake's trigger) ──", sendEveryWake: true);
             sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps above and in your messages are UTC.");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                 ProjectPromptHygiene.ScrubTrigger(ProjectsContextBudget.ScrubHarnessLeak(
                     trigger, "(trigger text omitted — contained non-project agent scaffolding)")),
                 ProjectsContextBudget.StimulusBudget));
+            briefSections?.AddRange(sb.Build());
             return sb.ToString();
         }
 

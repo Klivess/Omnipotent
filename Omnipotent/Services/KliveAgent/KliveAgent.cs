@@ -19,6 +19,10 @@ namespace Omnipotent.Services.KliveAgent
         public KliveAgentBackgroundTasks BackgroundTasks { get; private set; }
         public KliveAgentScheduler Scheduler { get; private set; }
         public KliveAgentCapabilityRegistry Capabilities { get; private set; }
+
+        /// <summary>Direct, schema'd access to every other OmniService — the Service Surface. See
+        /// KliveAgentServiceTools.</summary>
+        public KliveAgentServiceTools ServiceTools { get; private set; }
         public KliveAgentStats Stats { get; private set; } = null!;
 
         // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
@@ -59,6 +63,53 @@ namespace Omnipotent.Services.KliveAgent
         {
             name = "KliveAgent";
             threadAnteriority = ThreadAnteriority.Standard;
+        }
+
+        /// <summary>
+        /// Publishes every catalogued service operation into the capability registry, so
+        /// /kliveagent/capabilities and the dashboard's capability browser show what the agent can
+        /// actually do. Before this the registry was reachable but empty — nothing ever called
+        /// RegisterCapability — so those routes always returned [].
+        /// </summary>
+        private void PublishServiceCapabilities()
+        {
+            try
+            {
+                foreach (var operation in ServiceTools.Registry.Operations)
+                {
+                    var op = operation;
+                    Capabilities.RegisterCapability(new AgentCapabilityDefinition
+                    {
+                        Name = $"{op.ToolName}.{op.Op}",
+                        DisplayName = $"{op.ServiceDisplayName}: {op.Op}",
+                        Category = op.ServiceToolBase,
+                        Description = op.Description,
+                        PermissionTier = op.Destructive ? AgentCapabilityPermissionTier.Dangerous
+                            : op.Mutating ? AgentCapabilityPermissionTier.Moderate
+                            : AgentCapabilityPermissionTier.Safe,
+                        RequiresConfirmation = op.Destructive,
+                    },
+                    async (request, context) =>
+                    {
+                        // The registry hands arguments over as a loose dictionary; the invoker owns
+                        // validation and coercion, so hand it the JSON and let it apply the contract.
+                        var args = Newtonsoft.Json.Linq.JObject.FromObject(
+                            request.Arguments ?? new Dictionary<string, object?>());
+                        var result = await ServiceTools.Invoker.ExecuteAsync(op, args, cancellationToken.Token);
+                        return new AgentCapabilityInvocationResult
+                        {
+                            Success = result.Success,
+                            Message = result.Text,
+                            ErrorMessage = result.Success ? null : result.Text,
+                        };
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                // A capability browser that fails to populate must never stop the agent starting.
+                ServiceLogError(ex, "Failed to publish service capabilities.");
+            }
         }
 
         /// <summary>
@@ -206,6 +257,12 @@ namespace Omnipotent.Services.KliveAgent
                 if (Superseded()) return;
 
                 Capabilities = new KliveAgentCapabilityRegistry(this);
+
+                // The Service Surface: dedicated + universal tools over every OmniService. The
+                // catalogue itself is built from assembly metadata (no live services needed), so this
+                // is cheap and cannot be affected by service startup order.
+                ServiceTools = new KliveAgentServiceTools(this);
+                PublishServiceCapabilities();
 
                 // Initialize codebase intelligence (spec Ch. 3, 4, 7) — the slowest part of warmup.
                 SetInitProgress(55, "Indexing the codebase…");

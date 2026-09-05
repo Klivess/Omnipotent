@@ -128,7 +128,7 @@ namespace Omnipotent.Services.KliveLLM
             && (ProviderOnly == null || ProviderOnly.Count == 0);
     }
 
-    public class KliveLLM : OmniService
+    public partial class KliveLLM : OmniService
     {
         private const string DefaultHuggingFaceModel = "meta-llama/Llama-3.1-8B-Instruct:cerebras";
         private const string DefaultOpenRouterModel = "openai/gpt-4.1-mini";
@@ -790,6 +790,26 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>
+        /// Append a Projects wake seed without prepending another receipt-time stamp. Wake seeds are
+        /// already temporally grounded by their trailing <c>Now:</c> line; putting a fresh timestamp
+        /// in byte zero made every otherwise-stable wake prefix unique and defeated provider caching.
+        /// Ordinary user/steering messages must continue to use
+        /// <see cref="AppendUserMessageToToolSession"/>.
+        /// </summary>
+        public void AppendCacheStableWakeSeedToToolSession(string sessionId, string content)
+        {
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage
+                    {
+                        role = "user",
+                        content = content ?? string.Empty,
+                    });
+            }
+        }
+
+        /// <summary>
         /// Append a user turn carrying text plus inline images (content-parts array). Used by the
         /// vision feedback loop: requires a vision-capable model on a remote provider. Images are
         /// sent as base64 data URIs.
@@ -800,7 +820,12 @@ namespace Omnipotent.Services.KliveLLM
         /// image messages are flattened to a one-line text placeholder — the model always keeps the latest
         /// view(s) for current state, at a fraction of the tokens.
         /// </summary>
-        public void AppendUserContentToToolSession(string sessionId, string text, List<(byte[] data, string mimeType)> images, int keepRecentImages = 3)
+        public void AppendUserContentToToolSession(
+            string sessionId,
+            string text,
+            List<(byte[] data, string mimeType)> images,
+            int keepRecentImages = 3,
+            bool preservePromptPrefix = false)
         {
             var parts = new List<object>();
             // Stamp even image-only turns: the text part carries the capture-receipt time.
@@ -821,7 +846,7 @@ namespace Omnipotent.Services.KliveLLM
                 if (sessions.TryGetValue(sessionId, out var s))
                 {
                     s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = parts });
-                    PruneOldToolImages(s, keepRecentImages);
+                    if (!preservePromptPrefix) PruneOldToolImages(s, keepRecentImages);
                 }
             }
         }
@@ -946,7 +971,13 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Append a tool-result turn (role:"tool") answering a specific tool_call_id. After appending,
         /// OLD tool results are compacted (see <see cref="PruneOldToolResults"/>) so a long task's accumulated
         /// script/observation output doesn't bloat the window — the model keeps the most recent results in full.</summary>
-        public void AppendToolResult(string sessionId, string toolCallId, string name, string content, int keepRecentFull = 16)
+        public void AppendToolResult(
+            string sessionId,
+            string toolCallId,
+            string name,
+            string content,
+            int keepRecentFull = 16,
+            bool preservePromptPrefix = false)
         {
             lock (sessions)
             {
@@ -961,7 +992,10 @@ namespace Omnipotent.Services.KliveLLM
                         // this is how the model knows how much wall-clock the step consumed.
                         content = StampIncoming(content)
                     });
-                    PruneOldToolResults(s, keepRecentFull);
+                    // Projects already runs the deterministic context-window compactor immediately
+                    // before every request. Let it opt out of this older-history rewrite so normal
+                    // turns only append bytes and remain fully eligible for prefix reuse.
+                    if (!preservePromptPrefix) PruneOldToolResults(s, keepRecentFull);
                 }
             }
         }
@@ -1116,6 +1150,9 @@ namespace Omnipotent.Services.KliveLLM
             var msgs = s.structuredMessages;
             if (aboveTokens <= 0 || EstimateToolSessionTokens(msgs) <= aboveTokens) return false;
 
+            MaterializeBriefForCompaction(s);
+            if (s.briefState != null) protectPrefixMessages = Math.Max(1, protectPrefixMessages);
+
             int headStart = 0; // keep leading system message(s) verbatim
             while (headStart < msgs.Count && msgs[headStart].role == "system") headStart++;
 
@@ -1174,7 +1211,9 @@ namespace Omnipotent.Services.KliveLLM
             // Falling back to `underTrigger` preserves the old contract — get under the trigger by
             // whatever means — for the sessions whose protected prefix alone leaves no headroom.
             rebuilt ??= underTrigger ?? bestCompaction ?? new List<HFWrapper.HFMessage>(msgs);
-            TrimStringMessagesToBudget(rebuilt, headStart, aboveTokens);
+            // Briefed sessions have a freshly materialised authoritative snapshot. If even that
+            // cannot fit, preflight must reject the request rather than clip a current directive.
+            TrimStringMessagesToBudget(rebuilt, s.briefState == null ? headStart : headStart + 1, aboveTokens);
             s.structuredMessages = rebuilt;
             return true;
 
@@ -1275,6 +1314,9 @@ namespace Omnipotent.Services.KliveLLM
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
             bool contextWasCompacted = false;
+            int previousCacheMessageCount = 0;
+            string cacheEpochID = "";
+            int cacheEpochTurnIndex = 0;
             int? preflightMessageBudget = null;
             bool fixedRequestExceedsWindow = false;
             int irreducibleSystemTokens = 0;
@@ -1308,9 +1350,20 @@ namespace Omnipotent.Services.KliveLLM
                 if (compactAbove > 0)
                     contextWasCompacted = CompactToolSessionIfNeeded(session, compactAbove, keepRecent, compactProtectPrefixMessages);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
+                previousCacheMessageCount = contextWasCompacted ? 0 : session.lastCacheMessageCount;
+                if (contextWasCompacted)
+                {
+                    session.cacheEpochID = Guid.NewGuid().ToString("N");
+                    session.cacheEpochTurnIndex = 0;
+                }
+                cacheEpochID = session.cacheEpochID;
+                cacheEpochTurnIndex = session.cacheEpochTurnIndex + 1;
                 irreducibleSystemTokens = snapshot
                     .TakeWhile(message => message.role == "system")
                     .Sum(EstimateMessageTokens);
+                if (session.briefState != null)
+                    irreducibleSystemTokens += snapshot.Where(message => session.briefState.BriefMessages.Contains(message))
+                        .Sum(EstimateMessageTokens);
             }
 
             if (fixedRequestExceedsWindow
@@ -1320,10 +1373,12 @@ namespace Omnipotent.Services.KliveLLM
                 return new KliveLLMResponse
                 {
                     Success = false,
-                    ErrorMessage = $"The fixed system prompt, tool schemas and output reserve cannot fit the configured {contextWindowTokensOverride} token context window.",
+                    ErrorMessage = $"The fixed system prompt, authoritative brief, tool schemas and output reserve cannot fit the configured {contextWindowTokensOverride} token context window.",
                     SessionId = sessionId,
                     ContextWindowTokens = contextWindowTokensOverride,
                     ContextWasCompacted = contextWasCompacted,
+                    CacheEpochID = cacheEpochID,
+                    CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
             }
 
@@ -1341,10 +1396,18 @@ namespace Omnipotent.Services.KliveLLM
                     SessionId = sessionId,
                     ContextWindowTokens = contextWindowTokensOverride,
                     ContextWasCompacted = contextWasCompacted,
+                    CacheEpochID = cacheEpochID,
+                    CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride, modelOverride: modelOverride, cancellationToken: cancellationToken, onToken: onToken, thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete, modelRoutes: modelRoutes, enableOpenRouterContextCompression: enableOpenRouterContextCompression, samplingParameters: samplingParameters);
+            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride,
+                cacheSessionId: sessionId, previousCacheMessageCount: previousCacheMessageCount, modelOverride: modelOverride,
+                cancellationToken: cancellationToken, onToken: onToken,
+                thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete,
+                modelRoutes: modelRoutes,
+                enableOpenRouterContextCompression: enableOpenRouterContextCompression,
+                samplingParameters: samplingParameters);
             var msg = response.choices[0].message;
             var rawContent = HFWrapper.ContentToText(msg?.content);
             var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -1362,12 +1425,23 @@ namespace Omnipotent.Services.KliveLLM
                     SessionId = sessionId,
                     PromptTokens = response.usage?.prompt_tokens ?? 0,
                     CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+                    CacheWritePromptTokens = response.usage?.prompt_tokens_details?.cache_write_tokens ?? 0,
+                    CacheMetricsAvailable = response.usage?.prompt_tokens_details?.HasCacheReadMetrics == true,
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
                     GenerationId = response.id,
                     CostUsd = response.usage?.cost,
+                    UpstreamInferenceCostUsd = response.usage?.cost_details?.upstream_inference_cost,
                     Model = response.model,
+                    Provider = response.request_provider,
+                    RoutedProvider = SelectedOpenRouterProvider(response.openrouter_metadata),
+                    RouterStrategy = response.openrouter_metadata?.strategy,
+                    RouterAttempt = response.openrouter_metadata?.attempt,
+                    RequestDurationMs = response.request_duration_ms,
+                    ResponseCacheStatus = response.response_cache_status,
                     ContextWindowTokens = contextWindowTokensOverride,
                     ContextWasCompacted = contextWasCompacted,
+                    CacheEpochID = cacheEpochID,
+                    CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
             }
 
@@ -1390,6 +1464,8 @@ namespace Omnipotent.Services.KliveLLM
                 session.lastPromptTokens = response.usage?.prompt_tokens ?? 0;
                 session.lastCompletionTokens = response.usage?.completion_tokens ?? 0;
                 session.lastUpdated = DateTime.UtcNow;
+                session.lastCacheMessageCount = snapshot.Count;
+                session.cacheEpochTurnIndex = cacheEpochTurnIndex;
             }
 
             return new KliveLLMResponse
@@ -1400,14 +1476,34 @@ namespace Omnipotent.Services.KliveLLM
                 Success = true,
                 ToolCalls = toolCalls,
                 PromptTokens = response.usage?.prompt_tokens ?? 0,
-                    CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+                CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+                CacheWritePromptTokens = response.usage?.prompt_tokens_details?.cache_write_tokens ?? 0,
+                CacheMetricsAvailable = response.usage?.prompt_tokens_details?.HasCacheReadMetrics == true,
                 CompletionTokens = response.usage?.completion_tokens ?? 0,
                 GenerationId = response.id,
                 CostUsd = response.usage?.cost,
+                UpstreamInferenceCostUsd = response.usage?.cost_details?.upstream_inference_cost,
                 Model = response.model,
+                Provider = response.request_provider,
+                RoutedProvider = SelectedOpenRouterProvider(response.openrouter_metadata),
+                RouterStrategy = response.openrouter_metadata?.strategy,
+                RouterAttempt = response.openrouter_metadata?.attempt,
+                RequestDurationMs = response.request_duration_ms,
+                ResponseCacheStatus = response.response_cache_status,
                 ContextWindowTokens = contextWindowTokensOverride,
                 ContextWasCompacted = contextWasCompacted,
+                CacheEpochID = cacheEpochID,
+                CacheEpochTurnIndex = cacheEpochTurnIndex,
             };
+        }
+
+        private static string? SelectedOpenRouterProvider(HFWrapper.OpenRouterMetadata? metadata)
+        {
+            string? selected = metadata?.endpoints?.available?
+                .FirstOrDefault(endpoint => endpoint.selected)?.provider;
+            if (!string.IsNullOrWhiteSpace(selected)) return selected;
+            return metadata?.attempts?
+                .LastOrDefault(attempt => !string.IsNullOrWhiteSpace(attempt.provider))?.provider;
         }
 
         private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
@@ -1746,20 +1842,27 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Reconcile a fair-use reservation against the provider's reported usage. A response
         /// without a usage block leaves the pessimistic reservation standing — under-counting the
         /// window is the one failure mode this whole mechanism exists to prevent.</summary>
-        private void ReportFairUseUsage(AIRouterFairUseLease? lease, HFWrapper.HFLLMInferenceResponse.UsageDetails? usage)
+        private void ReportFairUseUsage(
+            LLMProvider provider,
+            AIRouterFairUseLease? lease,
+            HFWrapper.HFLLMInferenceResponse.UsageDetails? usage)
         {
-            if (lease == null || usage == null) return;
-            long total = usage.total_tokens > 0
-                ? usage.total_tokens
-                : (long)usage.prompt_tokens + usage.completion_tokens;
-            if (total > 0) lease.ReportActualTokens(total);
+            if (usage == null) return;
+            if (lease != null)
+            {
+                long total = usage.total_tokens > 0
+                    ? usage.total_tokens
+                    : (long)usage.prompt_tokens + usage.completion_tokens;
+                if (total > 0) lease.ReportActualTokens(total);
+            }
 
-            // A lease only exists for AIRouter, so this meters exactly the traffic whose prefill we
-            // are responsible for. The router already tells us how much of each prompt it served from
-            // cache; until now nothing read it, which is why a prompt-assembly regression could run
-            // for hours and reach us only as a suspension notice. See PrefixCacheMeter.
+            // Meter both routers. Previously this lived behind `lease != null`, which meant the
+            // OpenRouter validation path the website relies on recorded nothing at all.
+            if (provider is not (LLMProvider.OpenRouter or LLMProvider.AIRouter)
+                || usage.prompt_tokens_details?.HasCacheReadMetrics != true)
+                return;
             string? warning = PrefixCacheMeter.Shared.Record(
-                usage.prompt_tokens, usage.prompt_tokens_details?.cached_tokens ?? 0);
+                usage.prompt_tokens, usage.prompt_tokens_details.cached_tokens);
             if (warning != null)
             {
                 try { _ = ServiceLog(warning); } catch { }
@@ -1805,6 +1908,8 @@ namespace Omnipotent.Services.KliveLLM
             List<HFWrapper.HFTool> tools,
             int? maxTokensOverride,
             bool forceFreeModel = false,
+            string? cacheSessionId = null,
+            int previousCacheMessageCount = 0,
             string? modelOverride = null,
             CancellationToken cancellationToken = default,
             Action<string>? onToken = null,
@@ -1838,6 +1943,7 @@ namespace Omnipotent.Services.KliveLLM
                 max_tokens = maxTokensOverride,
                 tools = tools,
             };
+            ApplyOpenRouterSession(ref payload, remoteProvider, cacheSessionId);
             ApplyModelFallback(ref payload, remoteProvider, modelRoutes);
             ApplyServiceTier(ref payload, remoteProvider);
             ApplyUsageAccounting(ref payload, remoteProvider);
@@ -1851,9 +1957,28 @@ namespace Omnipotent.Services.KliveLLM
             // the standard OpenAI path.
             var providerMessages = GemmaToolCallCompatibility.PrepareContinuationMessages(structuredMessages);
             payload.BuildMessagesFromList(providerMessages);
-            ApplyPromptCaching(ref payload, remoteProvider);
+            ApplyPromptCaching(ref payload, remoteProvider, previousCacheMessageCount);
 
-            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken, onToolCallComplete);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var response = await SendInferencePayloadAsync(
+                remoteProvider, payload, cancellationToken, onToken, onToolCallComplete);
+            stopwatch.Stop();
+            response.request_provider = remoteProvider.Provider.ToString();
+            response.request_duration_ms = stopwatch.ElapsedMilliseconds;
+            return response;
+        }
+
+        internal static void ApplyOpenRouterSession(
+            ref HFWrapper.HFLLMInferenceRequest payload,
+            RemoteLLMProviderConfiguration remoteProvider,
+            string? sessionId)
+        {
+            if (remoteProvider.Provider != LLMProvider.OpenRouter
+                || string.IsNullOrWhiteSpace(sessionId))
+                return;
+
+            string clean = sessionId.Trim();
+            payload.session_id = clean.Length <= 256 ? clean : clean[..256];
         }
 
         // Marker that KliveAgent's BuildSystemPrompt inserts between the STABLE system-prompt skeleton
@@ -1869,7 +1994,7 @@ namespace Omnipotent.Services.KliveLLM
         /// skeleton (text before <see cref="CacheBreakpointMarker"/>, or the whole system message when the
         /// marker is absent) becomes a content-part tagged with cache_control; the volatile remainder
         /// follows as a plain part. For non-OpenRouter providers this only strips the marker.</summary>
-        private static void ApplyPromptCaching(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        internal static void ApplyPromptCaching(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider, int previousCacheMessageCount = 0)
         {
             if (payload.messages == null || payload.messages.Length == 0) return;
 
@@ -1890,6 +2015,10 @@ namespace Omnipotent.Services.KliveLLM
                 return;
             }
 
+            // OpenRouter uses this top-level control for automatic caching providers. Keep the
+            // explicit content-part breakpoint as well for Anthropic/Qwen-compatible routes.
+            payload.cache_control = EphemeralCacheControl;
+
             var parts = new List<object>
             {
                 new HFWrapper.HFTextPart { text = stable, cache_control = EphemeralCacheControl }
@@ -1899,71 +2028,64 @@ namespace Omnipotent.Services.KliveLLM
 
             system.content = parts;
 
-            ApplyConversationCacheBreakpoint(payload);
+            ApplyConversationCacheBreakpoint(payload, previousCacheMessageCount);
         }
 
-        /// <summary>
-        /// Places a second cache breakpoint at the END of the settled conversation, so the growing
-        /// tool transcript is served from cache instead of being re-billed in full on every turn.
-        ///
-        /// Caching the system message alone only ever covered the fixed prefix; in an agentic tool loop
-        /// the conversation is the part that grows, and it was 100% uncached — which is why a Projects
-        /// wake bills prompt tokens far in excess of what it generates.
-        ///
-        /// The breakpoint goes on the last USER-role message. Anthropic (via OpenRouter) caches the whole
-        /// prefix up to and including a marked block, and a user turn is the shape that survives
-        /// OpenRouter's OpenAI-compat translation most reliably — assistant/tool turns are reshaped more
-        /// aggressively. Anthropic allows four breakpoints; this is the second.
-        /// </summary>
-        internal static void ApplyConversationCacheBreakpoint(HFWrapper.HFLLMInferenceRequest payload)
+        /// <summary>Write at the growing transcript frontier, including tool results. Also retain
+        /// the previous request's write boundary: a large batch can exceed a provider's lookback
+        /// window. With the system marker these use at most three explicit breakpoints.</summary>
+        internal static void ApplyConversationCacheBreakpoint(HFWrapper.HFLLMInferenceRequest payload,
+            int previousCacheMessageCount = 0)
         {
-            // The final user turn is the live one; marking it would write a new cache entry every turn
-            // and never read one back. Mark the previous user turn instead — by the next request the
-            // conversation has grown past it, so it is a stable prefix boundary.
-            int lastUser = -1, previousUser = -1;
-            for (int i = 0; i < payload.messages.Length; i++)
-            {
-                var m = payload.messages[i];
-                if (m == null || m.role != "user") continue;
-                previousUser = lastUser;
-                lastUser = i;
-            }
-            if (previousUser < 0) return;
+            if (payload.messages == null) return;
+            int last = FindCacheable(payload.messages.Length - 1);
+            if (last < 0) return;
+            int previous = FindCacheable(Math.Min(previousCacheMessageCount, payload.messages.Length) - 1);
+            if (previous >= 0 && previous != last) Mark(payload.messages[previous]);
+            Mark(payload.messages[last]);
 
-            var target = payload.messages[previousUser];
-
-            // CRITICAL: BuildMessagesFromList copies HFMessage objects but SHARES their content
-            // reference with the live session. Tagging in place would mutate the caller's stored
-            // history — poisoning the session and changing earlier turns between requests. Always
-            // build a fresh content object here.
-            if (target.content is string s)
+            int FindCacheable(int from)
             {
-                target.content = new List<object>
+                for (int i = from; i >= 0; i--)
                 {
-                    new HFWrapper.HFTextPart { text = s, cache_control = EphemeralCacheControl },
-                };
-                return;
-            }
-
-            if (target.content is System.Collections.IEnumerable existing and not string)
-            {
-                var copy = new List<object>();
-                foreach (var part in existing) copy.Add(part);
-                if (copy.Count == 0) return;
-
-                // Only a TEXT part can carry cache_control; an image/audio part cannot. If the last part
-                // is not text, append a tiny marker part rather than corrupting a media part.
-                if (copy[^1] is HFWrapper.HFTextPart lastText)
-                {
-                    copy[^1] = new HFWrapper.HFTextPart
-                    {
-                        text = lastText.text,
-                        cache_control = EphemeralCacheControl,
-                    };
+                    var message = payload.messages[i];
+                    if (message == null || message.role == "system") continue;
+                    if (message.role is not ("user" or "assistant" or "tool")) continue;
+                    if (message.content is string text && !string.IsNullOrEmpty(text)) return i;
+                    if (message.content is System.Collections.IEnumerable parts and not string)
+                        foreach (var part in parts)
+                            if (part is HFWrapper.HFTextPart { text.Length: > 0 }
+                                || part is Newtonsoft.Json.Linq.JObject jo && (string?)jo["type"] == "text"
+                                    && !string.IsNullOrEmpty((string?)jo["text"])) return i;
                 }
-                else
+                return -1;
+            }
+
+            static void Mark(HFWrapper.HFMessage target)
+            {
+                // Payload messages are copies, but their content objects belong to the session.
+                // Copy the marked part; never edit history or insert placeholder text around media.
+                if (target.content is string text)
                 {
-                    copy.Add(new HFWrapper.HFTextPart { text = " ", cache_control = EphemeralCacheControl });
+                    target.content = new List<object> { new HFWrapper.HFTextPart { text = text, cache_control = EphemeralCacheControl } };
+                    return;
+                }
+                var copy = ((System.Collections.IEnumerable)target.content).Cast<object>().ToList();
+                for (int i = copy.Count - 1; i >= 0; i--)
+                {
+                    if (copy[i] is HFWrapper.HFTextPart part && !string.IsNullOrEmpty(part.text))
+                    {
+                        copy[i] = new HFWrapper.HFTextPart { text = part.text, cache_control = EphemeralCacheControl };
+                        break;
+                    }
+                    if (copy[i] is Newtonsoft.Json.Linq.JObject jo && (string?)jo["type"] == "text"
+                        && !string.IsNullOrEmpty((string?)jo["text"]))
+                    {
+                        var clone = (Newtonsoft.Json.Linq.JObject)jo.DeepClone();
+                        clone["cache_control"] = Newtonsoft.Json.Linq.JToken.FromObject(EphemeralCacheControl);
+                        copy[i] = clone;
+                        break;
+                    }
                 }
                 target.content = copy;
             }
@@ -2188,6 +2310,23 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        private static void ApplyOpenRouterHeaders(HttpRequestMessage request)
+        {
+            request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
+            request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
+            // Ask for provider-selection/attempt metadata, and make the experiment unambiguous:
+            // OpenRouter's whole-response cache is separate from provider prompt-prefix caching.
+            request.Headers.TryAddWithoutValidation("X-OpenRouter-Metadata", "enabled");
+            request.Headers.TryAddWithoutValidation("X-OpenRouter-Cache", "false");
+        }
+
+        private static string? ReadHeader(HttpResponseMessage response, string name)
+            => response.Headers.TryGetValues(name, out var values)
+                ? values.FirstOrDefault()
+                : response.Content.Headers.TryGetValues(name, out values)
+                    ? values.FirstOrDefault()
+                    : null;
+
         // Streams an OpenAI-compatible chat completion: posts stream=true, reads the SSE body as it
         // arrives, invokes onToken per content delta, merges any tool_call deltas by index, and
         // synthesizes a normal HFLLMInferenceResponse so the rest of the pipeline is unchanged. A
@@ -2215,10 +2354,7 @@ namespace Omnipotent.Services.KliveLLM
             };
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
             if (remoteProvider.Provider == LLMProvider.OpenRouter)
-            {
-                request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
-                request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
-            }
+                ApplyOpenRouterHeaders(request);
 
             using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
             if (!response.IsSuccessStatusCode)
@@ -2244,6 +2380,7 @@ namespace Omnipotent.Services.KliveLLM
             // these, so a streamed response must report them exactly as the buffered path does.
             string generationId = null;
             string servedModel = null;
+            HFWrapper.OpenRouterMetadata openRouterMetadata = null;
 
             // #9 Speculative dispatch: notify the caller the moment a tool_call's arguments are fully
             // streamed so it can start executing that tool while the model is still generating later
@@ -2289,6 +2426,7 @@ namespace Omnipotent.Services.KliveLLM
                     if (chunk.usage != null) usage = chunk.usage;
                     if (!string.IsNullOrEmpty(chunk.id)) generationId = chunk.id;
                     if (!string.IsNullOrEmpty(chunk.model)) servedModel = chunk.model;
+                    if (chunk.openrouter_metadata != null) openRouterMetadata = chunk.openrouter_metadata;
 
                     var choice = chunk.choices != null && chunk.choices.Count > 0 ? chunk.choices[0] : null;
                     if (choice == null) continue;
@@ -2352,12 +2490,14 @@ namespace Omnipotent.Services.KliveLLM
             }
 
             // The final SSE chunk carries usage; reconcile the reservation before returning.
-            ReportFairUseUsage(fairUse, usage);
+            ReportFairUseUsage(remoteProvider.Provider, fairUse, usage);
 
             return new HFWrapper.HFLLMInferenceResponse
             {
                 id = generationId,
                 model = servedModel,
+                openrouter_metadata = openRouterMetadata,
+                response_cache_status = ReadHeader(response, "X-OpenRouter-Cache-Status"),
                 choices = new List<HFWrapper.HFLLMInferenceResponse.Choice>
                 {
                     new HFWrapper.HFLLMInferenceResponse.Choice
@@ -2431,6 +2571,7 @@ namespace Omnipotent.Services.KliveLLM
             {
                 HttpResponseMessage response;
                 string responseContent;
+                string? responseCacheStatus = null;
                 // Every ATTEMPT is another request against the per-minute windows, so admission is
                 // re-acquired per attempt rather than once per call. The lease holds the parallel slot
                 // only for the HTTP exchange; its window entry outlives disposal for the full minute.
@@ -2445,13 +2586,11 @@ namespace Omnipotent.Services.KliveLLM
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
 
                     if (remoteProvider.Provider == LLMProvider.OpenRouter)
-                    {
-                        request.Headers.TryAddWithoutValidation("HTTP-Referer", "https://github.com/Klivess/Omnipotent");
-                        request.Headers.TryAddWithoutValidation("X-Title", "Omnipotent");
-                    }
+                        ApplyOpenRouterHeaders(request);
 
                     response = await client.SendAsync(request, cancellationToken);
                     responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+                    responseCacheStatus = ReadHeader(response, "X-OpenRouter-Cache-Status");
                 }
                 // A deliberate cancellation (manual Stop / stall watchdog) surfaces as an
                 // OperationCanceledException tied to our token — it is NOT a transient blip, so
@@ -2623,7 +2762,9 @@ namespace Omnipotent.Services.KliveLLM
 
                     // Swap our pessimistic reservation for what the router actually counted, releasing
                     // the difference to the callers queued behind us.
-                    ReportFairUseUsage(fairUse, hfResponse.usage);
+                    hfResponse.request_provider = remoteProvider.Provider.ToString();
+                    hfResponse.response_cache_status = responseCacheStatus;
+                    ReportFairUseUsage(remoteProvider.Provider, fairUse, hfResponse.usage);
                     return hfResponse;
                 }
             }
@@ -2981,6 +3122,14 @@ namespace Omnipotent.Services.KliveLLM
             /// </summary>
             public int CachedPromptTokens { get; set; }
 
+            /// <summary>Provider-reported cache-write tokens. A zero value is meaningful only when
+            /// <see cref="CacheMetricsAvailable"/> is true; automatic caches often omit this counter.</summary>
+            public int CacheWritePromptTokens { get; set; }
+
+            /// <summary>True when prompt_tokens_details was present, so a real zero cache hit can be
+            /// distinguished from a provider that returned no cache telemetry.</summary>
+            public bool CacheMetricsAvailable { get; set; }
+
             /// <summary>The provider's generation/response id (OpenRouter's `id`), used to fetch
             /// the authoritative per-request cost from /generation. Null when unavailable.</summary>
             public string? GenerationId { get; set; }
@@ -2991,10 +3140,24 @@ namespace Omnipotent.Services.KliveLLM
             /// case callers fall back to a provisional estimate + optional /generation reconciliation.</summary>
             public double? CostUsd { get; set; }
 
+            /// <summary>OpenRouter's provider-side inference cost before router fees, when reported.</summary>
+            public double? UpstreamInferenceCostUsd { get; set; }
+
             /// <summary>The model that actually served this turn, as reported by the provider (OpenRouter's
             /// response `model`). With OpenRouter fallback routing this may be a later route than the primary
             /// one requested. Null when the provider doesn't echo it.</summary>
             public string? Model { get; set; }
+
+            /// <summary>The configured transport (OpenRouter, AIRouter, HuggingFace, etc.).</summary>
+            public string? Provider { get; set; }
+
+            /// <summary>The endpoint provider OpenRouter actually selected for this generation.</summary>
+            public string? RoutedProvider { get; set; }
+
+            public string? RouterStrategy { get; set; }
+            public int? RouterAttempt { get; set; }
+            public long RequestDurationMs { get; set; }
+            public string? ResponseCacheStatus { get; set; }
 
             /// <summary>The live model-window limit applied to this request, when the caller supplied
             /// one (Projects/OpenRouter).</summary>
@@ -3002,6 +3165,8 @@ namespace Omnipotent.Services.KliveLLM
 
             /// <summary>Whether KliveLLM compacted the structured session before dispatch.</summary>
             public bool ContextWasCompacted { get; set; }
+            public string? CacheEpochID { get; set; }
+            public int CacheEpochTurnIndex { get; set; }
 
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.
@@ -3248,6 +3413,10 @@ namespace Omnipotent.Services.KliveLLM
             // carrying tool_calls and role:"tool" result turns — neither of which LLama's ChatHistory
             // (role+content only) can hold. The remote tool path uses this instead of chatHistory.
             public List<HFWrapper.HFMessage> structuredMessages = new();
+            internal ToolSessionBriefState? briefState;
+            internal int lastCacheMessageCount;
+            internal string cacheEpochID = Guid.NewGuid().ToString("N");
+            internal int cacheEpochTurnIndex;
 
 
             //local

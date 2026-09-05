@@ -1,4 +1,5 @@
 ﻿using System.Text;
+using Omnipotent.Services.KliveLLM;
 
 namespace Omnipotent.Services.Projects
 {
@@ -40,9 +41,10 @@ namespace Omnipotent.Services.Projects
             string? approvalsBlock = null,
             string? taskForceBlock = null,
             string? externalActionsBlock = null,
-            bool tokensUnmetered = false)
+            bool tokensUnmetered = false,
+            List<ToolSessionBriefSection>? briefSections = null)
         {
-            var sb = new StringBuilder();
+            var sb = new ToolSessionBriefBuilder();
 
             // PREFIX-CACHE ORDER (see PromptPrefixStability). This header used to open with the
             // wall-clock and a recomputed relative age, which made the seed's SECOND line differ on
@@ -50,7 +52,7 @@ namespace Omnipotent.Services.Projects
             // it were re-prefilled from scratch every time even when their text had not changed.
             // Absolute stamps here (they mean the same thing and never churn); the live clock is
             // stated with the trigger at the end, where the genuinely per-wake content lives.
-            sb.AppendLine("── PROJECT ──");
+            sb.BeginSection("project","── PROJECT ──");
             sb.AppendLine($"Name: {project.Name}");
             sb.AppendLine($"Goal: {project.Goal}");
             sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampMinute(project.CreatedAt)}");
@@ -61,7 +63,7 @@ namespace Omnipotent.Services.Projects
                 ? "tokens unmetered (flat-fee router — do not ration model calls to save money)"
                 : $"tokens ${project.TokenBudgetUsd:0.##}";
             sb.AppendLine($"Budgets: {tokenBudgetLine} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
-            sb.AppendLine("── RUNTIME CAPABILITY TRUTH (authoritative) ──");
+            sb.BeginSection("capabilities","── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
 
             // This is intentionally ahead of the grand plan/digest/retrieval legs. A rule from
@@ -69,7 +71,7 @@ namespace Omnipotent.Services.Projects
             // or omitted because an unrelated trigger had better lexical retrieval score.
             if (!string.IsNullOrWhiteSpace(directivesBlock))
             {
-                sb.AppendLine("── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before all plans) ──");
+                sb.BeginSection("directives","── NON-NEGOTIABLE KLIVES DIRECTIVES (durable project memory; obey before all plans) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(directivesBlock, ProjectsContextBudget.DirectivesBudget));
             }
 
@@ -78,7 +80,7 @@ namespace Omnipotent.Services.Projects
             // a card that is already waiting in front of him and re-proposes what he already refused.
             if (!string.IsNullOrWhiteSpace(approvalsBlock))
             {
-                sb.AppendLine("── APPROVALS (your own outstanding requests and Klives' recent decisions) ──");
+                sb.BeginSection("approvals","── APPROVALS (your own outstanding requests and Klives' recent decisions) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(approvalsBlock, ProjectsContextBudget.ApprovalsBudget));
             }
 
@@ -86,7 +88,7 @@ namespace Omnipotent.Services.Projects
             // every wake anchors on it. Read it in full with get_grand_plan; revise via amend_grand_plan.
             if (!string.IsNullOrWhiteSpace(grandPlanBlock))
             {
-                sb.AppendLine("── GRAND PLAN (approved north star — read via grand_plan op:get, revise via op:amend) ──");
+                sb.BeginSection("grand-plan","── GRAND PLAN (approved north star — read via grand_plan op:get, revise via op:amend) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(grandPlanBlock, ProjectsContextBudget.GrandPlanBudget));
             }
 
@@ -97,13 +99,13 @@ namespace Omnipotent.Services.Projects
             // next, since the match ends at the first block that churned. See PromptPrefixStability.
             if (!string.IsNullOrWhiteSpace(accountsBlock))
             {
-                sb.AppendLine("── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
+                sb.BeginSection("accounts","── SHARED ACCOUNTS (global registry — reuse before creating; account op:list for details) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(accountsBlock, ProjectsContextBudget.AccountsBudget));
             }
 
             if (!string.IsNullOrWhiteSpace(kliveAgentContextBlock))
             {
-                sb.AppendLine("── KLIVEAGENT LIVE BRIDGE (same service graph/capabilities/recipes available to this agent) ──");
+                sb.BeginSection("kliveagent","── KLIVEAGENT LIVE BRIDGE (same service graph/capabilities/recipes available to this agent) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(kliveAgentContextBlock, ProjectsContextBudget.KnowledgeBudget));
             }
 
@@ -113,7 +115,7 @@ namespace Omnipotent.Services.Projects
             // roster sitting at one worker with eleven slots free looked exactly like a full one.
             if (!string.IsNullOrWhiteSpace(taskForceBlock))
             {
-                sb.AppendLine("── YOUR TASK FORCE (muster this FIRST: retire finished workers, re-task idle ones, staff free slots) ──");
+                sb.BeginSection("task-force","── YOUR TASK FORCE (muster this FIRST: retire finished workers, re-task idle ones, staff free slots) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(taskForceBlock, ProjectsContextBudget.TaskForceBudget));
             }
 
@@ -121,7 +123,7 @@ namespace Omnipotent.Services.Projects
             // resume actions. It precedes model-authored digest prose so a stale summary cannot win.
             if (!string.IsNullOrWhiteSpace(runtimeStateBlock))
             {
-                sb.AppendLine("── TYPED EXECUTION STATE (authoritative; update with checkpoint tools) ──");
+                sb.BeginSection("execution-state","── TYPED EXECUTION STATE (authoritative; update with checkpoint tools) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                     ProjectPromptHygiene.ScrubState(runtimeStateBlock), ProjectsContextBudget.DigestBudget));
             }
@@ -131,7 +133,7 @@ namespace Omnipotent.Services.Projects
             // a wake that lost its context would otherwise sign up or apply a second time.
             if (!string.IsNullOrWhiteSpace(externalActionsBlock))
             {
-                sb.AppendLine("── EXTERNAL ACTION LEDGER (evidenced side effects in the real world; authoritative) ──");
+                sb.BeginSection("external-actions","── EXTERNAL ACTION LEDGER (evidenced side effects in the real world; authoritative) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(
                     externalActionsBlock, ProjectsContextBudget.ObservablesBudget));
             }
@@ -139,7 +141,7 @@ namespace Omnipotent.Services.Projects
             // Absolute, not StampWithAge: a relative age recomputes every wake, so an UNCHANGED digest
             // would still hand the provider a different byte here and cost a re-prefill of everything
             // after it. The clock line at the end of the seed is what the age was for.
-            sb.AppendLine($"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampMinute(digest.UpdatedAt)}) ──");
+            sb.BeginSection("digest",$"── STANDING DIGEST (last rebuilt {Data_Handling.TemporalFormat.StampMinute(digest.UpdatedAt)}) ──");
             string digestBlock = ComposeDigestBlock(digest);
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(digestBlock, ProjectsContextBudget.DigestBudget));
 
@@ -147,7 +149,7 @@ namespace Omnipotent.Services.Projects
             // so the numbers the Commander sees are exactly the numbers Klives sees.
             if (!string.IsNullOrWhiteSpace(observablesBlock))
             {
-                sb.AppendLine("── OBSERVABLES (live values you maintain for Klives via observable op:set) ──");
+                sb.BeginSection("observables","── OBSERVABLES (live values you maintain for Klives via observable op:set) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(observablesBlock, ProjectsContextBudget.ObservablesBudget));
             }
 
@@ -155,7 +157,7 @@ namespace Omnipotent.Services.Projects
             // summary is intentionally small; list_files/stat_file provide paged detail on demand.
             if (!string.IsNullOrWhiteSpace(filesBlock))
             {
-                sb.AppendLine("── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
+                sb.BeginSection("files","── SHARED PROJECT FILES (/project — inspect before work; list_files / manage_files op:stat for more) ──");
                 sb.AppendLine(ProjectsContextBudget.TruncateToTokens(filesBlock, ProjectsContextBudget.SharedFilesBudget));
             }
 
@@ -163,7 +165,7 @@ namespace Omnipotent.Services.Projects
             // Commander's own log is deliberately NOT here — that's the RETRIEVED-FROM-LOG leg below.
             if (knowledgeHits is { Count: > 0 })
             {
-                sb.AppendLine("── RELEVANT KNOWLEDGE (Klives' knowledge base: other projects, KliveAgent memory, Omniscience, docs) ──");
+                sb.BeginSection("knowledge","── RELEVANT KNOWLEDGE (Klives' knowledge base: other projects, KliveAgent memory, Omniscience, docs) ──");
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
                     knowledgeHits,
                     ProjectsContextBudget.KnowledgeBudget,
@@ -178,7 +180,7 @@ namespace Omnipotent.Services.Projects
                 .ToList();
             if (visibleRetrievalHits.Count > 0)
             {
-                sb.AppendLine("── RETRIEVED FROM THE FULL LOG (relevant to this wake's trigger) ──");
+                sb.BeginSection("retrieved-events","── RETRIEVED FROM THE FULL LOG (relevant to this wake's trigger) ──");
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
                     visibleRetrievalHits,
                     ProjectsContextBudget.RetrievalBudget,
@@ -197,13 +199,14 @@ namespace Omnipotent.Services.Projects
             int eventsBudget = recentEventsBudget ?? ProjectsContextBudget.RecentEventsBudget;
             if (chronologicalEvents)
             {
-                string history = RenderHistoryBlock("── RECENT EVENTS (newest last) ──", visibleRecentEvents, eventsBudget);
-                if (history.Length > 0) sb.AppendLine(history);
+                var entries = new List<ToolSessionBriefEntry>();
+                string history = RenderHistoryBlock("── RECENT EVENTS (newest last) ──", visibleRecentEvents, eventsBudget, entries);
+                sb.AppendJournal("recent-events", history, entries);
             }
             else if (visibleRecentEvents.Count > 0)
             {
                 // Legacy relevance-ranked window, kept behind the ChronologicalRecentEvents setting.
-                sb.AppendLine("── RECENT EVENTS (newest last) ──");
+                sb.BeginSection("recent-events","── RECENT EVENTS (newest last) ──");
                 var fitted = ProjectsContextBudget.FitItemsInBudget(
                     visibleRecentEvents.Select((e, i) =>
                         (evt: e, idxFromEnd: visibleRecentEvents.Count - 1 - i)),
@@ -217,10 +220,11 @@ namespace Omnipotent.Services.Projects
             // The clock lives here, at the very end of the seed, rather than in the header. It is the
             // most volatile line in the whole prompt — second precision — so anything placed after it
             // can never be served from a provider's prefix cache on a later wake.
-            sb.AppendLine("── THIS WAKE'S TRIGGER ──");
+            sb.BeginSection("trigger","── THIS WAKE'S TRIGGER ──", sendEveryWake: true);
             sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — every timestamp in this seed and in your messages is UTC; measure staleness and elapsed time against this clock.");
             sb.AppendLine(ProjectsContextBudget.TruncateToTokens(triggerDescription, ProjectsContextBudget.StimulusBudget));
 
+            briefSections?.AddRange(sb.Build());
             return sb.ToString();
         }
 
@@ -336,7 +340,8 @@ namespace Omnipotent.Services.Projects
         /// that silently drops its middle looks complete, so the agent stops reaching for query_events
         /// and re-derives (or re-attempts) whatever fell out.
         /// </summary>
-        public static string RenderHistoryBlock(string header, IReadOnlyList<ProjectEvent> ascending, int budget)
+        public static string RenderHistoryBlock(string header, IReadOnlyList<ProjectEvent> ascending, int budget,
+            List<ToolSessionBriefEntry>? briefEntries = null)
         {
             if (ascending.Count == 0) return "";
             var items = GroupHistory(ascending);
@@ -352,7 +357,16 @@ namespace Omnipotent.Services.Projects
                     $"complete and unbroken back to {window.OldestKept.Timestamp:yyyy-MM-dd HH:mm} — for anything earlier " +
                     $"call query_events with to={window.OldestKept.Timestamp:O} rather than assuming it did not happen.]");
             }
-            foreach (var line in window.Lines) sb.AppendLine(line);
+            var keptItems = items.Skip(window.Dropped).ToArray();
+            for (int i = 0; i < window.Lines.Count; i++)
+            {
+                string line = window.Lines[i];
+                sb.AppendLine(line);
+                var item = keptItems[i];
+                // The result sequence distinguishes an unfinished call from its later completed pair.
+                // Older entries becoming compact does not make them new evidence.
+                briefEntries?.Add(new($"{item.Anchor.Sequence}:{item.Result?.Sequence}", line, IsPolicyBearing(item)));
+            }
             return sb.ToString().TrimEnd();
         }
 

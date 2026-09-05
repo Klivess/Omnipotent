@@ -37,6 +37,10 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Compatibility self-reference for scripts ported from hosts that expose a Globals object.</summary>
         public dynamic Globals => this;
 
+        /// <summary>The owning agent. Internal so the brain's static tool dispatch can reach per-agent
+        /// state (the Service Surface bridge) without threading it through every call.</summary>
+        internal KliveAgent AgentService => agentService;
+
         // ── Symbol Discovery ──
 
         /// <summary>

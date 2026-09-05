@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
+using System.Globalization;
 
 namespace Omnipotent.Services.Projects
 {
@@ -216,6 +217,98 @@ namespace Omnipotent.Services.Projects
                 if (to.HasValue && ts > to.Value) continue;
                 yield return e;
             }
+        }
+
+        /// <summary>
+        /// Analytics needs every event in the selected range plus the sparse lifecycle transitions
+        /// before it. Read only Timestamp/Type from the front of each old JSON row first, so years of
+        /// historical tool payloads are not fully deserialized merely to be discarded.
+        /// </summary>
+        public IEnumerable<ProjectEvent> EnumerateForAnalytics(
+            string projectID,
+            DateTime fromUtc,
+            DateTime toUtc)
+        {
+            CacheDeps.NoteRead(CacheKey(projectID));
+            string path = LogPath(projectID);
+            if (!File.Exists(path)) yield break;
+            DateTime from = fromUtc.ToUniversalTime();
+            DateTime to = toUtc.ToUniversalTime();
+
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            string? line;
+            while ((line = sr.ReadLine()) != null)
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                if (TryReadAnalyticsEnvelope(line, out DateTime envelopeTimestamp, out string? envelopeType))
+                {
+                    if (envelopeTimestamp > to) continue;
+                    if (envelopeTimestamp < from
+                        && !ProjectLifecycleEvents.IsLifecycleCapableType(envelopeType))
+                        continue;
+                }
+
+                ProjectEvent? evt = null;
+                try { evt = JsonConvert.DeserializeObject<ProjectEvent>(line); }
+                catch { /* skip partial/corrupt line */ }
+                if (evt == null) continue;
+                DateTime timestamp = evt.Timestamp.ToUniversalTime();
+                if (timestamp > to) continue;
+                if (timestamp < from && !ProjectLifecycleEvents.TryReadToStatus(evt, out _))
+                    continue;
+                yield return evt;
+            }
+        }
+
+        private static bool TryReadAnalyticsEnvelope(
+            string json,
+            out DateTime timestamp,
+            out string? type)
+        {
+            timestamp = default;
+            type = null;
+            bool hasTimestamp = false;
+            bool hasType = false;
+            try
+            {
+                using var reader = new JsonTextReader(new StringReader(json))
+                {
+                    DateParseHandling = DateParseHandling.DateTime,
+                };
+                while (reader.Read())
+                {
+                    if (reader.TokenType != JsonToken.PropertyName) continue;
+                    string? name = reader.Value?.ToString();
+                    if (!reader.Read()) break;
+                    if (string.Equals(name, nameof(ProjectEvent.Timestamp), StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (reader.Value is DateTime value)
+                        {
+                            timestamp = value.ToUniversalTime();
+                            hasTimestamp = true;
+                        }
+                        else if (DateTime.TryParse(
+                            reader.Value?.ToString(), CultureInfo.InvariantCulture,
+                            DateTimeStyles.RoundtripKind, out value))
+                        {
+                            timestamp = value.ToUniversalTime();
+                            hasTimestamp = true;
+                        }
+                    }
+                    else if (string.Equals(name, nameof(ProjectEvent.Type), StringComparison.OrdinalIgnoreCase))
+                    {
+                        type = reader.Value?.ToString();
+                        hasType = true;
+                    }
+
+                    // ProjectEvent serializes Timestamp and Type before the potentially 32KB Text /
+                    // PayloadJson fields, so the normal path stops before parsing those strings.
+                    if (hasTimestamp && hasType) return true;
+                }
+            }
+            catch { }
+            return hasTimestamp && hasType;
         }
 
         public long GetLastSequence(string projectID)

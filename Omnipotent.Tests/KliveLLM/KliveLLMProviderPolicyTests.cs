@@ -64,6 +64,47 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
+        public async Task OpenRouter_RequestsRoutingMetadataAndDisablesResponseCaching()
+        {
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, SuccessBody));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+
+            await service.SendPayloadWithRetryAsync(OpenRouter(), Payload(maxTokens: 256));
+
+            var request = Assert.Single(handler.Requests);
+            Assert.Contains("X-OpenRouter-Metadata", request.HeaderNames);
+            Assert.Contains("X-OpenRouter-Cache", request.HeaderNames);
+        }
+
+        [Fact]
+        public void OpenRouterCacheContract_UsesStableSessionAndAutomaticCaching()
+        {
+            var payload = Payload(maxTokens: 256);
+            payload.messages = new[]
+            {
+                new HFWrapper.HFMessage
+                {
+                    role = "system",
+                    content = "stable doctrine" + LlmService.CacheBreakpointMarker + "project identity",
+                },
+                new HFWrapper.HFMessage { role = "user", content = "stable wake seed" },
+            };
+
+            LlmService.ApplyOpenRouterSession(ref payload, OpenRouter(), "projects-commander-p1");
+            LlmService.ApplyPromptCaching(ref payload, OpenRouter());
+
+            Assert.Equal("projects-commander-p1", payload.session_id);
+            Assert.NotNull(payload.cache_control);
+            Assert.IsType<List<object>>(payload.messages[0].content);
+            Assert.IsType<List<object>>(payload.messages[1].content);
+
+            var nonRouter = Payload(maxTokens: 256);
+            LlmService.ApplyOpenRouterSession(ref nonRouter, HuggingFace(), "must-not-leak");
+            Assert.Null(nonRouter.session_id);
+        }
+
+        [Fact]
         public async Task OpenRouter402_SecondFailureDoesNotLoopAndIsTyped()
         {
             var handler = new RecordingHandler(

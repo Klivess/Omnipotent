@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
@@ -20,12 +20,37 @@ public sealed class ProjectTokenUsageContext
     public string? Model { get; set; }
     public string? SourceReference { get; set; }
     public string? Label { get; set; }
+    public string? Provider { get; set; }
+    public string? RoutedProvider { get; set; }
+    public bool CacheMetricsAvailable { get; set; }
+    public long CacheWritePromptTokens { get; set; }
+    public double? UpstreamInferenceCostUsd { get; set; }
+    public int TurnIndex { get; set; }
+    public long RequestDurationMs { get; set; }
+    public string? RouterStrategy { get; set; }
+    public int? RouterAttempt { get; set; }
+    public bool ContextWasCompacted { get; set; }
+    public string? CacheEpochID { get; set; }
+    public int CacheEpochTurnIndex { get; set; }
+    public string? PromptAssemblyStatus { get; set; }
+    public int AppendedBriefTokens { get; set; }
+    public int FullBriefTokens { get; set; }
+    public string? CacheSessionID { get; set; }
+    public string? ResponseCacheStatus { get; set; }
+    public string? PromptCacheTelemetryVersion { get; set; }
+}
+
+/// <summary>Version gate separating measurements produced after the repaired Projects prefix
+/// assembly from older journal rows whose missing cache fields cannot be distinguished from zero.</summary>
+public static class ProjectPromptCacheTelemetry
+{
+    public const string CurrentVersion = "projects-prefix-v3";
 }
 
 /// <summary>One immutable token-spend or cost-reconciliation journal entry.</summary>
 public sealed class ProjectTokenUsageRecord
 {
-    public int SchemaVersion { get; set; } = 1;
+    public int SchemaVersion { get; set; } = 2;
     public string RecordKind { get; set; } = "usage";
     public long Sequence { get; set; }
     public string UsageID { get; set; } = "";
@@ -44,6 +69,24 @@ public sealed class ProjectTokenUsageRecord
     /// <summary>How many of <see cref="PromptTokens"/> the provider served from its prompt cache.
     /// Zero on routes that don't support caching — which is exactly what makes it worth journaling.</summary>
     public long CachedPromptTokens { get; set; }
+    public bool CacheMetricsAvailable { get; set; }
+    public long CacheWritePromptTokens { get; set; }
+    public string? Provider { get; set; }
+    public string? RoutedProvider { get; set; }
+    public double? UpstreamInferenceCostUsd { get; set; }
+    public int TurnIndex { get; set; }
+    public long RequestDurationMs { get; set; }
+    public string? RouterStrategy { get; set; }
+    public int? RouterAttempt { get; set; }
+    public bool ContextWasCompacted { get; set; }
+    public string? CacheEpochID { get; set; }
+    public int CacheEpochTurnIndex { get; set; }
+    public string? PromptAssemblyStatus { get; set; }
+    public int AppendedBriefTokens { get; set; }
+    public int FullBriefTokens { get; set; }
+    public string? CacheSessionID { get; set; }
+    public string? ResponseCacheStatus { get; set; }
+    public string? PromptCacheTelemetryVersion { get; set; }
     /// <summary>
     /// Effective USD booked by this entry. Reconciliation entries may be negative so
     /// the sum of the provisional record and its adjustment equals the provider truth.
@@ -102,8 +145,22 @@ public sealed class ProjectTokenUsageStore
                 record.Label = CleanNullable(record.Label, 240);
                 record.GenerationID = CleanNullable(record.GenerationID, 240);
                 record.ReconcilesUsageID = CleanNullable(record.ReconcilesUsageID, 64);
+                record.Provider = CleanNullable(record.Provider, 80);
+                record.RoutedProvider = CleanNullable(record.RoutedProvider, 120);
+                record.RouterStrategy = CleanNullable(record.RouterStrategy, 120);
+                record.CacheSessionID = CleanNullable(record.CacheSessionID, 256);
+                record.ResponseCacheStatus = CleanNullable(record.ResponseCacheStatus, 40);
+                record.PromptCacheTelemetryVersion = CleanNullable(record.PromptCacheTelemetryVersion, 80);
                 record.PromptTokens = Math.Max(0, record.PromptTokens);
                 record.CompletionTokens = Math.Max(0, record.CompletionTokens);
+                record.CachedPromptTokens = Math.Clamp(record.CachedPromptTokens, 0, record.PromptTokens);
+                record.CacheWritePromptTokens = Math.Max(0, record.CacheWritePromptTokens);
+                record.TurnIndex = Math.Max(0, record.TurnIndex);
+                record.RequestDurationMs = Math.Max(0, record.RequestDurationMs);
+                if (record.RouterAttempt is < 0) record.RouterAttempt = null;
+                if (record.UpstreamInferenceCostUsd is { } upstream
+                    && (!double.IsFinite(upstream) || upstream < 0))
+                    record.UpstreamInferenceCostUsd = null;
                 if (!double.IsFinite(record.CostUsd)) record.CostUsd = 0;
 
                 string json = JsonConvert.SerializeObject(record, Formatting.None);

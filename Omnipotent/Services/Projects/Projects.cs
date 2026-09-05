@@ -1,4 +1,4 @@
-using DSharpPlus;
+﻿using DSharpPlus;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.Projects.Containers;
 using Omnipotent.Services.Projects.Discord;
@@ -1435,7 +1435,8 @@ namespace Omnipotent.Services.Projects
                     : string.Join(", ", capabilities.Take(80).Select(c => c.Name))));
             }
             catch { sb.AppendLine("Registered agent capabilities: unavailable"); }
-            try { sb.AppendLine($"Omnipotent uptime: {globals.GetOmnipotentUptime()}"); } catch { }
+            // Uptime changes on every wake and invalidates an otherwise identical reference
+            // snapshot. The wake trigger already carries the current clock; inspect uptime on demand.
             try
             {
                 string shortcuts = await globals.GetShortcuts();

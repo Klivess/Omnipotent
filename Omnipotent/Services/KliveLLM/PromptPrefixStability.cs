@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLLM
+﻿namespace Omnipotent.Services.KliveLLM
 {
     /// <summary>
     /// The rules that keep a provider's PREFIX CACHE able to serve our requests.
@@ -167,9 +167,8 @@ namespace Omnipotent.Services.KliveLLM
 
             return $"Prefix cache is being missed: only {snapshot.HitRate:P0} of prompt tokens were served from " +
                    $"cache across the last {snapshot.Requests} requests ({snapshot.UncachedTokens:N0} of " +
-                   $"{snapshot.PromptTokens:N0} tokens re-prefilled). That is a prompt-ASSEMBLY problem, not a " +
-                   "load problem: something is rewriting messages an earlier request already sent, or per-request " +
-                   "text (a clock, a relative age, an id) has moved into the head of a prompt. See PromptPrefixStability.";
+                   $"{snapshot.PromptTokens:N0} tokens re-prefilled). Check request prefix stability, cold starts, provider routing " +
+                   "and cache expiry. See PromptPrefixStability.";
         }
 
         private void Prune(DateTime now)
