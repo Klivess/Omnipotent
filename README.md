@@ -9,7 +9,7 @@ Built by [Nourdin "Klivess"](https://github.com/Klivess), a University of Bath C
 [Service runtime](Docs/service-runtime.md) · [API and security](Docs/api-and-security.md) · [Agents and retrieval](Docs/agent-and-rag.md) · [Metrics](#code-and-test-metrics) · [Private production dashboard](https://klive.uk)
 
 <a href="Docs/assets/readme/dashboard-overview.png">
-  <img src="Docs/assets/readme/dashboard-overview.png" alt="Omnipotent dashboard showing service health, CPU and RAM use, task count, and active services" width="100%">
+  <img src="https://github.com/user-attachments/assets/93d59d60-ff68-4019-9ced-432255089de4" alt="Omnipotent dashboard showing service health, CPU and RAM use, task count, and active services" width="100%">
 </a>
 
 <p align="center"><em>The live dashboard is private. This screenshot hides log and error contents, task arguments, identities, and account details.</em></p>
