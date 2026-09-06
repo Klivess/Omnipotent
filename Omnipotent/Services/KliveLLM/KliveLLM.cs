@@ -209,7 +209,8 @@ namespace Omnipotent.Services.KliveLLM
         // One process-wide limiter: the fair-use envelope is per KEY, and every subsystem
         // (KliveAgent, Projects Commander + sub-agents + councils + utility routes, Omniscience,
         // Stratum) shares the one configured AIRouter key, so they must share one queue.
-        private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new();
+        private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new(
+            prefillStatePath: OmniPaths.GetPath(Path.Combine(OmniPaths.GlobalPaths.KliveLLMDirectory, "AIRouterPrefillBudget.json")));
 
         /// <summary>The fair-use queue this instance admits AIRouter requests through. Defaults to the
         /// process-wide one — the live service must share a queue with every other caller of the same
@@ -1709,11 +1710,8 @@ namespace Omnipotent.Services.KliveLLM
         private const int RateLimitMaxDelayMs = 20000;
         private const double AffordableTokenSafetyFraction = 0.90;
 
-        // AIRouter's limits are all measured over a ROLLING MINUTE, which makes a 429 there a wait
-        // rather than a wall: one cool-off inside the wake always clears it. So instead of the
-        // ordinary policy — a few short retries, then surface a RateLimited failure that opens the
-        // project circuit and defers the wake — we hold the whole shared queue off for the cool-off
-        // and keep going. Bounded: at most this many attempts, each waiting at most one window.
+        // Short AIRouter rate limits can recover inside a wake. Longer provider Retry-After values
+        // are respected in full and surfaced to the project scheduler rather than retried early.
         private const int AIRouterRateLimitMaxAttempts = 6;
         private static readonly TimeSpan AIRouterMaxCoolOff = TimeSpan.FromSeconds(75);
         private static readonly TimeSpan AIRouterDefaultCoolOff = TimeSpan.FromSeconds(10);
@@ -1724,12 +1722,15 @@ namespace Omnipotent.Services.KliveLLM
         private const int FairUseDefaultCompletionReserve = 16_384;
 
         /// <summary>
-        /// Pessimistic token size of one outbound request: everything being sent plus the entire
-        /// completion being permitted. Over-counting is deliberate — the reservation is reconciled
-        /// DOWN to the provider's own figure once the response lands, so the per-minute token window
-        /// can never be over-committed during the gap between admission and reply.
+        /// Token estimate for the full prompt plus the entire permitted completion. Prompt size
+        /// uses the existing local estimator, not the provider's tokenizer. Reconciliation can
+        /// increase or decrease the reservation when actual usage arrives.
         /// </summary>
         internal static long EstimateRequestTokens(HFWrapper.HFLLMInferenceRequest payload)
+            => EstimatePromptTokens(payload)
+                + (payload.max_tokens is > 0 ? payload.max_tokens.Value : FairUseDefaultCompletionReserve);
+
+        internal static long EstimatePromptTokens(HFWrapper.HFLLMInferenceRequest payload)
         {
             long total = 0;
             if (payload.messages != null)
@@ -1737,19 +1738,31 @@ namespace Omnipotent.Services.KliveLLM
                     if (message != null)
                         total += EstimateMessageTokens(message);
             total += EstimateToolDefinitionTokens(payload.tools);
-            total += payload.max_tokens is > 0 ? payload.max_tokens.Value : FairUseDefaultCompletionReserve;
             return total;
         }
 
         /// <summary>Queue behind the flat-fee router's fair-use envelope, or pass straight through for
-        /// every other provider. Null means "no limiter applies", not "denied" — this never rejects.</summary>
+        /// every other provider. Null means "no limiter applies".</summary>
         private async Task<AIRouterFairUseLease?> AcquireFairUseAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
             CancellationToken cancellationToken)
         {
             if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
-            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), cancellationToken);
+            long promptTokens = EstimatePromptTokens(payload);
+            var budget = FairUse.Describe();
+            if (promptTokens > budget.UncachedBurstTokens)
+                throw new RemoteLLMException(RemoteLLMFailureKind.InvalidRequest,
+                    $"AIRouter prompt estimate {promptTokens:N0} exceeds the local prefill burst budget " +
+                    $"{budget.UncachedBurstTokens:N0}. Reduce context before sending.", remoteProvider.DisplayName, payload.model);
+            if (promptTokens > budget.UncachedTokensAvailable)
+            {
+                double seconds = (promptTokens - budget.UncachedTokensAvailable) * 3600d / budget.UncachedTokensPerHour;
+                try { await ServiceLog($"AIRouter uncached-input budget: queued for approximately {seconds:0}s; " +
+                    $"reserving {promptTokens:N0} prompt tokens, {budget.UncachedTokensAvailable:N0} available, " +
+                    $"refill {budget.UncachedTokensPerHour:N0}/hour. Only measured cache reads refund this reservation."); } catch { }
+            }
+            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), promptTokens, cancellationToken);
         }
 
         // ── AIRouter model resolution ──
@@ -1854,6 +1867,9 @@ namespace Omnipotent.Services.KliveLLM
                     ? usage.total_tokens
                     : (long)usage.prompt_tokens + usage.completion_tokens;
                 if (total > 0) lease.ReportActualTokens(total);
+                lease.ReportPromptTokens(usage.prompt_tokens,
+                    usage.prompt_tokens_details?.HasCacheReadMetrics == true
+                        ? usage.prompt_tokens_details.cached_tokens : null);
             }
 
             // Meter both routers. Previously this lived behind `lease != null`, which meant the
@@ -1876,7 +1892,7 @@ namespace Omnipotent.Services.KliveLLM
             var coolOff = providerRetryAfter is { } requested && requested > TimeSpan.Zero
                 ? requested
                 : AIRouterDefaultCoolOff;
-            return coolOff > AIRouterMaxCoolOff ? AIRouterMaxCoolOff : coolOff;
+            return coolOff;
         }
 
         private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
@@ -2283,7 +2299,7 @@ namespace Omnipotent.Services.KliveLLM
         // can show tokens as they generate; otherwise we use the buffered request with its retry policy.
         // If a streaming attempt fails BEFORE any token is emitted (connect/headers/auth), we fall back
         // to the buffered path so streaming never reduces reliability.
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendInferencePayloadAsync(
+        internal async Task<HFWrapper.HFLLMInferenceResponse> SendInferencePayloadAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
             CancellationToken cancellationToken,
@@ -2298,6 +2314,11 @@ namespace Omnipotent.Services.KliveLLM
                 return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken, onToolCallComplete);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (RemoteLLMException ex) when (!ex.IsRetryable
+                || (ex.Kind == RemoteLLMFailureKind.RateLimited && ex.RetryAfter > AIRouterMaxCoolOff))
             {
                 throw;
             }
@@ -2365,7 +2386,14 @@ namespace Omnipotent.Services.KliveLLM
                 // cool-off instead of immediately reproducing the same 429.
                 if (remoteProvider.Provider == LLMProvider.AIRouter
                     && ((int)response.StatusCode == 429 || IsUpstreamRateLimitBody(body)))
-                    FairUse.Penalize(ResolveAIRouterCoolOff(GetProviderRetryAfter(response)));
+                {
+                    var coolOff = ResolveAIRouterCoolOff(GetProviderRetryAfter(response));
+                    FairUse.Penalize(coolOff);
+                    if (coolOff > AIRouterMaxCoolOff)
+                        throw new RemoteLLMException(RemoteLLMFailureKind.RateLimited,
+                            $"AIRouter requested a {coolOff.TotalSeconds:0}s pause.", remoteProvider.DisplayName,
+                            payload.model, response.StatusCode, retryAfter: coolOff);
+                }
                 throw new HttpRequestException(
                     $"{remoteProvider.DisplayName} streaming request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {body}");
             }
@@ -2599,7 +2627,7 @@ namespace Omnipotent.Services.KliveLLM
                 {
                     throw;
                 }
-                catch (Exception ex) when (IsTransientNetworkError(ex))
+                catch (Exception ex) when (ex is not RemoteLLMException && IsTransientNetworkError(ex))
                 {
                     // Connection reset / timeout / DNS blip — retry with backoff.
                     var kind = ex is TaskCanceledException
@@ -2660,19 +2688,15 @@ namespace Omnipotent.Services.KliveLLM
                         bool transient = status == 408 || status >= 500 || rateLimited;
                         if (rateLimited) maxAttempts = Math.Max(maxAttempts, RateLimitMaxAttempts);
 
-                        // A 429 from a flat-fee router means our client-side admission control drifted
-                        // out of step with the router's own windows — another client on the same key, a
-                        // window boundary, a restart that lost the in-memory window. It is not a reason
-                        // to give up the wake: the windows are per-minute, so hold the WHOLE shared queue
-                        // for the cool-off (every other agent would otherwise walk straight into the same
-                        // wall) and keep retrying. The sleep happens inside the limiter on the next
-                        // admission, so no extra backoff is added here.
+                        // Hold the shared queue after any AIRouter rate limit. Short pauses can be
+                        // retried in this wake; longer restrictions are passed to the scheduler with
+                        // the original retry time. Public per-minute limits do not bound every 429.
                         if (rateLimited && remoteProvider.Provider == LLMProvider.AIRouter)
                         {
                             var coolOff = ResolveAIRouterCoolOff(GetProviderRetryAfter(response));
                             FairUse.Penalize(coolOff);
                             maxAttempts = Math.Max(maxAttempts, AIRouterRateLimitMaxAttempts);
-                            if (attempt < maxAttempts)
+                            if (attempt < maxAttempts && coolOff <= AIRouterMaxCoolOff)
                             {
                                 try
                                 {

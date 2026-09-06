@@ -183,6 +183,13 @@ namespace Omnipotent.Services.Projects
 
             string wakeID = Guid.NewGuid().ToString("N");
             var runtime = parent.RuntimeState.Get(project.ProjectID);
+            if (ProjectWakeRecovery.BlockedUntil(runtime, "commander", DateTime.UtcNow) is { } admissionRetryAt)
+            {
+                parent.RuntimeState.DeferProviderAdmission(project.ProjectID, "commander", admissionRetryAt);
+                if (queueIfBusy)
+                    parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
+                return null;
+            }
             if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open)
             {
                 if (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > DateTime.UtcNow)
@@ -271,6 +278,8 @@ namespace Omnipotent.Services.Projects
             string? initialModel = null;
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
+            var providerRecovery = new ProjectWakeRecovery();
+            int modelResponses = 0;
             ProjectResumeAction? startingResumeAction = null;
             // Whether Klives is expecting a reply from this wake — either it was triggered by his
             // message, or he steered it mid-flight. Drives the Discord reply mirror.
@@ -421,12 +430,15 @@ namespace Omnipotent.Services.Projects
                 {
                     cts.Token.ThrowIfCancellationRequested();
                     parent.RuntimeState.HeartbeatWakeLease(projectID, wakeID, leaseGeneration);
-                    var liveRuntime = parent.RuntimeState.Get(projectID);
-                    if (liveRuntime.Health.Circuit.Status == ProjectCircuitStatus.Open
-                        && (!liveRuntime.Health.Circuit.RetryAt.HasValue || liveRuntime.Health.Circuit.RetryAt > DateTime.UtcNow))
+                    if (!await providerRecovery.WaitForAdmissionAsync(
+                            () => ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(projectID), "commander", DateTime.UtcNow),
+                            () => parent.RuntimeState.HeartbeatWakeLease(projectID, wakeID, leaseGeneration), cts.Token))
                     {
+                        DateTime? retryAt = ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(projectID), "commander", DateTime.UtcNow);
+                        parent.RuntimeState.RecordDependencyHealth(projectID, ProjectWakeRecovery.DependencyKey("commander"),
+                            false, "ProviderCircuit", "The active wake is waiting for provider recovery.", retryAt);
                         outcome = ProjectEventTypes.WakeDeferred;
-                        outcomeText = $"Wake deferred by open provider circuit until {liveRuntime.Health.Circuit.RetryAt?.ToString("O") ?? "manual recovery"}.";
+                        outcomeText = $"Wake deferred by open provider circuit until {retryAt?.ToString("O") ?? "manual recovery"}.";
                         break;
                     }
 
@@ -479,7 +491,9 @@ namespace Omnipotent.Services.Projects
                         try
                         {
                             parent.Activity.BeginThinking(projectID, "commander", "commander", model);
-                            resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
+                            resp = await providerRecovery.ExecuteAsync(async () =>
+                            {
+                                var response = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
                                 modelOverride: model, cancellationToken: cts.Token,
                                 onToken: activitySink,
@@ -489,6 +503,21 @@ namespace Omnipotent.Services.Projects
                                 enableOpenRouterContextCompression: contextPolicy != null,
                                 samplingParameters: routeSampling,
                                 compactProtectPrefixMessages: protectedBriefMessages);
+                                if (!response.Success)
+                                    throw ProjectProviderFailure.FromUnsuccessfulResponse(response.ErrorMessage, response.Model ?? model, maxOutputTokens);
+                                return response;
+                            }, (failure, attempt, delay) =>
+                            {
+                                parent.RuntimeState.HeartbeatWakeLease(projectID, wakeID, leaseGeneration);
+                                parent.EventLog.Append(new ProjectEvent
+                                {
+                                    ProjectID = projectID, WakeID = wakeID, AgentID = "commander",
+                                    Type = ProjectEventTypes.WakeRetry, Author = "system",
+                                    Text = $"Keeping this wake active; inference retry {attempt} in {delay.TotalSeconds:0}s. Committed tools and conversation are retained.",
+                                    PayloadJson = JsonConvert.SerializeObject(new { reason = failure.Kind.ToString(), attempt, delayMs = delay.TotalMilliseconds }),
+                                });
+                            }, cts.Token);
+                            modelResponses++;
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
@@ -926,13 +955,14 @@ namespace Omnipotent.Services.Projects
                 var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
                 string providerDetail = ProjectProviderFailure.Describe(ex);
                 outcomePayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
-                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex, flatFeeProvider: flatFeeProvider);
+                DateTime retryAt = ProjectWakeRecovery.AutomaticRetryAt(ex, flatFeeProvider);
                 // A provider failure is telemetry, never an autonomous project veto. Keep the
                 // circuit finite so a restored provider or adjusted route can recover itself.
                 failure.Retryable = true;
                 failure.RetryAt = retryAt;
-                parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
-                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                parent.RuntimeState.RecordExecutionFailure(projectID, failure,
+                    openCircuit: ProjectWakeRecovery.IsSharedFailure(ex), circuitRetryAt: retryAt);
+                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectWakeRecovery.DependencyKey("commander"),
                     healthy: false, ex.Kind.ToString(), providerDetail, retryAt);
                 outcome = ProjectEventTypes.WakeDeferred;
                 outcomeText = $"Wake deferred by provider failure: {providerDetail}; automatic retry after {retryAt:O}.";
@@ -971,7 +1001,8 @@ namespace Omnipotent.Services.Projects
                 // — without this, starting each wake in a fresh session loses it entirely.
                 try
                 {
-                    if (actionTrail.Count > 0 || !string.IsNullOrWhiteSpace(outcomeText))
+                    // A failed preflight must not replace the last real handoff with outage prose.
+                    if (actionTrail.Count > 0 || modelResponses > 0 && !string.IsNullOrWhiteSpace(outcomeText))
                     {
                         var tail = new System.Text.StringBuilder();
                         tail.AppendLine($"Ended {DateTime.UtcNow:O} — {outcome}: {outcomeText}");
@@ -1000,7 +1031,8 @@ namespace Omnipotent.Services.Projects
                         emptyResponses, stuckTrips, endedAtWorkSlice, initialModel, finalModel,
                         sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool,
                         wakePromptTokens, wakeCompletionTokens, wakeCostUsd,
-                        wakeCostEstimated ? "provisional-or-mixed" : "actual"));
+                        wakeCostEstimated ? "provisional-or-mixed" : "actual",
+                        modelResponses, providerRecovery.Retries, providerRecovery.WaitMs));
 
                     // Backstop: every exit owes Klives prose when he was waiting on one. The ordinary
                     // no-tool-calls ending already replied and cleared this. A work-slice rollover,
@@ -1024,7 +1056,8 @@ namespace Omnipotent.Services.Projects
                     }
 
                     // Refresh budget/org in the digest, then compact — never in the hot path.
-                    await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
+                    if (modelResponses > 0)
+                        await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
                 }
                 catch { /* never mask the wake outcome */ }
 
@@ -1051,8 +1084,7 @@ namespace Omnipotent.Services.Projects
                         .Select(e => (long?)e.Sequence).Max();
                 if (outcome == ProjectEventTypes.WakeCompleted)
                 {
-                    parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
-                    parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
+                    parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence, providerAgentID: "commander");
                 }
                 // The durable inbox entry is only removed after a successful wake. Failed and
                 // deferred wakes release their claim, allowing recovery/retry to replay the exact
@@ -1087,7 +1119,7 @@ namespace Omnipotent.Services.Projects
                         outcome == ProjectEventTypes.WakeCompleted, productiveActions, stuckTrips))
                     parent.RuntimeState.ClearResumeAction(projectID, startingResumeAction!.ActionID);
                 var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
-                if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
+                if (modelResponses > 0 && ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                     parent.RuntimeState.ClearResumeAction(projectID, consumedResume!.ActionID);
                 if (!DrainPendingTriggers(projectID) && continueAfterSlice)
                     ContinueProductiveWork(projectID);

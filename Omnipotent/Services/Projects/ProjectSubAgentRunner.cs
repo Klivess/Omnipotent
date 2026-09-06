@@ -72,11 +72,29 @@ namespace Omnipotent.Services.Projects
                     return current.WakeID;
                 }
 
+                // Do not start a known-doomed wake. Directed stimuli remain in their durable
+                // queue; direct steering is also retained until the next admitted wake.
+                if (ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(project.ProjectID),
+                        agent.AgentID, DateTime.UtcNow) is { } admissionRetryAt)
+                {
+                    parent.RuntimeState.DeferProviderAdmission(project.ProjectID, agent.AgentID, admissionRetryAt);
+                    if (queueIfBusy)
+                    {
+                        var pending = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
+                        if (pending.Count < MaxPendingTriggers && !pending.Contains(trigger)) pending.Enqueue(trigger);
+                    }
+                    return null;
+                }
+
                 string wakeID = Guid.NewGuid().ToString("N");
                 var lease = parent.RuntimeState.TryAcquireAgentWakeLease(project.ProjectID, agent.AgentID, wakeID);
                 if (!lease.Acquired || lease.Lease == null) return lease.Lease?.WakeID;
                 active = new ActiveWake(wakeID, lease.Lease.Generation, new CancellationTokenSource());
                 activeWakes[key] = active;
+                // A trigger retained during admission is now in the initial seed. Do not
+                // deliver it again as fresh mid-wake steering and invite repeated actions.
+                if (steerQueue.TryGetValue(key, out var queued))
+                    steerQueue[key] = new ConcurrentQueue<string>(queued.Where(text => !string.Equals(text, trigger, StringComparison.Ordinal)));
             }
 
             try
@@ -247,6 +265,8 @@ namespace Omnipotent.Services.Projects
             string? initialModel = null;
             string? finalModel = null;
             DateTime wakeStartedAtUtc = DateTime.UtcNow;
+            var providerRecovery = new ProjectWakeRecovery();
+            int modelResponses = 0;
             ProjectResumeAction? startingResumeAction = null;
             // Set once the provider is resolved; read by the RemoteLLMException handler, which sits
             // outside the scope the LLM service is declared in. Parity with the Commander: a flat-fee
@@ -348,12 +368,15 @@ namespace Omnipotent.Services.Projects
                 {
                     cts.Token.ThrowIfCancellationRequested();
                     parent.RuntimeState.HeartbeatAgentWakeLease(projectID, agent.AgentID, wakeID, leaseGeneration);
-                    var liveRuntime = parent.RuntimeState.Get(projectID);
-                    if (liveRuntime.Health.Circuit.Status == ProjectCircuitStatus.Open
-                        && (!liveRuntime.Health.Circuit.RetryAt.HasValue || liveRuntime.Health.Circuit.RetryAt > DateTime.UtcNow))
+                    if (!await providerRecovery.WaitForAdmissionAsync(
+                            () => ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(projectID), agent.AgentID, DateTime.UtcNow),
+                            () => parent.RuntimeState.HeartbeatAgentWakeLease(projectID, agent.AgentID, wakeID, leaseGeneration), cts.Token))
                     {
+                        DateTime? retryAt = ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(projectID), agent.AgentID, DateTime.UtcNow);
+                        parent.RuntimeState.RecordDependencyHealth(projectID, ProjectWakeRecovery.DependencyKey(agent.AgentID),
+                            false, "ProviderCircuit", "The active wake is waiting for provider recovery.", retryAt);
                         outcome = ProjectEventTypes.WakeDeferred;
-                        outcomeText = $"Agent {agent.AgentID} deferred by open provider circuit until {liveRuntime.Health.Circuit.RetryAt?.ToString("O") ?? "manual recovery"}.";
+                        outcomeText = $"Agent {agent.AgentID} deferred by open provider circuit until {retryAt?.ToString("O") ?? "manual recovery"}.";
                         break;
                     }
 
@@ -394,7 +417,9 @@ namespace Omnipotent.Services.Projects
                         try
                         {
                             parent.Activity.BeginThinking(projectID, agent.AgentID, agent.Role, model);
-                            resp = await llm.QueryToolSessionAsync(sessionId, toolDefs,
+                            resp = await providerRecovery.ExecuteAsync(async () =>
+                            {
+                                var response = await llm.QueryToolSessionAsync(sessionId, toolDefs,
                                 maxTokensOverride: maxOutputTokens,
                                 modelOverride: model, cancellationToken: cts.Token,
                                 onToken: activitySink,
@@ -404,6 +429,21 @@ namespace Omnipotent.Services.Projects
                                 enableOpenRouterContextCompression: contextPolicy != null,
                                 samplingParameters: routeSampling,
                                 compactProtectPrefixMessages: protectedBriefMessages);
+                                if (!response.Success)
+                                    throw ProjectProviderFailure.FromUnsuccessfulResponse(response.ErrorMessage, response.Model ?? model, maxOutputTokens);
+                                return response;
+                            }, (failure, attempt, delay) =>
+                            {
+                                parent.RuntimeState.HeartbeatAgentWakeLease(projectID, agent.AgentID, wakeID, leaseGeneration);
+                                parent.EventLog.Append(new ProjectEvent
+                                {
+                                    ProjectID = projectID, WakeID = wakeID, AgentID = agent.AgentID,
+                                    Type = ProjectEventTypes.WakeRetry, Author = "system",
+                                    Text = $"Keeping this wake active; inference retry {attempt} in {delay.TotalSeconds:0}s. Committed tools and conversation are retained.",
+                                    PayloadJson = JsonConvert.SerializeObject(new { reason = failure.Kind.ToString(), attempt, delayMs = delay.TotalMilliseconds }),
+                                });
+                            }, cts.Token);
+                            modelResponses++;
                             modelTurns++;
                         }
                         catch (OperationCanceledException) { throw; }
@@ -840,14 +880,15 @@ namespace Omnipotent.Services.Projects
             catch (RemoteLLMException ex)
             {
                 string providerDetail = ProjectProviderFailure.Describe(ex);
-                DateTime retryAt = ProjectProviderFailure.AutomaticRetryAt(ex, flatFeeProvider: flatFeeProvider);
+                DateTime retryAt = ProjectWakeRecovery.AutomaticRetryAt(ex, flatFeeProvider);
                 var failure = ProjectProviderFailure.ToExecutionFailure(ex, wakeID);
                 // Provider labels describe the failed attempt, not permission to permanently
                 // block an autonomous project. Keep retry telemetry truthful but recoverable.
                 failure.Retryable = true;
                 failure.RetryAt = retryAt;
-                parent.RuntimeState.RecordExecutionFailure(projectID, failure, openCircuit: true, circuitRetryAt: retryAt);
-                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectProviderFailure.DependencyKey,
+                parent.RuntimeState.RecordExecutionFailure(projectID, failure,
+                    openCircuit: ProjectWakeRecovery.IsSharedFailure(ex), circuitRetryAt: retryAt);
+                parent.RuntimeState.RecordDependencyHealth(projectID, ProjectWakeRecovery.DependencyKey(agent.AgentID),
                     healthy: false, ex.Kind.ToString(), providerDetail, retryAt);
                 outcomePayloadJson = ProjectProviderFailure.ToPayloadJson(ex);
                 outcome = ProjectEventTypes.WakeDeferred;
@@ -876,7 +917,8 @@ namespace Omnipotent.Services.Projects
                         emptyResponses, loopTrips, endedAtWorkSlice, initialModel, finalModel,
                         sliceToolCalls, sliceModelTurns, liveContextTokens, sliceTokenBudget, lastCommittedTool,
                         wakePromptTokens, wakeCompletionTokens, wakeCostUsd,
-                        wakeCostEstimated ? "provisional-or-mixed" : "actual"));
+                        wakeCostEstimated ? "provisional-or-mixed" : "actual",
+                        modelResponses, providerRecovery.Retries, providerRecovery.WaitMs));
                 }
                 catch { }
                 parent.SubAgents.UpdateWorkState(projectID, agent.AgentID,
@@ -902,14 +944,13 @@ namespace Omnipotent.Services.Projects
                 .Select(e => (long?)e.Sequence).Max();
             if (outcome == ProjectEventTypes.WakeCompleted)
             {
-                parent.RuntimeState.ClearDependencyHealth(projectID, ProjectProviderFailure.DependencyKey);
-                parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence);
+                parent.RuntimeState.RecordExecutionSuccess(projectID, verifiedProgressSequence, providerAgentID: agent.AgentID);
             }
             if (ProjectLoopRecovery.ShouldClearAfterProgress(startingResumeAction,
                     outcome == ProjectEventTypes.WakeCompleted, productiveActions, loopTrips))
                 parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, startingResumeAction!.ActionID);
             var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agent.AgentID);
-            if (ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
+            if (modelResponses > 0 && ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                 parent.RuntimeState.ClearAgentResumeAction(projectID, agent.AgentID, consumedResume!.ActionID);
             bool completed = outcome == ProjectEventTypes.WakeCompleted;
             return ProjectWorkSliceBoundary.ShouldContinueAssignment(endedAtWorkSlice, completed)

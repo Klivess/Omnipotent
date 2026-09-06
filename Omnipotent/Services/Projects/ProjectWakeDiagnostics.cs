@@ -16,7 +16,8 @@ public static class ProjectWakeDiagnostics
         string? initialModel, string? finalModel, int toolCallLimit, int modelTurnLimit,
         long liveContextTokens, int tokenLimit, string? lastToolName,
         long promptTokens = 0, long completionTokens = 0, double costUsd = 0,
-        string costBasis = "unknown")
+        string costBasis = "unknown", int? modelResponses = null,
+        int providerRetries = 0, long providerWaitMs = 0)
     {
         long elapsedMs = Math.Max(0, (long)(DateTime.UtcNow - startedAtUtc).TotalMilliseconds);
         string route = string.IsNullOrWhiteSpace(finalModel) ? (initialModel ?? "unknown") : finalModel;
@@ -45,10 +46,13 @@ public static class ProjectWakeDiagnostics
                 $"last tool={lastToolName ?? "none"}.",
             PayloadJson = JsonConvert.SerializeObject(new
             {
-                schemaVersion = 2,
+                schemaVersion = 3,
                 outcome,
                 elapsedMs,
                 modelTurns,
+                modelResponses,
+                providerRetries,
+                providerWaitMs,
                 modelToolCalls,
                 dispatchedToolCalls,
                 productiveActions,

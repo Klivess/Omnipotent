@@ -54,7 +54,8 @@ public sealed class ProjectAnalyticsService
         string projectID,
         string? rangeKey,
         DateTime? utcNow = null,
-        bool forceRefresh = false)
+        bool forceRefresh = false,
+        string? fromUtc = null, string? toUtc = null, string? bucket = null)
     {
         // Analytics is deliberately a five-minute snapshot. Manual refresh must bypass both the
         // internal snapshot and KliveAPI's outer response cache.
@@ -63,7 +64,7 @@ public sealed class ProjectAnalyticsService
         if (project == null) return null;
 
         DateTime now = (utcNow ?? DateTime.UtcNow).ToUniversalTime();
-        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, project.CreatedAt, now);
+        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, project.CreatedAt, now, fromUtc, toUtc, bucket);
         var snapshot = GetProject(project, range, now, forceRefresh, useWallClockCompletion: !utcNow.HasValue);
         // Anchor the outer cache after a potentially slow fill. If the build crosses a bucket
         // boundary, store-time validation still succeeds and the next request can reuse it.
@@ -121,7 +122,8 @@ public sealed class ProjectAnalyticsService
     public PortfolioAnalyticsSnapshot GetPortfolio(
         string? rangeKey,
         DateTime? utcNow = null,
-        bool forceRefresh = false)
+        bool forceRefresh = false,
+        string? fromUtc = null, string? toUtc = null, string? bucket = null)
     {
         if (forceRefresh) CacheDeps.MarkUncacheable("forced portfolio analytics refresh");
         DateTime now = (utcNow ?? DateTime.UtcNow).ToUniversalTime();
@@ -129,7 +131,7 @@ public sealed class ProjectAnalyticsService
         DateTime earliest = allProjects.Count == 0
             ? now.Date
             : allProjects.Min(p => p.CreatedAt).ToUniversalTime();
-        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, earliest, now);
+        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, earliest, now, fromUtc, toUtc, bucket);
 
         // Project logs are independent files. Bound concurrency so a cold fleet report uses the
         // machine without turning one large project into head-of-line blocking for every other one.
@@ -154,7 +156,8 @@ public sealed class ProjectAnalyticsService
         // part of the question. It changes at UTC midnight for rolling windows and differs between
         // a direct project's all-time range and that project's slice inside a fleet-wide range.
         => projectID + "|" + range.Key + "|"
-            + range.FromUtc.ToUniversalTime().Ticks + "|" + range.Bucket;
+            + (range.Key is "1h" or "6h" or "24h" ? SnapshotTimeBucket(range.FromUtc) : range.FromUtc.ToUniversalTime().Ticks)
+            + "|" + range.Bucket + (range.Key == "custom" ? "|" + range.ToUtc.ToUniversalTime().Ticks : "");
 
     private object CacheLock(string cacheKey)
     {
@@ -224,6 +227,7 @@ public sealed class ProjectAnalyticsSnapshot
     public AnalyticsProjectIdentity Project { get; set; } = new();
     public AnalyticsSummary Summary { get; set; } = new();
     public List<AnalyticsSeriesPoint> Series { get; set; } = new();
+    public ProjectExecutionAnalytics Execution { get; set; } = new();
     public List<AnalyticsCountItem> Outcomes { get; set; } = new();
     public List<AnalyticsModelMetric> Models { get; set; } = new();
     public List<AnalyticsAgentMetric> Agents { get; set; } = new();
@@ -249,6 +253,7 @@ public sealed class PortfolioAnalyticsSnapshot
     public AnalyticsRange Range { get; set; } = new();
     public AnalyticsSummary Summary { get; set; } = new();
     public List<AnalyticsSeriesPoint> Series { get; set; } = new();
+    public ProjectExecutionAnalytics Execution { get; set; } = new();
     public List<AnalyticsCountItem> Outcomes { get; set; } = new();
     public List<AnalyticsModelMetric> Models { get; set; } = new();
     public List<AnalyticsCountItem> EventTypes { get; set; } = new();
@@ -331,6 +336,7 @@ public sealed class AnalyticsSummary
 
 public sealed class AnalyticsSeriesPoint
 {
+    public ProjectExecutionAnalytics Execution { get; set; } = new();
     public string Date { get; set; } = "";
     public double SpendUsd { get; set; }
     public double CumulativeSpendUsd { get; set; }
@@ -494,37 +500,9 @@ internal static class ProjectAnalyticsCalculator
         ProjectEventTypes.WakeCancelled,
     };
 
-    internal static AnalyticsRange ResolveRange(string? rawKey, DateTime earliestUtc, DateTime nowUtc)
-    {
-        string key = (rawKey ?? "30d").Trim().ToLowerInvariant();
-        if (key is "1y" or "year") key = "365d";
-        if (key is not ("7d" or "30d" or "90d" or "365d" or "all")) key = "30d";
-
-        nowUtc = nowUtc.Kind == DateTimeKind.Utc ? nowUtc : nowUtc.ToUniversalTime();
-        earliestUtc = earliestUtc.Kind == DateTimeKind.Utc ? earliestUtc : earliestUtc.ToUniversalTime();
-        DateTime from;
-        string label;
-        switch (key)
-        {
-            case "7d": from = nowUtc.Date.AddDays(-6); label = "Last 7 days"; break;
-            case "90d": from = nowUtc.Date.AddDays(-89); label = "Last 90 days"; break;
-            case "365d": from = nowUtc.Date.AddDays(-364); label = "Last 12 months"; break;
-            case "all": from = earliestUtc.Date; label = "All time"; break;
-            default: from = nowUtc.Date.AddDays(-29); label = "Last 30 days"; break;
-        }
-        if (from > nowUtc) from = nowUtc.Date;
-
-        double days = Math.Max(1, (nowUtc.Date - from.Date).TotalDays + 1);
-        string bucket = days > 730 ? "month" : days > 120 ? "week" : "day";
-        return new AnalyticsRange
-        {
-            Key = key,
-            Label = label,
-            FromUtc = DateTime.SpecifyKind(from, DateTimeKind.Utc),
-            ToUtc = nowUtc,
-            Bucket = bucket,
-        };
-    }
+    internal static AnalyticsRange ResolveRange(string? rawKey, DateTime earliestUtc, DateTime nowUtc,
+        string? fromUtc = null, string? toUtc = null, string? bucket = null) =>
+        ProjectAnalyticsRange.Resolve(rawKey, earliestUtc, nowUtc, fromUtc, toUtc, bucket);
 
     internal static ProjectAnalyticsSnapshot BuildProject(
         Project project,
@@ -645,6 +623,7 @@ internal static class ProjectAnalyticsCalculator
         long rangePrompt = 0, rangeCompletion = 0, rangeUnclassified = 0;
         double rangeSpend = 0;
         double councilSpend = 0;
+        var execution = new ProjectExecutionAnalytics();
         int successful = 0, failed = 0, deferred = 0, cancelled = 0;
         long elapsedTotal = 0;
         int elapsedCount = 0;
@@ -728,6 +707,8 @@ internal static class ProjectAnalyticsCalculator
                 && wake.CostBasis.Contains("provisional", StringComparison.OrdinalIgnoreCase)
                 && wake.CostUsd > 0)
                 provisionalCostRecords++;
+            execution.Record(wake.Outcome, wake.HasExecutionTelemetry, wake.ActiveExecution, wake.ProductiveActions,
+                wake.ProviderRetries, wake.ProviderWaitMs, wake.LoopTrips, wake.InterruptionReason);
             outcomeCounts[wake.Outcome] = outcomeCounts.GetValueOrDefault(wake.Outcome) + 1;
             switch (wake.Outcome)
             {
@@ -754,6 +735,8 @@ internal static class ProjectAnalyticsCalculator
             if (seriesByKey.TryGetValue(BucketKey(wake.Timestamp, range.Bucket), out var point))
             {
                 point.Wakes++;
+                point.Execution.Record(wake.Outcome, wake.HasExecutionTelemetry, wake.ActiveExecution, wake.ProductiveActions,
+                    wake.ProviderRetries, wake.ProviderWaitMs, wake.LoopTrips, wake.InterruptionReason);
                 if (!journalBacked)
                 {
                     point.SpendUsd += wake.CostUsd;
@@ -974,6 +957,7 @@ internal static class ProjectAnalyticsCalculator
             },
             Summary = summary,
             Series = series,
+            Execution = execution,
             Outcomes = OutcomeItems(outcomeCounts),
             Models = modelMetrics.Values
                 .OrderByDescending(m => m.CostUsd)
@@ -1073,6 +1057,8 @@ internal static class ProjectAnalyticsCalculator
         AnalyticsRange range,
         DateTime nowUtc)
     {
+        var execution = new ProjectExecutionAnalytics();
+        foreach (var snapshot in projects) execution.Add(snapshot.Execution);
         var series = CreateSeries(range);
         var seriesByKey = series.ToDictionary(p => p.Date, StringComparer.Ordinal);
         var outcomes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -1097,6 +1083,7 @@ internal static class ProjectAnalyticsCalculator
                 target.Wakes += source.Wakes;
                 target.SuccessfulWakes += source.SuccessfulWakes;
                 target.FailedWakes += source.FailedWakes;
+                target.Execution.Add(source.Execution);
                 target.DeferredWakes += source.DeferredWakes;
                 target.CancelledWakes += source.CancelledWakes;
                 target.ToolCalls += source.ToolCalls;
@@ -1251,6 +1238,7 @@ internal static class ProjectAnalyticsCalculator
             Range = CloneRange(range),
             Summary = summary,
             Series = series,
+            Execution = execution,
             Outcomes = OutcomeItems(outcomes),
             Models = models.Values.OrderByDescending(m => m.CostUsd).ThenByDescending(m => m.Tokens)
                 .Select(RoundModel).ToList(),
@@ -1386,6 +1374,7 @@ internal static class ProjectAnalyticsCalculator
             wake.Timestamp = evt.Timestamp.ToUniversalTime();
             wake.AgentID = string.IsNullOrWhiteSpace(evt.AgentID) ? wake.AgentID : evt.AgentID;
             wake.Outcome = evt.Type;
+            wake.InterruptionReason = InterruptionReason(evt);
             ParseLegacyWakeSpend(evt.Text, wake);
             byWake[key] = wake;
         }
@@ -1407,6 +1396,12 @@ internal static class ProjectAnalyticsCalculator
 
             string? outcome = ReadString(payload, "outcome");
             if (!string.IsNullOrWhiteSpace(outcome)) wake.Outcome = outcome;
+            wake.HasExecutionTelemetry = ReadLong(payload, "modelResponses").HasValue
+                || ReadLong(payload, "dispatchedToolCalls").HasValue;
+            wake.ModelResponses = (int)(ReadLong(payload, "modelResponses") ?? 0);
+            wake.ProviderRetries = (int)(ReadLong(payload, "providerRetries") ?? 0);
+            wake.ProviderWaitMs = ReadLong(payload, "providerWaitMs") ?? 0;
+            wake.LoopTrips = (int)(ReadLong(payload, "loopTrips") ?? 0);
             wake.ElapsedMs = ReadLong(payload, "elapsedMs") ?? wake.ElapsedMs;
             wake.DispatchedToolCalls = (int)(ReadLong(payload, "dispatchedToolCalls") ?? wake.DispatchedToolCalls);
             wake.ProductiveActions = (int)(ReadLong(payload, "productiveActions") ?? wake.ProductiveActions);
@@ -1443,6 +1438,24 @@ internal static class ProjectAnalyticsCalculator
                 wake.UnclassifiedTokens = wake.TotalTokens - wake.PromptTokens - wake.CompletionTokens;
         }
         return byWake.Values.OrderBy(w => w.Timestamp).ToList();
+    }
+
+    private static string InterruptionReason(ProjectEvent evt)
+    {
+        try
+        {
+            var payload = string.IsNullOrWhiteSpace(evt.PayloadJson) ? null : JObject.Parse(evt.PayloadJson);
+            string? code = ReadString(payload, "kind") ?? ReadString(payload, "code");
+            if (Enum.TryParse<KliveLLM.RemoteLLMFailureKind>(code, true, out var kind)) return kind.ToString();
+            if (code == "OpenRouterCreditExhausted") return "InsufficientProviderCredit";
+        }
+        catch { }
+        string text = evt.Text ?? "";
+        if (text.Contains("budget", StringComparison.OrdinalIgnoreCase)) return "Budget";
+        if (text.Contains("circuit", StringComparison.OrdinalIgnoreCase)) return "ProviderCircuit";
+        if (text.Contains("restart", StringComparison.OrdinalIgnoreCase)) return "ProcessRestart";
+        if (evt.Type == ProjectEventTypes.WakeCancelled) return "Cancellation";
+        return "Unknown";
     }
 
     private static void ParseLegacyWakeSpend(string? text, WakeMetric wake)
@@ -1575,18 +1588,9 @@ internal static class ProjectAnalyticsCalculator
     {
         foreach (var point in series)
         {
-            DateTime bucketStart = DateTime.SpecifyKind(
-                DateTime.ParseExact(
-                    point.Date,
-                    "yyyy-MM-dd",
-                    CultureInfo.InvariantCulture),
-                DateTimeKind.Utc);
-            DateTime bucketEnd = range.Bucket switch
-            {
-                "month" => bucketStart.AddMonths(1),
-                "week" => bucketStart.AddDays(7),
-                _ => bucketStart.AddDays(1),
-            };
+            DateTime bucketStart = DateTime.Parse(point.Date, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+            DateTime bucketEnd = ProjectAnalyticsRange.Next(bucketStart, range.Bucket);
 
             foreach (var interval in intervals)
             {
@@ -1629,30 +1633,16 @@ internal static class ProjectAnalyticsCalculator
         while (cursor <= end)
         {
             result.Add(new AnalyticsSeriesPoint { Date = BucketKey(cursor, range.Bucket) });
-            cursor = range.Bucket switch
-            {
-                "month" => cursor.AddMonths(1),
-                "week" => cursor.AddDays(7),
-                _ => cursor.AddDays(1),
-            };
+            if (result.Count > ProjectAnalyticsRange.MaxBuckets)
+                throw new ArgumentException("Too many analytics chart points.");
+            cursor = ProjectAnalyticsRange.Next(cursor, range.Bucket);
         }
         return result;
     }
 
-    private static DateTime BucketStart(DateTime timestamp, string bucket)
-    {
-        DateTime date = timestamp.ToUniversalTime().Date;
-        if (bucket == "month") return new DateTime(date.Year, date.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-        if (bucket == "week")
-        {
-            int daysSinceMonday = MondayBasedDay(date.DayOfWeek);
-            return date.AddDays(-daysSinceMonday);
-        }
-        return date;
-    }
+    private static DateTime BucketStart(DateTime timestamp, string bucket) => ProjectAnalyticsRange.Start(timestamp, bucket);
 
-    private static string BucketKey(DateTime timestamp, string bucket)
-        => BucketStart(timestamp, bucket).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+    private static string BucketKey(DateTime timestamp, string bucket) => ProjectAnalyticsRange.Key(timestamp, bucket);
 
     private static int MondayBasedDay(DayOfWeek day) => ((int)day + 6) % 7;
 
@@ -1796,6 +1786,13 @@ internal static class ProjectAnalyticsCalculator
 
     private sealed class WakeMetric
     {
+        public bool HasExecutionTelemetry { get; set; }
+        public int ModelResponses { get; set; }
+        public int ProviderRetries { get; set; }
+        public long ProviderWaitMs { get; set; }
+        public int LoopTrips { get; set; }
+        public string? InterruptionReason { get; set; }
+        public bool ActiveExecution => ModelResponses > 0 || DispatchedToolCalls > 0 || CompletionTokens > 0;
         public string WakeID { get; set; } = "";
         public DateTime Timestamp { get; set; }
         public string AgentID { get; set; } = "commander";

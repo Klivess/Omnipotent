@@ -498,7 +498,7 @@ namespace Omnipotent.Services.KliveLLM
             public class PromptTokensDetails
             {
                 private int cachedTokens;
-                [JsonProperty("cached_tokens")]
+                [JsonProperty("cached_tokens", NullValueHandling = NullValueHandling.Ignore)]
                 public int cached_tokens
                 {
                     get => cachedTokens;

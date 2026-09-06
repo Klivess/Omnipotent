@@ -476,6 +476,74 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(new[] { "c/three", "a/one" }, payload.models);
         }
 
+        [Theory]
+        [InlineData(false, 80, 20)]
+        [InlineData(true, 80, 20)]
+        [InlineData(false, null, 100)]
+        [InlineData(true, null, 100)]
+        [InlineData(false, 101, 100)]
+        [InlineData(true, -1, 100)]
+        public async Task AIRouterUsage_ReconcilesUncachedBudgetInBothTransports(bool stream, int? cached, long charged)
+        {
+            string usage = $"{{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{{\"cached_tokens\":{(cached.HasValue ? cached.Value.ToString() : "null")}}}}}";
+            string body = stream
+                ? "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
+                    + "data: {\"choices\":[],\"usage\":" + usage + "}\n\ndata: [DONE]\n\n"
+                : "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":" + usage + "}";
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK, body));
+            using var http = new HttpClient(handler);
+            var now = DateTime.UtcNow;
+            var service = new LlmService(http) { FairUse = new AIRouterFairUseLimiter(nowUtc: () => now) };
+            long before = service.FairUse.Describe().UncachedTokensAvailable;
+
+            var response = await service.SendInferencePayloadAsync(AIRouter(), Payload(256), CancellationToken.None,
+                stream ? _ => { } : null);
+
+            Assert.Single(response.choices);
+            Assert.Single(handler.RequestBodies);
+            Assert.Equal(before - charged, service.FairUse.Describe().UncachedTokensAvailable);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task AIRouterLongRetryAfter_IsPreservedWithoutAnotherAttempt(bool stream)
+        {
+            var handler = new RecordingHandler(_ =>
+            {
+                var response = RateLimitResponse();
+                response.Headers.Remove("Retry-After");
+                response.Headers.TryAddWithoutValidation("Retry-After", "3600");
+                return response;
+            });
+            using var http = new HttpClient(handler);
+            var now = DateTime.UtcNow;
+            var service = new LlmService(http) { FairUse = new AIRouterFairUseLimiter(nowUtc: () => now) };
+
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(() => service.SendInferencePayloadAsync(
+                AIRouter(), Payload(256), CancellationToken.None, stream ? _ => { } : null));
+
+            Assert.Single(handler.RequestBodies);
+            Assert.Equal(RemoteLLMFailureKind.RateLimited, error.Kind);
+            Assert.Equal(TimeSpan.FromHours(1), error.RetryAfter);
+            Assert.Equal(TimeSpan.FromHours(1), service.FairUse.Describe().PenaltyRemaining);
+            Assert.Equal(now.AddHours(1), Omnipotent.Services.Projects.ProjectProviderFailure.AutomaticRetryAt(error, now, flatFeeProvider: true));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task AIRouterOverBudgetPrompt_IsRejectedLocallyWithoutSendingOrRetrying(bool stream)
+        {
+            var handler = new RecordingHandler();
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http) { FairUse = new AIRouterFairUseLimiter(uncachedBurstTokens: 1) };
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(() => service.SendInferencePayloadAsync(
+                AIRouter(), Payload(256), CancellationToken.None, stream ? _ => { } : null));
+            Assert.Equal(RemoteLLMFailureKind.InvalidRequest, error.Kind);
+            Assert.Empty(handler.RequestBodies);
+        }
+
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(
             LlmService.LLMProvider.OpenRouter,
             "OpenRouter",

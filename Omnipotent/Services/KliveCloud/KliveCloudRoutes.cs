@@ -123,7 +123,38 @@ namespace Omnipotent.Services.KliveCloud
             await StreamVideoPath(req, filePath, parent.GetVideoMimeType(item));
         }
 
-        private async Task StreamVideoPath(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string filePath, string mimeType)
+        private Task StreamVideoPath(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string filePath, string mimeType)
+        {
+            return StreamFileToClient(req, filePath, mimeType, null);
+        }
+
+        /// <summary>
+        /// Builds a Content-Disposition that survives a non-ASCII name. The plain
+        /// filename stays for old clients; modern browsers prefer the RFC 5987
+        /// filename* form and get the name exactly as stored.
+        /// </summary>
+        private static string BuildAttachmentDisposition(string fileName)
+        {
+            string ascii = new string(fileName.Select(c => c < 32 || c > 126 || c == '"' ? '_' : c).ToArray());
+            return $"attachment; filename=\"{ascii}\"; filename*=UTF-8''{Uri.EscapeDataString(fileName)}";
+        }
+
+        /// <summary>
+        /// Sends a file from disk to the client a buffer at a time, honouring HTTP Range.
+        ///
+        /// Every download route funnels through here rather than reading the file into a
+        /// byte[] first. Buffering meant the client received nothing until the whole file
+        /// had been read off disk, the server held a full copy of it in memory (a second
+        /// copy again for the response-cache tee), and a file over 2GB could not be sent
+        /// at all. Streaming makes time-to-first-byte independent of file size and keeps
+        /// server memory flat.
+        ///
+        /// Advertising Accept-Ranges is what lets a browser or download manager resume a
+        /// large transfer instead of restarting it from zero when the connection drops.
+        /// </summary>
+        private async Task StreamFileToClient(
+            Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string filePath, string mimeType,
+            string? attachmentFileName)
         {
             if (!File.Exists(filePath))
             {
@@ -177,6 +208,10 @@ namespace Omnipotent.Services.KliveCloud
                 NameValueCollection rangeHeaders = new();
                 rangeHeaders.Add("Accept-Ranges", "bytes");
                 rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
+                if (attachmentFileName != null)
+                {
+                    rangeHeaders.Add("Content-Disposition", BuildAttachmentDisposition(attachmentFileName));
+                }
 
                 using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
                 if (isHeadRequest)
@@ -201,6 +236,10 @@ namespace Omnipotent.Services.KliveCloud
             {
                 NameValueCollection fullHeaders = new();
                 fullHeaders.Add("Accept-Ranges", "bytes");
+                if (attachmentFileName != null)
+                {
+                    fullHeaders.Add("Content-Disposition", BuildAttachmentDisposition(attachmentFileName));
+                }
 
                 using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
                 if (isHeadRequest)
@@ -363,8 +402,12 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Post, KMPermissions.Guest);
 
-            // Upload a file (file bytes sent as request body)
-            await parent.CreateAPIRoute("/KliveCloud/UploadFile", async (req) =>
+            // Upload a file (file bytes sent as request body).
+            // Streaming: the body goes socket -> disk a buffer at a time. As a buffered
+            // route the pipeline first had to materialise the whole file as a byte[] and
+            // then UTF-8-decode it into a string it would never use, which on a large
+            // upload dominated the entire request.
+            await parent.CreateStreamingAPIRoute("/KliveCloud/UploadFile", async (req) =>
             {
                 try
                 {
@@ -390,24 +433,26 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    // Use the raw bytes already read by the server listen loop
-                    byte[] fileData = req.userMessageBytes;
-
-                    if (fileData.Length == 0)
-                    {
-                        await req.ReturnResponse("EmptyFileBody", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    var file = await parent.UploadFile(fileName, fileData, parentFolderID, req.user.UserID, permLevel);
+                    var file = await parent.UploadFileFromStream(
+                        fileName, req.RequestBodyStream, req.req.ContentLength64,
+                        parentFolderID, req.user.UserID, permLevel);
                     string json = JsonConvert.SerializeObject(file);
                     await req.ReturnResponse(json, "application/json");
+                }
+                catch (InvalidDataException)
+                {
+                    await req.ReturnResponse("EmptyFileBody", code: HttpStatusCode.BadRequest);
+                }
+                catch (Omnipotent.Services.KliveAPI.KliveAPI.RequestBodyTooLargeException)
+                {
+                    // Let the pipeline emit its consistent 413 and audit outcome.
+                    throw;
                 }
                 catch (Exception ex)
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, KMPermissions.Guest, KliveCloud.MaxUploadBytes);
 
             // Download a file
             await parent.CreateAPIRoute("/KliveCloud/DownloadFile", async (req) =>
@@ -432,16 +477,14 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    byte[] fileData = await parent.DownloadFile(itemID);
-                    if (fileData == null)
+                    string filePath = parent.TryGetReadableFilePath(item);
+                    if (filePath == null)
                     {
                         await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
                         return;
                     }
 
-                    NameValueCollection dlHeaders = new();
-                    dlHeaders.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
-                    await req.ReturnBinaryResponse(fileData, "application/octet-stream", HttpStatusCode.OK, dlHeaders);
+                    await StreamFileToClient(req, filePath, "application/octet-stream", item.Name);
                 }
                 catch (Exception ex)
                 {
@@ -926,16 +969,14 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    byte[] fileData = await parent.DownloadFile(item.ItemID);
-                    if (fileData == null)
+                    string sharedFilePath = parent.TryGetReadableFilePath(item);
+                    if (sharedFilePath == null)
                     {
                         await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
                         return;
                     }
 
-                    NameValueCollection sharedHeaders = new();
-                    sharedHeaders.Add("Content-Disposition", $"attachment; filename=\"{item.Name}\"");
-                    await req.ReturnBinaryResponse(fileData, "application/octet-stream", HttpStatusCode.OK, sharedHeaders);
+                    await StreamFileToClient(req, sharedFilePath, "application/octet-stream", item.Name);
                 }
                 catch (Exception ex)
                 {
@@ -1200,7 +1241,8 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Post, KMPermissions.Anybody);
 
-            await parent.CreateAPIRoute("/KliveCloud/UploadShared", async (req) =>
+            // Streaming for the same reason as /KliveCloud/UploadFile above.
+            await parent.CreateStreamingAPIRoute("/KliveCloud/UploadShared", async (req) =>
             {
                 try
                 {
@@ -1234,20 +1276,25 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    if (req.userMessageBytes == null || req.userMessageBytes.Length == 0)
-                    {
-                        await req.ReturnResponse("EmptyFileBody", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
-                    var file = await parent.UploadFile(fileName, req.userMessageBytes, parentFolderID, $"shared:{link.ShareCode}", targetFolder.MinimumPermissionLevel);
+                    var file = await parent.UploadFileFromStream(
+                        fileName, req.RequestBodyStream, req.req.ContentLength64,
+                        parentFolderID, $"shared:{link.ShareCode}", targetFolder.MinimumPermissionLevel);
                     await req.ReturnResponse(JsonConvert.SerializeObject(file), "application/json");
+                }
+                catch (InvalidDataException)
+                {
+                    await req.ReturnResponse("EmptyFileBody", code: HttpStatusCode.BadRequest);
+                }
+                catch (Omnipotent.Services.KliveAPI.KliveAPI.RequestBodyTooLargeException)
+                {
+                    // Let the pipeline emit its consistent 413 and audit outcome.
+                    throw;
                 }
                 catch (Exception ex)
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Anybody);
+            }, HttpMethod.Post, KMPermissions.Anybody, KliveCloud.MaxUploadBytes);
 
             await parent.CreateAPIRoute("/KliveCloud/DeleteSharedItem", async (req) =>
             {

@@ -5,7 +5,7 @@ namespace Omnipotent.Tests.Projects;
 public class ProjectLoopRecoveryTests
 {
     [Fact]
-    public void FirstStopCreatesADurableOneHourCooldown()
+    public void FirstStopCreatesADurableTwoMinuteCooldown()
     {
         var now = new DateTime(2026, 8, 9, 4, 0, 0, DateTimeKind.Utc);
 
@@ -15,22 +15,22 @@ public class ProjectLoopRecoveryTests
         Assert.Equal("loop-recovery", action.Kind);
         Assert.Equal(now, action.RecordedAt);
         Assert.Equal(now + ProjectLoopRecovery.InitialRetryDelay, action.NotBefore);
-        Assert.True(ProjectLoopRecovery.DefersAutomaticWake(action, now.AddMinutes(59)));
-        Assert.False(ProjectLoopRecovery.DefersAutomaticWake(action, now.AddHours(1)));
+        Assert.True(ProjectLoopRecovery.DefersAutomaticWake(action, now.AddMinutes(1)));
+        Assert.False(ProjectLoopRecovery.DefersAutomaticWake(action, now.AddMinutes(2)));
     }
 
     [Fact]
-    public void RepeatedStopsBackOffExponentiallyAndCapAtOneDay()
+    public void RepeatedStopsBackOffExponentiallyAndCapAtOneHour()
     {
         var now = new DateTime(2026, 8, 9, 4, 0, 0, DateTimeKind.Utc);
         ProjectResumeAction? previous = null;
-        var expectedHours = new[] { 1, 2, 4, 8, 16, 24, 24 };
+        var expectedMinutes = new[] { 2, 4, 8, 16, 32, 60, 60 };
 
-        foreach (int hours in expectedHours)
+        foreach (int minutes in expectedMinutes)
         {
             var next = ProjectLoopRecovery.Create(previous, "commander", "project_directive",
                 "change strategy", now);
-            Assert.Equal(now.AddHours(hours), next.NotBefore);
+            Assert.Equal(now.AddMinutes(minutes), next.NotBefore);
             previous = next;
             now = now.AddDays(2);
         }
@@ -46,8 +46,8 @@ public class ProjectLoopRecoveryTests
             RecordedAt = now,
         };
 
-        Assert.True(ProjectLoopRecovery.DefersAutomaticWake(legacy, now.AddMinutes(30)));
-        Assert.False(ProjectLoopRecovery.DefersAutomaticWake(legacy, now.AddHours(1)));
+        Assert.True(ProjectLoopRecovery.DefersAutomaticWake(legacy, now.AddMinutes(1)));
+        Assert.False(ProjectLoopRecovery.DefersAutomaticWake(legacy, now.AddMinutes(2)));
     }
 
     [Fact]

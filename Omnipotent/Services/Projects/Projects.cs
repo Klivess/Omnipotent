@@ -75,6 +75,7 @@ namespace Omnipotent.Services.Projects
         // ── Phase 7: watchdog ──
         public ProjectWatchdog Watchdog { get; private set; } = null!;
         private System.Threading.Timer? keepaliveTimer;
+        private int keepaliveRunning;
         /// <summary>The desktop-container subsystem (P2). Null when containers are disabled or off-Windows.</summary>
         public ContainerDesktopManager? Desktops { get; private set; }
         private ProjectsRoutes routes = null!;
@@ -422,7 +423,7 @@ namespace Omnipotent.Services.Projects
             Watchdog = new ProjectWatchdog(this, msg => ServiceLog(msg));
             Watchdog.Start();
             keepaliveTimer = new System.Threading.Timer(_ => KeepaliveTick(), null,
-                TimeSpan.FromMinutes(15), TimeSpan.FromMinutes(15));
+                TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
 
             ServiceLog("Projects service started.");
         }
@@ -505,6 +506,7 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private void KeepaliveTick()
         {
+            if (Interlocked.Exchange(ref keepaliveRunning, 1) != 0) return;
             try
             {
                 foreach (var project in Store.ListProjects())
@@ -523,25 +525,29 @@ namespace Omnipotent.Services.Projects
                     var outcomes = tail.Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed).ToList();
                     int consecutiveFailures = 0;
                     for (int i = outcomes.Count - 1; i >= 0 && outcomes[i].Type == ProjectEventTypes.WakeFailed; i--) consecutiveFailures++;
-                    if (consecutiveFailures >= 2)
+                    bool providerRetryDue = ProjectWakeRecovery.RetryDue(runtime, "commander", now);
+                    var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
+                    bool resumeDue = ProjectLoopRecovery.RetryDue(runtime.Checkpoint.ResumeAction, now, lastWake?.Timestamp);
+                    bool failureBackoff = false;
+                    if (consecutiveFailures >= 2 && !providerRetryDue && !resumeDue)
                     {
                         var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
-                        if (now - outcomes[^1].Timestamp < backoff) continue; // still backing off
+                        failureBackoff = now - outcomes[^1].Timestamp < backoff;
                     }
 
-                    var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
                     // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
-                    if (!ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
-                        && (lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
+                    if (!failureBackoff && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
+                        && (resumeDue || providerRetryDue || lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
                         CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
                             ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
-                            : "Periodic keepalive: reassess the plan and make the next concrete progress toward the goal.",
+                            : "Periodic keepalive: resume the next unfinished step from the latest verified checkpoint. Preserve completed work and use the approved plan; revise it only when new evidence requires a change.",
                             queueIfBusy: false); // ephemeral nudge: never replay stale phase instructions behind a live wake
 
                     HeartbeatWorkers(project);
                 }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
+            finally { Volatile.Write(ref keepaliveRunning, 0); }
         }
 
         /// <summary>
@@ -563,18 +569,37 @@ namespace Omnipotent.Services.Projects
             if (!Budget.IsWithinTokenBudget(project.ProjectID)) return;
 
             var now = DateTime.UtcNow;
-            var agentResumes = RuntimeState.Get(project.ProjectID).Checkpoint.AgentResumeActions;
+            var runtime = RuntimeState.Get(project.ProjectID);
+            var agentResumes = runtime.Checkpoint.AgentResumeActions;
+            List<ProjectDirective>? pendingDirectives = null;
             foreach (var agent in SubAgents.ListActive(project.ProjectID))
             {
                 try
                 {
+                    bool retryDue = ProjectWakeRecovery.RetryDue(runtime, agent.AgentID, now);
+                    // A direct human message can arrive for an idle/completed worker while
+                    // admission is closed. Its durable directive is new work, so recover it
+                    // even though the previous assignment no longer qualifies for a heartbeat.
+                    ProjectDirective? newInstruction = null;
+                    if (retryDue)
+                    {
+                        pendingDirectives ??= Directives.List(project.ProjectID, includeResolved: false);
+                        newInstruction = pendingDirectives.FirstOrDefault(d => d.IsOpen
+                            && ProjectDirectiveStore.AppliesTo(d, agent.AgentID)
+                            && d.CreatedAt > (agent.LastWakeAt ?? DateTime.MinValue)
+                            && !(d.Kind == ProjectDirectiveKind.Steering && d.Status == ProjectDirectiveStatus.Acknowledged));
+                    }
                     if (!ProjectWorkerHeartbeat.ShouldWake(agent,
                             SubAgentRunner.IsAwake(project.ProjectID, agent.AgentID), now,
                             settings.WorkerHeartbeatMinutes, settings.WorkerHeartbeatMaxMinutes,
                             SubAgentRunner.UnproductiveStreak(project.ProjectID, agent.AgentID),
-                            agentResumes.GetValueOrDefault(agent.AgentID)))
+                            agentResumes.GetValueOrDefault(agent.AgentID),
+                            retryDue, hasNewInstruction: newInstruction != null))
                         continue;
-                    SubAgentRunner.Wake(project, agent, ProjectWorkerHeartbeat.TriggerFor(agent), queueIfBusy: false);
+                    string trigger = newInstruction == null ? ProjectWorkerHeartbeat.TriggerFor(agent)
+                        : $"Message from Klives [directive:{newInstruction.DirectiveID}]: {newInstruction.Text}";
+                    string? wakeID = SubAgentRunner.Wake(project, agent, trigger, queueIfBusy: false);
+                    if (newInstruction != null) MarkDirectiveDelivered(project, newInstruction, agent.AgentID, wakeID);
                 }
                 catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: worker heartbeat failed for {agent.AgentID}"); }
             }

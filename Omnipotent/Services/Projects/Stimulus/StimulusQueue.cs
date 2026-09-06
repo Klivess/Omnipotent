@@ -219,10 +219,10 @@ namespace Omnipotent.Services.Projects.Stimulus
                     else
                     {
                         deliveryFailureCounts.TryRemove(env.EnvelopeID, out _);
-                        // Paused projects and busy agents retain the durable queue record. Requeue
-                        // with a small delay rather than acknowledging or spinning hot.
-                        await Task.Delay(TimeSpan.FromSeconds(2));
-                        await DispatchAsync(env, agentID);
+                        // Keep the sole reader free to consume newer stimuli. Awaiting a requeue
+                        // here deadlocks when the bounded channel fills: only this reader can make
+                        // room for its own write. The durable envelope remains unacknowledged.
+                        _ = RetryAfterFailureAsync(env, agentID, TimeSpan.FromSeconds(2));
                     }
                 }
                 catch (Exception ex)

@@ -516,27 +516,17 @@ internal static class ProjectPromptCacheAnalytics
         while (cursor <= end)
         {
             result.Add(new AnalyticsPromptCacheSeriesPoint { Date = BucketKey(cursor, range.Bucket) });
-            cursor = range.Bucket switch
-            {
-                "month" => cursor.AddMonths(1),
-                "week" => cursor.AddDays(7),
-                _ => cursor.AddDays(1),
-            };
+            if (result.Count > ProjectAnalyticsRange.MaxBuckets)
+                throw new ArgumentException("Too many analytics chart points.");
+            cursor = ProjectAnalyticsRange.Next(cursor, range.Bucket);
         }
         return result;
     }
 
-    private static DateTime BucketStart(DateTime timestamp, string bucket)
-    {
-        DateTime date = timestamp.ToUniversalTime().Date;
-        if (bucket == "month")
-            return new DateTime(date.Year, date.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-        if (bucket == "week") return date.AddDays(-(((int)date.DayOfWeek + 6) % 7));
-        return date;
-    }
+    private static DateTime BucketStart(DateTime timestamp, string bucket) => ProjectAnalyticsRange.Start(timestamp, bucket);
 
     private static string BucketKey(DateTime timestamp, string bucket)
-        => BucketStart(timestamp, bucket).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        => ProjectAnalyticsRange.Key(timestamp, bucket);
 
     private static double Percent(long numerator, long denominator)
         => denominator > 0 ? Math.Round(numerator * 100.0 / denominator, 1) : 0;

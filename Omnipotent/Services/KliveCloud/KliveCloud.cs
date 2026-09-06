@@ -421,7 +421,27 @@ namespace Omnipotent.Services.KliveCloud
             return folder;
         }
 
-        public async Task<CloudItem> UploadFile(string fileName, byte[] fileData, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
+        /// <summary>
+        /// Chunk size for streaming a payload to or from disk. Large enough that a
+        /// multi-gigabyte transfer is not paced by syscall overhead, small enough that
+        /// the buffers stay off the large object heap's worst behaviour.
+        /// </summary>
+        internal const int TransferBufferBytes = 1024 * 1024;
+
+        /// <summary>
+        /// Ceiling on a single uploaded file. Effectively unbounded for a personal
+        /// cloud -- the real limit is free disk space -- but the API pipeline needs a
+        /// declared number to reject an absurd Content-Length before reading anything.
+        /// </summary>
+        public const long MaxUploadBytes = 64L * 1024 * 1024 * 1024;
+
+        /// <summary>
+        /// Resolves and validates where an uploaded file will land, creating the parent
+        /// directory. Shared by the buffered and streaming upload paths so both enforce
+        /// exactly the same name, permission and path-traversal rules.
+        /// </summary>
+        private (string RelativePath, string FullPath, KMPermissions Permission) ResolveUploadTarget(
+            string fileName, string parentFolderID, KMPermissions minimumPermission)
         {
             ValidateItemName(fileName);
             minimumPermission = ApplyParentPermissionFloor(parentFolderID, minimumPermission);
@@ -447,8 +467,13 @@ namespace Omnipotent.Services.KliveCloud
             if (!Directory.Exists(directory))
                 Directory.CreateDirectory(directory);
 
-            await GetDataHandler().WriteBytesToFile(fullPath, fileData);
+            return (relativePath, fullPath, minimumPermission);
+        }
 
+        private async Task<CloudItem> RegisterUploadedFile(
+            string fileName, string relativePath, string parentFolderID, string createdByUserID,
+            KMPermissions minimumPermission, long fileSizeBytes)
+        {
             CloudItem file = new CloudItem
             {
                 ItemID = RandomGeneration.GenerateRandomLengthOfNumbers(12),
@@ -460,13 +485,125 @@ namespace Omnipotent.Services.KliveCloud
                 CreatedByUserID = createdByUserID,
                 ItemType = CloudItemType.File,
                 MinimumPermissionLevel = minimumPermission,
-                FileSizeBytes = fileData.Length
+                FileSizeBytes = fileSizeBytes
             };
 
             CloudItems.Add(file);
             await SaveMetadata();
-            ServiceLog($"File '{fileName}' ({fileData.Length} bytes) uploaded by user {createdByUserID}.");
+            ServiceLog($"File '{fileName}' ({fileSizeBytes} bytes) uploaded by user {createdByUserID}.");
             return file;
+        }
+
+        public async Task<CloudItem> UploadFile(string fileName, byte[] fileData, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
+        {
+            var target = ResolveUploadTarget(fileName, parentFolderID, minimumPermission);
+
+            await GetDataHandler().WriteBytesToFile(target.FullPath, fileData);
+
+            return await RegisterUploadedFile(
+                fileName, target.RelativePath, parentFolderID, createdByUserID,
+                target.Permission, fileData.Length);
+        }
+
+        /// <summary>
+        /// Copies an upload straight from the request socket to disk, one buffer at a
+        /// time, and only then records it.
+        ///
+        /// The buffered <see cref="UploadFile(string, byte[], string, string, KMPermissions)"/>
+        /// above needs the whole payload resident as a byte[] before it can write a single
+        /// byte, which costs a full copy of the file in memory, stalls the write until the
+        /// last network byte arrives, and cannot represent a file over 2GB at all. This
+        /// path holds one buffer regardless of file size and overlaps network with disk.
+        ///
+        /// Writes land on a sibling temp file that is moved into place at the end, so an
+        /// aborted or failed upload never leaves a half-written file visible under the
+        /// item's name.
+        /// </summary>
+        public async Task<CloudItem> UploadFileFromStream(
+            string fileName, Stream source, long declaredLength, string parentFolderID,
+            string createdByUserID, KMPermissions minimumPermission,
+            CancellationToken cancellationToken = default)
+        {
+            ArgumentNullException.ThrowIfNull(source);
+            var target = ResolveUploadTarget(fileName, parentFolderID, minimumPermission);
+
+            long written = await StreamToFileAtomically(
+                target.FullPath, source, declaredLength, cancellationToken);
+            DataUtil.NoteExternalFileWrite(target.FullPath);
+
+            return await RegisterUploadedFile(
+                fileName, target.RelativePath, parentFolderID, createdByUserID,
+                target.Permission, written);
+        }
+
+        /// <summary>
+        /// Copies <paramref name="source"/> onto a sibling temp file one buffer at a time
+        /// and moves it into place, returning the byte count written. Nothing appears at
+        /// <paramref name="destinationPath"/> unless the whole payload arrived, so an
+        /// aborted transfer leaves the previous file (or no file) rather than a truncated one.
+        ///
+        /// <paramref name="declaredLength"/> is the sender's Content-Length, or a negative
+        /// value when the length is unknown (a chunked upload). When it is known it both
+        /// preallocates the file and is enforced as an exact byte count on completion.
+        /// </summary>
+        internal static async Task<long> StreamToFileAtomically(
+            string destinationPath, Stream source, long declaredLength,
+            CancellationToken cancellationToken = default)
+        {
+            string directory = Path.GetDirectoryName(destinationPath);
+            string tempPath = Path.Combine(
+                directory, "." + Path.GetFileName(destinationPath) + "." + Guid.NewGuid().ToString("N") + ".uploading");
+
+            long written = 0;
+            try
+            {
+                await using (var destination = new FileStream(
+                    tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    TransferBufferBytes, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    // Preallocating stops NTFS extending (and fragmenting) the file on
+                    // every buffer when the client told us how big the payload is.
+                    if (declaredLength > TransferBufferBytes)
+                    {
+                        try { destination.SetLength(declaredLength); } catch { }
+                    }
+
+                    byte[] buffer = new byte[TransferBufferBytes];
+                    while (true)
+                    {
+                        int read = await source.ReadAsync(buffer, cancellationToken);
+                        if (read == 0) break;
+                        await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                        written += read;
+                    }
+
+                    // A short upload must not leave the preallocated tail behind as
+                    // trailing zero bytes.
+                    if (destination.Length != written) destination.SetLength(written);
+                }
+
+                if (written == 0)
+                {
+                    throw new InvalidDataException("Upload contained no data.");
+                }
+
+                // A client that vanishes mid-transfer can end the body stream early. The
+                // truncated bytes must never be promoted into place as a complete file,
+                // so when a length was declared it has to match exactly.
+                if (declaredLength >= 0 && written != declaredLength)
+                {
+                    throw new EndOfStreamException(
+                        $"Upload ended early: received {written} of {declaredLength} declared bytes.");
+                }
+
+                File.Move(tempPath, destinationPath, overwrite: true);
+                return written;
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                throw;
+            }
         }
 
         public async Task<bool> DeleteItem(string itemID, KMProfile user)
@@ -620,6 +757,14 @@ namespace Omnipotent.Services.KliveCloud
             return true;
         }
 
+        /// <summary>
+        /// Reads a whole file into memory. Nothing calls this any more: every download
+        /// route streams via <see cref="TryGetReadableFilePath"/> instead, because
+        /// buffering meant the client waited for the entire disk read before its first
+        /// byte, the server held a full copy (and the response-cache tee a second), and
+        /// a file over 2GB could not be returned at all.
+        /// </summary>
+        [Obsolete("Stream the file with TryGetReadableFilePath instead of buffering it in memory.")]
         public async Task<byte[]> DownloadFile(string itemID)
         {
             var item = GetItemByID(itemID);
@@ -627,6 +772,19 @@ namespace Omnipotent.Services.KliveCloud
             string fullPath = GetFullItemPath(item);
             if (!File.Exists(fullPath)) return null;
             return await GetDataHandler().ReadBytesFromFile(fullPath, true);
+        }
+
+        /// <summary>
+        /// Resolves a file item to a path on disk without reading it. Download routes
+        /// stream from this path rather than calling
+        /// <see cref="DownloadFile(string)"/>, which has to hold the entire file in
+        /// memory before the client receives its first byte.
+        /// </summary>
+        public string TryGetReadableFilePath(CloudItem item)
+        {
+            if (item == null || item.ItemType != CloudItemType.File) return null;
+            string fullPath = GetFullItemPath(item);
+            return File.Exists(fullPath) ? fullPath : null;
         }
 
         public CloudItem GetFolderTree(string folderID, KMPermissions userPermission)

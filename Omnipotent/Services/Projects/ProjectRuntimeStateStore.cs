@@ -783,7 +783,8 @@ namespace Omnipotent.Services.Projects
         }
 
         public ProjectRuntimeMutationResult RecordExecutionSuccess(string projectID, long? verifiedProgressSequence = null,
-            bool closeCircuit = true, long? expectedRevision = null, DateTime? nowUtc = null)
+            bool closeCircuit = true, long? expectedRevision = null, DateTime? nowUtc = null,
+            string? providerAgentID = null)
         {
             DateTime now = Utc(nowUtc);
             return Mutate(projectID, expectedRevision, state =>
@@ -797,6 +798,14 @@ namespace Omnipotent.Services.Projects
                 {
                     state.Health.LastVerifiedProgressAt = now;
                     state.Health.LastVerifiedProgressSequence = verifiedProgressSequence;
+                }
+                if (providerAgentID != null)
+                {
+                    state.Health.Dependencies.Remove(ProjectWakeRecovery.DependencyKey(providerAgentID));
+                    // A teammate's success must not erase a newer shared Retry-After window.
+                    closeCircuit &= state.Health.Circuit.Status != ProjectCircuitStatus.Open
+                        || state.Health.Circuit.RetryAt <= now;
+                    if (closeCircuit) state.Health.Dependencies.Remove(ProjectProviderFailure.DependencyKey);
                 }
                 if (closeCircuit) state.Health.Circuit = new ProjectCircuitBreakerState();
                 RecomputeHealthStatus(state);
@@ -854,6 +863,29 @@ namespace Omnipotent.Services.Projects
                 return new(true, true);
             }, now);
         }
+
+        /// <summary>Remember an actor denied admission during a shared outage. Its deadline survives
+        /// a restart and another actor closing the shared circuit, so idle backoff cannot strand it.
+        /// Repeated delivery polls are no-ops and never shorten an existing provider restriction.</summary>
+        internal ProjectRuntimeMutationResult DeferProviderAdmission(string projectID, string agentID, DateTime retryAt,
+            DateTime? nowUtc = null) => Mutate(projectID, null, state =>
+            {
+                // A manual-only shared circuit must remain controlled by CloseCircuit; copying
+                // its sentinel into an actor dependency would outlive that manual recovery.
+                if (retryAt == DateTime.MaxValue) return new(true, false);
+                string key = ProjectWakeRecovery.DependencyKey(agentID);
+                var existing = state.Health.Dependencies.GetValueOrDefault(key);
+                if (existing is { Healthy: false, RetryAt: not null } && existing.RetryAt >= retryAt)
+                    return new(true, false);
+                state.Health.Dependencies[key] = new ProjectDependencyHealth
+                {
+                    Key = key, Healthy = false, Code = existing is { Healthy: false } ? existing.Code : "ProviderAdmission",
+                    Summary = existing is { Healthy: false } ? existing.Summary : "Assigned work is waiting for provider admission.",
+                    CheckedAt = Utc(nowUtc), RetryAt = retryAt,
+                };
+                RecomputeHealthStatus(state);
+                return new(true, true);
+            }, nowUtc);
 
         public ProjectRuntimeMutationResult ClearDependencyHealth(string projectID, string key,
             long? expectedRevision = null, DateTime? nowUtc = null) =>

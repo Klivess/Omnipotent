@@ -12,8 +12,7 @@ namespace Omnipotent.Services.Projects
     {
         public const string DependencyKey = "llm-provider";
 
-        /// <summary>How long a rate limit on a fixed-window router can possibly need to clear. The
-        /// windows are measured over a rolling minute, so waiting one out is always enough.</summary>
+        /// <summary>Fallback for a flat-fee router rate limit when it supplies no retry time.</summary>
         private static readonly TimeSpan FlatFeeRateLimitRetry = TimeSpan.FromSeconds(60);
 
         /// <summary>
@@ -23,11 +22,8 @@ namespace Omnipotent.Services.Projects
         /// configuration to recover without an agent having to unblock the project.
         ///
         /// <paramref name="flatFeeProvider"/> shortens exactly one case: a rate limit on a flat-fee
-        /// router. There, the limit is a rolling-minute fair-use window rather than a spent balance
-        /// or a degraded upstream, so the default 15-minute stand-down would idle the project for
-        /// fourteen minutes longer than the condition actually lasts. KliveLLM normally absorbs
-        /// these inside the wake (see AIRouterFairUseLimiter); this is the backstop for one that
-        /// outlived even that.
+        /// router without an explicit Retry-After. KliveLLM normally absorbs short delays inside
+        /// the wake; the scheduler preserves any longer pause requested by the provider.
         /// </summary>
         public static DateTime AutomaticRetryAt(RemoteLLMException ex, DateTime? nowUtc = null,
             bool flatFeeProvider = false)
@@ -37,8 +33,8 @@ namespace Omnipotent.Services.Projects
             TimeSpan fallback = flatFeeProvider && rateLimited ? FlatFeeRateLimitRetry : TimeSpan.FromMinutes(15);
             TimeSpan delay = ex.RetryAfter is { } requested && requested > TimeSpan.Zero
                 ? requested : fallback;
-            // A flat-fee rate limit never needs longer than one window, whatever the header claims.
-            if (flatFeeProvider && rateLimited && delay > FlatFeeRateLimitRetry) delay = FlatFeeRateLimitRetry;
+            // A provider can impose a longer restriction than its advertised RPM/TPM windows.
+            // Its explicit retry time must survive all the way to the scheduler.
             return now + delay;
         }
 

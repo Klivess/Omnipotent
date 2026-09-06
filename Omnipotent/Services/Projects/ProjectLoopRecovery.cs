@@ -8,8 +8,8 @@ namespace Omnipotent.Services.Projects;
 /// </summary>
 internal static class ProjectLoopRecovery
 {
-    internal static readonly TimeSpan InitialRetryDelay = TimeSpan.FromHours(1);
-    internal static readonly TimeSpan MaximumRetryDelay = TimeSpan.FromHours(24);
+    internal static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMinutes(2);
+    internal static readonly TimeSpan MaximumRetryDelay = TimeSpan.FromHours(1);
 
     public static ProjectResumeAction Create(ProjectResumeAction? previous, string recordedBy,
         string toolName, string summary, DateTime? nowUtc = null)
@@ -37,7 +37,8 @@ internal static class ProjectLoopRecovery
             Kind = "loop-recovery",
             RecordedBy = recordedBy,
             ToolName = toolName,
-            Summary = summary,
+            Summary = summary + " Resume the current unfinished step using a different evidence-backed approach. "
+                + "Keep completed work, account IDs and committed artifacts; do not restart the goal or replay the failed action unchanged.",
             RecordedAt = now,
             NotBefore = now + delay,
         };
@@ -55,6 +56,16 @@ internal static class ProjectLoopRecovery
         if (!retryAt.HasValue && action.Kind == "loop-recovery" && action.RecordedAt != default)
             retryAt = action.RecordedAt.ToUniversalTime() + InitialRetryDelay;
         return retryAt.HasValue && retryAt.Value > nowUtc.ToUniversalTime();
+    }
+
+    /// <summary>Dispatch one wake at a durable deadline rather than waiting for the idle heartbeat.
+    /// A previous dispatch after this deadline prevents a 15-second loop on an unchanged resume.</summary>
+    public static bool RetryDue(ProjectResumeAction? action, DateTime nowUtc, DateTime? lastWakeAt)
+    {
+        DateTime? deadline = action?.NotBefore;
+        if (!deadline.HasValue && action?.Kind == "loop-recovery" && action.RecordedAt != default)
+            deadline = action.RecordedAt + InitialRetryDelay;
+        return deadline.HasValue && deadline <= nowUtc && (!lastWakeAt.HasValue || lastWakeAt < deadline);
     }
 
     /// <summary>A productive, loop-free retry has recovered. Clear only the action captured when

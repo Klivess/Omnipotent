@@ -41,25 +41,28 @@ namespace Omnipotent.Services.Projects
             int baseMinutes,
             int maxMinutes,
             int unproductiveStreak,
-            ProjectResumeAction? resumeAction = null)
+            ProjectResumeAction? resumeAction = null,
+            bool providerRetryDue = false,
+            bool hasNewInstruction = false)
         {
             if (agent.Retired) return false;
             if (ProjectSubAgentManager.IsCommander(agent)) return false;  // the Commander has its own keepalive
             if (isAwake) return false;
-            if (ProjectLoopRecovery.DefersAutomaticWake(resumeAction, nowUtc)) return false;
+            if (!hasNewInstruction && ProjectLoopRecovery.DefersAutomaticWake(resumeAction, nowUtc)) return false;
 
             // A bounded worker that has delivered is genuinely finished — waking it would just make it
             // re-report. Its slot is the Commander's to reclaim, and the task-force block says so.
             if (agent.MissionKind == ProjectAgentMissionKind.Task
-                && agent.WorkStatus == ProjectAgentWorkStatus.Completed) return false;
+                && agent.WorkStatus == ProjectAgentWorkStatus.Completed && !hasNewInstruction) return false;
 
             // Nothing has ever been assigned: an empty-handed wake would have nothing to work on.
             if (agent.WorkStatus == ProjectAgentWorkStatus.Idle
                 && agent.ActiveMilestoneIDs.Count == 0
-                && string.IsNullOrWhiteSpace(agent.Objective)) return false;
+                && string.IsNullOrWhiteSpace(agent.Objective) && !hasNewInstruction) return false;
 
             var last = agent.LastWakeAt ?? agent.CreatedAt;
-            return nowUtc - last >= Interval(baseMinutes, maxMinutes, unproductiveStreak);
+            return hasNewInstruction || providerRetryDue || ProjectLoopRecovery.RetryDue(resumeAction, nowUtc, agent.LastWakeAt)
+                || nowUtc - last >= Interval(baseMinutes, maxMinutes, unproductiveStreak);
         }
 
         /// <summary>The trigger text for a heartbeat wake. Names the mission and makes the cheap exit

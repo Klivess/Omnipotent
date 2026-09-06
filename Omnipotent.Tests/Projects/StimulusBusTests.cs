@@ -35,6 +35,48 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task UnavailableDestinationCannotDeadlockAFullChannelWhenRequeuing()
+        {
+            var q = new StimulusQueue(_ => { });
+            string pid = NewPid();
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var delivered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var seen = new System.Collections.Concurrent.ConcurrentDictionary<string, bool>();
+            int firstAttempts = 0;
+            q.OnClaim = async env =>
+            {
+                if (env.Payload == "initial" && Interlocked.Increment(ref firstAttempts) == 1)
+                {
+                    entered.TrySetResult();
+                    await release.Task;
+                    return null;
+                }
+                seen[env.Payload] = true;
+                if (seen.Count == 257) delivered.TrySetResult();
+                return StimulusQueue.DiscardReceipt;
+            };
+            try
+            {
+                await q.EnqueueAsync(Env(pid, "full-channel", "initial"), "worker");
+                await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                // The reader is inside OnClaim. Fill all 256 channel slots before allowing
+                // the null receipt; an awaited write by that reader can never make room.
+                for (int i = 0; i < 256; i++)
+                    await q.EnqueueAsync(Env(pid, "full-channel", "message-" + i), "worker");
+                release.TrySetResult();
+                await delivered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+                Assert.Equal(257, seen.Count);
+                Assert.Equal(2, firstAttempts);
+            }
+            finally
+            {
+                release.TrySetResult();
+                q.OnClaim = _ => Task.FromResult<string?>(StimulusQueue.DiscardReceipt);
+            }
+        }
+
+        [Fact]
         public async Task PerAgentChannels_FanOutIndependently()
         {
             var q = new StimulusQueue(_ => { });

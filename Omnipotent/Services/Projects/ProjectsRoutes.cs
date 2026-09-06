@@ -616,7 +616,9 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     string range = req.userParameters?.Get("range") ?? "30d";
                     bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
-                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range, forceRefresh: fresh);
+                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range, forceRefresh: fresh,
+                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
+                        bucket: req.userParameters?.Get("bucket"));
                     if (snapshot == null)
                     {
                         await req.ReturnResponse("unknown projectID", code: HttpStatusCode.NotFound);
@@ -624,6 +626,7 @@ namespace Omnipotent.Services.Projects
                     }
                     await req.ReturnResponse(Json(snapshot));
                 }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
@@ -633,8 +636,11 @@ namespace Omnipotent.Services.Projects
                 {
                     string range = req.userParameters?.Get("range") ?? "30d";
                     bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
-                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range, forceRefresh: fresh)));
+                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range, forceRefresh: fresh,
+                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
+                        bucket: req.userParameters?.Get("bucket"))));
                 }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
