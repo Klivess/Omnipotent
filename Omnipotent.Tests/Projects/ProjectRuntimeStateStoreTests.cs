@@ -8,6 +8,33 @@ namespace Omnipotent.Tests.Projects
 
         private ProjectRuntimeStateStore NewStore() => new(_ => { }, root);
 
+        [Theory]
+        [InlineData("commander")]
+        [InlineData("worker")]
+        public void EmojiAtToolSummaryBoundary_DoesNotAbortWakeCheckpoint(string actor)
+        {
+            var store = NewStore();
+            string text = new string('x', 799) + "\U0001F600 caption";
+            Assert.True(ProjectWorkProgress.RecordIfNovel(store, "emoji", actor,
+                "read_file", "{}", new CommanderToolResult(text)));
+            var checkpoint = NewStore().Get("emoji").Checkpoint;
+            string summary = actor == "commander" ? checkpoint.LastSuccessfulAction!.Summary
+                : checkpoint.AgentLastSuccessfulActions[actor].Summary;
+            Assert.DoesNotContain('\uFFFD', summary);
+            Assert.DoesNotContain('\uD83D', summary);
+            Assert.EndsWith("…", summary);
+            Assert.True(store.SetLastWakeTail("emoji", "completed").Applied);
+        }
+
+        [Fact]
+        public void TruncatedLegacyText_DoesNotBreakRuntimePersistence()
+        {
+            var store = NewStore();
+            Assert.True(store.SetLastWakeTail("legacy-emoji", "intact \U0001F600; broken \uD83D; lone \uDE00").Applied);
+            Assert.Contains("intact \U0001F600", NewStore().Get("legacy-emoji").Checkpoint.LastWakeTail);
+            Assert.True(store.TryAcquireWakeLease("legacy-emoji", "next-wake").Acquired);
+        }
+
         [Fact]
         public void WakeLease_IsSingleFlightAndGenerationFenced()
         {

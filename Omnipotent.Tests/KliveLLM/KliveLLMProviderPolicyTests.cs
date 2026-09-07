@@ -160,6 +160,26 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(expected, LlmService.ClassifyRemoteFailure(status, "ordinary provider error"));
         }
 
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task ModelHarnessRestriction_DoesNotBecomeAnAccountOutage(bool stream)
+        {
+            const string body = """
+                {"error":{"message":"thinkingmachines/inkling:free is only available on agentic harnesses.",
+                  "code":403,"metadata":{"failed_routing_step":"Gate Free Endpoints by Agentic Harness"}}}
+                """;
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.Forbidden, body));
+            using var http = new HttpClient(handler);
+            var service = new LlmService(http);
+            var error = await Assert.ThrowsAsync<RemoteLLMException>(() => service.SendInferencePayloadAsync(
+                OpenRouter(), Payload(8192), CancellationToken.None, stream ? _ => { } : null));
+            Assert.Equal(RemoteLLMFailureKind.ModelUnavailable, error.Kind);
+            Assert.Equal(HttpStatusCode.Forbidden, error.StatusCode);
+            Assert.False(Omnipotent.Services.Projects.ProjectWakeRecovery.IsSharedFailure(error));
+            Assert.Single(handler.RequestBodies);
+        }
+
         [Fact]
         public void WrappedUpstreamRateLimit_IsClassifiedFromBody()
         {

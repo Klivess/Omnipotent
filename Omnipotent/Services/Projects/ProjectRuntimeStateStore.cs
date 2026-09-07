@@ -1948,7 +1948,10 @@ namespace Omnipotent.Services.Projects
             string tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
-                File.WriteAllText(tmp, JsonConvert.SerializeObject(state, Formatting.Indented));
+                // Checkpoints can include legacy/model text containing lone UTF-16 surrogates.
+                // Repair only those invalid code units; strict UTF-8 must not abort a completed tool.
+                File.WriteAllText(tmp, Data_Handling.UnicodeText.RepairInvalidSurrogates(
+                    JsonConvert.SerializeObject(state, Formatting.Indented)));
                 for (int attempt = 0; ; attempt++)
                 {
                     try { File.Move(tmp, path, overwrite: true); break; }
@@ -2059,7 +2062,7 @@ namespace Omnipotent.Services.Projects
         private static string Clip(string? value, int max)
         {
             string text = System.Text.RegularExpressions.Regex.Replace(value ?? "", @"\s+", " ").Trim();
-            return text.Length <= max ? text : text[..max] + "…";
+            return text.Length <= max ? text : Data_Handling.UnicodeText.Prefix(text, max) + "…";
         }
 
         private static void ValidateProjectID(string projectID)

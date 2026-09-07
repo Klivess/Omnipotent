@@ -2394,6 +2394,12 @@ namespace Omnipotent.Services.KliveLLM
                             $"AIRouter requested a {coolOff.TotalSeconds:0}s pause.", remoteProvider.DisplayName,
                             payload.model, response.StatusCode, retryAfter: coolOff);
                 }
+                var failureKind = ClassifyRemoteFailure(response.StatusCode, body);
+                if (failureKind is RemoteLLMFailureKind.Authentication or RemoteLLMFailureKind.ModelUnavailable)
+                    throw new RemoteLLMException(failureKind,
+                        $"{remoteProvider.DisplayName} streaming request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {body}",
+                        remoteProvider.DisplayName, payload.model ?? remoteProvider.Model,
+                        response.StatusCode, payload.max_tokens, retryAfter: GetProviderRetryAfter(response));
                 throw new HttpRequestException(
                     $"{remoteProvider.DisplayName} streaming request failed with status {(int)response.StatusCode} ({response.ReasonPhrase}). Body: {body}");
             }
@@ -2904,6 +2910,10 @@ namespace Omnipotent.Services.KliveLLM
         {
             int code = (int)status;
             if (status == HttpStatusCode.PaymentRequired) return RemoteLLMFailureKind.InsufficientProviderCredit;
+            // A model-specific access gate says nothing about the account credential or other
+            // routes. Misclassifying it as authentication opens a project-wide provider circuit.
+            if (status == HttpStatusCode.Forbidden && IsModelAccessRestriction(responseContent))
+                return RemoteLLMFailureKind.ModelUnavailable;
             if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return RemoteLLMFailureKind.Authentication;
             if (status == HttpStatusCode.NotFound) return RemoteLLMFailureKind.ModelUnavailable;
             if (status == HttpStatusCode.RequestTimeout) return RemoteLLMFailureKind.Timeout;
@@ -2911,6 +2921,22 @@ namespace Omnipotent.Services.KliveLLM
             if (code >= 500) return RemoteLLMFailureKind.ProviderUnavailable;
             if (code >= 400) return RemoteLLMFailureKind.InvalidRequest;
             return RemoteLLMFailureKind.Unknown;
+        }
+
+        private static bool IsModelAccessRestriction(string? body)
+        {
+            if (string.IsNullOrWhiteSpace(body)) return false;
+            try
+            {
+                // Inspect the final error only; earlier fallback failures are not authoritative.
+                var error = (JToken.Parse(body) as JObject)?["error"] as JObject;
+                if (error == null) return false;
+                return string.Equals(error.SelectToken("metadata.failed_routing_step")?.ToString(),
+                        "Gate Free Endpoints by Agentic Harness", StringComparison.OrdinalIgnoreCase)
+                    || (error["message"]?.ToString().Contains("is only available on agentic harnesses",
+                        StringComparison.OrdinalIgnoreCase) ?? false);
+            }
+            catch (JsonException) { return false; }
         }
 
         private static bool IsTransientNetworkError(Exception ex)

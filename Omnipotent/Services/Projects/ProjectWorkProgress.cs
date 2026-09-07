@@ -62,5 +62,5 @@ public static class ProjectWorkProgress
 
     private static string Clip(string text, int max) =>
         string.IsNullOrWhiteSpace(text) ? "(successful result contained no text)" :
-        text.Length <= max ? text.Trim() : text[..max].TrimEnd() + "…";
+        text.Length <= max ? text.Trim() : Data_Handling.UnicodeText.Prefix(text, max).TrimEnd() + "…";
 }

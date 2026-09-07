@@ -192,7 +192,7 @@ namespace Omnipotent.Services.Projects
             var maxChars = (int)(maxTokens * CharsPerToken);
             if (text.Length <= maxChars) return text;
             const string marker = "\n[...truncated]";
-            return text[..Math.Max(0, maxChars - marker.Length)] + marker;
+            return Data_Handling.UnicodeText.Prefix(text, Math.Max(0, maxChars - marker.Length)) + marker;
         }
 
         /// <summary>
