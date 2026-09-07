@@ -1,4 +1,4 @@
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
@@ -1912,7 +1912,15 @@ namespace Omnipotent.Services.KliveAgent
                 Omnipotent.Services.Projects.ProjectExecutionDisposition.Running);
             projects.RuntimeState.ClearBlocker(project.ProjectID);
             projects.RuntimeState.CloseCircuit(project.ProjectID);
-            await projects.RefreshDesktopRegistryAsync();
+            // Same three release steps /projects/resume performs — this dashboard path is a second
+            // front door to the same state machine, and every one of them was missing here.
+            // Closing the circuit alone still leaves the per-actor provider-admission deadline
+            // standing, which refuses the wake below outright; a pause caught in a wake's startup
+            // window leaves a cancel-on-birth flag that kills it; and the desktop reconcile is an
+            // unbounded Docker round trip that has no business delaying the wake.
+            projects.RuntimeState.ClearProviderAdmission(project.ProjectID);
+            projects.CommanderRunner.ClearPendingCancellation(project.ProjectID);
+            _ = projects.RefreshDesktopRegistryAsync();
             projects.EventLog.Append(new Omnipotent.Services.Projects.ProjectEvent
             {
                 ProjectID = project.ProjectID,
@@ -1929,6 +1937,10 @@ namespace Omnipotent.Services.KliveAgent
                 needsPlan
                     ? "Project resumed by Klives — continue planning and submit the Grand Plan for approval."
                     : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+            // Pausing cancelled every worker mid-flight; without this the roster stays asleep until
+            // each agent's quiet period elapses (20 min, doubling toward 4 h) and only the Commander
+            // comes back — which reads as a resumed project doing nothing.
+            projects.ResumeWorkers(project);
             projects.DeliverPendingDirectives(project.ProjectID);
             return true;
         }

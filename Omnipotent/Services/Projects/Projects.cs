@@ -1164,6 +1164,11 @@ namespace Omnipotent.Services.Projects
                 RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                 RuntimeState.ClearBlocker(project.ProjectID);
                 RuntimeState.CloseCircuit(project.ProjectID);
+                // The circuit is only half the admission gate: the per-actor provider deadline
+                // refuses the wake below on its own, and a halt caught in a wake's startup window
+                // leaves a cancel-on-birth flag that kills whichever wake starts next.
+                RuntimeState.ClearProviderAdmission(project.ProjectID);
+                CommanderRunner.ClearPendingCancellation(project.ProjectID);
                 EventLog.Append(new ProjectEvent
                 {
                     ProjectID = project.ProjectID,
@@ -1176,6 +1181,10 @@ namespace Omnipotent.Services.Projects
                 CommanderRunner.Wake(project, wasPlanning
                     ? "Project unhalted by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
                     : "Project unhalted by Klives. Rehydrate current state and continue with the next concrete step.");
+                // HaltProject cancels every worker wake exactly as pause does, so unhalting has to
+                // put the roster back to work too. Fleet-wide, this is the difference between
+                // unhalt-all restarting the whole estate and it restarting only the Commanders.
+                ResumeWorkers(project);
             }
             else
             {
