@@ -1,4 +1,4 @@
-using Omnipotent.Services.Projects;
+﻿using Omnipotent.Services.Projects;
 
 namespace Omnipotent.Tests.Projects
 {
@@ -185,6 +185,71 @@ namespace Omnipotent.Tests.Projects
             Assert.False(ProjectWorkProgress.RecordIfNovel(store, pid, "commander", "web_fetch", "{\"url\":\"a\"}", success));
             Assert.True(ProjectWorkProgress.RecordIfNovel(store, pid, "agent-a", "web_fetch", "{\"url\":\"a\"}", success));
             Assert.NotNull(store.Get(pid).Checkpoint.AgentLastSuccessfulActions["agent-a"].Fingerprint);
+        }
+
+        /// <summary>
+        /// Resuming a paused project has to reopen provider admission, not just the shared circuit.
+        /// BlockedUntil consults the per-actor "llm-provider:&lt;agent&gt;" deadline too, so a project
+        /// paused during a provider backoff used to have its resume wake silently refused until that
+        /// deadline expired — up to 15 minutes of "I unpaused it and nothing happened".
+        /// </summary>
+        [Fact]
+        public void ClearProviderAdmission_ReopensSharedAndPerActorDeadlines()
+        {
+            var store = NewStore();
+            string pid = "resumed";
+            var now = DateTime.UtcNow;
+            var retryAt = now.AddMinutes(15);
+
+            store.RecordDependencyHealth(pid, ProjectProviderFailure.DependencyKey, healthy: false,
+                "RateLimited", "shared outage", retryAt);
+            store.DeferProviderAdmission(pid, "commander", retryAt);
+            store.DeferProviderAdmission(pid, "worker-1", retryAt);
+            store.RecordDependencyHealth(pid, "klivemail", healthy: false, "Down", "unrelated", retryAt);
+
+            Assert.NotNull(ProjectWakeRecovery.BlockedUntil(store.Get(pid), "commander", now));
+            Assert.NotNull(ProjectWakeRecovery.BlockedUntil(store.Get(pid), "worker-1", now));
+
+            Assert.True(store.ClearProviderAdmission(pid).Applied);
+
+            var state = NewStore().Get(pid);   // survives a reload; this is durable state
+            Assert.Null(ProjectWakeRecovery.BlockedUntil(state, "commander", now));
+            Assert.Null(ProjectWakeRecovery.BlockedUntil(state, "worker-1", now));
+            // Unrelated dependencies are evidence, not admission control — they must survive.
+            Assert.True(state.Health.Dependencies.ContainsKey("klivemail"));
+        }
+
+        /// <summary>
+        /// The keepalive's queued-work backstop reads exactly this: an unclaimed, applicable trigger
+        /// means work is waiting even though the wake that should have consumed it was refused.
+        /// </summary>
+        [Fact]
+        public void PendingTrigger_IsApplicableOnceResumeSetsRunning()
+        {
+            var store = NewStore();
+            string pid = "queued";
+            var now = DateTime.UtcNow;
+            var trigger = new ProjectWakeTrigger
+            {
+                Kind = ProjectWakeTriggerKind.Other,
+                Payload = "Project resumed by Klives.",
+                AllowedDispositions = new List<ProjectExecutionDisposition>
+                {
+                    ProjectExecutionDisposition.Running,
+                    ProjectExecutionDisposition.Waiting,
+                },
+            };
+
+            store.SetDisposition(pid, ProjectExecutionDisposition.Paused);
+            Assert.True(store.EnqueueTrigger(pid, trigger).Applied);
+            Assert.Equal(ProjectWakeTriggerApplicability.Deferred,
+                ProjectRuntimeStateStore.EvaluateApplicability(trigger, store.Get(pid), now));
+
+            store.SetDisposition(pid, ProjectExecutionDisposition.Running);
+            var state = store.Get(pid);
+            Assert.Contains(state.PendingTriggers, t => t.ClaimedByWakeID == null
+                && ProjectRuntimeStateStore.EvaluateApplicability(t, state, now)
+                    == ProjectWakeTriggerApplicability.Applicable);
         }
 
         public void Dispose()

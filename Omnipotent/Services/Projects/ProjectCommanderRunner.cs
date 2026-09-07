@@ -152,6 +152,15 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
+        /// Disarms a cancel-on-birth request left by a pause/halt that landed in a wake's startup
+        /// window (digest marked a wake active, but its CancellationTokenSource was not registered
+        /// yet). The flag is consumed by whichever wake starts NEXT — so without this, the first
+        /// wake after a resume is cancelled the instant it is created, and the project only gets
+        /// moving on the follow-up wake its own postamble schedules.
+        /// </summary>
+        public void ClearPendingCancellation(string projectID) => cancelBeforeStart.TryRemove(projectID, out _);
+
+        /// <summary>
         /// Wakes the Commander in response to a trigger. Returns immediately with the wake ID;
         /// the loop runs in the background and streams events. If a wake is already active on the
         /// project, the trigger is queued and re-wakes the Commander when the active wake ends
@@ -1056,7 +1065,13 @@ namespace Omnipotent.Services.Projects
                     }
 
                     // Refresh budget/org in the digest, then compact — never in the hot path.
-                    if (modelResponses > 0)
+                    //
+                    // Skipped when Klives cancelled this wake. The rebuild is a full utility-model
+                    // round trip and it runs BEFORE the single-flight marker is released below, so on
+                    // a pause it sits squarely between Klives pressing resume and the replacement wake
+                    // being allowed to start. Nothing is lost: the digest watermark is sequence-based,
+                    // so the next wake's rebuild covers this wake's events as well.
+                    if (modelResponses > 0 && outcome != ProjectEventTypes.WakeCancelled)
                         await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
                 }
                 catch { /* never mask the wake outcome */ }

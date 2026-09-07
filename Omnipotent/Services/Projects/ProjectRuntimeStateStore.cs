@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Omnipotent.Data_Handling;
@@ -883,6 +883,28 @@ namespace Omnipotent.Services.Projects
                     Summary = existing is { Healthy: false } ? existing.Summary : "Assigned work is waiting for provider admission.",
                     CheckedAt = Utc(nowUtc), RetryAt = retryAt,
                 };
+                RecomputeHealthStatus(state);
+                return new(true, true);
+            }, nowUtc);
+
+        /// <summary>
+        /// Drops every provider-admission deadline on the project — the shared "llm-provider" entry
+        /// and each actor's "llm-provider:&lt;agentID&gt;" entry alike. <see cref="CloseCircuit"/> only
+        /// clears the shared circuit, but <see cref="ProjectWakeRecovery.BlockedUntil"/> consults both,
+        /// so a project resumed while an actor deadline stood had its wake refused with no visible
+        /// reason until the deadline expired (up to 15 minutes, or the router's own Retry-After).
+        /// Klives resuming a project is an explicit instruction to try the provider again now.
+        /// </summary>
+        public ProjectRuntimeMutationResult ClearProviderAdmission(string projectID,
+            long? expectedRevision = null, DateTime? nowUtc = null) =>
+            Mutate(projectID, expectedRevision, state =>
+            {
+                var keys = state.Health.Dependencies.Keys
+                    .Where(k => string.Equals(k, ProjectProviderFailure.DependencyKey, StringComparison.Ordinal)
+                        || k.StartsWith(ProjectProviderFailure.DependencyKey + ":", StringComparison.Ordinal))
+                    .ToList();
+                foreach (string key in keys) state.Health.Dependencies.Remove(key);
+                if (keys.Count == 0) return new(true, false);
                 RecomputeHealthStatus(state);
                 return new(true, true);
             }, nowUtc);

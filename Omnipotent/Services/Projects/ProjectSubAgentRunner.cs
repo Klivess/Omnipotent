@@ -931,9 +931,15 @@ namespace Omnipotent.Services.Projects
                 // Feeds the heartbeat's backoff. Counted over all wakes, not just heartbeat ones: an
                 // agent that keeps waking and achieving nothing should be nudged less often no matter
                 // who woke it, and any real progress puts it straight back on the base interval.
+                //
+                // A wake WE cancelled is not evidence about the agent. Pausing a project cancels every
+                // worker mid-flight, so counting those against the streak doubled the quiet period on
+                // each pause/resume cycle — three pauses and a healthy worker would not be nudged for
+                // hours after the project was resumed.
                 string streakKey = Key(projectID, agent.AgentID);
                 if (productiveActions > 0) unproductiveWakes.TryRemove(streakKey, out _);
-                else unproductiveWakes.AddOrUpdate(streakKey, 1, (_, n) => n + 1);
+                else if (outcome != ProjectEventTypes.WakeCancelled)
+                    unproductiveWakes.AddOrUpdate(streakKey, 1, (_, n) => n + 1);
             }
             var wakeEvents = parent.EventLog.ReadSince(projectID, wakeStartSeq, max: 2000);
             long? verifiedProgressSequence = wakeEvents.Where(e =>

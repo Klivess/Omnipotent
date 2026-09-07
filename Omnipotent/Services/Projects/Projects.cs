@@ -535,9 +535,21 @@ namespace Omnipotent.Services.Projects
                         failureBackoff = now - outcomes[^1].Timestamp < backoff;
                     }
 
+                    // Durable work is queued, admission is open, and no wake is running: start one NOW
+                    // rather than waiting out the 14-minute floor below. Every caller that enqueues a
+                    // trigger and then has its wake refused (single-flight raced, lease not acquired,
+                    // admission closed at the time) lands here — including Klives' resume, which is why
+                    // unpausing could look dead for a quarter of an hour with the instruction already
+                    // sitting in the inbox. Wake() is a no-op while one is in flight, so this cannot
+                    // overlap work; queueIfBusy stays false, so nothing is ever double-enqueued.
+                    bool queuedWork = ProjectWakeRecovery.BlockedUntil(runtime, "commander", now) == null
+                        && runtime.PendingTriggers.Any(t => t.ClaimedByWakeID == null
+                            && ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, now)
+                                == ProjectWakeTriggerApplicability.Applicable);
+
                     // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
                     if (!failureBackoff && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
-                        && (resumeDue || providerRetryDue || lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
+                        && (queuedWork || resumeDue || providerRetryDue || lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
                         CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
                             ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
                             : "Periodic keepalive: resume the next unfinished step from the latest verified checkpoint. Preserve completed work and use the approved plan; revise it only when new evidence requires a change.",
@@ -548,6 +560,47 @@ namespace Omnipotent.Services.Projects
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
             finally { Volatile.Write(ref keepaliveRunning, 0); }
+        }
+
+        /// <summary>
+        /// Puts the task force back to work the moment Klives resumes the project.
+        ///
+        /// Pausing calls <see cref="ProjectSubAgentRunner.CancelProject"/>, which cancels every
+        /// worker's in-flight wake. Resuming only ever woke the Commander, and nothing else reaches a
+        /// worker: <see cref="HeartbeatWorkers"/> waits for the agent's quiet period to elapse since
+        /// its LAST wake — the one the pause just cancelled, which had stamped LastWakeAt on the way
+        /// in. So the whole roster sat idle for 20 minutes minimum (doubling toward 4 hours each time
+        /// a cancelled wake was counted as unproductive) while the project read as resumed. That is
+        /// the bulk of the "nothing happens for ages after unpausing" gap.
+        ///
+        /// Same admission rules as the heartbeat — retired, already-awake, unassigned and finished
+        /// bounded agents are skipped, and a project out of budget spends nothing — but no interval
+        /// gate, because Klives asking for work to restart IS the trigger.
+        /// </summary>
+        internal void ResumeWorkers(Project project)
+        {
+            if (project.Status != ProjectStatus.Active) return;   // Planning has no task force yet
+            if (!Budget.IsWithinTokenBudget(project.ProjectID)) return;
+            foreach (var agent in SubAgents.ListActive(project.ProjectID))
+            {
+                try
+                {
+                    if (ProjectSubAgentManager.IsCommander(agent) || agent.Retired) continue;
+                    if (SubAgentRunner.IsAwake(project.ProjectID, agent.AgentID)) continue;
+                    // Nothing was ever assigned, or a bounded task already delivered: waking these
+                    // only makes them re-report. The Commander reclaims the slot instead.
+                    if (agent.MissionKind == ProjectAgentMissionKind.Task
+                        && agent.WorkStatus == ProjectAgentWorkStatus.Completed) continue;
+                    if (agent.WorkStatus == ProjectAgentWorkStatus.Idle
+                        && agent.ActiveMilestoneIDs.Count == 0
+                        && string.IsNullOrWhiteSpace(agent.Objective)) continue;
+                    SubAgentRunner.Wake(project, agent,
+                        "Project resumed by Klives — your wake was halted by the pause, not by you finishing. "
+                        + "Rehydrate from your durable checkpoint and continue the assignment you still own.",
+                        queueIfBusy: false);
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: resume wake failed for {agent.AgentID}"); }
+            }
         }
 
         /// <summary>
@@ -2225,11 +2278,19 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Best-effort live refresh used by resume and desktop discovery. Desktop
-        /// availability must never make the otherwise-valid project control routes fail.</summary>
-        internal async Task RefreshDesktopRegistryAsync()
+        /// availability must never make the otherwise-valid project control routes fail — nor hang
+        /// them: a reconcile lists Docker, inspects every tracked container, restarts stopped ones
+        /// and stops duplicates (15s grace each), any of which blocks indefinitely when the daemon
+        /// is slow or gone. Time-boxed so a request thread can never be parked on Docker.</summary>
+        internal async Task RefreshDesktopRegistryAsync(TimeSpan? timeout = null)
         {
             if (Desktops == null || !OperatingSystem.IsWindows()) return;
-            try { await Desktops.ReconcileAsync(); }
+            using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(20));
+            try { await Desktops.ReconcileAsync(cts.Token); }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
+            {
+                ServiceLog("Projects: desktop registry refresh timed out; continuing with the last known fleet.");
+            }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: live desktop registry refresh failed"); }
         }
 

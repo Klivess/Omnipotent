@@ -1,4 +1,4 @@
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
 using Omnipotent.Services.Projects.Stimulus;
@@ -377,10 +377,21 @@ namespace Omnipotent.Services.Projects
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                     parent.RuntimeState.ClearBlocker(project.ProjectID);
                     parent.RuntimeState.CloseCircuit(project.ProjectID);
+                    // Closing the shared circuit is not enough: a wake is also refused while the
+                    // per-actor provider-admission deadline stands (up to 15 minutes, or whatever
+                    // Retry-After the router asked for). Klives pressing resume IS the instruction
+                    // to try again now, so the deadline goes with the circuit — otherwise the
+                    // resume wake is silently deferred and nothing happens until it expires.
+                    parent.RuntimeState.ClearProviderAdmission(project.ProjectID);
+                    // A pause that landed in the wake's startup window armed a cancel-on-birth flag.
+                    // Left set, it kills the very wake this resume is about to start.
+                    parent.CommanderRunner.ClearPendingCancellation(project.ProjectID);
                     // Agents may already be attached to Docker desktops that survived the pause or
-                    // process restart. Reconcile before publishing the resume event and waking them,
-                    // so the Desktops menu sees the same live fleet the agents use.
-                    await parent.RefreshDesktopRegistryAsync();
+                    // process restart, so the Desktops menu should see the same live fleet the agents
+                    // use. But a reconcile lists Docker, inspects every container, restarts stopped
+                    // ones and stops duplicates (15s grace each) — awaiting that here delayed the
+                    // wake itself by however long Docker took. It runs alongside the resume instead.
+                    _ = parent.RefreshDesktopRegistryAsync();
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -393,6 +404,12 @@ namespace Omnipotent.Services.Projects
                     parent.CommanderRunner.Wake(project, wasPlanning
                         ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
                         : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+                    // Pause cancelled every worker's in-flight wake too, and nothing else brings them
+                    // back: the heartbeat only nudges an agent once its quiet period (20 min, doubling
+                    // to 4 h) has elapsed since its LAST wake — which the cancelled one just reset.
+                    // Resuming therefore has to re-wake the task force, or the Commander comes back
+                    // alone and the project looks stalled for the whole interval.
+                    parent.ResumeWorkers(project);
                     // Commands sent while paused are not discarded or falsely marked delivered;
                     // their durable directive records are re-injected as soon as work resumes.
                     parent.DeliverPendingDirectives(project.ProjectID);
