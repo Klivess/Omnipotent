@@ -28,35 +28,35 @@ public sealed class ProjectFilesRoutes
 
     public async Task RegisterRoutes()
     {
-        await parent.CreateBufferedAPIRoute("/projects/files/uploads/start", StartUpload,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/start", StartUpload,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateAPIRoute("/projects/files/uploads/get", GetUpload,
+        await parent.RegisterHttpRouteAsync("/projects/files/uploads/get", GetUpload,
             HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-        await parent.CreateStreamingAPIRoute("/projects/files/uploads/chunk", UploadChunk,
+        await parent.RegisterStreamingHttpRouteAsync("/projects/files/uploads/chunk", UploadChunk,
             HttpMethod.Put, KMProfileManager.KMPermissions.Klives, parent.Files.Options.MaxChunkBytes);
-        await parent.CreateBufferedAPIRoute("/projects/files/uploads/commit", CommitUpload,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/commit", CommitUpload,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateBufferedAPIRoute("/projects/files/uploads/cancel", CancelUpload,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/cancel", CancelUpload,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
 
-        await parent.CreateAPIRoute("/projects/files/list", ListFiles,
+        await parent.RegisterHttpRouteAsync("/projects/files/list", ListFiles,
             HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-        await parent.CreateAPIRoute("/projects/files/stat", StatFile,
+        await parent.RegisterHttpRouteAsync("/projects/files/stat", StatFile,
             HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-        await parent.CreateAPIRoute("/projects/files/download", DownloadFile,
+        await parent.RegisterHttpRouteAsync("/projects/files/download", DownloadFile,
             HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-        await parent.CreateAPIRoute("/projects/files/audit", AuditFiles,
+        await parent.RegisterHttpRouteAsync("/projects/files/audit", AuditFiles,
             HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
-        await parent.CreateBufferedAPIRoute("/projects/files/directory", CreateDirectory,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/directory", CreateDirectory,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateBufferedAPIRoute("/projects/files/move", MoveFile,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/move", MoveFile,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateBufferedAPIRoute("/projects/files/copy", CopyFile,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/copy", CopyFile,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateBufferedAPIRoute("/projects/files/delete", DeleteFile,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/delete", DeleteFile,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
-        await parent.CreateBufferedAPIRoute("/projects/files/metadata", SetMetadata,
+        await parent.RegisterBufferedHttpRouteAsync("/projects/files/metadata", SetMetadata,
             HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
     }
 

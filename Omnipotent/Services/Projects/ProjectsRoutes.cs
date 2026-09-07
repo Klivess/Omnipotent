@@ -53,7 +53,7 @@ namespace Omnipotent.Services.Projects
         public async Task RegisterRoutes()
         {
             // ── Projects ──
-            await parent.CreateAPIRoute("/projects/list", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/list", async req =>
             {
                 try
                 {
@@ -63,7 +63,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/create", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/create", async req =>
             {
                 try
                 {
@@ -115,7 +115,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/get", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/get", async req =>
             {
                 try
                 {
@@ -125,7 +125,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/state", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/state", async req =>
             {
                 try
                 {
@@ -141,7 +141,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/pause", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/pause", async req =>
             {
                 try
                 {
@@ -170,7 +170,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Archive / unarchive (shelving, item 2) ──
-            await parent.CreateAPIRoute("/projects/archive", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/archive", async req =>
             {
                 try
                 {
@@ -196,7 +196,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/unarchive", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/unarchive", async req =>
             {
                 try
                 {
@@ -223,7 +223,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Rename (agents learn of it via the log + wake seed, item 4) ──
-            await parent.CreateAPIRoute("/projects/rename", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/rename", async req =>
             {
                 try
                 {
@@ -262,7 +262,7 @@ namespace Omnipotent.Services.Projects
             // POST { projectID, tokenBudgetUsd?, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap? }
             // Only supplied fields change. Raising the token budget above current spend un-pauses a
             // BudgetPaused project; the change is logged as a KlivesMessage so the Commander sees it.
-            await parent.CreateAPIRoute("/projects/budget/update", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/budget/update", async req =>
             {
                 try
                 {
@@ -345,7 +345,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/resume", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/resume", async req =>
             {
                 try
                 {
@@ -423,7 +423,7 @@ namespace Omnipotent.Services.Projects
             // Durable broadcast. Default is a concrete task to each Commander; scope=all-agents
             // creates individually tracked tasks for every active worker too. The response is a
             // recipient-level receipt, never the old optimistic "delivered=N" claim.
-            await parent.CreateAPIRoute("/projects/broadcast", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/broadcast", async req =>
             {
                 try
                 {
@@ -458,7 +458,7 @@ namespace Omnipotent.Services.Projects
 
             // Durable broadcast reconciliation. A caller can refresh this after a page reload to
             // answer “did every Project actually finish its report?” without retaining receipts client-side.
-            await parent.CreateAPIRoute("/projects/broadcast/status", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/broadcast/status", async req =>
             {
                 try
                 {
@@ -491,7 +491,7 @@ namespace Omnipotent.Services.Projects
 
             // Halt every project that isn't already halted (or terminal), remembering each project's
             // pre-halt status so unhalt-all restores it exactly. POST (no body).
-            await parent.CreateAPIRoute("/projects/halt-all", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/halt-all", async req =>
             {
                 try
                 {
@@ -505,7 +505,7 @@ namespace Omnipotent.Services.Projects
 
             // Restore every globally-halted project to the exact status it held before the halt.
             // POST (no body).
-            await parent.CreateAPIRoute("/projects/unhalt-all", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/unhalt-all", async req =>
             {
                 try
                 {
@@ -525,7 +525,7 @@ namespace Omnipotent.Services.Projects
             // OLDEST `max` events while the client advances its cursor to lastSequence, so any project
             // with more than `max` events showed ancient history and silently skipped everything after
             // it. The tail path returns the newest events so the panels open on current activity.
-            await parent.CreateAPIRoute("/projects/events", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/events", async req =>
             {
                 try
                 {
@@ -555,7 +555,7 @@ namespace Omnipotent.Services.Projects
             // media is referenced by artifact ID exactly as the log stores it).
             //   GET /projects/events/export?projectID=..&from=<ISO8601>&to=<ISO8601>
             // from/to are optional and open-ended when omitted; both are treated as UTC.
-            await parent.CreateAPIRoute("/projects/events/export", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/events/export", async req =>
             {
                 try
                 {
@@ -603,7 +603,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/digest", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/digest", async req =>
             {
                 try
                 {
@@ -613,7 +613,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/ledger", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/ledger", async req =>
             {
                 try
                 {
@@ -626,7 +626,7 @@ namespace Omnipotent.Services.Projects
             // Server-side analytics keep the browser from paging/scanning every project's raw log.
             // Lifetime ledger totals remain authoritative; the response also describes the coverage
             // of historical per-wake attribution for older records.
-            await parent.CreateAPIRoute("/projects/analytics", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/analytics", async req =>
             {
                 try
                 {
@@ -647,7 +647,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/analytics/all", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/analytics/all", async req =>
             {
                 try
                 {
@@ -662,7 +662,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // Agent roster (org chart) for the workspace's Agents panel.
-            await parent.CreateAPIRoute("/projects/agents", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/agents", async req =>
             {
                 try
                 {
@@ -682,7 +682,7 @@ namespace Omnipotent.Services.Projects
 
             // Who is mid-turn right now. The event stream pushes this live; this route only exists so
             // a panel can paint the indicator before its socket is up (or if the socket is down).
-            await parent.CreateAPIRoute("/projects/activity", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/activity", async req =>
             {
                 try
                 {
@@ -694,7 +694,7 @@ namespace Omnipotent.Services.Projects
 
             // Observables (the agents' live dashboard for this project). History is trimmed to the
             // last N samples server-side so the 1s-debounced refresh stays cheap; ?history=0 = values only.
-            await parent.CreateAPIRoute("/projects/observables", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/observables", async req =>
             {
                 try
                 {
@@ -727,7 +727,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // Manual cleanup of an agent-created observable (agents own the values; Klives can only prune).
-            await parent.CreateAPIRoute("/projects/observables/delete", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/observables/delete", async req =>
             {
                 try
                 {
@@ -755,7 +755,7 @@ namespace Omnipotent.Services.Projects
             // ── Step ledger (the project's linear path) ──
             // Reads go through RuntimeState.Get, so these responses participate in that store's existing
             // cache dependency and are invalidated by any checkpoint write.
-            await parent.CreateAPIRoute("/projects/steps", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/steps", async req =>
             {
                 try
                 {
@@ -789,7 +789,7 @@ namespace Omnipotent.Services.Projects
 
             // Klives can add steps to the path himself — the point of the panel is that the linear path is
             // steerable, not just observable.
-            await parent.CreateAPIRoute("/projects/steps/add", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/steps/add", async req =>
             {
                 try
                 {
@@ -819,7 +819,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/steps/reorder", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/steps/reorder", async req =>
             {
                 try
                 {
@@ -832,7 +832,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/steps/activate", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/steps/activate", async req =>
             {
                 try
                 {
@@ -854,7 +854,7 @@ namespace Omnipotent.Services.Projects
 
             // Klives closing a step is a steer, so it needs no evidence gate for 'abandoned'/'blocked'; a
             // 'done' still does, since the evidence rule protects the record rather than the agent.
-            await parent.CreateAPIRoute("/projects/steps/close", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/steps/close", async req =>
             {
                 try
                 {
@@ -889,7 +889,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Councils (adversarial deliberation transcripts) ──
-            await parent.CreateAPIRoute("/projects/councils", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/councils", async req =>
             {
                 try
                 {
@@ -916,7 +916,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/councils/get", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/councils/get", async req =>
             {
                 try
                 {
@@ -930,7 +930,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // ── Grand Plan (the approved strategic north star + version history) ──
-            await parent.CreateAPIRoute("/projects/grandplan", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/grandplan", async req =>
             {
                 try
                 {
@@ -959,7 +959,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
-            await parent.CreateAPIRoute("/projects/containers", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/containers", async req =>
             {
                 try
                 {
@@ -976,7 +976,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // ── Per-project settings (Projects' own setting system, not OmniSettings) ──
-            await parent.CreateAPIRoute("/projects/settings", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/settings", async req =>
             {
                 try
                 {
@@ -988,7 +988,7 @@ namespace Omnipotent.Services.Projects
 
             // Patch one or more settings. Route values are ordered JSON arrays; scalar settings
             // retain their natural JSON type.
-            await parent.CreateAPIRoute("/projects/settings/update", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/settings/update", async req =>
             {
                 try
                 {
@@ -1023,7 +1023,7 @@ namespace Omnipotent.Services.Projects
             // the ones the UI offers without a caveat. When the catalog can't be reached every parameter
             // is still offered (fromCatalog=false): OpenRouter ignores a parameter a model doesn't
             // implement, so offering one is harmless, whereas hiding it would silently drop configuration.
-            await parent.CreateAPIRoute("/projects/models/parameters", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/models/parameters", async req =>
             {
                 try
                 {
@@ -1105,13 +1105,13 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Get, KMPermissions.Klives);
 
             // ── System default settings (what NEW projects inherit) — Projects' own config, not OmniSettings ──
-            await parent.CreateAPIRoute("/projects/system/settings", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/system/settings", async req =>
             {
                 try { await req.ReturnResponse(Json(parent.Settings.GetSystemDefaults())); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/system/settings/update", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/system/settings/update", async req =>
             {
                 try
                 {
@@ -1134,7 +1134,7 @@ namespace Omnipotent.Services.Projects
 
             // GET ?projectID&includeResolved=false. Rules are visible and editable as explicit
             // project memory instead of being hidden in a compacted message timeline.
-            await parent.CreateAPIRoute("/projects/memory", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/memory", async req =>
             {
                 try
                 {
@@ -1147,7 +1147,7 @@ namespace Omnipotent.Services.Projects
 
             // POST { projectID, text, key?, priority? }. Rules are all-agent, durable and are
             // immediately injected into the Commander; every future worker receives them too.
-            await parent.CreateAPIRoute("/projects/memory/upsert", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/memory/upsert", async req =>
             {
                 try
                 {
@@ -1168,7 +1168,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/memory/revoke", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/memory/revoke", async req =>
             {
                 try
                 {
@@ -1199,7 +1199,7 @@ namespace Omnipotent.Services.Projects
 
             // Klives → one live sub-agent. It has the same durable receipt/lifecycle as Commander
             // steering instead of relying on the internal-only inter-agent bus.
-            await parent.CreateAPIRoute("/projects/agents/message", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/agents/message", async req =>
             {
                 try
                 {
@@ -1224,7 +1224,7 @@ namespace Omnipotent.Services.Projects
             // Klives → Commander message. A message is now a durable steering record first,
             // then a low-latency live injection; returning {ok:true} never again implies a wake
             // actually accepted it.
-            await parent.CreateAPIRoute("/projects/message", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/message", async req =>
             {
                 try
                 {
@@ -1251,7 +1251,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Approvals ──
-            await parent.CreateAPIRoute("/projects/gates", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/gates", async req =>
             {
                 try
                 {
@@ -1261,7 +1261,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/gates/resolve", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/gates/resolve", async req =>
             {
                 try
                 {
@@ -1303,7 +1303,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Stimulus hooks (Klives-side CRUD; the Commander does the same via tools in a later build) ──
-            await parent.CreateAPIRoute("/projects/hooks", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/hooks", async req =>
             {
                 try
                 {
@@ -1334,7 +1334,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/hooks/create", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/hooks/create", async req =>
             {
                 try
                 {
@@ -1353,7 +1353,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/hooks/delete", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/hooks/delete", async req =>
             {
                 try
                 {
@@ -1366,7 +1366,7 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
-            await parent.CreateAPIRoute("/projects/hooks/token/rotate", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/hooks/token/rotate", async req =>
             {
                 try
                 {
@@ -1385,7 +1385,7 @@ namespace Omnipotent.Services.Projects
             }, HttpMethod.Post, KMPermissions.Klives);
 
             // ── Artifacts (screenshots/clips referenced by timeline events) ──
-            await parent.CreateAPIRoute("/projects/artifacts/get", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/artifacts/get", async req =>
             {
                 try
                 {
@@ -1416,7 +1416,7 @@ namespace Omnipotent.Services.Projects
 
             // Webhook ingest: POST /projects/hooks/webhook?projectID=..&hookID=.. with a raw body.
             // Guest-level so external services can call it; the hook's criterion + triage gate it.
-            await parent.CreateAPIRoute("/projects/hooks/webhook", async req =>
+            await parent.RegisterHttpRouteAsync("/projects/hooks/webhook", async req =>
             {
                 try
                 {

@@ -413,6 +413,10 @@ namespace Omnipotent.Services.Projects
             await routes.RegisterRoutes();
             fileRoutes = new ProjectFilesRoutes(this);
             await fileRoutes.RegisterRoutes();
+            // Say so explicitly. Until now the HTTP surface registered in silence, so "the website
+            // 404s every /projects/* path" and "the routes are fine" produced identical logs and
+            // there was no way to tell which had happened from the timeline alone.
+            ServiceLog("Projects: HTTP routes registered (project + file surfaces).");
             await RegisterWebSocketRoutesAsync();
 
             await InitialiseDesktopsAsync();
@@ -2023,7 +2027,18 @@ namespace Omnipotent.Services.Projects
                 // Reattach/adopt Docker reality before deleting either registry records or
                 // "orphans". Otherwise a surviving desktop with a temporarily missing registry
                 // entry can be destroyed by cleanup while its resumed agent is still using it.
-                await RefreshDesktopRegistryAsync();
+                //
+                // Everything below this line DELETES containers, so a partial reconcile is not good
+                // enough — it is exactly the "temporarily missing registry entry" state the comment
+                // above warns about. Nothing waits on this reap (it runs hourly in the background),
+                // so it gets a generous bound rather than the interactive one, and skips the whole
+                // pass if Docker still did not answer in full.
+                if (!await RefreshDesktopRegistryAsync(TimeSpan.FromMinutes(5)))
+                {
+                    ServiceLog("Projects: container reap skipped — the desktop reconcile did not complete, "
+                        + "and pruning a half-reconciled registry would destroy live desktops.");
+                    return;
+                }
 
                 // 1. Prune records still confirmed Lost after live reconciliation.
                 foreach (var lost in reg.All().Where(r => r.Lost))
@@ -2291,16 +2306,27 @@ namespace Omnipotent.Services.Projects
         /// them: a reconcile lists Docker, inspects every tracked container, restarts stopped ones
         /// and stops duplicates (15s grace each), any of which blocks indefinitely when the daemon
         /// is slow or gone. Time-boxed so a request thread can never be parked on Docker.</summary>
-        internal async Task RefreshDesktopRegistryAsync(TimeSpan? timeout = null)
+        /// <returns>
+        /// True only when Docker reality was reconciled IN FULL. Any caller that goes on to DELETE
+        /// something — prune registry records, reap orphans, tear a desktop down — must bail when
+        /// this is false. A half-reconciled registry still shows live desktops as Lost/untracked, and
+        /// cleanup run against it destroys containers whose agents are actively using them.
+        /// </returns>
+        internal async Task<bool> RefreshDesktopRegistryAsync(TimeSpan? timeout = null)
         {
-            if (Desktops == null || !OperatingSystem.IsWindows()) return;
+            if (Desktops == null || !OperatingSystem.IsWindows()) return false;
             using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(20));
-            try { await Desktops.ReconcileAsync(cts.Token); }
+            try { await Desktops.ReconcileAsync(cts.Token); return true; }
             catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
                 ServiceLog("Projects: desktop registry refresh timed out; continuing with the last known fleet.");
+                return false;
             }
-            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: live desktop registry refresh failed"); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, "Projects: live desktop registry refresh failed");
+                return false;
+            }
         }
 
         /// <summary>
@@ -2320,6 +2346,89 @@ namespace Omnipotent.Services.Projects
                     resolved = await ExecuteServiceMethod<Profiles.KMProfileManager>("GetProfileByPassword", pw) as Profiles.KMProfileManager.KMProfile;
             }
             return resolved != null && resolved.KlivesManagementRank >= Profiles.KMProfileManager.KMPermissions.Klives;
+        }
+
+        // Resolved once, then reused by all 65 HTTP route registrations. See RegisterHttpRouteAsync.
+        private Omnipotent.Services.KliveAPI.KliveAPI? routeApi;
+
+        /// <summary>
+        /// Resolves the typed KliveAPI once, waiting out the window in which it exists but has not
+        /// finished activating.
+        ///
+        /// <see cref="OmniServiceManager.GetServiceByClassType{T}"/> spins until the service TYPE
+        /// appears, but then returns an EMPTY array while any instance is still inactive — which
+        /// ExecuteServiceMethod turns into a thrown "Service of type KliveAPI not found". Thrown
+        /// from the middle of a registration run, that leaves a partially populated route table and
+        /// writes nothing to the log: an arbitrary subset of /projects/* 404s with no diagnosis.
+        /// So we wait for it properly, and give up loudly rather than half-registering.
+        /// </summary>
+        private async Task<Omnipotent.Services.KliveAPI.KliveAPI> ResolveRouteApiAsync()
+        {
+            if (routeApi != null) return routeApi;
+            DateTime deadline = DateTime.UtcNow.AddSeconds(60);
+            while (true)
+            {
+                var apis = await GetServicesByType<Omnipotent.Services.KliveAPI.KliveAPI>();
+                if (apis is { Length: > 0 })
+                    return routeApi = (Omnipotent.Services.KliveAPI.KliveAPI)apis[0];
+                if (DateTime.UtcNow >= deadline)
+                {
+                    var ex = new InvalidOperationException(
+                        "KliveAPI did not become active within 60s, so Projects cannot register its HTTP "
+                        + "routes. Every /projects/* endpoint would 404 and the website would show nothing.");
+                    _ = ServiceLogError(ex, "Projects: HTTP route registration aborted");
+                    throw ex;
+                }
+                await Task.Delay(250);
+            }
+        }
+
+        /// <summary>
+        /// Registers one Projects HTTP route against the TYPED KliveAPI, for the same reason the
+        /// WebSocket routes below do it: the inherited CreateAPIRoute dispatches through
+        /// ExecuteServiceMethod's reflection, which fails silently and partially (see
+        /// <see cref="ResolveRouteApiAsync"/>). A failure here names the route and stops the run
+        /// instead of leaving a half-registered surface.
+        /// </summary>
+        internal async Task RegisterHttpRouteAsync(string path,
+            Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
+            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission)
+        {
+            var api = await ResolveRouteApiAsync();
+            try { await api.CreateRoute(path, handler, method, permission); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, $"Projects: failed to register HTTP route {path}");
+                throw;
+            }
+        }
+
+        /// <summary>Body-capped variant of <see cref="RegisterHttpRouteAsync"/>.</summary>
+        internal async Task RegisterBufferedHttpRouteAsync(string path,
+            Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
+            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        {
+            var api = await ResolveRouteApiAsync();
+            try { await api.CreateBufferedRoute(path, handler, method, permission, maxBodyBytes); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, $"Projects: failed to register buffered HTTP route {path}");
+                throw;
+            }
+        }
+
+        /// <summary>Unbuffered variant of <see cref="RegisterHttpRouteAsync"/> (large uploads).</summary>
+        internal async Task RegisterStreamingHttpRouteAsync(string path,
+            Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
+            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        {
+            var api = await ResolveRouteApiAsync();
+            try { await api.CreateStreamingRoute(path, handler, method, permission, maxBodyBytes); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, $"Projects: failed to register streaming HTTP route {path}");
+                throw;
+            }
         }
 
         /// <summary>

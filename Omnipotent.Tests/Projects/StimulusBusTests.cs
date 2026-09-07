@@ -143,7 +143,16 @@ namespace Omnipotent.Tests.Projects
 
             var q2 = new StimulusQueue(_ => { });
             int replayed = 0;
-            q2.OnDeliver = _ => { Interlocked.Increment(ref replayed); return Task.CompletedTask; };
+            // Count only THIS test's envelopes. Replay scans the durable global inbox, which also
+            // holds envelopes left by other tests in this run and by previously interrupted runs —
+            // the same reason DurableEnvelope_IsReplayedAfterRestart above filters on ProjectID.
+            // Counting every delivery made this assertion fail on accumulated state rather than on
+            // the behaviour under test.
+            q2.OnDeliver = e =>
+            {
+                if (e.ProjectID == pid) Interlocked.Increment(ref replayed);
+                return Task.CompletedTask;
+            };
             q2.ReplayUndelivered();
             await Task.Delay(200);
             Assert.Equal(0, replayed); // already delivered, nothing to replay
