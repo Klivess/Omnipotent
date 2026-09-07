@@ -1941,116 +1941,149 @@ CHALLENGE_PROBE_JS = r"""
     const r = x.getBoundingClientRect(), s = getComputedStyle(x);
     return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
   };
-  const param = (url, name) => { try { return new URL(url, location.href).searchParams.get(name); } catch (e) { return null; } };
+  const param = (src, name) => {
+    try {
+      const u = new URL(src, location.href);
+      return u.searchParams.get(name) || new URLSearchParams(u.hash.slice(1)).get(name);
+    } catch (_) { return null; }
+  };
+  const old = window.__kliveChallengeState;
+  const state = old && old.url === location.href ? old
+    : {documentId: String(performance.timeOrigin) + ':' + Math.random(), url: location.href, next: 0, widgets: []};
   const widgets = [];
-  const push = w => { if (w.sitekey && !widgets.some(x => x.sitekey === w.sitekey && x.provider === w.provider)) widgets.push(w); };
+  const frameKind = src => /recaptcha\/enterprise\/(?:anchor|bframe)/.test(src) ? 'recaptcha_enterprise'
+    : /recaptcha\/api2\/(?:anchor|bframe)/.test(src) ? 'recaptcha_v2'
+    : /hcaptcha\.com\/captcha/.test(src) ? 'hcaptcha'
+    : /challenges\.cloudflare\.com/.test(src) ? 'turnstile' : null;
+  const push = (node, data) => {
+    if (!data.sitekey) return;
+    const prior = state.widgets.find(w => w.node === node && w.sitekey === data.sitekey && w.provider === data.provider);
+    widgets.push({node, id: prior ? prior.id : String(++state.next), ...data});
+  };
+  // Containers carry action/cdata/s that were previously lost by accepting an iframe first.
+  for (const node of document.querySelectorAll('[data-sitekey]')) {
+    const frame = node.querySelector('iframe[src]');
+    const src = frame ? frame.getAttribute('src') || '' : '';
+    const cls = String(node.className || '');
+    const provider = frameKind(src) || (/h-captcha|hcaptcha/i.test(cls) ? 'hcaptcha'
+      : /turnstile/i.test(cls) ? 'turnstile' : /g-recaptcha/i.test(cls) ? 'recaptcha_v2' : null);
+    if (!provider) continue; // Arbitrary data-sitekey attributes are not necessarily CAPTCHAs.
+    push(node, {provider, sitekey: node.getAttribute('data-sitekey'),
+      invisible: node.getAttribute('data-size') === 'invisible' || param(src, 'size') === 'invisible',
+      visible: visible(node), action: node.getAttribute('data-action') || param(src, 'sa'),
+      cData: node.getAttribute('data-cdata'), dataS: node.getAttribute('data-s') || param(src, 's')});
+  }
   for (const frame of document.querySelectorAll('iframe[src]')) {
-    const src = frame.getAttribute('src') || '';
-    if (/recaptcha\/(api2|enterprise)\/(anchor|bframe)/.test(src)) {
-      push({provider: /enterprise/.test(src) ? 'recaptcha_enterprise' : 'recaptcha_v2',
-            sitekey: param(src, 'k'), invisible: (param(src, 'size') || '') === 'invisible',
-            visible: visible(frame), source: 'iframe'});
-    } else if (/hcaptcha\.com\/captcha/.test(src)) {
-      push({provider: 'hcaptcha', sitekey: param(src, 'sitekey'),
-            invisible: false, visible: visible(frame), source: 'iframe'});
-    } else if (/challenges\.cloudflare\.com/.test(src)) {
-      push({provider: 'turnstile', sitekey: param(src, 'sitekey'),
-            invisible: false, visible: visible(frame), source: 'iframe'});
-    }
+    if (widgets.some(w => w.node.contains(frame))) continue;
+    const src = frame.getAttribute('src') || '', provider = frameKind(src);
+    if (!provider) continue;
+    push(frame, {provider, sitekey: param(src, provider.startsWith('recaptcha') ? 'k' : 'sitekey'),
+      invisible: param(src, 'size') === 'invisible', visible: visible(frame),
+      action: param(src, 'sa'), dataS: param(src, 's')});
   }
-  const attributed = [
-    ['.g-recaptcha', 'recaptcha_v2'], ['.h-captcha', 'hcaptcha'],
-    ['.cf-turnstile', 'turnstile'], ['[data-sitekey]', null]];
-  for (const [selector, provider] of attributed) {
-    for (const node of document.querySelectorAll(selector)) {
-      const key = node.getAttribute('data-sitekey');
-      if (!key) continue;
-      let kind = provider;
-      if (!kind) {
-        const cls = node.className && node.className.baseVal !== undefined ? node.className.baseVal : String(node.className || '');
-        kind = /h-captcha|hcaptcha/i.test(cls) ? 'hcaptcha'
-             : /turnstile/i.test(cls) ? 'turnstile' : 'recaptcha_v2';
-      }
-      push({provider: kind, sitekey: key,
-            invisible: (node.getAttribute('data-size') || '') === 'invisible',
-            visible: visible(node), source: 'attribute',
-            action: node.getAttribute('data-action') || null});
-    }
+  const responseSelector = provider => provider === 'hcaptcha'
+    ? '[name="h-captcha-response"],[name="g-recaptcha-response"]'
+    : provider === 'turnstile' ? '[name="cf-turnstile-response"],[name="cf_challenge_response"]'
+    : '[name="g-recaptcha-response"]';
+  for (const w of widgets) {
+    const form = w.node.closest('form');
+    // Widen only when the owner is unambiguous. Never fill every form with the same token.
+    const peers = widgets.filter(x => form ? x.node.closest('form') === form : true);
+    const scope = peers.length === 1 ? form || document : w.node;
+    w.fields = Array.from(scope.querySelectorAll(responseSelector(w.provider)))
+      .filter(x => x instanceof HTMLInputElement || x instanceof HTMLTextAreaElement);
+    w.responsePresent = w.fields.some(x => Boolean(x.value && x.value.trim()));
+    w.callbackName = w.node.getAttribute('data-callback');
   }
-  const text = (document.body ? document.body.innerText || '' : '').slice(0, 4000).toLowerCase();
-  const title = (document.title || '').toLowerCase();
-  // A Cloudflare/Akamai interstitial has no token to buy: it clears itself, or it does not.
-  const interstitial = /just a moment|checking your browser|verifying you are human|attention required/.test(title + ' ' + text)
-    && !widgets.length;
-  const responseFields = document.querySelectorAll(
-    'textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"],input[name="cf-turnstile-response"]').length;
+  state.widgets = widgets;
+  window.__kliveChallengeState = state;
+  const text = ((document.title || '') + ' ' + (document.body ? document.body.innerText || '' : '')).slice(0, 4500);
+  const interstitial = /just a moment|checking your browser|verifying you are human|attention required/i.test(text);
+  const unknownWidget = !widgets.length && Boolean(document.querySelector(
+    '.g-recaptcha,.h-captcha,.cf-turnstile,iframe[src*="recaptcha/"],iframe[src*="hcaptcha.com"],iframe[src*="challenges.cloudflare.com"],iframe[src*="challenges.fed.cloudflare.com"],iframe[src*="arkoselabs.com"],iframe[src*="funcaptcha.com"]'));
   return {
-    detected: widgets.length > 0 || interstitial,
-    widgets: widgets.slice(0, 5),
-    interstitial: interstitial,
-    responseFields: responseFields,
-    url: location.href,
-    title: (document.title || '').slice(0, 200),
+    detected: widgets.some(w => !w.responsePresent) || interstitial || unknownWidget,
+    interstitial, documentId: state.documentId,
+    widgets: widgets.slice(0, 5).map(({node, fields, callbackName, ...w}) => w),
+    url: location.href, title: (document.title || '').slice(0, 200)
   };
 })()
 """
 
 CHALLENGE_INJECT_JS = r"""
 (() => {
-  const token = %s, provider = %s;
-  let fields = 0;
-  const names = provider === 'hcaptcha'
-    ? ['textarea[name="h-captcha-response"]', 'textarea[name="g-recaptcha-response"]', 'input[name="h-captcha-response"]']
-    : provider === 'turnstile'
-      ? ['input[name="cf-turnstile-response"]', 'textarea[name="cf-turnstile-response"]', 'input[name="cf_challenge_response"]']
-      : ['textarea[name="g-recaptcha-response"]', 'textarea#g-recaptcha-response', 'input[name="g-recaptcha-response"]'];
+  const token = %s, expected = %s, state = window.__kliveChallengeState;
+  const fail = (code, message) => ({ok: false, error: {code, message}});
+  if (!state || state.documentId !== expected.documentId || state.url !== location.href)
+    return fail('stale-document', 'The page changed while the solver was working. Re-inspect before continuing.');
+  const widget = state.widgets.find(w => w.id === expected.widgetId
+    && w.provider === expected.provider && w.sitekey === expected.sitekey);
+  if (!widget || !widget.node.isConnected)
+    return fail('stale-widget', 'The original challenge widget was replaced. Re-inspect before continuing.');
+  const liveKey = widget.node.getAttribute('data-sitekey');
+  if (liveKey && liveKey !== expected.sitekey)
+    return fail('stale-widget', 'The challenge sitekey changed while solving.');
+  let fields = 0, callbacks = 0, callbackErrors = 0;
   const seen = new Set();
-  for (const selector of names) {
-    for (const node of document.querySelectorAll(selector)) {
-      if (seen.has(node)) continue;
-      seen.add(node);
-      node.value = token;
-      node.dispatchEvent(new Event('input', {bubbles: true}));
-      node.dispatchEvent(new Event('change', {bubbles: true}));
-      fields++;
-    }
+  const invoke = (fn, owner) => {
+    if (typeof fn !== 'function' || seen.has(fn)) return;
+    seen.add(fn);
+    try { fn.call(owner, token); callbacks++; } catch (_) { callbackErrors++; }
+  };
+  const name = widget.callbackName;
+  let callbackOwner = window, callback;
+  if (name && /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(name)) {
+    const parts = name.split('.');
+    try {
+      for (const part of parts.slice(0, -1)) callbackOwner = callbackOwner[part];
+      callback = callbackOwner[parts[parts.length - 1]];
+    } catch (_) {}
   }
-  if (!fields) {
-    // Some widgets create their response field only on completion; make one the form can post.
-    const form = document.querySelector('form');
-    if (form) {
-      const created = document.createElement('textarea');
-      created.name = provider === 'hcaptcha' ? 'h-captcha-response'
-                   : provider === 'turnstile' ? 'cf-turnstile-response' : 'g-recaptcha-response';
-      created.style.display = 'none';
-      created.value = token;
-      form.appendChild(created);
-      fields++;
-    }
+  const matchingCallbacks = [];
+  if (widget.provider.startsWith('recaptcha')) {
+    try {
+      const clients = (window.___grecaptcha_cfg || {}).clients || {};
+      for (const client of Object.values(clients)) {
+        const visited = new Set(), found = [];
+        let matchesKey = false, matchesNode = false, count = 0;
+        const walk = (node, depth) => {
+          if (!node || typeof node !== 'object' || depth > 8 || visited.has(node) || count++ > 500) return;
+          visited.add(node);
+          if (node instanceof Element) {
+            matchesNode ||= node === widget.node || node.contains(widget.node) || widget.node.contains(node);
+            return;
+          }
+          for (const key of Object.keys(node)) {
+            let value;
+            try { value = node[key]; } catch (_) { continue; }
+            if (value === widget.sitekey) matchesKey = true;
+            // error-callback and expired-callback must NEVER be called with a success token.
+            if (key === 'callback' && typeof value === 'function') found.push([value, node]);
+            else if (value && typeof value === 'object') walk(value, depth + 1);
+          }
+        };
+        walk(client, 0);
+        const sameKey = state.widgets.filter(w => w.sitekey === widget.sitekey && w.provider === widget.provider);
+        if (matchesKey && (matchesNode || sameKey.length === 1)) matchingCallbacks.push(...found);
+      }
+    } catch (_) {}
   }
-  // The page usually acts on its completion callback, not on the field. Invoke every callback the
-  // widget registered so the site behaves exactly as if the human had passed the challenge.
-  let callbacks = 0;
-  const invoke = fn => { try { fn(token); callbacks++; } catch (e) {} };
-  try {
-    const cfg = window.___grecaptcha_cfg;
-    if (cfg && cfg.clients) {
-      const walk = (node, depth) => {
-        if (!node || depth > 6) return;
-        for (const key of Object.keys(node)) {
-          let value;
-          try { value = node[key]; } catch (e) { continue; }
-          if (typeof value === 'function' && /callback/i.test(key)) invoke(value);
-          else if (value && typeof value === 'object') walk(value, depth + 1);
-        }
-      };
-      for (const id of Object.keys(cfg.clients)) walk(cfg.clients[id], 0);
-    }
-  } catch (e) {}
-  for (const name of ['captchaCallback', 'onCaptchaSuccess', 'hcaptchaCallback', 'turnstileCallback', 'onTurnstileSuccess']) {
-    if (typeof window[name] === 'function') invoke(window[name]);
+  for (const node of widget.fields) {
+    if (!node.isConnected) continue;
+    const proto = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(node, token);
+    node.dispatchEvent(new Event('input', {bubbles: true}));
+    node.dispatchEvent(new Event('change', {bubbles: true}));
+    if (node.value === token) fields++;
   }
-  return {injected: fields, callbacks: callbacks, url: location.href};
+  invoke(callback, callbackOwner);
+  for (const [fn, owner] of matchingCallbacks) invoke(fn, owner);
+  if (!fields && !callbacks)
+    return fail('inject-nowhere', 'No response field or registered success callback accepted the token. Use another supported route or request_human.');
+  if (callbackErrors)
+    return fail('callback-failed', 'A registered success callback failed. Inspect the page before attempting any further solve.');
+  return {ok: true, injected: fields, callbacks, acceptance: 'unverified', url: location.href};
 })()
 """
 
@@ -2066,7 +2099,7 @@ def do_control(payload):
         "locate", "click", "fill", "type", "select", "check", "uncheck", "focus",
         "hover", "scroll_into_view", "scroll", "press", "wait", "back", "forward",
         "reload", "activate_tab", "close_tab", "script",
-        "challenge_probe", "challenge_inject", "dismiss_overlays",
+        "challenge_probe", "challenge_inject", "challenge_wait", "dismiss_overlays",
     }
     if op not in allowed:
         return error_result(
@@ -2176,6 +2209,38 @@ def do_control(payload):
             waited["op"] = op
             return add_control_state(waited, session, tab, index, before_tab_ids)
 
+        if op == "challenge_wait":
+            # The extension acts in the live page and in its challenge frames. Wait on observed
+            # response state, never spend money or claim the enclosing form was submitted.
+            try:
+                extension_path = "/usr/local/share/klive-nopecha/manifest.json"
+                if not os.path.isfile(extension_path):
+                    result = error_result("free-solver-missing",
+                        "The free CAPTCHA extension is missing from this desktop. Update to desktop image v11.")
+                    return add_control_state(result, session, tab, index, before_tab_ids)
+                deadline = time.monotonic() + min(120, max(1, int(payload.get("timeoutMs", 90000)) / 1000))
+                stable_clear = 0
+                while time.monotonic() < deadline:
+                    probe = main_world_eval(session, CHALLENGE_PROBE_JS)
+                    answered = any(w.get("responsePresent") for w in probe.get("widgets", []))
+                    if answered:
+                        result = {"ok": True, "state": "response-present", "acceptance": "unverified"}
+                        return add_control_state(result, session, tab, index, before_tab_ids)
+                    stable_clear = stable_clear + 1 if not probe.get("detected") else 0
+                    if stable_clear >= 2:
+                        result = {"ok": True, "state": "challenge-cleared", "acceptance": "unverified"}
+                        return add_control_state(result, session, tab, index, before_tab_ids)
+                    time.sleep(2)
+                result = error_result("free-solver-unresolved",
+                    "The free extension did not produce a response within the bounded wait. Its free allowance "
+                    "is shared by public IP and requires an eligible residential connection; quota, an unsupported "
+                    "challenge, or a site refusal may be responsible. Use an official API/alternative route or "
+                    "request_human on this same desktop. Do not repeatedly reload or register paid solver accounts.")
+                return add_control_state(result, session, tab, index, before_tab_ids)
+            except Exception as ex:
+                result = error_result("free-solver-inspection-failed", bounded_text(ex, 800))
+                return add_control_state(result, session, tab, index, before_tab_ids)
+
         if op == "challenge_probe":
             try:
                 probe = main_world_eval(session, CHALLENGE_PROBE_JS)
@@ -2194,10 +2259,14 @@ def do_control(payload):
                 return add_control_state(result, session, tab, index, before_tab_ids)
             try:
                 injected = main_world_eval(session, CHALLENGE_INJECT_JS % (
-                    json.dumps(token, ensure_ascii=False), json.dumps(provider)))
+                    json.dumps(token, ensure_ascii=False), json.dumps({
+                        "provider": provider, "documentId": payload.get("documentId"),
+                        "widgetId": payload.get("widgetId"), "sitekey": payload.get("sitekey")})))
             except Exception as ex:
                 result = error_result("inject-failed", bounded_text(ex, 800))
                 return add_control_state(result, session, tab, index, before_tab_ids)
+            if injected.get("ok") is False:
+                return add_control_state(injected, session, tab, index, before_tab_ids)
             if not injected.get("injected") and not injected.get("callbacks"):
                 result = error_result(
                     "inject-nowhere",

@@ -25,8 +25,8 @@ public sealed class ProjectAutonomyTests
         => Assert.Equal(expected, BrowserChallengeSolver.TaskTypeFor(service, provider));
 
     [Fact]
-    public void AntiCaptchaCannotSolveTurnstile()
-        => Assert.Null(BrowserChallengeSolver.TaskTypeFor("anticaptcha", "turnstile"));
+    public void AntiCaptchaSupportsTurnstile()
+        => Assert.Equal("TurnstileTaskProxyless", BrowserChallengeSolver.TaskTypeFor("anticaptcha", "turnstile"));
 
     [Fact]
     public void ProbeParsesTheWidgetTheSolverNeeds()

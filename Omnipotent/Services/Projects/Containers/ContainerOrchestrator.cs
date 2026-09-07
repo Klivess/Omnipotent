@@ -257,12 +257,22 @@ namespace Omnipotent.Services.Projects.Containers
             # (chiefly the WebGL renderer, which --disable-gpu otherwise exposes as SwiftShader). If the
             # persona var or template is absent the block is skipped and the browser is unchanged.
             fp_args=()
+            extension_dirs=()
             if [ -n "${OMNIPOTENT_FP_JSON:-}" ] && [ -f /usr/local/share/klive-fp/patch.js ]; then
               FPDIR="$HOME/.klive-fp"
               mkdir -p "$FPDIR"
               cp -f /usr/local/share/klive-fp/manifest.json /usr/local/share/klive-fp/patch.js "$FPDIR"/ 2>/dev/null || true
               printf 'self.__KFP__=%s;\n' "$OMNIPOTENT_FP_JSON" > "$FPDIR/persona.js"
-              fp_args=(--disable-extensions-except="$FPDIR" --load-extension="$FPDIR" \
+              extension_dirs+=("$FPDIR")
+            fi
+            # Load the free solver alongside the persona extension, also when humanisation is off.
+            # No account key is supplied: this cannot consume paid recognition credits.
+            if [ -f /usr/local/share/klive-nopecha/manifest.json ]; then
+              extension_dirs+=("/usr/local/share/klive-nopecha")
+            fi
+            if [ "${#extension_dirs[@]}" -gt 0 ]; then
+              extension_paths=$(IFS=,; echo "${extension_dirs[*]}")
+              fp_args=(--disable-extensions-except="$extension_paths" --load-extension="$extension_paths" \
                 --disable-features=DisableLoadExtensionCommandLineSwitch)
             fi
             # --disable-blink-features=AutomationControlled keeps navigator.webdriver false and drops

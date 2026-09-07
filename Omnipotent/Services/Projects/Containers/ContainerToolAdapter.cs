@@ -46,6 +46,9 @@ namespace Omnipotent.Services.Projects.Containers
             public int Width;
             public int Height;
             public DateTime CapturedUtc;
+            public string? LastFreeChallengeDocument;
+            public string? LastFreeChallengeError;
+            public DateTime FreeChallengeRetryAfterUtc;
         }
 
         private static readonly HashSet<string> Tools = new(StringComparer.Ordinal)
@@ -403,8 +406,8 @@ namespace Omnipotent.Services.Projects.Containers
                     && detected.ValueKind is JsonValueKind.True)
                     banner += "CHALLENGE_DETECTED: a CAPTCHA or human-verification widget is on this page. " +
                         "Do not retry the signup controls underneath it. Call computer_browser_action op=solve_challenge, " +
-                        "which clears reCAPTCHA/hCaptcha/Turnstile by itself; only escalate to a human if it reports " +
-                        "that the challenge is not token-solvable or that no solving service is registered.\n";
+                        "which waits for the free browser solver. A response token already present means submit/verify " +
+                        "the form, not buy another token. If solving fails, follow its recovery diagnosis.\n";
                 if (root.ValueKind == JsonValueKind.Object && NativeDialogBanner(root) is { } dialog) banner += dialog;
                 return banner + inspectionJson;
             }
@@ -582,12 +585,11 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         private static readonly HttpClient SolverHttp = new() { Timeout = TimeSpan.FromSeconds(30) };
+        private static readonly BrowserChallengeClient ChallengeClient = new(SolverHttp);
 
         /// <summary>
-        /// Clears a CAPTCHA the way any other automated operator does: read the widget's provider
-        /// and sitekey out of the live page, buy a token from whichever solving service the shared
-        /// account registry holds a key for, then hand that token to the page's own response field
-        /// and completion callback. Without this a signup flow ends the project on a human.
+        /// Waits for free recognition in the persistent browser and reports observed response state.
+        /// Paid token services are only available when the host operator explicitly enables them.
         /// </summary>
         private async Task<ContainerToolResult> SolveChallengeAsync(JsonElement a, CancellationToken ct)
         {
@@ -603,64 +605,73 @@ namespace Omnipotent.Services.Projects.Containers
                     ContainerToolFailureKind.Semantic);
 
             var probe = BrowserChallengeSolver.ParseProbe(probeRun.Stdout);
+            if (probe.Error != null)
+                return ContainerToolResult.Fail(probe.Error, ContainerToolFailureKind.BrowserInspection);
+            if (probe.Primary == null && probe.Widgets.Any(w => w.ResponsePresent))
+                return ContainerToolResult.Ok("A challenge response is already present. Submit the intended form once "
+                    + "and verify its result before requesting another solve.");
             if (!probe.Detected)
                 return new ContainerToolResult(true,
                     "No CAPTCHA or human-verification widget is present on this page. "
                     + "Nothing to solve — continue with the form itself.");
 
+            // Free mode is the default for every agent. Existing stored paid credentials alone
+            // cannot authorize spending; the host operator must explicitly enable that fallback.
+            var free = await WaitForFreeChallengeAsync(a, probe, ct);
+            if (free.Success || !PaidChallengeFallbackEnabled())
+                return free;
+
+            // The free attempt may have navigated or replaced the widget. Never pay for the old probe.
+            probeRun = await RunBrowserHelperAsync("action", new
+            {
+                op = "challenge_probe", tabId = probe.TabId, tabIndex,
+            }, 45, ct);
+            probeError = BrowserHelperReportedError(probeRun.Stdout);
+            if (!probeRun.Ok || probeError != null) return free;
+            probe = BrowserChallengeSolver.ParseProbe(probeRun.Stdout);
+            if (probe.Error != null) return free;
+            if (!probe.Detected) return ContainerToolResult.Ok("The challenge cleared. Inspect the page and verify the intended result.");
             var widget = probe.Primary;
+            if (widget == null && probe.Widgets.Any(w => w.ResponsePresent))
+                return ContainerToolResult.Ok("A challenge response is already present. Submit the intended form once "
+                    + "and verify its result before requesting another token.");
             if (widget == null)
                 return ContainerToolResult.Fail(
                     probe.Interstitial
-                        ? "This is a provider interstitial ('checking your browser'), not a widget with a "
-                          + "sitekey — there is no token to buy. It clears itself when the browser looks "
-                          + "human enough: wait ~15s and reload once. If it survives two reloads the site is "
-                          + "refusing this IP or browser, so change approach or target site rather than retrying."
+                        ? "This interstitial exposes no supported widget parameters. Wait once for it to finish. "
+                          + "If it persists, use a supported API/alternative route or request_human on this desktop. "
+                          + "Repeated reloads and token purchases will not resolve missing challenge parameters."
                         : "A challenge was detected but exposes no sitekey, so it cannot be solved by token. "
                           + "Inspect mode=controls and try completing it in the page, or pick another route.",
                     ContainerToolFailureKind.Semantic);
 
-            var credential = await FindChallengeSolverKeyAsync();
-            if (credential == null)
+            if (string.IsNullOrWhiteSpace(probe.TabId) || string.IsNullOrWhiteSpace(probe.DocumentId)
+                || string.IsNullOrWhiteSpace(widget.Id))
+                return ContainerToolResult.Fail("The desktop helper is too old to apply a token to a verified widget. "
+                    + "Update browser-inspect.py in this desktop before solving; no token was purchased.",
+                    ContainerToolFailureKind.Infrastructure);
+
+            var credentials = await FindChallengeSolverKeysAsync(ct);
+            if (credentials.Count == 0)
                 return ContainerToolResult.Fail(
                     BrowserChallengeSolver.NoSolverConfiguredMessage(probe.Url, widget.Provider),
                     ContainerToolFailureKind.Semantic);
-            var (service, apiKey) = credential.Value;
-
-            if (BrowserChallengeSolver.TaskTypeFor(service, widget.Provider) == null)
-                return ContainerToolResult.Fail(
-                    $"The registered solver ({service}) cannot solve a {widget.Provider} challenge. "
-                    + "Register a capsolver key in the account registry, which covers all of reCAPTCHA, "
-                    + "hCaptcha and Turnstile.",
-                    ContainerToolFailureKind.Semantic);
-
             int timeoutMs = Math.Clamp(Int(a, "timeoutMs", 180_000), 30_000, 300_000);
-            string token;
-            try
-            {
-                token = await BuyChallengeTokenAsync(service, apiKey, widget, probe.Url, timeoutMs, ct);
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                return ContainerToolResult.Fail(
-                    $"The {service} solve did not finish within {timeoutMs / 1000}s. Challenge queues spike; "
-                    + "retry once, and if it times out again continue with other work and come back to this form.",
-                    ContainerToolFailureKind.Semantic);
-            }
-            catch (Exception ex)
-            {
-                return ContainerToolResult.Fail(
-                    $"The {service} solve failed: {ComputerAudit.Truncate(ex.Message, 700)}",
-                    ContainerToolFailureKind.Semantic);
-            }
+            var solved = await ChallengeClient.SolveAsync(credentials, widget, probe.Url,
+                TimeSpan.FromMilliseconds(timeoutMs), ct);
+            if (solved.Token == null)
+                return ContainerToolResult.Fail(solved.Error ?? "Challenge solving failed.", ContainerToolFailureKind.Semantic);
 
             byte[]? before = RecentFrameJpeg();
             var inject = await RunBrowserHelperAsync("action", new
             {
                 op = "challenge_inject",
-                value = token,
+                value = solved.Token,
                 provider = widget.Provider,
-                tabIndex,
+                tabId = probe.TabId,
+                documentId = probe.DocumentId,
+                widgetId = widget.Id,
+                sitekey = widget.SiteKey,
             }, 45, ct);
             string? injectError = BrowserHelperReportedError(inject.Stdout);
             if (!inject.Ok || injectError != null)
@@ -671,29 +682,83 @@ namespace Omnipotent.Services.Projects.Containers
                     ContainerToolFailureKind.Semantic);
 
             return await ObserveAfterMutationAsync(
-                $"Solved the {widget.Provider} challenge via {service} and applied the token to the page. "
+                $"Applied a {widget.Provider} response from {solved.Service} to the original widget. "
                 + ComputerAudit.Truncate(AnnotateInspection(inject.Stdout), 6000)
-                + " Now submit the form yourself and verify the result — a solved challenge is not a submitted form.",
+                + " The site's acceptance is not yet verified. Inspect the page, submit the intended form if still needed, "
+                + "and verify its result. Do not purchase another token while this response is still present.",
                 before, ct);
+        }
+
+        internal static bool PaidChallengeFallbackEnabled() =>
+            string.Equals(Environment.GetEnvironmentVariable("PROJECTS_CAPTCHA_ALLOW_PAID"), "1", StringComparison.Ordinal);
+
+        private async Task<ContainerToolResult> WaitForFreeChallengeAsync(
+            JsonElement a, BrowserChallengeSolver.ChallengeProbe probe, CancellationToken ct)
+        {
+            lock (frameState.Gate)
+            {
+                if (!string.IsNullOrEmpty(probe.DocumentId)
+                    && frameState.LastFreeChallengeDocument == probe.DocumentId
+                    && DateTime.UtcNow < frameState.FreeChallengeRetryAfterUtc)
+                    return ContainerToolResult.Fail(frameState.LastFreeChallengeError
+                        + " This unchanged page is cooling down; continue other work or request_human.");
+            }
+            int timeoutMs = Math.Clamp(Int(a, "timeoutMs", 90_000), 1_000, 120_000);
+            var run = await RunBrowserHelperAsync("action", new
+            {
+                op = "challenge_wait", tabId = probe.TabId, tabIndex = RequestedTabIndex(a), timeoutMs,
+            }, timeoutMs / 1000 + 15, ct);
+            string? error = BrowserHelperReportedError(run.Stdout);
+            if (run.Ok && error == null && FreeChallengeCompleted(run.Stdout))
+                return ContainerToolResult.Ok("The free browser solver produced a response or the challenge cleared. "
+                    + "No paid solver was called. Site acceptance is unverified: inspect this page, submit the intended "
+                    + "form if still needed, and verify the result. " + ComputerAudit.Truncate(run.Stdout, 2500));
+            error = "Free CAPTCHA recovery did not complete: "
+                + ComputerAudit.Truncate(error ?? (run.Ok ? "No verified completion state was returned. Update the desktop helper."
+                    : run.Error), 1600);
+            lock (frameState.Gate)
+            {
+                frameState.LastFreeChallengeDocument = probe.DocumentId;
+                frameState.LastFreeChallengeError = error;
+                frameState.FreeChallengeRetryAfterUtc = DateTime.UtcNow.AddMinutes(2);
+            }
+            return ContainerToolResult.Fail(error);
+        }
+
+        internal static bool FreeChallengeCompleted(string json)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                return root.ValueKind == JsonValueKind.Object
+                    && root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True
+                    && root.TryGetProperty("state", out var state) && state.ValueKind == JsonValueKind.String
+                    && state.GetString() is "response-present" or "challenge-cleared";
+            }
+            catch (JsonException) { return false; }
         }
 
         /// <summary>
         /// Finds a solver key in the shared account registry. It is read through the same one-way
         /// placeholder channel as any other credential, so the key is never returned to a model.
         /// </summary>
-        private async Task<(string Service, string ApiKey)?> FindChallengeSolverKeyAsync()
+        private async Task<List<BrowserChallengeClient.Credential>> FindChallengeSolverKeysAsync(CancellationToken ct)
         {
-            if (resolveSecretsAsync == null) return null;
+            var credentials = new List<BrowserChallengeClient.Credential>();
+            if (resolveSecretsAsync == null) return credentials;
             foreach (string service in BrowserChallengeSolver.SupportedServices)
             {
                 foreach (string field in BrowserChallengeSolver.KeyFieldNames)
                 {
+                    ct.ThrowIfCancellationRequested();
                     string placeholder = "{account:" + service + "/" + field + "}";
                     string resolved;
                     try
                     {
                         resolved = await resolveSecretsAsync(placeholder);
                     }
+                    catch (OperationCanceledException) { throw; }
                     catch
                     {
                         // An unknown or ambiguous account ref throws; that simply means "not this one".
@@ -701,38 +766,13 @@ namespace Omnipotent.Services.Projects.Containers
                     }
                     if (!string.IsNullOrWhiteSpace(resolved)
                         && !resolved.Contains("{account:", StringComparison.OrdinalIgnoreCase))
-                        return (service, resolved.Trim());
+                    {
+                        credentials.Add(new(service, resolved.Trim()));
+                        break;
+                    }
                 }
             }
-            return null;
-        }
-
-        private static async Task<string> BuyChallengeTokenAsync(
-            string service, string apiKey, BrowserChallengeSolver.ChallengeWidget widget,
-            string pageUrl, int timeoutMs, CancellationToken ct)
-        {
-            string createBody = BrowserChallengeSolver.BuildCreateTaskRequest(service, apiKey, widget, pageUrl);
-            using var createResponse = await SolverHttp.PostAsync(
-                BrowserChallengeSolver.EndpointFor(service, "createTask"),
-                new StringContent(createBody, Encoding.UTF8, "application/json"), ct);
-            string createJson = await createResponse.Content.ReadAsStringAsync(ct);
-            string? taskId = BrowserChallengeSolver.ReadTaskId(createJson, out string? createError);
-            if (taskId == null)
-                throw new InvalidOperationException(createError ?? "The solver did not accept the task.");
-
-            string resultBody = BrowserChallengeSolver.BuildResultRequest(apiKey, taskId);
-            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-            while (DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(5000, ct);
-                using var poll = await SolverHttp.PostAsync(
-                    BrowserChallengeSolver.EndpointFor(service, "getTaskResult"),
-                    new StringContent(resultBody, Encoding.UTF8, "application/json"), ct);
-                var outcome = BrowserChallengeSolver.ReadResult(await poll.Content.ReadAsStringAsync(ct));
-                if (outcome.Error != null) throw new InvalidOperationException(outcome.Error);
-                if (outcome.Ready && !string.IsNullOrWhiteSpace(outcome.Token)) return outcome.Token!;
-            }
-            throw new OperationCanceledException();
+            return credentials;
         }
 
         /// <summary>The helper reports semantic failures as bounded JSON while exiting zero so it

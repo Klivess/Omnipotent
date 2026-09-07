@@ -134,6 +134,11 @@ namespace Omnipotent.Data_Handling
             //KliveMultiTool
             public static string KliveMultiToolDirectory = $"{SavedDataDirectory}/KliveMultiTool";
 
+            //Tripwires (tracked redirect links)
+            public static string TripwireDirectory = $"{SavedDataDirectory}/Tripwires";
+            public static string TripwireDbFile = $"{TripwireDirectory}/tripwires.db";
+            public static string TripwireVisitorKeyFile = $"{TripwireDirectory}/visitor.key";
+
             //KliveAgent
             public static string KliveAgentDirectory = $"{SavedDataDirectory}/KliveAgent";
             public static string KliveAgentMemoriesDirectory = $"{KliveAgentDirectory}/Memories";

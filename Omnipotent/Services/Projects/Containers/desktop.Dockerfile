@@ -52,11 +52,21 @@ RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect
 COPY klive-fp-manifest.json /usr/local/share/klive-fp/manifest.json
 COPY klive-fp-patch.js /usr/local/share/klive-fp/patch.js
 
+# Free, keyless CAPTCHA recognition in the existing visible browser. Pin the automation build
+# and verify GitHub's release digest; never fetch executable "latest" code at browser startup.
+# The free quota is shared by public IP and requires an eligible residential connection.
+RUN curl --fail --location --retry 3 \
+      https://github.com/NopeCHALLC/nopecha-extension/releases/download/0.6.1/chromium_automation.zip \
+      -o /tmp/nopecha.zip \
+    && echo '92ebe154bd34433b4a36e6b2df33006fa6acb19a1b81031a0acb5b72be5e025a  /tmp/nopecha.zip' | sha256sum -c - \
+    && python3 -m zipfile -e /tmp/nopecha.zip /usr/local/share/klive-nopecha \
+    && rm /tmp/nopecha.zip
+
 # Capability stamp — the preflight reads this to know what the image ships without probing each
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"10","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
+    '{"imageVersion":"11","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent
