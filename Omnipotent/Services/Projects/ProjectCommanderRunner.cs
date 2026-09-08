@@ -525,7 +525,7 @@ namespace Omnipotent.Services.Projects
                                     Text = $"Keeping this wake active; inference retry {attempt} in {delay.TotalSeconds:0}s. Committed tools and conversation are retained.",
                                     PayloadJson = JsonConvert.SerializeObject(new { reason = failure.Kind.ToString(), attempt, delayMs = delay.TotalMilliseconds }),
                                 });
-                            }, cts.Token);
+                            }, cts.Token, model: model);
                             modelResponses++;
                             modelTurns++;
                         }
@@ -935,10 +935,13 @@ namespace Omnipotent.Services.Projects
                 }
                 done: ;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
                 outcome = ProjectEventTypes.WakeCancelled;
-                outcomeText = "Wake cancelled because the project was paused, archived, or a recovery was requested.";
+                var lease = parent.RuntimeState.Get(projectID).ActiveWakeLease;
+                string reason = lease?.WakeID == wakeID ? lease.CancellationReason ?? "Wake stop requested." : "Wake stop requested.";
+                outcomeText = $"Wake cancelled: {reason}";
+                outcomePayloadJson = JsonConvert.SerializeObject(new { reason = "wake-cancellation-requested", detail = reason });
             }
             catch (OpenRouterCreditExhaustedException ex)
             {
@@ -1271,25 +1274,23 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Startup crash recovery: clear any wake left active by a restart (rehydrate-on-wake makes this safe).</summary>
-        public void RecoverInterruptedWakes()
+        public void RecoverInterruptedWakes() => RecoverInterruptedWakes(
+            (project, trigger) => Wake(project, trigger, queueIfBusy: false));
+
+        internal void RecoverInterruptedWakes(Action<Project, string> resumeWake)
         {
             var recovered = new HashSet<string>(StringComparer.Ordinal);
+            var resumptions = new List<(Project Project, string Trigger)>();
             foreach (var runtime in parent.RuntimeState.ListWithActiveWakeLeases())
             {
                 var lease = runtime.ActiveWakeLease;
                 if (lease == null) continue; // worker-only leases are recovered by ProjectSubAgentRunner
                 try
                 {
-                    int uncertainCalls = ProjectToolCallJournal.ReconcileInterruptedWake(
+                    string outcome = ProjectWakeRecovery.RecordInterruption(
                         parent.EventLog, runtime.ProjectID, lease.WakeID, "commander");
-                    parent.EventLog.Append(new ProjectEvent
-                    {
-                        ProjectID = runtime.ProjectID, WakeID = lease.WakeID, AgentID = "commander",
-                        Type = ProjectEventTypes.WakeCancelled, Author = "system",
-                        Text = "Omnipotent restarted mid-wake. The fenced lease was released and its typed resume action was requeued." +
-                            (uncertainCalls > 0 ? $" {uncertainCalls} interrupted tool outcome(s) were marked unknown and require inspection before retry." : ""),
-                    });
-                    ReleaseClaimedTriggers(runtime.ProjectID, lease.WakeID, lease.Generation);
+                    ReleaseClaimedTriggers(runtime.ProjectID, lease.WakeID, lease.Generation,
+                        succeeded: outcome == ProjectEventTypes.WakeCompleted);
                     parent.RuntimeState.ReleaseWakeLease(runtime.ProjectID, lease.WakeID, lease.Generation);
                     var legacyDigest = parent.Digests.GetDigest(runtime.ProjectID);
                     if (legacyDigest.ActiveWakeID == lease.WakeID)
@@ -1299,11 +1300,12 @@ namespace Omnipotent.Services.Projects
                     }
                     var project = parent.Store.GetProject(runtime.ProjectID);
                     if (project?.Status is (ProjectStatus.Active or ProjectStatus.Planning)
+                        && (outcome != ProjectEventTypes.WakeCompleted || runtime.Checkpoint.ResumeAction?.Kind == "work-slice")
                         && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, DateTime.UtcNow))
                     {
                         string resume = runtime.Checkpoint.ResumeAction?.Summary
                             ?? "Rehydrate committed state and continue from the last verified action without re-discovery.";
-                        Wake(project, $"Recovery after process restart. Exact resume action: {resume}", queueIfBusy: false);
+                        resumptions.Add((project, $"Recovery after process restart. Exact resume action: {resume}"));
                     }
                     recovered.Add(runtime.ProjectID);
                 }
@@ -1313,26 +1315,20 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
-                    if (recovered.Contains(digest.ProjectID))
-                    {
-                        digest.ActiveWakeID = null;
-                        parent.Digests.SaveDigest(digest);
-                        continue;
-                    }
-                    ProjectToolCallJournal.ReconcileInterruptedWake(
-                        parent.EventLog, digest.ProjectID, digest.ActiveWakeID, "commander");
-                    ReleaseClaimedTriggers(digest.ProjectID, digest.ActiveWakeID, null);
-                    parent.EventLog.Append(new ProjectEvent
-                    {
-                        ProjectID = digest.ProjectID, WakeID = digest.ActiveWakeID,
-                        Type = ProjectEventTypes.WakeCancelled, Author = "system",
-                        Text = "Omnipotent restarted mid-wake. Committed events preserved; next stimulus rehydrates the Commander.",
-                    });
+                    if (recovered.Contains(digest.ProjectID)) continue;
+                    string outcome = ProjectWakeRecovery.RecordInterruption(
+                        parent.EventLog, digest.ProjectID, digest.ActiveWakeID!, "commander");
+                    ReleaseClaimedTriggers(digest.ProjectID, digest.ActiveWakeID, null,
+                        succeeded: outcome == ProjectEventTypes.WakeCompleted);
                     digest.ActiveWakeID = null;
                     parent.Digests.SaveDigest(digest);
                 }
                 catch { }
             }
+            // Finish every legacy cleanup before starting replacements. Previously the second
+            // pass erased a newly started wake's digest marker, breaking steering and recovery.
+            foreach (var (project, trigger) in resumptions)
+                resumeWake(project, trigger);
         }
 
         /// <summary>
@@ -1366,7 +1362,7 @@ namespace Omnipotent.Services.Projects
         /// block acknowledges it. Release that claim during recovery so the payload is eligible
         /// for the next fenced wake instead of being stranded forever as "in progress".
         /// </summary>
-        private void ReleaseClaimedTriggers(string projectID, string? wakeID, long? fallbackGeneration)
+        private void ReleaseClaimedTriggers(string projectID, string? wakeID, long? fallbackGeneration, bool succeeded = false)
         {
             if (string.IsNullOrWhiteSpace(wakeID)) return;
             foreach (var trigger in parent.RuntimeState.ListPendingTriggers(projectID, includeClaimed: true)
@@ -1377,7 +1373,7 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     parent.RuntimeState.AcknowledgeTrigger(projectID, trigger.TriggerID, wakeID,
-                        generation.Value, succeeded: false);
+                        generation.Value, succeeded: succeeded);
                 }
                 catch { /* recovery proceeds even if one old trigger is malformed */ }
             }

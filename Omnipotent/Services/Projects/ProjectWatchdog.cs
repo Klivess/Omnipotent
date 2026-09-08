@@ -130,7 +130,10 @@ namespace Omnipotent.Services.Projects
             var leaseBeat = runtime?.ActiveWakeLease?.LastHeartbeatAt;
             DateTime? workerBeat = runtime?.ActiveAgentWakeLeases.Values.Select(x => (DateTime?)x.LastHeartbeatAt).Max();
             var verifiedBeat = runtime?.Health.LastVerifiedProgressAt;
-            var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
+            var approvalBeat = parent.Gates?.LastResolutionAt(project.ProjectID);
+            var liveActivity = parent.Activity?.ListForProject(project.ProjectID) ?? Array.Empty<ProjectAgentActivity>();
+            var streamBeat = liveActivity.Select(x => (DateTime?)x.UpdatedAt).Max();
+            var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat, approvalBeat, streamBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
             var lastBeat = observedBeats.DefaultIfEmpty(project.CreatedAt).Max();
             if (tail.Count > 0 && now - lastBeat > MaxWakeGap)
                 return ($"No Commander activity or verified worker heartbeat in over {MaxWakeGap.TotalMinutes:0} minutes " +
@@ -163,16 +166,25 @@ namespace Omnipotent.Services.Projects
             //    (a live worker emits tool calls constantly — silence, not duration, is the wedge
             //    signal, so a slow-but-working desktop agent is left alone).
             var staleLease = runtime?.ActiveAgentWakeLeases
-                .FirstOrDefault(x => now - x.Value.LastHeartbeatAt > MaxWakeGap);
+                .FirstOrDefault(x => now - x.Value.LastHeartbeatAt > MaxWakeGap
+                    && !liveActivity.Any(a => a.AgentID == x.Key && now - a.UpdatedAt <= MaxWakeGap)
+                    && !(parent.Gates?.LastResolutionAt(project.ProjectID, x.Key) is { } resolved
+                        && now - resolved <= MaxWakeGap));
             if (staleLease.HasValue && !string.IsNullOrWhiteSpace(staleLease.Value.Key))
                 return ($"Sub-agent {staleLease.Value.Key} has a fenced wake lease with no heartbeat for over {MaxWakeGap.TotalMinutes:0} minutes.", staleLease.Value.Key);
 
             var staleAgentWake = tail
-                .Where(e => e.Type == ProjectEventTypes.AgentWake && now - e.Timestamp > MaxWakeGap)
+                .Where(e => e.Type == ProjectEventTypes.AgentWake && now - e.Timestamp > MaxWakeGap
+                    // Fenced leases are authoritative. An old orphaned start must not keep
+                    // diagnosing a worker whose replacement wake is currently healthy.
+                    && !(runtime?.ActiveAgentWakeLeases.ContainsKey(e.AgentID ?? "") ?? false))
                 .FirstOrDefault(w => !tail.Any(e => e.WakeID == w.WakeID &&
                         (e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed
                             or ProjectEventTypes.WakeCancelled or ProjectEventTypes.WakeDeferred))
-                    && !tail.Any(e => e.AgentID == w.AgentID && now - e.Timestamp <= MaxWakeGap));
+                    && !tail.Any(e => e.AgentID == w.AgentID && now - e.Timestamp <= MaxWakeGap)
+                    && !liveActivity.Any(a => a.AgentID == w.AgentID && now - a.UpdatedAt <= MaxWakeGap)
+                    && !(parent.Gates?.LastResolutionAt(project.ProjectID, w.AgentID) is { } resolved
+                        && now - resolved <= MaxWakeGap));
             if (staleAgentWake != null)
                 return ($"Sub-agent {staleAgentWake.AgentID} has been awake without finishing or emitting any activity for over {MaxWakeGap.TotalMinutes:0} minutes.", staleAgentWake.AgentID);
 
@@ -215,11 +227,11 @@ namespace Omnipotent.Services.Projects
                     or ProjectEventTypes.WakeCancelled or ProjectEventTypes.WakeDeferred);
 
         /// <summary>
-        /// Recovers a diagnosed stall without involving Klives: cancel a wedged sub-agent if that
-        /// is the diagnosis, then force-wake the Commander with the diagnosis as its trigger.
+        /// Recovers a diagnosed stall without involving Klives: cancel only a wedged worker and
+        /// notify its commander in place, or force-wake a stalled commander.
         /// Klives is pinged only when recoveries keep happening or wakes keep failing outright.
         /// </summary>
-        private async Task SelfHealAsync(Project project, string diagnosis, string? wedgedAgentID)
+        internal async Task SelfHealAsync(Project project, string diagnosis, string? wedgedAgentID)
         {
             var now = DateTime.UtcNow;
             var watchdog = parent.RuntimeState.Get(project.ProjectID).Health.Watchdog;
@@ -283,11 +295,11 @@ namespace Omnipotent.Services.Projects
                 parent.Digests.SaveDigest(digest);
             }
 
-            // A wedged sub-agent holds its single-flight slot until cancelled; free it so the
-            // force-woken Commander can re-dispatch the work.
+            // A wedged sub-agent keeps its single-flight slot until its cancellation finishes;
+            // its commander can then re-dispatch the work.
             if (wedgedAgentID != null)
             {
-                try { parent.SubAgentRunner.CancelAgent(project.ProjectID, wedgedAgentID); } catch { }
+                try { parent.SubAgentRunner.CancelAgent(project.ProjectID, wedgedAgentID, $"Watchdog recovery: {diagnosis}"); } catch { }
             }
 
             var recorded = parent.RuntimeState.RecordWatchdogRecovery(project.ProjectID, HealWindow, nowUtc: now);
@@ -300,7 +312,7 @@ namespace Omnipotent.Services.Projects
                 Type = ProjectEventTypes.WatchdogRecovery,
                 Author = "system",
                 AgentID = "commander",
-                Text = $"Watchdog: {diagnosis} Self-healing — force-waking the Commander (recovery #{lifetimeCount} lifetime; {windowCount} in the last {HealWindow.TotalHours:0}h).",
+                Text = $"Watchdog: {diagnosis} Self-healing — {(wedgedAgentID == null ? "recovering the Commander" : "recovering the worker and notifying the Commander")} (recovery #{lifetimeCount} lifetime; {windowCount} in the last {HealWindow.TotalHours:0}h).",
                 PayloadJson = System.Text.Json.JsonSerializer.Serialize(new
                 {
                     diagnosis,
@@ -312,8 +324,16 @@ namespace Omnipotent.Services.Projects
                 }),
             });
             log($"Watchdog self-heal on project {project.ProjectID}: {diagnosis}");
-            parent.CommanderRunner.ForceWake(current,
-                $"{diagnosis} The watchdog force-woke you to recover. Assess what wedged, avoid repeating it (change approach if you were looping), and continue toward the goal.");
+            string recoveryAdvice = $"{diagnosis} Assess what wedged, avoid repeating it (change approach if you were looping), and continue toward the goal.";
+            if (wedgedAgentID != null)
+            {
+                // Only the diagnosed worker was cancelled. Its healthy commander keeps its
+                // conversation and in-flight actions, and receives the recovery report in place.
+                if (!parent.CommanderRunner.NudgeActiveWake(current, recoveryAdvice))
+                    parent.CommanderRunner.Wake(current, $"[watchdog recovery] {recoveryAdvice}");
+            }
+            else
+                parent.CommanderRunner.ForceWake(current, recoveryAdvice);
 
             if (windowCount >= HealsBeforeEscalation)
                 await EscalateAsync(current,

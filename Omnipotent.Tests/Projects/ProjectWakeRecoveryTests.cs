@@ -71,6 +71,69 @@ public sealed class ProjectWakeRecoveryTests
     }
 
     [Fact]
+    public async Task InternalTimeoutRetriesInTheSameWakeInsteadOfCancellingIt()
+    {
+        int calls = 0;
+        var recovery = new ProjectWakeRecovery();
+        var result = await recovery.ExecuteAsync(() => ++calls == 1
+            ? Task.FromException<string>(new TaskCanceledException("HTTP timeout"))
+            : Task.FromResult("completed"), (failure, _, _) => Assert.Equal(RemoteLLMFailureKind.Timeout, failure.Kind),
+            CancellationToken.None, (_, _) => Task.CompletedTask, model: "test-model");
+        Assert.Equal("completed", result);
+        Assert.Equal(2, calls);
+    }
+
+    [Theory]
+    [InlineData(ProjectEventTypes.WakeCompleted)]
+    [InlineData(ProjectEventTypes.WakeDeferred)]
+    [InlineData(ProjectEventTypes.WakeFailed)]
+    public void RestartAfterOutcomeCommitDoesNotOverwriteItWithCancelled(string outcome)
+    {
+        string pid = "test_" + Guid.NewGuid().ToString("N");
+        var events = new ProjectEventLogStore(_ => { });
+        events.Append(new ProjectEvent { ProjectID = pid, WakeID = "wake", Type = outcome });
+        Assert.Equal(outcome, ProjectWakeRecovery.RecordInterruption(events, pid, "wake", "commander"));
+        Assert.Single(events.ReadTail(pid, 10));
+    }
+
+    [Fact]
+    public void InterruptedWorkerGetsOneTerminalOutcomeAndUnknownToolResult()
+    {
+        string pid = "test_" + Guid.NewGuid().ToString("N");
+        var events = new ProjectEventLogStore(_ => { });
+        events.Append(new ProjectEvent { ProjectID = pid, WakeID = "wake", AgentID = "worker",
+            Type = ProjectEventTypes.ToolCall, ToolName = "publish", ToolCallId = "call" });
+        ProjectWakeRecovery.RecordInterruption(events, pid, "wake", "worker");
+        ProjectWakeRecovery.RecordInterruption(events, pid, "wake", "worker");
+        var history = events.ReadTail(pid, 10);
+        Assert.Single(history, e => e.Type == ProjectEventTypes.WakeCancelled);
+        Assert.Single(history, e => e.Type == ProjectEventTypes.ToolResult
+            && e.Text.StartsWith(ProjectToolCallJournal.InterruptedResultPrefix));
+        Assert.Equal(3, history.Count);
+    }
+
+    [Fact]
+    public async Task PersistentInternalTimeoutReportsProviderFailureWithModel()
+    {
+        var error = await Assert.ThrowsAsync<RemoteLLMException>(() => new ProjectWakeRecovery().ExecuteAsync<int>(
+            () => Task.FromException<int>(new OperationCanceledException()), (_, _, _) => { },
+            CancellationToken.None, (_, _) => Task.CompletedTask, model: "test-model"));
+        Assert.Equal(RemoteLLMFailureKind.Timeout, error.Kind);
+        Assert.Equal("test-model", error.Model);
+    }
+
+    [Fact]
+    public async Task RequestedCancellationInsideInferenceDoesNotRetry()
+    {
+        using var cts = new CancellationTokenSource();
+        int calls = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new ProjectWakeRecovery().ExecuteAsync<int>(
+            () => { calls++; cts.Cancel(); return Task.FromCanceled<int>(cts.Token); },
+            (_, _, _) => throw new Exception("Must not retry"), cts.Token));
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
     public void WorkerRouteFailureDoesNotBlockTeammatesAndRecoversAtTheDeadline()
     {
         var now = DateTime.UtcNow;

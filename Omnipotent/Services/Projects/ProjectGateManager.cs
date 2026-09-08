@@ -253,6 +253,17 @@ namespace Omnipotent.Services.Projects
             return sb.ToString().TrimEnd();
         }
 
+        /// <summary>Read the persisted decision time, including the interval after the pending
+        /// flag is cleared but before its event/continuation is published. Approval wait time
+        /// must not become apparent execution silence as soon as Klives answers.</summary>
+        public DateTime? LastResolutionAt(string projectID, string? agentID = null)
+        {
+            lock (LockFor(projectID))
+                return LoadLocked(projectID)
+                    .Where(g => g.Resolved && (agentID == null || g.AgentID == agentID))
+                    .Select(g => g.ResolvedAt).Max();
+        }
+
         public List<ProjectGate> ListPending(string projectID)
         {
             CacheDeps.NoteRead(CacheKey(projectID));

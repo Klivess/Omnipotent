@@ -192,7 +192,7 @@ namespace Omnipotent.Services.Projects
             return cancelled;
         }
 
-        public bool CancelAgent(string projectID, string agentID)
+        public bool CancelAgent(string projectID, string agentID, string reason = "Agent cancellation requested.")
         {
             string key = Key(projectID, agentID);
             steerQueue.TryRemove(key, out _);
@@ -200,7 +200,7 @@ namespace Omnipotent.Services.Projects
             try
             {
                 parent.RuntimeState.RequestAgentWakeCancellation(projectID, agentID, active.WakeID, active.LeaseGeneration,
-                    "Agent cancellation requested.");
+                    reason);
                 active.Cancellation.Cancel(); return true;
             }
             catch { return false; }
@@ -217,7 +217,7 @@ namespace Omnipotent.Services.Projects
                 {
                     string agentID = entry.Key;
                     var lease = entry.Value;
-                    ProjectToolCallJournal.ReconcileInterruptedWake(
+                    ProjectWakeRecovery.RecordInterruption(
                         parent.EventLog, state.ProjectID, lease.WakeID, agentID);
                     parent.RuntimeState.ReleaseAgentWakeLease(state.ProjectID, agentID, lease.WakeID, lease.Generation);
                     var project = parent.Store.GetProject(state.ProjectID);
@@ -442,7 +442,7 @@ namespace Omnipotent.Services.Projects
                                     Text = $"Keeping this wake active; inference retry {attempt} in {delay.TotalSeconds:0}s. Committed tools and conversation are retained.",
                                     PayloadJson = JsonConvert.SerializeObject(new { reason = failure.Kind.ToString(), attempt, delayMs = delay.TotalMilliseconds }),
                                 });
-                            }, cts.Token);
+                            }, cts.Token, model: model);
                             modelResponses++;
                             modelTurns++;
                         }
@@ -853,10 +853,13 @@ namespace Omnipotent.Services.Projects
                 }
                 done: ;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cts.IsCancellationRequested)
             {
                 outcome = ProjectEventTypes.WakeCancelled;
-                outcomeText = $"Agent {agent.AgentID} wake cancelled because the project or agent was stopped.";
+                var lease = parent.RuntimeState.Get(projectID).ActiveAgentWakeLeases.GetValueOrDefault(agent.AgentID);
+                string reason = lease?.WakeID == wakeID ? lease.CancellationReason ?? "Agent stop requested." : "Agent stop requested.";
+                outcomeText = $"Agent {agent.AgentID} wake cancelled: {reason}";
+                outcomePayloadJson = JsonConvert.SerializeObject(new { reason = "wake-cancellation-requested", detail = reason });
             }
             catch (OpenRouterCreditExhaustedException ex)
             {

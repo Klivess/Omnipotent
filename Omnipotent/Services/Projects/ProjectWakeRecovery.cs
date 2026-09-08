@@ -11,6 +11,27 @@ internal sealed class ProjectWakeRecovery
     public long WaitMs { get; private set; }
     private TimeSpan reservedWait;
 
+    /// <summary>Close an orphan once. A process can stop after the outcome was committed but
+    /// before releasing its lease; that completed/deferred outcome must survive recovery.</summary>
+    internal static string RecordInterruption(ProjectEventLogStore events, string projectID,
+        string wakeID, string? agentID)
+    {
+        var terminal = events.EnumerateRange(projectID, null, null).LastOrDefault(e => e.WakeID == wakeID
+            && e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeDeferred
+                or ProjectEventTypes.WakeFailed or ProjectEventTypes.WakeCancelled);
+        if (terminal != null) return terminal.Type;
+        int uncertain = ProjectToolCallJournal.ReconcileInterruptedWake(events, projectID, wakeID, agentID);
+        events.Append(new ProjectEvent
+        {
+            ProjectID = projectID, WakeID = wakeID, AgentID = agentID, Author = "system",
+            Type = ProjectEventTypes.WakeCancelled,
+            Text = "Omnipotent restarted mid-wake. Committed work was preserved for recovery." +
+                (uncertain > 0 ? $" {uncertain} interrupted tool outcome(s) require inspection before retry." : ""),
+            PayloadJson = System.Text.Json.JsonSerializer.Serialize(new { reason = "process-restart", uncertainToolCalls = uncertain }),
+        });
+        return ProjectEventTypes.WakeCancelled;
+    }
+
     internal async Task<bool> WaitForAdmissionAsync(Func<DateTime?> blockedUntil,
         Action heartbeat, CancellationToken ct)
     {
@@ -75,13 +96,25 @@ internal sealed class ProjectWakeRecovery
 
     internal async Task<T> ExecuteAsync<T>(Func<Task<T>> query,
         Action<RemoteLLMException, int, TimeSpan> onRetry, CancellationToken ct,
-        Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+        Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
+        string? model = null)
     {
         delayAsync ??= Task.Delay;
         while (true)
         {
             ct.ThrowIfCancellationRequested();
-            try { return await query(); }
+            try
+            {
+                try { return await query(); }
+                catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+                {
+                    // HTTP/internal timeouts can use cancellation exceptions without cancelling
+                    // the wake. Retry inference in the same session; never report a user stop.
+                    throw new RemoteLLMException(RemoteLLMFailureKind.Timeout,
+                        "Inference timed out without a wake cancellation request.",
+                        "KliveLLM", model ?? "unknown", innerException: ex);
+                }
+            }
             catch (RemoteLLMException ex)
             {
                 var delay = RetryDelay(ex, Retries, reservedWait);

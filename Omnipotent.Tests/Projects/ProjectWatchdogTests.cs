@@ -229,6 +229,94 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public async Task ResolvedApprovalRestartsTheSilenceWindowForItsWaitingWorkerAndCommander()
+        {
+            var (svc, pid) = NewProjectService();
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.Gates))!
+                .SetValue(svc, new ProjectGateManager(svc.EventLog, _ => { }));
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.RuntimeState.TryAcquireAgentWakeLease(pid, "worker", "worker-wake", nowUtc: DateTime.UtcNow.AddHours(-2));
+            var gate = new ProjectGate { ProjectID = pid, AgentID = "worker", WakeID = "worker-wake", Title = "Approve work" };
+            var waiting = svc.Gates.OpenGateAndWaitAsync(gate, CancellationToken.None);
+            Assert.True(svc.Gates.ResolveGate(pid, gate.GateID, new(GateDecision.Approve, "", "test")));
+            await waiting;
+            Assert.Empty(svc.Gates.ListPending(pid));
+            Assert.Null(new ProjectWatchdog(svc, _ => { }).Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public void OldWorkerWakeDoesNotOverrideAHealthyReplacementLease()
+        {
+            var (svc, pid) = NewProjectService();
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.EventLog.Append(new ProjectEvent { ProjectID = pid, AgentID = "worker", WakeID = "old",
+                Type = ProjectEventTypes.AgentWake, Timestamp = DateTime.UtcNow.AddHours(-2) });
+            svc.RuntimeState.TryAcquireAgentWakeLease(pid, "worker", "replacement");
+            Assert.Null(new ProjectWatchdog(svc, _ => { }).Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public void StreamingWorkerIsAliveBeforeItsModelResponseIsCommitted()
+        {
+            var (svc, pid) = NewProjectService();
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.Activity))!
+                .SetValue(svc, new ProjectAgentActivityTracker());
+            Wake(svc, pid, DateTime.UtcNow.AddHours(-2));
+            svc.RuntimeState.TryAcquireAgentWakeLease(pid, "worker", "w", nowUtc: DateTime.UtcNow.AddHours(-2));
+            svc.Activity.BeginThinking(pid, "worker", "worker", "model");
+            svc.Activity.AppendToken(pid, "worker", "still generating");
+            Assert.Null(new ProjectWatchdog(svc, _ => { }).Diagnose(svc.Store.GetProject(pid)!));
+        }
+
+        [Fact]
+        public async Task WorkerRecoveryDoesNotRequestCommanderCancellation()
+        {
+            var (svc, pid) = NewProjectService();
+            var project = svc.Store.GetProject(pid)!;
+            project.Status = ProjectStatus.Active;
+            svc.Store.SaveProject(project);
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.CommanderRunner))!
+                .SetValue(svc, new ProjectCommanderRunner(svc));
+            typeof(ProjectsService).GetProperty(nameof(ProjectsService.SubAgentRunner))!
+                .SetValue(svc, new ProjectSubAgentRunner(svc));
+            svc.RuntimeState.TryAcquireWakeLease(pid, "commander-live");
+            var digest = svc.Digests.GetDigest(pid);
+            digest.ActiveWakeID = "commander-live";
+            svc.Digests.SaveDigest(digest);
+            svc.RuntimeState.TryAcquireAgentWakeLease(pid, "worker", "stale", nowUtc: DateTime.UtcNow.AddHours(-2));
+            var watchdog = new ProjectWatchdog(svc, _ => { });
+            await watchdog.SelfHealAsync(project, "stale worker", "worker");
+            var lease = svc.RuntimeState.Get(pid).ActiveWakeLease!;
+            Assert.Equal("commander-live", lease.WakeID);
+            Assert.Null(lease.CancellationRequestedAt);
+            Assert.Empty(svc.RuntimeState.ListPendingTriggers(pid));
+            Assert.Single(svc.EventLog.ReadTail(pid, 10), e => e.Type == ProjectEventTypes.WatchdogRecovery);
+        }
+
+        [Fact]
+        public void RestartRecoveryPreservesTheReplacementWakeMarker()
+        {
+            var (svc, pid) = NewProjectService();
+            svc.RuntimeState.TryAcquireWakeLease(pid, "interrupted");
+            var digest = svc.Digests.GetDigest(pid);
+            digest.ActiveWakeID = "interrupted";
+            svc.Digests.SaveDigest(digest);
+            int resumed = 0;
+            new ProjectCommanderRunner(svc).RecoverInterruptedWakes((project, _) =>
+            {
+                if (project.ProjectID != pid) return;
+                resumed++;
+                Assert.True(svc.RuntimeState.TryAcquireWakeLease(pid, "replacement").Acquired);
+                var replacement = svc.Digests.GetDigest(pid);
+                replacement.ActiveWakeID = "replacement";
+                svc.Digests.SaveDigest(replacement);
+            });
+            Assert.Equal(1, resumed);
+            Assert.Equal("replacement", svc.Digests.GetDigest(pid).ActiveWakeID);
+            Assert.Equal("replacement", svc.RuntimeState.Get(pid).ActiveWakeLease!.WakeID);
+        }
+
+        [Fact]
         public void StuckLoopTrips_AreDiagnosedAsStall()
         {
             var (svc, pid) = NewProjectService();
