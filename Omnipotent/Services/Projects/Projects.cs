@@ -750,12 +750,23 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
+                    bool desktopAllocationChanged = false;
                     foreach (var kv in settingsPatch)
                     {
                         if (kv.Key.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue;
+                        if (kv.Key.Equals(ProjectDesktopAllocation.SettingKey, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (ProjectDesktopAllocation.TryParse(kv.Value?.ToString(), out var allocation))
+                            {
+                                p.DesktopAllocation = allocation;
+                                desktopAllocationChanged = true;
+                            }
+                            continue;
+                        }
                         settings.TrySet(kv.Key, kv.Value ?? JValue.CreateNull());
                     }
                     Settings.Save(settings);
+                    if (desktopAllocationChanged) Store.SaveProject(p);
                 }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: applying create-time settings failed (using defaults)"); }
             }

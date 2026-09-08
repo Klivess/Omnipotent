@@ -997,12 +997,28 @@ namespace Omnipotent.Services.Projects
                     var settings = parent.Settings.Get(project!.ProjectID);
                     var applied = new List<string>();
                     var unknown = new List<string>();
+                    bool projectChanged = false;
                     foreach (var kv in patch.Properties())
                     {
                         if (kv.Name.Equals("projectID", StringComparison.OrdinalIgnoreCase)) continue; // routing field, not a setting
+                        if (kv.Name.Equals(ProjectDesktopAllocation.SettingKey, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (ProjectDesktopAllocation.TryParse(kv.Value.ToString(), out var allocation))
+                            {
+                                if (project.DesktopAllocation != allocation)
+                                {
+                                    project.DesktopAllocation = allocation;
+                                    projectChanged = true;
+                                }
+                                applied.Add(kv.Name);
+                            }
+                            else unknown.Add(kv.Name);
+                            continue;
+                        }
                         (settings.TrySet(kv.Name, kv.Value) ? applied : unknown).Add(kv.Name);
                     }
                     parent.Settings.Save(settings);
+                    if (projectChanged) parent.Store.SaveProject(project);
                     parent.EventLog.Append(new ProjectEvent
                     {
                         ProjectID = project.ProjectID,
@@ -1010,7 +1026,7 @@ namespace Omnipotent.Services.Projects
                         Author = "klives",
                         Text = $"Settings updated: {string.Join(", ", applied)}." + (unknown.Count > 0 ? $" Unknown keys ignored: {string.Join(", ", unknown)}." : ""),
                     });
-                    await req.ReturnResponse(Json(new { applied, unknown, settings }));
+                    await req.ReturnResponse(Json(new { applied, unknown, settings, desktopAllocation = project.DesktopAllocation }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);

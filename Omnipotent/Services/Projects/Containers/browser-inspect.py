@@ -2005,7 +2005,7 @@ CHALLENGE_PROBE_JS = r"""
     detected: widgets.some(w => !w.responsePresent) || interstitial || unknownWidget,
     interstitial, documentId: state.documentId,
     widgets: widgets.slice(0, 5).map(({node, fields, callbackName, ...w}) => w),
-    url: location.href, title: (document.title || '').slice(0, 200)
+    url: location.href, title: (document.title || '').slice(0, 200), readyState: document.readyState
   };
 })()
 """
@@ -2222,11 +2222,13 @@ def do_control(payload):
                 stable_clear = 0
                 while time.monotonic() < deadline:
                     probe = main_world_eval(session, CHALLENGE_PROBE_JS)
-                    answered = any(w.get("responsePresent") for w in probe.get("widgets", []))
+                    widgets = probe.get("widgets", [])
+                    answered = bool(widgets) and all(w.get("responsePresent") for w in widgets)
                     if answered:
                         result = {"ok": True, "state": "response-present", "acceptance": "unverified"}
                         return add_control_state(result, session, tab, index, before_tab_ids)
-                    stable_clear = stable_clear + 1 if not probe.get("detected") else 0
+                    stable_clear = stable_clear + 1 if (not probe.get("detected")
+                        and probe.get("readyState") == "complete") else 0
                     if stable_clear >= 2:
                         result = {"ok": True, "state": "challenge-cleared", "acceptance": "unverified"}
                         return add_control_state(result, session, tab, index, before_tab_ids)

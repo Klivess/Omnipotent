@@ -25,6 +25,7 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly string? agentID;
         private readonly Func<string, Task<string>>? resolveSecretsAsync;
         private readonly Func<string, string?, int, CancellationToken, Task<ContainerShellResult>>? terminalAsync;
+        private readonly Func<string, CancellationToken, Task<string>>? takeBrowserSessionAsync;
         private readonly int actionSettleMs;
         private readonly int typingDelayMs;
         private readonly CachedFrameState frameState;
@@ -107,6 +108,7 @@ namespace Omnipotent.Services.Projects.Containers
             Func<ContainerDesktopControlCommand, string?, CancellationToken, Task>? dockerControlAsync = null,
             Func<string, string?, int, CancellationToken, Task<ContainerShellResult>>? terminalAsync = null,
             Func<string, Task<string>>? resolveSecretsAsync = null,
+            Func<string, CancellationToken, Task<string>>? takeBrowserSessionAsync = null,
             int actionSettleMs = 350, int typingDelayMs = 18)
         {
             this.transport = transport;
@@ -116,6 +118,7 @@ namespace Omnipotent.Services.Projects.Containers
             this.inputLock = inputLock;
             this.terminalAsync = terminalAsync;
             this.resolveSecretsAsync = resolveSecretsAsync;
+            this.takeBrowserSessionAsync = takeBrowserSessionAsync;
             this.actionSettleMs = Math.Clamp(actionSettleMs, 50, 5000);
             this.typingDelayMs = Math.Clamp(typingDelayMs, 0, 500);
             frameState = FrameStates.GetValue(transport, _ => new CachedFrameState());
@@ -483,7 +486,7 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 "click", "fill", "type", "select", "check", "uncheck", "focus", "hover",
                 "scroll_into_view", "scroll", "press", "wait", "back", "forward", "reload",
-                "activate_tab", "close_tab", "script", "solve_challenge", "dismiss_overlays",
+                "activate_tab", "close_tab", "script", "solve_challenge", "dismiss_overlays", "take_session",
             };
             if (!allowed.Contains(op, StringComparer.Ordinal))
                 return ContainerToolResult.Fail(
@@ -492,6 +495,19 @@ namespace Omnipotent.Services.Projects.Containers
 
             if (op == "solve_challenge")
                 return await SolveChallengeAsync(a, ct);
+
+            if (op == "take_session")
+            {
+                if (takeBrowserSessionAsync == null)
+                    return ContainerToolResult.Fail("Browser-session handoff is unavailable for this desktop.",
+                        ContainerToolFailureKind.Infrastructure);
+                string sourceAgentID = (Str(a, "sourceAgentId") ?? "").Trim();
+                if (sourceAgentID.Length == 0 || sourceAgentID.Length > 256 || sourceAgentID.Any(char.IsControl))
+                    return ContainerToolResult.Fail(
+                        "op=take_session requires sourceAgentId (use 'commander' for the Commander or a roster agent ID).",
+                        ContainerToolFailureKind.Validation);
+                return ContainerToolResult.Ok(await takeBrowserSessionAsync(sourceAgentID, ct));
+            }
 
             string[] targetOps =
             {

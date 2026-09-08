@@ -171,6 +171,34 @@ namespace Omnipotent.Services.Projects.Containers
             }
         }
 
+        /// <summary>
+        /// Serialises a profile-level operation with every browser launch on the supplied desktops.
+        /// A session handoff holds these locks while Chromium is stopped and its on-disk profile is
+        /// replaced; a competing launch must not recreate SQLite or Singleton state mid-copy.
+        /// Callers also hold the corresponding desktop action gates.
+        /// </summary>
+        internal async Task WithBrowserLaunchLocksAsync(IEnumerable<string> containerIDs, Func<Task> operation,
+            CancellationToken ct = default)
+        {
+            var ids = containerIDs.Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToList();
+            var held = new List<SemaphoreSlim>(ids.Count);
+            try
+            {
+                foreach (string containerID in ids)
+                {
+                    var gate = browserLaunchGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1));
+                    await gate.WaitAsync(ct);
+                    held.Add(gate);
+                }
+                await operation();
+            }
+            finally
+            {
+                for (int i = held.Count - 1; i >= 0; i--) held[i].Release();
+            }
+        }
+
         // One idempotent browser supervisor. It waits for an in-progress start instead of spawning
         // a competitor, kills a genuinely wedged local Chromium before clearing stale singleton
         // markers, and does not return success until CDP is listening. When a browser is already
@@ -647,9 +675,8 @@ namespace Omnipotent.Services.Projects.Containers
 
             string volumeHostDir = ProjectWorkspaceLocator.HostRoot(projectID);
             Directory.CreateDirectory(volumeHostDir);
-            string profileSegment = string.Concat((agentID ?? "shared").Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '_'));
-            if (string.IsNullOrWhiteSpace(profileSegment)) profileSegment = "shared";
-            string profileHostDir = Path.Combine(volumeHostDir, ".klive", "browser-profiles", profileSegment);
+            string profileSegment = BrowserProfileHandoff.ProfileSegment(agentID);
+            string profileHostDir = BrowserProfileHandoff.ProfilePath(projectID, agentID);
             Directory.CreateDirectory(profileHostDir);
             // Package environments contain platform-specific launchers and native binaries. Keep
             // them in an owner-specific Linux runtime mount rather than the cross-OS /project tree;

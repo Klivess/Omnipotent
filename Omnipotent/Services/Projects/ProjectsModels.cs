@@ -178,6 +178,23 @@ namespace Omnipotent.Services.Projects
         SharedDesktopWithInputLock,
     }
 
+    /// <summary>One canonical wire-format parser for the browser/desktop allocation setting.</summary>
+    public static class ProjectDesktopAllocation
+    {
+        public const string SettingKey = "desktopAllocation";
+
+        public static bool TryParse(string? value, out DesktopAllocationMode mode)
+        {
+            if (string.Equals(value?.Trim(), "shared", StringComparison.OrdinalIgnoreCase))
+            {
+                mode = DesktopAllocationMode.SharedDesktopWithInputLock;
+                return true;
+            }
+            return Enum.TryParse(value?.Trim(), ignoreCase: true, out mode)
+                && Enum.IsDefined(mode);
+        }
+    }
+
     /// <summary>
     /// A Project: a goal + a budget, pursued 24/7 by one Commander and a fleet of
     /// sub-agents. Budget/cap fields are deliberately NOT OmniSettings (design doc §8) —

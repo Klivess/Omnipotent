@@ -6,13 +6,9 @@ using System.Text.Json;
 namespace Omnipotent.Services.Projects.Containers
 {
     /// <summary>
-    /// Protocol layer for turning a detected browser challenge into a token through a solving
-    /// service. A CAPTCHA used to be a hard stop that ended the run and parked the project on a
-    /// human; with a funded solver account an agent clears it the same way any other automated
-    /// operator does, and only genuinely human-bound walls (SMS, ID checks) escalate.
-    ///
-    /// All three supported services speak the same createTask/getTaskResult JSON dialect, so the
-    /// only per-service differences are the host and the task-type spelling.
+    /// Protocol layer for the optional paid fallback. Free browser recognition is the default
+    /// in ContainerToolAdapter. Services share createTask/getTaskResult envelopes but differ in
+    /// task names and challenge metadata. A returned token does not establish site acceptance.
     /// </summary>
     public static class BrowserChallengeSolver
     {

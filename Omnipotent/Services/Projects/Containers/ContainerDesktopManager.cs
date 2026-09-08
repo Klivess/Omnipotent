@@ -24,6 +24,9 @@ namespace Omnipotent.Services.Projects.Containers
         // socket writes, but this gate serialises the whole observe → act → settle transaction.
         private readonly ConcurrentDictionary<string, SemaphoreSlim> actionGates = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, SemaphoreSlim> provisioningGates = new(StringComparer.Ordinal);
+        // A session handoff touches two persistent Chromium profiles. Keep competing handoffs for
+        // one project serial so an agent cannot copy half of A while another replaces A from B.
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> browserSessionHandoffGates = new(StringComparer.Ordinal);
         // Startup, project resume, and the desktop-list route can all request reconciliation at
         // once. Docker reconciliation mutates the persisted registry, so keep it single-flight.
         private readonly SemaphoreSlim reconcileGate = new(1, 1);
@@ -451,8 +454,89 @@ namespace Omnipotent.Services.Projects.Containers
                 terminalAsync: (command, workingDirectory, timeoutSeconds, token) =>
                     orchestrator.ExecuteDesktopShellAsync(record.ContainerID, command, workingDirectory, timeoutSeconds, token),
                 resolveSecretsAsync: resolveSecretsAsync,
+                takeBrowserSessionAsync: (sourceAgentID, token) =>
+                    TakeBrowserSessionAsync(project, agentID, sourceAgentID, token),
                 actionSettleMs: actionSettleMs,
                 typingDelayMs: typingDelayMs);
+        }
+
+        /// <summary>
+        /// Directly gives <paramref name="recipientAgentID"/> a copy of another Project agent's
+        /// persistent Chromium sign-in state. Cookie/session values never pass through an LLM tool
+        /// result, the event log, or the dashboard; only the local profile bytes move between the
+        /// two agent-owned virtual desktops. The destination's previous profile is replaced.
+        /// </summary>
+        public async Task<string> TakeBrowserSessionAsync(Project project, string recipientAgentID,
+            string sourceAgentID, CancellationToken ct = default)
+        {
+            string recipient = (recipientAgentID ?? "").Trim();
+            string source = (sourceAgentID ?? "").Trim();
+            if (recipient.Length == 0) throw new ArgumentException("A recipient agent ID is required.", nameof(recipientAgentID));
+            if (source.Length == 0) throw new ArgumentException("Provide sourceAgentId — the commander is 'commander'.", nameof(sourceAgentID));
+            if (string.Equals(source, recipient, StringComparison.OrdinalIgnoreCase))
+                return "Your browser session is already your own; no handoff was needed.";
+
+            var sourceRecord = registry.ResolveForAgent(project.ProjectID, source);
+            if (sourceRecord == null)
+                throw new InvalidOperationException($"Agent '{source}' has no desktop browser session to take yet.");
+            var recipientRecord = await EnsureDesktopAsync(project, recipient, requireVisualReady: false, ct);
+            if (string.Equals(sourceRecord.ContainerID, recipientRecord.ContainerID, StringComparison.Ordinal))
+                return "Both agents already resolve to the same desktop and browser session.";
+
+            var handoffGate = browserSessionHandoffGates.GetOrAdd(project.ProjectID, _ => new SemaphoreSlim(1, 1));
+            await handoffGate.WaitAsync(ct);
+            // The recipient adapter is calling this while holding its own action gate. Acquiring it
+            // again would self-deadlock; only drain the source desktop, which is the one another
+            // agent could otherwise still be mutating while its profile is copied.
+            var actionGatesToHold = new[] { sourceRecord.ContainerID }
+                .Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal)
+                .Select(id => actionGates.GetOrAdd(id, _ => new SemaphoreSlim(1, 1))).ToList();
+            var heldActionGates = new List<SemaphoreSlim>(actionGatesToHold.Count);
+            try
+            {
+                foreach (var gate in actionGatesToHold)
+                {
+                    await gate.WaitAsync(ct);
+                    heldActionGates.Add(gate);
+                }
+
+                await orchestrator.WithBrowserLaunchLocksAsync(
+                    new[] { sourceRecord.ContainerID, recipientRecord.ContainerID },
+                    async () =>
+                    {
+                        await StopBrowserForSessionHandoffAsync(sourceRecord.ContainerID, ct);
+                        await StopBrowserForSessionHandoffAsync(recipientRecord.ContainerID, ct);
+                        BrowserProfileHandoff.Copy(
+                            BrowserProfileHandoff.ProfilePath(project.ProjectID, sourceRecord.AgentID),
+                            BrowserProfileHandoff.ProfilePath(project.ProjectID, recipientRecord.AgentID));
+                    }, ct);
+
+                // Start the recipient's one visible Chromium immediately. Its supervisor deletes
+                // any runtime Singleton artefacts and establishes the normal CDP/control channel.
+                await orchestrator.ExecuteDesktopControlAsync(recipientRecord.ContainerID,
+                    ContainerDesktopControlCommand.LaunchBrowser, null, ct);
+                log($"Browser session handed from {source} to {recipient} in project {project.ProjectID}; token values were not exposed.");
+                return $"Browser session taken from agent '{source}'. Your visible Chromium was restarted with that sign-in; inspect the target site to verify it still accepts the session.";
+            }
+            finally
+            {
+                for (int i = heldActionGates.Count - 1; i >= 0; i--) heldActionGates[i].Release();
+                handoffGate.Release();
+            }
+        }
+
+        private async Task StopBrowserForSessionHandoffAsync(string containerID, CancellationToken ct)
+        {
+            const string stopBrowser =
+                "set +e\n" +
+                "pkill -x chromium >/dev/null 2>&1 || true\n" +
+                "for i in $(seq 1 40); do pgrep -x chromium >/dev/null 2>&1 || exit 0; sleep 0.25; done\n" +
+                "echo 'Chromium did not exit before the session handoff.' >&2\n" +
+                "exit 1\n";
+            var result = await orchestrator.ExecuteDesktopShellAsync(containerID, stopBrowser, "/home/agent", 20, ct);
+            if (!result.Success)
+                throw new InvalidOperationException("Could not stop Chromium for the browser-session handoff: "
+                    + (result.Stderr + " " + result.Stdout).Trim());
         }
 
         /// <summary>Creates (or resolves) the desktop record an agent should use. A freshly created
