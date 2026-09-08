@@ -27,6 +27,9 @@ public sealed class ProjectTokenUsageContext
     public double? UpstreamInferenceCostUsd { get; set; }
     public int TurnIndex { get; set; }
     public long RequestDurationMs { get; set; }
+    public long QueueDurationMs { get; set; }
+    public long ProviderDurationMs { get; set; }
+    public bool LatencyBreakdownAvailable { get; set; }
     public string? RouterStrategy { get; set; }
     public int? RouterAttempt { get; set; }
     public bool ContextWasCompacted { get; set; }
@@ -76,6 +79,9 @@ public sealed class ProjectTokenUsageRecord
     public double? UpstreamInferenceCostUsd { get; set; }
     public int TurnIndex { get; set; }
     public long RequestDurationMs { get; set; }
+    public long QueueDurationMs { get; set; }
+    public long ProviderDurationMs { get; set; }
+    public bool LatencyBreakdownAvailable { get; set; }
     public string? RouterStrategy { get; set; }
     public int? RouterAttempt { get; set; }
     public bool ContextWasCompacted { get; set; }
@@ -157,6 +163,8 @@ public sealed class ProjectTokenUsageStore
                 record.CacheWritePromptTokens = Math.Max(0, record.CacheWritePromptTokens);
                 record.TurnIndex = Math.Max(0, record.TurnIndex);
                 record.RequestDurationMs = Math.Max(0, record.RequestDurationMs);
+                record.QueueDurationMs = Math.Max(0, record.QueueDurationMs);
+                record.ProviderDurationMs = Math.Max(0, record.ProviderDurationMs);
                 if (record.RouterAttempt is < 0) record.RouterAttempt = null;
                 if (record.UpstreamInferenceCostUsd is { } upstream
                     && (!double.IsFinite(upstream) || upstream < 0))

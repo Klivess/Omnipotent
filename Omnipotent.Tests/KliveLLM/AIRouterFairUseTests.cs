@@ -84,11 +84,15 @@ namespace Omnipotent.Tests.KliveLLM
                 nowUtc: clock.Now, delay: clock.DelayAsync);
 
             DateTime start = clock.UtcNow;
-            (await limiter.AcquireAsync(900, CancellationToken.None)).Dispose();
+            var first = await limiter.AcquireAsync(900, CancellationToken.None);
+            Assert.Equal(0, first.QueueDurationMs);
+            first.Dispose();
             Assert.Equal(start, clock.UtcNow);
 
             // 900 + 900 exceeds the 950 ceiling, so this one waits for the first to expire.
-            (await limiter.AcquireAsync(900, CancellationToken.None)).Dispose();
+            var second = await limiter.AcquireAsync(900, CancellationToken.None);
+            Assert.True(second.QueueDurationMs >= AIRouterFairUseLimiter.Window.TotalMilliseconds);
+            second.Dispose();
             Assert.True(clock.UtcNow - start >= AIRouterFairUseLimiter.Window);
         }
 
@@ -158,6 +162,54 @@ namespace Omnipotent.Tests.KliveLLM
             // The slot is genuinely free again — a cancellation must not leak the semaphore.
             var next = await limiter.AcquireAsync(10).WaitAsync(TimeSpan.FromSeconds(5));
             next.Dispose();
+        }
+
+        [Fact]
+        public async Task WindowBlockedCaller_DoesNotPinAParallelSlotOrBlockSmallerWork()
+        {
+            using var blockedCts = new CancellationTokenSource();
+            var waitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task WaitUntilCancelled(TimeSpan _, CancellationToken cancellationToken)
+            {
+                waitStarted.TrySetResult();
+                return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+
+            var limiter = new AIRouterFairUseLimiter(maxParallelRequests: 1, maxTokensPerMinute: 1_000,
+                delay: WaitUntilCancelled);
+            (await limiter.AcquireAsync(900)).Dispose();
+
+            var blocked = limiter.AcquireAsync(900, blockedCts.Token);
+            await waitStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(0, limiter.Describe().InFlight);
+
+            var smaller = await limiter.AcquireAsync(40).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, limiter.Describe().InFlight);
+            smaller.Dispose();
+
+            blockedCts.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => blocked);
+        }
+
+        [Fact]
+        public async Task Reconciliation_WakesNewlyAdmissibleWorkWithoutWaitingForThePollTimer()
+        {
+            var waitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task NeverFinishTimer(TimeSpan _, CancellationToken cancellationToken)
+            {
+                waitStarted.TrySetResult();
+                return Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+
+            var limiter = new AIRouterFairUseLimiter(maxParallelRequests: 2, maxTokensPerMinute: 1_000,
+                delay: NeverFinishTimer);
+            using var first = await limiter.AcquireAsync(900);
+            var blocked = limiter.AcquireAsync(900);
+            await waitStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            first.ReportActualTokens(10);
+            using var admitted = await blocked.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(910, limiter.Describe().TokensInWindow);
         }
 
         /// <summary>Advances instantly instead of sleeping, so window arithmetic is tested in

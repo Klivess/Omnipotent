@@ -4,11 +4,9 @@ namespace Omnipotent.Services.KliveLLM
     /// Client-side admission control for AIRouter's published fair-use policy:
     /// 3 parallel requests, 240 requests/minute, 10M tokens/minute.
     ///
-    /// A separate, much smaller LOCAL uncached-input budget limits the compute cost that caused
-    /// the provider suspensions. Published RPM/TPM limits alone do not establish acceptable use.
-    /// Admission is serialized; reservations are reconciled to reported usage in either direction.
-    /// Estimates, external clients and provider policy mean this cannot guarantee absence of 429s
-    /// or complaints. Cancellation remains available while waiting for either budget.
+    /// Reservations are reconciled to provider-reported usage so pessimistic completion estimates
+    /// do not strand capacity. Estimates, external clients and provider policy mean this cannot
+    /// guarantee absence of 429s, so provider-directed cool-offs are shared by every caller.
     /// </summary>
     public sealed class AIRouterFairUseLimiter
     {
@@ -28,23 +26,20 @@ namespace Omnipotent.Services.KliveLLM
         private const double RequestHeadroomFraction = 0.95;   // 228 req/min
         private const double TokenHeadroomFraction = 0.95;     // 9.5M tokens/min
 
-        // Longest single wait handed out before re-evaluating. The window drains continuously, so a
-        // caller re-checks rather than sleeping on a stale computation.
+        // Longest single wait handed out before re-evaluating. The window drains continuously and a
+        // smaller request may become admissible first, so callers re-check instead of sleeping on a
+        // stale computation.
         private static readonly TimeSpan MaxSingleWait = TimeSpan.FromSeconds(5);
 
         private readonly int requestCeiling;
         private readonly long tokenCeiling;
         private readonly Func<DateTime> nowUtc;
         private readonly Func<TimeSpan, CancellationToken, Task> delay;
-        private readonly AIRouterPrefillBudget prefill;
-
-        // Admission is serialised so waiting callers form a queue in arrival order instead of all
-        // waking together and re-racing for the same slot.
-        private readonly SemaphoreSlim admission = new(1, 1);
         private readonly SemaphoreSlim parallelism;
 
         private readonly object sync = new();
         private readonly LinkedList<WindowEntry> window = new();
+        private TaskCompletionSource<bool> stateChanged = NewStateSignal();
         private long windowTokens;
         private DateTime penaltyUntilUtc = DateTime.MinValue;
 
@@ -58,17 +53,13 @@ namespace Omnipotent.Services.KliveLLM
             int maxRequestsPerMinute = PolicyMaxRequestsPerMinute,
             long maxTokensPerMinute = PolicyMaxTokensPerMinute,
             Func<DateTime>? nowUtc = null,
-            Func<TimeSpan, CancellationToken, Task>? delay = null,
-            long uncachedTokensPerHour = AIRouterPrefillBudget.DefaultTokensPerHour,
-            long uncachedBurstTokens = AIRouterPrefillBudget.DefaultBurstTokens,
-            string? prefillStatePath = null)
+            Func<TimeSpan, CancellationToken, Task>? delay = null)
         {
             parallelism = new SemaphoreSlim(Math.Max(1, maxParallelRequests), Math.Max(1, maxParallelRequests));
             requestCeiling = Math.Max(1, (int)Math.Floor(Math.Max(1, maxRequestsPerMinute) * RequestHeadroomFraction));
             tokenCeiling = Math.Max(1, (long)Math.Floor(Math.Max(1, maxTokensPerMinute) * TokenHeadroomFraction));
             this.nowUtc = nowUtc ?? (() => DateTime.UtcNow);
             this.delay = delay ?? ((span, ct) => Task.Delay(span, ct));
-            prefill = new AIRouterPrefillBudget(uncachedTokensPerHour, uncachedBurstTokens, prefillStatePath);
         }
 
         /// <summary>Observable state, for logs and the fair-use diagnostics surface.</summary>
@@ -81,11 +72,7 @@ namespace Omnipotent.Services.KliveLLM
             TimeSpan PenaltyRemaining,
             long TotalAdmitted,
             long TotalWaitedMs,
-            long TotalPenalties,
-            long UncachedTokensAvailable,
-            long UncachedBurstTokens,
-            long UncachedTokensPerHour,
-            string? PrefillPersistenceError);
+            long TotalPenalties);
 
         public Snapshot Describe()
         {
@@ -93,8 +80,6 @@ namespace Omnipotent.Services.KliveLLM
             lock (sync)
             {
                 Prune(now);
-                var uncached = prefill.Describe(now);
-                if (prefill.PenaltyUntilUtc > penaltyUntilUtc) penaltyUntilUtc = prefill.PenaltyUntilUtc;
                 return new Snapshot(
                     InFlight: Volatile.Read(ref inFlight),
                     RequestsInWindow: window.Count,
@@ -104,16 +89,12 @@ namespace Omnipotent.Services.KliveLLM
                     PenaltyRemaining: penaltyUntilUtc > now ? penaltyUntilUtc - now : TimeSpan.Zero,
                     TotalAdmitted: Interlocked.Read(ref totalAdmitted),
                     TotalWaitedMs: Interlocked.Read(ref totalWaitedMs),
-                    TotalPenalties: Interlocked.Read(ref totalPenalties),
-                    UncachedTokensAvailable: uncached.AvailableTokens,
-                    UncachedBurstTokens: uncached.BurstTokens,
-                    UncachedTokensPerHour: uncached.TokensPerHour,
-                    PrefillPersistenceError: uncached.PersistenceError);
+                    TotalPenalties: Interlocked.Read(ref totalPenalties));
             }
         }
 
         /// <summary>
-        /// Queue for permission to send one AIRouter request. Returns only when all budgets have
+        /// Queue for permission to send one AIRouter request. Returns only when all published limits have
         /// room; the returned lease holds the parallel slot until it is disposed, which the caller
         /// must do as soon as the HTTP exchange completes (not when it finishes processing the body).
         /// </summary>
@@ -121,11 +102,7 @@ namespace Omnipotent.Services.KliveLLM
         /// Pessimistic size of the request: prompt estimate plus the full completion reserve. Reconciled
         /// to the provider-reported figure via <see cref="AIRouterFairUseLease.ReportActualTokens"/>.
         /// </param>
-        public Task<AIRouterFairUseLease> AcquireAsync(long estimatedTokens, CancellationToken cancellationToken = default)
-            => AcquireAsync(estimatedTokens, estimatedTokens, cancellationToken);
-
-        /// <summary>Reserve total tokens against TPM and the full prompt against the uncached budget.</summary>
-        public async Task<AIRouterFairUseLease> AcquireAsync(long estimatedTokens, long estimatedPromptTokens,
+        public async Task<AIRouterFairUseLease> AcquireAsync(long estimatedTokens,
             CancellationToken cancellationToken = default)
         {
             // A request bigger than the entire per-minute token ceiling could never be admitted; clamp
@@ -133,56 +110,53 @@ namespace Omnipotent.Services.KliveLLM
             long reserved = Math.Clamp(estimatedTokens, 1, tokenCeiling);
             DateTime queuedAt = nowUtc();
 
-            await admission.WaitAsync(cancellationToken);
-            bool slotHeld = false;
-            try
+            while (true)
             {
+                // Never occupy one of AIRouter's three parallel slots while waiting for an RPM/TPM
+                // window or provider cool-off. The previous ordering took the slot first and then
+                // slept, allowing one blocked prompt to pin a slot and the serialized admission gate
+                // to hold every request behind it.
                 await parallelism.WaitAsync(cancellationToken);
-                slotHeld = true;
-                Interlocked.Increment(ref inFlight);
-
-                LinkedListNode<WindowEntry> node;
-                AIRouterPrefillBudget.Reservation prefillReservation;
-                while (true)
+                bool admitted = false;
+                TimeSpan wait;
+                Task recheck;
+                LinkedListNode<WindowEntry>? node = null;
+                try
                 {
                     DateTime now = nowUtc();
-                    TimeSpan wait;
                     lock (sync)
                     {
                         Prune(now);
-                        TimeSpan prefillWait = prefill.WaitFor(estimatedPromptTokens, now);
-                        if (prefill.PenaltyUntilUtc > penaltyUntilUtc) penaltyUntilUtc = prefill.PenaltyUntilUtc;
                         wait = TimeUntilAdmissible(now, reserved);
-                        if (prefillWait > wait) wait = prefillWait;
+                        recheck = stateChanged.Task;
                         if (wait <= TimeSpan.Zero)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
-                            prefillReservation = prefill.Reserve(estimatedPromptTokens, now);
                             node = window.AddLast(new WindowEntry(now, reserved));
                             windowTokens += reserved;
-                            break;
+                            admitted = true;
                         }
                     }
-                    if (wait > MaxSingleWait) wait = MaxSingleWait;
-                    await delay(wait, cancellationToken);
+                }
+                finally
+                {
+                    if (!admitted) parallelism.Release();
                 }
 
-                Interlocked.Increment(ref totalAdmitted);
-                Interlocked.Add(ref totalWaitedMs, (long)Math.Max(0, (nowUtc() - queuedAt).TotalMilliseconds));
-                return new AIRouterFairUseLease(this, node, prefillReservation);
-            }
-            catch
-            {
-                if (slotHeld)
+                if (admitted)
                 {
-                    Interlocked.Decrement(ref inFlight);
-                    parallelism.Release();
+                    long queueDurationMs = (long)Math.Max(0, (nowUtc() - queuedAt).TotalMilliseconds);
+                    Interlocked.Increment(ref inFlight);
+                    Interlocked.Increment(ref totalAdmitted);
+                    Interlocked.Add(ref totalWaitedMs, queueDurationMs);
+                    return new AIRouterFairUseLease(this, node!, queueDurationMs);
                 }
-                throw;
-            }
-            finally
-            {
-                admission.Release();
+
+                if (wait > MaxSingleWait) wait = MaxSingleWait;
+                // Provider usage usually reconciles a pessimistic max-completion reservation down
+                // long before its minute expires. Wake immediately when that happens instead of
+                // adding up to five seconds of polling latency to every newly-admissible request.
+                await await Task.WhenAny(delay(wait, cancellationToken), recheck.WaitAsync(cancellationToken));
             }
         }
 
@@ -198,7 +172,6 @@ namespace Omnipotent.Services.KliveLLM
             lock (sync)
             {
                 if (until > penaltyUntilUtc) penaltyUntilUtc = until;
-                prefill.Penalize(coolOff, nowUtc());
             }
             Interlocked.Increment(ref totalPenalties);
         }
@@ -269,12 +242,19 @@ namespace Omnipotent.Services.KliveLLM
                 node.Value = node.Value with { Tokens = actualTokens };
                 windowTokens += delta;
                 if (windowTokens < 0) windowTokens = 0;
+                if (delta < 0) PulseStateChanged();
             }
         }
 
-        internal void ReconcilePrefill(AIRouterPrefillBudget.Reservation reservation, long promptTokens, long? cachedTokens)
+        private static TaskCompletionSource<bool> NewStateSignal()
+            => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Complete the current generation and replace it while holding <see cref="sync"/>.</summary>
+        private void PulseStateChanged()
         {
-            lock (sync) prefill.Reconcile(reservation, promptTokens, cachedTokens, nowUtc());
+            var previous = stateChanged;
+            stateChanged = NewStateSignal();
+            previous.TrySetResult(true);
         }
 
         internal readonly record struct WindowEntry(DateTime At, long Tokens);
@@ -288,23 +268,21 @@ namespace Omnipotent.Services.KliveLLM
     {
         private readonly AIRouterFairUseLimiter limiter;
         private readonly LinkedListNode<AIRouterFairUseLimiter.WindowEntry> node;
-        private readonly AIRouterPrefillBudget.Reservation prefillReservation;
         private int released;
 
-        internal AIRouterFairUseLease(AIRouterFairUseLimiter limiter, LinkedListNode<AIRouterFairUseLimiter.WindowEntry> node,
-            AIRouterPrefillBudget.Reservation prefillReservation)
+        internal AIRouterFairUseLease(AIRouterFairUseLimiter limiter,
+            LinkedListNode<AIRouterFairUseLimiter.WindowEntry> node, long queueDurationMs)
         {
             this.limiter = limiter;
             this.node = node;
-            this.prefillReservation = prefillReservation;
+            QueueDurationMs = queueDurationMs;
         }
+
+        /// <summary>Time spent waiting locally before this request was allowed to reach AIRouter.</summary>
+        public long QueueDurationMs { get; }
 
         /// <summary>Book the provider's own token count against the window in place of our estimate.</summary>
         public void ReportActualTokens(long totalTokens) => limiter.Reconcile(node, totalTokens);
-
-        /// <summary>Only measured cache reads release prefill credit; absent/invalid metrics charge full input.</summary>
-        public void ReportPromptTokens(long promptTokens, long? cachedTokens)
-            => limiter.ReconcilePrefill(prefillReservation, promptTokens, cachedTokens);
 
         public void Dispose()
         {

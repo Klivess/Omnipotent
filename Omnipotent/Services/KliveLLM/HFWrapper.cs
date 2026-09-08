@@ -439,6 +439,15 @@ namespace Omnipotent.Services.KliveLLM
             public long request_duration_ms { get; set; }
 
             [JsonIgnore]
+            public long queue_duration_ms { get; set; }
+
+            [JsonIgnore]
+            public long provider_duration_ms { get; set; }
+
+            [JsonIgnore]
+            public bool latency_breakdown_available { get; set; }
+
+            [JsonIgnore]
             public string response_cache_status { get; set; }
 
             public class Choice

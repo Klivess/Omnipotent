@@ -209,8 +209,7 @@ namespace Omnipotent.Services.KliveLLM
         // One process-wide limiter: the fair-use envelope is per KEY, and every subsystem
         // (KliveAgent, Projects Commander + sub-agents + councils + utility routes, Omniscience,
         // Stratum) shares the one configured AIRouter key, so they must share one queue.
-        private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new(
-            prefillStatePath: OmniPaths.GetPath(Path.Combine(OmniPaths.GlobalPaths.KliveLLMDirectory, "AIRouterPrefillBudget.json")));
+        private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new();
 
         /// <summary>The fair-use queue this instance admits AIRouter requests through. Defaults to the
         /// process-wide one — the live service must share a queue with every other caller of the same
@@ -1438,6 +1437,9 @@ namespace Omnipotent.Services.KliveLLM
                     RouterStrategy = response.openrouter_metadata?.strategy,
                     RouterAttempt = response.openrouter_metadata?.attempt,
                     RequestDurationMs = response.request_duration_ms,
+                    QueueDurationMs = response.queue_duration_ms,
+                    ProviderDurationMs = response.provider_duration_ms,
+                    LatencyBreakdownAvailable = response.latency_breakdown_available,
                     ResponseCacheStatus = response.response_cache_status,
                     ContextWindowTokens = contextWindowTokensOverride,
                     ContextWasCompacted = contextWasCompacted,
@@ -1490,6 +1492,9 @@ namespace Omnipotent.Services.KliveLLM
                 RouterStrategy = response.openrouter_metadata?.strategy,
                 RouterAttempt = response.openrouter_metadata?.attempt,
                 RequestDurationMs = response.request_duration_ms,
+                QueueDurationMs = response.queue_duration_ms,
+                ProviderDurationMs = response.provider_duration_ms,
+                LatencyBreakdownAvailable = response.latency_breakdown_available,
                 ResponseCacheStatus = response.response_cache_status,
                 ContextWindowTokens = contextWindowTokensOverride,
                 ContextWasCompacted = contextWasCompacted,
@@ -1749,20 +1754,7 @@ namespace Omnipotent.Services.KliveLLM
             CancellationToken cancellationToken)
         {
             if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
-            long promptTokens = EstimatePromptTokens(payload);
-            var budget = FairUse.Describe();
-            if (promptTokens > budget.UncachedBurstTokens)
-                throw new RemoteLLMException(RemoteLLMFailureKind.InvalidRequest,
-                    $"AIRouter prompt estimate {promptTokens:N0} exceeds the local prefill burst budget " +
-                    $"{budget.UncachedBurstTokens:N0}. Reduce context before sending.", remoteProvider.DisplayName, payload.model);
-            if (promptTokens > budget.UncachedTokensAvailable)
-            {
-                double seconds = (promptTokens - budget.UncachedTokensAvailable) * 3600d / budget.UncachedTokensPerHour;
-                try { await ServiceLog($"AIRouter uncached-input budget: queued for approximately {seconds:0}s; " +
-                    $"reserving {promptTokens:N0} prompt tokens, {budget.UncachedTokensAvailable:N0} available, " +
-                    $"refill {budget.UncachedTokensPerHour:N0}/hour. Only measured cache reads refund this reservation."); } catch { }
-            }
-            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), promptTokens, cancellationToken);
+            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), cancellationToken);
         }
 
         // ── AIRouter model resolution ──
@@ -1867,9 +1859,6 @@ namespace Omnipotent.Services.KliveLLM
                     ? usage.total_tokens
                     : (long)usage.prompt_tokens + usage.completion_tokens;
                 if (total > 0) lease.ReportActualTokens(total);
-                lease.ReportPromptTokens(usage.prompt_tokens,
-                    usage.prompt_tokens_details?.HasCacheReadMetrics == true
-                        ? usage.prompt_tokens_details.cached_tokens : null);
             }
 
             // Meter both routers. Previously this lived behind `lease != null`, which meant the
@@ -1911,7 +1900,12 @@ namespace Omnipotent.Services.KliveLLM
             payload.BuildMessagesFromChatHistory(messages);
             ApplyPromptCaching(ref payload, remoteProvider);
 
-            return await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var response = await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
+            stopwatch.Stop();
+            response.request_provider = remoteProvider.Provider.ToString();
+            response.request_duration_ms = stopwatch.ElapsedMilliseconds;
+            return response;
         }
 
         /// <summary>
@@ -2368,6 +2362,7 @@ namespace Omnipotent.Services.KliveLLM
             // request/response round-trip, so the lease is method-scoped: it is released when the SSE
             // body ends. Non-flat-fee providers get null and pass straight through.
             using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
+            var providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
             {
@@ -2525,6 +2520,7 @@ namespace Omnipotent.Services.KliveLLM
 
             // The final SSE chunk carries usage; reconcile the reservation before returning.
             ReportFairUseUsage(remoteProvider.Provider, fairUse, usage);
+            providerStopwatch.Stop();
 
             return new HFWrapper.HFLLMInferenceResponse
             {
@@ -2532,6 +2528,9 @@ namespace Omnipotent.Services.KliveLLM
                 model = servedModel,
                 openrouter_metadata = openRouterMetadata,
                 response_cache_status = ReadHeader(response, "X-OpenRouter-Cache-Status"),
+                queue_duration_ms = fairUse?.QueueDurationMs ?? 0,
+                provider_duration_ms = providerStopwatch.ElapsedMilliseconds,
+                latency_breakdown_available = true,
                 choices = new List<HFWrapper.HFLLMInferenceResponse.Choice>
                 {
                     new HFWrapper.HFLLMInferenceResponse.Choice
@@ -2600,6 +2599,8 @@ namespace Omnipotent.Services.KliveLLM
 
             Exception lastError = null;
             bool affordableTokenRetryUsed = false;
+            long totalQueueDurationMs = 0;
+            long totalProviderDurationMs = 0;
             int maxAttempts = RemoteInferenceMaxAttempts; // raised to RateLimitMaxAttempts if we hit a rate-limit
             for (int attempt = 1; attempt <= maxAttempts; attempt++)
             {
@@ -2610,9 +2611,11 @@ namespace Omnipotent.Services.KliveLLM
                 // re-acquired per attempt rather than once per call. The lease holds the parallel slot
                 // only for the HTTP exchange; its window entry outlives disposal for the full minute.
                 AIRouterFairUseLease? fairUse = null;
+                System.Diagnostics.Stopwatch? providerStopwatch = null;
                 try
                 {
                     fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
+                    totalQueueDurationMs += fairUse?.QueueDurationMs ?? 0;
                     using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
                     {
                         Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
@@ -2622,6 +2625,7 @@ namespace Omnipotent.Services.KliveLLM
                     if (remoteProvider.Provider == LLMProvider.OpenRouter)
                         ApplyOpenRouterHeaders(request);
 
+                    providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
                     response = await client.SendAsync(request, cancellationToken);
                     responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
                     responseCacheStatus = ReadHeader(response, "X-OpenRouter-Cache-Status");
@@ -2654,6 +2658,11 @@ namespace Omnipotent.Services.KliveLLM
                 }
                 finally
                 {
+                    if (providerStopwatch != null)
+                    {
+                        providerStopwatch.Stop();
+                        totalProviderDurationMs += providerStopwatch.ElapsedMilliseconds;
+                    }
                     // The HTTP exchange is over (body fully read, or it failed) — hand the parallel
                     // slot back immediately so a queued caller can use it while we parse. The window
                     // entry survives disposal, so the per-minute limits still count this request.
@@ -2794,6 +2803,9 @@ namespace Omnipotent.Services.KliveLLM
                     // the difference to the callers queued behind us.
                     hfResponse.request_provider = remoteProvider.Provider.ToString();
                     hfResponse.response_cache_status = responseCacheStatus;
+                    hfResponse.queue_duration_ms = totalQueueDurationMs;
+                    hfResponse.provider_duration_ms = totalProviderDurationMs;
+                    hfResponse.latency_breakdown_available = true;
                     ReportFairUseUsage(remoteProvider.Provider, fairUse, hfResponse.usage);
                     return hfResponse;
                 }
@@ -3207,6 +3219,9 @@ namespace Omnipotent.Services.KliveLLM
             public string? RouterStrategy { get; set; }
             public int? RouterAttempt { get; set; }
             public long RequestDurationMs { get; set; }
+            public long QueueDurationMs { get; set; }
+            public long ProviderDurationMs { get; set; }
+            public bool LatencyBreakdownAvailable { get; set; }
             public string? ResponseCacheStatus { get; set; }
 
             /// <summary>The live model-window limit applied to this request, when the caller supplied

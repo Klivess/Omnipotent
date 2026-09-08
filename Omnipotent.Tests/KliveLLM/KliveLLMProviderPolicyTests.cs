@@ -497,15 +497,12 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Theory]
-        [InlineData(false, 80, 20)]
-        [InlineData(true, 80, 20)]
-        [InlineData(false, null, 100)]
-        [InlineData(true, null, 100)]
-        [InlineData(false, 101, 100)]
-        [InlineData(true, -1, 100)]
-        public async Task AIRouterUsage_ReconcilesUncachedBudgetInBothTransports(bool stream, int? cached, long charged)
+        [InlineData(false)]
+        [InlineData(true)]
+        public async Task AIRouterUsage_ReconcilesPublishedTokenWindowAndReportsTiming(bool stream)
         {
-            string usage = $"{{\"prompt_tokens\":100,\"completion_tokens\":1,\"prompt_tokens_details\":{{\"cached_tokens\":{(cached.HasValue ? cached.Value.ToString() : "null")}}}}}";
+            const string usage = "{\"prompt_tokens\":100,\"completion_tokens\":1,\"total_tokens\":101," +
+                "\"prompt_tokens_details\":{\"cached_tokens\":80}}";
             string body = stream
                 ? "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n"
                     + "data: {\"choices\":[],\"usage\":" + usage + "}\n\ndata: [DONE]\n\n"
@@ -514,14 +511,16 @@ namespace Omnipotent.Tests.KliveLLM
             using var http = new HttpClient(handler);
             var now = DateTime.UtcNow;
             var service = new LlmService(http) { FairUse = new AIRouterFairUseLimiter(nowUtc: () => now) };
-            long before = service.FairUse.Describe().UncachedTokensAvailable;
 
             var response = await service.SendInferencePayloadAsync(AIRouter(), Payload(256), CancellationToken.None,
                 stream ? _ => { } : null);
 
             Assert.Single(response.choices);
             Assert.Single(handler.RequestBodies);
-            Assert.Equal(before - charged, service.FairUse.Describe().UncachedTokensAvailable);
+            Assert.Equal(101, service.FairUse.Describe().TokensInWindow);
+            Assert.True(response.latency_breakdown_available);
+            Assert.Equal(0, response.queue_duration_ms);
+            Assert.True(response.provider_duration_ms >= 0);
         }
 
         [Theory]
@@ -553,15 +552,24 @@ namespace Omnipotent.Tests.KliveLLM
         [Theory]
         [InlineData(false)]
         [InlineData(true)]
-        public async Task AIRouterOverBudgetPrompt_IsRejectedLocallyWithoutSendingOrRetrying(bool stream)
+        public async Task AIRouterLargeEstimate_IsClampedToPublishedWindowAndSent(bool stream)
         {
-            var handler = new RecordingHandler();
+            const string body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]," +
+                "\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"total_tokens\":101}}";
+            var handler = new RecordingHandler(_ => JsonResponse(HttpStatusCode.OK,
+                stream
+                    ? "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n" +
+                      "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":1,\"total_tokens\":101}}\n\ndata: [DONE]\n\n"
+                    : body));
             using var http = new HttpClient(handler);
-            var service = new LlmService(http) { FairUse = new AIRouterFairUseLimiter(uncachedBurstTokens: 1) };
-            var error = await Assert.ThrowsAsync<RemoteLLMException>(() => service.SendInferencePayloadAsync(
-                AIRouter(), Payload(256), CancellationToken.None, stream ? _ => { } : null));
-            Assert.Equal(RemoteLLMFailureKind.InvalidRequest, error.Kind);
-            Assert.Empty(handler.RequestBodies);
+            var service = new LlmService(http)
+            {
+                FairUse = new AIRouterFairUseLimiter(maxTokensPerMinute: 100)
+            };
+            var response = await service.SendInferencePayloadAsync(
+                AIRouter(), Payload(256), CancellationToken.None, stream ? _ => { } : null);
+            Assert.Single(response.choices);
+            Assert.Single(handler.RequestBodies);
         }
 
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(

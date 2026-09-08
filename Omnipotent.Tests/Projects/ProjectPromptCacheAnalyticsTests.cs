@@ -47,6 +47,10 @@ public class ProjectPromptCacheAnalyticsTests
         Assert.NotEmpty(result.Series);
         Assert.Single(result.Breakdown);
         Assert.Equal(20, result.Recent.Count);
+        Assert.Equal(20, result.LatencyBreakdownRequests);
+        Assert.Equal(500, result.AverageQueueDurationMs);
+        Assert.Equal(1_500, result.AverageProviderDurationMs);
+        Assert.Equal(100, result.LatencyBreakdownCoveragePct);
     }
 
     [Fact]
@@ -130,6 +134,27 @@ public class ProjectPromptCacheAnalyticsTests
         Assert.Equal(18, result.ContinuationRequests);
     }
 
+    [Fact]
+    public void LatencySplit_ExcludesLegacyRowsInsteadOfCallingTheirWholeDurationProviderTime()
+    {
+        var current = Record(1, 55_000, 0);
+        var legacy = Record(2, 55_000, 0);
+        legacy.LatencyBreakdownAvailable = false;
+        legacy.QueueDurationMs = 0;
+        legacy.ProviderDurationMs = 0;
+        legacy.RequestDurationMs = 60_000;
+
+        var result = ProjectPromptCacheAnalytics.Build([current, legacy], Range);
+
+        Assert.Equal(2, result.MeasuredRequests);
+        Assert.Equal(1, result.LatencyBreakdownRequests);
+        Assert.Equal(500, result.AverageQueueDurationMs);
+        Assert.Equal(1_500, result.AverageProviderDurationMs);
+        Assert.Equal(50, result.LatencyBreakdownCoveragePct);
+        Assert.False(result.Recent.Single(sample => sample.RequestDurationMs == 60_000)
+            .LatencyBreakdownAvailable);
+    }
+
     private static ProjectTokenUsageRecord Record(
         int index,
         long prompt,
@@ -157,6 +182,9 @@ public class ProjectPromptCacheAnalyticsTests
             CachedPromptTokens = cached,
             CompletionTokens = 100,
             RequestDurationMs = 2_000,
+            QueueDurationMs = 500,
+            ProviderDurationMs = 1_500,
+            LatencyBreakdownAvailable = true,
             GenerationID = $"gen-{index}",
         };
 

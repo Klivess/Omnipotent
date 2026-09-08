@@ -41,7 +41,9 @@ The usage journal now identifies these requests as `projects-prefix-v3` and incl
 - `CacheEpochID` / `CacheEpochTurnIndex`: comparisons across continued wakes, separated at resets and compaction.
 - `PromptAssemblyStatus`: continuation, cold start, expiry, changed configuration, incomplete batch, context limit, or retained-history limit.
 - `AppendedBriefTokens` / `FullBriefTokens`: local input estimates on the first turn of each wake.
-- Existing provider-reported input, cached input, cache writes, timing, routed provider, and cost fields.
+- Existing provider-reported input, cached input, cache writes, routed provider, and cost fields.
+- End-to-end, local AIRouter queue, and actual provider-exchange durations. A coverage flag keeps
+  older rows without the split from being misreported as zero queue time.
 
 The prompt-cache analytics now includes AIRouter and other identified providers instead of filtering exclusively to OpenRouter. Missing cache-read metrics stay unknown, including a details object that contains only non-cache fields. The dashboard separates whole-prompt cache hit rate from reuse of preceding comparable input. Legacy versions are excluded from the new measurement window.
 

@@ -39,6 +39,12 @@ public sealed class AnalyticsPromptCacheSnapshot
     public long AverageUncachedTokens { get; set; }
     public long AverageRequestDurationMs { get; set; }
     public long TotalRequestDurationMs { get; set; }
+    public int LatencyBreakdownRequests { get; set; }
+    public long AverageQueueDurationMs { get; set; }
+    public long TotalQueueDurationMs { get; set; }
+    public long AverageProviderDurationMs { get; set; }
+    public long TotalProviderDurationMs { get; set; }
+    public double LatencyBreakdownCoveragePct { get; set; }
     public int FirstTurnRequests { get; set; }
     public long FirstTurnPromptTokens { get; set; }
     public long FirstTurnCachedTokens { get; set; }
@@ -70,6 +76,11 @@ public sealed class AnalyticsPromptCacheSeriesPoint
     public double CacheHitRatePct { get; set; }
     public long AverageRequestDurationMs { get; set; }
     public long TotalRequestDurationMs { get; set; }
+    public int LatencyBreakdownRequests { get; set; }
+    public long AverageQueueDurationMs { get; set; }
+    public long TotalQueueDurationMs { get; set; }
+    public long AverageProviderDurationMs { get; set; }
+    public long TotalProviderDurationMs { get; set; }
 }
 
 public sealed class AnalyticsPromptCacheBreakdown
@@ -87,6 +98,11 @@ public sealed class AnalyticsPromptCacheBreakdown
     public double ZeroHitRatePct { get; set; }
     public long AverageRequestDurationMs { get; set; }
     public long TotalRequestDurationMs { get; set; }
+    public int LatencyBreakdownRequests { get; set; }
+    public long AverageQueueDurationMs { get; set; }
+    public long TotalQueueDurationMs { get; set; }
+    public long AverageProviderDurationMs { get; set; }
+    public long TotalProviderDurationMs { get; set; }
 }
 
 public sealed class AnalyticsPromptCacheSample
@@ -113,6 +129,9 @@ public sealed class AnalyticsPromptCacheSample
     public long CacheWriteTokens { get; set; }
     public double CacheHitRatePct { get; set; }
     public long RequestDurationMs { get; set; }
+    public long QueueDurationMs { get; set; }
+    public long ProviderDurationMs { get; set; }
+    public bool LatencyBreakdownAvailable { get; set; }
     public bool ContextWasCompacted { get; set; }
     public string? ResponseCacheStatus { get; set; }
 }
@@ -154,6 +173,12 @@ internal static class ProjectPromptCacheAnalytics
             result.UncachedTokens += uncached;
             result.CacheWriteTokens += Math.Max(0, record.CacheWritePromptTokens);
             result.TotalRequestDurationMs += Math.Max(0, record.RequestDurationMs);
+            if (record.LatencyBreakdownAvailable)
+            {
+                result.LatencyBreakdownRequests++;
+                result.TotalQueueDurationMs += Math.Max(0, record.QueueDurationMs);
+                result.TotalProviderDurationMs += Math.Max(0, record.ProviderDurationMs);
+            }
             if (cached > 0) result.HitRequests++;
             else result.ZeroHitRequests++;
             if (record.ContextWasCompacted) result.CompactedRequests++;
@@ -182,6 +207,12 @@ internal static class ProjectPromptCacheAnalytics
                 point.CachedTokens += cached;
                 point.UncachedTokens += uncached;
                 point.TotalRequestDurationMs += Math.Max(0, record.RequestDurationMs);
+                if (record.LatencyBreakdownAvailable)
+                {
+                    point.LatencyBreakdownRequests++;
+                    point.TotalQueueDurationMs += Math.Max(0, record.QueueDurationMs);
+                    point.TotalProviderDurationMs += Math.Max(0, record.ProviderDurationMs);
+                }
             }
         }
 
@@ -228,6 +259,9 @@ internal static class ProjectPromptCacheAnalytics
             ReusablePrefixTokens = snapshots.Sum(item => item.ReusablePrefixTokens),
             ReusedPrefixTokens = snapshots.Sum(item => item.ReusedPrefixTokens),
             TotalRequestDurationMs = snapshots.Sum(item => item.TotalRequestDurationMs),
+            LatencyBreakdownRequests = snapshots.Sum(item => item.LatencyBreakdownRequests),
+            TotalQueueDurationMs = snapshots.Sum(item => item.TotalQueueDurationMs),
+            TotalProviderDurationMs = snapshots.Sum(item => item.TotalProviderDurationMs),
             FirstTurnRequests = snapshots.Sum(item => item.FirstTurnRequests),
             FirstTurnPromptTokens = snapshots.Sum(item => item.FirstTurnPromptTokens),
             FirstTurnCachedTokens = snapshots.Sum(item => item.FirstTurnCachedTokens),
@@ -255,6 +289,9 @@ internal static class ProjectPromptCacheAnalytics
             target.CachedTokens += point.CachedTokens;
             target.UncachedTokens += point.UncachedTokens;
             target.TotalRequestDurationMs += point.TotalRequestDurationMs;
+            target.LatencyBreakdownRequests += point.LatencyBreakdownRequests;
+            target.TotalQueueDurationMs += point.TotalQueueDurationMs;
+            target.TotalProviderDurationMs += point.TotalProviderDurationMs;
         }
 
         result.Breakdown = snapshots.SelectMany(item => item.Breakdown)
@@ -272,6 +309,9 @@ internal static class ProjectPromptCacheAnalytics
                     CachedTokens = group.Sum(item => item.CachedTokens),
                     UncachedTokens = group.Sum(item => item.UncachedTokens),
                     TotalRequestDurationMs = group.Sum(item => item.TotalRequestDurationMs),
+                    LatencyBreakdownRequests = group.Sum(item => item.LatencyBreakdownRequests),
+                    TotalQueueDurationMs = group.Sum(item => item.TotalQueueDurationMs),
+                    TotalProviderDurationMs = group.Sum(item => item.TotalProviderDurationMs),
                 };
                 FinishBreakdown(merged);
                 return merged;
@@ -392,6 +432,12 @@ internal static class ProjectPromptCacheAnalytics
             result.CachedTokens += cached;
             result.UncachedTokens += prompt - cached;
             result.TotalRequestDurationMs += Math.Max(0, record.RequestDurationMs);
+            if (record.LatencyBreakdownAvailable)
+            {
+                result.LatencyBreakdownRequests++;
+                result.TotalQueueDurationMs += Math.Max(0, record.QueueDurationMs);
+                result.TotalProviderDurationMs += Math.Max(0, record.ProviderDurationMs);
+            }
         }
         FinishBreakdown(result);
         return result;
@@ -404,6 +450,12 @@ internal static class ProjectPromptCacheAnalytics
         result.ZeroHitRatePct = Percent(result.ZeroHitRequests, result.Requests);
         result.AverageRequestDurationMs = result.Requests > 0
             ? result.TotalRequestDurationMs / result.Requests
+            : 0;
+        result.AverageQueueDurationMs = result.LatencyBreakdownRequests > 0
+            ? result.TotalQueueDurationMs / result.LatencyBreakdownRequests
+            : 0;
+        result.AverageProviderDurationMs = result.LatencyBreakdownRequests > 0
+            ? result.TotalProviderDurationMs / result.LatencyBreakdownRequests
             : 0;
     }
 
@@ -435,6 +487,9 @@ internal static class ProjectPromptCacheAnalytics
             CacheWriteTokens = Math.Max(0, record.CacheWritePromptTokens),
             CacheHitRatePct = Percent(cached, prompt),
             RequestDurationMs = Math.Max(0, record.RequestDurationMs),
+            QueueDurationMs = Math.Max(0, record.QueueDurationMs),
+            ProviderDurationMs = Math.Max(0, record.ProviderDurationMs),
+            LatencyBreakdownAvailable = record.LatencyBreakdownAvailable,
             ContextWasCompacted = record.ContextWasCompacted,
             ResponseCacheStatus = record.ResponseCacheStatus,
         };
@@ -472,12 +527,26 @@ internal static class ProjectPromptCacheAnalytics
         result.AverageRequestDurationMs = result.MeasuredRequests > 0
             ? result.TotalRequestDurationMs / result.MeasuredRequests
             : 0;
+        result.AverageQueueDurationMs = result.LatencyBreakdownRequests > 0
+            ? result.TotalQueueDurationMs / result.LatencyBreakdownRequests
+            : 0;
+        result.AverageProviderDurationMs = result.LatencyBreakdownRequests > 0
+            ? result.TotalProviderDurationMs / result.LatencyBreakdownRequests
+            : 0;
+        result.LatencyBreakdownCoveragePct = Percent(
+            result.LatencyBreakdownRequests, result.MeasuredRequests);
 
         foreach (var point in result.Series)
         {
             point.CacheHitRatePct = Percent(point.CachedTokens, point.PromptTokens);
             point.AverageRequestDurationMs = point.Requests > 0
                 ? point.TotalRequestDurationMs / point.Requests
+                : 0;
+            point.AverageQueueDurationMs = point.LatencyBreakdownRequests > 0
+                ? point.TotalQueueDurationMs / point.LatencyBreakdownRequests
+                : 0;
+            point.AverageProviderDurationMs = point.LatencyBreakdownRequests > 0
+                ? point.TotalProviderDurationMs / point.LatencyBreakdownRequests
                 : 0;
         }
 
