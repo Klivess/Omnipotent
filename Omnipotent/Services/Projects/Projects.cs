@@ -72,10 +72,13 @@ namespace Omnipotent.Services.Projects
         public ProjectDiscordManager? DiscordManager { get; private set; }
         private ProjectReportScheduler? reportScheduler;
         private System.Threading.Timer? discordInitRetryTimer;
+        private System.Threading.Timer? mailWiringRetryTimer;
         // ── Phase 7: watchdog ──
         public ProjectWatchdog Watchdog { get; private set; } = null!;
         private System.Threading.Timer? keepaliveTimer;
         private int keepaliveRunning;
+        private long keepaliveTickStartedAtTicks;
+        private long lastStuckKeepaliveLogTicks;
         /// <summary>The desktop-container subsystem (P2). Null when containers are disabled or off-Windows.</summary>
         public ContainerDesktopManager? Desktops { get; private set; }
         private ProjectsRoutes routes = null!;
@@ -454,23 +457,42 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: failed to restore directives for {existing.ProjectID}"); }
             }
 
+            // Phase 7: watchdog + a keepalive that guarantees each active project wakes at least
+            // periodically (the "no stimuli" half of stall prevention — dev note #1).
+            //
+            // These start HERE — before mail, stimulus replay, desktops and Discord — because they
+            // are the only thing that guarantees a project ever wakes again. They used to start last,
+            // behind three optional-integration awaits, and the watchdog is explicitly documented as
+            // "architecturally independent of the Commander's own execution" — which it was not, in
+            // the one way that mattered. If any of those awaits blocked (they resolve services via a
+            // registry lookup that had no timeout, and KliveMail is registered AFTER Projects), the
+            // keepalive timer was never created and every project silently stopped waking. Nothing
+            // reported it: the HTTP API was already open, so the website stayed healthy, the service
+            // thread parks on Task.Delay(-1) so the monitor still saw Projects as active, and the
+            // pending-trigger queue simply drained to empty and never refilled.
+            //
+            // Everything they need (Store, EventLog, RuntimeState, Settings, Budget, Gates,
+            // SubAgents, both runners) is constructed well above. Racing crash recovery is harmless:
+            // Wake() is refused while a stale lease is still held and the tick simply retries in 15s.
+            Watchdog = new ProjectWatchdog(this, msg => ServiceLog(msg));
+            Watchdog.Start();
+            keepaliveTimer = new System.Threading.Timer(_ => KeepaliveTick(), null,
+                TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+            ServiceLog("Projects: keepalive and watchdog started — projects will wake from here on.");
+
             // Wire the email push source (via KliveMail) before arming so email hooks attach at boot.
             // The Discord push source is wired later in InitialiseDiscordAsync once the bot is confirmed up.
-            await WireMailStimulusSourceAsync();
+            try { await WireMailStimulusSourceAsync(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: mail stimulus wiring failed (non-fatal)"); }
 
             // Replay durable undelivered stimuli, then arm the source adapters.
             try { Bus.Replay(); Adapters.ArmAll(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: stimulus replay/arm failed"); }
 
-            await InitialiseDesktopsAsync();
-            await InitialiseDiscordAsync();
-
-            // Phase 7: watchdog + a keepalive that guarantees each active project wakes at least
-            // periodically (the "no stimuli" half of stall prevention — dev note #1).
-            Watchdog = new ProjectWatchdog(this, msg => ServiceLog(msg));
-            Watchdog.Start();
-            keepaliveTimer = new System.Threading.Timer(_ => KeepaliveTick(), null,
-                TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
+            try { await InitialiseDesktopsAsync(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: desktop init failed (non-fatal)"); }
+            try { await InitialiseDiscordAsync(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: Discord init failed (non-fatal)"); }
 
             ServiceLog("Projects service started.");
         }
@@ -577,7 +599,30 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private void KeepaliveTick()
         {
-            if (Interlocked.Exchange(ref keepaliveRunning, 1) != 0) return;
+            if (Interlocked.Exchange(ref keepaliveRunning, 1) != 0)
+            {
+                // The latch is held. Normally that means the previous tick is a few hundred ms behind
+                // and skipping is correct. But nothing ever released it on a tick that blocked, so a
+                // single wedged project used to take the keepalive down for every project, forever,
+                // without a word in the log. Say so — a stuck tick is now diagnosable from the timeline.
+                var startedAt = Volatile.Read(ref keepaliveTickStartedAtTicks);
+                if (startedAt != 0)
+                {
+                    var running = DateTime.UtcNow - new DateTime(startedAt, DateTimeKind.Utc);
+                    long lastLog = Volatile.Read(ref lastStuckKeepaliveLogTicks);
+                    if (running > TimeSpan.FromMinutes(5)
+                        && DateTime.UtcNow - new DateTime(lastLog, DateTimeKind.Utc) > TimeSpan.FromMinutes(15))
+                    {
+                        Volatile.Write(ref lastStuckKeepaliveLogTicks, DateTime.UtcNow.Ticks);
+                        _ = ServiceLogError(new TimeoutException(
+                            $"A Projects keepalive tick has been running for {running.TotalMinutes:F0} minutes. "
+                            + "No project will receive a periodic wake until it returns."),
+                            "Projects: keepalive tick is stuck");
+                    }
+                }
+                return;
+            }
+            Volatile.Write(ref keepaliveTickStartedAtTicks, DateTime.UtcNow.Ticks);
             try
             {
                 foreach (var project in Store.ListProjects())
@@ -630,7 +675,11 @@ namespace Omnipotent.Services.Projects
                 }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
-            finally { Volatile.Write(ref keepaliveRunning, 0); }
+            finally
+            {
+                Volatile.Write(ref keepaliveTickStartedAtTicks, 0);
+                Volatile.Write(ref keepaliveRunning, 0);
+            }
         }
 
         /// <summary>
@@ -2196,14 +2245,15 @@ namespace Omnipotent.Services.Projects
             if (DiscordManager != null) return; // already initialised (idempotent for the retry timer)
             try
             {
-                var services = await GetServicesByType<KliveBotDiscord>();
-                if (services == null || services.Length == 0)
+                // Bounded: see TryResolveServiceAsync. The retry timer below is the actual mechanism
+                // for "the bot starts after us", and it only ever ran because this returned.
+                var discord = await TryResolveServiceAsync<KliveBotDiscord>(TimeSpan.FromSeconds(30));
+                if (discord == null)
                 {
                     ServiceLog("Projects: KliveBotDiscord not available yet — will retry Discord init periodically.");
                     ScheduleDiscordInitRetry();
                     return;
                 }
-                var discord = (KliveBotDiscord)services[0];
                 DiscordManager = new ProjectDiscordManager(this, discord, msg => ServiceLog(msg));
                 DiscordManager.Initialise();
 
@@ -2272,13 +2322,15 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
-                var services = await GetServicesByType<KliveMail.KliveMail>();
-                if (services == null || services.Length == 0)
+                // Bounded: see TryResolveServiceAsync. KliveMail is constructed after Projects in
+                // Program.cs, so a generous deadline is normal here — but it must be a deadline.
+                var mail = await TryResolveServiceAsync<KliveMail.KliveMail>(TimeSpan.FromMinutes(2));
+                if (mail == null)
                 {
-                    ServiceLog("Projects: KliveMail not available — email stimulus hooks will be inert.");
+                    ServiceLog("Projects: KliveMail did not become available — email stimulus hooks are inert; retrying periodically.");
+                    ScheduleMailWiringRetry();
                     return;
                 }
-                var mail = (KliveMail.KliveMail)services[0];
                 Adapters.MailSource = handler =>
                 {
                     Action<KliveMail.Models.StoredMessage> h = m =>
@@ -2294,8 +2346,26 @@ namespace Omnipotent.Services.Projects
                     mail.MailStored += h;
                     return new ActionDisposable(() => { try { mail.MailStored -= h; } catch { } });
                 };
+                // Hooks created while mail was down armed in the Error state; bring them alive.
+                try { Adapters.ArmAll(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: re-arm after mail source wiring failed"); }
+                mailWiringRetryTimer?.Dispose();
+                mailWiringRetryTimer = null;
+                ServiceLog("Projects: email stimulus source wired.");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to wire KliveMail stimulus source"); }
+        }
+
+        /// <summary>Retries mail wiring until KliveMail is available (it is created after us).</summary>
+        private void ScheduleMailWiringRetry()
+        {
+            if (mailWiringRetryTimer != null) return; // already scheduled
+            mailWiringRetryTimer = new System.Threading.Timer(async _ =>
+            {
+                if (Adapters?.MailSource != null) { mailWiringRetryTimer?.Dispose(); mailWiringRetryTimer = null; return; }
+                try { await WireMailStimulusSourceAsync(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: mail wiring retry failed"); }
+            }, null, TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(2));
         }
 
         private static string StripHtml(string? html)
@@ -2452,6 +2522,33 @@ namespace Omnipotent.Services.Projects
                     _ = ServiceLogError(ex, "Projects: HTTP route registration aborted");
                     throw ex;
                 }
+                await Task.Delay(250);
+            }
+        }
+
+        /// <summary>
+        /// Resolves an OPTIONAL sibling service within a deadline, returning null if it never shows up.
+        ///
+        /// Use this for every dependency Projects can live without. <see cref="GetServicesByType{T}"/>
+        /// funnels into OmniServiceManager.GetServiceByClassType, whose "wait for the type to appear"
+        /// loop is <c>while (true)</c> with no cancellation and no timeout — so awaiting it for a
+        /// service that never registers blocks the caller for the lifetime of the process. That is not
+        /// hypothetical here: KliveMail is created AFTER Projects in Program.cs, so Projects routinely
+        /// waits on a type that does not exist yet, and anything that stops KliveMail from registering
+        /// (a throw in an earlier service's ServiceStart, for one) strands the wait forever.
+        ///
+        /// Polling the registry directly keeps the deadline real, and returning null lets the caller
+        /// degrade — an inert email hook is a bad day; a Projects service that never finishes starting
+        /// is every project silently ceasing to run.
+        /// </summary>
+        private async Task<T?> TryResolveServiceAsync<T>(TimeSpan timeout) where T : OmniService
+        {
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (true)
+            {
+                var match = GetActiveServices().OfType<T>().FirstOrDefault(s => s.IsServiceActive());
+                if (match != null) return match;
+                if (DateTime.UtcNow >= deadline) return null;
                 await Task.Delay(250);
             }
         }
