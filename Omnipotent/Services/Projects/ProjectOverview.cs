@@ -61,7 +61,9 @@ public sealed class OverviewProject
     public double MoneyBudgetUsd { get; set; }
     public double RangeSpendUsd { get; set; }
     public double RangeMoneySpendUsd { get; set; }
+    public long RangeTokens { get; set; }
     public int CompletedSteps { get; set; }
+    public bool HistoricalReady { get; set; }
     public DateTime? HistoricalAt { get; set; }
     public OverviewResult Result { get; set; } = new();
     public List<ResultOption> ResultOptions { get; set; } = new();
@@ -78,10 +80,13 @@ public sealed class ProjectOverviewSnapshot
     public int CompletedSteps { get; set; }
     public double ModelSpendUsd { get; set; }
     public double ExternalSpendUsd { get; set; }
+    public long RangeTokens { get; set; }
     public ProjectExecutionAnalytics Execution { get; set; } = new();
     public List<OverviewPoint> Series { get; set; } = new();
     public List<OverviewProject> Projects { get; set; } = new();
     public List<OverviewAttention> Attention { get; set; } = new();
+    public bool HistoricalLoading { get; set; }
+    public string? HistoricalLoadingMessage { get; set; }
 }
 
 /// <summary>Lightweight live projection joined to existing five-minute analytics snapshots.</summary>
@@ -97,17 +102,21 @@ public sealed class ProjectOverviewService(Projects parent)
         var result = new ProjectOverviewSnapshot { LiveAt = now, Range = range };
         var projects = parent.Store.ListProjects();
         var snapshots = new ProjectAnalyticsSnapshot?[projects.Count];
-        Parallel.For(0, projects.Count, new ParallelOptions { MaxDegreeOfParallelism = 4 }, i =>
+        int buildingSnapshots = 0;
+        for (int i = 0; i < projects.Count; i++)
         {
-            if (projects[i].Status != ProjectStatus.Archived)
-                snapshots[i] = parent.Analytics.GetProject(projects[i].ProjectID, rangeKey, now);
-        });
+            if (projects[i].Status == ProjectStatus.Archived) continue;
+            snapshots[i] = parent.Analytics.GetCachedProjectOrQueue(
+                projects[i].ProjectID, rangeKey, now, out bool building);
+            if (building) buildingSnapshots++;
+        }
         for (int i = 0; i < projects.Count; i++)
         {
             var p = projects[i];
             var row = new OverviewProject { ProjectID = p.ProjectID, Name = p.Name, Status = p.Status.ToString(),
                 Halted = p.HaltedFromStatus.HasValue, SubAgentCap = p.SubAgentCap,
-                TokenBudgetUsd = p.TokenBudgetUsd, MoneyBudgetUsd = p.MoneyBudgetUsd };
+                TokenBudgetUsd = p.TokenBudgetUsd, MoneyBudgetUsd = p.MoneyBudgetUsd,
+                HistoricalReady = p.Status == ProjectStatus.Archived };
             var spend = parent.Budget.GetSpend(p.ProjectID);
             row.TokenSpendUsd = spend.TokenSpendUsd;
             row.MoneySpendUsd = spend.MoneySpendUsd;
@@ -139,17 +148,22 @@ public sealed class ProjectOverviewService(Projects parent)
             var activity = parent.Activity.ListForProject(p.ProjectID);
             row.WorkingAgents = activity.Count;
             row.ActivityPhase = activity.FirstOrDefault()?.Phase;
-            var snapshot = snapshots[i]!;
-            row.RangeSpendUsd = snapshot.Summary.RangeSpendUsd;
-            row.RangeMoneySpendUsd = snapshot.Summary.RangeMoneySpendUsd;
-            row.CompletedSteps = snapshot.Summary.CompletedSteps;
-            row.HistoricalAt = snapshot.GeneratedAt;
-            row.Series = snapshot.Series.Select(Point).ToList();
+            var snapshot = snapshots[i];
+            row.HistoricalReady = snapshot != null;
+            if (snapshot != null)
+            {
+                row.RangeSpendUsd = snapshot.Summary.RangeSpendUsd;
+                row.RangeMoneySpendUsd = snapshot.Summary.RangeMoneySpendUsd;
+                row.RangeTokens = snapshot.Summary.RangeTokens;
+                row.CompletedSteps = snapshot.Summary.CompletedSteps;
+                row.HistoricalAt = snapshot.GeneratedAt;
+                row.Series = snapshot.Series.Select(Point).ToList();
+            }
             var observables = parent.Observables.List(p.ProjectID);
             row.ResultOptions = observables.Where(o => o.Type == ObservableType.Numeric)
                 .Select(o => new ResultOption(o.ObservableID, o.Name)).ToList();
             row.Result = BuildResult(p, observables, row.CompletedSteps, range.FromUtc, now);
-            result.Execution.Add(snapshot.Execution);
+            if (snapshot != null) result.Execution.Add(snapshot.Execution);
             if (row.PendingApprovals > 0) result.Attention.Add(new(p.ProjectID, p.Name, "approval", $"{row.PendingApprovals} approval(s) pending"));
             if (p.Status == ProjectStatus.BudgetPaused) result.Attention.Add(new(p.ProjectID, p.Name, "budget", "Budget exhausted — paused"));
             if (!string.IsNullOrWhiteSpace(row.Blocker) || p.Status == ProjectStatus.Blocked)
@@ -160,7 +174,9 @@ public sealed class ProjectOverviewService(Projects parent)
         result.CompletedSteps = live.Sum(p => p.CompletedSteps);
         result.ModelSpendUsd = live.Sum(p => p.RangeSpendUsd);
         result.ExternalSpendUsd = live.Sum(p => p.RangeMoneySpendUsd);
-        result.HistoricalAt = live.Select(p => p.HistoricalAt).Min();
+        result.RangeTokens = live.Sum(p => p.RangeTokens);
+        result.HistoricalAt = live.Where(p => p.HistoricalAt.HasValue).Select(p => p.HistoricalAt)
+            .DefaultIfEmpty().Min();
         result.Series = live.SelectMany(p => p.Series).GroupBy(p => p.Date).OrderBy(g => g.Key)
             .Select(g => new OverviewPoint(g.Key, g.Sum(p => p.SpendUsd), g.Sum(p => p.MoneySpendUsd),
                 g.Sum(p => p.CompletedSteps), g.Sum(p => p.Completed), g.Sum(p => p.Failed),
@@ -172,6 +188,9 @@ public sealed class ProjectOverviewService(Projects parent)
             row.Series = result.Series.Select(p => byDate.GetValueOrDefault(p.Date)
                 ?? new OverviewPoint(p.Date, 0, 0, 0, 0, 0, 0, 0)).ToList();
         }
+        result.HistoricalLoading = buildingSnapshots > 0;
+        result.HistoricalLoadingMessage = buildingSnapshots == 0 ? null
+            : $"Building historical activity for {buildingSnapshots} project{(buildingSnapshots == 1 ? "" : "s")} from the durable event log";
         return result;
     }
 

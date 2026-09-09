@@ -80,6 +80,8 @@ namespace Omnipotent.Services.Projects
         public ContainerDesktopManager? Desktops { get; private set; }
         private ProjectsRoutes routes = null!;
         private ProjectFilesRoutes fileRoutes = null!;
+        private volatile bool httpApiReady;
+        private string initializationStage = "Starting Projects service";
 
         /// <summary>Inter-agent messaging over the bus: (projectID, fromAgent, toAgent, message).</summary>
         public Func<string, string, string, string, Task>? SendAgentMessageHook { get; set; }
@@ -111,6 +113,19 @@ namespace Omnipotent.Services.Projects
 
         protected override async void ServiceMain()
         {
+            // Register the complete HTTP surface before touching any project data. A cold database,
+            // a large shared-file manifest, or an optional service starting late must never make the
+            // routes themselves disappear. Until the required stores are ready the guard installed by
+            // RegisterHttpRouteAsync returns a fast 503 with this stage, which lets the website show an
+            // honest loading screen instead of reporting a false 404.
+            SetInitializationStage("Registering Projects API routes");
+            routes = new ProjectsRoutes(this);
+            await routes.RegisterRoutes();
+            fileRoutes = new ProjectFilesRoutes(this);
+            await fileRoutes.RegisterRoutes();
+            ServiceLog("Projects: HTTP routes registered (project + file surfaces; initialization guard active).");
+
+            SetInitializationStage("Loading the project index");
             Store = new ProjectStore(msg => ServiceLog(msg));
             int maxFileGb = 10, uploadChunkMb = 8, freeReserveGb = 10;
             try
@@ -124,12 +139,8 @@ namespace Omnipotent.Services.Projects
                 maxFileBytes: maxFileGb * 1024L * 1024 * 1024,
                 maxChunkBytes: uploadChunkMb * 1024 * 1024,
                 minimumFreeDiskBytes: freeReserveGb * 1024L * 1024 * 1024),
-                msg => ServiceLog(msg));
-            foreach (var existing in Store.ListProjects())
-            {
-                try { Files.EnsureProjectScaffold(existing.ProjectID); }
-                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: shared-file scaffold failed for {existing.ProjectID}"); }
-            }
+                msg => ServiceLog(msg), cleanupExpiredUploadsOnStart: false);
+            SetInitializationStage("Opening project history and runtime state");
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
             Activity = new ProjectAgentActivityTracker();
             EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg), Activity);
@@ -293,7 +304,8 @@ namespace Omnipotent.Services.Projects
             // Strategy layer: adversarial councils + the approved Grand Plan (the project's north star).
             Councils = new ProjectCouncilStore(msg => ServiceLog(msg));
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
-            Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage);
+            Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage,
+                message => ServiceLog(message));
             Overview = new ProjectOverviewService(this);
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
@@ -386,6 +398,20 @@ namespace Omnipotent.Services.Projects
                 }, toAgent);
             };
 
+            // Every HTTP handler can now safely use its required stores. Open the guard before
+            // recovery, optional integrations and shared-file housekeeping: those jobs may be slow,
+            // but none of them is a prerequisite for reading or controlling a project.
+            SetInitializationStage("Projects API ready");
+            httpApiReady = true;
+            ServiceLog("Projects: API ready; continuing recovery and integrations in the background.");
+            await RegisterWebSocketRoutesAsync();
+
+            // A project volume can contain an arbitrarily large manifest. Rewriting every manifest
+            // serially was on the route-registration path, so one large volume could make the entire
+            // Projects website 404 for hours after a restart. The file API creates/reconciles its own
+            // scaffold on demand; this best-effort sweep is housekeeping only.
+            QueueSharedFileScaffoldRefresh();
+
             // Crash recovery: clear any wake left active by a restart (rehydrate-on-wake safe).
             try { CommanderRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted wakes"); }
@@ -411,16 +437,6 @@ namespace Omnipotent.Services.Projects
             try { Bus.Replay(); Adapters.ArmAll(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: stimulus replay/arm failed"); }
 
-            routes = new ProjectsRoutes(this);
-            await routes.RegisterRoutes();
-            fileRoutes = new ProjectFilesRoutes(this);
-            await fileRoutes.RegisterRoutes();
-            // Say so explicitly. Until now the HTTP surface registered in silence, so "the website
-            // 404s every /projects/* path" and "the routes are fine" produced identical logs and
-            // there was no way to tell which had happened from the timeline alone.
-            ServiceLog("Projects: HTTP routes registered (project + file surfaces).");
-            await RegisterWebSocketRoutesAsync();
-
             await InitialiseDesktopsAsync();
             await InitialiseDiscordAsync();
 
@@ -432,6 +448,30 @@ namespace Omnipotent.Services.Projects
                 TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(15));
 
             ServiceLog("Projects service started.");
+        }
+
+        private void SetInitializationStage(string stage)
+            => Volatile.Write(ref initializationStage, stage);
+
+        internal string InitializationStage
+            => Volatile.Read(ref initializationStage) ?? "Starting Projects service";
+
+        private void QueueSharedFileScaffoldRefresh()
+        {
+            using (ExecutionContext.SuppressFlow())
+            {
+                _ = Task.Run(() =>
+                {
+                    try { Files.CleanupExpiredUploads(); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, "Projects: expired upload cleanup failed during startup"); }
+                    foreach (var existing in Store.ListProjects())
+                    {
+                        try { Files.EnsureProjectScaffold(existing.ProjectID); }
+                        catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: shared-file scaffold failed for {existing.ProjectID}"); }
+                    }
+                    ServiceLog("Projects: shared-file scaffold refresh complete.");
+                });
+            }
         }
 
         /// <summary>
@@ -2408,7 +2448,7 @@ namespace Omnipotent.Services.Projects
             HttpMethod method, Profiles.KMProfileManager.KMPermissions permission)
         {
             var api = await ResolveRouteApiAsync();
-            try { await api.CreateRoute(path, handler, method, permission); }
+            try { await api.CreateRoute(path, GuardUntilReady(handler), method, permission); }
             catch (Exception ex)
             {
                 _ = ServiceLogError(ex, $"Projects: failed to register HTTP route {path}");
@@ -2422,7 +2462,7 @@ namespace Omnipotent.Services.Projects
             HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
         {
             var api = await ResolveRouteApiAsync();
-            try { await api.CreateBufferedRoute(path, handler, method, permission, maxBodyBytes); }
+            try { await api.CreateBufferedRoute(path, GuardUntilReady(handler), method, permission, maxBodyBytes); }
             catch (Exception ex)
             {
                 _ = ServiceLogError(ex, $"Projects: failed to register buffered HTTP route {path}");
@@ -2436,12 +2476,33 @@ namespace Omnipotent.Services.Projects
             HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
         {
             var api = await ResolveRouteApiAsync();
-            try { await api.CreateStreamingRoute(path, handler, method, permission, maxBodyBytes); }
+            try { await api.CreateStreamingRoute(path, GuardUntilReady(handler), method, permission, maxBodyBytes); }
             catch (Exception ex)
             {
                 _ = ServiceLogError(ex, $"Projects: failed to register streaming HTTP route {path}");
                 throw;
             }
+        }
+
+        private Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> GuardUntilReady(
+            Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler)
+        {
+            return async req =>
+            {
+                if (httpApiReady)
+                {
+                    await handler(req);
+                    return;
+                }
+
+                Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Projects is still initializing");
+                var headers = new NameValueCollection { ["Retry-After"] = "1" };
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    ready = false,
+                    stage = InitializationStage,
+                }), "application/json", headers, HttpStatusCode.ServiceUnavailable);
+            };
         }
 
         /// <summary>

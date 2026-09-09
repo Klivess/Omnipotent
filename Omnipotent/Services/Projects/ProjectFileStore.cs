@@ -43,7 +43,8 @@ public sealed class ProjectFileStore
         public ConcurrentDictionary<string, SemaphoreSlim> FileGates { get; } = new(StringComparer.OrdinalIgnoreCase);
     }
 
-    public ProjectFileStore(ProjectFileStoreOptions options, Action<string>? log = null)
+    public ProjectFileStore(ProjectFileStoreOptions options, Action<string>? log = null,
+        bool cleanupExpiredUploadsOnStart = true)
     {
         this.options = options ?? throw new ArgumentNullException(nameof(options));
         this.log = log ?? (_ => { });
@@ -61,7 +62,7 @@ public sealed class ProjectFileStore
         Directory.CreateDirectory(stagingRoot);
         Directory.CreateDirectory(Path.GetDirectoryName(databasePath)!);
         InitializeSchema();
-        CleanupExpiredUploads();
+        if (cleanupExpiredUploadsOnStart) CleanupExpiredUploads();
     }
 
     public ProjectFileStoreOptions Options => options;

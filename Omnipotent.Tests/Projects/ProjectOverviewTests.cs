@@ -120,7 +120,16 @@ public sealed class ProjectOverviewTests : IDisposable
         Set("Gates", new ProjectGateManager(events, _ => { })); Set("Digests", new ProjectDigestStore(_ => { }));
         Set("Observables", new ProjectObservableStore(_ => { }));
         var service = new ProjectOverviewService(parent);
+        var cold = service.Get("24h");
+        Assert.True(cold.HistoricalLoading);
+        Assert.Equal("Live", cold.Projects.Single(p => p.Status != "Archived").Name);
+        Assert.False(cold.Projects.Single(p => p.Status != "Archived").HistoricalReady);
+
+        // The request above queued the expensive scan instead of blocking. A direct analytics read
+        // joins that one build, after which the next operational snapshot is fully populated.
+        analytics.GetProject(project.ProjectID, "24h");
         var first = service.Get("24h");
+        Assert.False(first.HistoricalLoading);
         Assert.Equal(2, first.Projects.Count);
         Assert.Equal(1, first.CompletedSteps);
         Assert.Equal(1, first.WorkingProjects);

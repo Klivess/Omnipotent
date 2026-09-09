@@ -24,7 +24,10 @@ public sealed class ProjectAnalyticsService
     private readonly ProjectSubAgentManager agents;
     private readonly ProjectCouncilStore councils;
     private readonly ProjectTokenUsageStore? tokenUsage;
+    private readonly Action<string> log;
     private readonly ConcurrentDictionary<string, CachedProjectSnapshot> cache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> backgroundBuilds = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim backgroundBuildSlots = new(Math.Max(1, Math.Min(4, Environment.ProcessorCount)));
     // Fixed lock striping coalesces cold fills without retaining one lock forever for every
     // project/range/date combination the process has ever seen.
     private readonly object[] cacheLocks = Enumerable.Range(0, 64).Select(_ => new object()).ToArray();
@@ -40,7 +43,8 @@ public sealed class ProjectAnalyticsService
         ProjectEventLogStore events,
         ProjectSubAgentManager agents,
         ProjectCouncilStore councils,
-        ProjectTokenUsageStore? tokenUsage = null)
+        ProjectTokenUsageStore? tokenUsage = null,
+        Action<string>? log = null)
     {
         this.projects = projects;
         this.budgets = budgets;
@@ -48,6 +52,7 @@ public sealed class ProjectAnalyticsService
         this.agents = agents;
         this.councils = councils;
         this.tokenUsage = tokenUsage;
+        this.log = log ?? (_ => { });
     }
 
     public ProjectAnalyticsSnapshot? GetProject(
@@ -70,6 +75,63 @@ public sealed class ProjectAnalyticsService
         // boundary, store-time validation still succeeds and the next request can reuse it.
         if (!forceRefresh) CacheDeps.NoteTimeBucket(SnapshotTtl);
         return snapshot;
+    }
+
+    /// <summary>
+    /// Returns only an already-built snapshot and schedules a cold/stale rebuild off the request
+    /// thread. The Projects overview is an operational surface first: a multi-gigabyte JSONL history
+    /// must never hold its live project list hostage after a process restart.
+    /// </summary>
+    public ProjectAnalyticsSnapshot? GetCachedProjectOrQueue(
+        string projectID,
+        string? rangeKey,
+        DateTime utcNow,
+        out bool building)
+    {
+        var project = projects.GetProject(projectID);
+        if (project == null)
+        {
+            building = false;
+            return null;
+        }
+
+        DateTime now = utcNow.ToUniversalTime();
+        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, project.CreatedAt, now);
+        string cacheKey = SnapshotCacheKey(projectID, range);
+        if (TryGetFresh(cacheKey, project, now, out var cached))
+        {
+            building = false;
+            return cached.Snapshot;
+        }
+
+        building = true;
+        QueueBuild(cacheKey, project, range, now);
+        return null;
+    }
+
+    private void QueueBuild(string cacheKey, Project project, AnalyticsRange range, DateTime now)
+    {
+        if (!backgroundBuilds.TryAdd(cacheKey, 0)) return;
+
+        // Do not flow KliveAPI's ambient response-cache dependency scope into work which outlives
+        // the response that queued it. That would mutate a sealed request scope from another thread.
+        using (ExecutionContext.SuppressFlow())
+        {
+            _ = Task.Run(async () =>
+            {
+                await backgroundBuildSlots.WaitAsync();
+                try { GetProject(project, range, now, useWallClockCompletion: true); }
+                catch (Exception ex)
+                {
+                    log($"Projects analytics background build failed for {project.ProjectID}: {ex.Message}");
+                }
+                finally
+                {
+                    backgroundBuildSlots.Release();
+                    backgroundBuilds.TryRemove(cacheKey, out _);
+                }
+            });
+        }
     }
 
     private ProjectAnalyticsSnapshot GetProject(
