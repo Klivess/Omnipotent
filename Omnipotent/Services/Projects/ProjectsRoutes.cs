@@ -1581,9 +1581,16 @@ namespace Omnipotent.Services.Projects
             };
         }
 
-        private static async Task Err(Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)
+        private async Task Err(Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)
         {
-            await req.ReturnResponse(ex.Message, code: HttpStatusCode.InternalServerError);
+            // Route handlers used to turn exceptions into an unlogged plain-text 500. That made a
+            // production failure impossible to diagnose from Omnipotent and encouraged the website
+            // to replace the only useful detail with "HTTP 500". Keep a full server-side stack and
+            // return a small structured error to the Klives-only client.
+            try { _ = parent.ServiceLogError(ex, $"Projects HTTP route failed: {req.route}"); }
+            catch { /* logging must never delay or replace the HTTP error response */ }
+            await req.ReturnResponse(Json(new { error = ex.Message, route = req.route }),
+                "application/json", code: HttpStatusCode.InternalServerError);
         }
 
         // RFC 4180 CSV field: quote when the value contains a comma, quote, CR or LF; escape

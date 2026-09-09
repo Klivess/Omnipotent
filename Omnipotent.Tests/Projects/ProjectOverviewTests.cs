@@ -48,6 +48,48 @@ public sealed class ProjectOverviewTests : IDisposable
         Assert.Null(fallback.Delta);
     }
 
+    [Fact]
+    public void LegacyObservableWithNullCollectionsDoesNotBreakOverviewResult()
+    {
+        var metric = Metric();
+        metric.EvidenceArtifactIDs = null!;
+        metric.History = null!;
+
+        var result = ProjectOverviewService.BuildResult(
+            new Project { CommanderResult = Choice(metric.ObservableID) }, [metric], 0, Now.AddDays(-1), Now);
+
+        Assert.Equal(140, result.Value);
+        Assert.Empty(result.EvidenceArtifactIDs);
+        Assert.Empty(result.History);
+    }
+
+    [Fact]
+    public void EmptyProjectIndexReturnsACompleteImmediateOverview()
+    {
+        var store = new ProjectStore(_ => { }, Path.Combine(root, "empty-projects.json"));
+        var events = new ProjectEventLogStore(_ => { });
+        var budgets = new ProjectBudgetLedger(store, events,
+            new OpenRouterCostFetcher(() => Task.FromResult<string?>(null), _ => { }), _ => { });
+        var analytics = new ProjectAnalyticsService(store, budgets, events,
+            new ProjectSubAgentManager(store, events), new ProjectCouncilStore(_ => { }));
+        var parent = new Omnipotent.Services.Projects.Projects();
+        void Set(string property, object value) => parent.GetType().GetProperty(property)!.SetValue(parent, value);
+        Set("Store", store); Set("Budget", budgets); Set("Analytics", analytics);
+        Set("Activity", new ProjectAgentActivityTracker());
+        Set("RuntimeState", new ProjectRuntimeStateStore(_ => { }, Path.Combine(root, "empty-runtime")));
+        Set("Gates", new ProjectGateManager(events, _ => { }));
+        Set("Digests", new ProjectDigestStore(_ => { }));
+        Set("Observables", new ProjectObservableStore(_ => { }));
+
+        var result = new ProjectOverviewService(parent).Get("24h");
+
+        Assert.Empty(result.Projects);
+        Assert.Empty(result.Series);
+        Assert.False(result.Degraded);
+        Assert.False(result.HistoricalLoading);
+        Assert.NotEmpty(JsonConvert.SerializeObject(result));
+    }
+
     [Theory]
     [InlineData("stale")]
     [InlineData("unverified")]

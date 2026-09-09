@@ -1,5 +1,6 @@
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveAPI.Caching;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.RegularExpressions;
 
@@ -85,6 +86,8 @@ public sealed class ProjectOverviewSnapshot
     public List<OverviewPoint> Series { get; set; } = new();
     public List<OverviewProject> Projects { get; set; } = new();
     public List<OverviewAttention> Attention { get; set; } = new();
+    public bool Degraded { get; set; }
+    public List<string> Warnings { get; set; } = new();
     public bool HistoricalLoading { get; set; }
     public string? HistoricalLoadingMessage { get; set; }
 }
@@ -92,6 +95,8 @@ public sealed class ProjectOverviewSnapshot
 /// <summary>Lightweight live projection joined to existing five-minute analytics snapshots.</summary>
 public sealed class ProjectOverviewService(Projects parent)
 {
+    private readonly ConcurrentDictionary<string, DateTime> lastWarningLogs = new(StringComparer.Ordinal);
+
     public ProjectOverviewSnapshot Get(string rangeKey)
     {
         if (rangeKey is not ("1h" or "24h" or "7d")) throw new ArgumentException("Choose range 1h, 24h or 7d.");
@@ -105,65 +110,115 @@ public sealed class ProjectOverviewService(Projects parent)
         int buildingSnapshots = 0;
         for (int i = 0; i < projects.Count; i++)
         {
-            if (projects[i].Status == ProjectStatus.Archived) continue;
-            snapshots[i] = parent.Analytics.GetCachedProjectOrQueue(
-                projects[i].ProjectID, rangeKey, now, out bool building);
-            if (building) buildingSnapshots++;
+            var project = projects[i];
+            if (project == null || project.Status == ProjectStatus.Archived) continue;
+            try
+            {
+                snapshots[i] = parent.Analytics.GetCachedProjectOrQueue(
+                    project.ProjectID, rangeKey, now, out bool building);
+                if (building) buildingSnapshots++;
+            }
+            catch (Exception ex)
+            {
+                Warn(result, project.ProjectID, "historical analytics", ex);
+            }
         }
         for (int i = 0; i < projects.Count; i++)
         {
             var p = projects[i];
-            var row = new OverviewProject { ProjectID = p.ProjectID, Name = p.Name, Status = p.Status.ToString(),
+            if (p == null)
+            {
+                Warn(result, "unknown", "project index entry", new InvalidDataException("The project index contains a null entry."));
+                continue;
+            }
+            var row = new OverviewProject { ProjectID = p.ProjectID ?? "", Name = p.Name ?? "(untitled)", Status = p.Status.ToString(),
                 Halted = p.HaltedFromStatus.HasValue, SubAgentCap = p.SubAgentCap,
                 TokenBudgetUsd = p.TokenBudgetUsd, MoneyBudgetUsd = p.MoneyBudgetUsd,
                 HistoricalReady = p.Status == ProjectStatus.Archived };
-            var spend = parent.Budget.GetSpend(p.ProjectID);
-            row.TokenSpendUsd = spend.TokenSpendUsd;
-            row.MoneySpendUsd = spend.MoneySpendUsd;
             result.Projects.Add(row);
-            if (p.Status == ProjectStatus.Archived) continue;
-            var runtime = parent.RuntimeState.GetSummary(p.ProjectID);
-            row.ExecutionDisposition = runtime.Disposition.ToString();
-            row.ExecutionHealth = runtime.HealthStatus.ToString();
-            row.Blocker = runtime.BlockerSummary ?? p.BlockedReason;
-            row.NextRetryAt = runtime.NextRetryAt;
-            row.PendingApprovals = parent.Gates.CountPending(p.ProjectID);
-            var step = parent.RuntimeState.GetActiveStep(p.ProjectID);
-            if (step != null)
+            try
             {
-                row.CurrentWork = Clip(step.NextConcreteAction ?? step.Title, 220);
-                row.CurrentWorkSource = "Active step";
-                row.CurrentWorkAt = step.UpdatedAt;
+                var spend = parent.Budget.GetSpend(row.ProjectID);
+                row.TokenSpendUsd = spend.TokenSpendUsd;
+                row.MoneySpendUsd = spend.MoneySpendUsd;
             }
-            else
+            catch (Exception ex) { Warn(result, row.ProjectID, "budget totals", ex); }
+            if (p.Status == ProjectStatus.Archived) continue;
+            try
             {
-                var digest = parent.Digests.GetDigest(p.ProjectID);
-                if (!string.IsNullOrWhiteSpace(digest.CurrentFocus))
+                var runtime = parent.RuntimeState.GetSummary(row.ProjectID);
+                row.ExecutionDisposition = runtime.Disposition.ToString();
+                row.ExecutionHealth = runtime.HealthStatus.ToString();
+                row.Blocker = runtime.BlockerSummary ?? p.BlockedReason;
+                row.NextRetryAt = runtime.NextRetryAt;
+            }
+            catch (Exception ex)
+            {
+                row.Blocker = p.BlockedReason;
+                Warn(result, row.ProjectID, "runtime state", ex);
+            }
+            try { row.PendingApprovals = parent.Gates.CountPending(row.ProjectID); }
+            catch (Exception ex) { Warn(result, row.ProjectID, "approval gates", ex); }
+            try
+            {
+                var step = parent.RuntimeState.GetActiveStep(row.ProjectID);
+                if (step != null)
                 {
-                    row.CurrentWork = Clip(digest.CurrentFocus, 220);
-                    row.CurrentWorkSource = "Digest focus";
-                    row.CurrentWorkAt = digest.UpdatedAt;
+                    row.CurrentWork = Clip(step.NextConcreteAction ?? step.Title, 220);
+                    row.CurrentWorkSource = "Active step";
+                    row.CurrentWorkAt = step.UpdatedAt;
+                }
+                else
+                {
+                    var digest = parent.Digests.GetDigest(row.ProjectID);
+                    if (!string.IsNullOrWhiteSpace(digest.CurrentFocus))
+                    {
+                        row.CurrentWork = Clip(digest.CurrentFocus, 220);
+                        row.CurrentWorkSource = "Digest focus";
+                        row.CurrentWorkAt = digest.UpdatedAt;
+                    }
                 }
             }
-            var activity = parent.Activity.ListForProject(p.ProjectID);
-            row.WorkingAgents = activity.Count;
-            row.ActivityPhase = activity.FirstOrDefault()?.Phase;
+            catch (Exception ex) { Warn(result, row.ProjectID, "current work", ex); }
+            try
+            {
+                var activity = parent.Activity.ListForProject(row.ProjectID);
+                row.WorkingAgents = activity.Count;
+                row.ActivityPhase = activity.FirstOrDefault()?.Phase;
+            }
+            catch (Exception ex) { Warn(result, row.ProjectID, "live agent activity", ex); }
             var snapshot = snapshots[i];
             row.HistoricalReady = snapshot != null;
             if (snapshot != null)
             {
-                row.RangeSpendUsd = snapshot.Summary.RangeSpendUsd;
-                row.RangeMoneySpendUsd = snapshot.Summary.RangeMoneySpendUsd;
-                row.RangeTokens = snapshot.Summary.RangeTokens;
-                row.CompletedSteps = snapshot.Summary.CompletedSteps;
-                row.HistoricalAt = snapshot.GeneratedAt;
-                row.Series = snapshot.Series.Select(Point).ToList();
+                try
+                {
+                    row.RangeSpendUsd = snapshot.Summary.RangeSpendUsd;
+                    row.RangeMoneySpendUsd = snapshot.Summary.RangeMoneySpendUsd;
+                    row.RangeTokens = snapshot.Summary.RangeTokens;
+                    row.CompletedSteps = snapshot.Summary.CompletedSteps;
+                    row.HistoricalAt = snapshot.GeneratedAt;
+                    row.Series = (snapshot.Series ?? []).Where(point => point != null).Select(Point).ToList();
+                    result.Execution.Add(snapshot.Execution);
+                }
+                catch (Exception ex)
+                {
+                    row.HistoricalReady = false;
+                    Warn(result, row.ProjectID, "cached analytics", ex);
+                }
             }
-            var observables = parent.Observables.List(p.ProjectID);
-            row.ResultOptions = observables.Where(o => o.Type == ObservableType.Numeric)
-                .Select(o => new ResultOption(o.ObservableID, o.Name)).ToList();
-            row.Result = BuildResult(p, observables, row.CompletedSteps, range.FromUtc, now);
-            if (snapshot != null) result.Execution.Add(snapshot.Execution);
+            try
+            {
+                var observables = parent.Observables.List(row.ProjectID).Where(o => o != null).ToList();
+                row.ResultOptions = observables.Where(o => o.Type == ObservableType.Numeric)
+                    .Select(o => new ResultOption(o.ObservableID ?? "", o.Name ?? "(unnamed)")).ToList();
+                row.Result = BuildResult(p, observables, row.CompletedSteps, range.FromUtc, now);
+            }
+            catch (Exception ex)
+            {
+                row.Result = BuildResult(p, [], row.CompletedSteps, range.FromUtc, now);
+                Warn(result, row.ProjectID, "project results", ex);
+            }
             if (row.PendingApprovals > 0) result.Attention.Add(new(p.ProjectID, p.Name, "approval", $"{row.PendingApprovals} approval(s) pending"));
             if (p.Status == ProjectStatus.BudgetPaused) result.Attention.Add(new(p.ProjectID, p.Name, "budget", "Budget exhausted — paused"));
             if (!string.IsNullOrWhiteSpace(row.Blocker) || p.Status == ProjectStatus.Blocked)
@@ -184,19 +239,41 @@ public sealed class ProjectOverviewService(Projects parent)
         // Cached projects may have different minute boundaries. Every lane uses the same axis.
         foreach (var row in live)
         {
-            var byDate = row.Series.ToDictionary(p => p.Date);
+            // Old or partially-written analytics snapshots can contain duplicate bins. They should
+            // degrade one lane, not throw from ToDictionary and take down the whole fleet page.
+            var byDate = row.Series.Where(p => !string.IsNullOrWhiteSpace(p.Date))
+                .GroupBy(p => p.Date).ToDictionary(g => g.Key, g => g.Last());
             row.Series = result.Series.Select(p => byDate.GetValueOrDefault(p.Date)
                 ?? new OverviewPoint(p.Date, 0, 0, 0, 0, 0, 0, 0)).ToList();
         }
-        result.HistoricalLoading = buildingSnapshots > 0;
-        result.HistoricalLoadingMessage = buildingSnapshots == 0 ? null
-            : $"Building historical activity for {buildingSnapshots} project{(buildingSnapshots == 1 ? "" : "s")} from the durable event log";
+        result.Degraded = result.Warnings.Count > 0;
+        result.HistoricalLoading = buildingSnapshots > 0 || live.Any(row => !row.HistoricalReady);
+        result.HistoricalLoadingMessage = buildingSnapshots > 0
+            ? $"Building historical activity for {buildingSnapshots} project{(buildingSnapshots == 1 ? "" : "s")} from the durable event log"
+            : result.Degraded ? "Retrying unavailable project details while live operations remain usable" : null;
         return result;
     }
 
     private static OverviewPoint Point(AnalyticsSeriesPoint p) => new(p.Date, p.SpendUsd, p.MoneySpendUsd,
         p.CompletedSteps, p.SuccessfulWakes, p.FailedWakes, p.DeferredWakes, p.CancelledWakes);
-    private static string Clip(string text, int length) => text.Length <= length ? text : text[..length] + "…";
+    private static string Clip(string? text, int length)
+        => string.IsNullOrEmpty(text) ? "" : text.Length <= length ? text : text[..length] + "…";
+
+    private void Warn(ProjectOverviewSnapshot result, string? projectID, string stage, Exception ex)
+    {
+        string id = string.IsNullOrWhiteSpace(projectID) ? "unknown project" : projectID;
+        string warning = $"{id}: {stage} unavailable ({ex.Message})";
+        result.Warnings.Add(warning);
+
+        string key = id + "|" + stage;
+        DateTime now = DateTime.UtcNow;
+        if (!lastWarningLogs.TryGetValue(key, out DateTime last) || now - last >= TimeSpan.FromMinutes(5))
+        {
+            lastWarningLogs[key] = now;
+            try { _ = parent.ServiceLogError(ex, $"Projects overview: {stage} failed for {id}"); }
+            catch { /* diagnostics must never turn a degraded overview back into a 500 */ }
+        }
+    }
 
     public static ProjectResultSelection ValidateSelection(IEnumerable<ProjectObservable> observables,
         string observableID, string direction, string rationale)
@@ -220,7 +297,7 @@ public sealed class ProjectOverviewService(Projects parent)
             Rationale = choice.Rationale, Name = "Selected result unavailable", Validity = "Unknown", Source = "Unknown" };
         var observable = observables.FirstOrDefault(o => o.ObservableID == choice.ObservableID);
         if (observable == null) return result;
-        result.Name = observable.Name;
+        result.Name = string.IsNullOrWhiteSpace(observable.Name) ? "(unnamed result)" : observable.Name;
         result.Value = observable.NumericValue;
         result.Format = observable.Format.ToString();
         result.Unit = observable.Unit;
@@ -229,8 +306,8 @@ public sealed class ProjectOverviewService(Projects parent)
         result.Validity = observable.Validity.ToString();
         result.Source = observable.SourceKind.ToString();
         result.EvidenceEventSequence = observable.EvidenceEventSequence;
-        result.EvidenceArtifactIDs = observable.EvidenceArtifactIDs.Take(12).ToList();
-        var history = observable.History.Where(s => s.NumericValue.HasValue && double.IsFinite(s.NumericValue.Value)
+        result.EvidenceArtifactIDs = (observable.EvidenceArtifactIDs ?? []).Where(id => !string.IsNullOrWhiteSpace(id)).Take(12).ToList();
+        var history = (observable.History ?? []).Where(s => s != null && s.NumericValue.HasValue && double.IsFinite(s.NumericValue.Value)
             && s.Timestamp <= now).OrderBy(s => s.Timestamp).ToList();
         var baseline = history.LastOrDefault(s => s.Timestamp <= from);
         var latest = history.LastOrDefault();
