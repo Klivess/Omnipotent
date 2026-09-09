@@ -38,6 +38,7 @@ namespace Omnipotent.Services.Projects
             "update_plan", "report_progress",
             "list_project_directives", "acknowledge_project_directive", "complete_project_directive",
             "update_observable", "list_observables",
+            "select_primary_result",
             "update_checkpoint", "get_checkpoint",
             "account_register", "account_list", "account_update", "record_external_action",
             "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_code", "klivemail_send",
@@ -49,6 +50,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>
         private static readonly HashSet<string> CommanderOnlyTools = new(StringComparer.Ordinal)
         {
+            "select_primary_result",
             "complete_project", "request_user_approval", "request_budget_increase", "request_human", "retire_sub_agent", "assign_plan_work", "record_money_spend",
             "update_project", "update_plan_progress",
             // Klives talks to the Commander, not to the roster: a worker reports upward with

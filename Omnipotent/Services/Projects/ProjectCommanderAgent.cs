@@ -250,6 +250,13 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                 Tool("list_observables", "List this project's Observables with current values, descriptions and last-updated times.",
                     Obj(new { }, Array.Empty<string>())),
 
+                Tool("select_primary_result", "Commander only: nominate the stable primary numeric outcome for the fleet dashboard. Prefer goal results (revenue, audience growth, shipped deliverables, resolved defects) over effort counters. Klives' manual pin takes precedence. Select an existing observable by name, explain its relationship to the goal, and keep this choice unless the goal or measurement quality changes.",
+                    Obj(new {
+                        name = Str("Existing numeric observable name."),
+                        direction = new { type = "string", @enum = new[] { "higher", "lower", "neutral" } },
+                        rationale = Str("Why this is the most meaningful goal result, 1–300 characters."),
+                    }, "name", "direction", "rationale")),
+
                 Tool("update_project", "Rename this project and/or revise its description (its stated goal — your north star, shown to Klives and used to seed every wake). Provide 'name', 'description', or both; omit either to leave it unchanged. Use it to keep the project's identity accurate as its scope sharpens. A name change also renames the Discord channel; a goal change reshapes your context, so make it deliberate — it shows on Klives' timeline.",
                     Obj(new
                     {

@@ -52,6 +52,33 @@ namespace Omnipotent.Services.Projects
 
         public async Task RegisterRoutes()
         {
+            await parent.RegisterHttpRouteAsync("/projects/overview", async req =>
+            {
+                try { await req.ReturnResponse(Json(parent.Overview.Get(req.userParameters?.Get("range") ?? "24h"))); }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.RegisterHttpRouteAsync("/projects/result-pin", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = ParseBody(req) ?? throw new ArgumentException("JSON body required.");
+                    if (!body.ContainsKey("observableID")) throw new ArgumentException("Provide observableID, or null to clear the pin.");
+                    string? id = (string?)body["observableID"];
+                    var selection = id == null ? null : ProjectOverviewService.ValidateSelection(
+                        parent.Observables.List(project!.ProjectID), id, (string?)body["direction"] ?? "neutral",
+                        "Selected by Klives");
+                    parent.Store.SetResultSelection(project!.ProjectID, selection, userPin: true);
+                    parent.EventLog.Append(new ProjectEvent { ProjectID = project.ProjectID, Type = ProjectEventTypes.ObservableChanged,
+                        Author = "klives", Text = selection == null ? "Using Commander result selection." : "Primary result pinned by Klives." });
+                    await req.ReturnResponse(Json(new { saved = true }));
+                }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // ── Projects ──
             await parent.RegisterHttpRouteAsync("/projects/list", async req =>
             {
@@ -882,6 +909,7 @@ namespace Omnipotent.Services.Projects
                             Type = ProjectEventTypes.CheckpointChanged,
                             Author = "klives",
                             Text = $"Klives closed step {stepID} as {status}: {reason}",
+                            PayloadJson = JsonConvert.SerializeObject(new { op = "close_step", stepID, result = status.ToString() }),
                         });
                     await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
                 }

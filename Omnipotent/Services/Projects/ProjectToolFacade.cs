@@ -81,6 +81,7 @@ public static class ProjectToolFacade
             new[]
             {
                 ("list", "list_observables"),
+                ("select_result", "select_primary_result"),
                 ("*", "update_observable"),
             }),
 

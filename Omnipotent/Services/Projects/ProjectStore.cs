@@ -18,10 +18,10 @@ namespace Omnipotent.Services.Projects
         private readonly object gate = new();
         private List<Project> projects = new();
 
-        public ProjectStore(Action<string> log)
+        public ProjectStore(Action<string> log, string? indexFilePath = null)
         {
             this.log = log ?? (_ => { });
-            indexPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsIndexFile);
+            indexPath = indexFilePath ?? OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsIndexFile);
             Directory.CreateDirectory(Path.GetDirectoryName(indexPath)!);
             Load();
         }
@@ -119,6 +119,19 @@ namespace Omnipotent.Services.Projects
                 int idx = projects.FindIndex(p => p.ProjectID == project.ProjectID);
                 if (idx < 0) throw new InvalidOperationException($"Unknown project {project.ProjectID}");
                 projects[idx] = project;
+                SaveLocked();
+                CacheDeps.Bump(CacheKey);
+            }
+        }
+
+        public void SetResultSelection(string projectID, ProjectResultSelection? selection, bool userPin)
+        {
+            lock (gate)
+            {
+                var project = projects.FirstOrDefault(p => p.ProjectID == projectID)
+                    ?? throw new ArgumentException("Unknown project.");
+                if (userPin) project.PinnedResult = selection;
+                else project.CommanderResult = selection;
                 SaveLocked();
                 CacheDeps.Bump(CacheKey);
             }

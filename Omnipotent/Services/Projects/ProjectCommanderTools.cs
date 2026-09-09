@@ -607,6 +607,23 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult(Observables.DescribeAll(project.ProjectID));
                 }
 
+                case "select_primary_result":
+                {
+                    if (actingAgentID != "commander") return FailedResult("Only the project Commander can select its primary result.");
+                    if (Observables == null) return FailedResult("Observables unavailable.");
+                    try
+                    {
+                        var all = Observables.List(project.ProjectID);
+                        var observable = all.FirstOrDefault(o => string.Equals(o.Name, (string?)a["name"], StringComparison.OrdinalIgnoreCase));
+                        var selection = ProjectOverviewService.ValidateSelection(all, observable?.ObservableID ?? "",
+                            (string?)a["direction"] ?? "", (string?)a["rationale"] ?? "");
+                        projectStore.SetResultSelection(project.ProjectID, selection, userPin: false);
+                        eventLog.Append(Evt(ProjectEventTypes.ObservableChanged, "commander", $"Primary result: {observable!.Name}. {selection.Rationale}"));
+                        return new CommanderToolResult($"Primary result nominated: {observable.Name}. Klives' pin, if present, remains authoritative.");
+                    }
+                    catch (ArgumentException ex) { return FailedResult(ex.Message); }
+                }
+
                 case "update_observable":
                 {
                     if (Observables == null) return new CommanderToolResult("Observables unavailable.");

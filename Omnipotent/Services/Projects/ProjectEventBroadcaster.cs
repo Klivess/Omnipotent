@@ -45,6 +45,14 @@ namespace Omnipotent.Services.Projects
         }
 
         private readonly ConcurrentDictionary<Guid, Subscriber> subscribers = new();
+        private readonly ConcurrentDictionary<string, string> fleetActivityPhases = new();
+
+        private void SignalFleetActivity(string projectID)
+        {
+            var msg = JsonConvert.SerializeObject(new { kind = "project-event", projectID, type = "activity-changed" });
+            foreach (var s in subscribers.Values.Where(s => s.ProjectID == null))
+                if (!s.Outbox.Writer.TryWrite(msg)) Interlocked.Exchange(ref s.NeedsResync, 1);
+        }
         private readonly Action<string> log;
         private readonly ProjectAgentActivityTracker? activity;
 
@@ -88,6 +96,13 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private void OnActivityChanged(ProjectAgentActivity a)
         {
+            string key = a.ProjectID + "/" + a.AgentID;
+            string phase = a.StartedAt.Ticks + "/" + a.Phase;
+            if (!fleetActivityPhases.TryGetValue(key, out var previous) || previous != phase)
+            {
+                fleetActivityPhases[key] = phase;
+                SignalFleetActivity(a.ProjectID);
+            }
             if (subscribers.IsEmpty) return;
             string? msg = null;
             foreach (var s in subscribers.Values)
@@ -100,6 +115,8 @@ namespace Omnipotent.Services.Projects
 
         private void OnActivityEnded(string projectID, string agentID)
         {
+            fleetActivityPhases.TryRemove(projectID + "/" + agentID, out _);
+            SignalFleetActivity(projectID);
             if (subscribers.IsEmpty) return;
             string? msg = null;
             foreach (var s in subscribers.Values)

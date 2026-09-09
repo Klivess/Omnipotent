@@ -203,6 +203,8 @@ namespace Omnipotent.Services.Projects
     /// </summary>
     public class Project
     {
+        public ProjectResultSelection? CommanderResult { get; set; }
+        public ProjectResultSelection? PinnedResult { get; set; }
         public string ProjectID { get; set; } = "";
         public string Name { get; set; } = "";
         /// <summary>The long-horizon goal, verbatim as Klives stated it.</summary>

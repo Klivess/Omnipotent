@@ -275,6 +275,7 @@ public sealed class AnalyticsProjectIdentity
 
 public sealed class AnalyticsSummary
 {
+    public int CompletedSteps { get; set; }
     public int ProjectCount { get; set; }
     public int ActiveProjects { get; set; }
     public double LifetimeSpendUsd { get; set; }
@@ -336,6 +337,7 @@ public sealed class AnalyticsSummary
 
 public sealed class AnalyticsSeriesPoint
 {
+    public int CompletedSteps { get; set; }
     public ProjectExecutionAnalytics Execution { get; set; } = new();
     public string Date { get; set; } = "";
     public double SpendUsd { get; set; }
@@ -571,6 +573,7 @@ internal static class ProjectAnalyticsCalculator
 
         DateTime? lastActivityAt = null;
         int artifacts = 0;
+        var completedStepIDs = new HashSet<string>(StringComparer.Ordinal);
         double rangeMoneySpend = 0;
         foreach (var evt in eventList)
         {
@@ -583,6 +586,8 @@ internal static class ProjectAnalyticsCalculator
             eventTypeCounts[type] = eventTypeCounts.GetValueOrDefault(type) + 1;
             if (seriesByKey.TryGetValue(BucketKey(timestamp, range.Bucket), out var point))
             {
+                var completedStep = ProjectOverviewService.CompletedStepID(evt);
+                if (completedStep != null && completedStepIDs.Add(completedStep)) point.CompletedSteps++;
                 point.Events++;
                 if (type == ProjectEventTypes.ToolCall) point.ToolCalls++;
                 if (type == ProjectEventTypes.MoneySpent)
@@ -936,6 +941,7 @@ internal static class ProjectAnalyticsCalculator
             AvgCostPerWake = wakes.Count > 0 ? RoundMoney(rangeSpend / wakes.Count) : 0,
             Tools = toolCalls,
             ProductiveActions = productiveActions,
+            CompletedSteps = completedStepIDs.Count,
             Artifacts = artifacts,
             Councils = councilCount,
             CouncilSpendUsd = RoundMoney(councilSpend),
@@ -1088,6 +1094,7 @@ internal static class ProjectAnalyticsCalculator
                 target.CancelledWakes += source.CancelledWakes;
                 target.ToolCalls += source.ToolCalls;
                 target.ProductiveActions += source.ProductiveActions;
+                target.CompletedSteps += source.CompletedSteps;
                 target.ActiveDurationMs += source.ActiveDurationMs;
                 target.PausedDurationMs += source.PausedDurationMs;
                 target.InactiveDurationMs += source.InactiveDurationMs;
@@ -1221,6 +1228,7 @@ internal static class ProjectAnalyticsCalculator
             AvgCostPerWake = wakes > 0 ? RoundMoney(rangeSpend / wakes) : 0,
             Tools = projects.Sum(p => p.Summary.Tools),
             ProductiveActions = projects.Sum(p => p.Summary.ProductiveActions),
+            CompletedSteps = projects.Sum(p => p.Summary.CompletedSteps),
             Artifacts = projects.Sum(p => p.Summary.Artifacts),
             Councils = projects.Sum(p => p.Summary.Councils),
             CouncilSpendUsd = RoundMoney(projects.Sum(p => p.Summary.CouncilSpendUsd)),

@@ -92,6 +92,7 @@ namespace Omnipotent.Services.Projects
         public ProjectCouncilStore Councils { get; private set; } = null!;
         /// <summary>Read-only project and fleet performance/cost analytics for the KM website.</summary>
         public ProjectAnalyticsService Analytics { get; private set; } = null!;
+        public ProjectOverviewService Overview { get; private set; } = null!;
         /// <summary>Versioned Grand Plan — the strategic north star Klives approves before work begins.</summary>
         public ProjectGrandPlanStore GrandPlans { get; private set; } = null!;
         /// <summary>Orchestrates adversarial councils (transient tool-less LLM seats + a Chair).</summary>
@@ -293,6 +294,7 @@ namespace Omnipotent.Services.Projects
             Councils = new ProjectCouncilStore(msg => ServiceLog(msg));
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
             Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage);
+            Overview = new ProjectOverviewService(this);
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
                 QueryAsync = async (pid, sid, sys, user, routes, maxTokens, ct) =>

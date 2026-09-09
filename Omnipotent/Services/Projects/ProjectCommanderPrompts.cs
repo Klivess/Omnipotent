@@ -55,6 +55,10 @@ namespace Omnipotent.Services.Projects
             sb.BeginSection("project","── PROJECT ──");
             sb.AppendLine($"Name: {project.Name}");
             sb.AppendLine($"Goal: {project.Goal}");
+            sb.AppendLine("Maintain one primary numeric RESULT observable for the fleet dashboard. Prefer measured goal outcomes over tool calls or effort. Use observable op:select_result with name, direction (higher/lower/neutral), and rationale. Nominate during your next normal wake if none exists; keep it stable unless the goal or measurement quality changes. Supply evidence and freshness when updating measurements; never invent results. Klives' manual pin takes precedence.");
+            sb.AppendLine(project.CommanderResult == null ? "Commander result: none nominated."
+                : $"Commander result observable ID: {project.CommanderResult.ObservableID}; direction: {project.CommanderResult.Direction}; rationale: {project.CommanderResult.Rationale}");
+            if (project.PinnedResult != null) sb.AppendLine($"Klives pinned result observable ID: {project.PinnedResult.ObservableID} (do not override).");
             sb.AppendLine($"Status: {project.Status} · project created {Data_Handling.TemporalFormat.StampMinute(project.CreatedAt)}");
             // Under a flat-fee router the token budget is not a live constraint, and stating one
             // invites the Commander to ration model calls it is not actually paying for. The MONEY
