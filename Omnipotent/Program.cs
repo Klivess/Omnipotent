@@ -60,7 +60,8 @@ namespace Omnipotent
 
                 //Create services
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.SeleniumManager.SeleniumManager());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveAPI());
+                var kliveApi = new KliveAPI();
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(kliveApi);
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniDefence.OmniDefence());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGlobalSettingsManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());
@@ -92,7 +93,9 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Tripwires.TripwireService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Stratum.Stratum());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Projects.Projects());
+                // Projects receives the API instance directly so route registration never depends on
+                // the service manager's unbounded asynchronous type lookup during cold startup.
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Projects.Projects(kliveApi));
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveRAG.KliveRAG());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.AccountRegistry.AccountRegistry());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new PortForwardManager());

@@ -81,7 +81,9 @@ namespace Omnipotent.Services.Projects
         private ProjectsRoutes routes = null!;
         private ProjectFilesRoutes fileRoutes = null!;
         private volatile bool httpApiReady;
+        private volatile bool httpApiFailed;
         private string initializationStage = "Starting Projects service";
+        private string? initializationFailure;
 
         /// <summary>Inter-agent messaging over the bus: (projectID, fromAgent, toAgent, message).</summary>
         public Func<string, string, string, string, Task>? SendAgentMessageHook { get; set; }
@@ -105,13 +107,32 @@ namespace Omnipotent.Services.Projects
         /// router bills per token without awaiting a service lookup on a hot path.</summary>
         private KliveLLM.KliveLLM? llmForBudget;
 
-        public Projects()
+        public Projects(Omnipotent.Services.KliveAPI.KliveAPI? api = null)
         {
             name = "Projects";
             threadAnteriority = ThreadAnteriority.Standard;
+            routeApi = api;
         }
 
         protected override async void ServiceMain()
+        {
+            httpApiReady = false;
+            httpApiFailed = false;
+            Volatile.Write(ref initializationFailure, null);
+            try
+            {
+                await ServiceMainAsync();
+            }
+            catch (Exception ex)
+            {
+                httpApiFailed = true;
+                Volatile.Write(ref initializationFailure, ex.Message);
+                SetInitializationStage("Projects startup failed");
+                await ServiceLogError(ex, "Projects: startup failed");
+            }
+        }
+
+        private async Task ServiceMainAsync()
         {
             // Register the complete HTTP surface before touching any project data. A cold database,
             // a large shared-file manifest, or an optional service starting late must never make the
@@ -121,9 +142,7 @@ namespace Omnipotent.Services.Projects
             SetInitializationStage("Registering Projects API routes");
             routes = new ProjectsRoutes(this);
             await routes.RegisterRoutes();
-            fileRoutes = new ProjectFilesRoutes(this);
-            await fileRoutes.RegisterRoutes();
-            ServiceLog("Projects: HTTP routes registered (project + file surfaces; initialization guard active).");
+            ServiceLog("Projects: core HTTP routes registered (initialization guard active).");
 
             SetInitializationStage("Loading the project index");
             Store = new ProjectStore(msg => ServiceLog(msg));
@@ -140,6 +159,12 @@ namespace Omnipotent.Services.Projects
                 maxChunkBytes: uploadChunkMb * 1024 * 1024,
                 minimumFreeDiskBytes: freeReserveGb * 1024L * 1024 * 1024),
                 msg => ServiceLog(msg), cleanupExpiredUploadsOnStart: false);
+            // File route registration reads Files.Options for the configured upload limit. Registering
+            // it before ProjectFileStore exists throws and strands the core route guard indefinitely.
+            SetInitializationStage("Registering project file API routes");
+            fileRoutes = new ProjectFilesRoutes(this);
+            await fileRoutes.RegisterRoutes();
+            ServiceLog("Projects: project file HTTP routes registered.");
             SetInitializationStage("Opening project history and runtime state");
             EventLog = new ProjectEventLogStore(msg => ServiceLog(msg));
             Activity = new ProjectAgentActivityTracker();
@@ -2405,15 +2430,11 @@ namespace Omnipotent.Services.Projects
         private Omnipotent.Services.KliveAPI.KliveAPI? routeApi;
 
         /// <summary>
-        /// Resolves the typed KliveAPI once, waiting out the window in which it exists but has not
-        /// finished activating.
-        ///
-        /// <see cref="OmniServiceManager.GetServiceByClassType{T}"/> spins until the service TYPE
-        /// appears, but then returns an EMPTY array while any instance is still inactive — which
-        /// ExecuteServiceMethod turns into a thrown "Service of type KliveAPI not found". Thrown
-        /// from the middle of a registration run, that leaves a partially populated route table and
-        /// writes nothing to the log: an arbitrary subset of /projects/* 404s with no diagnosis.
-        /// So we wait for it properly, and give up loudly rather than half-registering.
+        /// Resolves the typed KliveAPI once from the service registry. Do not call
+        /// GetServicesByType here: its internal "wait for type" loop has no cancellation or timeout,
+        /// so awaiting it defeats this method's deadline and can freeze route registration forever.
+        /// The route dictionaries exist from KliveAPI construction and are safe to populate before
+        /// its listener finishes activating.
         /// </summary>
         private async Task<Omnipotent.Services.KliveAPI.KliveAPI> ResolveRouteApiAsync()
         {
@@ -2421,9 +2442,8 @@ namespace Omnipotent.Services.Projects
             DateTime deadline = DateTime.UtcNow.AddSeconds(60);
             while (true)
             {
-                var apis = await GetServicesByType<Omnipotent.Services.KliveAPI.KliveAPI>();
-                if (apis is { Length: > 0 })
-                    return routeApi = (Omnipotent.Services.KliveAPI.KliveAPI)apis[0];
+                var api = GetActiveServices().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault();
+                if (api != null) return routeApi = api;
                 if (DateTime.UtcNow >= deadline)
                 {
                     var ex = new InvalidOperationException(
@@ -2489,6 +2509,18 @@ namespace Omnipotent.Services.Projects
         {
             return async req =>
             {
+                if (httpApiFailed)
+                {
+                    Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Projects startup failed");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        ready = false,
+                        failed = true,
+                        stage = InitializationStage,
+                        error = Volatile.Read(ref initializationFailure) ?? "Unknown startup failure",
+                    }), "application/json", code: HttpStatusCode.InternalServerError);
+                    return;
+                }
                 if (httpApiReady)
                 {
                     await handler(req);
