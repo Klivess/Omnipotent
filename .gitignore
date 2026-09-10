@@ -415,3 +415,9 @@ Omnipotent/Services/KliveAgent/AGENT_ARCHITECTURE.md
 Omnipotent/Services/Projects/HUMANIZATION_PLAN.md
 Omnipotent-Code-Capability-Audit.md
 Docs/projects-wake-reliability.md
+
+# Omnipotent Testing project hygiene (2026-09-09)
+# local FFmpeg build download (~109MB), not source
+ffmpeg-download/
+# project scratch/output scratch dir
+work/
