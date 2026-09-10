@@ -125,6 +125,13 @@ namespace Omnipotent.Services.Projects
         /// committed event log is intact, and a later resume simply wakes fresh. Returns true if a
         /// wake was actually cancelled.
         /// </summary>
+        /// <summary>
+        /// True while THIS process is running a Commander wake for the project. Deliberately reads
+        /// only in-process state (no runtime-state file), because its one caller is the corrupt-state
+        /// repair path — asking the unreadable file whether it has a lease would be circular.
+        /// </summary>
+        public bool HasLiveWake(string projectID) => activeWakeCts.ContainsKey(projectID);
+
         public bool CancelActiveWake(string projectID)
         {
             steerQueue.TryRemove(projectID, out _);

@@ -79,4 +79,28 @@ public class ProjectStartupLivenessTests
         Assert.True(finallyAt > 0, "KeepaliveTick has no finally block.");
         Assert.Contains("Volatile.Write(ref keepaliveRunning, 0)", body[finallyAt..]);
     }
+
+    /// <summary>
+    /// A per-project fault must not end the tick for every project after it. RuntimeState.Get throws
+    /// by design on an unreadable state file, and an unguarded throw inside the foreach meant one
+    /// corrupt project silently stopped the keepalive for everything ordered behind it — on every
+    /// tick, forever. Same for the watchdog, which is the backstop for exactly that situation.
+    /// </summary>
+    [Theory]
+    [InlineData("Omnipotent/Services/Projects/Projects.cs", "KeepaliveProject(project)")]
+    [InlineData("Omnipotent/Services/Projects/ProjectWatchdog.cs", "TickProjectAsync(project)")]
+    public void PerProjectWorkIsIsolatedInsideTheTickLoop(string relativePath, string call)
+    {
+        string source = File.ReadAllText(Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory, "..", "..", "..", "..", relativePath.Replace('/', Path.DirectorySeparatorChar))));
+
+        int loop = source.IndexOf("foreach (var project in", StringComparison.Ordinal);
+        Assert.True(loop > 0, $"No per-project loop found in {relativePath}.");
+        int loopEnd = source.IndexOf("\n            }", loop, StringComparison.Ordinal);
+        string body = loopEnd > loop ? source[loop..loopEnd] : source[loop..];
+
+        Assert.Contains(call, body);
+        Assert.Contains("try {", body);
+        Assert.Contains("catch (Exception ex)", body);
+    }
 }

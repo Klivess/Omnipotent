@@ -4,6 +4,7 @@ using Omnipotent.Services.Projects.Containers;
 using Omnipotent.Services.Projects.Discord;
 using Omnipotent.Services.Projects.Stimulus;
 using Omnipotent.Services.KliveBot_Discord;
+using System.Collections.Concurrent;
 using System.Collections.Specialized;
 using System.Net;
 using System.Net.WebSockets;
@@ -79,6 +80,7 @@ namespace Omnipotent.Services.Projects
         private int keepaliveRunning;
         private long keepaliveTickStartedAtTicks;
         private long lastStuckKeepaliveLogTicks;
+        private readonly ConcurrentDictionary<string, DateTime> keepaliveProjectFailureLogs = new(StringComparer.Ordinal);
         /// <summary>The desktop-container subsystem (P2). Null when containers are disabled or off-Windows.</summary>
         public ContainerDesktopManager? Desktops { get; private set; }
         private ProjectsRoutes routes = null!;
@@ -266,6 +268,11 @@ namespace Omnipotent.Services.Projects
             SubAgents = new ProjectSubAgentManager(Store, EventLog);
             CommanderRunner = new ProjectCommanderRunner(this);
             SubAgentRunner = new ProjectSubAgentRunner(this);
+            // Lets the runtime-state store repair a corrupt state file without ever dropping a lease
+            // a live wake is still using. Until this is set the store treats "live wake" as unknown
+            // and refuses to rebuild, which is the safe default.
+            RuntimeState.HasLiveWake = projectID =>
+                CommanderRunner.HasLiveWake(projectID) || SubAgentRunner.HasLiveWake(projectID);
             Gates.GateOpened += gate =>
             {
                 var current = RuntimeState.Get(gate.ProjectID);
@@ -628,50 +635,16 @@ namespace Omnipotent.Services.Projects
                 foreach (var project in Store.ListProjects())
                 {
                     if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
-                    var runtime = RuntimeState.Get(project.ProjectID);
-                    var now = DateTime.UtcNow;
-                    if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open
-                        && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > now))
-                        continue;
-                    var tail = EventLog.ReadTail(project.ProjectID, 30);
-
-                    // LLM-outage backoff: if recent wakes keep failing (provider down), don't keep
-                    // firing a doomed keepalive every 15 min — back off exponentially (cap 4h) so a
-                    // sustained outage produces occasional retries, not a steady stream of WakeFailed.
-                    var outcomes = tail.Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed).ToList();
-                    int consecutiveFailures = 0;
-                    for (int i = outcomes.Count - 1; i >= 0 && outcomes[i].Type == ProjectEventTypes.WakeFailed; i--) consecutiveFailures++;
-                    bool providerRetryDue = ProjectWakeRecovery.RetryDue(runtime, "commander", now);
-                    var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
-                    bool resumeDue = ProjectLoopRecovery.RetryDue(runtime.Checkpoint.ResumeAction, now, lastWake?.Timestamp);
-                    bool failureBackoff = false;
-                    if (consecutiveFailures >= 2 && !providerRetryDue && !resumeDue)
+                    // One project must never cost the others their keepalive. RuntimeState.Get throws
+                    // by design when a project's runtime-state file is unreadable (fail closed, to
+                    // protect single-flight), and an unhandled throw here aborted the whole foreach —
+                    // so every project ORDERED AFTER a corrupt one silently stopped being woken, on
+                    // every tick, forever. That is the "only some of my projects are running" bug.
+                    try { KeepaliveProject(project); }
+                    catch (Exception ex)
                     {
-                        var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
-                        failureBackoff = now - outcomes[^1].Timestamp < backoff;
+                        NoteKeepaliveProjectFailure(project, ex);
                     }
-
-                    // Durable work is queued, admission is open, and no wake is running: start one NOW
-                    // rather than waiting out the 14-minute floor below. Every caller that enqueues a
-                    // trigger and then has its wake refused (single-flight raced, lease not acquired,
-                    // admission closed at the time) lands here — including Klives' resume, which is why
-                    // unpausing could look dead for a quarter of an hour with the instruction already
-                    // sitting in the inbox. Wake() is a no-op while one is in flight, so this cannot
-                    // overlap work; queueIfBusy stays false, so nothing is ever double-enqueued.
-                    bool queuedWork = ProjectWakeRecovery.BlockedUntil(runtime, "commander", now) == null
-                        && runtime.PendingTriggers.Any(t => t.ClaimedByWakeID == null
-                            && ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, now)
-                                == ProjectWakeTriggerApplicability.Applicable);
-
-                    // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
-                    if (!failureBackoff && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
-                        && (queuedWork || resumeDue || providerRetryDue || lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
-                        CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
-                            ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
-                            : "Periodic keepalive: resume the next unfinished step from the latest verified checkpoint. Preserve completed work and use the approved plan; revise it only when new evidence requires a change.",
-                            queueIfBusy: false); // ephemeral nudge: never replay stale phase instructions behind a live wake
-
-                    HeartbeatWorkers(project);
                 }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
@@ -680,6 +653,71 @@ namespace Omnipotent.Services.Projects
                 Volatile.Write(ref keepaliveTickStartedAtTicks, 0);
                 Volatile.Write(ref keepaliveRunning, 0);
             }
+        }
+
+        /// <summary>
+        /// Reports a project whose keepalive slice threw, without letting the log drown. A corrupt
+        /// runtime state throws on EVERY tick — four times a minute, per project — so this is rate
+        /// limited to one report per project per 15 minutes and states the consequence plainly:
+        /// that project is not being woken.
+        /// </summary>
+        private void NoteKeepaliveProjectFailure(Project project, Exception ex)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (keepaliveProjectFailureLogs.TryGetValue(project.ProjectID, out DateTime last)
+                && now - last < TimeSpan.FromMinutes(15)) return;
+            keepaliveProjectFailureLogs[project.ProjectID] = now;
+            _ = ServiceLogError(ex,
+                $"Projects: keepalive skipped {project.Name} ({project.ProjectID}) — it is not being woken");
+        }
+
+        /// <summary>One project's slice of a keepalive tick. Throws are contained by the caller.</summary>
+        private void KeepaliveProject(Project project)
+        {
+            var runtime = RuntimeState.Get(project.ProjectID);
+            var now = DateTime.UtcNow;
+            if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open
+                && (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > now))
+                return;
+            var tail = EventLog.ReadTail(project.ProjectID, 30);
+
+            // LLM-outage backoff: if recent wakes keep failing (provider down), don't keep
+            // firing a doomed keepalive every 15 min — back off exponentially (cap 4h) so a
+            // sustained outage produces occasional retries, not a steady stream of WakeFailed.
+            var outcomes = tail.Where(e => e.Type is ProjectEventTypes.WakeCompleted or ProjectEventTypes.WakeFailed).ToList();
+            int consecutiveFailures = 0;
+            for (int i = outcomes.Count - 1; i >= 0 && outcomes[i].Type == ProjectEventTypes.WakeFailed; i--) consecutiveFailures++;
+            bool providerRetryDue = ProjectWakeRecovery.RetryDue(runtime, "commander", now);
+            var lastWake = tail.LastOrDefault(e => e.Type == ProjectEventTypes.CommanderWake);
+            bool resumeDue = ProjectLoopRecovery.RetryDue(runtime.Checkpoint.ResumeAction, now, lastWake?.Timestamp);
+            bool failureBackoff = false;
+            if (consecutiveFailures >= 2 && !providerRetryDue && !resumeDue)
+            {
+                var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
+                failureBackoff = now - outcomes[^1].Timestamp < backoff;
+            }
+
+            // Durable work is queued, admission is open, and no wake is running: start one NOW
+            // rather than waiting out the 14-minute floor below. Every caller that enqueues a
+            // trigger and then has its wake refused (single-flight raced, lease not acquired,
+            // admission closed at the time) lands here — including Klives' resume, which is why
+            // unpausing could look dead for a quarter of an hour with the instruction already
+            // sitting in the inbox. Wake() is a no-op while one is in flight, so this cannot
+            // overlap work; queueIfBusy stays false, so nothing is ever double-enqueued.
+            bool queuedWork = ProjectWakeRecovery.BlockedUntil(runtime, "commander", now) == null
+                && runtime.PendingTriggers.Any(t => t.ClaimedByWakeID == null
+                    && ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, now)
+                        == ProjectWakeTriggerApplicability.Applicable);
+
+            // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
+            if (!failureBackoff && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
+                && (queuedWork || resumeDue || providerRetryDue || lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
+                CommanderRunner.Wake(project, project.Status == ProjectStatus.Planning
+                    ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
+                    : "Periodic keepalive: resume the next unfinished step from the latest verified checkpoint. Preserve completed work and use the approved plan; revise it only when new evidence requires a change.",
+                    queueIfBusy: false); // ephemeral nudge: never replay stale phase instructions behind a live wake
+
+            HeartbeatWorkers(project);
         }
 
         /// <summary>

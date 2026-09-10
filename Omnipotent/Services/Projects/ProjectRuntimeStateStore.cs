@@ -1943,24 +1943,134 @@ namespace Omnipotent.Services.Projects
             CacheDeps.Bump(CacheKey(state.ProjectID));
         }
 
+        /// <summary>
+        /// Set by Projects once the runners exist: true while THIS process has a live wake for the
+        /// project. Consulted only on the corrupt-state repair path, where rebuilding a state would
+        /// drop an active lease. Null (unset) is treated as "unknown", which blocks the rebuild.
+        /// </summary>
+        public Func<string, bool>? HasLiveWake { get; set; }
+
         private ProjectRuntimeState LoadLocked(string projectID)
         {
             string path = GetStatePath(projectID);
             if (!File.Exists(path)) return NewState(projectID);
+            string text;
+            try { text = File.ReadAllText(path); }
+            catch (Exception ex)
+            {
+                // An I/O error is transient (sharing violation, disk hiccup) — it is NOT evidence the
+                // document is bad, so never quarantine on it. Fail closed and let the caller retry.
+                log($"ProjectRuntimeStateStore: failed to read {path}: {ex.Message}");
+                throw new InvalidDataException($"Project runtime state for {projectID} is unreadable; execution is stopped to preserve single-flight safety.", ex);
+            }
+
             try
             {
-                var state = JsonConvert.DeserializeObject<ProjectRuntimeState>(File.ReadAllText(path));
+                var state = JsonConvert.DeserializeObject<ProjectRuntimeState>(text);
                 if (state == null) throw new InvalidDataException("Runtime-state document was empty.");
                 Normalize(state, projectID);
                 return state;
             }
-            catch (Exception ex)
+            catch (Exception strictFailure)
             {
-                // Runtime coordination must fail closed: silently replacing a corrupt active lease
-                // with an empty state could start a second wake.
-                log($"ProjectRuntimeStateStore: failed to load {path}: {ex.Message}");
-                throw new InvalidDataException($"Project runtime state for {projectID} is unreadable; execution is stopped to preserve single-flight safety.", ex);
+                log($"ProjectRuntimeStateStore: failed to load {path}: {strictFailure.Message}");
+                return RepairLocked(projectID, path, text, strictFailure);
             }
+        }
+
+        /// <summary>
+        /// Recovers a runtime state that would not deserialize, instead of bricking the project.
+        ///
+        /// Fail-closed was the right instinct — replacing a corrupt ACTIVE LEASE with an empty state
+        /// could start a second wake — but throwing on every read made the project permanently
+        /// unrunnable with no path back: the wake path, the keepalive and the watchdog all call Get,
+        /// and nothing ever rewrites the file because every writer must read it first. So the project
+        /// stops forever and the only visible symptom is that it quietly never runs again.
+        ///
+        /// Two tiers, most conservative first:
+        ///   1. SALVAGE — re-parse tolerantly, skipping only the members that would not bind. This is
+        ///      the common case (a schema/type change, one bad enum or date) and it keeps the
+        ///      checkpoint, pending triggers and lease intact.
+        ///   2. QUARANTINE — the document is not valid JSON at all (truncated, empty, half-written).
+        ///      Nothing is recoverable from it, so move it aside for inspection and start clean.
+        ///
+        /// Single-flight is still honoured: tier 2 runs only when this process holds no live wake for
+        /// the project. It cannot, in practice — every wake start goes through Mutate → LoadLocked,
+        /// which was already throwing — but the check is cheap and makes the guarantee explicit rather
+        /// than inferred. If a wake IS live, the original fail-closed throw stands.
+        /// </summary>
+        private ProjectRuntimeState RepairLocked(string projectID, string path, string text, Exception strictFailure)
+        {
+            // Tier 1 is only legitimate when the DOCUMENT is intact and merely a MEMBER would not
+            // bind. Tolerant deserialization alone does not draw that line — handing it a truncated
+            // file returns a cheerfully half-populated object, which is the one outcome fail-closed
+            // exists to prevent: a state silently missing its ActiveWakeLease reads as "no wake
+            // running" and lets a second wake start. So parse structurally first, and only salvage a
+            // document that is genuinely well-formed JSON.
+            Newtonsoft.Json.Linq.JObject? document = null;
+            try { document = Newtonsoft.Json.Linq.JObject.Parse(text); }
+            catch { /* structurally broken — not salvageable, fall through to quarantine */ }
+
+            if (document != null)
+            {
+                try
+                {
+                    var salvaged = JsonConvert.DeserializeObject<ProjectRuntimeState>(text, new JsonSerializerSettings
+                    {
+                        Error = (_, args) => args.ErrorContext.Handled = true,
+                    });
+                    if (salvaged != null)
+                    {
+                        Normalize(salvaged, projectID);
+                        // If the lease was present in the file but is not in the salvaged object, the
+                        // one member we cannot afford to lose is exactly the one that was dropped.
+                        bool leaseInFile = document["ActiveWakeLease"] is { } lease
+                            && lease.Type != Newtonsoft.Json.Linq.JTokenType.Null;
+                        if (!(leaseInFile && salvaged.ActiveWakeLease == null))
+                        {
+                            log($"ProjectRuntimeStateStore: salvaged {projectID} runtime state by skipping unreadable "
+                                + $"members ({strictFailure.Message}). Checkpoint revision {salvaged.Checkpoint.Revision} preserved.");
+                            // Rewrite immediately so the next reader takes the fast path and the damage
+                            // is not re-salvaged on every single call.
+                            SaveLocked(salvaged);
+                            return salvaged;
+                        }
+                        log($"ProjectRuntimeStateStore: refusing to salvage {projectID} — the active wake lease is the "
+                            + "member that failed to bind.");
+                    }
+                }
+                catch (Exception salvageFailure)
+                {
+                    log($"ProjectRuntimeStateStore: salvage of {projectID} failed: {salvageFailure.Message}");
+                }
+            }
+
+            bool liveWake;
+            try { liveWake = HasLiveWake?.Invoke(projectID) ?? true; }
+            catch { liveWake = true; }
+            if (liveWake)
+            {
+                throw new InvalidDataException(
+                    $"Project runtime state for {projectID} is unreadable and a wake is currently live; execution is "
+                    + "stopped to preserve single-flight safety.", strictFailure);
+            }
+
+            string quarantine = path + ".corrupt-" + DateTime.UtcNow.ToString("yyyyMMdd'T'HHmmss'Z'");
+            try { File.Move(path, quarantine, overwrite: true); }
+            catch (Exception moveFailure)
+            {
+                log($"ProjectRuntimeStateStore: could not quarantine {path}: {moveFailure.Message}");
+                throw new InvalidDataException(
+                    $"Project runtime state for {projectID} is unreadable and could not be quarantined; execution is "
+                    + "stopped to preserve single-flight safety.", strictFailure);
+            }
+
+            var fresh = NewState(projectID);
+            SaveLocked(fresh);
+            log($"ProjectRuntimeStateStore: {projectID} runtime state was unrecoverable ({strictFailure.Message}). "
+                + $"Quarantined to {Path.GetFileName(quarantine)} and rebuilt empty — the project can run again, but its "
+                + "checkpoint is gone and the Commander will rehydrate from the durable event log.");
+            return fresh;
         }
 
         private void SaveLocked(ProjectRuntimeState state)
@@ -1972,8 +2082,21 @@ namespace Omnipotent.Services.Projects
             {
                 // Checkpoints can include legacy/model text containing lone UTF-16 surrogates.
                 // Repair only those invalid code units; strict UTF-8 must not abort a completed tool.
-                File.WriteAllText(tmp, Data_Handling.UnicodeText.RepairInvalidSurrogates(
+                byte[] payload = new System.Text.UTF8Encoding(false).GetBytes(Data_Handling.UnicodeText.RepairInvalidSurrogates(
                     JsonConvert.SerializeObject(state, Formatting.Indented)));
+
+                // Flush to the DISK, not just the page cache, before the rename commits.
+                // File.WriteAllText + File.Move is only atomic in its metadata: the rename can reach
+                // the journal while the temp file's data blocks have not, so a hard kill or power
+                // loss leaves the live path pointing at a truncated or all-NUL document. That is a
+                // runtime state that will never deserialize again — and until the repair path above
+                // existed, a project that silently never ran again.
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None,
+                    bufferSize: 4096, FileOptions.WriteThrough))
+                {
+                    fs.Write(payload, 0, payload.Length);
+                    fs.Flush(flushToDisk: true);
+                }
                 for (int attempt = 0; ; attempt++)
                 {
                     try { File.Move(tmp, path, overwrite: true); break; }

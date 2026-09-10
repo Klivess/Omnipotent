@@ -168,6 +168,11 @@ namespace Omnipotent.Services.Projects
         /// avoid stacking a redundant nudge behind work that is already running.</summary>
         public bool IsAwake(string projectID, string agentID) => activeWakes.ContainsKey(Key(projectID, agentID));
 
+        /// <summary>True while ANY worker on the project holds an in-flight wake. Used by the
+        /// runtime-state repair path, which must not rebuild a state any live wake is writing to.</summary>
+        public bool HasLiveWake(string projectID)
+            => activeWakes.Keys.Any(k => k.StartsWith(projectID + "/", StringComparison.Ordinal));
+
         /// <summary>Consecutive wakes this agent has ended without a single productive action. Drives
         /// the heartbeat's backoff so an agent with nothing to do costs geometrically less over time.
         /// In-memory on purpose: a restart resets the backoff to base, which is one extra wake.</summary>

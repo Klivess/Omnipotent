@@ -19,6 +19,8 @@ namespace Omnipotent.Services.Projects
         private readonly Projects parent;
         private readonly Action<string> log;
         private CancellationTokenSource? cts;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> projectFailureLogs
+            = new(StringComparer.Ordinal);
 
         // Tunables (could become OmniSettings; kept as constants for V1).
         private static readonly TimeSpan MaxWakeGap = TimeSpan.FromMinutes(30);      // heartbeat staleness
@@ -59,21 +61,40 @@ namespace Omnipotent.Services.Projects
             foreach (var project in parent.Store.ListProjects())
             {
                 if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
-
-                // A pending approval gate means the project is waiting on Klives, not stalled.
-                // Never force-wake it (that cancels the gate wait); remind him once per aged gate.
-                var pending = parent.Gates?.ListPending(project.ProjectID) ?? new List<ProjectGate>();
-                if (pending.Count > 0)
-                {
-                    await RemindAgedGatesAsync(project, pending);
-                    continue;
-                }
-
-                var (diagnosis, wedgedAgentID) = DiagnoseCore(project);
-                if (diagnosis == null) continue;
-
-                await SelfHealAsync(project, diagnosis, wedgedAgentID);
+                // Per project, for the same reason the keepalive is: an unreadable runtime state (or
+                // any other per-project fault) threw out of the whole loop, so every project after it
+                // lost its stall detection too. The watchdog is the last line of defence against a
+                // wedged project — it must not be takeable down by one.
+                try { await TickProjectAsync(project); }
+                catch (Exception ex) { NoteProjectFailure(project, ex); }
             }
+        }
+
+        private async Task TickProjectAsync(Project project)
+        {
+            // A pending approval gate means the project is waiting on Klives, not stalled.
+            // Never force-wake it (that cancels the gate wait); remind him once per aged gate.
+            var pending = parent.Gates?.ListPending(project.ProjectID) ?? new List<ProjectGate>();
+            if (pending.Count > 0)
+            {
+                await RemindAgedGatesAsync(project, pending);
+                return;
+            }
+
+            var (diagnosis, wedgedAgentID) = DiagnoseCore(project);
+            if (diagnosis == null) return;
+
+            await SelfHealAsync(project, diagnosis, wedgedAgentID);
+        }
+
+        /// <summary>Rate-limited so a persistently broken project cannot flood the log every 2 minutes.</summary>
+        private void NoteProjectFailure(Project project, Exception ex)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (projectFailureLogs.TryGetValue(project.ProjectID, out DateTime last)
+                && now - last < TimeSpan.FromMinutes(30)) return;
+            projectFailureLogs[project.ProjectID] = now;
+            log($"Watchdog: skipped {project.Name} ({project.ProjectID}) — stall detection is off for it: {ex.Message}");
         }
 
         /// <summary>
