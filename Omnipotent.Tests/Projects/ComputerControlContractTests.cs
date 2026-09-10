@@ -193,7 +193,7 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"10\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"11\"", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
             Assert.Contains("\"structured-browser-actions\"", dockerfile);
             // Text entry is read back, overlays are cleared, and captchas are solved in-image.

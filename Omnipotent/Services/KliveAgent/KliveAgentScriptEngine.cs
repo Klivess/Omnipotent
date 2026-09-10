@@ -1837,6 +1837,21 @@ namespace Omnipotent.Services.KliveAgent
             return null;
         }
 
+        private static readonly string[] SourceIndexExcludedSegments =
+            { "bin", "obj", "serverBuild", "SavedData", "ffmpeg-download", "work", ".git" };
+
+        // Runtime-deployed trees (serverBuild, SavedData project volumes, build outputs, scratch dirs)
+        // contain full copies of the source and would pollute the class index with duplicates
+        // (and slow it to a crawl). They are not project source.
+        private static bool IsSourceIndexFile(string path)
+        {
+            var normalized = "/" + path.Replace("\\", "/") + "/";
+            foreach (var segment in SourceIndexExcludedSegments)
+                if (normalized.Contains("/" + segment + "/", StringComparison.OrdinalIgnoreCase))
+                    return false;
+            return true;
+        }
+
         private List<ProjectClassInfo> GetProjectClassIndex()
         {
             lock (ProjectClassIndexLock)
@@ -1845,7 +1860,8 @@ namespace Omnipotent.Services.KliveAgent
                     return projectClassIndexCache;
 
                 var classes = new List<ProjectClassInfo>();
-                foreach (var file in Directory.EnumerateFiles(CodebaseRoot, "*.cs", SearchOption.AllDirectories))
+                foreach (var file in Directory.EnumerateFiles(CodebaseRoot, "*.cs", SearchOption.AllDirectories)
+                    .Where(IsSourceIndexFile))
                 {
                     try
                     {
