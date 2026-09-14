@@ -52,6 +52,9 @@ namespace Omnipotent.Services.Projects
         {
             "select_primary_result",
             "complete_project", "request_user_approval", "request_budget_increase", "request_human", "retire_sub_agent", "assign_plan_work", "record_money_spend",
+            // Deciding what happens to a retired agent's work is a staffing decision, and staffing is
+            // the Commander's. A worker offered these would be able to quietly drop work it never owned.
+            "list_handovers", "claim_handover",
             "update_project", "update_plan_progress",
             // Klives talks to the Commander, not to the roster: a worker reports upward with
             // send_agent_message and the Commander decides what reaches him.

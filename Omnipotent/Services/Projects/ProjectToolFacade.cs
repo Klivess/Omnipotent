@@ -86,12 +86,14 @@ public static class ProjectToolFacade
             }),
 
         ("manage_agents",
-            "Command your task force: spawn workers (a 'task' mission for a bounded deliverable, a 'standing' mission for an ongoing beat someone must keep owning), assign them Grand Plan milestones, and retire finished ones to free slots. Keep the roster near its cap while the plan has unowned dependency-ready work. Message an existing agent with send_agent_message instead.",
+            "Command your task force: spawn workers (a 'task' mission for a bounded deliverable, a 'standing' mission for an ongoing beat someone must keep owning), assign them Grand Plan milestones, and retire finished ones to free slots. Keep the roster near its cap while the plan has unowned dependency-ready work. op:handovers/op:claim_handover cover work left by retired agents. Message an existing agent with send_agent_message instead.",
             new[]
             {
                 ("spawn", "spawn_sub_agent"),
                 ("assign_work", "assign_plan_work"),
                 ("retire", "retire_sub_agent"),
+                ("handovers", "list_handovers"),
+                ("claim_handover", "claim_handover"),
             }),
 
         ("vault",

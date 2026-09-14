@@ -1,6 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects
 {
@@ -30,6 +31,13 @@ namespace Omnipotent.Services.Projects
 
         private object LockFor(string projectID) => locks.GetOrAdd(projectID, _ => new object());
         private string AgentsPath(string projectID) => Path.Combine(dir, projectID + ".agents.json");
+
+        // Response-cache dependency key. Every /projects/* GET is cacheable (RequireProject notes a
+        // read of the project index), so a store that neither notes its reads nor bumps on write has
+        // its stale output served back indefinitely — /projects/agents would keep listing an agent
+        // Klives had already removed. Now that the roster can change from OUTSIDE a project save,
+        // rather than only as a side effect of one, this instrumentation is load-bearing.
+        private static string CacheKey(string projectID) => "projects:agents:" + projectID;
 
         public const string CommanderRole = "commander";
 
@@ -138,19 +146,30 @@ namespace Omnipotent.Services.Projects
             return depth;
         }
 
-        public bool Retire(string projectID, string agentID)
+        /// <summary>
+        /// Retires one agent. <paramref name="author"/> is who took the slot ("commander", "klives",
+        /// "system") and <paramref name="reasonNote"/> is the human-readable why, which matters now
+        /// that retirement is no longer always the agent's own work finishing — Klives can lower the
+        /// cap out from under a running assignment, and the log line is what tells the difference.
+        /// Returns the record as it was immediately before retirement so the caller can snapshot the
+        /// work it was holding; null when there was no such active agent.
+        /// </summary>
+        public ProjectAgentRecord? RetireWithRecord(string projectID, string agentID,
+            string author = "commander", string? reasonNote = null)
         {
             lock (LockFor(projectID))
             {
                 var agents = LoadLocked(projectID);
                 var agent = agents.FirstOrDefault(a => a.AgentID == agentID && !a.Retired);
-                if (agent == null) return false;
-                if (string.Equals(agent.AgentID, "commander", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(agent.Role, CommanderRole, StringComparison.OrdinalIgnoreCase))
+                if (agent == null) return null;
+                if (IsCommander(agent))
                     throw new InvalidOperationException("The Commander cannot be retired through the sub-agent lifecycle tool.");
                 var activeChildren = agents.Where(a => !a.Retired && a.ParentAgentID == agent.AgentID).ToList();
                 if (activeChildren.Count > 0)
                     throw new InvalidOperationException($"Retire or reassign this agent's active children first: {string.Join(", ", activeChildren.Select(a => a.AgentID))}.");
+                // Snapshot BEFORE flipping the flag: the caller's handover record is built from this,
+                // and a retired record stops being seeded, messageable or rostered.
+                var snapshot = Clone(agent);
                 agent.Retired = true;
                 agent.RetiredAt = DateTime.UtcNow;
                 SaveLocked(projectID, agents);
@@ -159,12 +178,30 @@ namespace Omnipotent.Services.Projects
                     ProjectID = projectID,
                     AgentID = agentID,
                     Type = ProjectEventTypes.AgentRetired,
-                    Author = "commander",
-                    Text = $"Retired agent {agentID} ({agent.Role}).",
+                    Author = string.IsNullOrWhiteSpace(author) ? "commander" : author.Trim(),
+                    Text = $"Retired agent {agentID} ({agent.Role})."
+                        + (string.IsNullOrWhiteSpace(reasonNote) ? "" : " " + reasonNote!.Trim()),
                 });
-                return true;
+                return snapshot;
             }
         }
+
+        public bool Retire(string projectID, string agentID) =>
+            RetireWithRecord(projectID, agentID) != null;
+
+        /// <summary>One active agent by ID, or null. Does not resolve roles — see TryResolveActiveTarget.</summary>
+        public ProjectAgentRecord? Get(string projectID, string agentID)
+        {
+            if (string.IsNullOrWhiteSpace(agentID)) return null;
+            lock (LockFor(projectID))
+                return LoadLocked(projectID)
+                    .Where(a => !a.Retired && string.Equals(a.AgentID, agentID.Trim(), StringComparison.OrdinalIgnoreCase))
+                    .Select(Clone)
+                    .FirstOrDefault();
+        }
+
+        private static ProjectAgentRecord Clone(ProjectAgentRecord source) =>
+            JsonConvert.DeserializeObject<ProjectAgentRecord>(JsonConvert.SerializeObject(source))!;
 
         public List<ProjectAgentRecord> ListActive(string projectID)
         {
@@ -423,6 +460,7 @@ namespace Omnipotent.Services.Projects
 
         private List<ProjectAgentRecord> LoadLocked(string projectID)
         {
+            CacheDeps.NoteRead(CacheKey(projectID));
             string path = AgentsPath(projectID);
             if (!File.Exists(path)) return new();
             try
@@ -442,6 +480,7 @@ namespace Omnipotent.Services.Projects
             string tmp = path + ".tmp";
             File.WriteAllText(tmp, JsonConvert.SerializeObject(agents, Formatting.Indented));
             File.Move(tmp, path, overwrite: true);
+            CacheDeps.Bump(CacheKey(projectID)); // after the move — the new roster is now visible
         }
     }
 }

@@ -180,6 +180,47 @@ namespace Omnipotent.Services.Projects
                 return true;
             });
 
+        /// <summary>
+        /// Re-points an agent-scoped directive at the Commander because its only recipient was retired.
+        ///
+        /// Reassignment, not re-issue: the directive ID, deliverables, acknowledgement history and
+        /// completion requirements are exactly the ones Klives created, so his instruction survives
+        /// the loss of the agent that happened to be carrying it. Delivery is reset to Active so the
+        /// Commander actually receives it — a directive still marked Delivered/Acknowledged by an agent
+        /// that no longer exists would be filtered out of every future seed and quietly die.
+        /// Returns null when there is no such directive, and leaves resolved directives untouched.
+        /// </summary>
+        public ProjectDirective? ReassignToCommander(string projectID, string directiveID)
+            => Mutate(projectID, directiveID, item =>
+            {
+                if (!item.IsOpen || item.Scope != ProjectDirectiveScope.SpecificAgents) return false;
+                item.Scope = ProjectDirectiveScope.Commander;
+                item.TargetAgentIDs = new List<string>();
+                item.Status = ProjectDirectiveStatus.Active;
+                item.DeliveredAt = null;
+                item.DeliveredToAgentID = null;
+                item.DeliveredWakeID = null;
+                item.Deliveries = new List<ProjectDirectiveDelivery>();
+                item.AcknowledgedAt = null;
+                item.AcknowledgedBy = null;
+                item.Acknowledgement = null;
+                item.RetryCount = 0;
+                item.LastRetryAt = null;
+                return true;
+            });
+
+        /// <summary>Open directives addressed to exactly this agent (not project-wide rules, which
+        /// every future agent inherits anyway and must not be narrowed to the Commander).</summary>
+        public List<ProjectDirective> ListAgentScoped(string projectID, string agentID)
+        {
+            if (string.IsNullOrWhiteSpace(agentID)) return new();
+            return List(projectID, includeResolved: false)
+                .Where(x => x.IsOpen
+                    && x.Scope == ProjectDirectiveScope.SpecificAgents
+                    && x.TargetAgentIDs.Any(t => string.Equals(t, agentID.Trim(), StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+        }
+
         public ProjectDirective? Acknowledge(string projectID, string directiveID, string agentID, string? note = null)
             => Mutate(projectID, directiveID, item =>
             {

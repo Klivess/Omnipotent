@@ -283,8 +283,22 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                         mission = Str("Optional: 'standing' or 'task' to change this worker's mission kind as you reassign it. Omit to leave it unchanged."),
                     }, "milestoneId", "agentID", "objective")),
 
-                Tool("retire_sub_agent", "Retire a sub-agent that has finished its work, freeing a slot against the cap.",
+                // These three descriptions are deliberately terse. Tool schemas are re-sent on every
+                // request of every wake, so a paragraph here is paid for forever; the handover block
+                // in the seed carries the full procedure and is only assembled when one exists.
+                Tool("retire_sub_agent", "Retire a sub-agent, freeing a slot. Its desktop is destroyed and any unfinished work becomes a handover.",
                     Obj(new { agentID = Str("The agent's ID.") }, "agentID")),
+
+                Tool("list_handovers", "List every open handover — unfinished work left by retired agents.",
+                    Obj(new { }, Array.Empty<string>())),
+
+                Tool("claim_handover", "Close one handover: you took the work, reassigned it, or dropped it.",
+                    Obj(new
+                    {
+                        handoverID = Str("From the UNCLAIMED WORK list."),
+                        note = Str("Required: who continues it, or why dropping it is acceptable."),
+                        drop = Bool("Abandon the work instead of continuing it."),
+                    }, "handoverID", "note")),
 
                 Tool("send_agent_message", "Message any agent on the roster (rides the stimulus bus): the commander, or a peer, by agent ID or unique role name. Use it to task, steer, answer, hand off an artifact, or coordinate on adjacent work. Pass 'team' to reach every active worker at once.",
                     Obj(new { agentID = Str("Target agent ID, its unique role name from the roster, 'commander', or 'team' for all active workers."), message = Str("The message.") }, "agentID", "message")),

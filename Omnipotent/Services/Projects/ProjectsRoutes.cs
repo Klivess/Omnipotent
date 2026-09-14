@@ -313,17 +313,10 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("budgets must be finite, tokenBudgetUsd must be > 0, money limits must be ≥ 0, and subAgentCap ≥ 1", code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    if (agentCap.HasValue)
-                    {
-                        int activeAgents = parent.SubAgents.ListActive(project!.ProjectID).Count;
-                        if (agentCap.Value < activeAgents)
-                        {
-                            await req.ReturnResponse($"subAgentCap cannot be lowered below the active roster ({activeAgents}); retire agents first",
-                                code: HttpStatusCode.Conflict);
-                            return;
-                        }
-                    }
-
+                    // Lowering the cap under a live roster used to be a 409 ("retire agents first"),
+                    // which made the cap un-lowerable in exactly the case it exists for. It now applies
+                    // immediately: SetAgentCapAsync reclaims the excess slots, preserves every retired
+                    // agent's work as a handover, destroys their containers, and wakes the Commander.
                     var changes = new List<string>();
                     if (tokenBudget.HasValue && tokenBudget.Value != project!.TokenBudgetUsd)
                     { changes.Add($"token budget ${project.TokenBudgetUsd:0.##} → ${tokenBudget.Value:0.##}"); project.TokenBudgetUsd = tokenBudget.Value; }
@@ -331,11 +324,24 @@ namespace Omnipotent.Services.Projects
                     { changes.Add($"money budget ${project.MoneyBudgetUsd:0.##} → ${moneyBudget.Value:0.##}"); project.MoneyBudgetUsd = moneyBudget.Value; }
                     if (moneyThreshold.HasValue && moneyThreshold.Value != project!.MoneyAutonomousThresholdUsd)
                     { changes.Add($"autonomous threshold ${project.MoneyAutonomousThresholdUsd:0.##} → ${moneyThreshold.Value:0.##}"); project.MoneyAutonomousThresholdUsd = moneyThreshold.Value; }
-                    if (agentCap.HasValue && agentCap.Value != project!.SubAgentCap)
-                    { changes.Add($"agent cap {project.SubAgentCap} → {agentCap.Value}"); project.SubAgentCap = agentCap.Value; }
+                    // Recorded, but NOT applied here — the cap moves through SetAgentCapAsync below so a
+                    // reduction and the retirements it forces are one operation, never a saved cap with
+                    // an over-cap roster still running under it.
+                    int requestedCap = agentCap.HasValue ? Math.Max(1, agentCap.Value) : project!.SubAgentCap;
+                    bool capChanging = agentCap.HasValue && requestedCap != project!.SubAgentCap;
+                    if (capChanging) changes.Add($"agent cap {project!.SubAgentCap} → {requestedCap}");
 
                     if (changes.Count == 0) { await req.ReturnResponse(Json(project)); return; }
                     parent.Store.SaveProject(project!);
+
+                    Projects.AgentCapChangeResult? capChange = null;
+                    if (capChanging)
+                    {
+                        capChange = await parent.SetAgentCapAsync(project!, requestedCap, "klives");
+                        if (capChange.Handovers.Count > 0)
+                            changes.Add($"{capChange.Handovers.Count} agent(s) retired to fit the new cap "
+                                + $"({string.Join(", ", capChange.RetiredAgentIDs)})");
+                    }
 
                     // Re-arm the 80% warning for the new budget; un-pause if spend is back within it.
                     bool withinBudget = parent.Budget.NotifyBudgetChanged(project!.ProjectID);
@@ -367,10 +373,87 @@ namespace Omnipotent.Services.Projects
                                 "budget-increase-resume")
                             : null,
                     });
-                    await req.ReturnResponse(Json(project));
+                    // Still the project object itself, with `retiredAgents` added ALONGSIDE its fields
+                    // rather than wrapping it. A cap reduction has to be able to say who lost their
+                    // slot — silently returning a smaller number is how a destructive action becomes
+                    // invisible — but a wrapper would break every existing reader of this response,
+                    // which reads it as the project. Additive is both.
+                    var payload = JObject.Parse(Json(project));
+                    payload["retiredAgents"] = JArray.FromObject(
+                        (capChange?.Handovers ?? Array.Empty<ProjectAgentHandover>())
+                            .Select(DescribeHandover).ToList(), JsonSerializer.Create(CamelCase));
+                    await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Klives removes specific agents by hand. Same instant, work-preserving path as a cap
+            // reduction: wake cancelled, work snapshotted to a handover, milestones released,
+            // agent-scoped directives re-pointed at the Commander, containers destroyed, Commander
+            // woken. The cap itself is untouched — the freed slots stay available for re-staffing.
+            // POST { projectID, agentIDs: [..] } (or agentID: ".."), optional note.
+            await parent.RegisterHttpRouteAsync("/projects/agents/retire", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = JObject.Parse(req.userMessageContent ?? "{}");
+                    var requested = ParseStringArray(body["agentIDs"]).ToList();
+                    string single = ((string?)body["agentID"] ?? "").Trim();
+                    if (single.Length > 0) requested.Add(single);
+                    requested = requested.Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Select(x => x.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                    if (requested.Count == 0)
+                    {
+                        await req.ReturnResponse("agentID or agentIDs required", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    var roster = parent.SubAgents.ListActive(project!.ProjectID);
+                    var commanderAsked = requested.Where(id => roster.Any(a =>
+                        string.Equals(a.AgentID, id, StringComparison.OrdinalIgnoreCase)
+                        && ProjectSubAgentManager.IsCommander(a))).ToList();
+                    if (commanderAsked.Count > 0)
+                    {
+                        await req.ReturnResponse("the Commander cannot be retired — it is the agent the work is handed back to; "
+                            + "pause or archive the project instead", code: HttpStatusCode.Conflict);
+                        return;
+                    }
+
+                    // Helpers go with their parent, deepest first, so no orphan keeps a slot.
+                    var ordered = ProjectAgentRetirementPolicy.ExpandWithDescendants(roster, requested);
+                    if (ordered.Count == 0)
+                    {
+                        await req.ReturnResponse("no active agent matched", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    string? note = ((string?)body["note"])?.Trim();
+                    var handovers = await parent.RetireAgentsAsync(project!, ordered.Select(a => a.AgentID),
+                        ProjectAgentRetirementReason.KlivesRemoved, "klives", notifyCommander: true,
+                        context: string.IsNullOrWhiteSpace(note)
+                            ? "Klives removed these agents directly. The slots stay available — re-staff them when the work warrants it."
+                            : $"Klives removed these agents directly, saying: {note}");
+                    await req.ReturnResponse(Json(new
+                    {
+                        ok = handovers.Count > 0,
+                        retired = handovers.Select(DescribeHandover).ToList(),
+                        slotsFree = Math.Max(0, project!.SubAgentCap - parent.SubAgents.ListActive(project.ProjectID).Count),
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // The unfinished work of retired agents. ?open=true is what the UI badges.
+            await parent.RegisterHttpRouteAsync("/projects/agents/handovers", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    bool openOnly = string.Equals(req.userParameters?.Get("open"), "true", StringComparison.OrdinalIgnoreCase);
+                    await req.ReturnResponse(Json(parent.Handovers.List(project!.ProjectID, openOnly)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
 
             await parent.RegisterHttpRouteAsync("/projects/resume", async req =>
             {
@@ -694,14 +777,36 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    var agents = parent.SubAgents.ListActive(project!.ProjectID).Select(a => new
+                    var roster = parent.SubAgents.ListActive(project!.ProjectID);
+                    var now = DateTime.UtcNow;
+                    var agents = roster.Select(a => new
                     {
                         a.AgentID,
                         a.Role,
                         Tier = a.Tier.ToString(),
                         a.ParentAgentID,
                         a.CreatedAt,
+                        // Klives can now remove any of these by hand, so the list has to say what
+                        // removing one would actually interrupt rather than just naming it.
+                        Mission = a.MissionKind.ToString(),
+                        WorkStatus = a.WorkStatus.ToString(),
+                        a.Objective,
+                        a.ActiveMilestoneIDs,
+                        a.LastReport,
+                        a.LastReportAt,
+                        a.LastWakeAt,
+                        IsCommander = ProjectSubAgentManager.IsCommander(a),
+                        Awake = parent.SubAgentRunner.IsAwake(project.ProjectID, a.AgentID),
+                        Reclaimable = ProjectSubAgentManager.IsReclaimable(a, now),
+                        // Removing this agent takes its helpers with it; the UI should say so before
+                        // Klives clicks, not after three agents disappear.
+                        HelperAgentIDs = roster.Where(c =>
+                            string.Equals(c.ParentAgentID, a.AgentID, StringComparison.OrdinalIgnoreCase))
+                            .Select(c => c.AgentID).ToList(),
                     }).ToList();
+                    // Still a bare array: the website reads this as one, and the added fields are
+                    // additive. Slot arithmetic and the open-handover count live on
+                    // /projects/agents/handovers rather than changing this shape underneath it.
                     await req.ReturnResponse(Json(agents));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -1622,6 +1727,27 @@ namespace Omnipotent.Services.Projects
                 _ => fallback,
             };
         }
+
+        /// <summary>The UI-facing shape of a retirement: who went, what they were holding, and whether
+        /// anyone still has to pick it up. Deliberately not the whole record — the full handover, with
+        /// the checkpointed next action and directive texts, is /projects/agents/handovers.</summary>
+        private static object DescribeHandover(ProjectAgentHandover h) => new
+        {
+            h.HandoverID,
+            h.AgentID,
+            h.Role,
+            h.Tier,
+            mission = h.MissionKind.ToString(),
+            reason = h.Reason.ToString(),
+            status = h.Status.ToString(),
+            h.Objective,
+            h.ActiveMilestoneIDs,
+            h.DeliverablePaths,
+            h.InterruptedMidWake,
+            disposedContainers = h.DisposedContainerIDs.Count,
+            openDirectives = h.OpenDirectives.Count,
+            h.RetiredAt,
+        };
 
         private static List<string> ParseStringArray(JToken? token)
         {

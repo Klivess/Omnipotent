@@ -95,6 +95,14 @@ namespace Omnipotent.Services.Projects
         public Func<ProjectAgentRecord, string, Task>? StartAgentAsync { get; set; }
         /// <summary>Cancels a retiring agent's in-flight wake before its resources are released.</summary>
         public Func<string, bool>? CancelAgentWake { get; set; }
+        /// <summary>The single retirement path: cancels the wake, preserves the agent's work as a
+        /// handover, releases its milestones, re-points its directives, and destroys its containers.
+        /// (agentIDs, reason) → the handovers recorded.</summary>
+        public Func<IEnumerable<string>, ProjectAgentRetirementReason, Task<IReadOnlyList<ProjectAgentHandover>>>? RetireAgentsAsync { get; set; }
+        /// <summary>Durable record of what retired agents left behind, so their work outlives their slots.</summary>
+        public ProjectAgentHandoverStore? Handovers { get; set; }
+        /// <summary>Closes one handover: (handoverID, claimedBy, note, dropped) → the resolved record.</summary>
+        public Func<string, string, string?, bool, ProjectAgentHandover?>? ResolveHandover { get; set; }
         /// <summary>Recall from KliveAgent's shared memory (Projects is part of KliveAgent): (query, max, sinceUtc, untilUtc) → formatted results.</summary>
         public Func<string, int, DateTime?, DateTime?, Task<string>>? RecallMemoriesAsync { get; set; }
         /// <summary>Save to KliveAgent's shared memory: (content, tags) → confirmation.</summary>
@@ -759,9 +767,34 @@ namespace Omnipotent.Services.Projects
 
                 case "retire_sub_agent":
                 {
-                    string id = (string?)a["agentID"] ?? "";
+                    string id = ((string?)a["agentID"] ?? "").Trim();
                     try
                     {
+                        // One retirement path for everyone. Going through the harness rather than
+                        // retiring the record here is what guarantees a Commander retirement also
+                        // destroys the container and captures anything the agent was still holding —
+                        // a worker "finished" by its own report is regularly still holding a milestone.
+                        if (RetireAgentsAsync != null)
+                        {
+                            var roster = subAgents.ListActive(project.ProjectID);
+                            var ordered = ProjectAgentRetirementPolicy.ExpandWithDescendants(roster, new[] { id });
+                            if (ordered.Count == 0) return new CommanderToolResult($"No active agent {id}.");
+                            var done = await RetireAgentsAsync(ordered.Select(x => x.AgentID),
+                                ProjectAgentRetirementReason.CommanderRetired);
+                            if (done.Count == 0) return new CommanderToolResult($"No active agent {id}.");
+                            var open = done.Where(h => h.Status == ProjectHandoverStatus.Open).ToList();
+                            string extra = ordered.Count > 1
+                                ? $" Its {ordered.Count - 1} helper(s) went with it: {string.Join(", ", ordered.Where(x => x.AgentID != id).Select(x => x.AgentID))}."
+                                : "";
+                            return new CommanderToolResult(
+                                $"Retired {done.Count} agent(s) and destroyed their desktops.{extra}"
+                                + (open.Count > 0
+                                    ? $" {open.Count} had unfinished work — handover(s) {string.Join(", ", open.Select(h => h.HandoverID))} "
+                                      + "are now OPEN in your task-force block. Pick the work up, reassign it, or drop it with "
+                                      + "manage_agents op:claim_handover."
+                                    : " Nothing was left outstanding."));
+                        }
+
                         CancelAgentWake?.Invoke(id);
                         bool ok = subAgents.Retire(project.ProjectID, id);
                         // Free the retired agent's own desktop immediately rather than leaking it until
@@ -771,6 +804,42 @@ namespace Omnipotent.Services.Projects
                         return new CommanderToolResult(ok ? $"Retired agent {id}." : $"No active agent {id}.");
                     }
                     catch (InvalidOperationException ex) { return new CommanderToolResult(ex.Message); }
+                }
+
+                case "list_handovers":
+                {
+                    if (Handovers == null) return new CommanderToolResult("Handover records are unavailable.");
+                    var open = Handovers.List(project.ProjectID, openOnly: true);
+                    if (open.Count == 0) return new CommanderToolResult("No open handovers — every retired agent's work is accounted for.");
+                    return new CommanderToolResult(Handovers.DescribeForPrompt(project.ProjectID));
+                }
+
+                case "claim_handover":
+                {
+                    if (Handovers == null || ResolveHandover == null)
+                        return new CommanderToolResult("Handover records are unavailable.");
+                    string handoverID = ((string?)a["handoverID"] ?? "").Trim();
+                    string note = ((string?)a["note"] ?? "").Trim();
+                    bool dropped = (bool?)a["drop"] ?? false;
+                    if (handoverID.Length == 0)
+                        return new CommanderToolResult("Provide 'handoverID' — see the UNCLAIMED WORK list in your task-force block.");
+                    // A drop is a real decision with a real cost, so it must be argued for. Closing a
+                    // handover with no account of what happens to the work is how preserved work gets
+                    // lost anyway, one silent claim at a time.
+                    if (note.Length == 0)
+                        return new CommanderToolResult(dropped
+                            ? "Say why this work is being dropped in 'note' — what will not happen, and why that is acceptable for the goal."
+                            : "Say in 'note' who is continuing this work and from where (yourself, or the agent ID you reassigned it to).");
+                    var existing = Handovers.Get(project.ProjectID, handoverID);
+                    if (existing == null) return new CommanderToolResult($"No handover {handoverID} in this project.");
+                    if (existing.Status != ProjectHandoverStatus.Open)
+                        return new CommanderToolResult($"Handover {handoverID} was already {existing.Status.ToString().ToLowerInvariant()} by {existing.ClaimedBy}.");
+                    var resolved = ResolveHandover(handoverID, actingAgentID, note, dropped);
+                    if (resolved == null) return new CommanderToolResult($"No handover {handoverID} in this project.");
+                    return new CommanderToolResult(dropped
+                        ? $"Handover {handoverID} ({resolved.Role}'s work) dropped and logged. It will stop appearing in your task-force block."
+                        : $"Handover {handoverID} ({resolved.Role}'s work) picked up. Its milestones are yours now — "
+                          + "assign them with manage_agents op:assign_work or work them on your own step ledger.");
                 }
 
                 case "assign_plan_work":

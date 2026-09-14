@@ -306,6 +306,9 @@ namespace Omnipotent.Services.Projects
         public const string ToolResult = "tool-result";
         public const string AgentSpawned = "agent-spawned";
         public const string AgentRetired = "agent-retired";
+        public const string AgentHandover = "agent-handover";          // a retired agent's work, preserved for a successor
+        public const string AgentHandoverResolved = "agent-handover-resolved"; // that work was picked up, or deliberately dropped
+        public const string AgentCapChanged = "agent-cap-changed";      // Klives raised or lowered the roster ceiling
         public const string DesktopChanged = "desktop-changed";        // a desktop was created/discovered/restored/removed
         public const string ApprovalRequested = "approval-requested";
         public const string ApprovalResolved = "approval-resolved";

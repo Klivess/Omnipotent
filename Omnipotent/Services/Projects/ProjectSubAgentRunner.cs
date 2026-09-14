@@ -58,6 +58,12 @@ namespace Omnipotent.Services.Projects
         public string? Wake(Project project, ProjectAgentRecord agent, string trigger, bool queueIfBusy = true)
         {
             if (project.Status != ProjectStatus.Active || agent.Retired) return null;
+            // The caller's record can be a snapshot taken before the agent lost its slot — FinishWake
+            // in particular re-wakes from the record it captured when the wake started. Retirement is
+            // no longer only something the Commander does at a moment of its choosing: Klives can
+            // remove an agent, or lower the cap, mid-wake. Without this re-read a stale
+            // `Retired == false` would let a reclaimed slot quietly keep running and keep spending.
+            if (parent.SubAgents.Get(project.ProjectID, agent.AgentID) == null) return null;
             string key = Key(project.ProjectID, agent.AgentID);
             ActiveWake active;
             lock (WakeGate(key))

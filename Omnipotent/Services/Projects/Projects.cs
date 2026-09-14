@@ -104,6 +104,9 @@ namespace Omnipotent.Services.Projects
         public ProjectOverviewService Overview { get; private set; } = null!;
         /// <summary>Versioned Grand Plan — the strategic north star Klives approves before work begins.</summary>
         public ProjectGrandPlanStore GrandPlans { get; private set; } = null!;
+        /// <summary>What each retired agent was holding when its slot was taken away. Klives can lower
+        /// the agent cap under a live roster, so retirement is no longer always "its work finished".</summary>
+        public ProjectAgentHandoverStore Handovers { get; private set; } = null!;
         /// <summary>Orchestrates adversarial councils (transient tool-less LLM seats + a Chair).</summary>
         public ProjectCouncilRunner CouncilRunner { get; private set; } = null!;
         public ProjectSubAgentRunner SubAgentRunner { get; private set; } = null!;
@@ -176,6 +179,7 @@ namespace Omnipotent.Services.Projects
             EventBroadcaster = new ProjectEventBroadcaster(EventLog, msg => ServiceLog(msg), Activity);
             Digests = new ProjectDigestStore(msg => ServiceLog(msg));
             Directives = new ProjectDirectiveStore(msg => ServiceLog(msg));
+            Handovers = new ProjectAgentHandoverStore(msg => ServiceLog(msg));
             RuntimeState = new ProjectRuntimeStateStore(msg => ServiceLog(msg));
             Retrieval = new ProjectRetrievalIndex(EventLog);
             EventLog.EventAppended += Retrieval.Ingest;
@@ -378,7 +382,16 @@ namespace Omnipotent.Services.Projects
             WakeCycle.DescribeTaskForce = pid =>
             {
                 var p = Store.GetProject(pid);
-                return p == null ? "" : SubAgents.DescribeTaskForce(pid, p.SubAgentCap);
+                if (p == null) return "";
+                string roster = SubAgents.DescribeTaskForce(pid, p.SubAgentCap);
+                // Unclaimed handovers ride the roster block rather than a section of their own. They
+                // only ever appear at the moment the roster changed, so folding them in here costs the
+                // provider's prefix cache nothing that retiring the agent had not already cost — a
+                // separate section higher in the seed would invalidate everything behind it instead.
+                string handovers = "";
+                try { handovers = Handovers.DescribeForPrompt(pid); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: handover block failed for {pid}"); }
+                return string.IsNullOrWhiteSpace(handovers) ? roster : roster + "\n" + handovers;
             };
             // 48h raw-media retention sweep (§7) + idle/orphan container reap, hourly.
             retentionTimer = new System.Threading.Timer(async _ =>
@@ -961,10 +974,16 @@ namespace Omnipotent.Services.Projects
         /// means a specific wake accepted it, and Deferred means it will remain in project memory
         /// until the project can run again.
         /// </summary>
+        /// <param name="allowRulePromotion">
+        /// False for machine-generated notices. A one-off system message like "these four agents were
+        /// retired — do not spawn replacements above the new cap" is constraint-shaped English, so the
+        /// auto-promoter would file it as a permanent Rule injected into every future wake forever.
+        /// Promotion is for what KLIVES typed, not for what the harness says on his behalf.
+        /// </param>
         public ProjectCommandReceipt MessageProjectWithReceipt(string projectID, string text,
             ProjectDirectiveKind kind = ProjectDirectiveKind.Steering, bool remember = false,
             string? key = null, int priority = 100, IEnumerable<string>? expectedArtifactPaths = null,
-            string? batchID = null)
+            string? batchID = null, bool allowRulePromotion = true)
         {
             var project = Store.GetProject(projectID);
             if (project == null)
@@ -975,7 +994,7 @@ namespace Omnipotent.Services.Projects
             if (remember) kind = ProjectDirectiveKind.Rule;
             var scope = kind == ProjectDirectiveKind.Rule ? ProjectDirectiveScope.AllAgents : ProjectDirectiveScope.Commander;
             var receipt = CreateAndDeliverDirective(project, text, kind, scope, Array.Empty<string>(), "commander",
-                key, priority, expectedArtifactPaths, batchID);
+                key, priority, expectedArtifactPaths, batchID, allowRulePromotion);
             // Also covers a message auto-promoted to a Rule inside CreateAndDeliverDirective, which widens
             // the scope to AllAgents after this local `scope` was computed.
             if (receipt.Accepted && (scope == ProjectDirectiveScope.AllAgents || receipt.PromotedToRule))
@@ -1111,7 +1130,8 @@ namespace Omnipotent.Services.Projects
 
         private ProjectCommandReceipt CreateAndDeliverDirective(Project project, string text, ProjectDirectiveKind kind,
             ProjectDirectiveScope scope, IEnumerable<string> targetAgentIDs, string deliveryTargetAgentID,
-            string? key, int priority, IEnumerable<string>? expectedArtifactPaths, string? batchID = null)
+            string? key, int priority, IEnumerable<string>? expectedArtifactPaths, string? batchID = null,
+            bool allowRulePromotion = true)
         {
             text = (text ?? "").Trim();
             var expected = (expectedArtifactPaths ?? Array.Empty<string>()).Where(x => !string.IsNullOrWhiteSpace(x))
@@ -1126,7 +1146,8 @@ namespace Omnipotent.Services.Projects
             // either sits on the books forever or disappears the moment the Commander replies to it. Save it
             // as what it actually is. Only fires on unambiguous constraint grammar with no deliverable named.
             bool promotedToRule = false;
-            if (kind != ProjectDirectiveKind.Rule && expected.Count == 0 && Settings.Get(project.ProjectID).AutoPromoteRules
+            if (allowRulePromotion
+                && kind != ProjectDirectiveKind.Rule && expected.Count == 0 && Settings.Get(project.ProjectID).AutoPromoteRules
                 && ProjectDirectiveClassifier.ClassifyStandingConstraint(text) == ProjectDirectiveKind.Rule)
             {
                 kind = ProjectDirectiveKind.Rule;
@@ -1602,6 +1623,13 @@ namespace Omnipotent.Services.Projects
                     return Task.CompletedTask;
                 },
                 CancelAgentWake = agentID => SubAgentRunner.CancelAgent(project.ProjectID, agentID),
+                Handovers = Handovers,
+                // The Commander retiring its own worker is not a roster change it needs telling about,
+                // so this path skips the notification the Klives-side paths send.
+                RetireAgentsAsync = (agentIDs, reason) =>
+                    RetireAgentsAsync(project, agentIDs, reason, actingAgentID, notifyCommander: false),
+                ResolveHandover = (handoverID, claimedBy, note, dropped) =>
+                    ResolveHandover(project.ProjectID, handoverID, claimedBy, note, dropped),
                 CompleteProjectAsync = () => CompleteProjectAsync(project),
                 RenameDiscordChannelAsync = DiscordManager == null ? null : () => DiscordManager.RenameProjectChannelAsync(project),
                 DisposeAgentDesktopAsync = agentID => DisposeAgentDesktopAsync(project.ProjectID, agentID),
@@ -2159,6 +2187,332 @@ namespace Omnipotent.Services.Projects
                 try { await DiscordManager.PostAttentionAsync(p, "✅ Grand Plan approved", "The project is now Active — work begins."); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: activation Discord post failed"); }
             }
+        }
+
+        /// <summary>Outcome of an agent-cap change: what the ceiling moved to, and who lost a slot.</summary>
+        public sealed record AgentCapChangeResult(
+            int PreviousCap, int NewCap, IReadOnlyList<ProjectAgentHandover> Handovers)
+        {
+            public bool CapChanged => PreviousCap != NewCap;
+            public IReadOnlyList<string> RetiredAgentIDs => Handovers.Select(h => h.AgentID).ToList();
+        }
+
+        /// <summary>
+        /// Sets the agent cap, reclaiming slots immediately when it drops below the live roster.
+        ///
+        /// Lowering the cap under running agents used to be refused outright ("retire agents first"),
+        /// which made the cap un-lowerable in exactly the situation it is for: a task force that has
+        /// grown too big or too expensive while everyone is mid-assignment. It now applies at once —
+        /// the excess agents are retired synchronously, their containers are destroyed, and everything
+        /// they were holding is written to a handover the Commander is woken with. Nothing about the
+        /// work is lost; only the slots are.
+        /// </summary>
+        public async Task<AgentCapChangeResult> SetAgentCapAsync(Project project, int newCap,
+            string changedBy = "klives", bool notifyCommander = true)
+        {
+            ArgumentNullException.ThrowIfNull(project);
+            newCap = Math.Max(1, newCap);
+            var stored = Store.GetProject(project.ProjectID) ?? project;
+            int previous = stored.SubAgentCap;
+            if (previous != newCap)
+            {
+                stored.SubAgentCap = newCap;
+                Store.SaveProject(stored);
+                project.SubAgentCap = newCap; // lift the in-wake snapshot too, like ActivateProjectAsync
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = stored.ProjectID,
+                    Type = ProjectEventTypes.AgentCapChanged,
+                    Author = changedBy,
+                    Text = $"Agent cap {previous} → {newCap}.",
+                    PayloadJson = JsonConvert.SerializeObject(new { previousCap = previous, newCap, changedBy }),
+                });
+            }
+
+            var roster = SubAgents.ListActive(stored.ProjectID);
+            if (roster.Count <= newCap)
+                return new AgentCapChangeResult(previous, newCap, Array.Empty<ProjectAgentHandover>());
+
+            // The harness picks, synchronously. See ProjectAgentRetirementPolicy for why this cannot
+            // wait on a Commander wake and still honour "instantly".
+            var doomed = ProjectAgentRetirementPolicy.SelectForCap(roster, newCap, DateTime.UtcNow);
+            var handovers = await RetireAgentsAsync(stored, doomed.Select(a => a.AgentID),
+                ProjectAgentRetirementReason.CapLowered, changedBy, notifyCommander,
+                $"Klives lowered this project's agent cap from {previous} to {newCap}, so {doomed.Count} "
+                + $"slot(s) were reclaimed automatically. You did not choose these agents and they did not finish.");
+            return new AgentCapChangeResult(previous, newCap, handovers);
+        }
+
+        /// <summary>
+        /// Retires agents immediately, preserving everything they were holding.
+        ///
+        /// This is the single retirement path — the Commander's retire tool, Klives removing an agent
+        /// by hand, and a cap reduction all come through here, so a retirement can never half-happen
+        /// (roster updated but container leaked, or container destroyed but work forgotten). For each
+        /// agent, in order: its live wake is cancelled, its work is snapshotted into a durable
+        /// handover, its Grand Plan milestones are released, Klives directives addressed to it alone
+        /// are re-pointed at the Commander, and its desktop containers are destroyed. The Commander is
+        /// then woken ONCE with the whole set rather than once per agent.
+        ///
+        /// Helpers are dragged out with their parent by the caller's ordering
+        /// (<see cref="ProjectAgentRetirementPolicy.ExpandWithDescendants"/>), deepest first, so the
+        /// "retire your children first" guard is satisfied rather than bypassed.
+        /// </summary>
+        public async Task<IReadOnlyList<ProjectAgentHandover>> RetireAgentsAsync(
+            Project project, IEnumerable<string> agentIDs, ProjectAgentRetirementReason reason,
+            string retiredBy = "klives", bool notifyCommander = true, string? context = null)
+        {
+            ArgumentNullException.ThrowIfNull(project);
+            ArgumentNullException.ThrowIfNull(agentIDs);
+            string pid = project.ProjectID;
+            var recorded = new List<ProjectAgentHandover>();
+
+            foreach (string rawID in agentIDs)
+            {
+                string agentID = (rawID ?? "").Trim();
+                if (agentID.Length == 0) continue;
+                var live = SubAgents.Get(pid, agentID);
+                if (live == null || ProjectSubAgentManager.IsCommander(live)) continue;
+
+                // 1. Stop it generating before anything it owns is taken away, so it cannot write a
+                //    report against state that no longer exists.
+                bool interrupted = false;
+                try { interrupted = SubAgentRunner.CancelAgent(pid, agentID, DescribeRetirementForAgent(reason)); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cancelling {agentID}'s wake before retirement failed"); }
+
+                // 2. Read everything that is about to become unreachable BEFORE retiring the record.
+                var resume = TryGetAgentResumeAction(pid, agentID);
+                var agentDirectives = TryListAgentDirectives(pid, agentID);
+                var containerIDs = ListAgentContainerIDs(pid, agentID);
+
+                ProjectAgentRecord? snapshot;
+                try
+                {
+                    snapshot = SubAgents.RetireWithRecord(pid, agentID, retiredBy,
+                        ProjectAgentHandoverStore.DescribeReason(reason) + ".");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    // Active children the caller did not expand. Refusing is correct — an orphaned
+                    // helper would hold a slot forever — so surface it rather than silently skipping.
+                    _ = ServiceLogError(ex, $"Projects: could not retire {agentID}");
+                    continue;
+                }
+                if (snapshot == null) continue;
+
+                // 3. Release what the retired agent was holding.
+                var releasedMilestones = new List<string>();
+                try { releasedMilestones = GrandPlans.ReleaseOwnership(pid, agentID); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: releasing {agentID}'s milestones failed"); }
+
+                foreach (var directive in agentDirectives)
+                {
+                    try { Directives.ReassignToCommander(pid, directive.DirectiveID); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: re-pointing directive {directive.DirectiveID} at the Commander failed"); }
+                }
+
+                // A resume action keyed to a retired agent is dead weight in the checkpoint — its
+                // content now lives in the handover, where a successor can actually read it.
+                try { RuntimeState.ClearAgentResumeAction(pid, agentID); } catch { }
+                try { Activity.End(pid, agentID); } catch { }
+
+                // 4. The container goes now, not at the hourly reap: a slot Klives took back should
+                //    stop costing ~2 GB the moment he takes it.
+                try { await DisposeAgentDesktopAsync(pid, agentID); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: disposing {agentID}'s desktop on retirement failed"); }
+
+                var handover = new ProjectAgentHandover
+                {
+                    ProjectID = pid,
+                    AgentID = snapshot.AgentID,
+                    Role = snapshot.Role,
+                    Tier = snapshot.Tier.ToString(),
+                    ParentAgentID = snapshot.ParentAgentID,
+                    MissionKind = snapshot.MissionKind,
+                    WorkStatus = snapshot.WorkStatus,
+                    Reason = reason,
+                    RetiredBy = retiredBy,
+                    Objective = snapshot.Objective,
+                    // The plan is the authority on what it owned; fall back to the agent's own list
+                    // when there is no approved plan to release ownership from.
+                    ActiveMilestoneIDs = releasedMilestones.Count > 0
+                        ? releasedMilestones
+                        : snapshot.ActiveMilestoneIDs.ToList(),
+                    DeliverablePaths = snapshot.DeliverablePaths.ToList(),
+                    LastReport = snapshot.LastReport,
+                    LastReportAt = snapshot.LastReportAt,
+                    LastWakeAt = snapshot.LastWakeAt,
+                    ResumeAction = resume?.Summary,
+                    ResumePreconditions = resume?.Preconditions?.ToList() ?? new List<string>(),
+                    OpenDirectives = agentDirectives.Select(d => new ProjectHandoverDirective
+                    {
+                        DirectiveID = d.DirectiveID,
+                        Kind = d.Kind.ToString(),
+                        Text = d.Text,
+                        ExpectedArtifactPaths = d.ExpectedArtifactPaths.ToList(),
+                    }).ToList(),
+                    DisposedContainerIDs = containerIDs,
+                    InterruptedMidWake = interrupted,
+                    RetiredAt = DateTime.UtcNow,
+                };
+
+                // An agent that finished cleanly and was retired by its own Commander is not a handover
+                // — there is no unclaimed work, and an Open record would nag the seed forever. Record
+                // it resolved so the audit trail is complete without the roster block growing noise.
+                bool unfinishedWork = reason != ProjectAgentRetirementReason.CommanderRetired
+                    || interrupted
+                    || handover.ActiveMilestoneIDs.Count > 0
+                    || handover.OpenDirectives.Count > 0;
+                if (!unfinishedWork)
+                {
+                    handover.Status = ProjectHandoverStatus.Claimed;
+                    handover.ClaimedBy = retiredBy;
+                    handover.ClaimedAt = handover.RetiredAt;
+                    handover.ClaimNote = "Retired after delivering; nothing was left outstanding.";
+                }
+
+                try { handover = Handovers.Record(handover); }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: recording {agentID}'s handover failed"); }
+
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = pid,
+                    AgentID = agentID,
+                    Type = ProjectEventTypes.AgentHandover,
+                    Author = retiredBy,
+                    Text = (handover.Status == ProjectHandoverStatus.Open
+                            ? $"Work preserved from {snapshot.Role} ({agentID}) and waiting for an owner: "
+                            : $"Closing record for {snapshot.Role} ({agentID}), nothing left outstanding: ")
+                        + $"handover {handover.HandoverID}. {ProjectAgentHandoverStore.DescribeReason(reason)}."
+                        + (handover.ActiveMilestoneIDs.Count > 0
+                            ? $" Milestones now unowned: {string.Join(", ", handover.ActiveMilestoneIDs)}."
+                            : "")
+                        + (interrupted ? " Its wake was interrupted mid-flight." : ""),
+                    PayloadJson = JsonConvert.SerializeObject(new
+                    {
+                        handoverID = handover.HandoverID,
+                        reason = reason.ToString(),
+                        handover.Status,
+                        milestones = handover.ActiveMilestoneIDs,
+                        directives = handover.OpenDirectives.Select(d => d.DirectiveID),
+                        containers = handover.DisposedContainerIDs,
+                    }),
+                });
+                recorded.Add(handover);
+            }
+
+            if (notifyCommander && recorded.Count > 0)
+                NotifyCommanderOfRetirements(project, recorded, context);
+            return recorded;
+        }
+
+        /// <summary>
+        /// Tells the Commander its roster shrank, in one durable message that also wakes it now.
+        ///
+        /// It goes through the same Klives-directive path as a chat message rather than a bare event,
+        /// for two reasons: an event only reaches the Commander if it happens to survive the recent-events
+        /// window, and a directive is delivered the moment it is created — including to a wake already
+        /// in flight — which is what makes "notified immediately" true rather than "notified eventually".
+        /// </summary>
+        private void NotifyCommanderOfRetirements(Project project,
+            IReadOnlyList<ProjectAgentHandover> handovers, string? context)
+        {
+            var open = handovers.Where(h => h.Status == ProjectHandoverStatus.Open).ToList();
+            var sb = new StringBuilder();
+            sb.AppendLine($"ROSTER CHANGE — {handovers.Count} agent(s) were retired by {handovers[0].RetiredBy} and are gone from your task force.");
+            if (!string.IsNullOrWhiteSpace(context)) sb.AppendLine(context!.Trim());
+            foreach (var h in handovers)
+                sb.AppendLine($"· {h.Role} ({h.AgentID}) — {ProjectAgentHandoverStore.DescribeReason(h.Reason)}"
+                    + (h.InterruptedMidWake ? ", interrupted mid-wake" : "")
+                    + (h.Status == ProjectHandoverStatus.Open ? $". Handover {h.HandoverID} is OPEN." : ". Nothing outstanding."));
+            if (open.Count > 0)
+            {
+                sb.AppendLine($"Their work was preserved, not cancelled. {open.Count} open handover(s) are in your TASK FORCE block "
+                    + "with each agent's objective, unowned milestones, expected deliverables and exact checkpointed next action.");
+                sb.AppendLine("Do this now, before any other work: read each handover, then either pick the work up yourself, "
+                    + "re-assign it to a remaining worker, or deliberately drop it — and close each one with "
+                    + "manage_agents op:claim_handover so the block stops carrying it. Files they wrote to /project survive; "
+                    + "their desktops do not.");
+            }
+            sb.Append("Your cap has not changed by accident — do not spawn replacements above it, and do not ask Klives to undo it.");
+
+            try
+            {
+                // Priority above an ordinary Klives message: a shrunken roster invalidates the staffing
+                // decisions every other instruction in the seed was written against. Rule promotion is
+                // off — this notice is constraint-shaped prose ("do not spawn replacements above it")
+                // and would otherwise be filed as a permanent rule seeded into every wake forever.
+                MessageProjectWithReceipt(project.ProjectID, sb.ToString(),
+                    ProjectDirectiveKind.Steering, remember: false, key: null, priority: 400,
+                    allowRulePromotion: false);
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: notifying the Commander of a roster change failed"); }
+        }
+
+        private static string DescribeRetirementForAgent(ProjectAgentRetirementReason reason) =>
+            reason switch
+            {
+                ProjectAgentRetirementReason.CapLowered =>
+                    "Klives lowered this project's agent cap and your slot was reclaimed. Your work has been preserved and handed to the Commander.",
+                ProjectAgentRetirementReason.KlivesRemoved =>
+                    "Klives removed you from this project's roster. Your work has been preserved and handed to the Commander.",
+                ProjectAgentRetirementReason.ParentRetired =>
+                    "The agent you report to was retired, so your slot went with it. Your work has been preserved and handed to the Commander.",
+                _ => "Retired by the Commander.",
+            };
+
+        private ProjectResumeAction? TryGetAgentResumeAction(string projectID, string agentID)
+        {
+            try { return RuntimeState.Get(projectID).Checkpoint.AgentResumeActions.GetValueOrDefault(agentID); }
+            catch { return null; }
+        }
+
+        private List<ProjectDirective> TryListAgentDirectives(string projectID, string agentID)
+        {
+            try { return Directives.ListAgentScoped(projectID, agentID); }
+            catch { return new List<ProjectDirective>(); }
+        }
+
+        private List<string> ListAgentContainerIDs(string projectID, string agentID)
+        {
+            if (Desktops == null) return new();
+            try
+            {
+                return Desktops.Registry.ForProject(projectID)
+                    .Where(r => string.Equals(r.AgentID, agentID, StringComparison.OrdinalIgnoreCase))
+                    .Select(r => r.ContainerID).ToList();
+            }
+            catch { return new(); }
+        }
+
+        /// <summary>
+        /// Closes one open handover: the work was picked up, re-assigned, or deliberately dropped.
+        /// Logged either way — "we decided not to finish this" is a real project decision and belongs
+        /// on the timeline next to the retirement that caused it.
+        /// </summary>
+        public ProjectAgentHandover? ResolveHandover(string projectID, string handoverID, string claimedBy,
+            string? note, bool dropped)
+        {
+            var resolved = Handovers.Claim(projectID, handoverID, claimedBy, note, dropped);
+            if (resolved == null) return null;
+            EventLog.Append(new ProjectEvent
+            {
+                ProjectID = projectID,
+                AgentID = claimedBy,
+                Type = ProjectEventTypes.AgentHandoverResolved,
+                Author = string.IsNullOrWhiteSpace(claimedBy) ? "commander" : claimedBy,
+                Text = (dropped ? "Dropped" : "Picked up")
+                    + $" handover {resolved.HandoverID} from retired agent {resolved.AgentID} ({resolved.Role})."
+                    + (string.IsNullOrWhiteSpace(note) ? "" : " " + note!.Trim()),
+                PayloadJson = JsonConvert.SerializeObject(new
+                {
+                    handoverID = resolved.HandoverID,
+                    resolved.AgentID,
+                    status = resolved.Status.ToString(),
+                    dropped,
+                }),
+            });
+            return resolved;
         }
 
         /// <summary>Disposes a specific agent's own desktop container(s), if any. Safe no-op without Desktops.</summary>

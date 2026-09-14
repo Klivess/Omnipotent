@@ -323,6 +323,37 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
+        /// Clears <paramref name="agentID"/>'s ownership of every milestone it held, returning the
+        /// milestone IDs that just became unowned.
+        ///
+        /// Called when an agent is retired mid-assignment. A milestone left pointing at a retired
+        /// owner reads as staffed in the plan block Klives and the Commander both see, while nobody
+        /// is working it — the exact failure the staffing checkpoint exists to prevent. Status is
+        /// left alone deliberately: the work genuinely is in progress, it just has no owner, and
+        /// rewinding it to Pending would discard that.
+        /// </summary>
+        public List<string> ReleaseOwnership(string projectID, string agentID)
+        {
+            if (string.IsNullOrWhiteSpace(agentID)) return new();
+            lock (LockFor(projectID))
+            {
+                var doc = LoadLocked(projectID);
+                var v = CurrentApprovedLocked(doc);
+                var owned = v?.Content?.Milestones
+                    .Where(m => string.Equals(m.OwnerAgentID, agentID.Trim(), StringComparison.OrdinalIgnoreCase))
+                    .ToList() ?? new List<PlanMilestone>();
+                if (owned.Count == 0) return new();
+                foreach (var m in owned)
+                {
+                    m.OwnerAgentID = null;
+                    m.UpdatedAt = DateTime.UtcNow;
+                }
+                SaveLocked(projectID, doc);
+                return owned.Select(m => m.ID).ToList();
+            }
+        }
+
+        /// <summary>
         /// Marks a success criterion met/unmet on the current approved version, in place. Matches by id
         /// first, then case-insensitively by text. Returns the updated criterion, or null if no match.
         /// </summary>
