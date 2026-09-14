@@ -209,7 +209,11 @@ namespace Omnipotent.Services.Stratum
                     string summarySession = $"stratum-engineer-summary-{ctx.Run.RunID}";
                     llm.StartToolSession(summarySession, null);
                     llm.AppendUserMessageToToolSession(summarySession, prompt);
-                    var summaryResp = await llm.QueryToolSessionAsync(summarySession, new List<KliveLLM.HFWrapper.HFTool>(), modelOverride: utilityModel);
+                    // One query, then the session is dropped. It shares an id-space with the real
+                    // multi-turn engineer session, so no string rule could tell the two apart -- which
+                    // is exactly why the class is stated here rather than inferred.
+                    var summaryResp = await llm.QueryToolSessionAsync(summarySession, new List<KliveLLM.HFWrapper.HFTool>(), modelOverride: utilityModel,
+                        workClass: KliveLLM.AIRouterWorkClass.OneShot);
                     if (summaryResp.Success && !string.IsNullOrWhiteSpace(summaryResp.Response))
                     {
                         meta2.RollingSummary = summaryResp.Response.Trim();

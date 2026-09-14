@@ -217,6 +217,12 @@ namespace Omnipotent.Services.KliveLLM
         /// the shared queue for the rest of the run.</summary>
         internal AIRouterFairUseLimiter FairUse { get; set; } = sharedAIRouterFairUse;
 
+        /// <summary>Whether the shared AIRouter queue is currently holding work for this session
+        /// family. Static because the stall detectors that need it must not depend on resolving a
+        /// service instance, and the envelope is process-wide anyway.</summary>
+        internal static bool AIRouterHasQueuedWork(string sessionIdPrefix)
+            => sharedAIRouterFairUse.HasQueuedWork(sessionIdPrefix);
+
         internal sealed class RemoteLLMProviderConfiguration
         {
             public RemoteLLMProviderConfiguration(LLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model, string? serviceTier = null)
@@ -280,6 +286,21 @@ namespace Omnipotent.Services.KliveLLM
             {
                 thinkingType = e.Setting.Value;
                 ServiceLog($"Thinking type updated to '{thinkingType}'.");
+            }
+
+            if (e.Setting.Name == "AIRouterSchedulerMode" && valueChanged)
+            {
+                // A field read by the admission path, never a swap of the gate object: in-flight
+                // leases are untouched and the queue simply drains under the new policy from the next
+                // decision onwards. That is what makes this a safe thing to flip under load.
+                ApplySchedulerMode(e.Setting.Value);
+                ServiceLog($"AIRouter scheduler mode set to '{e.Setting.Value}'.");
+            }
+
+            if (e.Setting.Name == "AIRouterResidencyAlphaPercent" && valueChanged)
+            {
+                ApplySchedulerAlpha(e.Setting.Value);
+                ServiceLog($"AIRouter warm-cohort margin set to {e.Setting.Value}%.");
             }
 
             if (e.Setting.Name == "RemoteLLMProvider" && valueChanged)
@@ -418,6 +439,40 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
             await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
+
+            // How much of the cache-aware scheduler is allowed to affect dispatch.
+            //
+            // Ships as Enforce, because the point of it is the prefix efficiency it protects and a
+            // scheduler that is off protects nothing. That is safe to default to for two reasons that
+            // matter more than the mode itself: it refuses to act at all until the survival curve rests
+            // on real evidence (falling back to arrival order until then), and it is one field write
+            // away from being switched off under load. Observe sits between the two for anyone who
+            // wants to read its decisions against production traffic before trusting them.
+            //
+            // Note what is NOT here — the 3/240/10M limits stay compile-time constants, because they
+            // are AIRouter's policy rather than our tuning knobs.
+            string configuredMode = await GetDropdownOmniSetting(
+                "AIRouterSchedulerMode", AIRouterSchedulerMode.Enforce.ToString(), SchedulerModeOptions, false, false);
+            ApplySchedulerMode(configuredMode);
+            string configuredAlpha = await GetStringOmniSetting(
+                "AIRouterResidencyAlphaPercent",
+                ((int)(AIRouterResidencyScheduler.DefaultAlpha * 100)).ToString(), false, false);
+            ApplySchedulerAlpha(configuredAlpha);
+        }
+
+        internal static readonly string[] SchedulerModeOptions =
+            Enum.GetNames(typeof(AIRouterSchedulerMode));
+
+        private void ApplySchedulerMode(string? value)
+        {
+            if (Enum.TryParse(value, ignoreCase: true, out AIRouterSchedulerMode parsed))
+                FairUse.SetMode(parsed);
+        }
+
+        private void ApplySchedulerAlpha(string? value)
+        {
+            if (int.TryParse(value, out int percent) && percent > 0)
+                FairUse.SetAlpha(percent / 100d);
         }
 
         private async Task SetupLocalLLM()
@@ -1309,7 +1364,13 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Send the session's current structured message log (plus the tool definitions) to the
         /// remote provider. Appends the assistant response — including any requested tool_calls — back to
         /// the log, and returns it. ToolCalls is populated when the model wants to invoke tools.</summary>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0)
+        /// <param name="workClass">
+        /// What this request is for, which decides how it competes for one of AIRouter's three slots.
+        /// Left null it is inferred from the session id, which is right for most callers; the sites
+        /// whose intent a session id cannot express (a one-shot summary sitting in the same id-space as
+        /// a real multi-turn session, for instance) state it explicitly.
+        /// </param>
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -1407,7 +1468,11 @@ namespace Omnipotent.Services.KliveLLM
                 thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete,
                 modelRoutes: modelRoutes,
                 enableOpenRouterContextCompression: enableOpenRouterContextCompression,
-                samplingParameters: samplingParameters);
+                samplingParameters: samplingParameters,
+                // Session id AND cache epoch: the epoch is what makes a compaction or brief rotation
+                // read as a genuinely new prefix rather than a continuation of one that no longer exists.
+                cachePrefixHint: $"{sessionId}#{cacheEpochID}",
+                workClass: workClass);
             var msg = response.choices[0].message;
             var rawContent = HFWrapper.ContentToText(msg?.content);
             var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -1747,14 +1812,47 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>Queue behind the flat-fee router's fair-use envelope, or pass straight through for
-        /// every other provider. Null means "no limiter applies".</summary>
+        /// every other provider. Null means "no limiter applies".
+        ///
+        /// NOTE ON ORDERING: this completes BEFORE client.SendAsync, so the HttpClient timeout (5 min)
+        /// does not cover the queue wait — which is what makes a long park safe. Do not "tidy" the
+        /// acquisition inside the send, or a queued request starts burning its own request timeout.</summary>
         private async Task<AIRouterFairUseLease?> AcquireFairUseAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? cachePrefixHint = null,
+            AIRouterWorkClass? workClass = null,
+            AIRouterSlotIntent intent = AIRouterSlotIntent.Turn)
         {
             if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
-            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), cancellationToken);
+            var ticket = BuildWorkTicket(cachePrefixHint, workClass, payload.model ?? remoteProvider.Model, intent);
+            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), ticket, cancellationToken);
+        }
+
+        /// <summary>
+        /// Identity of the cached prefix this request will extend.
+        ///
+        /// The model belongs in the key because the same session can be routed elsewhere mid-wake via
+        /// modelOverride/modelRoutes, and a different model is a different cache. The hint itself
+        /// carries the session id AND its cache epoch, so a compaction or brief rotation produces a new
+        /// key — which correctly ENDS the old residency instead of leaving the scheduler believing a
+        /// prefix that no longer exists is still warm.
+        /// </summary>
+        private static AIRouterWorkTicket BuildWorkTicket(string? cachePrefixHint, AIRouterWorkClass? workClass,
+            string? model, AIRouterSlotIntent intent)
+        {
+            if (string.IsNullOrWhiteSpace(cachePrefixHint))
+                return AIRouterWorkTicket.Anonymous("no-session") with { Intent = intent };
+
+            string sessionId = cachePrefixHint;
+            int hash = cachePrefixHint.IndexOf('#');
+            if (hash > 0) sessionId = cachePrefixHint[..hash];
+
+            return new AIRouterWorkTicket(
+                $"{cachePrefixHint}|{model ?? ""}",
+                workClass ?? AIRouterWorkClassifier.Classify(sessionId),
+                intent);
         }
 
         // ── AIRouter model resolution ──
@@ -1866,11 +1964,23 @@ namespace Omnipotent.Services.KliveLLM
             if (provider is not (LLMProvider.OpenRouter or LLMProvider.AIRouter)
                 || usage.prompt_tokens_details?.HasCacheReadMetrics != true)
                 return;
+
+            // Close the scheduler's learning loop. The lease already knows how long this exact prefix
+            // had been idle; the response says how much of it survived. That pairing is the only way to
+            // learn a cache lifetime the provider never tells us and we cannot configure.
+            lease?.ReportCacheOutcome(usage.prompt_tokens, usage.prompt_tokens_details.cached_tokens);
+
             string? warning = PrefixCacheMeter.Shared.Record(
                 usage.prompt_tokens, usage.prompt_tokens_details.cached_tokens);
             if (warning != null)
             {
                 try { _ = ServiceLog(warning); } catch { }
+            }
+
+            string? capacity = FairUse.ConsumeCapacityReport();
+            if (capacity != null)
+            {
+                try { _ = ServiceLog(capacity); } catch { }
             }
         }
 
@@ -1927,7 +2037,9 @@ namespace Omnipotent.Services.KliveLLM
             Action<HFWrapper.HFToolCall>? onToolCallComplete = null,
             IReadOnlyList<string>? modelRoutes = null,
             bool enableOpenRouterContextCompression = false,
-            ModelSamplingParameters? samplingParameters = null)
+            ModelSamplingParameters? samplingParameters = null,
+            string? cachePrefixHint = null,
+            AIRouterWorkClass? workClass = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -1971,7 +2083,8 @@ namespace Omnipotent.Services.KliveLLM
 
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             var response = await SendInferencePayloadAsync(
-                remoteProvider, payload, cancellationToken, onToken, onToolCallComplete);
+                remoteProvider, payload, cancellationToken, onToken, onToolCallComplete,
+                cachePrefixHint, workClass);
             stopwatch.Stop();
             response.request_provider = remoteProvider.Provider.ToString();
             response.request_duration_ms = stopwatch.ElapsedMilliseconds;
@@ -2298,14 +2411,18 @@ namespace Omnipotent.Services.KliveLLM
             HFWrapper.HFLLMInferenceRequest payload,
             CancellationToken cancellationToken,
             Action<string>? onToken,
-            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null,
+            string? cachePrefixHint = null,
+            AIRouterWorkClass? workClass = null)
         {
             if (onToken == null)
-                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken);
+                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken,
+                    cachePrefixHint, workClass);
 
             try
             {
-                return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken, onToolCallComplete);
+                return await SendStreamingPayloadAsync(remoteProvider, payload, onToken, cancellationToken,
+                    onToolCallComplete, cachePrefixHint, workClass);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -2321,7 +2438,11 @@ namespace Omnipotent.Services.KliveLLM
                 try { await ServiceLog($"Streaming attempt failed before output ({ex.Message}); falling back to non-streaming."); } catch { }
                 payload.stream = false;
                 payload.stream_options = null;
-                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken);
+                // The streaming lease is already released by its using-scope, and the prefix key is
+                // identical because it comes from the same hint — so the fallback re-acquires against
+                // the same conversation rather than reading as a new cold one.
+                return await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken,
+                    cachePrefixHint, workClass, AIRouterSlotIntent.StreamFallback);
             }
         }
 
@@ -2352,7 +2473,9 @@ namespace Omnipotent.Services.KliveLLM
             HFWrapper.HFLLMInferenceRequest payload,
             Action<string> onToken,
             CancellationToken cancellationToken,
-            Action<HFWrapper.HFToolCall>? onToolCallComplete = null)
+            Action<HFWrapper.HFToolCall>? onToolCallComplete = null,
+            string? cachePrefixHint = null,
+            AIRouterWorkClass? workClass = null)
         {
             payload.stream = true;
             payload.stream_options = new { include_usage = true };
@@ -2361,7 +2484,8 @@ namespace Omnipotent.Services.KliveLLM
             // A streamed generation occupies a parallel slot for its WHOLE duration, not just the
             // request/response round-trip, so the lease is method-scoped: it is released when the SSE
             // body ends. Non-flat-fee providers get null and pass straight through.
-            using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
+            using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload,
+                cancellationToken, cachePrefixHint, workClass, AIRouterSlotIntent.Turn);
             var providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
             using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
@@ -2591,7 +2715,10 @@ namespace Omnipotent.Services.KliveLLM
         internal async Task<HFWrapper.HFLLMInferenceResponse> SendPayloadWithRetryAsync(
             RemoteLLMProviderConfiguration remoteProvider,
             HFWrapper.HFLLMInferenceRequest payload,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? cachePrefixHint = null,
+            AIRouterWorkClass? workClass = null,
+            AIRouterSlotIntent firstAttemptIntent = AIRouterSlotIntent.Turn)
         {
             // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
             // fresh request per attempt from this cached body.
@@ -2614,7 +2741,11 @@ namespace Omnipotent.Services.KliveLLM
                 System.Diagnostics.Stopwatch? providerStopwatch = null;
                 try
                 {
-                    fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken);
+                    // A retry is another request against the windows, but it is NOT another turn: it
+                    // must not consume the allowance that keeps a genuine tool loop holding its slot.
+                    fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken,
+                        cachePrefixHint, workClass,
+                        attempt > 1 ? AIRouterSlotIntent.Retry : firstAttemptIntent);
                     totalQueueDurationMs += fairUse?.QueueDurationMs ?? 0;
                     using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
                     {

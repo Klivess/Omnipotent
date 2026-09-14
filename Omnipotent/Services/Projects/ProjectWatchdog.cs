@@ -154,7 +154,17 @@ namespace Omnipotent.Services.Projects
             var approvalBeat = parent.Gates?.LastResolutionAt(project.ProjectID);
             var liveActivity = parent.Activity?.ListForProject(project.ProjectID) ?? Array.Empty<ProjectAgentActivity>();
             var streamBeat = liveActivity.Select(x => (DateTime?)x.UpdatedAt).Max();
-            var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat, approvalBeat, streamBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
+            // A request parked in the shared AIRouter queue is a healthy agent waiting for one of
+            // three slots, not a wedged one. The queue's park ceiling deliberately exceeds the
+            // client-side brief idle limit — dispatching a continuation onto an evicted prefix is the
+            // one thing the prefix-efficiency target forbids — so a legitimately parked turn can
+            // outlast MaxWakeGap once parks stack. Without this beat the scheduler would manufacture
+            // false stalls out of its own correct behaviour.
+            DateTime? queuedBeat =
+                KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-commander-{project.ProjectID}")
+                || KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-agent-{project.ProjectID}-")
+                    ? now : null;
+            var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat, approvalBeat, streamBeat, queuedBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
             var lastBeat = observedBeats.DefaultIfEmpty(project.CreatedAt).Max();
             if (tail.Count > 0 && now - lastBeat > MaxWakeGap)
                 return ($"No Commander activity or verified worker heartbeat in over {MaxWakeGap.TotalMinutes:0} minutes " +
@@ -189,6 +199,9 @@ namespace Omnipotent.Services.Projects
             var staleLease = runtime?.ActiveAgentWakeLeases
                 .FirstOrDefault(x => now - x.Value.LastHeartbeatAt > MaxWakeGap
                     && !liveActivity.Any(a => a.AgentID == x.Key && now - a.UpdatedAt <= MaxWakeGap)
+                    // Same reasoning as the heartbeat beat above: a worker whose turn is parked in
+                    // the AIRouter queue is waiting, not wedged.
+                    && !KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-agent-{project.ProjectID}-{x.Key}")
                     && !(parent.Gates?.LastResolutionAt(project.ProjectID, x.Key) is { } resolved
                         && now - resolved <= MaxWakeGap));
             if (staleLease.HasValue && !string.IsNullOrWhiteSpace(staleLease.Value.Key))

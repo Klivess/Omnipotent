@@ -42,6 +42,10 @@ public sealed class AnalyticsPromptCacheSnapshot
     public int LatencyBreakdownRequests { get; set; }
     public long AverageQueueDurationMs { get; set; }
     public long TotalQueueDurationMs { get; set; }
+    /// <summary>The queue-wait tail. Parking is a deliberate trade, so the mean is the wrong place to
+    /// look: these are what say whether the scheduler is spending patience it should not be.</summary>
+    public long MaxQueueDurationMs { get; set; }
+    public int ParkedRequests { get; set; }
     public long AverageProviderDurationMs { get; set; }
     public long TotalProviderDurationMs { get; set; }
     public double LatencyBreakdownCoveragePct { get; set; }
@@ -139,6 +143,10 @@ public sealed class AnalyticsPromptCacheSample
 internal static class ProjectPromptCacheAnalytics
 {
     private const int MinimumReadyRequests = 20;
+
+    /// <summary>Above this a request was held by a scheduling decision rather than by ordinary
+    /// contention, so counting it separately is what distinguishes deliberate parking from a stall.</summary>
+    private const long ParkedRequestThresholdMs = 5_000;
     private const long MinimumReadyPromptTokens = 1_000_000;
     private const int MinimumReusablePrefixSamples = 10;
     internal const double TargetCacheHitRatePct = 99.7;
@@ -176,7 +184,11 @@ internal static class ProjectPromptCacheAnalytics
             if (record.LatencyBreakdownAvailable)
             {
                 result.LatencyBreakdownRequests++;
-                result.TotalQueueDurationMs += Math.Max(0, record.QueueDurationMs);
+                long queued = Math.Max(0, record.QueueDurationMs);
+                result.TotalQueueDurationMs += queued;
+                if (queued > result.MaxQueueDurationMs) result.MaxQueueDurationMs = queued;
+                // Anything held this long was a scheduling decision, not contention noise.
+                if (queued > ParkedRequestThresholdMs) result.ParkedRequests++;
                 result.TotalProviderDurationMs += Math.Max(0, record.ProviderDurationMs);
             }
             if (cached > 0) result.HitRequests++;
@@ -261,6 +273,8 @@ internal static class ProjectPromptCacheAnalytics
             TotalRequestDurationMs = snapshots.Sum(item => item.TotalRequestDurationMs),
             LatencyBreakdownRequests = snapshots.Sum(item => item.LatencyBreakdownRequests),
             TotalQueueDurationMs = snapshots.Sum(item => item.TotalQueueDurationMs),
+            MaxQueueDurationMs = snapshots.Count == 0 ? 0 : snapshots.Max(item => item.MaxQueueDurationMs),
+            ParkedRequests = snapshots.Sum(item => item.ParkedRequests),
             TotalProviderDurationMs = snapshots.Sum(item => item.TotalProviderDurationMs),
             FirstTurnRequests = snapshots.Sum(item => item.FirstTurnRequests),
             FirstTurnPromptTokens = snapshots.Sum(item => item.FirstTurnPromptTokens),

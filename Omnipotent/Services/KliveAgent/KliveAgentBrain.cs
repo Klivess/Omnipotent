@@ -1567,7 +1567,10 @@ namespace Omnipotent.Services.KliveAgent
                             if (useToolCalling)
                             {
                                 // The structured session already holds system + user + any prior tool turns.
-                                llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete);
+                                // Klives is sitting there waiting on this one, so it is never parked
+                                // behind autonomous background work.
+                                llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete,
+                                    workClass: KliveLLM.AIRouterWorkClass.Interactive);
                             }
                             else
                             {

@@ -1445,7 +1445,11 @@ namespace Omnipotent.Services.Projects
                     compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens,
                     contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
                     enableOpenRouterContextCompression: contextPolicy != null,
-                    samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters));
+                    samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters),
+                    // One query on a throwaway session: it can never reuse a prefix, and its prefill
+                    // evicts prefixes that could. Stated rather than inferred so it is scheduled into
+                    // genuine slack instead of ahead of a conversation that is still warm.
+                    workClass: KliveLLM.AIRouterWorkClass.OneShot);
                 if (resp.Success && (resp.PromptTokens > 0 || resp.CompletionTokens > 0))
                     await Budget.RecordTokenSpendAsync(
                         projectID,
@@ -1496,7 +1500,10 @@ namespace Omnipotent.Services.Projects
                 compactAboveTokensOverride: contextPolicy?.CompactionTriggerTokens,
                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
                 enableOpenRouterContextCompression: contextPolicy != null,
-                samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters));
+                samplingParameters: ModelParameterCatalog.ToSamplingParameters(routeParameters),
+                // A council is a burst of related turns whose later rounds can reuse a prefix, so it
+                // earns residency -- but capped, so one council cannot evict the whole agent cohort.
+                workClass: KliveLLM.AIRouterWorkClass.Burst);
             if (!resp.Success) return null;
             return new CouncilTurn(
                 true,
