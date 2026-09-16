@@ -457,7 +457,11 @@ namespace Omnipotent.Services.Projects.Containers
                 takeBrowserSessionAsync: (sourceAgentID, token) =>
                     TakeBrowserSessionAsync(project, agentID, sourceAgentID, token),
                 actionSettleMs: actionSettleMs,
-                typingDelayMs: typingDelayMs);
+                typingDelayMs: typingDelayMs,
+                // 0 on a container created before the helper service existed; the adapter then falls
+                // back to docker exec, so an old desktop keeps working without being recreated.
+                browserServiceHostPort: record.BrowserServiceHostPort,
+                browserServiceHost: vncHost);
         }
 
         /// <summary>

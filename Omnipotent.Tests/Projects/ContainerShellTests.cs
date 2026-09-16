@@ -78,6 +78,99 @@ namespace Omnipotent.Tests.Projects
             Assert.True(stream.Truncated);
         }
 
+        /// <summary>
+        /// The quietest half of the 2026-09-16 stall. Queuing behind a wedged action wrote no event
+        /// at all, so the agent looked idle for 24 minutes. It must fail, and say why.
+        /// </summary>
+        [Fact]
+        public async Task Adapter_DoesNotQueueForeverBehindAWedgedDesktopAction()
+        {
+            using var transport = new VncTransport("127.0.0.1", 1, _ => { });
+            using var actionGate = new SemaphoreSlim(1, 1);
+            var adapter = new ContainerToolAdapter(
+                transport, "container", "agent", actionGate,
+                visualGateWait: TimeSpan.FromMilliseconds(150));
+
+            await actionGate.WaitAsync();   // stand in for the action that never finished
+            try
+            {
+                var result = await adapter
+                    .ExecuteAsync("computer_screenshot", "{}")
+                    .WaitAsync(TimeSpan.FromSeconds(5));
+
+                Assert.False(result.Success);
+                Assert.Equal(ContainerToolAdapter.ContainerToolFailureKind.Contention, result.FailureKind);
+                Assert.Contains("wedged rather than busy", result.Text, StringComparison.Ordinal);
+            }
+            finally { actionGate.Release(); }
+        }
+
+        /// <summary>
+        /// The 2026-09-16 stall: a Docker call that ignores its cancellation token. Passing a token
+        /// into Docker.DotNet is not a bound — exec attach is a hijacked stream with the library's
+        /// own timeout disabled — so the deadline has to be enforced from outside the call.
+        /// </summary>
+        [Fact]
+        public async Task Deadline_AbandonsADockerCallThatIgnoresItsCancellationToken()
+        {
+            var neverCompletes = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var start = DateTime.UtcNow;
+
+            var thrown = await Assert.ThrowsAsync<ContainerDaemonTimeoutException>(() =>
+                ContainerOrchestrator.WithDeadlineAsync(
+                    _ => neverCompletes.Task, TimeSpan.FromMilliseconds(150), "an exec", CancellationToken.None));
+
+            Assert.True(DateTime.UtcNow - start < TimeSpan.FromSeconds(5), "the deadline must not wait on the call");
+            Assert.Contains("an exec", thrown.Message, StringComparison.Ordinal);
+            // The abandoned call is left running on purpose; failing it later must not crash anything.
+            neverCompletes.SetException(new InvalidOperationException("late failure from an abandoned exec"));
+            await Task.Delay(50);
+        }
+
+        [Fact]
+        public async Task Deadline_ReturnsTheResultWhenTheCallAnswersInTime()
+        {
+            string result = await ContainerOrchestrator.WithDeadlineAsync(
+                async _ => { await Task.Delay(10); return "ok"; },
+                TimeSpan.FromSeconds(30), "an exec", CancellationToken.None);
+            Assert.Equal("ok", result);
+        }
+
+        /// <summary>A caller cancelling is not the daemon stalling, and must not be reported as one.</summary>
+        [Fact]
+        public async Task Deadline_SurfacesCallerCancellationRatherThanADaemonTimeout()
+        {
+            using var caller = new CancellationTokenSource();
+            var pending = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var call = ContainerOrchestrator.WithDeadlineAsync(
+                _ => pending.Task, TimeSpan.FromMinutes(5), "an exec", caller.Token);
+            caller.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
+        }
+
+        /// <summary>
+        /// A wedged host must not read to the agent as a bad selector. It retried the action for
+        /// twenty minutes last time because the failure said only "TaskCanceledException".
+        /// </summary>
+        [Fact]
+        public async Task Adapter_ReportsADaemonStallAsTheHostsFaultNotTheAgents()
+        {
+            using var transport = new VncTransport("127.0.0.1", 1, _ => { });
+            using var actionGate = new SemaphoreSlim(1, 1);
+            var adapter = new ContainerToolAdapter(
+                transport, "container", "agent", actionGate,
+                terminalAsync: (_, _, _, _) => throw new ContainerDaemonTimeoutException(
+                    "the Docker daemon did not complete a command in container abc within 35s"));
+
+            var result = await adapter.ExecuteAsync("computer_terminal",
+                "{\"command\":\"echo hi\",\"workingDirectory\":\"/project\"}");
+
+            Assert.False(result.Success);
+            Assert.Equal(ContainerToolAdapter.ContainerToolFailureKind.Infrastructure, result.FailureKind);
+            Assert.Contains("container host being unresponsive", result.Text, StringComparison.Ordinal);
+            Assert.DoesNotContain("TaskCanceledException", result.Text, StringComparison.Ordinal);
+        }
+
         [Fact]
         public async Task Adapter_TerminalDoesNotResolveOrEchoVaultPlaceholders()
         {

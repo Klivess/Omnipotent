@@ -44,7 +44,8 @@ RUN useradd -m -s /bin/bash agent && mkdir -p /project && chown agent:agent /pro
 
 COPY desktop-entrypoint.sh /usr/local/bin/desktop-entrypoint.sh
 COPY browser-inspect.py /usr/local/bin/browser-inspect.py
-RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py
+COPY browser-service.py /usr/local/bin/browser-service.py
+RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py /usr/local/bin/browser-service.py
 
 # Baked template for the per-desktop main-world fingerprint extension. The launcher copies this into
 # a writable dir and adds a one-line persona.js before loading it, so the page-visible environment
@@ -66,11 +67,11 @@ RUN curl --fail --location --retry 3 \
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"11","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint"],"display":":1"}' \
+    '{"imageVersion":"12","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint","browser-service"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent
 WORKDIR /home/agent
 
-EXPOSE 5901
+EXPOSE 5901 5902
 ENTRYPOINT ["/usr/local/bin/desktop-entrypoint.sh"]

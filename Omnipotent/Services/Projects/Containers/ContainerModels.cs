@@ -14,6 +14,12 @@ namespace Omnipotent.Services.Projects.Containers
         public string? AgentID { get; set; }
         /// <summary>Host port (bound to 127.0.0.1) where the container's VNC server is reachable.</summary>
         public int VncHostPort { get; set; }
+        /// <summary>
+        /// Host port (bound to 127.0.0.1) for the container's browser-helper service, or 0 on a
+        /// container built before it existed. Non-zero is what lets a browser action skip Docker
+        /// entirely; zero falls back to `docker exec` and the stalls that come with it.
+        /// </summary>
+        public int BrowserServiceHostPort { get; set; }
         /// <summary>Framebuffer geometry requested at creation.</summary>
         public int Width { get; set; } = 1920;
         public int Height { get; set; } = 1080;
@@ -50,6 +56,20 @@ namespace Omnipotent.Services.Projects.Containers
         public string ImageVersion { get; init; } = "";
         /// <summary>Probed capability name → "yes"/"no"/"up"/"down". Empty when the probe couldn't run.</summary>
         public Dictionary<string, string> Capabilities { get; init; } = new(StringComparer.Ordinal);
+    }
+
+    /// <summary>
+    /// The Docker daemon did not answer inside the budget the caller allowed it.
+    ///
+    /// Distinct from a command timing out INSIDE a container (which comes back as a normal
+    /// <see cref="ContainerShellResult"/> with exit 124): this says the host-side call never
+    /// returned, so nothing is known about whether the work ran. Its own type because the two need
+    /// opposite responses — a slow page is the agent's problem, an unresponsive daemon is not, and
+    /// telling an agent to "retry the selector" when the host is wedged sends it in circles.
+    /// </summary>
+    public sealed class ContainerDaemonTimeoutException : Exception
+    {
+        public ContainerDaemonTimeoutException(string message) : base(message) { }
     }
 
     /// <summary>Docker labels used to recognise our containers during reconciliation.</summary>

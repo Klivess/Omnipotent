@@ -100,6 +100,18 @@ start_xfce_component xfwm4 xfwm4 --compositor=off
 start_xfce_component xfdesktop xfdesktop
 start_xfce_component xfce4-panel xfce4-panel
 
+# The browser helper's front door. Supervised exactly like the shell components because the harness
+# drives every structured browser action through it: if this is down the desktop falls back to
+# `docker exec`, which is slower and — when the host is busy — the thing that used to hang for
+# tens of minutes. Restarting it is always safe; it holds no state of its own.
+start_browser_service() {
+    if ! pgrep -u "$(id -u)" -f "browser-service.py" >/dev/null 2>&1; then
+        DISPLAY=:1 python3 /usr/local/bin/browser-service.py >>/tmp/browser-service.log 2>&1 &
+    fi
+}
+
+start_browser_service
+
 # Keep the ordinary desktop usable if an individual shell component exits. Readiness checks all
 # three components, so a persistently broken shell is reported and rebuilt instead of being
 # mistaken for a healthy black framebuffer.
@@ -109,6 +121,7 @@ start_xfce_component xfce4-panel xfce4-panel
         start_xfce_component xfwm4 xfwm4 --compositor=off
         start_xfce_component xfdesktop xfdesktop
         start_xfce_component xfce4-panel xfce4-panel
+        start_browser_service
         sleep 5
     done
 ) &

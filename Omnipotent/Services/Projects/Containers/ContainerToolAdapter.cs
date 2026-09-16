@@ -21,6 +21,16 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly ContainerDesktopCommandBridge desktop;
         private readonly InputLockCoordinator? inputLock;
         private readonly SemaphoreSlim actionGate;
+        private readonly BrowserServiceClient browserService;
+
+        /// <summary>
+        /// How long an agent will queue behind another action on the same desktop before giving up.
+        /// Comfortably above the longest single action that can legitimately run — a browser op may
+        /// ask for 120s, plus a browser launch and the screenshot around it — and far below the
+        /// silent 24-minute wait this replaces.
+        /// </summary>
+        private static readonly TimeSpan DefaultVisualGateWait = TimeSpan.FromMinutes(5);
+        private readonly TimeSpan visualGateWait;
         private readonly string containerID;
         private readonly string? agentID;
         private readonly Func<string, Task<string>>? resolveSecretsAsync;
@@ -109,8 +119,11 @@ namespace Omnipotent.Services.Projects.Containers
             Func<string, string?, int, CancellationToken, Task<ContainerShellResult>>? terminalAsync = null,
             Func<string, Task<string>>? resolveSecretsAsync = null,
             Func<string, CancellationToken, Task<string>>? takeBrowserSessionAsync = null,
-            int actionSettleMs = 350, int typingDelayMs = 18)
+            int actionSettleMs = 350, int typingDelayMs = 18, TimeSpan? visualGateWait = null,
+            int browserServiceHostPort = 0, string browserServiceHost = "127.0.0.1")
         {
+            browserService = new BrowserServiceClient(browserServiceHost, browserServiceHostPort);
+            this.visualGateWait = visualGateWait ?? DefaultVisualGateWait;
             this.transport = transport;
             this.containerID = containerID;
             this.agentID = agentID;
@@ -161,7 +174,20 @@ namespace Omnipotent.Services.Projects.Containers
             // Container-local shell execution does not read or inject VNC state. Let it remain
             // usable while a live viewer or a degraded framebuffer has a visual action queued.
             bool usesVisualGate = tool is not ("computer_terminal" or "computer_window_state" or "computer_browser_inspect");
-            if (usesVisualGate) await actionGate.WaitAsync(ct);
+            if (usesVisualGate && !await actionGate.WaitAsync(visualGateWait, ct))
+            {
+                // Previously an unbounded wait, and the quietest failure in the system: no event is
+                // written until an action starts, so an agent queued behind a wedged predecessor
+                // simply produced nothing. On 2026-09-16 that read as 24 minutes of an agent doing
+                // nothing at all. Every action ahead of this one is now individually bounded, so
+                // waiting longer than this means something is wrong rather than merely slow.
+                doc?.Dispose();
+                return ContainerToolResult.Fail(
+                    $"Another action on this desktop has been running for over {visualGateWait.TotalSeconds:0}s and still holds it. "
+                    + "The desktop is wedged rather than busy — do not queue more desktop actions behind it; "
+                    + "use a non-desktop tool, or report the host as degraded.",
+                    ContainerToolFailureKind.Contention);
+            }
             try
             {
                 if (IsMutating(tool) && inputLock != null && agentID != null && !inputLock.TryAcquire(containerID, agentID))
@@ -177,6 +203,18 @@ namespace Omnipotent.Services.Projects.Containers
                     return ContainerToolResult.Fail("Action cancelled; held input was released.", ContainerToolFailureKind.Cancelled);
                 }
                 return ContainerToolResult.Fail("Container terminal command cancelled.", ContainerToolFailureKind.Cancelled);
+            }
+            catch (ContainerDaemonTimeoutException ex)
+            {
+                // Named separately so the agent is not told its selector or its page was at fault.
+                // The 2026-09-16 stall reached the Commander as a bare "TaskCanceledException: The
+                // operation has timed out.", which reads as "try again differently" — so it did,
+                // repeatedly, against a host that was never going to answer any faster.
+                return ContainerToolResult.Fail(
+                    $"{tool} could not run: {ex.Message}. This is the container host being unresponsive, not this "
+                    + "desktop or this page — the same call would stall for any agent right now. Do something that "
+                    + "does not need the desktop, and report the host as degraded if it keeps happening.",
+                    ContainerToolFailureKind.Infrastructure);
             }
             catch (Exception ex)
             {
@@ -364,13 +402,31 @@ namespace Omnipotent.Services.Projects.Containers
             // -1 means "whatever tab is actually in front". An explicit 0 used to be the default, so
             // every inspection after a couple of navigations described a stale background page.
             int tabIndex = RequestedTabIndex(a);
-            ContainerShellResult? last = null;
+            string lastError = "";
             for (int attempt = 1; attempt <= 3; attempt++)
             {
-                last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 45, ct);
-                string stdout = last.Stdout.Trim();
-                if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
-                    return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                // Same preference as the action path: the container's own service first, docker exec
+                // only when it is absent. Inspection runs several times per page, so it is the
+                // heaviest user of the exec round trip this removes.
+                var served = await browserService.RunAsync(
+                    mode, null, new[] { maxItems.ToString(), tabIndex.ToString() }, 45, ct);
+                string stdout;
+                if (served != null)
+                {
+                    stdout = served.Value.Stdout.Trim();
+                    lastError = served.Value.Error;
+                    if (served.Value.Ok && stdout.Length > 0 && stdout is not "null" and not "[]")
+                        return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                }
+                else
+                {
+                    var last = await terminalAsync($"python3 /usr/local/bin/browser-inspect.py {mode} {maxItems} {tabIndex}", "/project", 45, ct);
+                    stdout = last.Stdout.Trim();
+                    lastError = string.Join(" ", new[] { last.Stderr, last.Stdout }
+                        .Where(x => !string.IsNullOrWhiteSpace(x))).Trim();
+                    if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
+                        return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                }
                 if (attempt == 1)
                 {
                     // Inspection is a nonvisual entry point and can start the browser when no tab
@@ -385,10 +441,8 @@ namespace Omnipotent.Services.Projects.Containers
                 }
                 await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt), ct);
             }
-            string detail = string.Join("\n", new[] { last?.Stderr, last?.Stdout }
-                .Where(x => !string.IsNullOrWhiteSpace(x)));
             return ContainerToolResult.Fail("Browser inspection failed after retrying the existing visible browser: " +
-                ComputerAudit.Truncate(detail, 1600) + " Continue with visible screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
+                ComputerAudit.Truncate(lastError, 1600) + " Continue with visible screenshot/OCR/mouse/keyboard tools.", ContainerToolFailureKind.BrowserInspection);
         }
 
         /// <summary>Explicit tab index, or -1 for "the tab in front of the human".</summary>
@@ -462,9 +516,34 @@ namespace Omnipotent.Services.Projects.Containers
             Convert.ToBase64String(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload)))
                 .TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
+        /// <summary>
+        /// Makes sure Chromium is running before an action that needs it.
+        ///
+        /// Every structured browser action used to open with an unconditional <c>docker exec</c>
+        /// launch — a full daemon round trip, on every action, to re-answer a question whose answer
+        /// is "yes" every time after the first. Asking the container's own service instead costs a
+        /// loopback GET, and the exec now happens only when the browser is genuinely down.
+        ///
+        /// An unreachable service answers null, not false: that is "I do not know", and the honest
+        /// response to not knowing is the old unconditional launch, which is idempotent anyway
+        /// (the orchestrator's per-container gate makes it single-flight).
+        /// </summary>
+        private async Task EnsureBrowserAsync(CancellationToken ct)
+        {
+            if (await browserService.BrowserUpAsync(ct) == true) return;
+            await desktop.LaunchAsync("browser", null, ct);
+        }
+
         private async Task<(bool Ok, string Stdout, string Error)> RunBrowserHelperAsync(
             string mode, object payload, int timeoutSeconds, CancellationToken ct)
         {
+            // Preferred path: straight to the container's own helper service over its published
+            // loopback port. No Docker daemon on the hot path at all, which is what stops a busy
+            // host from parking a browser action for tens of minutes — and it is simply faster,
+            // losing an exec create/attach/inspect round trip per action.
+            var served = await browserService.RunAsync(mode, EncodePayload(payload), null, timeoutSeconds, ct);
+            if (served != null) return served.Value;
+
             if (terminalAsync == null) return (false, "", "Structured browser control is unavailable for this desktop.");
             var run = await terminalAsync(
                 $"python3 /usr/local/bin/browser-inspect.py {mode} {EncodePayload(payload)}", "/project", timeoutSeconds, ct);
@@ -555,7 +634,7 @@ namespace Omnipotent.Services.Projects.Containers
             if (script.Length > 16_000)
                 return ContainerToolResult.Fail("Browser script is limited to 16,000 characters.", ContainerToolFailureKind.Validation);
 
-            await desktop.LaunchAsync("browser", null, ct);
+            await EnsureBrowserAsync(ct);
             byte[]? before = RecentFrameJpeg();
             var action = await RunBrowserHelperAsync("action", new
             {

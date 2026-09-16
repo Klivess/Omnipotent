@@ -180,6 +180,8 @@ namespace Omnipotent.Tests.Projects
                 Assert.True(File.Exists(Path.Combine(context, name)), $"Missing desktop build asset: {name} in {context}");
             Assert.Contains("browser-inspect.py",
                 Omnipotent.Services.Projects.Containers.ContainerOrchestrator.DesktopBuildContextFiles);
+            Assert.Contains("browser-service.py",
+                Omnipotent.Services.Projects.Containers.ContainerOrchestrator.DesktopBuildContextFiles);
         }
 
         [Fact]
@@ -193,9 +195,16 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"11\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"12\"", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
             Assert.Contains("\"structured-browser-actions\"", dockerfile);
+            // The helper is served over a published loopback port so an ordinary browser action
+            // never touches the Docker daemon. Supervised like the shell components, because when
+            // it is down every action silently falls back to the exec path it exists to replace.
+            Assert.Contains("\"browser-service\"", dockerfile);
+            Assert.Contains("EXPOSE 5901 5902", dockerfile);
+            Assert.Contains("browser-service.py", entrypoint);
+            Assert.Contains("start_browser_service", entrypoint);
             // Text entry is read back, overlays are cleared, and captchas are solved in-image.
             Assert.Contains("\"verified-text-entry\"", dockerfile);
             Assert.Contains("\"overlay-dismissal\"", dockerfile);

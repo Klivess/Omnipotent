@@ -42,6 +42,8 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         private const int VncContainerPort = 5901;
+        /// <summary>Container port for the browser-helper front door (see browser-service.py).</summary>
+        private const int BrowserServiceContainerPort = 5902;
         // ~2 GB per desktop: XFCE + Firefox alone sit near 1 GB, and agents are expected to
         // apt-install and run real applications on their machines (§4 revised).
         private const long DefaultMemoryBytes = 2L * 1024 * 1024 * 1024;
@@ -53,7 +55,7 @@ namespace Omnipotent.Services.Projects.Containers
         private static readonly TimeSpan ImageBuildTimeout = TimeSpan.FromMinutes(30);
         internal static readonly string[] DesktopBuildContextFiles =
         {
-            "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py",
+            "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py", "browser-service.py",
             "klive-fp-manifest.json", "klive-fp-patch.js",
         };
 
@@ -69,17 +71,74 @@ namespace Omnipotent.Services.Projects.Containers
             this.dockerUri = dockerUri;
         }
 
-        private async Task<DockerClient> GetClientAsync()
+        /// <summary>
+        /// Budget for one desktop-control exec (launch/focus a window). Generous against commands
+        /// that finish in milliseconds, because Chromium's first launch on a cold profile is the
+        /// slow one — but finite, which is the entire point.
+        /// </summary>
+        private static readonly TimeSpan DesktopControlTimeout = TimeSpan.FromSeconds(60);
+
+        private async Task<DockerClient> GetClientAsync(CancellationToken ct = default)
         {
             if (client != null) return client;
-            await clientGate.WaitAsync();
+            await clientGate.WaitAsync(ct);
             try
             {
                 if (client != null) return client;
+                // Left on the library default on purpose. A blanket short timeout here looks like the
+                // obvious fix and is not: StopContainerAsync legitimately waits WaitBeforeKillSeconds
+                // (15s) before the daemon SIGKILLs, and capping every call near that turns an ordinary
+                // teardown into a failure on a busy host. The calls that actually hung are bounded
+                // individually by WithDeadlineAsync instead, where the right budget is known.
                 client = new DockerClientConfiguration(new Uri(dockerUri)).CreateClient();
                 return client;
             }
             finally { clientGate.Release(); }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="operation"/> against a wall-clock budget we enforce ourselves, and
+        /// abandons it if the budget expires.
+        ///
+        /// This exists because passing a CancellationToken into Docker.DotNet is not sufficient to
+        /// bound a call. Exec attach is a HIJACKED stream: the library drops its own timeout to
+        /// infinite for the duration, and once the named pipe stops producing bytes neither our
+        /// linked token nor its timeout ends the read. On 2026-09-16 that let one
+        /// computer_browser_action sit for 26 minutes against a ~35-second bound, simultaneously
+        /// across three projects on the one daemon — each agent's prompt prefix expired while it
+        /// waited, which is what the fleet eventually halted over.
+        ///
+        /// The abandoned task keeps running and is left to finish on its own: it owns a live stream
+        /// we must not dispose from under it, and the command inside the container is already bounded
+        /// by GNU timeout. Its exceptions are observed so an abandoned failure cannot resurface as an
+        /// unobserved-task crash long after the caller has moved on.
+        /// </summary>
+        internal static async Task<T> WithDeadlineAsync<T>(
+            Func<CancellationToken, Task<T>> operation, TimeSpan budget, string what, CancellationToken ct)
+        {
+            // Not scoped with `using`: on the abandon path the call we walk away from is still holding
+            // this token, and disposing a CancellationTokenSource out from under a live registration
+            // throws ObjectDisposedException inside it. It is disposed only once the work is finished
+            // with it, and otherwise left for the collector.
+            var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var work = operation(attempt.Token);
+            using var timer = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var finished = await Task.WhenAny(work, Task.Delay(budget, timer.Token));
+            if (finished == work)
+            {
+                timer.Cancel();   // stop the pending delay rather than leaving a timer per call
+                try { return await work; } finally { attempt.Dispose(); }
+            }
+            ct.ThrowIfCancellationRequested();
+            // Ask politely first; the read may still be sitting on the pipe regardless.
+            try { attempt.Cancel(); } catch { }
+            work.ContinueWith(t =>
+            {
+                _ = t.Exception;   // observed, so an abandoned failure is never an unobserved-task crash
+                try { attempt.Dispose(); } catch { }
+            }, TaskScheduler.Default);
+            throw new ContainerDaemonTimeoutException(
+                $"the Docker daemon did not complete {what} within {budget.TotalSeconds:0.#}s");
         }
 
         /// <summary>
@@ -149,21 +208,29 @@ namespace Omnipotent.Services.Projects.Containers
                 _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
             };
 
-            var docker = await GetClientAsync();
-            var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+            // Bounded like every other daemon call. This one had no ceiling at all, and it is the
+            // first thing every structured browser action does (LaunchAsync("browser")) — while
+            // holding the per-container launch gate, so one wedged launch stalled the whole desktop
+            // rather than just its own call. These commands all return in well under a second.
+            await WithDeadlineAsync(async execCt =>
             {
-                AttachStdout = true,
-                AttachStderr = true,
-                Tty = false,
-                User = "agent",
-                WorkingDir = "/home/agent",
-                Cmd = cmd,
-            }, ct);
-            using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, ct);
-            var (stdout, stderr) = await output.ReadOutputToEndAsync(ct);
-            var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, ct);
-            if (inspected.ExitCode != 0)
-                throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+                var docker = await GetClientAsync(execCt);
+                var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Tty = false,
+                    User = "agent",
+                    WorkingDir = "/home/agent",
+                    Cmd = cmd,
+                }, execCt);
+                using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                var (stdout, stderr) = await output.ReadOutputToEndAsync(execCt);
+                var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, execCt);
+                if (inspected.ExitCode != 0)
+                    throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+                return true;
+            }, DesktopControlTimeout, $"desktop control '{command}'", ct);
             }
             finally
             {
@@ -390,12 +457,13 @@ namespace Omnipotent.Services.Projects.Containers
 
             string workDir = ContainerShellResult.NormalizeWorkingDirectory(workingDirectory);
             int seconds = Math.Clamp(timeoutSeconds, 1, 900);
-            using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            operationTimeout.CancelAfter(TimeSpan.FromSeconds(seconds + 15));
-            CancellationToken execCt = operationTimeout.Token;
+            // The budget is ours to enforce, not the daemon's to respect: the inner command is
+            // already bounded by GNU timeout, so anything past this is the host-side call hanging.
             try
             {
-                var docker = await GetClientAsync();
+                return await WithDeadlineAsync(async execCt =>
+                {
+                var docker = await GetClientAsync(execCt);
                 var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
                 {
                     AttachStdout = true,
@@ -427,8 +495,18 @@ namespace Omnipotent.Services.Projects.Containers
                     stderr.GetText(),
                     TimedOut: exitCode == 124 || exitCode == 137,
                     OutputTruncated: stdout.Truncated || stderr.Truncated);
+                }, TimeSpan.FromSeconds(seconds + 15), $"a command in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
             }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested && operationTimeout.IsCancellationRequested)
+            catch (ContainerDaemonTimeoutException ex)
+            {
+                // Say which side stalled. The agent cannot act on the host being busy, and the
+                // previous bare cancellation read to it as its own command failing.
+                log($"Container exec abandoned after {seconds + 15}s: {ex.Message}");
+                return new ContainerShellResult(124, "", $"Docker exec exceeded its bounded command window — {ex.Message}. "
+                    + "The command may or may not have run; the host, not this desktop, was unresponsive.",
+                    TimedOut: true, OutputTruncated: false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 return new ContainerShellResult(124, "", "Docker exec exceeded its bounded command window.",
                     TimedOut: true, OutputTruncated: false);
@@ -699,7 +777,11 @@ namespace Omnipotent.Services.Projects.Containers
                     [ContainerLabels.ContextHash] = imageContextHash,
                 },
                 Env = BuildContainerEnv(resolvedWidth, resolvedHeight, profileSegment, projectID),
-                ExposedPorts = new Dictionary<string, EmptyStruct> { [$"{VncContainerPort}/tcp"] = default },
+                ExposedPorts = new Dictionary<string, EmptyStruct>
+                {
+                    [$"{VncContainerPort}/tcp"] = default,
+                    [$"{BrowserServiceContainerPort}/tcp"] = default,
+                },
                 HostConfig = new HostConfig
                 {
                     Memory = DefaultMemoryBytes,
@@ -707,6 +789,10 @@ namespace Omnipotent.Services.Projects.Containers
                     PortBindings = new Dictionary<string, IList<PortBinding>>
                     {
                         [$"{VncContainerPort}/tcp"] = new List<PortBinding> { new() { HostIP = "127.0.0.1", HostPort = "" } },
+                        // Loopback-only on the host, same as VNC: inside the container the service
+                        // binds every interface (a published port arrives over the bridge), so the
+                        // host binding is the confinement.
+                        [$"{BrowserServiceContainerPort}/tcp"] = new List<PortBinding> { new() { HostIP = "127.0.0.1", HostPort = "" } },
                     },
                     Binds = new List<string> { $"{volumeHostDir}:/project", $"{runtimeHostDir}:/agent-runtime" },
                     RestartPolicy = new RestartPolicy { Name = RestartPolicyKind.UnlessStopped },
@@ -727,12 +813,25 @@ namespace Omnipotent.Services.Projects.Containers
                         $"Container {create.ID[..12]} started but no host port was bound for VNC after waiting " +
                         $"(container state: {await DescribeStateAsync(docker, create.ID, ct)}).");
 
+                // By the time VNC's binding exists the rest are wired too. Not fatal if absent: a
+                // missing browser-service port only costs the docker-exec fallback, whereas no VNC
+                // port means no desktop at all, which is why only that one throws.
+                int browserServicePort = 0;
+                try
+                {
+                    browserServicePort = ResolvePublishedPort(
+                        await docker.Containers.InspectContainerAsync(create.ID, ct),
+                        BrowserServiceContainerPort) ?? 0;
+                }
+                catch (Exception ex) { log($"Could not resolve the browser-service port for {create.ID[..12]}: {ex.Message}"); }
+
                 record = new DesktopContainerRecord
                 {
                     ContainerID = create.ID,
                     ProjectID = projectID,
                     AgentID = agentID,
                     VncHostPort = hostPort,
+                    BrowserServiceHostPort = browserServicePort,
                     Width = resolvedWidth,
                     Height = resolvedHeight,
                     ImageContextHash = imageContextHash,
@@ -880,6 +979,7 @@ namespace Omnipotent.Services.Projects.Containers
                         ProjectID = projectID,
                         AgentID = string.IsNullOrWhiteSpace(agentID) ? null : agentID,
                         VncHostPort = port.Value,
+                        BrowserServiceHostPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0,
                         Width = width,
                         Height = height,
                         CreatedAt = summary.Created,
@@ -916,9 +1016,15 @@ namespace Omnipotent.Services.Projects.Containers
                 {
                     var inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, ct);
                     int? port = ResolveHostPort(inspect);
-                    if (port.HasValue && (port.Value != record.VncHostPort || record.Lost))
+                    // Docker reassigns ephemeral published ports on restart, so both must be
+                    // re-read together — a stale browser-service port silently sends every action
+                    // back down the docker-exec path this service exists to avoid.
+                    int browserPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0;
+                    if (port.HasValue && (port.Value != record.VncHostPort || record.Lost
+                        || browserPort != record.BrowserServiceHostPort))
                     {
                         record.VncHostPort = port.Value;
+                        record.BrowserServiceHostPort = browserPort;
                         record.Lost = false;
                         registry.Update(record);
                     }
@@ -983,9 +1089,12 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         private static int? ResolveHostPort(ContainerInspectResponse inspect)
+            => ResolvePublishedPort(inspect, VncContainerPort);
+
+        private static int? ResolvePublishedPort(ContainerInspectResponse inspect, int containerPort)
         {
             if (inspect.NetworkSettings?.Ports != null &&
-                inspect.NetworkSettings.Ports.TryGetValue($"{VncContainerPort}/tcp", out var bindings) &&
+                inspect.NetworkSettings.Ports.TryGetValue($"{containerPort}/tcp", out var bindings) &&
                 bindings is { Count: > 0 } &&
                 int.TryParse(bindings[0].HostPort, out int port))
                 return port;
