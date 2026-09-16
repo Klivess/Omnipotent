@@ -492,9 +492,12 @@ namespace Omnipotent.Services.Projects
                     {
                         // Deferred, not completed: no model call was made and no work was attempted.
                         // Leaving this as WakeCompleted inflated the analytics success rate and hid
-                        // budget exhaustion behind an apparently healthy wake.
+                        // budget exhaustion behind an apparently healthy wake. The reason comes from
+                        // the ledger rather than being assumed here — admission can now also be
+                        // refused fleet-wide by the prompt-cache kill switch.
                         outcome = ProjectEventTypes.WakeDeferred;
-                        outcomeText = "Wake stopped before the next model call because no token budget remained.";
+                        outcomeText = "Wake stopped before the next model call because "
+                            + parent.Budget.DescribeAdmissionRefusal(projectID) + ".";
                         goto done;
                     }
                     KliveLLM.KliveLLM.KliveLLMResponse resp;

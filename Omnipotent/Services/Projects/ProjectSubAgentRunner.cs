@@ -413,10 +413,12 @@ namespace Omnipotent.Services.Projects
                     var budgetLease = await parent.Budget.TryAcquireLlmTurnAsync(projectID, cts.Token);
                     if (budgetLease == null)
                     {
-                        // Same reasoning as the status guard above: budget exhaustion is a deferral, not
-                        // a completed assignment.
+                        // Same reasoning as the status guard above: a refused admission is a deferral,
+                        // not a completed assignment. The ledger states WHY — budget exhaustion and a
+                        // fleet-wide prompt-cache halt both land here.
                         outcome = ProjectEventTypes.WakeDeferred;
-                        outcomeText = $"Agent {agent.AgentID} stopped before the next model call because no token budget remained.";
+                        outcomeText = $"Agent {agent.AgentID} stopped before the next model call because "
+                            + parent.Budget.DescribeAdmissionRefusal(projectID) + ".";
                         break;
                     }
                     KliveLLM.KliveLLM.KliveLLMResponse resp;

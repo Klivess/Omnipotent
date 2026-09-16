@@ -342,6 +342,8 @@ namespace Omnipotent.Services.Projects
         public const string DirectiveCompleted = "directive-completed";
         public const string DirectiveRevoked = "directive-revoked";
         public const string ExternalAction = "external-action";        // a confirmed side effect in the outside world (account created, email sent, form submitted)
+        public const string CacheHalt = "cache-halt";                  // the fleet stopped sending requests: weighted prompt-cache hit rate below floor
+        public const string CacheHaltCleared = "cache-halt-cleared";   // Klives released the prompt-cache halt
     }
 
     /// <summary>

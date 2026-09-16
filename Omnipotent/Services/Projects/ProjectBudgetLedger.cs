@@ -42,6 +42,44 @@ namespace Omnipotent.Services.Projects
         public event Action<string>? BudgetPausedRaised;
 
         /// <summary>
+        /// Raised for every LLM turn booked here, with the full journal record. This is the one
+        /// place every Projects model call — Commander, sub-agent, council and utility — already
+        /// converges on, which is what lets <see cref="ProjectCacheHealthMonitor"/> measure a rate
+        /// across the whole fleet rather than per runner.
+        /// </summary>
+        public event Action<ProjectTokenUsageRecord>? TokenUsageRecorded;
+
+        /// <summary>
+        /// A fleet-wide reason no agent may be admitted to a model call, or null when the fleet may
+        /// run. Checked ahead of the per-project budget because it outranks it: a halt means no
+        /// request is sent regardless of how much budget a project still has. Wired by
+        /// <see cref="Projects"/> to the cache-health kill switch.
+        /// </summary>
+        public Func<string?>? FleetAdmissionBlock { get; set; }
+
+        private string? FleetBlockReason()
+        {
+            try { return FleetAdmissionBlock?.Invoke(); }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Why <see cref="TryAcquireLlmTurnAsync"/> would refuse this project right now, phrased for
+        /// a wake's outcome text. Runners used to hard-code "no token budget remained", which became
+        /// a lie the moment admission could be refused for any other reason.
+        /// </summary>
+        public string DescribeAdmissionRefusal(string projectID)
+        {
+            string? fleet = FleetBlockReason();
+            if (fleet != null) return fleet;
+            var project = projectStore.GetProject(projectID);
+            if (project == null) return "the project no longer exists";
+            if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning))
+                return $"the project status is {project.Status}";
+            return "no token budget remained";
+        }
+
+        /// <summary>
         /// True while the active router bills a FLAT FEE (AIRouter) rather than per token. Everything
         /// this ledger exists to police — turn reservations, the 80% warning, the 100% auto-pause —
         /// is arithmetic on money that, under a flat fee, is never actually charged. Metering it
@@ -156,6 +194,9 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public async Task<IAsyncDisposable?> TryAcquireLlmTurnAsync(string projectID, CancellationToken ct = default)
         {
+            // Ahead of the per-project gate: a fleet halt is not a budget question, and refusing here
+            // means a halted fleet never even contends for the reservation semaphore.
+            if (FleetBlockReason() != null) return null;
             var gate = llmTurnGates.GetOrAdd(projectID, _ => new SemaphoreSlim(1, 1));
             await gate.WaitAsync(ct);
             try
@@ -262,7 +303,7 @@ namespace Omnipotent.Services.Projects
                 SaveLocked(ledger);
             }
 
-            ProjectTokenUsageRecord? usageRecord = tokenUsage?.TryAppend(new ProjectTokenUsageRecord
+            var pendingUsage = new ProjectTokenUsageRecord
             {
                 RecordKind = "usage",
                 ProjectID = projectID,
@@ -303,7 +344,15 @@ namespace Omnipotent.Services.Projects
                 // instead of leaving a reader to wonder whether the figure simply failed to arrive.
                 CostBasis = flatFee ? "flat-fee" : haveActual ? "actual" : "provisional",
                 GenerationID = generationId,
-            });
+            };
+            ProjectTokenUsageRecord? usageRecord = tokenUsage?.TryAppend(pendingUsage);
+
+            // Announce the turn even when journaling failed. A cache collapse is exactly the kind of
+            // incident that arrives alongside disk trouble, and the kill switch must not be the thing
+            // that goes quiet first. TryAppend normalises in place, so the fallback carries the same
+            // values minus the assigned sequence.
+            try { TokenUsageRecorded?.Invoke(usageRecord ?? pendingUsage); }
+            catch (Exception ex) { log($"Token-usage observer failed for {projectID}: {ex.Message}"); }
 
             CheckTokenThresholds(projectID);
 

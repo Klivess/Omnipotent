@@ -613,6 +613,53 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            // Prompt-cache kill switch: the live trailing-window measurement plus the latch state.
+            // Answers both "is the fleet stopped, and why" and — via the verdict's summary — "why
+            // hasn't it fired", which is the question that matters while tuning the floor.
+            await parent.RegisterHttpRouteAsync("/projects/cache-health", async req =>
+            {
+                try
+                {
+                    var options = parent.CacheHealth.Options;
+                    await req.ReturnResponse(Json(new
+                    {
+                        halt = parent.CacheHealth.GetState(),
+                        window = parent.CacheHealth.Describe(),
+                        settings = new
+                        {
+                            enabled = options.Enabled,
+                            windowMinutes = options.Window.TotalMinutes,
+                            minimumWeightedHitRatePct = options.MinimumWeightedHitRatePct,
+                            minimumMeasuredRequests = options.MinimumMeasuredRequests,
+                            minimumMeasuredPromptTokens = options.MinimumMeasuredPromptTokens,
+                            minimumObservationSpanMinutes = options.MinimumObservationSpan.TotalMinutes,
+                        },
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Release the prompt-cache halt. Body: {"unhalt": true} also restores every project to
+            // the status it held before the halt; without it the latch opens but nothing resumes on
+            // its own, which is the safer default while the cause is still being checked.
+            await parent.RegisterHttpRouteAsync("/projects/cache-health/clear", async req =>
+            {
+                try
+                {
+                    bool unhalt = (bool?)ParseBody(req)?["unhalt"] ?? false;
+                    var result = parent.ClearCacheHalt(req.user?.Name ?? "klives", unhalt);
+                    await req.ReturnResponse(Json(new
+                    {
+                        ok = true,
+                        cleared = result.cleared,
+                        restored = result.restored,
+                        projectIDs = result.projectIDs,
+                        halt = parent.CacheHealth.GetState(),
+                    }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // Restore every globally-halted project to the exact status it held before the halt.
             // POST (no body).
             await parent.RegisterHttpRouteAsync("/projects/unhalt-all", async req =>
@@ -622,7 +669,20 @@ namespace Omnipotent.Services.Projects
                     var restored = new List<string>();
                     foreach (var p in parent.Store.ListProjects())
                         if (parent.UnhaltProject(p.ProjectID)) restored.Add(p.ProjectID);
-                    await req.ReturnResponse(Json(new { ok = true, restored = restored.Count, projectIDs = restored }));
+                    // Restoring statuses does not re-open LLM admission while the prompt-cache latch
+                    // is still closed: every restored project would wake and immediately defer. Say
+                    // so, rather than leaving Klives to infer it from a wave of deferred wakes.
+                    string? cacheHalt = parent.CacheHealth.IsHalted
+                        ? "The prompt-cache halt is still engaged, so no agent will send a request. "
+                          + "Clear it with POST /projects/cache-health/clear."
+                        : null;
+                    await req.ReturnResponse(Json(new
+                    {
+                        ok = true,
+                        restored = restored.Count,
+                        projectIDs = restored,
+                        warning = cacheHalt,
+                    }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);

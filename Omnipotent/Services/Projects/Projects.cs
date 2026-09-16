@@ -56,6 +56,9 @@ namespace Omnipotent.Services.Projects
         /// <summary>Append-only structured attribution for every project LLM charge.</summary>
         public ProjectTokenUsageStore TokenUsage { get; private set; } = null!;
         public ProjectBudgetLedger Budget { get; private set; } = null!;
+        /// <summary>Fleet-wide prompt-cache kill switch: halts every agent when the weighted hit
+        /// rate over the trailing window falls below its floor, and alerts Klives with the evidence.</summary>
+        public ProjectCacheHealthMonitor CacheHealth { get; private set; } = null!;
         public OpenRouterCreditChecker ProviderCredit { get; private set; } = null!;
         /// <summary>Live OpenRouter model-window metadata used by every Projects LLM route.</summary>
         public OpenRouterContextWindowResolver ProviderContexts { get; private set; } = null!;
@@ -227,6 +230,22 @@ namespace Omnipotent.Services.Projects
             ProviderCredit = new OpenRouterCreditChecker(openRouterToken, msg => ServiceLog(msg));
             ProviderContexts = new OpenRouterContextWindowResolver(openRouterToken, msg => ServiceLog(msg));
             Budget = new ProjectBudgetLedger(Store, EventLog, costFetcher, msg => ServiceLog(msg), TokenUsage);
+
+            // Prompt-cache kill switch. Constructed here, before anything can run a wake, because a
+            // halt restored from disk has to be blocking admission from the first turn after a
+            // restart — a fleet that resumes burning full prefill while the incident is still open
+            // is the failure this whole mechanism exists to prevent.
+            CacheHealth = new ProjectCacheHealthMonitor(
+                Path.Combine(Data_Handling.OmniPaths.GetPath(Data_Handling.OmniPaths.GlobalPaths.ProjectsDirectory), "CacheHealth"),
+                msg => ServiceLog(msg));
+            CacheHealth.HaltAction = HaltFleetForCacheAsync;
+            Budget.TokenUsageRecorded += CacheHealth.Observe;
+            Budget.FleetAdmissionBlock = () => CacheHealth.AdmissionRefusal();
+            _ = Task.Run(async () =>
+            {
+                try { CacheHealth.Configure(await LoadCacheHealthOptionsAsync()); }
+                catch (Exception ex) { await ServiceLogError(ex, "Projects: cache-health settings unavailable; using defaults"); }
+            });
             // Whether tokens cost money at all is a property of the router Klives has selected. Under a
             // flat-fee router (AIRouter) the ledger must book zero, or a project would warn, pause and
             // defer its wakes against a bill nobody is being sent. The check runs per model turn, so it
@@ -1298,8 +1317,13 @@ namespace Omnipotent.Services.Projects
         /// Halts a single project as part of a fleet-wide halt: records the pre-halt status so it can be
         /// restored exactly, forces the project to Paused, and stops in-flight work. No-op (returns false)
         /// for terminal projects and for projects already under a global halt. See <see cref="HaltedFromStatus"/>.
+        ///
+        /// <paramref name="automaticReason"/> distinguishes an automatic halt (the prompt-cache kill
+        /// switch) from Klives pressing halt-all. Both take the same path — the difference is only in
+        /// what the timeline is told, and a timeline that credits Klives with a decision a guardrail
+        /// made is worse than useless during an incident.
         /// </summary>
-        public bool HaltProject(string projectID)
+        public bool HaltProject(string projectID, string? automaticReason = null)
         {
             var project = Store.GetProject(projectID);
             if (project == null) return false;
@@ -1314,16 +1338,20 @@ namespace Omnipotent.Services.Projects
             // Stop the in-flight wake + sub-agents so a halt bites immediately, mirroring /projects/pause.
             bool cancelled = CommanderRunner.CancelActiveWake(project.ProjectID);
             SubAgentRunner.CancelProject(project.ProjectID);
+            bool automatic = !string.IsNullOrWhiteSpace(automaticReason);
             EventLog.Append(new ProjectEvent
             {
                 ProjectID = project.ProjectID,
                 Type = ProjectEventTypes.Status,
-                Author = "klives",
+                Author = automatic ? "system" : "klives",
                 PayloadJson = ProjectLifecycleEvents.Payload(
-                    fromStatus, ProjectStatus.Paused, "fleet-halt"),
-                Text = cancelled
-                    ? "Project halted by Klives (fleet halt-all) — in-flight wake halted."
-                    : "Project halted by Klives (fleet halt-all).",
+                    fromStatus, ProjectStatus.Paused, automatic ? "automatic-halt" : "fleet-halt"),
+                Text = automatic
+                    ? $"Project halted automatically: {automaticReason}"
+                      + (cancelled ? " In-flight wake halted." : "")
+                    : cancelled
+                        ? "Project halted by Klives (fleet halt-all) — in-flight wake halted."
+                        : "Project halted by Klives (fleet halt-all).",
             });
             return true;
         }
@@ -1393,6 +1421,312 @@ namespace Omnipotent.Services.Projects
                 });
             }
             return true;
+        }
+
+        // ── prompt-cache kill switch ──
+
+        /// <summary>Identity of the runtime blocker the cache halt raises, so clearing the halt
+        /// removes that blocker and only that blocker.</summary>
+        private const string CacheHaltBlockerID = "prompt-cache-halt";
+
+        /// <summary>
+        /// Reads the cache-halt tunables. Every one is an OmniSetting: the floor that is right for a
+        /// flat-fee router with three parallel slots is not the floor that is right for a per-token
+        /// provider, and the window is short enough that its length materially changes how jumpy the
+        /// trigger is. Clamped so a typo in settings cannot produce a trigger that either never
+        /// fires or fires on the first cold start.
+        /// </summary>
+        private async Task<ProjectCacheHealthOptions> LoadCacheHealthOptionsAsync()
+        {
+            return new ProjectCacheHealthOptions
+            {
+                Enabled = await GetBoolOmniSetting("Projects_CacheHaltEnabled", true),
+                Window = TimeSpan.FromMinutes(
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltWindowMinutes", 20), 1, 24 * 60)),
+                MinimumWeightedHitRatePct =
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumHitRatePct", 80), 1, 99),
+                MinimumMeasuredRequests =
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumRequests", 20), 1, 100_000),
+                MinimumMeasuredPromptTokens =
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumPromptTokens", 250_000), 0, int.MaxValue),
+                MinimumObservationSpan = TimeSpan.FromMinutes(
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumSpanMinutes", 5), 0, 24 * 60)),
+                MaxRetainedSamples =
+                    Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMaxSamples", 5_000), 100, 200_000),
+            };
+        }
+
+        /// <summary>
+        /// Everything that happens once the kill switch trips: stop the fleet, write the evidence to
+        /// disk, and put it in front of Klives on Discord.
+        ///
+        /// Ordering is deliberate. The halt comes first and the alert second — if Discord is down,
+        /// the estate is still stopped, and the report is still on disk. Doing it the other way round
+        /// would let a Discord outage keep the fleet spending.
+        /// </summary>
+        private async Task HaltFleetForCacheAsync(
+            ProjectCacheHealthVerdict verdict,
+            IReadOnlyList<ProjectTokenUsageRecord> window)
+        {
+            string shortReason = $"weighted prompt-cache hit rate {verdict.WeightedHitRatePct:0.0}% "
+                + $"over the last {CacheHealth.Options.Window.TotalMinutes:0.#} minutes "
+                + $"(floor {verdict.ThresholdPct:0.#}%).";
+
+            var halted = new List<string>();
+            foreach (var project in Store.ListProjects())
+            {
+                try
+                {
+                    if (HaltProject(project.ProjectID, shortReason)) halted.Add(project.ProjectID);
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"Projects: cache halt could not stop {project.ProjectID}");
+                }
+            }
+
+            // One incident event and one typed blocker per halted project, so the timeline and side
+            // rail of any project Klives opens explain why it stopped without him having to know a
+            // fleet-level mechanism exists at all.
+            foreach (string projectID in halted)
+            {
+                try
+                {
+                    EventLog.Append(new ProjectEvent
+                    {
+                        ProjectID = projectID,
+                        Type = ProjectEventTypes.CacheHalt,
+                        Author = "system",
+                        Text = "Fleet halted on prompt-cache health: " + verdict.Summary,
+                        PayloadJson = JsonConvert.SerializeObject(verdict),
+                    });
+                    RuntimeState.SetBlocker(projectID, new ProjectRuntimeBlocker
+                    {
+                        // Stable ID so clearing the halt removes exactly this blocker and cannot
+                        // discard one an approval or a dependency raised in the meantime.
+                        BlockerID = CacheHaltBlockerID,
+                        Category = ProjectBlockerCategory.ManualIntervention,
+                        Code = CacheHaltBlockerID,
+                        Summary = "Fleet halted: " + shortReason,
+                        Detail = verdict.Summary
+                            + " No agent will send another request until Klives clears the halt.",
+                        Retryable = false,
+                    });
+                }
+                catch (Exception ex) { await ServiceLogError(ex, $"Projects: cache-halt event failed for {projectID}"); }
+            }
+
+            string? reportPath = null;
+            string? requestLogPath = null;
+            string report = ProjectCacheHealthMonitor.BuildReport(
+                verdict, window, CacheHealth.Options, halted);
+            string requestLog = ProjectCacheHealthMonitor.BuildRequestLog(window);
+            try
+            {
+                string directory = Path.Combine(
+                    Data_Handling.OmniPaths.GetPath(Data_Handling.OmniPaths.GlobalPaths.ProjectsDirectory), "CacheHealth");
+                Directory.CreateDirectory(directory);
+                string slug = verdict.EvaluatedAt.ToUniversalTime().ToString("yyyyMMdd-HHmmss");
+                reportPath = Path.Combine(directory, $"cache-halt-{slug}.md");
+                requestLogPath = Path.Combine(directory, $"cache-halt-{slug}.requests.jsonl");
+                await File.WriteAllTextAsync(reportPath, report);
+                await File.WriteAllTextAsync(requestLogPath, requestLog);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Projects: cache-halt report could not be written to disk");
+            }
+
+            bool delivered = false;
+            string? alertError = null;
+            try
+            {
+                delivered = await SendCacheHaltAlertAsync(
+                    verdict, window, halted, report, requestLog, reportPath);
+                if (!delivered) alertError = "KliveBotDiscord was unavailable or the DM was rejected.";
+            }
+            catch (Exception ex)
+            {
+                alertError = ex.Message;
+                await ServiceLogError(ex, "Projects: cache-halt Discord alert failed");
+            }
+
+            CacheHealth.NoteHaltOutcome(halted, reportPath, requestLogPath, delivered, alertError);
+            ServiceLog($"Projects: cache halt engaged — {halted.Count} project(s) stopped; "
+                + $"Discord alert {(delivered ? "delivered" : "NOT delivered: " + alertError)}.");
+            if (!delivered)
+                RetryCacheHaltAlert(verdict, window, halted, report, requestLog, reportPath, requestLogPath);
+        }
+
+        /// <summary>
+        /// Keeps trying to reach Klives for half an hour when the first attempt failed. A halt he
+        /// never hears about is a fleet that is simply, silently, off — which is a worse outcome
+        /// than the overspend it was protecting him from. Gives up quietly after that; the report is
+        /// on disk and the status route still reports the undelivered alert.
+        /// </summary>
+        private void RetryCacheHaltAlert(
+            ProjectCacheHealthVerdict verdict,
+            IReadOnlyList<ProjectTokenUsageRecord> window,
+            IReadOnlyList<string> halted,
+            string report,
+            string requestLog,
+            string? reportPath,
+            string? requestLogPath)
+        {
+            _ = Task.Run(async () =>
+            {
+                for (int attempt = 1; attempt <= 15; attempt++)
+                {
+                    await Task.Delay(TimeSpan.FromMinutes(2));
+                    // Klives cleared it from the website in the meantime: he knows, and an alert
+                    // about a halt that is already over would only be confusing.
+                    if (!CacheHealth.IsHalted) return;
+                    try
+                    {
+                        if (await SendCacheHaltAlertAsync(
+                                verdict, window, halted, report, requestLog, reportPath))
+                        {
+                            CacheHealth.NoteHaltOutcome(halted, reportPath, requestLogPath, true, null);
+                            ServiceLog($"Projects: cache-halt alert delivered on retry {attempt}.");
+                            return;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        await ServiceLogError(ex, $"Projects: cache-halt alert retry {attempt} failed");
+                    }
+                }
+                ServiceLog("Projects: cache-halt alert could not be delivered to Discord after 30 minutes. "
+                    + "The fleet is still halted and the report is in the Projects CacheHealth folder.");
+            });
+        }
+
+        /// <summary>
+        /// DMs Klives the alert plus the full evidence as attachments. The embed carries only what
+        /// has to survive a phone notification; the numbers that matter for diagnosis are in the
+        /// report, and every individual request — with every ID — is in the JSONL beside it.
+        /// </summary>
+        private async Task<bool> SendCacheHaltAlertAsync(
+            ProjectCacheHealthVerdict verdict,
+            IReadOnlyList<ProjectTokenUsageRecord> window,
+            IReadOnlyList<string> halted,
+            string report,
+            string requestLog,
+            string? reportPath)
+        {
+            var discord = await TryResolveServiceAsync<KliveBotDiscord>(TimeSpan.FromSeconds(30));
+            if (discord == null) return false;
+
+            var summary = new StringBuilder();
+            summary.AppendLine($"**Every Projects agent has stopped sending requests.**");
+            summary.AppendLine();
+            summary.AppendLine($"Weighted prompt-cache hit rate is **{verdict.WeightedHitRatePct:0.0}%** over the last "
+                + $"{CacheHealth.Options.Window.TotalMinutes:0.#} minutes, below the {verdict.ThresholdPct:0.#}% floor.");
+            summary.AppendLine();
+            summary.AppendLine($"• Measured requests: **{verdict.MeasuredRequests:N0}** "
+                + $"({verdict.UnmeasuredRequests:N0} unmeasured, excluded)");
+            summary.AppendLine($"• Zero-hit requests: **{verdict.ZeroHitRequests:N0}**");
+            summary.AppendLine($"• Prompt tokens: **{verdict.PromptTokens:N0}** "
+                + $"({verdict.UncachedTokens:N0} uncached, {verdict.CachedTokens:N0} cached)");
+            summary.AppendLine($"• Reusable-prefix efficiency: **{verdict.ReusablePrefixEfficiencyPct:0.0}%** "
+                + $"over {verdict.ReusablePrefixSamples:N0} continuations");
+            summary.AppendLine($"• Unweighted per-request mean: {verdict.UnweightedHitRatePct:0.0}%");
+            summary.AppendLine($"• Projects halted: **{halted.Count}**");
+            summary.AppendLine();
+
+            // Worst-offender lines in the embed itself: during an incident the difference between
+            // "one model regressed" and "everything regressed" decides the next ten minutes, and it
+            // should not require opening an attachment.
+            var byModel = ProjectCacheHealthMonitor.Group(window, record => record.Model).Take(5).ToList();
+            if (byModel.Count > 0)
+            {
+                summary.AppendLine("**Worst by uncached tokens (model):**");
+                foreach (var line in byModel)
+                    summary.AppendLine($"`{Truncate(line.Key, 40)}` — {line.WeightedHitRatePct:0.0}% hit, "
+                        + $"{line.UncachedTokens:N0} uncached over {line.Requests:N0} req");
+                summary.AppendLine();
+            }
+
+            summary.AppendLine("Nothing will run until you clear it: `POST /projects/cache-health/clear` "
+                + "(`{\"unhalt\": true}` also restores every project to its pre-halt status).");
+            if (reportPath != null) summary.AppendLine($"Report on disk: `{reportPath}`");
+
+            var builder = KliveBotDiscord.MakeSimpleEmbed(
+                "⛔ Projects fleet halted — prompt-cache hit rate below floor",
+                Truncate(summary.ToString(), 4000),
+                DSharpPlus.Entities.DiscordColor.Red);
+            builder.WithContent($"<@{Data_Handling.OmniPaths.KlivesDiscordAccountID}>");
+            builder.WithAllowedMention(new DSharpPlus.Entities.UserMention(Data_Handling.OmniPaths.KlivesDiscordAccountID));
+
+            string slug = verdict.EvaluatedAt.ToUniversalTime().ToString("yyyyMMdd-HHmmss");
+            var reportStream = new MemoryStream(Encoding.UTF8.GetBytes(Cap(report, DiscordAttachmentCap)));
+            var requestStream = new MemoryStream(Encoding.UTF8.GetBytes(Cap(requestLog, DiscordAttachmentCap)));
+            await using (reportStream)
+            await using (requestStream)
+            {
+                builder.AddFile($"cache-halt-{slug}.md", reportStream);
+                builder.AddFile($"cache-halt-{slug}.requests.jsonl", requestStream);
+                var message = await discord.SendMessageToKlives(builder);
+                return message != null;
+            }
+        }
+
+        /// <summary>Discord rejects the whole message if an attachment is oversized, so the evidence
+        /// is trimmed to fit rather than risking the alert itself. The untrimmed copy is on disk.</summary>
+        private const int DiscordAttachmentCap = 6 * 1024 * 1024;
+
+        private static string Cap(string content, int maxBytes)
+        {
+            if (Encoding.UTF8.GetByteCount(content) <= maxBytes) return content;
+            var bytes = Encoding.UTF8.GetBytes(content);
+            // Cut on a line boundary so a truncated JSONL stays parseable line-by-line.
+            int cut = Array.LastIndexOf(bytes, (byte)'\n', Math.Min(maxBytes, bytes.Length) - 1);
+            if (cut <= 0) cut = Math.Min(maxBytes, bytes.Length);
+            return Encoding.UTF8.GetString(bytes, 0, cut)
+                + $"\n[truncated to fit Discord: the complete copy is in the Projects CacheHealth folder]\n";
+        }
+
+        private static string Truncate(string value, int maxLength)
+            => value.Length <= maxLength ? value : value[..maxLength];
+
+        /// <summary>
+        /// Releases the prompt-cache halt. Restoring the fleet is opt-in: clearing the latch alone
+        /// re-opens admission for anything Klives resumes by hand, which is the right default while
+        /// he is still checking whether the cause is actually fixed.
+        /// </summary>
+        public (bool cleared, int restored, List<string> projectIDs) ClearCacheHalt(string clearedBy, bool unhalt)
+        {
+            bool cleared = CacheHealth.Clear(clearedBy);
+            if (cleared)
+                foreach (var project in Store.ListProjects())
+                {
+                    try { RuntimeState.ClearBlocker(project.ProjectID, CacheHaltBlockerID); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt blocker clear failed for {project.ProjectID}"); }
+                }
+            var restored = new List<string>();
+            if (unhalt)
+                foreach (var project in Store.ListProjects())
+                {
+                    try { if (UnhaltProject(project.ProjectID)) restored.Add(project.ProjectID); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt clear could not restore {project.ProjectID}"); }
+                }
+            if (cleared)
+                foreach (var project in Store.ListProjects())
+                {
+                    try
+                    {
+                        EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = project.ProjectID,
+                            Type = ProjectEventTypes.CacheHaltCleared,
+                            Author = "klives",
+                            Text = $"Prompt-cache halt cleared by {clearedBy}"
+                                + (unhalt ? " — projects restored to their pre-halt status." : " — projects left where they are."),
+                        });
+                    }
+                    catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt clear event failed for {project.ProjectID}"); }
+                }
+            return (cleared, restored.Count, restored);
         }
 
         /// <summary>Compact one-line status (status/goal/budget/agents/last-event) for the bridge. Null if unknown.</summary>

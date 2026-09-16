@@ -357,6 +357,21 @@ internal static class ProjectPromptCacheAnalytics
             && string.Equals(record.PromptCacheTelemetryVersion,
                 ProjectPromptCacheTelemetry.CurrentVersion, StringComparison.Ordinal);
 
+    /// <summary>
+    /// Whether a journal row carries a provider cache measurement this build is allowed to believe.
+    /// Shared with <see cref="ProjectCacheHealthMonitor"/> on purpose: the rate that halts the fleet
+    /// and the rate on the analytics page have to be computed over the same population, or the
+    /// dashboard will contradict the kill switch at exactly the moment someone is reading both.
+    /// </summary>
+    internal static bool IsMeasuredSample(ProjectTokenUsageRecord record)
+        => IsEligible(record) && record.CacheMetricsAvailable;
+
+    /// <summary>The known-reusable prefix and how much of it the provider actually served.</summary>
+    internal readonly record struct ReusablePrefixMeasurement(
+        int Samples,
+        long ReusableTokens,
+        long ReusedTokens);
+
     private static void AddProviderTransitions(
         AnalyticsPromptCacheSnapshot result,
         IReadOnlyList<ProjectTokenUsageRecord> records)
@@ -384,9 +399,24 @@ internal static class ProjectPromptCacheAnalytics
         AnalyticsPromptCacheSnapshot result,
         IReadOnlyList<ProjectTokenUsageRecord> records)
     {
-        // The raw cached/prompt ratio has an unavoidable ceiling: every new assistant/tool suffix
-        // is being seen for the first time. For a correctness test, compare the provider's cache read
-        // against the preceding request that should be an exact prefix of this continuation.
+        var measurement = MeasureReusablePrefix(records);
+        result.ReusablePrefixSamples += measurement.Samples;
+        result.ReusablePrefixTokens += measurement.ReusableTokens;
+        result.ReusedPrefixTokens += measurement.ReusedTokens;
+    }
+
+    /// <summary>
+    /// The correctness figure behind the raw hit rate. The raw cached/prompt ratio has an
+    /// unavoidable ceiling — every new assistant/tool suffix is being seen for the first time — so
+    /// this compares the provider's cache read against the preceding request that should be an
+    /// exact prefix of this continuation instead.
+    /// </summary>
+    internal static ReusablePrefixMeasurement MeasureReusablePrefix(
+        IEnumerable<ProjectTokenUsageRecord> records)
+    {
+        int samples = 0;
+        long reusableTokens = 0;
+        long reusedTokens = 0;
         foreach (var wake in records
             .Where(record => !string.IsNullOrWhiteSpace(record.CacheSessionID)
                 && !string.IsNullOrWhiteSpace(record.WakeID))
@@ -414,14 +444,15 @@ internal static class ProjectPromptCacheAnalytics
                     if (reusable > 0)
                     {
                         long cached = Math.Clamp(record.CachedPromptTokens, 0, currentPrompt);
-                        result.ReusablePrefixSamples++;
-                        result.ReusablePrefixTokens += reusable;
-                        result.ReusedPrefixTokens += Math.Min(cached, reusable);
+                        samples++;
+                        reusableTokens += reusable;
+                        reusedTokens += Math.Min(cached, reusable);
                     }
                 }
                 previous = record;
             }
         }
+        return new ReusablePrefixMeasurement(samples, reusableTokens, reusedTokens);
     }
 
     private static AnalyticsPromptCacheBreakdown BuildBreakdown(
