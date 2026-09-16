@@ -31,6 +31,11 @@ public sealed class AnalyticsPromptCacheSnapshot
     public long ReusablePrefixTokens { get; set; }
     public long ReusedPrefixTokens { get; set; }
     public double ReusablePrefixEfficiencyPct { get; set; }
+    /// <summary>Continuations resumed after the assumed prefix lifetime, so excluded from the
+    /// efficiency ratio. The prefill they re-paid is real money and the main lever on the raw hit
+    /// rate, but it is idle time being billed, not a prefix-assembly fault.</summary>
+    public int ExpiredPrefixSamples { get; set; }
+    public long ExpiredPrefixTokens { get; set; }
     public double TargetReusablePrefixEfficiencyPct { get; set; } = 99.7;
     public bool MeetsReusablePrefixTarget { get; set; }
     public double ZeroHitRatePct { get; set; }
@@ -270,6 +275,8 @@ internal static class ProjectPromptCacheAnalytics
             ReusablePrefixSamples = snapshots.Sum(item => item.ReusablePrefixSamples),
             ReusablePrefixTokens = snapshots.Sum(item => item.ReusablePrefixTokens),
             ReusedPrefixTokens = snapshots.Sum(item => item.ReusedPrefixTokens),
+            ExpiredPrefixSamples = snapshots.Sum(item => item.ExpiredPrefixSamples),
+            ExpiredPrefixTokens = snapshots.Sum(item => item.ExpiredPrefixTokens),
             TotalRequestDurationMs = snapshots.Sum(item => item.TotalRequestDurationMs),
             LatencyBreakdownRequests = snapshots.Sum(item => item.LatencyBreakdownRequests),
             TotalQueueDurationMs = snapshots.Sum(item => item.TotalQueueDurationMs),
@@ -366,11 +373,21 @@ internal static class ProjectPromptCacheAnalytics
     internal static bool IsMeasuredSample(ProjectTokenUsageRecord record)
         => IsEligible(record) && record.CacheMetricsAvailable;
 
-    /// <summary>The known-reusable prefix and how much of it the provider actually served.</summary>
+    /// <summary>
+    /// The known-reusable prefix and how much of it the provider actually served.
+    ///
+    /// <paramref name="ExpiredSamples"/>/<paramref name="ExpiredTokens"/> are the continuations left
+    /// OUT of the ratio because the agent was away longer than the cache could plausibly hold the
+    /// prefix. They are reported rather than discarded: a rise in expiries is a real (and expensive)
+    /// fact about how the fleet is spending its time, it is just not evidence that prefix assembly
+    /// is broken, which is the only thing this ratio is allowed to claim.
+    /// </summary>
     internal readonly record struct ReusablePrefixMeasurement(
         int Samples,
         long ReusableTokens,
-        long ReusedTokens);
+        long ReusedTokens,
+        int ExpiredSamples = 0,
+        long ExpiredTokens = 0);
 
     private static void AddProviderTransitions(
         AnalyticsPromptCacheSnapshot result,
@@ -395,14 +412,24 @@ internal static class ProjectPromptCacheAnalytics
         }
     }
 
+    /// <summary>
+    /// How long a prefix is assumed to survive at the provider, for the purpose of deciding which
+    /// continuations were ever capable of hitting. Shared with
+    /// <see cref="ProjectCacheHealthOptions.AssumedPrefixLifetime"/>'s default so the dashboard and
+    /// the kill switch cannot report different efficiencies for the same window.
+    /// </summary>
+    internal static readonly TimeSpan DefaultAssumedPrefixLifetime = TimeSpan.FromMinutes(5);
+
     private static void AddReusablePrefixMeasurements(
         AnalyticsPromptCacheSnapshot result,
         IReadOnlyList<ProjectTokenUsageRecord> records)
     {
-        var measurement = MeasureReusablePrefix(records);
+        var measurement = MeasureReusablePrefix(records, DefaultAssumedPrefixLifetime);
         result.ReusablePrefixSamples += measurement.Samples;
         result.ReusablePrefixTokens += measurement.ReusableTokens;
         result.ReusedPrefixTokens += measurement.ReusedTokens;
+        result.ExpiredPrefixSamples += measurement.ExpiredSamples;
+        result.ExpiredPrefixTokens += measurement.ExpiredTokens;
     }
 
     /// <summary>
@@ -410,13 +437,27 @@ internal static class ProjectPromptCacheAnalytics
     /// unavoidable ceiling — every new assistant/tool suffix is being seen for the first time — so
     /// this compares the provider's cache read against the preceding request that should be an
     /// exact prefix of this continuation instead.
+    ///
+    /// "Should" is a claim about TIME as well as bytes. A provider-side prefix cache has a finite
+    /// lifetime, so a continuation sent half an hour after its predecessor was never going to hit
+    /// however perfect the prefix is — the entry is gone. Counting that as a lost prefix is what
+    /// made this figure agree with the raw rate exactly when the two needed to disagree, and it is
+    /// what halted the fleet on 2026-09-16: measured over the live journal, continuations resumed
+    /// within three minutes reused 99.96% of their prefix and never missed outright, while the
+    /// whole of the loss sat in the 5.8% of turns that resumed 10–30 minutes later.
+    ///
+    /// So pairs separated by more than <paramref name="prefixLifetime"/> are counted as EXPIRED and
+    /// excluded from the ratio. Passing null keeps the old time-blind behaviour.
     /// </summary>
     internal static ReusablePrefixMeasurement MeasureReusablePrefix(
-        IEnumerable<ProjectTokenUsageRecord> records)
+        IEnumerable<ProjectTokenUsageRecord> records,
+        TimeSpan? prefixLifetime = null)
     {
         int samples = 0;
         long reusableTokens = 0;
         long reusedTokens = 0;
+        int expiredSamples = 0;
+        long expiredTokens = 0;
         foreach (var wake in records
             .Where(record => !string.IsNullOrWhiteSpace(record.CacheSessionID)
                 && !string.IsNullOrWhiteSpace(record.WakeID))
@@ -444,15 +485,43 @@ internal static class ProjectPromptCacheAnalytics
                     if (reusable > 0)
                     {
                         long cached = Math.Clamp(record.CachedPromptTokens, 0, currentPrompt);
-                        samples++;
-                        reusableTokens += reusable;
-                        reusedTokens += Math.Min(cached, reusable);
+                        if (prefixLifetime is { } lifetime && IdleGap(previous, record) > lifetime)
+                        {
+                            expiredSamples++;
+                            expiredTokens += reusable;
+                        }
+                        else
+                        {
+                            samples++;
+                            reusableTokens += reusable;
+                            reusedTokens += Math.Min(cached, reusable);
+                        }
                     }
                 }
                 previous = record;
             }
         }
-        return new ReusablePrefixMeasurement(samples, reusableTokens, reusedTokens);
+        return new ReusablePrefixMeasurement(
+            samples, reusableTokens, reusedTokens, expiredSamples, expiredTokens);
+    }
+
+    /// <summary>
+    /// How long the prefix sat untouched between two consecutive turns.
+    ///
+    /// OccurredAt is stamped when the request COMPLETES, so the predecessor's write lands at its own
+    /// OccurredAt while the successor is dispatched <c>RequestDurationMs</c> before its own. Getting
+    /// this backwards double-counts the successor's own service time and understates every gap.
+    ///
+    /// A row with no latency breakdown loses that correction and so reads LONGER than it was, which
+    /// can only classify a live pair as expired — it drops evidence, it can never manufacture
+    /// health. That is the safe direction for a number whose job is to hold up a kill switch.
+    /// </summary>
+    private static TimeSpan IdleGap(ProjectTokenUsageRecord previous, ProjectTokenUsageRecord record)
+    {
+        DateTime wrote = previous.OccurredAt.ToUniversalTime();
+        DateTime dispatched = record.OccurredAt.ToUniversalTime()
+            - TimeSpan.FromMilliseconds(Math.Max(0, record.RequestDurationMs));
+        return dispatched > wrote ? dispatched - wrote : TimeSpan.Zero;
     }
 
     private static AnalyticsPromptCacheBreakdown BuildBreakdown(

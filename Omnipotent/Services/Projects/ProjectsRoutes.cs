@@ -633,6 +633,9 @@ namespace Omnipotent.Services.Projects
                             minimumMeasuredRequests = options.MinimumMeasuredRequests,
                             minimumMeasuredPromptTokens = options.MinimumMeasuredPromptTokens,
                             minimumObservationSpanMinutes = options.MinimumObservationSpan.TotalMinutes,
+                            minimumReusablePrefixEfficiencyPct = options.MinimumReusablePrefixEfficiencyPct,
+                            assumedPrefixLifetimeSeconds = options.AssumedPrefixLifetime.TotalSeconds,
+                            minimumReusablePrefixSamples = options.MinimumReusablePrefixSamples,
                         },
                     }));
                 }

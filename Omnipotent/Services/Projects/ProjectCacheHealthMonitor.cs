@@ -26,6 +26,40 @@ public sealed class ProjectCacheHealthOptions
     public double MinimumWeightedHitRatePct { get; set; } = 80;
 
     /// <summary>
+    /// The corroborating floor, on expiry-adjusted reusable-prefix efficiency. The weighted rate
+    /// alone cannot separate "prefix assembly is broken" from "the agents were away longer than the
+    /// cache lives", and the second is neither a fault nor fixable by stopping the fleet.
+    ///
+    /// Both floors must be breached to halt. That is not belt-and-braces: over the live journal the
+    /// fleet's ordinary weighted rate is 80–92% per project, so the weighted floor sits ON the
+    /// normal operating point and a trip was a matter of when, not whether — 2026-09-16 spent four
+    /// hours halted at 78.3% with a perfectly healthy prefix. Efficiency over the same window was
+    /// 99.96% once expiries were excluded, and the 2026-08-28 collapse this mechanism exists for ran
+    /// at ~30% with continuations seconds apart, so it clears this floor by a wide margin.
+    /// </summary>
+    public double MinimumReusablePrefixEfficiencyPct { get; set; } = 90;
+
+    /// <summary>
+    /// How long a prefix is assumed to survive at the provider. Continuations resumed after longer
+    /// than this are counted as expired and excluded from the efficiency figure.
+    ///
+    /// Deliberately a fixed setting rather than <see cref="KliveLLM.PrefixSurvivalMeter"/>'s measured
+    /// T_eff, even though that number is better. A real cache collapse drives the measured lifetime
+    /// DOWN, which would exclude more and more pairs as the fault worsened — the detector would go
+    /// blind exactly when it is needed. Five minutes is where the live journal puts the knee:
+    /// continuations under three minutes reuse 99.96% and none miss outright; losses start past five.
+    /// </summary>
+    public TimeSpan AssumedPrefixLifetime { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Floor on the population of the efficiency figure. Below this the halt is WITHHELD rather than
+    /// falling back to the weighted rate alone — falling back would restore the false positive in
+    /// exactly the thin windows where it is most likely. A genuine collapse is not hidden by this:
+    /// agents keep taking turns while it runs, so the continuations are there, they simply all miss.
+    /// </summary>
+    public int MinimumReusablePrefixSamples { get; set; } = 10;
+
+    /// <summary>
     /// Floor on the MEASURED population before the rule may fire. Not a comfort blanket: the first
     /// turn of any conversation is a genuine 0% by construction, so a handful of cold starts is a
     /// perfectly healthy fleet that happens to look terrible. Halting on those would be the
@@ -98,8 +132,17 @@ public sealed class ProjectCacheHealthVerdict
     public long ReusablePrefixTokens { get; set; }
     public long ReusedPrefixTokens { get; set; }
     public double ReusablePrefixEfficiencyPct { get; set; }
+    public double ReusablePrefixThresholdPct { get; set; }
+
+    /// <summary>Continuations excluded from the efficiency figure because the agent was away longer
+    /// than the assumed prefix lifetime. Not a fault — but the prefill they re-paid is the fleet's
+    /// real cache cost, so it is reported rather than silently dropped.</summary>
+    public int ExpiredPrefixSamples { get; set; }
+    public long ExpiredPrefixTokens { get; set; }
 
     public bool BelowThreshold { get; set; }
+    /// <summary>Whether the corroborating efficiency floor was breached too.</summary>
+    public bool PrefixEfficiencyBelowThreshold { get; set; }
     public bool ShouldHalt { get; set; }
     /// <summary>Plain-language statement of the decision, in both directions.</summary>
     public string Summary { get; set; } = "";
@@ -135,7 +178,8 @@ public sealed class ProjectCacheHaltState
 /// <see cref="ProjectBudgetLedger.RecordTokenSpendAsync"/>, which reports the provider's
 /// <c>cached_tokens</c> alongside the spend. This watches that stream, keeps a trailing window of
 /// the raw request records, and when the token-weighted hit rate across the whole fleet falls below
-/// the configured floor it latches — after which no agent is admitted to another model call until
+/// the configured floor AND continuations resumed inside the cache's lifetime are missing too, it
+/// latches — after which no agent is admitted to another model call until
 /// Klives clears it.
 ///
 /// It exists because a cache collapse is silent: every answer is still correct, every test still
@@ -143,6 +187,12 @@ public sealed class ProjectCacheHaltState
 /// and reached Klives as a suspension email from the router's owner
 /// (see PromptPrefixStability.cs). The point of halting rather than merely logging is that a
 /// warning nobody is awake to read costs the same as no warning at all.
+///
+/// The second condition is not redundancy, it is what keeps the first usable. A fleet doing cold
+/// starts and long idle gaps has a low weighted rate by construction — 2026-09-16 stopped five
+/// projects for four hours over 78.3% while every warm continuation in the window was hitting — and
+/// no amount of halting makes that work cheaper. See
+/// <see cref="ProjectCacheHealthOptions.MinimumReusablePrefixEfficiencyPct"/>.
 ///
 /// The measurement is deliberately the same one the analytics page shows
 /// (<see cref="ProjectPromptCacheAnalytics.IsMeasuredSample"/>): a number that stops the fleet and
@@ -384,11 +434,15 @@ public sealed class ProjectCacheHealthMonitor
             ? Math.Round(perRequestTotal * 100.0 / measured.Count, 1)
             : 0;
 
-        var reusable = ProjectPromptCacheAnalytics.MeasureReusablePrefix(measured);
+        var reusable = ProjectPromptCacheAnalytics.MeasureReusablePrefix(
+            measured, options.AssumedPrefixLifetime);
         verdict.ReusablePrefixSamples = reusable.Samples;
         verdict.ReusablePrefixTokens = reusable.ReusableTokens;
         verdict.ReusedPrefixTokens = reusable.ReusedTokens;
         verdict.ReusablePrefixEfficiencyPct = Percent(reusable.ReusedTokens, reusable.ReusableTokens);
+        verdict.ReusablePrefixThresholdPct = options.MinimumReusablePrefixEfficiencyPct;
+        verdict.ExpiredPrefixSamples = reusable.ExpiredSamples;
+        verdict.ExpiredPrefixTokens = reusable.ExpiredTokens;
 
         if (measured.Count > 0)
         {
@@ -399,6 +453,8 @@ public sealed class ProjectCacheHealthMonitor
 
         verdict.BelowThreshold = verdict.PromptTokens > 0
             && verdict.WeightedHitRatePct < options.MinimumWeightedHitRatePct;
+        verdict.PrefixEfficiencyBelowThreshold = reusable.ReusableTokens > 0
+            && verdict.ReusablePrefixEfficiencyPct < options.MinimumReusablePrefixEfficiencyPct;
 
         string? withheld =
             !options.Enabled ? "the fleet cache halt is disabled"
@@ -408,16 +464,32 @@ public sealed class ProjectCacheHealthMonitor
                 ? $"only {verdict.PromptTokens:N0} of the required {options.MinimumMeasuredPromptTokens:N0} measured prompt tokens"
             : verdict.ObservationSpan < options.MinimumObservationSpan
                 ? $"measured requests span only {verdict.ObservationSpan.TotalMinutes:0.#} of the required {options.MinimumObservationSpan.TotalMinutes:0.#} minutes"
+            : reusable.Samples < options.MinimumReusablePrefixSamples
+                ? $"only {reusable.Samples} of the required {options.MinimumReusablePrefixSamples} live continuations to judge prefix health by"
+                  + (reusable.ExpiredSamples > 0
+                      ? $" ({reusable.ExpiredSamples:N0} more were excluded as expired)" : "")
+            // The whole point of the second floor: a low weighted rate with healthy efficiency is a
+            // fleet paying for cold starts and expiries, which halting does not fix and cannot.
+            : !verdict.PrefixEfficiencyBelowThreshold
+                ? $"reusable-prefix efficiency is {verdict.ReusablePrefixEfficiencyPct:0.0}% over "
+                  + $"{reusable.Samples:N0} live continuations, at or above the "
+                  + $"{options.MinimumReusablePrefixEfficiencyPct:0.#}% floor — the prefix is intact and the "
+                  + $"shortfall is cold starts and {reusable.ExpiredSamples:N0} expired continuations"
             : null;
 
         verdict.ShouldHalt = verdict.BelowThreshold && withheld == null;
 
         string window = $"{options.Window.TotalMinutes:0.#}-minute window";
         verdict.Summary = verdict.ShouldHalt
-            ? $"Weighted prompt-cache hit rate is {verdict.WeightedHitRatePct:0.0}% over the {window}, "
-              + $"below the {options.MinimumWeightedHitRatePct:0.#}% floor "
+            ? $"Reusable-prefix efficiency is {verdict.ReusablePrefixEfficiencyPct:0.0}% over "
+              + $"{verdict.ReusablePrefixSamples:N0} live continuations, below the "
+              + $"{options.MinimumReusablePrefixEfficiencyPct:0.#}% floor, and the weighted hit rate is "
+              + $"{verdict.WeightedHitRatePct:0.0}% over the {window}, below the "
+              + $"{options.MinimumWeightedHitRatePct:0.#}% floor "
               + $"({verdict.MeasuredRequests:N0} measured requests, {verdict.PromptTokens:N0} prompt tokens, "
-              + $"{verdict.UncachedTokens:N0} of them uncached)."
+              + $"{verdict.UncachedTokens:N0} of them uncached). Warm prefixes are being lost, not merely "
+              + $"expiring: continuations sent inside the {options.AssumedPrefixLifetime.TotalMinutes:0.#}-minute "
+              + $"assumed prefix lifetime are missing."
             : verdict.BelowThreshold
                 ? $"Weighted hit rate is {verdict.WeightedHitRatePct:0.0}% over the {window}, below the "
                   + $"{options.MinimumWeightedHitRatePct:0.#}% floor, but the halt is withheld: {withheld}."
@@ -483,7 +555,8 @@ public sealed class ProjectCacheHealthMonitor
         text.AppendLine($"Generated: {Stamp(verdict.EvaluatedAt)}");
         text.AppendLine($"Window: {Stamp(verdict.WindowStart)} → {Stamp(verdict.WindowEnd)} "
             + $"({options.Window.TotalMinutes:0.#} minutes)");
-        text.AppendLine($"Trigger: weighted cache hit rate < {options.MinimumWeightedHitRatePct:0.#}%");
+        text.AppendLine($"Trigger: reusable-prefix efficiency < {options.MinimumReusablePrefixEfficiencyPct:0.#}% "
+            + $"AND weighted cache hit rate < {options.MinimumWeightedHitRatePct:0.#}%");
         text.AppendLine();
         text.AppendLine(verdict.Summary);
         text.AppendLine();
@@ -502,16 +575,27 @@ public sealed class ProjectCacheHealthMonitor
         text.AppendLine($"| Cached prompt tokens | {verdict.CachedTokens:N0} |");
         text.AppendLine($"| Uncached prompt tokens | {verdict.UncachedTokens:N0} |");
         text.AppendLine($"| Cache-write tokens | {verdict.CacheWriteTokens:N0} |");
-        text.AppendLine($"| Reusable-prefix efficiency | {verdict.ReusablePrefixEfficiencyPct:0.0}% "
+        text.AppendLine($"| Reusable-prefix efficiency (trigger metric) | **{verdict.ReusablePrefixEfficiencyPct:0.0}%** "
             + $"({verdict.ReusedPrefixTokens:N0} of {verdict.ReusablePrefixTokens:N0} tokens over "
-            + $"{verdict.ReusablePrefixSamples:N0} continuations) |");
+            + $"{verdict.ReusablePrefixSamples:N0} live continuations) |");
+        text.AppendLine($"| Reusable-prefix floor | {verdict.ReusablePrefixThresholdPct:0.#}% |");
+        text.AppendLine($"| Expired continuations (excluded) | {verdict.ExpiredPrefixSamples:N0} "
+            + $"({verdict.ExpiredPrefixTokens:N0} tokens re-prefilled) |");
+        text.AppendLine($"| Assumed prefix lifetime | {options.AssumedPrefixLifetime.TotalMinutes:0.#} min |");
         text.AppendLine($"| Measured span | {verdict.ObservationSpan.TotalMinutes:0.#} min |");
         text.AppendLine();
         text.AppendLine("The weighted rate is total cached prompt tokens over total prompt tokens, so each");
-        text.AppendLine("request counts in proportion to its size. Reusable-prefix efficiency is the stricter");
-        text.AppendLine("correctness figure: of the prefix a continuation SHOULD have reused, how much the");
-        text.AppendLine("provider actually served from cache. A healthy fleet with a low weighted rate but a");
-        text.AppendLine("~100% reusable figure is doing cold starts, not losing warm prefixes.");
+        text.AppendLine("request counts in proportion to its size. On its own it cannot be a trigger: its");
+        text.AppendLine("ceiling is set by how much COLD work the fleet is doing — first turns, and");
+        text.AppendLine("continuations resumed after the provider's cache had already dropped the prefix —");
+        text.AppendLine("and halting the fleet does not make any of that cheaper.");
+        text.AppendLine();
+        text.AppendLine("Reusable-prefix efficiency is the correctness figure, and both floors must be");
+        text.AppendLine("breached to halt. Of the prefix a continuation should have reused, how much the");
+        text.AppendLine("provider actually served — counting only continuations resumed INSIDE the assumed");
+        text.AppendLine("prefix lifetime, because one resumed after it was never going to hit. Those are");
+        text.AppendLine("counted separately above: they are real prefill spend and worth watching, but they");
+        text.AppendLine("are a fact about how long the agents were away, not about prefix assembly.");
         text.AppendLine();
 
         text.AppendLine($"## Halted projects ({haltedProjectIDs.Count})");

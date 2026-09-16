@@ -1451,6 +1451,12 @@ namespace Omnipotent.Services.Projects
                     Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumPromptTokens", 250_000), 0, int.MaxValue),
                 MinimumObservationSpan = TimeSpan.FromMinutes(
                     Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMinimumSpanMinutes", 5), 0, 24 * 60)),
+                MinimumReusablePrefixEfficiencyPct = Math.Clamp(
+                    await GetIntOmniSetting("Projects_CacheHaltMinimumPrefixEfficiencyPct", 90), 1, 100),
+                AssumedPrefixLifetime = TimeSpan.FromSeconds(Math.Clamp(
+                    await GetIntOmniSetting("Projects_CacheHaltPrefixLifetimeSeconds", 300), 30, 24 * 60 * 60)),
+                MinimumReusablePrefixSamples = Math.Clamp(
+                    await GetIntOmniSetting("Projects_CacheHaltMinimumPrefixSamples", 10), 1, 100_000),
                 MaxRetainedSamples =
                     Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMaxSamples", 5_000), 100, 200_000),
             };

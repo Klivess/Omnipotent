@@ -167,11 +167,11 @@ public class ProjectCacheHealthMonitorTests : IDisposable
     public void TheTriggerIsTokenWeighted_NotAPerRequestMean()
     {
         // Nineteen tiny fully-cached requests against one huge mostly-uncached one. The per-request
-        // mean says 96% and would let this run; weighted by tokens it is 16%, which is the figure
-        // the provider actually bills and the one the fleet is stopped on.
+        // mean says 96%; weighted by tokens it is 16%, which is the figure the provider actually
+        // bills. Asserted on the window rather than on a halt: the weighted rate being below the
+        // floor is necessary to stop the fleet but no longer sufficient, and this one huge request
+        // continues nothing, so there is no prefix evidence to convict it with.
         var monitor = Monitor();
-        ProjectCacheHealthVerdict? halted = null;
-        monitor.HaltAction = (verdict, _) => { halted = verdict; return Task.CompletedTask; };
 
         for (int index = 0; index < 19; index++)
         {
@@ -181,9 +181,10 @@ public class ProjectCacheHealthMonitorTests : IDisposable
         now = Start + TimeSpan.FromMinutes(11);
         monitor.Observe(Record(5_000_000, 800_000, epochTurn: 40));
 
-        Assert.True(SpinFor(() => halted != null));
-        Assert.Equal(16.3, halted!.WeightedHitRatePct, 1);
-        Assert.Equal(95.8, halted.UnweightedHitRatePct, 1);
+        var verdict = monitor.Describe();
+        Assert.Equal(16.3, verdict.WeightedHitRatePct, 1);
+        Assert.Equal(95.8, verdict.UnweightedHitRatePct, 1);
+        Assert.True(verdict.BelowThreshold);
     }
 
     [Fact]
@@ -228,6 +229,98 @@ public class ProjectCacheHealthMonitorTests : IDisposable
         Assert.False(verdict.ShouldHalt);
         Assert.Contains("halt is withheld", verdict.Summary, StringComparison.Ordinal);
         Assert.Contains("span only", verdict.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The 2026-09-16 false positive, reproduced. The fleet ran for four hours halted on a 78.3%
+    /// weighted rate while its prefixes were intact: every continuation resumed inside the cache
+    /// lifetime hit, and the entire shortfall came from a handful of turns resumed long after the
+    /// provider had dropped the prefix — idle agents and a hung browser call, neither of which
+    /// stopping the fleet repairs.
+    /// </summary>
+    [Fact]
+    public void ExpiredPrefixes_DragTheWeightedRateDown_ButDoNotHaltAHealthyFleet()
+    {
+        var monitor = Monitor();
+        int trips = 0;
+        monitor.HaltAction = (_, _) => { trips++; return Task.CompletedTask; };
+
+        // Twenty turns of ordinary work, 45s apart: warm, and reusing essentially all of the prefix.
+        for (int index = 0; index < 20; index++)
+        {
+            now = Start + TimeSpan.FromSeconds(45 * index);
+            monitor.Observe(Record(60_000, 59_500, epochTurn: index + 2, occurredAt: now));
+        }
+
+        // A second project whose commander went quiet for eight minutes mid-wake and came back to a
+        // prefix the provider had already evicted. Big, and a total miss — as it must be.
+        now = Start + TimeSpan.FromSeconds(45 * 19);
+        monitor.Observe(Record(300_000, 299_000, projectID: "p2", epochTurn: 2,
+            occurredAt: Start + TimeSpan.FromMinutes(6)));
+        monitor.Observe(Record(600_000, 0, projectID: "p2", epochTurn: 3,
+            occurredAt: Start + TimeSpan.FromMinutes(14)));
+
+        var verdict = monitor.Describe();
+        Assert.True(verdict.BelowThreshold);                      // 70.9% — well under the 80% floor
+        Assert.False(verdict.ShouldHalt);
+        Assert.False(monitor.IsHalted);
+        Assert.Equal(0, trips);
+
+        // The expired pair is excluded from the correctness figure and reported on its own.
+        Assert.Equal(1, verdict.ExpiredPrefixSamples);
+        Assert.Equal(300_000, verdict.ExpiredPrefixTokens);
+        Assert.Equal(19, verdict.ReusablePrefixSamples);
+        Assert.True(verdict.ReusablePrefixEfficiencyPct > 99);
+        Assert.False(verdict.PrefixEfficiencyBelowThreshold);
+        Assert.Contains("the prefix is intact", verdict.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other half of the same rule: once continuations start missing INSIDE the cache lifetime,
+    /// this is the 2026-08-28 collapse and the fleet must still stop.
+    /// </summary>
+    [Fact]
+    public void WarmContinuationsThatMiss_StillHaltTheFleet()
+    {
+        var monitor = Monitor();
+        ProjectCacheHealthVerdict? halted = null;
+        monitor.HaltAction = (verdict, _) => { halted = verdict; return Task.CompletedTask; };
+
+        // Same cadence as above — 45 seconds apart, nowhere near expiry — but the provider is
+        // serving almost none of the prefix back.
+        for (int index = 0; index < 22; index++)
+        {
+            now = Start + TimeSpan.FromSeconds(45 * index);
+            monitor.Observe(Record(60_000, 18_000, epochTurn: index + 2, occurredAt: now));
+        }
+
+        Assert.True(SpinFor(() => halted != null));
+        Assert.True(halted!.PrefixEfficiencyBelowThreshold);
+        Assert.Equal(0, halted.ExpiredPrefixSamples);
+        Assert.Contains("Warm prefixes are being lost", halted.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With too little live evidence the halt is withheld rather than falling back to the weighted
+    /// rate, which would put the false positive straight back in the thinnest windows.
+    /// </summary>
+    [Fact]
+    public void TooFewLiveContinuations_WithholdsTheHaltAndSaysWhy()
+    {
+        var monitor = Monitor();
+        // Twenty-five first turns: plenty of volume and span, but nothing continues anything, so
+        // there is no prefix to judge.
+        for (int index = 0; index < 25; index++)
+        {
+            now = Start + TimeSpan.FromSeconds(index * 30);
+            monitor.Observe(Record(55_000, 0, epochTurn: 1, occurredAt: now));
+        }
+
+        var verdict = monitor.Describe();
+        Assert.True(verdict.BelowThreshold);
+        Assert.False(verdict.ShouldHalt);
+        Assert.Contains("live continuations to judge prefix health by",
+            verdict.Summary, StringComparison.Ordinal);
     }
 
     [Fact]
