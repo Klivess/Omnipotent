@@ -21,7 +21,9 @@ namespace Omnipotent.Services.KliveLLM
     /// <summary>How much of the scheduler is actually allowed to affect dispatch.</summary>
     public enum AIRouterSchedulerMode
     {
-        /// <summary>Ordering by arrival, no residency, no parking. Behaviourally the old gate.</summary>
+        /// <summary>Ordering by arrival, no residency, no parking, no slot reservations. Every
+        /// cache-aware mechanism is off, leaving the published rate envelope and the provider
+        /// cool-off — behaviourally the gate that existed before any of this.</summary>
         Fifo,
         /// <summary>Compute every decision and record what it WOULD have done, then dispatch FIFO.
         /// Lets the policy be validated against production traffic before it can affect anything.</summary>

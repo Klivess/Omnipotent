@@ -423,6 +423,42 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
+        public async Task Fifo_TurnsOffSlotReservationsAndNotJustOrdering()
+        {
+            // The mode dropdown has to mean what it says. Ordering and parking were already gated on
+            // it, but the slot reservation was not — and that is a cache-aware mechanism too: it idles
+            // a just-freed slot for the conversation that released it, which is exactly the queue
+            // jumping Fifo exists to switch off. Left ungated, "Fifo" was the smart queue with its
+            // ordering removed, so anyone reaching for the plain gate under load did not get one.
+            static async Task<long> NewcomerWaitMsAsync(AIRouterSchedulerMode mode)
+            {
+                var clock = new VirtualClock();
+                var limiter = new AIRouterFairUseLimiter(2, 240, 10_000_000, clock.Now, clock.DelayAsync,
+                    new PrefixSurvivalMeter());
+                limiter.SetMode(mode);
+
+                // Two slots, both taken, then one released: the released slot is the contested one.
+                var releasing = await limiter.AcquireAsync(1_000, Ticket("toolloop#e1|qwen"));
+                var holding = await limiter.AcquireAsync(1_000, Ticket("filler#e1|qwen"));
+                releasing.Dispose();
+
+                var newcomer = await limiter.AcquireAsync(1_000, Ticket("newcomer#e1|qwen"))
+                    .WaitAsync(TimeSpan.FromSeconds(10));
+                newcomer.Dispose();
+                holding.Dispose();
+                return newcomer.QueueDurationMs;
+            }
+
+            Assert.Equal(0, await NewcomerWaitMsAsync(AIRouterSchedulerMode.Fifo));
+            // Observe's contract is that it decides without any of it reaching dispatch, so a
+            // reservation is not its to grant either.
+            Assert.Equal(0, await NewcomerWaitMsAsync(AIRouterSchedulerMode.Observe));
+            // And the mechanism is still there when it was asked for.
+            Assert.True(await NewcomerWaitMsAsync(AIRouterSchedulerMode.Enforce) > 0,
+                "Enforce must still hold a freed slot for the conversation that released it");
+        }
+
+        [Fact]
         public async Task TheSchedulerNeverManufacturesTrafficOfItsOwn()
         {
             // Pins the decision NOT to build cache-refresh pings. Every entry in the fair-use window
@@ -460,6 +496,22 @@ namespace Omnipotent.Tests.KliveLLM
             DateTime newcomerDeadline = scheduler.Deadline(Ticket("cold#e|m"), T0, lifetime);
             Assert.Equal(T0 + lifetime, residentDeadline);
             Assert.True(residentDeadline < newcomerDeadline);
+        }
+
+        /// <summary>Advances instantly instead of sleeping, so a reservation window is tested in
+        /// milliseconds rather than in the seconds it actually spans.</summary>
+        private sealed class VirtualClock
+        {
+            public DateTime UtcNow { get; private set; } = T0;
+
+            public Func<DateTime> Now => () => UtcNow;
+
+            public Task DelayAsync(TimeSpan span, CancellationToken cancellationToken)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (span > TimeSpan.Zero) UtcNow += span;
+                return Task.CompletedTask;
+            }
         }
     }
 }

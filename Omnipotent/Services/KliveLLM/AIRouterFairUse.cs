@@ -446,7 +446,11 @@ namespace Omnipotent.Services.KliveLLM
             // A human waiting, or a request that has already waited out its park ceiling, takes a
             // reserved slot rather than idling behind it.
             bool preempts = self.Info.Class == AIRouterWorkClass.Interactive || pastDeadline;
-            if (!preempts)
+            // Checked here as well as at the point a grace is granted, so that switching the mode
+            // under load takes effect on the very next decision instead of after the outstanding
+            // reservations time out. Leaving them in the dictionary is deliberate: flipping back to
+            // Enforce within the window then resumes with the state it had.
+            if (!preempts && mode == AIRouterSchedulerMode.Enforce)
             {
                 foreach (var kv in graces)
                 {
@@ -475,6 +479,12 @@ namespace Omnipotent.Services.KliveLLM
 
         private void OfferGraceLocked(AIRouterFairUseLease lease, DateTime now)
         {
+            // A reservation is part of the cache-aware policy, not the rate limiter: it idles a free
+            // slot that the longest-waiting caller could have taken. So it belongs to Enforce only.
+            // Observe must not grant one either — its whole contract is that it computes the policy's
+            // decisions without any of them reaching dispatch.
+            if (mode != AIRouterSchedulerMode.Enforce) return;
+
             // Only a conversation that can actually reuse a prefix is worth idling a slot for, and only
             // while it is still in the warm cohort.
             if (lease.Info.Class is not (AIRouterWorkClass.Interactive or AIRouterWorkClass.Agent)) return;
