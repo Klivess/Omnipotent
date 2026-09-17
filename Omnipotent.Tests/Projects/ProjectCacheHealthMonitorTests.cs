@@ -45,9 +45,15 @@ public class ProjectCacheHealthMonitorTests : IDisposable
         string model = "qwen3.8",
         bool measurable = true,
         int epochTurn = 2,
-        DateTime? occurredAt = null)
+        DateTime? occurredAt = null,
+        long queueMs = 0,
+        long providerMs = 0)
         => new()
         {
+            LatencyBreakdownAvailable = queueMs > 0 || providerMs > 0,
+            QueueDurationMs = queueMs,
+            ProviderDurationMs = providerMs,
+            RequestDurationMs = queueMs + providerMs,
             RecordKind = "usage",
             ProjectID = projectID,
             AgentID = agentID,
@@ -273,6 +279,57 @@ public class ProjectCacheHealthMonitorTests : IDisposable
         Assert.True(verdict.ReusablePrefixEfficiencyPct > 99);
         Assert.False(verdict.PrefixEfficiencyBelowThreshold);
         Assert.Contains("the prefix is intact", verdict.Summary, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The 2026-09-16 22:16 halt, reproduced: the false positive that survived the first fix.
+    ///
+    /// Nine projects against three AIRouter slots had pushed the queue to 4–6 minutes, so every
+    /// continuation was ENQUEUED seconds after its predecessor and did not REACH the provider until
+    /// well past the prefix lifetime. The gap was measured to the enqueue, which is the one point in
+    /// the request's life that excludes the wait responsible for the expiry, so eight genuinely
+    /// expired pairs were scored as warm prefixes the assembly had lost — 57.6% efficiency, both
+    /// floors breached, fleet halted for a fault that was not in the prompt.
+    /// </summary>
+    [Fact]
+    public void ContinuationsThatExpireInTheQueue_AreExpiries_NotLostPrefixes()
+    {
+        var monitor = Monitor();
+        int trips = 0;
+        monitor.HaltAction = (_, _) => { trips++; return Task.CompletedTask; };
+
+        // Turn 1 of twelve wakes, one per project, each completing 20s apart.
+        for (int index = 0; index < 12; index++)
+        {
+            DateTime at = Start + TimeSpan.FromSeconds(20 * index);
+            monitor.Observe(Record(50_000, 27_200, projectID: $"p{index}", epochTurn: 1,
+                occurredAt: at, queueMs: 150_000, providerMs: 60_000));
+        }
+
+        // Turn 2 of each: handed to the limiter ~4s after its predecessor finished, then held 5.5
+        // minutes for a slot. It arrives at the provider past the lifetime and comes back with the
+        // shared system+tools preamble only — 27,200 tokens, the same figure for every project,
+        // because that block is the one thing the fleet keeps hot between them.
+        for (int index = 0; index < 12; index++)
+        {
+            DateTime predecessor = Start + TimeSpan.FromSeconds(20 * index);
+            monitor.Observe(Record(51_000, 27_200, projectID: $"p{index}", epochTurn: 2,
+                occurredAt: predecessor.AddSeconds(4).AddSeconds(330 + 40),
+                queueMs: 330_000, providerMs: 40_000));
+        }
+
+        var verdict = monitor.Describe();
+        Assert.True(verdict.BelowThreshold);              // ~53%, far under the weighted floor
+        Assert.False(verdict.ShouldHalt);
+        Assert.Equal(0, trips);
+
+        // Every pair is an expiry, and every one of them expired in the queue rather than because
+        // anybody was idle — which is the distinction that decides whether halting could help.
+        Assert.Equal(0, verdict.ReusablePrefixSamples);
+        Assert.Equal(12, verdict.ExpiredPrefixSamples);
+        Assert.Equal(12, verdict.QueueExpiredPrefixSamples);
+        Assert.Equal(verdict.ExpiredPrefixTokens, verdict.QueueExpiredPrefixTokens);
+        Assert.Contains("live continuations to judge prefix health by", verdict.Summary, StringComparison.Ordinal);
     }
 
     /// <summary>

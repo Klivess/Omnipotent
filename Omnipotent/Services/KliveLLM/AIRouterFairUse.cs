@@ -604,8 +604,9 @@ namespace Omnipotent.Services.KliveLLM
         /// the loop that lets the scheduler learn a lifetime nobody can configure.</summary>
         internal void RecordCacheOutcome(AIRouterFairUseLease lease, long promptTokens, long cachedTokens,
             TimeSpan occupancy)
-            => survival.RecordOutcome(lease.GapSinceLastDispatch, promptTokens, cachedTokens,
-                lease.WasResident, lease.Info.Class == AIRouterWorkClass.OneShot, occupancy, nowUtc());
+            => survival.RecordOutcome(lease.Info.PrefixKey, lease.GapSinceLastDispatch, promptTokens,
+                cachedTokens, lease.WasResident, lease.Info.Class == AIRouterWorkClass.OneShot,
+                occupancy, nowUtc());
 
         internal DateTime UtcNow() => nowUtc();
 

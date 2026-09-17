@@ -140,6 +140,13 @@ public sealed class ProjectCacheHealthVerdict
     public int ExpiredPrefixSamples { get; set; }
     public long ExpiredPrefixTokens { get; set; }
 
+    /// <summary>Of <see cref="ExpiredPrefixSamples"/>, the ones that were NOT away: ready inside the
+    /// lifetime and queued past it waiting for one of AIRouter's three slots. Reported separately
+    /// because it is the one flavour of expiry the fleet causes and can fix, and because halting is
+    /// the wrong lever for it — a halted fleet has the same slots when it comes back.</summary>
+    public int QueueExpiredPrefixSamples { get; set; }
+    public long QueueExpiredPrefixTokens { get; set; }
+
     public bool BelowThreshold { get; set; }
     /// <summary>Whether the corroborating efficiency floor was breached too.</summary>
     public bool PrefixEfficiencyBelowThreshold { get; set; }
@@ -443,6 +450,8 @@ public sealed class ProjectCacheHealthMonitor
         verdict.ReusablePrefixThresholdPct = options.MinimumReusablePrefixEfficiencyPct;
         verdict.ExpiredPrefixSamples = reusable.ExpiredSamples;
         verdict.ExpiredPrefixTokens = reusable.ExpiredTokens;
+        verdict.QueueExpiredPrefixSamples = reusable.QueueExpiredSamples;
+        verdict.QueueExpiredPrefixTokens = reusable.QueueExpiredTokens;
 
         if (measured.Count > 0)
         {
@@ -581,6 +590,8 @@ public sealed class ProjectCacheHealthMonitor
         text.AppendLine($"| Reusable-prefix floor | {verdict.ReusablePrefixThresholdPct:0.#}% |");
         text.AppendLine($"| Expired continuations (excluded) | {verdict.ExpiredPrefixSamples:N0} "
             + $"({verdict.ExpiredPrefixTokens:N0} tokens re-prefilled) |");
+        text.AppendLine($"| ⤷ of those, expired IN THE QUEUE | {verdict.QueueExpiredPrefixSamples:N0} "
+            + $"({verdict.QueueExpiredPrefixTokens:N0} tokens re-prefilled) |");
         text.AppendLine($"| Assumed prefix lifetime | {options.AssumedPrefixLifetime.TotalMinutes:0.#} min |");
         text.AppendLine($"| Measured span | {verdict.ObservationSpan.TotalMinutes:0.#} min |");
         text.AppendLine();
@@ -597,6 +608,16 @@ public sealed class ProjectCacheHealthMonitor
         text.AppendLine("counted separately above: they are real prefill spend and worth watching, but they");
         text.AppendLine("are a fact about how long the agents were away, not about prefix assembly.");
         text.AppendLine();
+        if (verdict.QueueExpiredPrefixSamples > 0)
+        {
+            text.AppendLine("Some of those expiries were not idleness. A prefix expires on the PROVIDER's");
+            text.AppendLine("clock, which keeps running while a request waits for one of AIRouter's three");
+            text.AppendLine("slots, so a continuation that was ready seconds after its predecessor can still");
+            text.AppendLine("arrive after the prefix is gone. Those are broken out above. They mean the fleet");
+            text.AppendLine("is asking for more concurrent turns than the key can keep warm — the remedy is");
+            text.AppendLine("fewer active projects or a larger warm cohort, never a halt, which frees no slots.");
+            text.AppendLine();
+        }
 
         text.AppendLine($"## Halted projects ({haltedProjectIDs.Count})");
         text.AppendLine();

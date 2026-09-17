@@ -387,7 +387,11 @@ internal static class ProjectPromptCacheAnalytics
         long ReusableTokens,
         long ReusedTokens,
         int ExpiredSamples = 0,
-        long ExpiredTokens = 0);
+        long ExpiredTokens = 0,
+        /// <summary>Of <see cref="ExpiredSamples"/>, those that were ready inside the prefix lifetime
+        /// and spent it waiting for an AIRouter slot. A fleet fault, but a capacity one.</summary>
+        int QueueExpiredSamples = 0,
+        long QueueExpiredTokens = 0);
 
     private static void AddProviderTransitions(
         AnalyticsPromptCacheSnapshot result,
@@ -458,6 +462,8 @@ internal static class ProjectPromptCacheAnalytics
         long reusedTokens = 0;
         int expiredSamples = 0;
         long expiredTokens = 0;
+        int queueExpiredSamples = 0;
+        long queueExpiredTokens = 0;
         foreach (var wake in records
             .Where(record => !string.IsNullOrWhiteSpace(record.CacheSessionID)
                 && !string.IsNullOrWhiteSpace(record.WakeID))
@@ -485,10 +491,18 @@ internal static class ProjectPromptCacheAnalytics
                     if (reusable > 0)
                     {
                         long cached = Math.Clamp(record.CachedPromptTokens, 0, currentPrompt);
-                        if (prefixLifetime is { } lifetime && IdleGap(previous, record) > lifetime)
+                        if (prefixLifetime is { } lifetime && ProviderIdleGap(previous, record) > lifetime)
                         {
                             expiredSamples++;
                             expiredTokens += reusable;
+                            // Expired, but not because anyone was idle: this one was ready inside the
+                            // lifetime and spent it queued. Counted apart because the two have opposite
+                            // remedies — nothing, versus admission control.
+                            if (EnqueueIdleGap(previous, record) <= lifetime)
+                            {
+                                queueExpiredSamples++;
+                                queueExpiredTokens += reusable;
+                            }
                         }
                         else
                         {
@@ -502,26 +516,48 @@ internal static class ProjectPromptCacheAnalytics
             }
         }
         return new ReusablePrefixMeasurement(
-            samples, reusableTokens, reusedTokens, expiredSamples, expiredTokens);
+            samples, reusableTokens, reusedTokens, expiredSamples, expiredTokens,
+            queueExpiredSamples, queueExpiredTokens);
     }
 
     /// <summary>
-    /// How long the prefix sat untouched between two consecutive turns.
+    /// How long the prefix sat untouched between two consecutive turns, as the PROVIDER experienced
+    /// it: from the predecessor's write to the moment this request actually reached the provider.
     ///
-    /// OccurredAt is stamped when the request COMPLETES, so the predecessor's write lands at its own
-    /// OccurredAt while the successor is dispatched <c>RequestDurationMs</c> before its own. Getting
-    /// this backwards double-counts the successor's own service time and understates every gap.
+    /// The distinction is the whole measurement. A prefix cache expires in the provider's wall clock,
+    /// which keeps running while a request sits in our own admission queue — so the gap that decides
+    /// whether a prefix was still there is (completed → arrived at provider), and the local wait is
+    /// part of it, not an exemption from it.
     ///
-    /// A row with no latency breakdown loses that correction and so reads LONGER than it was, which
-    /// can only classify a live pair as expired — it drops evidence, it can never manufacture
-    /// health. That is the safe direction for a number whose job is to hold up a kill switch.
+    /// Subtracting <c>RequestDurationMs</c> instead — as this did until 2026-09-17 — deducts the queue
+    /// wait as well, which is the one term that makes the gap long in the first place. Under load that
+    /// wait is minutes: on 2026-09-16 every continuation in the halting window was enqueued 3–163s
+    /// after its predecessor but only reached the provider 267–440s after it, so eight pairs whose
+    /// prefixes had genuinely expired were scored as live prefixes the assembly had lost, and the
+    /// fleet was halted for a fault that was not in the prompt at all.
+    ///
+    /// A row with no latency breakdown gets no correction and so reads LONGER than it was, which can
+    /// only classify a live pair as expired — it drops evidence, it can never manufacture health.
+    /// That is the safe direction for a number whose job is to hold up a kill switch.
     /// </summary>
-    private static TimeSpan IdleGap(ProjectTokenUsageRecord previous, ProjectTokenUsageRecord record)
+    private static TimeSpan ProviderIdleGap(ProjectTokenUsageRecord previous, ProjectTokenUsageRecord record)
+        => GapTo(previous, record.LatencyBreakdownAvailable ? record.ProviderDurationMs : 0, record);
+
+    /// <summary>
+    /// The same gap measured to the moment the request ENTERED the queue rather than the moment it
+    /// left it. Only ever compared against <see cref="ProviderIdleGap"/>: a pair that is live by this
+    /// measure and expired by that one lost its prefix to our own queue, which is a capacity fault and
+    /// the one kind of expiry the fleet can actually do something about.
+    /// </summary>
+    private static TimeSpan EnqueueIdleGap(ProjectTokenUsageRecord previous, ProjectTokenUsageRecord record)
+        => GapTo(previous, record.LatencyBreakdownAvailable ? record.RequestDurationMs : 0, record);
+
+    private static TimeSpan GapTo(ProjectTokenUsageRecord previous, long rewindMs, ProjectTokenUsageRecord record)
     {
         DateTime wrote = previous.OccurredAt.ToUniversalTime();
-        DateTime dispatched = record.OccurredAt.ToUniversalTime()
-            - TimeSpan.FromMilliseconds(Math.Max(0, record.RequestDurationMs));
-        return dispatched > wrote ? dispatched - wrote : TimeSpan.Zero;
+        DateTime reached = record.OccurredAt.ToUniversalTime()
+            - TimeSpan.FromMilliseconds(Math.Max(0, rewindMs));
+        return reached > wrote ? reached - wrote : TimeSpan.Zero;
     }
 
     private static AnalyticsPromptCacheBreakdown BuildBreakdown(

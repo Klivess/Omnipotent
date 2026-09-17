@@ -313,6 +313,58 @@ namespace Omnipotent.Tests.KliveLLM
                 "a park that ends inside the dead zone defeats the entire point of the scheduler");
         }
 
+        // ── What the meter is allowed to call a hit ───────────────────────────────────────────
+
+        /// <summary>
+        /// The blind spot that let the scheduler switch itself off on 2026-09-16.
+        ///
+        /// Every agent prompt opens with the same system block and tool schemas. That block is
+        /// referenced by every project on the box, so it is never what LRU evicts, and it is 27K of a
+        /// 50K commander prompt. A continuation whose own conversation had been dropped therefore came
+        /// back 54% cached on the preamble alone — over a 50%-of-the-whole-prompt bar, so it scored as
+        /// a hit. No band could ever fail, the lifetime climbed to its ceiling, the warm cohort was
+        /// sized to the entire fleet, nothing was parked, and the gate degraded to FIFO while
+        /// reporting perfect health.
+        /// </summary>
+        [Fact]
+        public void SurvivingSharedPreamble_IsNotAHit()
+        {
+            var meter = new PrefixSurvivalMeter();
+            const string key = "projects-commander-p1#e1|qwen";
+            TimeSpan lifetimeBefore = meter.EffectiveLifetime();
+
+            // Enough evidence to schedule on, every sample a continuation that got the preamble back
+            // and nothing else.
+            for (int i = 0; i < 200; i++)
+                meter.RecordOutcome(key, TimeSpan.FromSeconds(300), promptTokens: 50_000,
+                    cachedTokens: 27_200, wasResident: true, outsideCohort: false,
+                    slotOccupancy: TimeSpan.FromSeconds(60), nowUtc: T0.AddSeconds(i * 300));
+
+            var snapshot = meter.Describe();
+            Assert.True(snapshot.ReusableSamples > 0, "these are continuations and must be judged as such");
+            Assert.Equal(0, snapshot.ReusableHits);
+            Assert.True(meter.EffectiveLifetime() < lifetimeBefore,
+                "a prefix that is never actually served back must pull the estimated lifetime down");
+        }
+
+        /// <summary>The other direction: a real continuation that gets its own conversation back is a
+        /// hit, and the estimate must not be so strict that honest reuse cannot clear it.</summary>
+        [Fact]
+        public void ReusedConversationPrefix_IsAHit()
+        {
+            var meter = new PrefixSurvivalMeter();
+            const string key = "projects-commander-p2#e1|qwen";
+
+            for (int i = 0; i < 200; i++)
+                meter.RecordOutcome(key, TimeSpan.FromSeconds(20), promptTokens: 50_000 + i,
+                    cachedTokens: 49_900, wasResident: true, outsideCohort: false,
+                    slotOccupancy: TimeSpan.FromSeconds(30), nowUtc: T0.AddSeconds(i * 20));
+
+            var snapshot = meter.Describe();
+            Assert.True(snapshot.ReusableEfficiency > 0.99, $"efficiency was {snapshot.ReusableEfficiency:P1}");
+            Assert.True(meter.EffectiveLifetime() >= PrefixSurvivalMeter.MinLifetime);
+        }
+
         // ── End to end, through the real limiter ──────────────────────────────────────────────
 
         [Fact]
@@ -323,7 +375,7 @@ namespace Omnipotent.Tests.KliveLLM
             // pays for this machinery, the whole thing is a regression however well it scales.
             var meter = new PrefixSurvivalMeter();
             for (int i = 0; i < 120; i++)
-                meter.RecordOutcome(TimeSpan.FromSeconds(20), 50_000, 49_000,
+                meter.RecordOutcome("projects-commander-solo#e1|qwen", TimeSpan.FromSeconds(20), 50_000, 49_000,
                     wasResident: true, outsideCohort: false, TimeSpan.FromSeconds(30), T0.AddSeconds(i * 30));
             Assert.True(meter.HasEnoughEvidence, "the scheduler must actually be in charge for this to mean anything");
 

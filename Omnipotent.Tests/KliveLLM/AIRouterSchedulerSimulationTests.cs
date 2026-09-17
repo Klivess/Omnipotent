@@ -357,7 +357,7 @@ namespace Omnipotent.Tests.KliveLLM
                     scheduler.OnDispatch(ticket, now, pastDeadline);
                     if (!wasResident) coldInFlight++;
                 }
-                meter.RecordOutcome(gap, promptTokens: 50_000, cachedTokens: hit ? 49_000 : 0,
+                meter.RecordOutcome(key, gap, promptTokens: 50_000, cachedTokens: hit ? 49_000 : 0,
                     wasResident: wasResident, outsideCohort: false, slotOccupancy: service, nowUtc: now);
 
                 providerCache[key] = now;

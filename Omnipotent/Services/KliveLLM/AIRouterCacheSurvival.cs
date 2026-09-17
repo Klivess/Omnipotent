@@ -36,9 +36,29 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Decayed sample weight a bucket needs before its survival figure is trusted.</summary>
         private const double MinBucketWeight = 8d;
 
-        /// <summary>A radix cache is bimodal — a request either matches nearly all of its prefix or
-        /// nearly none of it — so the exact split barely matters.</summary>
-        private const double HitFraction = 0.5;
+        /// <summary>
+        /// How much of the REUSABLE PREFIX must come back from cache to call the dispatch a hit.
+        ///
+        /// This was 0.5 of the whole prompt on the premise that a radix cache is bimodal — a request
+        /// matches nearly all of its prefix or nearly none — so the split barely mattered. That premise
+        /// is false for this fleet, and the third mode it misses is the one that matters: every agent
+        /// prompt opens with the same system block and tool schemas, that block is referenced by every
+        /// project on the box and so is never the thing LRU evicts, and it is 27K of a 50K commander
+        /// prompt. A continuation whose own conversation was evicted still comes back 52–58% cached on
+        /// the shared preamble alone — over the old bar, so it scored as a hit.
+        ///
+        /// That made the meter structurally incapable of observing an eviction: every band read ~100%
+        /// survival, no band ever failed, the lifetime climbed to its ceiling, K sized the warm cohort
+        /// to the entire fleet, nothing was ever parked, and the scheduler degraded to the FIFO gate it
+        /// was written to replace — while reporting perfect health. Measuring against the reusable
+        /// prefix instead of the whole prompt removes the preamble from the denominator; 0.9 then puts
+        /// the bar above anything a surviving preamble can reach on its own, and in line with the 99%
+        /// efficiency target the rest of this class is written against.
+        /// </summary>
+        private const double HitFraction = 0.9;
+
+        /// <summary>Bound on the per-prefix prompt sizes kept for the reusable-prefix denominator.</summary>
+        private const int MaxTrackedPrefixes = 512;
 
         /// <summary>Tracks drift in other tenants' load without reacting to individual requests.</summary>
         private static readonly TimeSpan DecayHalfLife = TimeSpan.FromHours(1);
@@ -69,6 +89,13 @@ namespace Omnipotent.Services.KliveLLM
         private readonly double[] bucketHits = new double[BucketEdgesSeconds.Length];
         private readonly double[] bucketWeight = new double[BucketEdgesSeconds.Length];
         private DateTime decayedAtUtc = DateTime.MinValue;
+
+        /// <summary>The prompt size of each prefix's last dispatch — the denominator for "how much of
+        /// what this request COULD have reused actually came back". Without it the only available
+        /// denominator is the whole prompt, which the shared preamble alone can satisfy.</summary>
+        private readonly Dictionary<string, PriorDispatch> priorDispatch = new(StringComparer.Ordinal);
+
+        private readonly record struct PriorDispatch(long PromptTokens, DateTime AtUtc);
 
         // Decayed aggregate of the metric this whole class exists to hold up: of the continuations we
         // sent, how many were actually served from cache. Decays alongside the bands so it tracks the
@@ -170,18 +197,26 @@ namespace Omnipotent.Services.KliveLLM
         /// other to the floor. Measured in simulation, that loop drove the cohort to 2 and the share
         /// to 100%, for no reason other than that they were each other's cause.
         /// </param>
-        internal void RecordOutcome(TimeSpan? gapSinceLastDispatch, long promptTokens, long cachedTokens,
-            bool wasResident, bool outsideCohort, TimeSpan slotOccupancy, DateTime nowUtc)
+        internal void RecordOutcome(string prefixKey, TimeSpan? gapSinceLastDispatch, long promptTokens,
+            long cachedTokens, bool wasResident, bool outsideCohort, TimeSpan slotOccupancy, DateTime nowUtc)
         {
             if (promptTokens <= 0) return;
             if (cachedTokens < 0) cachedTokens = 0;
             if (cachedTokens > promptTokens) cachedTokens = promptTokens;
-            bool hit = (double)cachedTokens / promptTokens >= HitFraction;
 
             lock (sync)
             {
                 Decay(nowUtc);
                 samples++;
+
+                // What this request could have reused: the previous prompt on this exact prefix, which
+                // is a prefix of this one by construction. No prior dispatch means nothing was reusable,
+                // so there is no hit to claim however much the shared preamble returned.
+                long reusable = priorDispatch.TryGetValue(prefixKey, out PriorDispatch prior)
+                    ? Math.Min(prior.PromptTokens, promptTokens)
+                    : 0;
+                RememberDispatch(prefixKey, promptTokens, nowUtc);
+                bool hit = reusable > 0 && cachedTokens >= HitFraction * reusable;
 
                 if (slotOccupancy > TimeSpan.Zero)
                 {
@@ -205,6 +240,11 @@ namespace Omnipotent.Services.KliveLLM
                 // A first-ever dispatch has no prefix to reuse; it is a legitimate cold start and must
                 // not be counted against efficiency. Only a CONTINUATION can waste a warm prefix.
                 if (gapSinceLastDispatch is not { } gap) return;
+
+                // The scheduler remembers this prefix but we no longer hold what its last prompt cost,
+                // so there is no honest denominator. Recording it either way would invent evidence:
+                // as a miss it convicts a prefix we cannot size, as a hit it is the old bug. Drop it.
+                if (reusable <= 0) return;
 
                 reusableSamples++;
                 recentReusable += 1d;
@@ -335,6 +375,28 @@ namespace Omnipotent.Services.KliveLLM
             TimeSpan ceiling = LifetimeCeiling();
             if (ceiling < MinLifetime) ceiling = MinLifetime;
             return value < MinLifetime ? MinLifetime : value > ceiling ? ceiling : value;
+        }
+
+        /// <summary>
+        /// Keep this dispatch's prompt size as the next one's reusable-prefix denominator. Bounded: a
+        /// prefix key carries a cache epoch, so every compaction and brief rotation mints a new one and
+        /// the map would otherwise grow for the life of the process. Entries past the point where our
+        /// own client abandons the session can never be a denominator again, so they go first, and a
+        /// clear-out is the fallback if a burst of fresh keys outruns that.
+        /// </summary>
+        private void RememberDispatch(string prefixKey, long promptTokens, DateTime nowUtc)
+        {
+            if (string.IsNullOrEmpty(prefixKey)) return;
+            if (priorDispatch.Count >= MaxTrackedPrefixes && !priorDispatch.ContainsKey(prefixKey))
+            {
+                DateTime cutoff = nowUtc - KliveLLM.BriefSessionIdleLimit;
+                List<string>? stale = null;
+                foreach (var kv in priorDispatch)
+                    if (kv.Value.AtUtc <= cutoff) (stale ??= new List<string>()).Add(kv.Key);
+                if (stale != null) foreach (string key in stale) priorDispatch.Remove(key);
+                if (priorDispatch.Count >= MaxTrackedPrefixes) priorDispatch.Clear();
+            }
+            priorDispatch[prefixKey] = new PriorDispatch(promptTokens, nowUtc);
         }
 
         private static int BucketFor(TimeSpan gap)
