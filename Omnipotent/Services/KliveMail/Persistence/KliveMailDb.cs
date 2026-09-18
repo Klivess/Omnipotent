@@ -12,6 +12,19 @@ namespace Omnipotent.Services.KliveMail.Persistence
 
         public string DbPath { get; }
 
+        // Test-only: point the store at an arbitrary file (hermetic tests never touch the production DB).
+        internal KliveMailDb(string dbPath)
+        {
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dbPath)!);
+            DbPath = dbPath;
+            connectionString = new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath,
+                Mode = SqliteOpenMode.ReadWriteCreate,
+                Cache = SqliteCacheMode.Shared,
+                Pooling = true
+            }.ToString();
+        }
         public KliveMailDb()
         {
             string dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveMailDirectory);
@@ -33,7 +46,9 @@ namespace Omnipotent.Services.KliveMail.Persistence
             await ExecuteAsync(conn, "PRAGMA journal_mode=WAL;", ct);
             await ExecuteAsync(conn, "PRAGMA synchronous=NORMAL;", ct);
             await ExecuteAsync(conn, "PRAGMA foreign_keys=ON;", ct);
-            await ApplyMigrationsAsync(conn, ct);
+            bool appliedV2 = await ApplyMigrationsAsync(conn, ct);
+            if (appliedV2)
+                await new KliveMailRepository(this).BackfillFtsSearchColumnsAsync(ct);
         }
 
         public async Task<SqliteConnection> OpenAsync(CancellationToken ct = default)
@@ -79,7 +94,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
-        private static async Task ApplyMigrationsAsync(SqliteConnection conn, CancellationToken ct)
+        private static async Task<bool> ApplyMigrationsAsync(SqliteConnection conn, CancellationToken ct)
         {
             await ExecuteAsync(conn, @"CREATE TABLE IF NOT EXISTS schema_versions (
                 version INTEGER PRIMARY KEY,
@@ -94,6 +109,8 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 while (await reader.ReadAsync(ct))
                     applied.Add(reader.GetInt32(0));
             }
+
+            bool appliedV2ThisCall = !applied.Contains(2);
 
             foreach (var (version, sql) in KliveMailSchema.Migrations)
             {
@@ -115,6 +132,8 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 }
                 await tx.CommitAsync(ct);
             }
+            return appliedV2ThisCall;
+
         }
 
         public void Dispose()
