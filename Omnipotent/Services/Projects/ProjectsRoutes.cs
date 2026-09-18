@@ -629,27 +629,7 @@ namespace Omnipotent.Services.Projects
                         // The other half of the question "why is my project not running". A halt stops
                         // the fleet; the wake budget decides how much of it may be live at once, and a
                         // project can be perfectly healthy and simply waiting for a permit.
-                        admission = new
-                        {
-                            admission.Enabled,
-                            admission.Live,
-                            admission.Active,
-                            admission.Budget,
-                            admission.Source,
-                            admission.MeasuredBudget,
-                            admission.ConfiguredCap,
-                            admission.Fallback,
-                            admission.Deferred,
-                            admission.RampStartedAt,
-                            liveKeys = admission.LiveKeys,
-                            deferred = admission.DeferredWakes.Select(wake => new
-                            {
-                                wake.ProjectID,
-                                wake.AgentID,
-                                wake.QueuedAt,
-                                waitingSeconds = (int)(DateTime.UtcNow - wake.QueuedAt).TotalSeconds,
-                            }),
-                        },
+                        admission = DescribeAdmission(admission),
                         settings = new
                         {
                             enabled = options.Enabled,
@@ -1854,6 +1834,28 @@ namespace Omnipotent.Services.Projects
             disposedContainers = h.DisposedContainerIDs.Count,
             openDirectives = h.OpenDirectives.Count,
             h.RetiredAt,
+        };
+
+        internal static object DescribeAdmission(ProjectWakeAdmission.AdmissionSnapshot admission) => new
+        {
+            admission.Enabled,
+            admission.Live,
+            admission.Active,
+            admission.Budget,
+            admission.Source,
+            admission.MeasuredBudget,
+            admission.ConfiguredCap,
+            admission.Fallback,
+            deferredCount = admission.Deferred,
+            admission.RampStartedAt,
+            liveKeys = admission.LiveKeys,
+            deferred = admission.DeferredWakes.Select(wake => new
+            {
+                wake.ProjectID,
+                wake.AgentID,
+                wake.QueuedAt,
+                waitingSeconds = Math.Max(0, (int)(DateTime.UtcNow - wake.QueuedAt).TotalSeconds),
+            }),
         };
 
         private static List<string> ParseStringArray(JToken? token)

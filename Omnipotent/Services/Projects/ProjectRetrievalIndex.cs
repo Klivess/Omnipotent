@@ -47,22 +47,29 @@ namespace Omnipotent.Services.Projects
 
         public void EnsureFresh(string projectID)
         {
-            lock (gate)
+            while (true)
             {
-                while (true)
+                long cursor;
+                lock (gate)
                 {
-                    long cursor;
                     using (var conn = Open()) cursor = GetCursor(conn, projectID);
-                    var newer = eventLog.ReadSince(projectID, cursor, max: 2000);
-                    if (newer.Count == 0) break;
+                }
+                // Append publishes Ingest while holding the event-log lock. Never acquire that
+                // lock while holding gate, or a refresh and an append can deadlock the fleet.
+                var newer = eventLog.ReadSince(projectID, cursor, max: 2000);
+                if (newer.Count == 0) break;
 
+                lock (gate)
+                {
                     using var write = Open();
                     using var tx = write.BeginTransaction();
+                    // A concurrent Ingest/refresh may already have inserted these rows. Inserts
+                    // are idempotent and the cursor is recalculated from the committed rows.
                     foreach (var evt in newer) Insert(write, tx, evt);
                     AdvanceContiguousCursor(write, tx, projectID);
                     tx.Commit();
-                    if (newer.Count < 2000) break;
                 }
+                if (newer.Count < 2000) break;
             }
         }
 

@@ -28,6 +28,47 @@ public class ProjectWakeAdmissionTests
     }
 
     [Fact]
+    public void QueuedOrRunningModelTurnsDoNotReleaseCapacityAfterTheActivityWindow()
+    {
+        var (gate, clock) = Build(measured: 1);
+        Assert.True(gate.TryAdmit("p1", "commander", "go", out _));
+        using (gate.BeginModelTurn("p1", "commander"))
+        {
+            clock.Advance(ProjectWakeAdmission.ActivityWindow + TimeSpan.FromMinutes(5));
+            Assert.Equal(1, gate.Describe().Active);
+            Assert.False(gate.TryAdmit("p2", "commander", "wait", out _));
+            Assert.Empty(gate.Promote());
+        }
+
+        // Completion starts the tool/idle window; it does not immediately abandon a warm prefix.
+        Assert.Equal(1, gate.Describe().Active);
+        clock.Advance(ProjectWakeAdmission.ActivityWindow + TimeSpan.FromSeconds(1));
+        Assert.Equal("p2", Assert.Single(gate.Promote()).ProjectID);
+    }
+
+    [Fact]
+    public void ModelTurnScopeReleasesOnFailureAndCannotChangeAReplacementWake()
+    {
+        var (gate, clock) = Build(measured: 1);
+        Assert.True(gate.TryAdmit("p1", "commander", "go", out _));
+        var oldTurn = gate.BeginModelTurn("p1", "commander");
+        gate.Forget("p1");
+        Assert.True(gate.TryAdmit("p1", "commander", "restart", out _));
+        clock.Advance(ProjectWakeAdmission.ActivityWindow + TimeSpan.FromSeconds(1));
+        oldTurn.Dispose();
+        oldTurn.Dispose();
+        Assert.Equal(0, gate.Describe().Active);
+
+        Assert.Throws<InvalidOperationException>((Action)(() =>
+        {
+            using var turn = gate.BeginModelTurn("p1", "commander");
+            throw new InvalidOperationException("provider failed");
+        }));
+        clock.Advance(ProjectWakeAdmission.ActivityWindow + TimeSpan.FromSeconds(1));
+        Assert.Equal(0, gate.Describe().Active);
+    }
+
+    [Fact]
     public void Budget_PrefersTheMeasurement_AndAConfiguredCapOverridesIt()
     {
         // Past the opening ramp, so this is testing where the steady-state number comes from.

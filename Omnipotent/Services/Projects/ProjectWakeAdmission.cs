@@ -83,6 +83,7 @@ public sealed class ProjectWakeAdmission
         internal string AgentID = "";
         internal DateTime AdmittedAt;
         internal DateTime LastTurnAt;
+        internal int PendingTurns;
     }
 
     private readonly object sync = new();
@@ -162,7 +163,7 @@ public sealed class ProjectWakeAdmission
     {
         int active = 0;
         foreach (LiveWake wake in live.Values)
-            if (now - wake.LastTurnAt <= ActivityWindow) active++;
+            if (wake.PendingTurns > 0 || now - wake.LastTurnAt <= ActivityWindow) active++;
         return active;
     }
 
@@ -231,6 +232,37 @@ public sealed class ProjectWakeAdmission
     {
         string key = Key(projectID, agentID);
         lock (sync) { if (live.TryGetValue(key, out LiveWake? wake)) wake.LastTurnAt = nowUtc(); }
+    }
+
+    /// <summary>Keep admission occupied throughout queueing, inference and retries. A slow model
+    /// request is still competing for capacity; only time spent outside the model call may idle out.</summary>
+    public IDisposable BeginModelTurn(string projectID, string agentID)
+    {
+        lock (sync)
+        {
+            live.TryGetValue(Key(projectID, agentID), out LiveWake? wake);
+            if (wake != null)
+            {
+                wake.PendingTurns++;
+                wake.LastTurnAt = nowUtc();
+            }
+            return new ModelTurn(this, wake);
+        }
+    }
+
+    private sealed class ModelTurn(ProjectWakeAdmission owner, LiveWake? wake) : IDisposable
+    {
+        private int disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0 || wake == null) return;
+            lock (owner.sync)
+            {
+                wake.PendingTurns--;
+                wake.LastTurnAt = owner.nowUtc();
+            }
+        }
     }
 
     /// <summary>Whether this agent is waiting for a permit. The watchdog needs it for the same reason

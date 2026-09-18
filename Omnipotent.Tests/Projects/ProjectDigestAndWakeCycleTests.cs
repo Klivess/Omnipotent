@@ -154,6 +154,49 @@ namespace Omnipotent.Tests.Projects
         private static string NewProjectId() => "test_" + Guid.NewGuid().ToString("N");
 
         [Fact]
+        public void RefreshWaitingForAnEventLogDoesNotBlockPushIngest()
+        {
+            var log = new ProjectEventLogStore(_ => { });
+            var index = new ProjectRetrievalIndex(log);
+            var evt = log.Append(new ProjectEvent
+            {
+                ProjectID = NewProjectId(), Type = ProjectEventTypes.Status, Text = "concurrent retrieval regression",
+            });
+            string blockedProject = NewProjectId();
+            object eventGate = typeof(ProjectEventLogStore)
+                .GetMethod("LockFor", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+                .Invoke(log, new object[] { blockedProject })!;
+            Exception? failure = null;
+            var refresh = new Thread(() =>
+            {
+                try { index.EnsureFresh(blockedProject); }
+                catch (Exception ex) { failure = ex; }
+            }) { IsBackground = true };
+            bool ingestedWhileBlocked = false;
+            Task? ingest = null;
+            try
+            {
+                lock (eventGate)
+                {
+                    refresh.Start();
+                    Assert.True(SpinWait.SpinUntil(
+                        () => (refresh.ThreadState & System.Threading.ThreadState.WaitSleepJoin) != 0,
+                        TimeSpan.FromSeconds(5)));
+                    ingest = Task.Run(() => index.Ingest(evt));
+                    ingestedWhileBlocked = ingest.Wait(TimeSpan.FromSeconds(2));
+                }
+            }
+            finally
+            {
+                Assert.True(refresh.Join(TimeSpan.FromSeconds(5)));
+                ingest?.GetAwaiter().GetResult();
+            }
+            Assert.Null(failure);
+            Assert.True(ingestedWhileBlocked, "Refresh held the retrieval lock while waiting for the event log.");
+            Assert.Single(index.Search(evt.ProjectID, "regression"));
+        }
+
+        [Fact]
         public void Search_RanksTermMatchesAboveNoise()
         {
             var log = new ProjectEventLogStore(_ => { });

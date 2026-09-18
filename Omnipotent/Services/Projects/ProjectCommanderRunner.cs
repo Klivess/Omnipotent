@@ -523,10 +523,8 @@ namespace Omnipotent.Services.Projects
                         // handler (circuit breaker / deferral).
                         try
                         {
-                            // A conversation only competes for a slot while it is taking turns. This
-                            // keeps the permit alive through a working loop and lets it lapse through a
-                            // long tool call, whose prefix is dead anyway.
-                            parent.WakeAdmission.NoteTurn(projectID, ProjectWakeAdmission.CommanderAgentID);
+                            using var modelTurn = parent.WakeAdmission.BeginModelTurn(
+                                projectID, ProjectWakeAdmission.CommanderAgentID);
                             parent.Activity.BeginThinking(projectID, "commander", "commander", model);
                             resp = await providerRecovery.ExecuteAsync(async () =>
                             {

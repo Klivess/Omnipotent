@@ -459,10 +459,7 @@ namespace Omnipotent.Services.Projects
                         // means every route was exhausted, so it propagates.
                         try
                         {
-                            // A conversation only competes for a slot while it is taking turns. This
-                            // keeps the permit alive through a working loop and lets it lapse through a
-                            // long tool call, whose prefix is dead anyway.
-                            parent.WakeAdmission.NoteTurn(projectID, agent.AgentID);
+                            using var modelTurn = parent.WakeAdmission.BeginModelTurn(projectID, agent.AgentID);
                             parent.Activity.BeginThinking(projectID, agent.AgentID, agent.Role, model);
                             resp = await providerRecovery.ExecuteAsync(async () =>
                             {
