@@ -60,6 +60,31 @@ namespace Omnipotent.Services.KliveMail.Persistence
                     subject,
                     body_text
                 );
+            "),
+            (2, @"
+                -- Feature #1: extend the FTS index with decoded HTML body text and attachment search
+                -- text so HTML-only messages and attachment content become searchable. FTS5 virtual
+                -- tables cannot be ALTERed in place, so rebuild: rename the v1 table, create the
+                -- extended v2 table, copy the existing rows (new columns stay empty), then drop v1.
+                -- A one-off C# backfill pass (KliveMailDb) recomputes body_html/attachments for the
+                -- rows carried over from v1, using the same HtmlToText/AttachmentSearchText logic the
+                -- insert path uses, so old messages become searchable too.
+                ALTER TABLE messages_fts RENAME TO messages_fts_v1;
+
+                CREATE VIRTUAL TABLE messages_fts USING fts5(
+                    message_id UNINDEXED,
+                    from_address,
+                    from_name,
+                    subject,
+                    body_text,
+                    body_html,
+                    attachments
+                );
+
+                INSERT INTO messages_fts(message_id, from_address, from_name, subject, body_text)
+                    SELECT message_id, from_address, from_name, subject, body_text FROM messages_fts_v1;
+
+                DROP TABLE messages_fts_v1;
             ")
         };
     }

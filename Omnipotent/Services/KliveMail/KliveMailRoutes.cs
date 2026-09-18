@@ -164,12 +164,14 @@ namespace Omnipotent.Services.KliveMail
                 var q = req.userParameters.Get("q");
                 int page = ParseInt(req.userParameters.Get("page"), 1);
                 int pageSize = ParseInt(req.userParameters.Get("pageSize"), 50);
+                string? mailbox = req.userParameters.Get("mailbox");
+                string? from = req.userParameters.Get("from");
                 if (string.IsNullOrWhiteSpace(q))
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(Array.Empty<object>()));
                     return;
                 }
-                var list = await Repo.SearchAsync(q, page, pageSize);
+                var list = await Repo.SearchAsync(q, page, pageSize, mailbox, from);
                 await req.ReturnResponse(JsonConvert.SerializeObject(list));
             }
             catch (Exception ex) { await Fail(req, ex); }
@@ -238,7 +240,7 @@ namespace Omnipotent.Services.KliveMail
             catch (Exception ex) { await Fail(req, ex); }
         }
 
-        // ── helpers ──
+        // â”€â”€ helpers â”€â”€
 
         private static async Task Fail(UserRequest req, Exception ex)
             => await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);

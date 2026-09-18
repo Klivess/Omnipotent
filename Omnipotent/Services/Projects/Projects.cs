@@ -2062,6 +2062,7 @@ namespace Omnipotent.Services.Projects
                 RuntimeState = RuntimeState,
                 ApprovalDedupe = Settings.Get(project.ProjectID).ApprovalDedupe,
                 Directives = Directives,
+                Retrieval = Retrieval,
                 NotifyDirectiveCompletedAsync = (directive, paths, summary) =>
                     NotifyDirectiveCompletionAsync(project, directive, paths, summary),
                 Accounts = GetAccountRegistry(),
@@ -3203,6 +3204,7 @@ namespace Omnipotent.Services.Projects
                             From = m.FromAddress,
                             Subject = m.Subject ?? "",
                             BodyPreview = m.BodyText ?? StripHtml(m.BodyHtml),
+                            Mailbox = StimulusAdapterManager.MailboxOf(m.ToAddress),
                         });
                     };
                     mail.MailStored += h;

@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
@@ -14,7 +15,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
 
         public KliveMailRepository(KliveMailDb db) { this.db = db; }
 
-        // ─────────────────────────── Ingestion ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Ingestion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public async Task InsertMessageAsync(StoredMessage m, CancellationToken ct = default)
         {
@@ -67,13 +68,15 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 await using (var fcmd = conn.CreateCommand())
                 {
                     fcmd.Transaction = tx;
-                    fcmd.CommandText = @"INSERT INTO messages_fts(message_id,from_address,from_name,subject,body_text)
-                        VALUES ($mid,$from,$fromName,$subject,$bodyText)";
+                    fcmd.CommandText = @"INSERT INTO messages_fts(message_id,from_address,from_name,subject,body_text,body_html,attachments)
+                        VALUES ($mid,$from,$fromName,$subject,$bodyText,$bodyHtml,$attach)";
                     fcmd.Parameters.AddWithValue("$mid", m.Id);
                     fcmd.Parameters.AddWithValue("$from", m.FromAddress ?? "");
                     fcmd.Parameters.AddWithValue("$fromName", (object?)m.FromName ?? DBNull.Value);
                     fcmd.Parameters.AddWithValue("$subject", (object?)m.Subject ?? DBNull.Value);
                     fcmd.Parameters.AddWithValue("$bodyText", (object?)m.BodyText ?? DBNull.Value);
+                    fcmd.Parameters.AddWithValue("$bodyHtml", (object?)HtmlToText(m.BodyHtml) ?? DBNull.Value);
+                    fcmd.Parameters.AddWithValue("$attach", (object?)string.Join(" ", m.Attachments.Select(a => AttachmentSearchText(a))) ?? DBNull.Value);
                     await fcmd.ExecuteNonQueryAsync(ct);
                 }
 
@@ -82,7 +85,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             }, ct);
         }
 
-        // ─────────────────────────── Lists / detail ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Lists / detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public async Task<List<MessageSummary>> ListMessagesAsync(string? mailbox, bool unreadOnly, bool hasAttachmentOnly, bool trash, int page, int pageSize, CancellationToken ct = default)
         {
@@ -160,7 +163,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return null;
         }
 
-        public async Task<List<MessageSummary>> SearchAsync(string query, int page, int pageSize, CancellationToken ct = default)
+        public async Task<List<MessageSummary>> SearchAsync(string query, int page = 1, int pageSize = 50, string? mailbox = null, string? from = null, CancellationToken ct = default)
         {
             page = Math.Max(1, page);
             pageSize = Math.Clamp(pageSize, 1, 200);
@@ -171,10 +174,21 @@ namespace Omnipotent.Services.KliveMail.Persistence
             var list = new List<MessageSummary>();
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
+            var where = new StringBuilder("messages_fts MATCH $q AND m.is_deleted = 0");
+            if (!string.IsNullOrWhiteSpace(mailbox))
+            {
+                where.Append(" AND m.to_address = $mailbox");
+                cmd.Parameters.AddWithValue("$mailbox", NormalizeAddress(mailbox));
+            }
+            if (!string.IsNullOrWhiteSpace(from))
+            {
+                where.Append(" AND m.from_address LIKE $fromEsc");
+                cmd.Parameters.AddWithValue("$fromEsc", "%" + (from ?? "").Trim() + "%");
+            }
             cmd.CommandText = @"SELECT m.id,m.to_address,m.from_address,m.from_name,m.subject,m.received_utc,m.date_utc,m.thread_id,m.has_attachments,m.is_read,
                     substr(replace(replace(coalesce(m.body_text,''),char(10),' '),char(13),' '),1,200) AS snippet
                     FROM messages_fts f JOIN messages m ON m.id = f.message_id
-                    WHERE f MATCH $q AND m.is_deleted = 0
+                    WHERE " + where + @"
                     ORDER BY m.received_utc DESC LIMIT $limit OFFSET $offset";
             cmd.Parameters.AddWithValue("$q", ftsQuery);
             cmd.Parameters.AddWithValue("$limit", pageSize);
@@ -184,7 +198,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return list;
         }
 
-        // ─────────────────────────── Mutations ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Mutations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public async Task<bool> SetReadAsync(string id, bool read, CancellationToken ct = default)
         {
@@ -213,7 +227,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return rows > 0;
         }
 
-        // ─────────────────────────── Mailboxes ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Mailboxes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public async Task<List<MailboxInfo>> ListMailboxesAsync(CancellationToken ct = default)
         {
@@ -272,7 +286,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return rows > 0;
         }
 
-        // ─────────────────────────── Stats ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public async Task<(int Total, int Unread, int Trash)> GetStatsAsync(CancellationToken ct = default)
         {
@@ -288,7 +302,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return (0, 0, 0);
         }
 
-        // ─────────────────────────── Helpers ───────────────────────────
+        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public static string NormalizeAddress(string address)
         {
@@ -296,6 +310,116 @@ namespace Omnipotent.Services.KliveMail.Persistence
             address = address.Trim().ToLowerInvariant();
             if (!address.Contains('@')) address = address + "@" + MailDomain;
             return address;
+        }
+
+        // Decode an HTML body into searchable plain text: drop scripts/styles, replace block tags
+        // with spaces, strip the rest of the markup, collapse whitespace, and HTML-decode entities.
+        internal static string HtmlToText(string? html)
+        {
+            if (string.IsNullOrWhiteSpace(html)) return "";
+            var s = html;
+            s = Regex.Replace(s, "(?is)<style[^>]*>.*?</style>", " ");
+            s = Regex.Replace(s, "(?is)<script[^>]*>.*?</script>", " ");
+            s = Regex.Replace(s, "(?is)<br\\s*/?>", " ");
+            s = Regex.Replace(s, "(?is)</(p|div|li|tr|h[1-6]|table|section|article)>", " ");
+            s = Regex.Replace(s, "(?s)<[^>]+>", " ");
+            s = WebUtility.HtmlDecode(s);
+            s = Regex.Replace(s, "\\s+", " ");
+            return s.Trim();
+        }
+
+        // Build the searchable text for an attachment: its file name plus, for text-like content
+        // types, a bounded slice of the stored file's contents.
+        internal static string AttachmentSearchText(StoredAttachment a)
+        {
+            string text = a.FileName ?? "";
+            try
+            {
+                var ct = a.ContentType ?? "";
+                bool textLike = ct.StartsWith("text/", StringComparison.OrdinalIgnoreCase)
+                    || ct is "application/json" or "application/xml" or "application/csv" or "image/svg+xml";
+                if (textLike && !string.IsNullOrWhiteSpace(a.StoragePath) && File.Exists(a.StoragePath))
+                {
+                    var raw = HtmlToText(File.ReadAllText(a.StoragePath));
+                    if (raw.Length > 4000) raw = raw[..4000];
+                    text = text + " " + raw;
+                }
+            }
+            catch { /* unreadable/binary attachment: index the file name only */ }
+            return text;
+        }
+
+        // Read one message's attachments and build the combined search text (file names + text content).
+        private string AttachmentSearchTextForMessage(SqliteConnection conn, string messageId)
+        {
+            var parts = new List<string>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT file_name,content_type,storage_path FROM attachments WHERE message_id = $mid";
+                cmd.Parameters.AddWithValue("$mid", messageId);
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var a = new StoredAttachment
+                    {
+                        FileName = reader.IsDBNull(0) ? "" : reader.GetString(0),
+                        ContentType = reader.IsDBNull(1) ? null : reader.GetString(1),
+                        StoragePath = reader.IsDBNull(2) ? "" : reader.GetString(2)
+                    };
+                    parts.Add(AttachmentSearchText(a));
+                }
+            }
+            return string.Join(" ", parts.Where(pt => !string.IsNullOrWhiteSpace(pt)));
+        }
+
+        // One-off backfill: after the v2 FTS rebuild, recompute body_html / attachments for every
+        // non-deleted message so pre-feature messages become searchable with the same logic the
+        // insert path uses. Runs inside the write lock, in a single transaction.
+        public async Task BackfillFtsSearchColumnsAsync(CancellationToken ct = default)
+        {
+            await db.WithWriteLockAsync(async conn =>
+            {
+                await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+                try
+                {
+                    await using (var clear = conn.CreateCommand())
+                    {
+                        clear.Transaction = tx;
+                        clear.CommandText = "DELETE FROM messages_fts;";
+                        await clear.ExecuteNonQueryAsync(ct);
+                    }
+
+                    await using (var seld = conn.CreateCommand())
+                    {
+                        seld.Transaction = tx;
+                        seld.CommandText = "SELECT id,coalesce(from_address,''),coalesce(from_name,''),coalesce(subject,''),coalesce(body_text,''),coalesce(body_html,'') FROM messages WHERE is_deleted = 0";
+                        await using var r = await seld.ExecuteReaderAsync(ct);
+                        await using var ins = conn.CreateCommand();
+                        ins.Transaction = tx;
+                        ins.CommandText = @"INSERT INTO messages_fts(message_id,from_address,from_name,subject,body_text,body_html,attachments)
+                            VALUES ($mid,$from,$fromName,$subject,$bodyText,$bodyHtml,$attach)";
+                        while (await r.ReadAsync(ct))
+                        {
+                            ins.Parameters.Clear();
+                            ins.Parameters.AddWithValue("$mid", r.GetString(0));
+                            ins.Parameters.AddWithValue("$from", r.GetString(1));
+                            ins.Parameters.AddWithValue("$fromName", r.GetString(2));
+                            ins.Parameters.AddWithValue("$subject", r.GetString(3));
+                            ins.Parameters.AddWithValue("$bodyText", r.GetString(4));
+                            ins.Parameters.AddWithValue("$bodyHtml", HtmlToText(r.GetString(5)));
+                            ins.Parameters.AddWithValue("$attach", AttachmentSearchTextForMessage(conn, r.GetString(0)));
+                            await ins.ExecuteNonQueryAsync(ct);
+                        }
+                    }
+
+                    await tx.CommitAsync(ct);
+                }
+                catch
+                {
+                    await tx.RollbackAsync(ct);
+                    throw;
+                }
+            }, ct);
         }
 
         // Convert free user input into a safe FTS5 prefix query (avoids MATCH syntax errors).

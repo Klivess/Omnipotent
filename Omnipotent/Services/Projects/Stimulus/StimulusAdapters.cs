@@ -26,6 +26,8 @@ namespace Omnipotent.Services.Projects.Stimulus
         public string From { get; init; } = "";
         public string Subject { get; init; } = "";
         public string BodyPreview { get; init; } = "";
+        // Local part of the To address (the mailbox the message belongs to); empty when To has no '@'.
+        public string Mailbox { get; init; } = "";
     }
 
     /// <summary>Lightweight inbound-Discord event shape the discord adapter matches against.</summary>
@@ -412,7 +414,24 @@ namespace Omnipotent.Services.Projects.Stimulus
             if (!string.IsNullOrWhiteSpace(to) && mail.To.IndexOf(to, StringComparison.OrdinalIgnoreCase) < 0) return false;
             if (!string.IsNullOrWhiteSpace(from) && mail.From.IndexOf(from, StringComparison.OrdinalIgnoreCase) < 0) return false;
             if (!string.IsNullOrWhiteSpace(subj) && mail.Subject.IndexOf(subj, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            string? mailbox = spec["mailbox"]?.Value<string>();
+            // Live mail sources populate Mailbox from the To address; derive it as a fallback so
+            // mailbox filters keep working even for sources that only carry To.
+            string effectiveMailbox = string.IsNullOrEmpty(mail.Mailbox) ? MailboxOf(mail.To) : mail.Mailbox;
+            if (!string.IsNullOrWhiteSpace(mailbox) && effectiveMailbox.IndexOf(mailbox, StringComparison.OrdinalIgnoreCase) < 0) return false;
+            string? body = spec["bodyContains"]?.Value<string>();
+            // bodyContains matches the body/preview the mail source already delivers (KliveMail
+            // BodyText, falling back to stripped HTML); the full message body is not fetched here.
+            if (!string.IsNullOrWhiteSpace(body) && mail.BodyPreview.IndexOf(body, StringComparison.OrdinalIgnoreCase) < 0) return false;
             return true;
+        }
+
+        /// <summary>Local part of a To address — the mailbox the message belongs to (empty when there is no '@').</summary>
+        internal static string MailboxOf(string? toAddress)
+        {
+            string to = toAddress ?? "";
+            int at = to.IndexOf('@');
+            return at > 0 ? to[..at] : to;
         }
 
         // Channel and author are routing scope. Content recognition belongs in StimulusAgent so

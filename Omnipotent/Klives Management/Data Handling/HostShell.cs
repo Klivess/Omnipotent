@@ -1,13 +1,13 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Text;
 
 namespace Omnipotent.Data_Handling
 {
     /// <summary>
     /// Runs shell scripts on the HOST machine (the box Omnipotent itself runs on), used by both
-    /// KliveAgent and Projects. Scripts inherit Omnipotent's own security context — if Omnipotent
+    /// KliveAgent and Projects. Scripts inherit Omnipotent's own security context â€” if Omnipotent
     /// is running elevated ("as admin"), so do these; this deliberately does NOT trigger a UAC
-    /// prompt (that can't work headless) — elevation is a property of how Omnipotent was launched.
+    /// prompt (that can't work headless) â€” elevation is a property of how Omnipotent was launched.
     ///
     /// PowerShell scripts use a temporary .ps1; Bash scripts are streamed on stdin so the same path
     /// works with WSL and Git Bash. Stdout/stderr are captured concurrently, and a timeout kills
@@ -24,12 +24,12 @@ namespace Omnipotent.Data_Handling
             {
                 var sb = new StringBuilder();
                 sb.AppendLine(TimedOut
-                    ? $"[{Interpreter}] TIMED OUT — process tree killed."
+                    ? $"[{Interpreter}] TIMED OUT â€” process tree killed."
                     : $"[{Interpreter}] exit code {ExitCode}{(Success ? " (success)" : " (non-zero)")}.");
-                if (!string.IsNullOrWhiteSpace(Stdout)) { sb.AppendLine("── stdout ──"); sb.AppendLine(Stdout.TrimEnd()); }
-                if (!string.IsNullOrWhiteSpace(Stderr)) { sb.AppendLine("── stderr ──"); sb.AppendLine(Stderr.TrimEnd()); }
+                if (!string.IsNullOrWhiteSpace(Stdout)) { sb.AppendLine("â”€â”€ stdout â”€â”€"); sb.AppendLine(Stdout.TrimEnd()); }
+                if (!string.IsNullOrWhiteSpace(Stderr)) { sb.AppendLine("â”€â”€ stderr â”€â”€"); sb.AppendLine(Stderr.TrimEnd()); }
                 string s = sb.ToString().TrimEnd();
-                return s.Length <= maxChars ? s : s[..maxChars] + $"\n[…output truncated to {maxChars} chars]";
+                return s.Length <= maxChars ? s : s[..maxChars] + $"\n[â€¦output truncated to {maxChars} chars]";
             }
         }
 
@@ -164,6 +164,157 @@ namespace Omnipotent.Data_Handling
         }
 
         /// <summary>Resolves an executable name against PATH (and PATHEXT-less direct hit), else null.</summary>
+        /// <summary>Result of a detached launch: the child PID and its interpreter. No output
+        /// capture and no waiting happen; the caller owns the reap (sentinel-file contract).</summary>
+        public sealed record DetachedShellResult(int Pid, string Interpreter)
+        {
+            /// <summary>Agent-facing block: the launch is fire-and-forget.</summary>
+            public string Format(int maxChars = 16000)
+            {
+                string s = $"[{Interpreter}] DETACHED - pid {Pid}. The child runs independently: no stdout/stderr capture, not killed by any timeout. Use the sentinel-file contract to detect completion.";
+                return s.Length <= maxChars ? s : s[..maxChars];
+            }
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private struct DetachStartupInfo
+        {
+            public uint cb;
+            public IntPtr lpReserved;
+            public string? lpDesktop;
+            public string? lpTitle;
+            public int dwX;
+            public int dwY;
+            public int dwXSize;
+            public int dwYSize;
+            public int dwXCountChars;
+            public int dwYCountChars;
+            public int dwFillAttribute;
+            public uint dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+        private struct DetachProcessInfo
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public uint dwProcessId;
+            public uint dwThreadId;
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool CreateProcessW(
+            string? lpApplicationName,
+            System.Text.StringBuilder lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)] bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string? lpCurrentDirectory,
+            ref DetachStartupInfo lpStartupInfo,
+            out DetachProcessInfo lpProcessInformation);
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        const uint CREATE_NO_WINDOW = 0x08000000;
+        // NOTE: do NOT add DETACHED_PROCESS (0x08) here. It tells the OS the child is a
+        // console process with no console that cannot use std/console handles; PowerShell
+        // and bash expect a console, so the child initializes and self-exits 0 before it
+        // ever reads its script. CREATE_NO_WINDOW gives a hidden-but-valid console instead,
+        // and CREATE_BREAKAWAY_FROM_JOB already keeps the child out of any job object.
+        const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000;
+
+        /// <summary>
+        /// Launches a PowerShell job DETACHED: returns the child PID immediately, capturing
+        /// nothing and waiting on nothing. CREATE_BREAKAWAY_FROM_JOB keeps the child out of
+        /// any job object the host runs under, so the caller's timeout or death cannot kill
+        /// the job. The temp script file is left in place for the lifetime of the child; the
+        /// OS reclaims it. The caller owns completion detection (sentinel-file contract).
+        /// </summary>
+        public static async Task<DetachedShellResult> RunPowerShellDetachedAsync(string script, string? workingDir = null, CancellationToken ct = default)
+        {
+            string exe = ResolveOnPath("pwsh.exe") ?? ResolveOnPath("pwsh") ?? "powershell.exe";
+            string tempFile = Path.Combine(Path.GetTempPath(), "omni-shell-" + Guid.NewGuid().ToString("N") + ".ps1");
+            try
+            {
+                await File.WriteAllTextAsync(tempFile, WrapPowerShell(script), ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            return await StartDetachedAsync(exe, $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{tempFile}\"", workingDir, "powershell");
+        }
+
+        /// <summary>
+        /// Launches a Bash job DETACHED (see <see cref="RunPowerShellDetachedAsync"/>). The
+        /// script goes to a temp file the child reads; the caller owns completion detection
+        /// (sentinel-file contract).
+        /// </summary>
+        public static async Task<DetachedShellResult> RunBashDetachedAsync(string script, string? workingDir = null, CancellationToken ct = default)
+        {
+            string? bash = ResolveOnPath("bash.exe") ?? ResolveOnPath("bash");
+            if (bash == null) throw new FileNotFoundException("bash is not installed or not on PATH on this host (install WSL or Git Bash, or use PowerShell).");
+            string tempFile = Path.Combine(Path.GetTempPath(), "omni-shell-" + Guid.NewGuid().ToString("N") + ".sh");
+            try
+            {
+                await File.WriteAllTextAsync(tempFile, (script ?? "").Replace("\r\n", "\n"), ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            return await StartDetachedAsync(bash, $"--noprofile --norc \"{tempFile}\"", workingDir, "bash");
+        }
+
+        private static async Task<DetachedShellResult> StartDetachedAsync(string exe, string arguments, string? workingDir, string label)
+        {
+            string? dir = string.IsNullOrWhiteSpace(workingDir) || !Directory.Exists(workingDir)
+                ? Path.GetTempPath() : workingDir;
+            // CreateProcessW wants the full command line; quote the image path because the
+            // temp working directory differs from the exe's own directory.
+            string commandLine = $"\"{exe}\" {arguments}";
+            var cmdLine = new System.Text.StringBuilder(commandLine);
+            var si = new DetachStartupInfo { cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf<DetachStartupInfo>() };
+            var pi = new DetachProcessInfo();
+            bool ok = await Task.Run(() => CreateProcessW(
+                null, cmdLine, IntPtr.Zero, IntPtr.Zero, false,
+                CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+                IntPtr.Zero, dir, ref si, out pi));
+            if (!ok)
+            {
+                int winErr = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                // ACCESS_DENIED (5) means this process is a NON-PRIMARY member of a job object, so the OS
+                // refuses CREATE_BREAKAWAY_FROM_JOB. Fall back to a plain no-window child: it still escapes
+                // the caller's timeout/kill via the sentinel-file contract, it just stays in the parent job
+                // (a host that closes its job with KILL_ON_JOB_CLOSE would take the child down with it).
+                if (winErr == 5)
+                {
+                    si = new DetachStartupInfo { cb = (uint)System.Runtime.InteropServices.Marshal.SizeOf<DetachStartupInfo>() };
+                    pi = new DetachProcessInfo();
+                    ok = await Task.Run(() => CreateProcessW(
+                        null, cmdLine, IntPtr.Zero, IntPtr.Zero, false,
+                        CREATE_NO_WINDOW,
+                        IntPtr.Zero, dir, ref si, out pi));
+                    if (!ok)
+                        throw new System.ComponentModel.Win32Exception(
+                            System.Runtime.InteropServices.Marshal.GetLastWin32Error(), "Failed to start detached " + label + " (fallback).");
+                }
+                else
+                {
+                    throw new System.ComponentModel.Win32Exception(winErr, "Failed to start detached " + label + " (win32 err " + winErr + ").");
+                }
+            }
+            uint pid = pi.dwProcessId;
+            try { CloseHandle(pi.hProcess); } catch { }
+            try { CloseHandle(pi.hThread); } catch { }
+            return new DetachedShellResult((int)pid, label);
+        }
+
         private static string? ResolveOnPath(string exe)
         {
             try
