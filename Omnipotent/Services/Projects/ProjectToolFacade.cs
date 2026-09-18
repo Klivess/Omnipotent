@@ -176,7 +176,7 @@ public static class ProjectToolFacade
             }),
 
         ("run_shell",
-            "Run a shell script on the HOST machine (where Omnipotent runs), in its security context — elevated if Omnipotent is. This is the host, NOT your desktop container; use computer_terminal for container work.",
+            "Run a shell script on the HOST machine (where Omnipotent runs), in its security context — elevated if Omnipotent is. This is the host, NOT your desktop container; use computer_terminal for container work. Both ops accept detach:true for long host jobs (builds/tests): the call returns the child PID immediately and the child survives the caller being killed or timed out; the caller is responsible for reaping (sentinel-file contract).",
             new[]
             {
                 ("powershell", "run_powershell"),

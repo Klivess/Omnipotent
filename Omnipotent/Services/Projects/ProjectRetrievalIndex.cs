@@ -18,6 +18,8 @@ namespace Omnipotent.Services.Projects
 
         public record RetrievalHit(long Sequence, string EventID, string Type, DateTime Timestamp, string Snippet, double Score);
 
+        public record SearchHit(long Sequence, string EventID, string Type, DateTime Timestamp, string Snippet, double Score, string ProjectID);
+
         public ProjectRetrievalIndex(ProjectEventLogStore eventLog)
         {
             this.eventLog = eventLog;
@@ -103,6 +105,48 @@ LIMIT $limit;";
                         reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
                         DateTime.Parse(reader.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
                         reader.GetString(4), -rank));
+                }
+                return hits;
+            }
+        }
+
+        /// <summary>Bring the shared index up to date for every project that has an event log (per-project cursors are preserved).</summary>
+        public void EnsureAllFresh()
+        {
+            foreach (var projectID in eventLog.AllProjectIDsWithLogs())
+                EnsureFresh(projectID);
+        }
+
+        /// <summary>Cross-project FTS/BM25 search over the whole shared index: the same query as Search but without the per-project filter, each hit annotated with its project id. Timestamps are ISO-8601 UTC, so the optional window filters by string comparison.</summary>
+        public List<SearchHit> SearchAll(string query, int topK = 20, DateTime? sinceUtc = null)
+        {
+            EnsureAllFresh();
+            var terms = Tokenize(query).Distinct(StringComparer.Ordinal).Take(24).ToList();
+            if (terms.Count == 0) return new();
+            string ftsQuery = string.Join(" OR ", terms.Select(t => $"""{t.Replace("\"", "\"\"")}"""));
+            lock (gate)
+            {
+                using var conn = Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"
+SELECT e.sequence, e.event_id, e.type, e.timestamp_utc, e.snippet, e.project_id, bm25(project_event_fts) AS rank
+FROM project_event_fts
+JOIN project_events e ON e.id = project_event_fts.rowid
+WHERE project_event_fts MATCH $query AND (e.timestamp_utc >= $since OR $since = '')
+ORDER BY rank
+LIMIT $limit;";
+                cmd.Parameters.AddWithValue("$query", ftsQuery);
+                cmd.Parameters.AddWithValue("$since", sinceUtc.HasValue ? sinceUtc.Value.ToUniversalTime().ToString("O") : "");
+                cmd.Parameters.AddWithValue("$limit", Math.Clamp(topK, 1, 100));
+                using var reader = cmd.ExecuteReader();
+                var hits = new List<SearchHit>();
+                while (reader.Read())
+                {
+                    double rank = reader.IsDBNull(6) ? 0 : reader.GetDouble(6);
+                    hits.Add(new SearchHit(
+                        reader.GetInt64(0), reader.GetString(1), reader.GetString(2),
+                        DateTime.Parse(reader.GetString(3), null, System.Globalization.DateTimeStyles.RoundtripKind),
+                        reader.GetString(4), -rank, reader.GetString(5)));
                 }
                 return hits;
             }

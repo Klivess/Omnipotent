@@ -44,7 +44,7 @@ namespace Omnipotent.Services.Projects
             "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_code", "klivemail_send",
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
-            "query_events",
+            "query_events", "cross_project_search",
         };
 
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>

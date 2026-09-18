@@ -425,6 +425,14 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                         max = Num("Max events to return (default 40, cap 200)."),
                     }, Array.Empty<string>())),
 
+                Tool("cross_project_search", "Cross-project retrieval: one full-text (FTS/BM25) query across ALL project event logs, ranked by relevance, with each hit annotated by its project id and name. Use it to find what was decided, done, or learned in OTHER projects; use query_events for a single project's time-window read. Optional 'since' bounds the window (a UTC date-time or a lookback like 7d). Returns up to 'max' hits.",
+                    Obj(new
+                    {
+                        query = Str("The full-text search query."),
+                        max = Num("Max hits to return (default 20, cap 100)."),
+                        since = Str("Optional window start: a UTC date-time (for example 2026-07-10 06:00) or a lookback (24h, 7d)."),
+                    }, "query")),
+
                 Tool("save_memory", "Save a durable fact to Klives' shared memory so it persists across wakes, projects, and KliveAgent. Save learnings, preferences, and important outcomes — not transient state.",
                     Obj(new { content = Str("The fact to remember."), tags = new { type = "array", items = new { type = "string" }, description = "Optional tags." } }, "content")),
 
@@ -480,10 +488,10 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                     Obj(new { key = Str("GlobalPaths field name.") }, "key")),
 
                 Tool("run_powershell", "Run a PowerShell script on the HOST machine (where Omnipotent runs), in its security context (elevated if Omnipotent is). Use for real host operations: installs, service/process control, git, filesystem, diagnostics. This is the host, NOT your desktop container. Returns exit code + stdout + stderr.",
-                    Obj(new { script = Str("PowerShell script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120)."), workingDirectory = Str("Optional directory under the shared /project volume; defaults to its root.") }, "script")),
+                    Obj(new { script = Str("PowerShell script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120)."),  workingDirectory = Str("Optional directory under the shared /project volume; defaults to its root."), detach = Bool("Set true to launch DETACHED: the call returns immediately with the child PID (no wait, no stdout/stderr capture) and the child is not killed by this call's timeout (CREATE_BREAKAWAY_FROM_JOB). The caller is responsible for reaping (sentinel-file contract).") }, "script")),
 
                 Tool("run_bash", "Run a Bash script on the HOST machine (WSL/Git Bash), in Omnipotent's security context. The host, NOT your desktop container. Returns exit code + stdout + stderr; says so if bash isn't installed.",
-                    Obj(new { script = Str("Bash script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120)."), workingDirectory = Str("Optional directory under the shared /project volume; defaults to its root.") }, "script")),
+                    Obj(new { script = Str("Bash script body."), timeoutSeconds = Num("Max seconds before the process tree is killed (default 120)."),  workingDirectory = Str("Optional directory under the shared /project volume; defaults to its root."), detach = Bool("Set true to launch DETACHED: the call returns immediately with the child PID (no wait, no stdout/stderr capture) and the child is not killed by this call's timeout (CREATE_BREAKAWAY_FROM_JOB). The caller is responsible for reaping (sentinel-file contract).") }, "script")),
 
                 Tool("http_request", "Make an HTTP request. Returns status + body (truncated).",
                     Obj(new
@@ -550,7 +558,7 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                     }, "path")),
 
                 // ── stimulus hooks: shape what wakes you ──
-                Tool("create_stimulus_hook", "Subscribe to a durable stimulus source so events wake you (or a sub-agent). Sources: timer {intervalSeconds, firstRunUtc?}; timers are wall-clock anchored across restarts and emit one catch-up wake after downtime. Other sources: webhook {}, file-watch {path relative to /project}, screen-diff {agentID?, intervalSeconds?, threshold?}, script {script, pollSeconds}, email {to?, from?, subjectContains?}, discord {channelId?, authorId?, contains?}, process-exit {processName?|pid?, pollSeconds?}. Spec filters are optional; the recognition criterion still triages what actually counts.",
+                Tool("create_stimulus_hook", "Subscribe to a durable stimulus source so events wake you (or a sub-agent). Sources: timer {intervalSeconds, firstRunUtc?}; timers are wall-clock anchored across restarts and emit one catch-up wake after downtime. Other sources: webhook {}, file-watch {path relative to /project}, screen-diff {agentID?, intervalSeconds?, threshold?}, script {script, pollSeconds}, email {to?, from?, subjectContains?, mailbox?, bodyContains?}, discord {channelId?, authorId?, contains?}, process-exit {processName?|pid?, pollSeconds?}. Spec filters are optional; the recognition criterion still triages what actually counts.",
                     Obj(new
                     {
                         sourceKind = Str("timer | webhook | file-watch | screen-diff | script | email | discord | process-exit"),

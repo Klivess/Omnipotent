@@ -77,6 +77,8 @@ namespace Omnipotent.Services.Projects
         public ProjectRuntimeStateStore? RuntimeState { get; set; }
         /// <summary>Durable Klives rules/tasks/steering receipts, never folded into the digest.</summary>
         public ProjectDirectiveStore? Directives { get; set; }
+        public ProjectRetrievalIndex? Retrieval { get; set; }
+
 
         /// <summary>
         /// Refuse to open a second approval gate identical to one still awaiting Klives, and make a refusal
@@ -1291,6 +1293,29 @@ namespace Omnipotent.Services.Projects
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(sbEvents.ToString().TrimEnd(), ProjectsContextBudget.ToolResultBudget));
                 }
 
+                case "cross_project_search":
+                {
+                    if (Retrieval == null) return new CommanderToolResult("Cross-project retrieval is unavailable in this context. Use query_events for this project.");
+                    string q = ((string?)a["query"] ?? "").Trim();
+                    if (q.Length == 0) return new CommanderToolResult("Provide a 'query' to search across all project event logs.");
+                    int maxHits = Math.Clamp((int?)a["max"] ?? 20, 1, 100);
+                    var nowS = DateTime.UtcNow;
+                    DateTime? sinceS = TemporalParse.TryParsePastInstant((string?)a["since"], nowS, out var sS) ? sS : null;
+                    var hits = Retrieval.SearchAll(q, maxHits, sinceS);
+                    if (hits.Count == 0)
+                        return new CommanderToolResult("No events matched across all projects" + (sinceS.HasValue ? $" since {TemporalFormat.Stamp(sinceS.Value)}" : "") + ".");
+                    var names = projectStore.ListProjects().ToDictionary(p => p.ProjectID, p => p.Name, StringComparer.Ordinal);
+                    var sb = new StringBuilder();
+                    sb.AppendLine($"{hits.Count} event(s) matching '{q}' across all projects" + (sinceS.HasValue ? $" since {TemporalFormat.Stamp(sinceS.Value)}" : "") + ":");
+                    foreach (var h in hits)
+                    {
+                        string name = names.TryGetValue(h.ProjectID, out var n) ? n : h.ProjectID;
+                        sb.AppendLine($"[{TemporalFormat.Stamp(h.Timestamp)}] project={h.ProjectID} ({name}) type={h.Type} score={h.Score:F2}");
+                        sb.AppendLine($"  #{h.Sequence} {h.Snippet}");
+                    }
+                    return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(sb.ToString().TrimEnd(), ProjectsContextBudget.ToolResultBudget));
+                }
+
                 case "save_memory":
                 {
                     if (SaveMemoryAsync == null) return new CommanderToolResult("Memory unavailable.");
@@ -1910,6 +1935,11 @@ namespace Omnipotent.Services.Projects
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var (workingDirectory, workingError) = ResolveHostWorkingDirectory((string?)a["workingDirectory"]);
                     if (workingError != null) return new CommanderToolResult(workingError) { Succeeded = false };
+                    if ((bool?)a["detach"] == true)
+                    {
+                        var d = await HostShell.RunPowerShellDetachedAsync(ps, workingDir: workingDirectory, ct: ct);
+                        return new CommanderToolResult(d.Format());
+                    }
                     var r = await HostShell.RunPowerShellAsync(ps, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: workingDirectory, ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget)) { Succeeded = r.Success };
                 }
@@ -1921,6 +1951,11 @@ namespace Omnipotent.Services.Projects
                     int secs = (int?)a["timeoutSeconds"] ?? 120;
                     var (workingDirectory, workingError) = ResolveHostWorkingDirectory((string?)a["workingDirectory"]);
                     if (workingError != null) return new CommanderToolResult(workingError) { Succeeded = false };
+                    if ((bool?)a["detach"] == true)
+                    {
+                        var d = await HostShell.RunBashDetachedAsync(bash, workingDir: workingDirectory, ct: ct);
+                        return new CommanderToolResult(d.Format());
+                    }
                     var r = await HostShell.RunBashAsync(bash, TimeSpan.FromSeconds(Math.Clamp(secs, 1, 900)), workingDir: workingDirectory, ct: ct);
                     return new CommanderToolResult(ProjectsContextBudget.TruncateToTokens(r.Format(), ProjectsContextBudget.ToolResultBudget)) { Succeeded = r.Success };
                 }
