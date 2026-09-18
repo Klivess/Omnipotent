@@ -92,9 +92,24 @@ namespace Omnipotent.Services.Projects
                     return null;
                 }
 
+                // Wake-boundary admission. Three AIRouter slots can only keep so many conversations
+                // inside the provider's prefix lifetime at once; starting one more past that point
+                // does not add throughput, it takes every live conversation cold. The trigger is
+                // retained by the gate and this agent is started as soon as a permit frees.
+                // Deliberately NOT recorded as a provider-admission deferral: that marks the project
+                // Degraded for a shared provider outage, and its retry deadline would then refuse the
+                // very resume this gate is about to issue. Waiting for a permit is a healthy state
+                // with its own retention, and the gate starts this agent the moment one frees.
+                if (!parent.WakeAdmission.TryAdmit(project.ProjectID, agent.AgentID, trigger, out string capacity))
+                    return null;
+
                 string wakeID = Guid.NewGuid().ToString("N");
                 var lease = parent.RuntimeState.TryAcquireAgentWakeLease(project.ProjectID, agent.AgentID, wakeID);
-                if (!lease.Acquired || lease.Lease == null) return lease.Lease?.WakeID;
+                if (!lease.Acquired || lease.Lease == null)
+                {
+                    parent.WakeAdmission.Release(project.ProjectID, agent.AgentID);
+                    return lease.Lease?.WakeID;
+                }
                 active = new ActiveWake(wakeID, lease.Lease.Generation, new CancellationTokenSource());
                 activeWakes[key] = active;
                 // A trigger retained during admission is now in the initial seed. Do not
@@ -120,6 +135,7 @@ namespace Omnipotent.Services.Projects
                 lock (WakeGate(key))
                     activeWakes.TryRemove(new KeyValuePair<string, ActiveWake>(key, active));
                 parent.RuntimeState.ReleaseAgentWakeLease(project.ProjectID, agent.AgentID, active.WakeID, active.LeaseGeneration);
+                parent.WakeAdmission.Release(project.ProjectID, agent.AgentID);
                 active.Cancellation.Dispose();
                 throw;
             }
@@ -139,6 +155,7 @@ namespace Omnipotent.Services.Projects
         private void FinishWake(Project project, ProjectAgentRecord agent, string key, ActiveWake active, bool continueAfterSlice)
         {
             ConcurrentQueue<string>? pending = null;
+            IReadOnlyList<ProjectWakeAdmission.DeferredWake> promoted = Array.Empty<ProjectWakeAdmission.DeferredWake>();
             try
             {
                 lock (WakeGate(key))
@@ -148,26 +165,39 @@ namespace Omnipotent.Services.Projects
                 }
                 active.Cancellation.Dispose();
                 parent.RuntimeState.ReleaseAgentWakeLease(project.ProjectID, agent.AgentID, active.WakeID, active.LeaseGeneration);
-
                 var refreshed = parent.Store.GetProject(project.ProjectID);
-                if (refreshed == null || refreshed.Status != ProjectStatus.Active) return;
-
                 var missed = pending == null ? new List<string>() : pending.ToList().Distinct().ToList();
+                bool rollsStraightOn = refreshed != null && refreshed.Status == ProjectStatus.Active
+                    && (missed.Count > 0 || continueAfterSlice);
+
+                // An agent chaining straight into its next slice KEEPS its conversation permit. The
+                // whole value of that permit is that this conversation's prefix is warm RIGHT NOW;
+                // handing it to a cold newcomer and putting this one at the back of the queue turns
+                // the fleet's one warm conversation into two cold ones.
+                if (rollsStraightOn) parent.WakeAdmission.NoteTurn(project.ProjectID, agent.AgentID);
+                else promoted = parent.WakeAdmission.Release(project.ProjectID, agent.AgentID);
+                if (!rollsStraightOn) return;
+
                 if (missed.Count > 0)
                 {
-                    Wake(refreshed, agent, missed.Count == 1 ? missed[0]
+                    Wake(refreshed!, agent, missed.Count == 1 ? missed[0]
                         : "Messages that arrived while you were awake:\n\n" + string.Join("\n\n", missed));
                     return;
                 }
 
-                if (!continueAfterSlice) return;
                 string resume = parent.RuntimeState.Get(project.ProjectID).Checkpoint.AgentResumeActions
                     .GetValueOrDefault(agent.AgentID)?.Summary ?? "Resume the assigned objective from the latest verified action.";
-                Wake(refreshed, agent,
+                Wake(refreshed!, agent,
                     "Continue the active assignment now. " +
                     $"Exact durable checkpoint: {ProjectPromptHygiene.ScrubState(resume, "Resume from the latest verified external state.")}");
             }
             catch { /* never mask the wake outcome */ }
+            finally
+            {
+                // Outside the wake gate: resuming a held-back wake re-enters this runner, and a
+                // deferral belonging to this same agent would otherwise recurse through its own lock.
+                try { parent.ResumeDeferredWakes(promoted); } catch { }
+            }
         }
 
         /// <summary>Whether this agent currently holds an in-flight wake. The heartbeat uses it to
@@ -429,6 +459,10 @@ namespace Omnipotent.Services.Projects
                         // means every route was exhausted, so it propagates.
                         try
                         {
+                            // A conversation only competes for a slot while it is taking turns. This
+                            // keeps the permit alive through a working loop and lets it lapse through a
+                            // long tool call, whose prefix is dead anyway.
+                            parent.WakeAdmission.NoteTurn(projectID, agent.AgentID);
                             parent.Activity.BeginThinking(projectID, agent.AgentID, agent.Role, model);
                             resp = await providerRecovery.ExecuteAsync(async () =>
                             {

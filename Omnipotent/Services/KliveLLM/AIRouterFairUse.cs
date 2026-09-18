@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLLM
+﻿namespace Omnipotent.Services.KliveLLM
 {
     /// <summary>
     /// Client-side admission control for AIRouter's published fair-use policy:
@@ -205,6 +205,33 @@ namespace Omnipotent.Services.KliveLLM
                     if (waiter.Info.PrefixKey.StartsWith(sessionIdPrefix, StringComparison.Ordinal))
                         return true;
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// How many conversations may be LIVE at once if consecutive turns are to keep landing inside
+        /// the provider's cache lifetime — the same K arithmetic the cohort is sized with, but costed
+        /// at the service time the fleet is actually paying (<see cref="PrefixSurvivalMeter.ExpectedServiceTime"/>).
+        ///
+        /// This is the number the scheduler itself cannot act on. By the time a request reaches this
+        /// queue its prompt has already been assembled as a continuation, so refusing it only makes it
+        /// miss later; the class comment on <see cref="AIRouterResidencyScheduler.HardParkCeiling"/>
+        /// spells that out. The only admission point that costs nothing is the WAKE BOUNDARY, which
+        /// lives above this layer — so this publishes the budget and Projects enforces it.
+        ///
+        /// Returns 0 while the survival curve is still guessing: a caller must fall back to its own
+        /// configured default rather than act on a number this class does not yet stand behind.
+        /// </summary>
+        internal int ConversationBudget()
+        {
+            lock (sync)
+            {
+                if (!survival.HasEnoughEvidence) return 0;
+                var curve = survival.Describe();
+                double service = Math.Max(1d, survival.ExpectedServiceTime().TotalSeconds);
+                double usable = Math.Clamp(1d - curve.NonResidentSlotShare, 0.1d, 1d);
+                double derived = residency.Alpha * usable * maxParallel * curve.Lifetime.TotalSeconds / service;
+                return Math.Clamp((int)Math.Floor(derived), 1, 64);
             }
         }
 

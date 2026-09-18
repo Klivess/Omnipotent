@@ -59,6 +59,10 @@ namespace Omnipotent.Services.Projects
         /// <summary>Fleet-wide prompt-cache kill switch: halts every agent when the weighted hit
         /// rate over the trailing window falls below its floor, and alerts Klives with the evidence.</summary>
         public ProjectCacheHealthMonitor CacheHealth { get; private set; } = null!;
+        /// <summary>Fleet-wide wake-boundary admission: how many agent conversations may be live at
+        /// once, so consecutive turns of each keep landing inside the provider's prompt-cache
+        /// lifetime instead of all going cold together.</summary>
+        public ProjectWakeAdmission WakeAdmission { get; private set; } = null!;
         public OpenRouterCreditChecker ProviderCredit { get; private set; } = null!;
         /// <summary>Live OpenRouter model-window metadata used by every Projects LLM route.</summary>
         public OpenRouterContextWindowResolver ProviderContexts { get; private set; } = null!;
@@ -104,6 +108,9 @@ namespace Omnipotent.Services.Projects
         public ProjectCouncilStore Councils { get; private set; } = null!;
         /// <summary>Read-only project and fleet performance/cost analytics for the KM website.</summary>
         public ProjectAnalyticsService Analytics { get; private set; } = null!;
+        /// <summary>"What would this have cost at these prices?" — re-prices the recorded usage
+        /// journal per project and per agent against prices Klives supplies.</summary>
+        public ProjectCostSimulatorService CostSimulator { get; private set; } = null!;
         public ProjectOverviewService Overview { get; private set; } = null!;
         /// <summary>Versioned Grand Plan — the strategic north star Klives approves before work begins.</summary>
         public ProjectGrandPlanStore GrandPlans { get; private set; } = null!;
@@ -239,6 +246,17 @@ namespace Omnipotent.Services.Projects
                 Path.Combine(Data_Handling.OmniPaths.GetPath(Data_Handling.OmniPaths.GlobalPaths.ProjectsDirectory), "CacheHealth"),
                 msg => ServiceLog(msg));
             CacheHealth.HaltAction = HaltFleetForCacheAsync;
+
+            // Wake-boundary admission. Constructed alongside the kill switch and before any runner,
+            // because the first wakes after a restart are the ones most able to re-collapse the fleet:
+            // every conversation is cold, so service time is at its worst exactly when the whole fleet
+            // wants to start at once.
+            WakeAdmission = new ProjectWakeAdmission();
+            _ = Task.Run(async () =>
+            {
+                try { await LoadWakeAdmissionOptionsAsync(); }
+                catch (Exception ex) { await ServiceLogError(ex, "Projects: wake-admission settings unavailable; using defaults"); }
+            });
             Budget.TokenUsageRecorded += CacheHealth.Observe;
             Budget.FleetAdmissionBlock = () => CacheHealth.AdmissionRefusal();
             _ = Task.Run(async () =>
@@ -363,6 +381,8 @@ namespace Omnipotent.Services.Projects
             Councils = new ProjectCouncilStore(msg => ServiceLog(msg));
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
             Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage,
+                message => ServiceLog(message));
+            CostSimulator = new ProjectCostSimulatorService(Store, TokenUsage, SubAgents,
                 message => ServiceLog(message));
             Overview = new ProjectOverviewService(this);
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
@@ -678,6 +698,12 @@ namespace Omnipotent.Services.Projects
                         NoteKeepaliveProjectFailure(project, ex);
                     }
                 }
+                // A conversation permit can also free without a wake ending — a wake that has been
+                // sitting in a long tool call stops competing for a slot. Nothing signals that, so the
+                // deferred queue is swept here rather than being left to wait for the next wake to
+                // finish somewhere else in the fleet.
+                try { ResumeDeferredWakes(WakeAdmission.Promote()); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: deferred-wake sweep failed"); }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: keepalive tick failed"); }
             finally
@@ -1338,6 +1364,9 @@ namespace Omnipotent.Services.Projects
             // Stop the in-flight wake + sub-agents so a halt bites immediately, mirroring /projects/pause.
             bool cancelled = CommanderRunner.CancelActiveWake(project.ProjectID);
             SubAgentRunner.CancelProject(project.ProjectID);
+            // A halted project holds no conversation permits and keeps no deferrals: leaving either
+            // behind would let a stopped project keep a live project out of the warm budget.
+            WakeAdmission.Forget(project.ProjectID);
             bool automatic = !string.IsNullOrWhiteSpace(automaticReason);
             EventLog.Append(new ProjectEvent
             {
@@ -1367,6 +1396,13 @@ namespace Omnipotent.Services.Projects
             var project = Store.GetProject(projectID);
             if (project == null) return false;
             if (!project.HaltedFromStatus.HasValue) return false; // not halted
+
+            // Every conversation in a halted project is cold, so a restore is the single most
+            // dangerous load the fleet can be given — a bulk unhalt is what put the 2026-09-17 window
+            // at 51.6%. Restarting the ramp here covers both routes back (unhalt-all and clearing the
+            // cache halt with unhalt:true); a bulk restore simply restarts it once per project, which
+            // is the same thing as restarting it when the last one lands.
+            WakeAdmission.BeginWarmRestart();
 
             ProjectStatus target = project.HaltedFromStatus.Value;
             ProjectStatus fromStatus = project.Status;
@@ -1460,6 +1496,71 @@ namespace Omnipotent.Services.Projects
                 MaxRetainedSamples =
                     Math.Clamp(await GetIntOmniSetting("Projects_CacheHaltMaxSamples", 5_000), 100, 200_000),
             };
+        }
+
+        /// <summary>
+        /// A keepalive nudge is phase-specific — the planning one tells the Commander to converge on a
+        /// Grand Plan, the active one to resume execution — and a deferral can outlive the phase it
+        /// was written for. Replaying the wrong one puts an Active project back to work on a plan that
+        /// is already approved. Same reasoning as the keepalive filter in DrainPendingTriggers; only
+        /// the retained keepalives are rewritten, every other trigger resumes verbatim.
+        /// </summary>
+        private static string PhaseSafeTrigger(Project project, string trigger)
+        {
+            if (!trigger.StartsWith("Periodic keepalive:", StringComparison.Ordinal)) return trigger;
+            bool forPlanning = trigger.Contains("PLANNING", StringComparison.OrdinalIgnoreCase);
+            bool isPlanning = project.Status == ProjectStatus.Planning;
+            if (forPlanning == isPlanning) return trigger;
+            return isPlanning
+                ? "Periodic keepalive: you are still in the PLANNING phase — converge on a Grand Plan and submit it (grand_plan op:submit) for Klives' approval."
+                : "Periodic keepalive: resume the next unfinished step from the latest verified checkpoint. Preserve completed work and use the approved plan; revise it only when new evidence requires a change.";
+        }
+
+        /// <summary>
+        /// Reads the wake-admission tunables.
+        ///
+        /// The cap is left at 0 — derive it — by default on purpose. The right number is not a
+        /// preference, it is arithmetic over two quantities that drift with the provider's load:
+        /// how long a prefix survives, and how long a turn occupies one of three slots. Pinning it
+        /// by hand would freeze an answer to a question whose inputs move. A positive value overrides
+        /// the measurement outright, which is the escape hatch for a deliberate experiment.
+        /// </summary>
+        private async Task LoadWakeAdmissionOptionsAsync()
+        {
+            WakeAdmission.Configure(
+                isEnabled: await GetBoolOmniSetting("Projects_WakeAdmissionEnabled", true),
+                cap: Math.Clamp(await GetIntOmniSetting("Projects_MaxLiveConversations", 0), 0, 128),
+                fallbackCap: Math.Clamp(await GetIntOmniSetting("Projects_LiveConversationsFallback", 6), 1, 128));
+        }
+
+        /// <summary>
+        /// Start a wake that was held back for prompt-cache capacity, now that a permit has freed.
+        /// Called with whatever <see cref="ProjectWakeAdmission.Release"/> promoted, so the resume
+        /// carries the trigger the wake was originally asked for rather than a generic nudge.
+        /// </summary>
+        public void ResumeDeferredWakes(IReadOnlyList<ProjectWakeAdmission.DeferredWake> promoted)
+        {
+            foreach (var wake in promoted)
+            {
+                try
+                {
+                    var project = Store.GetProject(wake.ProjectID);
+                    if (project == null || project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) continue;
+                    if (wake.IsCommander)
+                    {
+                        CommanderRunner.Wake(project, PhaseSafeTrigger(project, wake.Trigger), queueIfBusy: false);
+                        continue;
+                    }
+                    if (project.Status != ProjectStatus.Active) continue;
+                    var agent = SubAgents.Get(wake.ProjectID, wake.AgentID);
+                    if (agent == null || agent.Retired) continue;
+                    SubAgentRunner.Wake(project, agent, wake.Trigger, queueIfBusy: false);
+                }
+                catch (Exception ex)
+                {
+                    _ = ServiceLogError(ex, $"Projects: could not resume the deferred wake for {wake.ProjectID}/{wake.AgentID}");
+                }
+            }
         }
 
         /// <summary>
@@ -1703,6 +1804,11 @@ namespace Omnipotent.Services.Projects
         public (bool cleared, int restored, List<string> projectIDs) ClearCacheHalt(string clearedBy, bool unhalt)
         {
             bool cleared = CacheHealth.Clear(clearedBy);
+            // Restart the warm ramp BEFORE anything is restored. Every conversation in a halted fleet
+            // is cold, so releasing all of them at once is the worst possible load: full prefills at
+            // ~120s a slot instead of ~15s, which is how the 2026-09-17 clear went straight back into
+            // a 51.6% window. The ramp lets them warm in sequence instead.
+            if (cleared) WakeAdmission.BeginWarmRestart();
             if (cleared)
                 foreach (var project in Store.ListProjects())
                 {

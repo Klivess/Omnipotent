@@ -1,4 +1,4 @@
-using Omnipotent.Services.KliveLLM;
+﻿using Omnipotent.Services.KliveLLM;
 
 namespace Omnipotent.Tests.KliveLLM
 {
@@ -363,6 +363,52 @@ namespace Omnipotent.Tests.KliveLLM
             var snapshot = meter.Describe();
             Assert.True(snapshot.ReusableEfficiency > 0.99, $"efficiency was {snapshot.ReusableEfficiency:P1}");
             Assert.True(meter.EffectiveLifetime() >= PrefixSurvivalMeter.MinLifetime);
+        }
+
+        // ── The wake-boundary budget this layer publishes but cannot enforce ──────────────────
+
+        /// <summary>
+        /// Nothing may act on the budget until it rests on evidence. A fresh process reads 0, and the
+        /// consumer is required to fall back to its own ramp rather than treat that as "no limit".
+        /// </summary>
+        [Fact]
+        public void ConversationBudget_IsZeroUntilTheCurveHasEvidence()
+        {
+            var limiter = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, new PrefixSurvivalMeter());
+            Assert.Equal(0, limiter.ConversationBudget());
+        }
+
+        /// <summary>
+        /// The whole point of costing the budget at the BLENDED service time rather than the warm one.
+        ///
+        /// A cached turn and a re-prefilled turn differ by more than an order of magnitude in slot
+        /// occupancy, which is what makes the congestion collapse bistable: once enough conversations
+        /// go cold, throughput drops far enough that the rest cannot get a turn inside the cache
+        /// lifetime either. Sizing the live fleet off the WARM service time in that state would keep
+        /// admitting conversations into a fleet that can no longer serve the ones it has. The budget
+        /// therefore has to fall as the fleet goes cold — that is what lets it re-warm.
+        /// </summary>
+        [Fact]
+        public void ConversationBudget_ShrinksWhenTheFleetGoesCold()
+        {
+            var warm = new PrefixSurvivalMeter();
+            for (int i = 0; i < 200; i++)
+                warm.RecordOutcome($"projects-commander-warm{i % 4}#e1|qwen", TimeSpan.FromSeconds(20),
+                    promptTokens: 50_000 + i, cachedTokens: 49_900, wasResident: true, outsideCohort: false,
+                    slotOccupancy: TimeSpan.FromSeconds(15), nowUtc: T0.AddSeconds(i * 20));
+            int warmBudget = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, warm).ConversationBudget();
+
+            var cold = new PrefixSurvivalMeter();
+            for (int i = 0; i < 200; i++)
+                cold.RecordOutcome($"projects-commander-cold{i % 4}#e1|qwen", TimeSpan.FromSeconds(400),
+                    promptTokens: 50_000 + i, cachedTokens: 27_200, wasResident: true, outsideCohort: false,
+                    slotOccupancy: TimeSpan.FromSeconds(120), nowUtc: T0.AddSeconds(i * 400));
+            int coldBudget = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, cold).ConversationBudget();
+
+            Assert.True(warmBudget > 0 && coldBudget > 0, "the budget is a positive number of conversations");
+            Assert.True(coldBudget < warmBudget,
+                $"a collapsed fleet must be allowed FEWER live conversations, not the same number " +
+                $"(warm {warmBudget}, cold {coldBudget})");
         }
 
         // ── End to end, through the real limiter ──────────────────────────────────────────────

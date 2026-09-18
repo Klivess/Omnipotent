@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLLM;
+﻿namespace Omnipotent.Services.KliveLLM;
 
 public partial class KliveLLM
 {
@@ -9,6 +9,47 @@ public partial class KliveLLM
     internal const int MaxBriefSessionTokens = 96_000;
     internal const int MaxRetainedHistoryTokens = 24_000;
     internal static readonly TimeSpan BriefSessionIdleLimit = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Never re-seed more often than this, whatever the measured lifetime says. A re-seed buys a
+    /// small cold prompt in place of a large one; doing it on every brief pause would spend more on
+    /// fresh seeds than the dead resends it avoids.
+    /// </summary>
+    internal static readonly TimeSpan MinimumBriefSessionIdleLimit = TimeSpan.FromSeconds(90);
+
+    /// <summary>
+    /// The idle gap past which a session must be RE-SEEDED rather than continued.
+    ///
+    /// This used to be the flat 10-minute <see cref="BriefSessionIdleLimit"/>, and the gap between
+    /// that constant and the provider's real prefix lifetime is the most expensive region this fleet
+    /// operates in. Measured over the live journal: a continuation resumed inside the lifetime reuses
+    /// 98–99% of its prefix, while one resumed in the DEAD ZONE — past what the provider kept, short
+    /// of what made us rotate — re-sends a ~125K transcript against a prefix that is already gone and
+    /// gets ~20% of it back. On the fleet's healthiest measured day those were 5% of requests and
+    /// 51% of all wasted prefill.
+    ///
+    /// The perverse consequence of a fixed limit is that a six-minute pause cost MORE than a
+    /// twelve-minute one: the longer pause rotated to a ~55K seed, the shorter one paid full price
+    /// for a cache that no longer existed. Rotating on the MEASURED lifetime removes the dead zone:
+    /// past it there is nothing left to preserve, so the cheapest correct prompt is a fresh one.
+    ///
+    /// No circularity with <see cref="PrefixSurvivalMeter.LifetimeCeiling"/>, which is pinned to the
+    /// constant above rather than to this: the measurement bounds the rotation, never the reverse.
+    /// </summary>
+    internal static TimeSpan EffectiveBriefIdleLimit()
+    {
+        if (AIRouterMeasuredPrefixLifetime() is not { } measured) return BriefSessionIdleLimit;
+        if (measured < MinimumBriefSessionIdleLimit) measured = MinimumBriefSessionIdleLimit;
+        return measured < BriefSessionIdleLimit ? measured : BriefSessionIdleLimit;
+    }
+
+    /// <summary>
+    /// Has the provider certainly dropped this session's prefix? True when the session has been idle
+    /// longer than <see cref="EffectiveBriefIdleLimit"/> — the point past which continuing costs a
+    /// full re-prefill of whatever is retained and preserves nothing.
+    /// </summary>
+    internal static bool PrefixIsDead(KliveLLMSession session, DateTime now)
+        => session.briefState != null && now - session.lastUpdated > EffectiveBriefIdleLimit();
 
     internal async Task<string> GetBriefProviderKeyAsync()
     {
@@ -49,7 +90,7 @@ public partial class KliveLLM
                 if (!string.Equals(state.CompatibilityKey, compatibilityKey, StringComparison.Ordinal)
                     || !string.Equals(HFWrapper.ContentToText(session.structuredMessages.FirstOrDefault()?.content), system, StringComparison.Ordinal))
                     reason = "configuration-changed";
-                else if (now - session.lastUpdated > BriefSessionIdleLimit)
+                else if (now - session.lastUpdated > EffectiveBriefIdleLimit())
                     reason = "idle-expired";
                 else if (!HasCompleteToolExchanges(session.structuredMessages))
                     reason = "incomplete-tool-batch";

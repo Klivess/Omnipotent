@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLLM
+﻿namespace Omnipotent.Services.KliveLLM
 {
     /// <summary>
     /// Measures how long a prompt prefix actually survives in the provider's cache, and how long a
@@ -158,6 +158,34 @@ namespace Omnipotent.Services.KliveLLM
         internal TimeSpan ColdServiceTime()
         {
             lock (sync) { return TimeSpan.FromMilliseconds(Math.Max(1, coldServiceMs)); }
+        }
+
+        /// <summary>
+        /// What one live conversation costs a slot RIGHT NOW, warm and cold service time blended by
+        /// the rolling share of continuations actually being served from cache.
+        ///
+        /// <see cref="WarmServiceTime"/> alone is the right input for sizing the warm cohort, and the
+        /// wrong one for deciding how many conversations may be live at all. The two service times
+        /// differ by more than an order of magnitude on this fleet — a cached turn returns in seconds,
+        /// a full re-prefill of the same prompt takes a minute or two — which is exactly what makes
+        /// the congestion collapse bistable: once enough conversations go cold, throughput falls far
+        /// enough that the rest cannot get a turn inside the cache lifetime either, and the fleet has
+        /// no way back. Blending by the measured efficiency gives the one number that shrinks when the
+        /// fleet is cold, so admission tightens on its own and the fleet can re-warm. With no evidence
+        /// yet this reads as fully warm, which is the optimistic direction; the volume gates on the
+        /// consumer side are what stop that being acted on.
+        /// </summary>
+        internal TimeSpan ExpectedServiceTime()
+        {
+            lock (sync)
+            {
+                double efficiency = recentReusable > 0
+                    ? Math.Clamp(recentHits / recentReusable, 0d, 1d)
+                    : 1d;
+                double warm = Math.Max(1d, warmServiceMs + 0.5 * warmDeviationMs);
+                double cold = Math.Max(warm, coldServiceMs);
+                return TimeSpan.FromMilliseconds(warm * efficiency + cold * (1d - efficiency));
+            }
         }
 
         internal double NonResidentSlotShare()

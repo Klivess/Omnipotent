@@ -213,9 +213,22 @@ namespace Omnipotent.Services.Projects
                 parent.RuntimeState.CloseCircuit(project.ProjectID, halfOpen: true);
             }
 
+            // Wake-boundary admission. Three AIRouter slots keep only so many conversations inside
+            // the provider's prefix lifetime; starting one more past that point does not add
+            // throughput, it takes every live conversation cold. The trigger stays in the durable
+            // inbox and the gate starts this Commander as soon as a permit frees.
+            if (!parent.WakeAdmission.TryAdmit(project.ProjectID, ProjectWakeAdmission.CommanderAgentID,
+                    triggerDescription, out string capacity, mustAdmit: TriggeredByKlives(triggerDescription)))
+            {
+                if (queueIfBusy)
+                    parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
+                return null;
+            }
+
             var acquired = parent.RuntimeState.TryAcquireWakeLease(project.ProjectID, wakeID);
             if (!acquired.Acquired || acquired.Lease == null)
             {
+                parent.WakeAdmission.Release(project.ProjectID, ProjectWakeAdmission.CommanderAgentID);
                 if (queueIfBusy)
                     parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
                 return null;
@@ -256,6 +269,7 @@ namespace Omnipotent.Services.Projects
                     catch { }
                 }
                 parent.RuntimeState.ReleaseWakeLease(project.ProjectID, wakeID, acquired.Lease.Generation);
+                parent.WakeAdmission.Release(project.ProjectID, ProjectWakeAdmission.CommanderAgentID);
                 if (digest.ActiveWakeID == wakeID) { digest.ActiveWakeID = null; parent.Digests.SaveDigest(digest); }
                 throw;
             }
@@ -509,6 +523,10 @@ namespace Omnipotent.Services.Projects
                         // handler (circuit breaker / deferral).
                         try
                         {
+                            // A conversation only competes for a slot while it is taking turns. This
+                            // keeps the permit alive through a working loop and lets it lapse through a
+                            // long tool call, whose prefix is dead anyway.
+                            parent.WakeAdmission.NoteTurn(projectID, ProjectWakeAdmission.CommanderAgentID);
                             parent.Activity.BeginThinking(projectID, "commander", "commander", model);
                             resp = await providerRecovery.ExecuteAsync(async () =>
                             {
@@ -1152,27 +1170,36 @@ namespace Omnipotent.Services.Projects
                 var consumedResume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction;
                 if (modelResponses > 0 && ProjectWorkSliceBoundary.ShouldClearConsumedResume(endedAtWorkSlice, consumedResume))
                     parent.RuntimeState.ClearResumeAction(projectID, consumedResume!.ActionID);
-                if (!DrainPendingTriggers(projectID) && continueAfterSlice)
-                    ContinueProductiveWork(projectID);
+                // A Commander rolling straight into its next slice KEEPS its conversation permit:
+                // its prefix is warm right now, and handing the permit to a cold newcomer while this
+                // one re-queues turns one warm conversation into two cold ones. Only a Commander that
+                // is genuinely going to sleep gives the permit back — and that is the moment another
+                // project that has been waiting gets to start.
+                bool rollsStraightOn = DrainPendingTriggers(projectID);
+                if (!rollsStraightOn && continueAfterSlice) rollsStraightOn = ContinueProductiveWork(projectID);
+                if (rollsStraightOn) parent.WakeAdmission.NoteTurn(projectID, ProjectWakeAdmission.CommanderAgentID);
+                else
+                    parent.ResumeDeferredWakes(
+                        parent.WakeAdmission.Release(projectID, ProjectWakeAdmission.CommanderAgentID));
             }
         }
 
         /// <summary>Renews productive work in a fresh context. There is deliberately no continuation
         /// count limit: budget, cancellation, completion, blockers and convergence are the stopping
         /// conditions; context rollover is not.</summary>
-        private void ContinueProductiveWork(string projectID)
+        private bool ContinueProductiveWork(string projectID)
         {
             try
             {
                 var refreshed = parent.Store.GetProject(projectID);
-                if (refreshed == null || refreshed.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return;
+                if (refreshed == null || refreshed.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return false;
                 string resume = parent.RuntimeState.Get(projectID).Checkpoint.ResumeAction?.Summary
                     ?? "Resume from the most recent verified action and continue the current objective.";
-                Wake(refreshed,
+                return null != Wake(refreshed,
                     "Continue the active assignment now. " +
                     $"Exact durable checkpoint: {ProjectPromptHygiene.ScrubState(resume, "Resume from the latest verified external state.")}");
             }
-            catch { /* never mask the wake outcome */ }
+            catch { return false; /* never mask the wake outcome */ }
         }
 
         /// <summary>Klives-message triggers get their wake's closing status mirrored to Discord.</summary>

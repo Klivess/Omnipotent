@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLLM
+﻿namespace Omnipotent.Services.KliveLLM
 {
     /// <summary>
     /// What a request is FOR, which is the only thing that justifies it jumping a queue.
@@ -199,6 +199,10 @@ namespace Omnipotent.Services.KliveLLM
         internal long Evictions => evictions;
 
         internal void SetAlpha(double value) => alpha = Math.Clamp(value, 0.05d, 1.0d);
+
+        /// <summary>The EDF feasibility margin in force, so the same arithmetic that sizes the warm
+        /// cohort can size the fleet's live-conversation budget instead of a second copy of it.</summary>
+        internal double Alpha => alpha;
 
         internal bool IsResident(string prefixKey) => residents.ContainsKey(prefixKey);
 

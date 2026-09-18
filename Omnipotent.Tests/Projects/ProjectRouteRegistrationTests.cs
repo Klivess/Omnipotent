@@ -19,6 +19,7 @@ public sealed class ProjectRouteRegistrationTests
         Assert.True(api.ControllerLookup.ContainsKey("/projects/overview"));
         Assert.True(api.ControllerLookup.ContainsKey("/projects/get"));
         Assert.True(api.ControllerLookup.ContainsKey("/projects/analytics/all"));
+        Assert.True(api.ControllerLookup.ContainsKey("/projects/cost-simulator"));
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2),
             $"Core route registration took {stopwatch.Elapsed}.");
     }

@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.Projects
+﻿namespace Omnipotent.Services.Projects
 {
     /// <summary>
     /// Stall detection and SELF-HEALING (design doc §9 + the one explicit developer note: "prevent
@@ -160,9 +160,14 @@ namespace Omnipotent.Services.Projects
             // one thing the prefix-efficiency target forbids — so a legitimately parked turn can
             // outlast MaxWakeGap once parks stack. Without this beat the scheduler would manufacture
             // false stalls out of its own correct behaviour.
+            // The same reasoning one level up: a wake held at the WAKE BOUNDARY for prompt-cache
+            // capacity has not started, so it has nothing queued in AIRouter either — and it is the
+            // healthiest state in the system, not a stall. Without this beat the watchdog would
+            // diagnose the admission gate's correct behaviour and force-wake straight back into it.
             DateTime? queuedBeat =
                 KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-commander-{project.ProjectID}")
                 || KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-agent-{project.ProjectID}-")
+                || (parent.WakeAdmission?.IsDeferred(project.ProjectID) ?? false)
                     ? now : null;
             var observedBeats = new[] { lastActivity, leaseBeat, workerBeat, verifiedBeat, approvalBeat, streamBeat, queuedBeat }.Where(x => x.HasValue).Select(x => x!.Value).ToList();
             var lastBeat = observedBeats.DefaultIfEmpty(project.CreatedAt).Max();
@@ -202,6 +207,7 @@ namespace Omnipotent.Services.Projects
                     // Same reasoning as the heartbeat beat above: a worker whose turn is parked in
                     // the AIRouter queue is waiting, not wedged.
                     && !KliveLLM.KliveLLM.AIRouterHasQueuedWork($"projects-agent-{project.ProjectID}-{x.Key}")
+                    && !(parent.WakeAdmission?.IsDeferred(project.ProjectID, x.Key) ?? false)
                     && !(parent.Gates?.LastResolutionAt(project.ProjectID, x.Key) is { } resolved
                         && now - resolved <= MaxWakeGap));
             if (staleLease.HasValue && !string.IsNullOrWhiteSpace(staleLease.Value.Key))

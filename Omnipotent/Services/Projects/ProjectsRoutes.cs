@@ -621,10 +621,35 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     var options = parent.CacheHealth.Options;
+                    var admission = parent.WakeAdmission.Describe();
                     await req.ReturnResponse(Json(new
                     {
                         halt = parent.CacheHealth.GetState(),
                         window = parent.CacheHealth.Describe(),
+                        // The other half of the question "why is my project not running". A halt stops
+                        // the fleet; the wake budget decides how much of it may be live at once, and a
+                        // project can be perfectly healthy and simply waiting for a permit.
+                        admission = new
+                        {
+                            admission.Enabled,
+                            admission.Live,
+                            admission.Active,
+                            admission.Budget,
+                            admission.Source,
+                            admission.MeasuredBudget,
+                            admission.ConfiguredCap,
+                            admission.Fallback,
+                            admission.Deferred,
+                            admission.RampStartedAt,
+                            liveKeys = admission.LiveKeys,
+                            deferred = admission.DeferredWakes.Select(wake => new
+                            {
+                                wake.ProjectID,
+                                wake.AgentID,
+                                wake.QueuedAt,
+                                waitingSeconds = (int)(DateTime.UtcNow - wake.QueuedAt).TotalSeconds,
+                            }),
+                        },
                         settings = new
                         {
                             enabled = options.Enabled,
@@ -829,6 +854,25 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range, forceRefresh: fresh,
                         fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
                         bucket: req.userParameters?.Get("bucket"))));
+                }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            // Cost simulator: recorded token counts, bucketed the way providers bill them, per
+            // project and per agent. No prices here on purpose — the website multiplies, so Klives
+            // can retune a price and see the answer without another scan of the usage journals.
+            await parent.RegisterHttpRouteAsync("/projects/cost-simulator", async req =>
+            {
+                try
+                {
+                    string range = req.userParameters?.Get("range") ?? "30d";
+                    bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
+                    bool includeArchived = !string.Equals(
+                        req.userParameters?.Get("includeArchived"), "0", StringComparison.Ordinal);
+                    await req.ReturnResponse(Json(parent.CostSimulator.Get(range, forceRefresh: fresh,
+                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
+                        includeArchived: includeArchived)));
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }

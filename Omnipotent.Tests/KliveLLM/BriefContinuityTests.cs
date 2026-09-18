@@ -263,6 +263,86 @@ public class BriefContinuityTests(ITestOutputHelper output)
         return (reused / total, total - reused, total, rotations);
     }
 
+    // ── The dead zone: past what the provider kept, short of what used to make us rotate ──
+
+    /// <summary>
+    /// The rotation limit is a CEILING now, not a constant, and the measurement is what bounds it —
+    /// never the other way round. If this ever inverted, the survival meter's own ceiling
+    /// (BriefSessionIdleLimit − 30s) would feed back into the limit that produced it and collapse
+    /// both to the floor.
+    /// </summary>
+    [Fact]
+    public void RotationLimit_IsBoundedByTheConstant_AndFallsBackToItWithoutEvidence()
+    {
+        Assert.True(Llm.MinimumBriefSessionIdleLimit < Llm.BriefSessionIdleLimit);
+        Assert.True(Llm.EffectiveBriefIdleLimit() <= Llm.BriefSessionIdleLimit);
+        Assert.True(Llm.EffectiveBriefIdleLimit() >= Llm.MinimumBriefSessionIdleLimit);
+        // Nothing has measured the shared AIRouter curve in a unit-test process, so the honest answer
+        // is the constant: a rotation policy must not act on a lifetime nobody has observed.
+        Assert.Equal(Llm.BriefSessionIdleLimit, Llm.EffectiveBriefIdleLimit());
+    }
+
+    [Fact]
+    public void PrefixIsDead_TracksTheEffectiveLimit_AndOnlyAppliesToBriefedSessions()
+    {
+        var llm = new Llm();
+        Begin(llm);
+        var session = Session(llm);
+        session.lastUpdated = Now;
+
+        Assert.False(Llm.PrefixIsDead(session, Now + Llm.EffectiveBriefIdleLimit()));
+        Assert.True(Llm.PrefixIsDead(session, Now + Llm.EffectiveBriefIdleLimit() + TimeSpan.FromSeconds(1)));
+
+        // A plain chat session has no authoritative brief to re-seed from, so there is nothing safe
+        // to throw away and this must leave it alone.
+        session.briefState = null;
+        Assert.False(Llm.PrefixIsDead(session, Now.AddHours(4)));
+    }
+
+    /// <summary>
+    /// What the mid-wake re-seed is actually worth. A wake that went quiet long enough for the
+    /// provider to drop its prefix used to re-send the WHOLE retained transcript against a cache
+    /// entry that no longer existed — measured over the live journal those turns averaged a 125K
+    /// prompt and got ~20% of it back. Re-seeding trims the transcript to the retention budget, so
+    /// the unavoidable cold turn is a small one and every turn after it extends a small warm prompt.
+    /// </summary>
+    [Fact]
+    public void DeadPrefixReseed_TrimsTheTranscriptToTheRetentionBudget()
+    {
+        var llm = new Llm();
+        Begin(llm);
+        var session = Session(llm);
+        for (int i = 0; i < 60; i++) CompleteBatch(Session(llm), i);
+
+        int before = Llm.EstimateToolSessionTokens(session.structuredMessages);
+        int budget = Llm.IrreducibleSessionTokens(session) + Llm.MaxRetainedHistoryTokens;
+        Assert.True(before > budget, $"the fixture has to be over the budget to test anything (was {before} vs {budget})");
+
+        Assert.True(Llm.CompactToolSessionIfNeeded(session, budget, keepRecent: 16, protectPrefixMessages: 1));
+        int after = Llm.EstimateToolSessionTokens(session.structuredMessages);
+        Assert.True(after <= budget, $"re-seed left {after} tokens against a {budget} budget");
+        Assert.True(after < before);
+        // The brief survives: re-seeding is not amnesia, it is dropping the retained transcript the
+        // provider is no longer holding a prefix for.
+        Assert.Contains(session.structuredMessages, m => HFWrapper.ContentToText(m.content).Contains("── DIRECTIVES ──"));
+    }
+
+    /// <summary>A session already inside the retention budget is left alone — there is nothing to
+    /// save, and rewriting it would throw away history for no cache benefit at all.</summary>
+    [Fact]
+    public void DeadPrefixReseed_LeavesASmallSessionUntouched()
+    {
+        var llm = new Llm();
+        Begin(llm);
+        var session = Session(llm);
+        CompleteBatch(session, 0);
+        string before = JsonConvert.SerializeObject(session.structuredMessages);
+
+        int budget = Llm.IrreducibleSessionTokens(session) + Llm.MaxRetainedHistoryTokens;
+        Assert.False(Llm.CompactToolSessionIfNeeded(session, budget, keepRecent: 16, protectPrefixMessages: 1));
+        Assert.Equal(before, JsonConvert.SerializeObject(session.structuredMessages));
+    }
+
     private static void CompleteBatch(Llm.KliveLLMSession session, int index, bool complete = true)
     {
         session.structuredMessages.Add(new HFWrapper.HFMessage { role = "assistant", content = "Next action", tool_calls =

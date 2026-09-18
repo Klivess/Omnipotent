@@ -223,6 +223,25 @@ namespace Omnipotent.Services.KliveLLM
         internal static bool AIRouterHasQueuedWork(string sessionIdPrefix)
             => sharedAIRouterFairUse.HasQueuedWork(sessionIdPrefix);
 
+        /// <summary>
+        /// How many conversations the shared AIRouter envelope can currently keep cache-warm, or 0
+        /// while the survival curve is still guessing. Static for the same reason as the queue probe:
+        /// the wake-boundary admission that consumes it is in another service, and the envelope is
+        /// process-wide regardless of which KliveLLM instance assembled the prompt.
+        /// </summary>
+        internal static int AIRouterConversationBudget()
+            => sharedAIRouterFairUse.ConversationBudget();
+
+        /// <summary>
+        /// The measured prefix lifetime the shared envelope is scheduling against, or null while the
+        /// curve is still guessing. Prompt assembly needs this to tell a continuation whose prefix is
+        /// still alive from one whose prefix the provider dropped minutes ago.
+        /// </summary>
+        internal static TimeSpan? AIRouterMeasuredPrefixLifetime()
+            => PrefixSurvivalMeter.Shared.HasEnoughEvidence
+                ? PrefixSurvivalMeter.Shared.EffectiveLifetime()
+                : null;
+
         internal sealed class RemoteLLMProviderConfiguration
         {
             public RemoteLLMProviderConfiguration(LLMProvider provider, string displayName, string chatCompletionsEndpoint, string apiKey, string model, string? serviceTier = null)
@@ -1200,6 +1219,17 @@ namespace Omnipotent.Services.KliveLLM
         /// and the agent silently loses its entire rehydrated context mid-wake, which reliably produces
         /// repeated work and tool-call loops.
         /// </param>
+        /// <summary>The part of a session no compaction may remove: the system block plus, for a
+        /// briefed session, the authoritative brief. The floor under any re-seed budget.</summary>
+        internal static int IrreducibleSessionTokens(KliveLLMSession s)
+        {
+            int total = s.structuredMessages.TakeWhile(message => message.role == "system").Sum(EstimateMessageTokens);
+            if (s.briefState != null)
+                total += s.structuredMessages.Where(message => s.briefState.BriefMessages.Contains(message))
+                    .Sum(EstimateMessageTokens);
+            return total;
+        }
+
         internal static bool CompactToolSessionIfNeeded(KliveLLMSession s, int aboveTokens, int keepRecent, int protectPrefixMessages = 0)
         {
             var msgs = s.structuredMessages;
@@ -1408,11 +1438,31 @@ namespace Omnipotent.Services.KliveLLM
                         ? Math.Min(compactAbove, preflightMessageBudget.Value)
                         : preflightMessageBudget.Value;
                 }
-                if (compactAbove > 0)
+                // THE DEAD ZONE. A wake that goes quiet mid-flight — a long tool call, a timer
+                // stimulus, a queue wait — comes back to a prefix the provider dropped while it was
+                // away, and the session-start rotation cannot help because it only runs at wake START.
+                // Continuing here re-prefills the WHOLE retained transcript against a cache entry that
+                // no longer exists: measured over the live journal, those turns got ~20% of their
+                // prompt back and, on the fleet's healthiest day, were 5% of requests and 51% of all
+                // wasted prefill. Re-seeding costs nothing in cache terms (there is nothing left to
+                // lose) and every later turn extends a small warm prompt instead of a large dead one.
+                bool prefixDied = PrefixIsDead(session, DateTime.UtcNow);
+                if (prefixDied)
+                {
+                    int reseedBudget = IrreducibleSessionTokens(session) + MaxRetainedHistoryTokens;
+                    if (EstimateToolSessionTokens(session.structuredMessages) > reseedBudget)
+                        contextWasCompacted = CompactToolSessionIfNeeded(session, reseedBudget, keepRecent,
+                            Math.Max(1, compactProtectPrefixMessages));
+                }
+                if (compactAbove > 0 && !contextWasCompacted)
                     contextWasCompacted = CompactToolSessionIfNeeded(session, compactAbove, keepRecent, compactProtectPrefixMessages);
                 snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
-                previousCacheMessageCount = contextWasCompacted ? 0 : session.lastCacheMessageCount;
-                if (contextWasCompacted)
+                // A dead prefix ends the epoch whether or not anything was rewritten. Carrying the old
+                // id forward would have the scheduler hold a residency for a prefix that is gone and
+                // have the analytics score the miss as a lost warm prefix rather than the cold start
+                // it actually is.
+                previousCacheMessageCount = contextWasCompacted || prefixDied ? 0 : session.lastCacheMessageCount;
+                if (contextWasCompacted || prefixDied)
                 {
                     session.cacheEpochID = Guid.NewGuid().ToString("N");
                     session.cacheEpochTurnIndex = 0;
