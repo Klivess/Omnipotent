@@ -30,6 +30,8 @@ namespace Omnipotent.Services.Projects.Containers
         public DateTime LastUsedAt { get; set; } = DateTime.UtcNow;
         /// <summary>Set when the container was found missing/dead during reconciliation.</summary>
         public bool Lost { get; set; }
+        /// <summary>Intentionally stopped for idle resource savings; keep its writable filesystem.</summary>
+        public bool Suspended { get; set; }
         /// <summary>SHA-256 of the desktop image's build context this container was created from
         /// (copied from the image's context-hash label at creation). Compared against the current
         /// image's hash to detect a container running a now-stale image, so it can be recreated

@@ -1360,6 +1360,8 @@ namespace Omnipotent.Services.Projects
             project.HaltedFromStatus = project.Status;
             project.Status = ProjectStatus.Paused;
             Store.SaveProject(project);
+            if (DiscordManager != null)
+                _ = DiscordManager.SyncProjectChannelAsync(project);
             RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
             // Stop the in-flight wake + sub-agents so a halt bites immediately, mirroring /projects/pause.
             bool cancelled = CommanderRunner.CancelActiveWake(project.ProjectID);
@@ -1415,6 +1417,8 @@ namespace Omnipotent.Services.Projects
                 bool wasPlanning = target == ProjectStatus.Planning || !GrandPlans.HasApprovedPlan(project.ProjectID);
                 project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
                 Store.SaveProject(project);
+                if (DiscordManager != null)
+                    _ = DiscordManager.SyncProjectChannelAsync(project);
                 RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                 RuntimeState.ClearBlocker(project.ProjectID);
                 RuntimeState.CloseCircuit(project.ProjectID);
@@ -1444,6 +1448,8 @@ namespace Omnipotent.Services.Projects
             {
                 project.Status = target;
                 Store.SaveProject(project);
+                if (DiscordManager != null)
+                    _ = DiscordManager.SyncProjectChannelAsync(project);
                 RuntimeState.SetDisposition(project.ProjectID, target == ProjectStatus.Blocked
                     ? ProjectExecutionDisposition.Blocked : ProjectExecutionDisposition.Paused);
                 EventLog.Append(new ProjectEvent
@@ -2625,6 +2631,8 @@ namespace Omnipotent.Services.Projects
             p.Status = ProjectStatus.Active;
             Store.SaveProject(p);
             project.Status = ProjectStatus.Active; // lift the in-wake gate on the runner's snapshot
+            if (DiscordManager != null)
+                await DiscordManager.SyncProjectChannelAsync(project);
             RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
             EventLog.Append(new ProjectEvent
             {
@@ -2984,9 +2992,9 @@ namespace Omnipotent.Services.Projects
         /// Hourly container reap (§ resource hygiene): prunes orphaned Lost registry records, reaps
         /// desktop containers Docker still runs but the registry lost track of (create-failure /
         /// registry-drift orphans that would otherwise leak ~2 GB each forever), and tears down
-        /// desktops that are no longer needed — those owned by a retired agent, belonging to a
-        /// finished project, on a project idle beyond the reap window, or whose desktop itself has
-        /// gone unused (all recreated transparently on next use). Never touches a project with a
+        /// desktops owned by a retired agent or belonging to a finished project. Idle computers
+        /// are stopped in place so installed applications and home files survive their next wake.
+        /// Never touches a project with a
         /// live wake. Windows via Projects_ContainerIdleReapHours (project activity) and
         /// Projects_DesktopIdleReapHours (per-desktop use); host-global policy, 0 disables that lane.
         /// </summary>
@@ -3046,19 +3054,28 @@ namespace Omnipotent.Services.Projects
 
                     foreach (var c in containers)
                     {
-                        bool ownerRetired = c.AgentID != null && !activeIDs.Contains(c.AgentID);
+                        bool ownerRetired = IsDesktopOwnerRetired(c.AgentID, activeIDs);
                         bool desktopIdle = desktopIdleHours > 0 &&
                                            DateTime.UtcNow - c.LastUsedAt > TimeSpan.FromHours(desktopIdleHours);
-                        if (finished || idle || ownerRetired || desktopIdle)
+                        if (finished || ownerRetired)
                         {
                             try { await Desktops.DisposeDesktopAsync(c.ContainerID); }
                             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap dispose failed"); }
+                        }
+                        else if ((idle || desktopIdle) && !c.Suspended)
+                        {
+                            try { await Desktops.SuspendDesktopAsync(c.ContainerID); }
+                            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: idle desktop suspension failed"); }
                         }
                     }
                 }
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
         }
+
+        internal static bool IsDesktopOwnerRetired(string? agentID, ISet<string> activeIDs) =>
+            agentID != null && !string.Equals(agentID, "commander", StringComparison.OrdinalIgnoreCase)
+            && !activeIDs.Contains(agentID);
 
         /// <summary>Post-wake digest refresh + compaction, via the utility model. Never blocks a wake's hot path.</summary>
         public async Task RebuildDigestAfterWakeAsync(Project project, long wakeStartSeq)
@@ -3100,7 +3117,7 @@ namespace Omnipotent.Services.Projects
                     return;
                 }
                 DiscordManager = new ProjectDiscordManager(this, discord, msg => ServiceLog(msg));
-                DiscordManager.Initialise();
+                await DiscordManager.InitialiseAsync();
 
                 // Wire the Discord push stimulus source so 'discord' hooks observe real messages,
                 // then re-arm so any existing discord hooks attach to the now-live source.

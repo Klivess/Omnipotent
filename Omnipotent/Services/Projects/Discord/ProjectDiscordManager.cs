@@ -19,6 +19,10 @@ namespace Omnipotent.Services.Projects.Discord
     /// </summary>
     public class ProjectDiscordManager
     {
+        public const string ActiveCategoryName = "Active Projects";
+        public const string PausedCategoryName = "Paused Projects";
+        public const string ArchivedCategoryName = "Archived Projects";
+
         private readonly Projects parent;
         private readonly KliveBotDiscord discord;
         private readonly Action<string> log;
@@ -36,7 +40,7 @@ namespace Omnipotent.Services.Projects.Discord
         }
 
         /// <summary>Wires the shared client's events and indexes existing project channels.</summary>
-        public void Initialise()
+        public async Task InitialiseAsync()
         {
             foreach (var p in parent.Store.ListProjects())
                 if (p.DiscordChannelID != 0)
@@ -44,7 +48,16 @@ namespace Omnipotent.Services.Projects.Discord
 
             discord.Client.MessageCreated += OnMessageCreated;
             discord.Client.ComponentInteractionCreated += OnComponentInteraction;
+
+            // This is deliberately a startup reconciliation rather than a migration flag: it
+            // repairs channels created by older versions, including channels whose names were
+            // changed to archived-* when completion used to be implemented as a rename.
+            await ReconcileProjectChannelsAsync();
         }
+
+        // Keep the old fire-and-forget entry point for integrations compiled against the prior
+        // manager API; Omnipotent itself uses InitialiseAsync so startup waits for repair.
+        public void Initialise() => _ = InitialiseAsync();
 
         // ── channel lifecycle ──
 
@@ -52,8 +65,9 @@ namespace Omnipotent.Services.Projects.Discord
         {
             if (project.DiscordChannelID != 0) return project.DiscordChannelID;
             var guild = await discord.Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+            var category = await GetOrCreateCategoryAsync(guild, CategoryNameFor(project.Status));
             string name = "project-" + Sanitise(project.Name);
-            var channel = await guild.CreateTextChannelAsync(name, topic: $"Project: {project.Goal}");
+            var channel = await guild.CreateTextChannelAsync(name, parent: category, topic: $"Project: {project.Goal}");
             project.DiscordChannelID = channel.Id;
             parent.Store.SaveProject(project);
             channelToProject[channel.Id] = project.ProjectID;
@@ -81,15 +95,50 @@ namespace Omnipotent.Services.Projects.Discord
 
         public async Task ArchiveChannelAsync(Project project)
         {
+            await SyncProjectChannelAsync(project, "Project completed — channel archived.");
+        }
+
+        /// <summary>Moves an existing project channel to the category for its current status.</summary>
+        public async Task SyncProjectChannelAsync(Project project, string? announcement = null)
+        {
             if (project.DiscordChannelID == 0) return;
             try
             {
+                var guild = await discord.Client.GetGuildAsync(OmniPaths.DiscordServerContainingKlives);
+                var category = await GetOrCreateCategoryAsync(guild, CategoryNameFor(project.Status));
                 var channel = await discord.Client.GetChannelAsync(project.DiscordChannelID);
-                await channel.ModifyAsync(c => c.Name = "archived-" + channel.Name);
-                await channel.SendMessageAsync("Project completed — channel archived.");
+                if (channel.ParentId != category.Id)
+                    await channel.ModifyAsync(c => c.Parent = category);
+                if (!string.IsNullOrWhiteSpace(announcement))
+                    await channel.SendMessageAsync(announcement);
             }
-            catch (Exception ex) { log($"Archive channel failed for {project.ProjectID}: {ex.Message}"); }
-            channelToProject.TryRemove(project.DiscordChannelID, out _);
+            catch (Exception ex) { log($"Sync channel failed for {project.ProjectID}: {ex.Message}"); }
+        }
+
+        /// <summary>Repairs every persisted project channel after a restart.</summary>
+        public async Task ReconcileProjectChannelsAsync()
+        {
+            foreach (var project in parent.Store.ListProjects())
+            {
+                if (project.DiscordChannelID == 0) continue;
+                await SyncProjectChannelAsync(project);
+            }
+        }
+
+        internal static string CategoryNameFor(ProjectStatus status) => status switch
+        {
+            ProjectStatus.Paused or ProjectStatus.BudgetPaused or ProjectStatus.Blocked
+                => PausedCategoryName,
+            ProjectStatus.Completed or ProjectStatus.Archived => ArchivedCategoryName,
+            _ => ActiveCategoryName,
+        };
+
+        private static async Task<DiscordChannel> GetOrCreateCategoryAsync(DiscordGuild guild, string name)
+        {
+            var channels = await guild.GetChannelsAsync();
+            var category = channels.FirstOrDefault(c => c.Type == ChannelType.Category
+                && string.Equals(c.Name, name, StringComparison.OrdinalIgnoreCase));
+            return category ?? await guild.CreateChannelCategoryAsync(name);
         }
 
         // ── approvals ──

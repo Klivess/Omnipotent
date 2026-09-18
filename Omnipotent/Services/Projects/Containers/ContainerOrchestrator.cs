@@ -71,6 +71,9 @@ namespace Omnipotent.Services.Projects.Containers
             this.dockerUri = dockerUri;
         }
 
+        internal ContainerOrchestrator(ContainerRegistry registry, DockerClient client)
+            : this(registry, _ => { }, _ => "test-desktop", "http://localhost") => this.client = client;
+
         /// <summary>
         /// Budget for one desktop-control exec (launch/focus a window). Generous against commands
         /// that finish in milliseconds, because Chromium's first launch on a cold profile is the
@@ -129,7 +132,6 @@ namespace Omnipotent.Services.Projects.Containers
                 timer.Cancel();   // stop the pending delay rather than leaving a timer per call
                 try { return await work; } finally { attempt.Dispose(); }
             }
-            ct.ThrowIfCancellationRequested();
             // Ask politely first; the read may still be sitting on the pipe regardless.
             try { attempt.Cancel(); } catch { }
             work.ContinueWith(t =>
@@ -137,6 +139,7 @@ namespace Omnipotent.Services.Projects.Containers
                 _ = t.Exception;   // observed, so an abandoned failure is never an unobserved-task crash
                 try { attempt.Dispose(); } catch { }
             }, TaskScheduler.Default);
+            ct.ThrowIfCancellationRequested();
             throw new ContainerDaemonTimeoutException(
                 $"the Docker daemon did not complete {what} within {budget.TotalSeconds:0.#}s");
         }
@@ -151,16 +154,19 @@ namespace Omnipotent.Services.Projects.Containers
         {
             try
             {
-                var docker = await GetClientAsync();
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeout.CancelAfter(TimeSpan.FromSeconds(4));
-                await docker.System.PingAsync(timeout.Token);
+                await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    await docker.System.PingAsync(token);
+                    return true;
+                }, TimeSpan.FromSeconds(4), "daemon health probe", ct);
                 return null;
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
                 return $"the Docker daemon at {dockerUri} did not respond within 4s — it is not running (or is unreachable at that endpoint).";
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
                 return $"the Docker daemon at {dockerUri} is unreachable: {ex.Message}";
@@ -193,9 +199,9 @@ namespace Omnipotent.Services.Projects.Containers
                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
                     => new[] { "bash", "-lc", BrowserLaunchScriptForExec, "bash", uri.AbsoluteUri },
                 ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
-                    => new[] { "sh", "-lc", "DISPLAY=:1 xfce4-terminal >/dev/null 2>&1 &" },
+                    => new[] { "bash", "-lc", ApplicationLaunchScriptForExec, "desktop-launch", "xfce4-terminal" },
                 ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app
-                    => new[] { "sh", "-lc", "DISPLAY=:1 nohup \"$0\" \"$@\" >/tmp/launched-app.log 2>&1 &", app.Executable }
+                    => new[] { "bash", "-lc", ApplicationLaunchScriptForExec, "desktop-launch", app.Executable }
                         .Concat(app.Arguments).ToArray(),
                 ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
                     => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Chromium" },
@@ -402,6 +408,22 @@ namespace Omnipotent.Services.Projects.Containers
         // The fourth `bash -lc` argv is deliberately just "bash" ($0), not a pretend executable
         // name that agents could mistake for a missing launcher binary.
         internal static string BrowserLaunchScriptForExec => NormalizeLinuxShellScript(BrowserLaunchScript);
+
+        internal static string ApplicationLaunchScriptForExec => NormalizeLinuxShellScript(ApplicationLaunchScript);
+        private const string ApplicationLaunchScript = """
+            set -e
+            if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi
+            export DISPLAY=:1
+            command -v -- "$1" >/dev/null || { printf 'Application is not installed: %s\n' "$1" >&2; exit 127; }
+            log=$(mktemp /tmp/desktop-app.XXXXXX.log)
+            nohup "$@" </dev/null >"$log" 2>&1 &
+            app_pid=$!
+            sleep 0.5
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+                wait "$app_pid" || { code=$?; cat "$log" >&2; exit "$code"; }
+            fi
+            printf 'Application launch accepted; log: %s\n' "$log"
+            """;
         internal static string NormalizeLinuxShellScript(string script) =>
             (script ?? "").Replace("\r", "", StringComparison.Ordinal);
 
@@ -852,6 +874,51 @@ namespace Omnipotent.Services.Projects.Containers
             return record;
         }
 
+        /// <summary>Idle computers retain installed packages, home files and settings.</summary>
+        public async Task SuspendContainerAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            if (record.Suspended) return;
+            // Persist intent first so reconciliation cannot restart an intentionally idle machine.
+            record.Suspended = true;
+            registry.Update(record);
+            try
+            {
+                await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    await docker.Containers.StopContainerAsync(record.ContainerID,
+                        new ContainerStopParameters { WaitBeforeKillSeconds = 15 }, token);
+                    return true;
+                }, TimeSpan.FromSeconds(30), "desktop suspension", ct);
+            }
+            catch
+            {
+                record.Suspended = false;
+                registry.Update(record);
+                throw;
+            }
+        }
+
+        public async Task ResumeContainerAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                var inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, token);
+                if (!inspect.State.Running)
+                    await docker.Containers.StartContainerAsync(record.ContainerID, new ContainerStartParameters(), token);
+                record.VncHostPort = await WaitForHostPortAsync(docker, record.ContainerID, token)
+                    ?? throw new InvalidOperationException("Resumed desktop has no VNC port.");
+                inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, token);
+                record.BrowserServiceHostPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0;
+                record.Suspended = false;
+                record.Lost = false;
+                record.LastUsedAt = DateTime.UtcNow;
+                registry.Update(record);
+                return true;
+            }, TimeSpan.FromSeconds(45), "desktop resume", ct);
+        }
+
         /// <summary>Stops and removes a container and forgets it in the registry.</summary>
         public async Task StopContainerAsync(string containerID, CancellationToken ct = default)
         {
@@ -929,7 +996,7 @@ namespace Omnipotent.Services.Projects.Containers
             catch (Exception ex)
             {
                 log($"ContainerOrchestrator: Docker unreachable during reconcile ({ex.Message}) — desktops unavailable until it returns.");
-                return;
+                throw; // A failed inventory must never authorize subsequent cleanup.
             }
             var docker = await GetClientAsync();
             var liveByID = live.ToDictionary(c => c.ID, c => c);
@@ -1006,6 +1073,7 @@ namespace Omnipotent.Services.Projects.Containers
                     continue;
                 }
 
+                if (record.Suspended) continue;
                 if (!string.Equals(summary.State, "running", StringComparison.OrdinalIgnoreCase))
                 {
                     try { await docker.Containers.StartContainerAsync(record.ContainerID, new ContainerStartParameters(), ct); }

@@ -16,10 +16,12 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly object gate = new();
         private List<DesktopContainerRecord> records = new();
 
-        public ContainerRegistry(Action<string> log)
+        public ContainerRegistry(Action<string> log) : this(log, OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsContainersFile)) { }
+
+        internal ContainerRegistry(Action<string> log, string registryPath)
         {
             this.log = log ?? (_ => { });
-            path = OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsContainersFile);
+            path = registryPath;
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             Load();
         }

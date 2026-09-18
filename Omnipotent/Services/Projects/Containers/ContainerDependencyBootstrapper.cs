@@ -20,13 +20,15 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly SemaphoreSlim gate = new(1, 1);
         private DateTime lastAttemptUtc = DateTime.MinValue;
         private static readonly TimeSpan AttemptCooldown = TimeSpan.FromMinutes(10);
-        private static readonly TimeSpan DaemonStartBudget = TimeSpan.FromMinutes(4);
+        private static readonly TimeSpan DaemonStartBudget = TimeSpan.FromMinutes(1);
         private static readonly TimeSpan WingetBudget = TimeSpan.FromMinutes(20);
 
         /// <summary>Human-readable state of the last bootstrap attempt, for tool results and logs.</summary>
         public string LastStatus { get; private set; } = "no bootstrap attempted yet";
         /// <summary>True while an attempt is in flight (so callers can say "in progress, retry later").</summary>
         public bool InProgress { get; private set; }
+        public string LastDiagnostics { get; private set; } = "not collected";
+        public DateTime? LastAttemptUtc => lastAttemptUtc == DateTime.MinValue ? null : lastAttemptUtc;
 
         public ContainerDependencyBootstrapper(Action<string> log)
         {
@@ -39,9 +41,15 @@ namespace Omnipotent.Services.Projects.Containers
         /// running (or within the cooldown after a failed one) return false immediately with
         /// <see cref="LastStatus"/> explaining why.
         /// </summary>
-        public async Task<bool> EnsureDaemonAsync(Func<CancellationToken, Task<string?>> probeAsync, CancellationToken ct = default)
+        public async Task<bool> EnsureDaemonAsync(Func<CancellationToken, Task<string?>> probeAsync, CancellationToken ct = default,
+            string dockerUri = "npipe://./pipe/docker_engine")
         {
-            if (await probeAsync(ct) == null) return true;
+            if (await probeAsync(ct) == null) { Status("Docker daemon is up."); return true; }
+            if (!IsLocalDesktopEndpoint(dockerUri))
+            {
+                Status($"Configured Docker endpoint {dockerUri} is unavailable. Local Docker Desktop recovery does not apply to this endpoint.");
+                return false;
+            }
 
             if (!await gate.WaitAsync(0, ct))
                 return false; // an attempt is already running; its LastStatus is current
@@ -73,7 +81,7 @@ namespace Omnipotent.Services.Projects.Containers
                 Status("Starting Docker Desktop…");
                 try
                 {
-                    Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true });
+                    Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
                 }
                 catch (Exception ex)
                 {
@@ -92,7 +100,34 @@ namespace Omnipotent.Services.Projects.Containers
                         return true;
                     }
                 }
-                Status($"Docker Desktop was started but the daemon didn't answer within {DaemonStartBudget.TotalMinutes:0} minutes — a fresh install may need WSL2 enabled, a reboot, or the first-run dialog accepted once.");
+                // Use Docker's own bounded restart command when available. Never kill unrelated
+                // WSL workloads, unregister a distro, or infer corruption from a data distro's shell.
+                string cli = Path.Combine(Path.GetDirectoryName(exe)!, "resources", "bin", "docker.exe");
+                if (File.Exists(cli))
+                {
+                    Status("Docker engine is unavailable; attempting one Docker Desktop CLI restart.");
+                    var restart = await RunProcessAsync(cli, new[] { "desktop", "restart" }, TimeSpan.FromSeconds(60), ct);
+                    if (restart.ExitCode == 0)
+                    {
+                        deadline = DateTime.UtcNow + DaemonStartBudget;
+                        while (DateTime.UtcNow < deadline)
+                        {
+                            if (await probeAsync(ct) == null)
+                            {
+                                Status("Docker daemon recovered after Desktop restart.");
+                                return true;
+                            }
+                            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                        }
+                    }
+                    LastDiagnostics = $"Docker Desktop {FileVersionInfo.GetVersionInfo(exe).FileVersion}; restart: {restart.Output}";
+                }
+                string wsl = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WSL", "wsl.exe");
+                if (!File.Exists(wsl)) wsl = Path.Combine(Environment.SystemDirectory, "wsl.exe");
+                var wslStatus = await RunProcessAsync(wsl, new[] { "--status" }, TimeSpan.FromSeconds(10), ct);
+                LastDiagnostics += $"; WSL status (exit {wslStatus.ExitCode}): {wslStatus.Output}";
+                Status("Docker engine remains unavailable after bounded recovery. " + LastDiagnostics +
+                    " Preserve Docker data. A stopped or non-shell docker-desktop-data distro does not prove corruption; do not unregister it. Check host compatibility and Docker startup logs before choosing a repair.");
                 return false;
             }
             finally
@@ -100,6 +135,46 @@ namespace Omnipotent.Services.Projects.Containers
                 InProgress = false;
                 gate.Release();
             }
+        }
+
+        internal static bool IsLocalDesktopEndpoint(string endpoint) =>
+            Uri.TryCreate(endpoint, UriKind.Absolute, out var uri)
+            && uri.Scheme == "npipe" && uri.Host is "." or "localhost"
+            && uri.AbsolutePath is "/pipe/docker_engine" or "/pipe/dockerDesktopLinuxEngine";
+
+        internal static async Task<(int ExitCode, string Output)> RunProcessAsync(
+            string executable, IEnumerable<string> arguments, TimeSpan budget, CancellationToken ct)
+        {
+            var psi = new ProcessStartInfo(executable)
+            {
+                UseShellExecute = false, CreateNoWindow = true,
+                RedirectStandardOutput = true, RedirectStandardError = true,
+            };
+            foreach (var argument in arguments) psi.ArgumentList.Add(argument);
+            try
+            {
+                using var process = Process.Start(psi) ?? throw new InvalidOperationException("Process did not start.");
+                // Drain both pipes concurrently; installers and diagnostics can fill stderr.
+                var stdout = process.StandardOutput.ReadToEndAsync();
+                var stderr = process.StandardError.ReadToEndAsync();
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(budget);
+                try
+                {
+                    await process.WaitForExitAsync(timeout.Token);
+                    await Task.WhenAll(stdout, stderr).WaitAsync(timeout.Token);
+                    string output = (await stdout + " " + await stderr).Replace("\0", "").Trim();
+                    return (process.ExitCode, output.Length > 2000 ? output[..2000] : output);
+                }
+                catch (OperationCanceledException)
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    ct.ThrowIfCancellationRequested();
+                    return (-1, $"Timed out after {budget.TotalSeconds:0}s.");
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { return (-1, ex.Message); }
         }
 
         /// <summary>Locates Docker Desktop.exe in its standard install locations.</summary>
@@ -121,63 +196,19 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task<bool> WingetInstallDockerAsync(CancellationToken ct)
         {
-            ProcessStartInfo psi = new()
+            var result = await RunProcessAsync("winget", new[]
             {
-                FileName = "winget",
-                Arguments = "install -e --id Docker.DockerDesktop --silent --disable-interactivity " +
-                            "--accept-package-agreements --accept-source-agreements",
-                UseShellExecute = false,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                CreateNoWindow = true,
-            };
-            Process proc;
-            try
-            {
-                proc = Process.Start(psi) ?? throw new InvalidOperationException("winget did not start");
-            }
-            catch (Exception ex)
-            {
-                Status($"winget is unavailable on this host ({ex.Message}) — install Docker Desktop manually from docker.com.");
-                return false;
-            }
-
-            using (proc)
-            {
-                // Stream output into the service log so the (long) install is observable.
-                var stdout = Task.Run(async () =>
-                {
-                    string? line;
-                    while ((line = await proc.StandardOutput.ReadLineAsync(ct)) != null)
-                        if (!string.IsNullOrWhiteSpace(line)) log($"winget: {line.Trim()}");
-                }, ct);
-
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeout.CancelAfter(WingetBudget);
-                try
-                {
-                    await proc.WaitForExitAsync(timeout.Token);
-                    await stdout;
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                {
-                    try { proc.Kill(entireProcessTree: true); } catch { }
-                    Status($"winget install exceeded {WingetBudget.TotalMinutes:0} minutes and was abandoned — install Docker Desktop manually.");
-                    return false;
-                }
-
-                if (proc.ExitCode != 0)
-                {
-                    // Most common cause: Omnipotent isn't elevated and the installer needs admin.
-                    Status($"winget install failed (exit {proc.ExitCode}) — likely needs elevation. Run Omnipotent as admin once, or install Docker Desktop manually.");
-                    return false;
-                }
-            }
-            return true;
+                "install", "-e", "--id", "Docker.DockerDesktop", "--silent", "--disable-interactivity",
+                "--accept-package-agreements", "--accept-source-agreements",
+            }, WingetBudget, ct);
+            if (result.ExitCode == 0) return true;
+            Status($"Docker install failed (exit {result.ExitCode}): {result.Output}");
+            return false;
         }
 
         private void Status(string s)
         {
+            if (LastStatus == s) return;
             LastStatus = s;
             log($"Desktop bootstrap: {s}");
         }

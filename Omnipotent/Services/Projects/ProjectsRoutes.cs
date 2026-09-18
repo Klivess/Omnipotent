@@ -177,6 +177,8 @@ namespace Omnipotent.Services.Projects
                     project.Status = ProjectStatus.Paused;
                     project.HaltedFromStatus = null; // individual pause overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
+                    if (parent.DiscordManager != null)
+                        await parent.DiscordManager.SyncProjectChannelAsync(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
                     // Halt the in-flight wake too, so "pause" stops work promptly rather than only
                     // preventing the NEXT wake (item 1: halt progression).
@@ -206,6 +208,8 @@ namespace Omnipotent.Services.Projects
                     project.Status = ProjectStatus.Archived;
                     project.HaltedFromStatus = null; // shelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
+                    if (parent.DiscordManager != null)
+                        await parent.DiscordManager.SyncProjectChannelAsync(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Archived);
                     parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
                     parent.SubAgentRunner.CancelProject(project.ProjectID);
@@ -234,6 +238,8 @@ namespace Omnipotent.Services.Projects
                     project.Status = ProjectStatus.Paused;
                     project.HaltedFromStatus = null; // unshelving overrides any remembered fleet-halt state
                     parent.Store.SaveProject(project);
+                    if (parent.DiscordManager != null)
+                        await parent.DiscordManager.SyncProjectChannelAsync(project);
                     parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Paused);
                     parent.EventLog.Append(new ProjectEvent
                     {
@@ -354,6 +360,8 @@ namespace Omnipotent.Services.Projects
                             ? ProjectStatus.Active : ProjectStatus.Planning;
                         project.HaltedFromStatus = null; // budget-resume overrides any remembered fleet-halt state
                         parent.Store.SaveProject(project);
+                        if (parent.DiscordManager != null)
+                            await parent.DiscordManager.SyncProjectChannelAsync(project);
                         parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
                         parent.RuntimeState.ClearBlocker(project.ProjectID);
                         changes.Add("project resumed from budget-pause");
@@ -1178,9 +1186,42 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            await parent.RegisterHttpRouteAsync("/projects/computers/health", async req =>
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computer host health");
+                try
+                {
+                    await req.ReturnResponse(Json(parent.Desktops == null
+                        ? new { available = false, reason = "Desktop subsystem is disabled." }
+                        : await parent.Desktops.GetHostHealthAsync()));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.RegisterHttpRouteAsync("/projects/computers/resume", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    string? id = (string?)ParseBody(req)?["containerID"];
+                    var record = parent.Desktops?.Registry.ForProject(project!.ProjectID)
+                        .FirstOrDefault(r => r.ContainerID == id && !r.Lost);
+                    if (record == null)
+                    {
+                        await req.ReturnResponse("Computer not found in this project.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+                    await parent.Desktops!.ResumeDesktopAsync(record.ContainerID, timeout.Token);
+                    await req.ReturnResponse(Json(new { resumed = true, record.ContainerID }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
             await parent.RegisterHttpRouteAsync("/projects/containers", async req =>
             {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computer inventory");
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
@@ -1189,7 +1230,7 @@ namespace Omnipotent.Services.Projects
                     // which an agent can use a desktop that the menu cannot discover.
                     await parent.RefreshDesktopRegistryAsync();
                     var containers = (parent.Desktops?.Registry.ForProject(project!.ProjectID) ?? new())
-                        .Select(c => new { c.ContainerID, c.AgentID, c.Width, c.Height }).ToList();
+                        .Select(c => new { c.ContainerID, c.AgentID, c.Width, c.Height, c.Lost, c.Suspended }).ToList();
                     await req.ReturnResponse(Json(containers));
                 }
                 catch (Exception ex) { await Err(req, ex); }

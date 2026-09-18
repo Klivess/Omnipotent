@@ -87,6 +87,20 @@ namespace Omnipotent.Services.Projects.Containers
 
         private readonly ContainerDependencyBootstrapper bootstrapper;
 
+        public async Task<object> GetHostHealthAsync(CancellationToken ct = default) => new
+        {
+            endpoint = orchestrator.DockerUri,
+            daemonProblem = await ProbeDaemonAsync(ct),
+            recoveryInProgress = bootstrapper.InProgress,
+            recoveryStatus = bootstrapper.LastStatus,
+            lastAttemptUtc = bootstrapper.LastAttemptUtc,
+            diagnostics = bootstrapper.LastDiagnostics,
+            computers = registry.All().Select(r => new
+            {
+                r.ContainerID, r.ProjectID, r.AgentID, r.Lost, r.Suspended, r.LastUsedAt,
+            }).ToArray(),
+        };
+
         /// <summary>One-line remedy shown to the agent/logs when the desktop layer is unusable.</summary>
         public string SetupHint =>
             $"Desktop control needs Docker running on the host ({orchestrator.DockerUri}) and the desktop image built. " +
@@ -102,7 +116,7 @@ namespace Omnipotent.Services.Projects.Containers
         /// </summary>
         public async Task<string?> TryBootstrapAsync(string imageTag, CancellationToken ct = default)
         {
-            bool daemonUp = await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct);
+            bool daemonUp = await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct, orchestrator.DockerUri);
             if (!daemonUp) return bootstrapper.LastStatus;
 
             // Only the built-in tag is owned by the shipped Docker context. A project can point at
@@ -143,7 +157,7 @@ namespace Omnipotent.Services.Projects.Containers
         // and VNC frame alone are only a framebuffer; require the actual desktop, panel, and
         // window manager so the browser appears inside a normal, human-usable environment.
         private static readonly string[] RequiredCapabilities =
-            { "display", "desktop-shell", "panel", "window-manager", "vnc", "frame", "chromium", "browser-inspect" };
+            { "display", "desktop-shell", "panel", "window-manager", "vnc", "frame" };
 
         // Chromium being installed only proves the image contains a binary. Browser work also
         // requires the visible process, its local CDP endpoint, and a tab the inspection helper
@@ -177,8 +191,7 @@ namespace Omnipotent.Services.Projects.Containers
             "tail -n 12 /tmp/chromium.log 2>/dev/null | tr '\\n' ' ' | cut -c 1-1200\n";
 
         /// <summary>
-        /// Preflight a project's human-usable desktop: self-heal Docker + the image
-        /// (rebuilding/recreating a stale container so it picks up the current baked tools), then
+        /// Preflight a project's human-usable desktop: self-heal Docker and provision new computers, then
         /// probe the visible shell and framebuffer. Browser CDP is an optional inspection aid and
         /// is deliberately not part of this gate. The result's facts
         /// are recorded by the caller so later wakes start from known-good state instead of
@@ -187,7 +200,13 @@ namespace Omnipotent.Services.Projects.Containers
         public async Task<DesktopReadiness> EnsureDesktopReadyAsync(
             Project project, string agentID, string imageTag, CancellationToken ct = default)
         {
-            string? bootstrap = await TryBootstrapAsync(imageTag, ct);
+            string? owner = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock ? null : agentID;
+            bool hasComputer = registry.ForProject(project.ProjectID).Any(r => r.AgentID == owner && !r.Lost);
+            // An existing computer must remain usable even when building a new base image fails.
+            string? bootstrap = hasComputer
+                ? (await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct, orchestrator.DockerUri)
+                    ? null : bootstrapper.LastStatus)
+                : await TryBootstrapAsync(imageTag, ct);
             if (bootstrap != null)
                 return new DesktopReadiness { Ok = false, Summary = $"Desktop not ready — {bootstrap}" };
 
@@ -201,31 +220,9 @@ namespace Omnipotent.Services.Projects.Containers
             var readiness = await ProbeReadinessAsync(record, ct);
             if (readiness.Ok) return readiness;
 
-            // A current-looking image can still have broken desktop infrastructure (partial publish
-            // context, interrupted build, or external retag). Only a base shell/VNC failure reaches
-            // this repair path; browser inspection is not part of desktop readiness.
-            log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} failed readiness; attempting one automatic image/container repair.");
-            if (!string.Equals(imageTag, ProjectSettings.Defaults.DesktopImage, StringComparison.OrdinalIgnoreCase))
-                return new DesktopReadiness
-                {
-                    Ok = false,
-                    ContainerID = record.ContainerID,
-                    ImageVersion = readiness.ImageVersion,
-                    Capabilities = readiness.Capabilities,
-                    Summary = readiness.Summary + $" The configured custom image '{imageTag}' was preserved and cannot be rebuilt from the shipped base context.",
-                };
-            string contextDir = ResolveBuildContextDirectory();
-            string? rebuild = await orchestrator.EnsureImageBuiltAsync(imageTag, contextDir,
-                "desktop.Dockerfile", forceRebuild: true, ct: ct);
-            if (rebuild != null)
-                return new DesktopReadiness
-                {
-                    Ok = false,
-                    ContainerID = record.ContainerID,
-                    ImageVersion = readiness.ImageVersion,
-                    Capabilities = readiness.Capabilities,
-                    Summary = readiness.Summary + " Automatic repair failed: " + rebuild,
-                };
+            // Repair the existing machine. Replacing it destroys apt installs and home files;
+            // a temporary VNC or daemon fault is never evidence that those files are disposable.
+            log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} failed readiness; restarting its existing container.");
 
             if (project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock &&
                 inputLock.CurrentHolder(record.ContainerID) is { } holder && holder != agentID)
@@ -238,10 +235,7 @@ namespace Omnipotent.Services.Projects.Containers
                     Summary = readiness.Summary + $" Repair is deferred while agent {holder} controls the shared desktop.",
                 };
 
-            if (transports.TryRemove(record.ContainerID, out var staleTransport)) staleTransport.Dispose();
-            if (actionGates.TryRemove(record.ContainerID, out var staleGate)) staleGate.Dispose();
-            await orchestrator.StopContainerAsync(record.ContainerID, ct);
-            record = await EnsureDesktopAsync(project, agentID, requireVisualReady: true, ct);
+            await RestartDesktopAsync(record, agentID, ct);
             var repaired = await ProbeReadinessAsync(record, ct);
             if (!repaired.Ok) return repaired;
             return new DesktopReadiness
@@ -554,6 +548,7 @@ namespace Omnipotent.Services.Projects.Containers
             var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
             DesktopContainerRecord record;
             bool created = false;
+            bool resumed = false;
             await provisionGate.WaitAsync(ct);
             try
             {
@@ -575,54 +570,37 @@ namespace Omnipotent.Services.Projects.Containers
                     await orchestrator.StopContainerAsync(duplicate.ContainerID, ct);
                 }
 
-                // A container running a now-stale image (rebuilt with newer baked tools after this
-                // container was created) is recreated so the project's long-lived desktop actually
-                // gets those tools — the /project bind mount (cookies, browser profiles, work files)
-                // survives, so only ephemeral in-container state is lost. Skipped while a *different*
-                // agent holds the shared-desktop input lock, so we never yank a desktop mid-action.
-                if (existing != null && await orchestrator.IsRecordStaleAsync(existing, ct))
+                // Image updates apply to new computers. Existing machines own their installed
+                // applications and home directories; acquisition must never erase them.
+                if (existing != null)
                 {
-                    string? holder = sharedAllocation ? inputLock.CurrentHolder(existing.ContainerID) : null;
-                    if (holder != null && holder != agentID)
+                    record = existing;
+                    if (record.Suspended)
                     {
-                        log($"Desktop {existing.ContainerID[..12]} is stale but agent {holder} holds the input lock — deferring recreation.");
-                    }
-                    else
-                    {
-                        log($"Desktop {existing.ContainerID[..12]} (project {project.ProjectID}) is running a stale image — recreating so it picks up the current desktop tools.");
-                        // Tear the container down directly rather than via DisposeDesktopAsync — the
-                        // latter also disposes this owner's provisioning gate, which we are holding.
-                        if (transports.TryRemove(existing.ContainerID, out var staleTransport)) staleTransport.Dispose();
-                        if (actionGates.TryRemove(existing.ContainerID, out var staleGate)) staleGate.Dispose();
-                        await orchestrator.StopContainerAsync(existing.ContainerID, ct); // also removes the registry record
-                        existing = null;
+                        await orchestrator.ResumeContainerAsync(record, ct);
+                        if (transports.TryRemove(record.ContainerID, out var oldTransport)) oldTransport.Dispose();
+                        resumed = true;
                     }
                 }
-
-                if (existing != null) record = existing;
                 else
                 {
                     record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, targetAgent, ct: ct);
                     created = true;
                 }
+                if (!created && DateTime.UtcNow - record.LastUsedAt > TimeSpan.FromMinutes(5))
+                {
+                    record.LastUsedAt = DateTime.UtcNow;
+                    registry.Update(record);
+                }
             }
             finally { provisionGate.Release(); }
 
-            // Stamp desktop usage so the reaper can retire desktops agents have stopped touching,
-            // independent of overall project activity. The registry write is whole-file, so persist
-            // lazily — only when the stamp advances materially — to keep continuous use from churning
-            // the file on every action. A freshly created record is already stamped at construction.
-            if (!created && DateTime.UtcNow - record.LastUsedAt > TimeSpan.FromMinutes(5))
-            {
-                record.LastUsedAt = DateTime.UtcNow;
-                registry.Update(record);
-            }
-
             if (created) NotifyDesktopChanged(record, "created");
+            else if (resumed) NotifyDesktopChanged(record, "resumed");
 
             // Readiness probing is deliberately outside the provisioning lock: a terminal call
             // may use the newly started container while a visual caller waits for Xvfb/x11vnc.
-            if (created && requireVisualReady) await WaitForDesktopReadyAsync(record, ct);
+            if ((created || resumed) && requireVisualReady) await WaitForDesktopReadyAsync(record, ct);
             return record;
         }
 
@@ -741,6 +719,72 @@ namespace Omnipotent.Services.Projects.Containers
                 if (transports.TryRemove(new KeyValuePair<string, VncTransport>(record.ContainerID, existing))) existing.Dispose();
             return transports.GetOrAdd(record.ContainerID,
                 _ => new VncTransport(vncHost, record.VncHostPort, log));
+        }
+
+        private async Task RestartDesktopAsync(DesktopContainerRecord record, string agentID, CancellationToken ct)
+        {
+            string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
+            var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
+            await provisionGate.WaitAsync(ct);
+            try
+            {
+                var actionGate = actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1));
+                if (!await actionGate.WaitAsync(0, ct))
+                    throw new InvalidOperationException("Desktop repair deferred while an action is in progress.");
+                try
+                {
+                    if (inputLock.CurrentHolder(record.ContainerID) is { } holder && holder != agentID)
+                        throw new InvalidOperationException("Desktop repair deferred while another agent controls it.");
+                    await orchestrator.SuspendContainerAsync(record, ct);
+                    await orchestrator.ResumeContainerAsync(record, ct);
+                    if (transports.TryRemove(record.ContainerID, out var transport)) transport.Dispose();
+                }
+                finally { actionGate.Release(); }
+            }
+            finally { provisionGate.Release(); }
+            await WaitForDesktopReadyAsync(record, ct);
+        }
+
+        public async Task ResumeDesktopAsync(string containerID, CancellationToken ct = default)
+        {
+            var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost)
+                ?? throw new InvalidOperationException("Computer is missing; resume cannot recreate its filesystem.");
+            string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
+            var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
+            await provisionGate.WaitAsync(ct);
+            try
+            {
+                await orchestrator.ResumeContainerAsync(record, ct);
+                if (transports.TryRemove(containerID, out var transport)) transport.Dispose();
+                NotifyDesktopChanged(record, "resumed");
+            }
+            finally { provisionGate.Release(); }
+            await WaitForDesktopReadyAsync(record, ct);
+        }
+
+        public async Task SuspendDesktopAsync(string containerID, CancellationToken ct = default)
+        {
+            var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost);
+            if (record == null || record.Suspended) return;
+            string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
+            var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
+            await provisionGate.WaitAsync(ct);
+            try
+            {
+                // An acquisition since the reaper's snapshot wins over resource cleanup.
+                if (DateTime.UtcNow - record.LastUsedAt < TimeSpan.FromMinutes(5)
+                    || inputLock.CurrentHolder(containerID) != null) return;
+                var actionGate = actionGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1));
+                if (!await actionGate.WaitAsync(0, ct)) return;
+                try
+                {
+                    await orchestrator.SuspendContainerAsync(record, ct);
+                    if (transports.TryRemove(containerID, out var transport)) transport.Dispose();
+                    NotifyDesktopChanged(record, "suspended");
+                }
+                finally { actionGate.Release(); }
+            }
+            finally { provisionGate.Release(); }
         }
 
         /// <summary>Tears down a container and its transport (agent retired / project completed).</summary>

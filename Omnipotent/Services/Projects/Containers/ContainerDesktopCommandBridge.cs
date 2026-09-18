@@ -25,8 +25,8 @@ namespace Omnipotent.Services.Projects.Containers
         {
             ["browser"] = "chromium",
             ["chromium"] = "chromium",
-            ["firefox"] = "chromium",
-            ["firefox-esr"] = "chromium",
+            ["firefox"] = "firefox-esr",
+            ["firefox-esr"] = "firefox-esr",
             ["terminal"] = "xfce4-terminal",
             ["xfce4-terminal"] = "xfce4-terminal",
         };
@@ -85,7 +85,7 @@ namespace Omnipotent.Services.Projects.Containers
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
                 (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
                 throw new InvalidOperationException("computer_navigate requires an absolute http(s) URL.");
-            // Pass the validated URL as one Docker-exec argv value. This focuses/opens Firefox in
+            // Pass the validated URL as one Docker-exec argv value. This focuses/opens Chromium in
             // one operation and avoids a fragile launch -> focus -> address-bar typing sequence.
             await LaunchAsync("browser", uri.AbsoluteUri, ct);
         }
@@ -93,12 +93,9 @@ namespace Omnipotent.Services.Projects.Containers
         public Task FocusAsync(string? titleContains, string? processName, CancellationToken ct)
         {
             string target = (processName ?? titleContains ?? "").Trim();
-            if (target.Contains("firefox", StringComparison.OrdinalIgnoreCase)
-                || target.Contains("browser", StringComparison.OrdinalIgnoreCase)
-                || target.Contains("chromium", StringComparison.OrdinalIgnoreCase)
-                || target.Contains("chrome", StringComparison.OrdinalIgnoreCase))
+            if (new[] { "browser", "chromium", "chrome", "google-chrome" }.Contains(target, StringComparer.OrdinalIgnoreCase))
                 return dockerControlAsync != null ? dockerControlAsync(ContainerDesktopControlCommand.FocusBrowser, null, ct) : LaunchAsync("browser", null, ct);
-            if (target.Contains("terminal", StringComparison.OrdinalIgnoreCase) || target.Contains("xfce", StringComparison.OrdinalIgnoreCase))
+            if (new[] { "terminal", "xfce4-terminal" }.Contains(target, StringComparer.OrdinalIgnoreCase))
                 return dockerControlAsync != null ? dockerControlAsync(ContainerDesktopControlCommand.FocusTerminal, null, ct) : LaunchAsync("terminal", null, ct);
             if (target.Length == 0) throw new InvalidOperationException("Provide titleContains or processName.");
             if (target.Length > 256 || target.Any(char.IsControl)) throw new InvalidOperationException("Window focus target is invalid.");
