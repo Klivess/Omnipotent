@@ -11,14 +11,40 @@ namespace Omnipotent.Services.Projects;
 public partial class Projects
 {
     public IncusComputerProvider? WorkerComputers { get; private set; }
+    public WorkerBootstrapper? WorkerSetup { get; private set; }
     public bool UsesWorker(string projectID) => Settings.Get(projectID).ComputerProvider == "incus";
+
+    private IncusComputerProvider RequireProjectWorker(string projectID)
+    {
+        var provider = WorkerComputers ?? throw new InvalidOperationException("Linux worker setup is not complete.");
+        ValidateWorkerIdentity(Settings.Get(projectID).ComputerWorkerIdentity, provider.Client.Identity);
+        return provider;
+    }
+
+    internal static void ValidateWorkerIdentity(string? expected, string? actual)
+    {
+        if (string.IsNullOrWhiteSpace(expected) || !string.Equals(expected, actual, StringComparison.Ordinal))
+            throw new InvalidOperationException("This project's persistent computer belongs to a different or unverified worker. Restore or migrate its data before rebinding; a replacement computer will not be created.");
+    }
 
     private void InitialiseWorker()
     {
-        var client = WorkerClient.FromEnvironment();
-        if (client != null) WorkerComputers = new IncusComputerProvider(client);
+        // An explicit remote worker remains an override. Local setup needs no env file.
+        string? explicitConfig = Environment.GetEnvironmentVariable("PROJECTS_WORKER_CONFIG");
+        if (!string.IsNullOrWhiteSpace(explicitConfig))
+            WorkerComputers = new IncusComputerProvider(WorkerClient.FromFile(explicitConfig));
+        else
+        {
+            WorkerSetup = new WorkerBootstrapper(client =>
+            {
+                WorkerComputers = new IncusComputerProvider(client);
+                Adapters.WorkerComputers = WorkerComputers;
+                Adapters.ArmAll();
+            }, message => ServiceLog(message));
+            WorkerSetup.Start();
+        }
         Files.WorkspaceBackend = pid => UsesWorker(pid)
-            ? new WorkerWorkspaceBackend(WorkerComputers?.Client ?? throw new InvalidOperationException("Linux workspace is unavailable; local fallback is forbidden")) : null;
+            ? new WorkerWorkspaceBackend(RequireProjectWorker(pid).Client) : null;
         ProjectWorkspaceLocator.IsRemote = UsesWorker;
         Adapters.Files = Files;
         Adapters.WorkerComputers = WorkerComputers;
@@ -27,7 +53,7 @@ public partial class Projects
     public async Task<JArray> ListComputersAsync(string projectID, CancellationToken ct = default)
     {
         if (UsesWorker(projectID))
-            return await (WorkerComputers ?? throw new InvalidOperationException("Linux worker is not configured")).ListAsync(projectID, ct);
+            return await RequireProjectWorker(projectID).ListAsync(projectID, ct);
         return JArray.FromObject((Desktops?.Registry.ForProject(projectID) ?? []).Select(c => new
         {
             computerID = c.ContainerID, containerID = c.ContainerID, agentID = c.AgentID, provider = "docker",
@@ -45,7 +71,7 @@ public partial class Projects
             return new CommanderToolResult("The project's Linux worker is not configured. The project has not been redirected to Docker. Files and computer identity are preserved.") { Succeeded = false };
         try
         {
-            var controller = await WorkerComputers.ForAgentAsync(project, agentID, ct);
+            var controller = await RequireProjectWorker(project.ProjectID).ForAgentAsync(project, agentID, ct);
             // Resolve only string values, preserving JSON encoding of quotes/newlines in secrets.
             var args = JObject.Parse(arguments);
             foreach (var property in args.Properties())
@@ -79,6 +105,7 @@ public partial class Projects
         var all = (JArray)await WorkerComputers.Client.SendAsync(HttpMethod.Get, "/computers");
         string? projectID = all.FirstOrDefault(c => c.Value<string>("computerID") == computerID)?.Value<string>("projectID");
         if (projectID == null || !UsesWorker(projectID)) throw new KeyNotFoundException("Computer is not active in this project");
+        _ = RequireProjectWorker(projectID);
         return projectID;
     }
 

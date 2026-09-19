@@ -35,6 +35,8 @@ internal sealed class WorkerObservationHook : IDisposable
                     }
                     else
                     {
+                        // Validate the project's bound worker before observing its screen.
+                        _ = files.WorkspaceBackend!(hook.ProjectID);
                         var records = await worker.ListAsync(hook.ProjectID, stopped.Token);
                         string agent = spec.Value<string>("agentID") ?? "commander";
                         var record = records.FirstOrDefault(c => c.Value<string>("agentID") == agent)

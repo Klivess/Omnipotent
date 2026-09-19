@@ -99,4 +99,12 @@
 		<None Update="Services\Projects\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<!-- Complete portable worker payload: shipped on both build and publish. -->
+		<Content Include="..\AgentWorker\ka_worker\**\*.py" Link="AgentWorker\ka_worker\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+		<Content Include="..\AgentWorker\tests\**\*.py" Link="AgentWorker\tests\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+		<Content Include="..\AgentWorker\deploy\*" Link="AgentWorker\deploy\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+		<Content Include="Services\Projects\Containers\browser-inspect.py" Link="AgentWorker\browser-inspect.py" TargetPath="AgentWorker\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+	</ItemGroup>
+
 </Project>

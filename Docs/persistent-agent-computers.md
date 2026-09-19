@@ -8,10 +8,18 @@ a restored production fleet.** A Linux/Incus end-to-end run, fault tests, browse
 login verification, backup restore and the production capacity soak are required
 before migration. No existing project has been switched by this change.
 
-Local validation on 2026-09-19: 104 selected .NET tests passed; 14 worker tests
-passed and three Linux-only integration tests were skipped; three Playwright
-computer tests passed; the Nuxt production build, Python compilation and shell
-syntax checks passed. The browser tests use mocked worker connections, so they
+Automatic host setup is now part of Omnipotent startup and its build/publish
+payload. It no longer requires a prepared VHDX, manually installed Incus, copied
+certificates or a `PROJECTS_WORKER_CONFIG` environment variable. Windows elevation
+and a required reboot are explicit boundaries; neither is disguised as a Docker
+timeout. The real Hyper-V first-boot path has not been executed on this development
+machine, so the implementation is not yet a production deployment verification.
+
+Local validation: 121 selected .NET tests, 15 worker tests and four Playwright
+computer tests passed (three Linux-only tests remain skipped on Windows);
+the Nuxt production build, Python compilation and shell syntax checks passed.
+An independent ISO reader verified all three generated NoCloud files, including
+a multi-sector payload. The browser tests use mocked worker connections, so they
 verify UI ownership and job reconnection contracts, not real Incus desktops.
 The new upload regression covers a lost commit response with KeepBoth and verifies
 that retry does not create another copy. These checks do not satisfy the Linux
@@ -64,11 +72,22 @@ survives. This is one host, not high availability.
 ## Interfaces and configuration
 
 `IProjectComputerProvider` has Docker and Incus implementations; existing
-`IComputerController` vocabulary remains. A project's `ComputerProvider` defaults
-to `docker`. Generic settings updates cannot change it. There is no silent
-provider fallback after cutover.
+`IComputerController` vocabulary remains. New projects explicitly select Incus
+and create their workspace on the worker. Creation waits for worker availability
+instead of creating a Docker fallback. Existing settings without a provider retain
+their legacy Docker interpretation until verified migration. Corrupt settings fail
+closed instead of reverting to Docker. Generic settings updates cannot change the
+provider.
 
-Set `PROJECTS_WORKER_CONFIG` to a protected JSON file on the Omnipotent host:
+Each Incus project also records the worker CA identity at creation/cutover. Moving
+the executable or restoring project settings onto another host cannot silently
+provision empty replacements. Restore the original worker data/identity or perform
+a verified migration before rebinding. A matching hostname/IP alone is insufficient.
+
+Local worker configuration is generated under
+`%ProgramData%/Omnipotent/AgentWorker/client.json`. To override automatic local
+provisioning with an existing remote worker, optionally set `PROJECTS_WORKER_CONFIG`
+to a protected JSON file on the Omnipotent host:
 
 ```json
 {
@@ -90,6 +109,7 @@ Owner-authenticated application routes:
 | --- | --- |
 | GET `/projects/computers?projectID=...` | Stable IDs, provider, state and queue reason |
 | GET `/projects/computers/health?projectID=...` | Worker pressure and admission diagnostics |
+| POST `/projects/computers/setup` | Owner starts Windows prerequisite setup/UAC; never reboots Windows |
 | POST `/projects/computers/request?projectID=...` | Scoped action/job submission and inspection |
 | POST `/projects/computers/activate?projectID=...` | Verified, paused-project cutover |
 | Existing `/projects/containers` and desktop WebSockets | Compatibility routing by computer ID |
@@ -118,31 +138,39 @@ worker's privileged workspace API.
 
 ## Installation and staged migration
 
-1. Run `AgentWorker/deploy/New-KAWorker.ps1 -Mode Inspect` **on the live host**.
-   During the agreed maintenance window, update Windows to a supported release,
-   enable Hyper-V prerequisites and reboot if required. Preserve existing Docker
-   disks. Never unregister `docker-desktop-data` as part of this migration.
-2. Prepare a verified Ubuntu 24.04 Gen2 VHDX with an administrative SSH key and a
-   private host-reachable network. Use `New-KAWorker.ps1 -Mode Create` with its
-   SHA-256, an existing switch and a fixed storage directory. The script refuses
-   existing VM/disk paths and insufficient memory headroom. It configures static
-   memory, automatic startup and graceful shutdown. Use 6 GiB/3 vCPU for the pilot;
-   production starts at 40 GiB/12 vCPU on the upgraded 64 GB/eight-core platform.
-   No script forces an unsupported Windows upgrade or reboots the physical host.
-3. Identify the **new, empty** data VHDX inside the worker, format it as Btrfs and
-   mount it at `/srv/ka` by UUID. This deliberate disk-identification step is not
-   automated against a guessed `/dev/sdX`. Keep OS and computer data disks separate.
-4. Copy `AgentWorker` to the worker and run `deploy/install-worker.sh` as root.
-   It installs Incus, bounded swap, firewall rules and service units without
-   formatting storage. Containers cannot reach sibling NICs, the Windows LAN or
-   worker management services. Verify those rules before admitting computers.
-5. Run `WORKER_ADDRESS=<private-IP> deploy/create-certificates.sh`. Transfer only
-   the host API identity to protected Windows configuration. Pin a verified
-   Debian 12 Incus image fingerprint, then run `deploy/build-computer.sh`. This
-   creates a candidate with a package inventory and leaves the build instance
-   intact. Pin the resulting immutable fingerprint in `/etc/ka/broker.json`
-   using `broker.example.json`; placeholders are rejected on startup. Enable
-   `ka-broker.service` after configuration is complete.
+1. Start a complete Omnipotent build on the intended host during maintenance. The
+   Computers page displays automatic setup state. If Omnipotent already has admin
+   permission, prerequisites install automatically. Otherwise use **Set up computer
+   host** and accept Windows elevation. Hyper-V/OpenSSH are enabled without
+   an automatic reboot. After a required reboot, a protected SYSTEM task resumes
+   setup even if Omnipotent has not reopened. No WSL or Docker installation is used.
+2. `Ensure-KAWorker.ps1` selects an internal NTFS/ReFS volume with at least 100 GiB
+   free, downloads the Ubuntu 24.04 `release-20260911` Azure VHD archive and verifies
+   SHA-256 `bcf5f2e60e55b3eb0eb57201fd57c0e34ced8b2dd1cdf4718084f41854786195`
+   from [Canonical's release checksums](https://cloud-images.ubuntu.com/releases/noble/release-20260911/SHA256SUMS).
+   It resumes partial downloads, quarantines checksum failures and converts the
+   verified image to VHDX. A private internal Hyper-V switch/NAT and static address
+   are provisioned automatically; conflicting networks are reported, not replaced.
+3. A native ISO writer creates the NoCloud seed with a pinned SSH host identity,
+   key-only bootstrap account and worker payload. The marked VM uses Secure Boot,
+   fixed memory (6 GiB pilot; 40 GiB on a 64 GiB host), automatic startup and graceful
+   shutdown. Its data disk is attached at a recorded SCSI location. Linux accepts
+   only an unpartitioned, signature-free disk at that location with the expected
+   size, labels it uniquely, formats Btrfs and mounts by UUID. Existing disks and
+   running VMs are never replaced to retry installation.
+4. A Linux systemd timer installs Incus and the desktop image, creates certificates,
+   pins base/result image fingerprints and records packages. Windows retrieves only
+   its API identity over pinned SSH. The application user can read configuration;
+   installer code/state are writable only by SYSTEM/administrators. Host backing
+   disk telemetry is required for new admissions, since guest free space alone is
+   insufficient with thin VHDX storage.
+5. Before returning credentials, first boot runs the Linux unit tests and a
+   disposable computer smoke check: sudo, a persistent file/shortcut, graphical
+   editor, screenshot and durable terminal completion. Tests use stable operation
+   IDs on retries. The canary is retained for inspection. These are first-install
+   checks, not substitutes for the fault/restore/72-hour production gates below.
+   `New-KAWorker.ps1` remains an expert diagnostic/manual provisioning tool, not a
+   required step of normal portable setup.
 6. On a separate backup disk, initialize an encrypted restic repository. Supply
    `RESTIC_REPOSITORY` and `RESTIC_PASSWORD_FILE` in `/etc/ka/backup.env`; enable
    `ka-backup.timer`. A backup snapshots each project subvolume separately, exports

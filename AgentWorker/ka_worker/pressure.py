@@ -2,8 +2,24 @@
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import time
+import json
 
 MIB = 1024 * 1024
+
+
+def host_headroom(path):
+    """Thin VHDX guest free space must not conceal exhausted Windows storage."""
+    if not path:
+        return None
+    try:
+        status = json.loads(Path(path).read_text())
+        if time.time() - status['sampled'] > 300:
+            return 'Waiting for current host storage telemetry; existing computers are preserved'
+        if status['freeBytes'] < 10 * 1024 ** 3:
+            return 'Waiting for free space on the Windows disk backing computer storage'
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'Waiting for host storage telemetry; existing computers are preserved'
+    return None
 
 
 @dataclass

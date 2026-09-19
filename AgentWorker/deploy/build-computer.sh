@@ -5,9 +5,12 @@ set -euo pipefail
 [[ "$BASE_IMAGE_FINGERPRINT" =~ ^[a-f0-9]{64}$ ]] || exit 2
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$root/build"
-name="ka-image-build-$(date +%s)"
-incus init "$BASE_IMAGE_FINGERPRINT" "$name" -s ka -c security.privileged=false
-incus start "$name"
+name="ka-image-build-v1"
+incus info "$name" >/dev/null 2>&1 || incus init "$BASE_IMAGE_FINGERPRINT" "$name" -s ka -n ka-computers -c security.privileged=false
+if [[ -z "$(incus config device get "$name" eth0 network 2>/dev/null)" ]]; then
+  incus config device add "$name" eth0 nic network=ka-computers name=eth0
+fi
+if [[ "$(incus list "$name" --format csv -c s)" != RUNNING ]]; then incus start "$name"; fi
 incus exec "$name" -- bash -euxo pipefail -c '
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -25,7 +28,9 @@ dpkg-query -W > /etc/ka/packages.lock
 apt-get clean
 '
 incus file push -r "$root/ka_worker" "$name/opt/ka/"
-incus file push "$root/../Omnipotent/Services/Projects/Containers/browser-inspect.py" "$name/opt/ka/browser-inspect.py"
+helper="$root/browser-inspect.py"
+[[ -f "$helper" ]] || helper="$root/../Omnipotent/Services/Projects/Containers/browser-inspect.py"
+incus file push "$helper" "$name/opt/ka/browser-inspect.py"
 incus file push "$root/deploy/ka-session.service" "$name/etc/systemd/system/ka-session.service"
 incus file push "$root/deploy/ka-desktop.service" "$name/etc/systemd/system/ka-desktop.service"
 incus file push "$root/deploy/ka-desktop" "$name/usr/local/bin/ka-desktop" --mode=0755

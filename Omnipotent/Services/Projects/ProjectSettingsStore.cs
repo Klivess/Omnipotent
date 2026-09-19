@@ -94,9 +94,14 @@ namespace Omnipotent.Services.Projects
                     try
                     {
                         var s = JsonConvert.DeserializeObject<ProjectSettings>(File.ReadAllText(path));
-                        if (s != null) { s.ProjectID = projectID; s.NormalizeRoutes(); return s; }
+                        if (s == null || s.ComputerProvider is not ("docker" or "incus"))
+                            throw new InvalidDataException("Project computer provider is missing or invalid; routing is paused.");
+                        s.ProjectID = projectID; s.NormalizeRoutes(); return s;
                     }
-                    catch { }
+                    catch (JsonException ex)
+                    {
+                        throw new InvalidDataException("Project settings could not be read. Existing settings are preserved; provider fallback is forbidden.", ex);
+                    }
                 }
             }
             // No per-project file yet — inherit the system defaults (stamped with this project's ID).

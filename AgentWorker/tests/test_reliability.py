@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from ka_worker.state import State, public_operation
-from ka_worker.pressure import Admission, Pressure, MIB
+from ka_worker.pressure import Admission, Pressure, MIB, host_headroom
 from ka_worker.broker import Broker
 from ka_worker.session import Session
 from ka_worker.workspace import Workspace
@@ -82,6 +82,17 @@ class DurableOperations(unittest.TestCase):
 
 
 class ResourceAdmission(unittest.TestCase):
+    def test_thin_disk_admission_checks_actual_host_capacity_and_freshness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'host.json'
+            self.assertIsNotNone(host_headroom(path))
+            path.write_text(json.dumps({'sampled': time.time(), 'freeBytes': 2 * 1024 ** 3}))
+            self.assertIsNotNone(host_headroom(path))
+            path.write_text(json.dumps({'sampled': time.time() - 600, 'freeBytes': 80 * 1024 ** 3}))
+            self.assertIsNotNone(host_headroom(path))
+            path.write_text(json.dumps({'sampled': time.time(), 'freeBytes': 80 * 1024 ** 3}))
+            self.assertIsNone(host_headroom(path))
+
     def pressure(self, available=8192, full=0, swap_free=8192, age=0):
         return Pressure(available * MIB, 16384 * MIB, swap_free * MIB, 8192 * MIB, full, time.time() - age)
 

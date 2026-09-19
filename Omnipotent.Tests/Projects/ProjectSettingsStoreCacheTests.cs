@@ -19,6 +19,20 @@ namespace Omnipotent.Tests.Projects
         private static string NewProjectId() => "test_" + Guid.NewGuid().ToString("N");
 
         [Fact]
+        public void CorruptMigratedSettingsCannotFallBackToDocker()
+        {
+            var store = new ProjectSettingsStore();
+            string pid = NewProjectId();
+            var settings = store.EnsureCreated(pid);
+            settings.ComputerProvider = "incus";
+            store.Save(settings);
+            string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "Settings", pid + ".settings.json");
+            File.WriteAllText(path, "{interrupted write");
+            Assert.Throws<InvalidDataException>(() => store.Get(pid));
+            Assert.Equal("{interrupted write", File.ReadAllText(path));
+        }
+
+        [Fact]
         public void Get_NotesADependency_SoTheFillIsCacheableAtAll()
         {
             var store = new ProjectSettingsStore();

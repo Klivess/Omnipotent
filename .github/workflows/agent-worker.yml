@@ -13,4 +13,4 @@ jobs:
         working-directory: AgentWorker
         run: python3 -m unittest discover -s tests -v
       - name: Shell syntax
-        run: bash -n AgentWorker/deploy/*.sh AgentWorker/deploy/ka-desktop
+        run: for file in AgentWorker/deploy/*.sh AgentWorker/deploy/ka-desktop; do bash -n "$file" || exit; done

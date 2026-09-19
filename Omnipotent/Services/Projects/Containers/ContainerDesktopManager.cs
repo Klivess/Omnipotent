@@ -92,7 +92,9 @@ namespace Omnipotent.Services.Projects.Containers
             endpoint = orchestrator.DockerUri,
             daemonProblem = await ProbeDaemonAsync(ct),
             recoveryInProgress = bootstrapper.InProgress,
-            recoveryStatus = bootstrapper.LastStatus,
+            recoveryStatus = Environment.GetEnvironmentVariable("PROJECTS_LEGACY_DOCKER_AUTOSTART") == "true"
+                ? bootstrapper.LastStatus
+                : "Legacy Docker restarts are disabled. Persistent Linux worker setup is managed separately; existing Docker disks are preserved.",
             lastAttemptUtc = bootstrapper.LastAttemptUtc,
             diagnostics = bootstrapper.LastDiagnostics,
             computers = registry.All().Select(r => new

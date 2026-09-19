@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 from .http import serve
 from .incus import Incus
-from .pressure import Admission, Pressure
+from .pressure import Admission, Pressure, host_headroom
 from .state import State, identifier, public_operation
 from .workspace import Workspace
 
@@ -74,6 +74,22 @@ class Broker:
             self.state.submit(op_id, "start", {"computerID": computer_id})
             return record
 
+    def ensure_workspace(self, project):
+        project = identifier(project)
+        with self.lock:
+            root = Path(self.config["projects_root"]) / project
+            if root.is_symlink():
+                raise ValueError("Workspace root cannot be a symlink")
+            if not root.exists():
+                subprocess.run(["btrfs", "subvolume", "create", str(root)], check=True, capture_output=True, timeout=30)
+                os.chown(root, 1000, 1000)
+            for folder in ("inputs", "shared", "work", "outputs"):
+                path = root / folder
+                if not path.exists():
+                    path.mkdir()
+                    os.chown(path, 1000, 1000)
+        return {"projectID": project, "ready": True}
+
     def tick(self):
         pressure = Pressure.read()
         self.state.setting("pressure", pressure.json())
@@ -86,7 +102,7 @@ class Broker:
                 continue
             record = self.state.computer(op["request"]["computerID"])
             if op["state"] == "queued":
-                reason = self.admission.reason(pressure, pending)
+                reason = self.admission.reason(pressure, pending) or host_headroom(self.config.get("host_pressure_file"))
                 if self.config.get("projects_root") and shutil.disk_usage(self.config["projects_root"]).free < 5 * 1024 ** 3:
                     reason = "Waiting for disk headroom; no existing computer will be removed"
                 if reason:
@@ -129,13 +145,8 @@ class Broker:
             self.state.save_computer(record)
         instance = self.incus.instance(name)
         if instance is None:
+            self.ensure_workspace(record["projectID"])
             root = Path(self.config["projects_root"]) / record["projectID"]
-            if not root.exists():
-                subprocess.run(["btrfs", "subvolume", "create", str(root)], check=True, capture_output=True, timeout=30)
-                os.chown(root, 1000, 1000)
-                for folder in ("inputs", "shared", "work", "outputs"):
-                    (root / folder).mkdir()
-                    os.chown(root / folder, 1000, 1000)
             created = self.incus.request("POST", "/1.0/instances", {
                 "name": name, "type": "container", "profiles": [],
                 "source": {"type": "image", "fingerprint": self.config["image_fingerprint"]},
@@ -227,7 +238,7 @@ class Broker:
         if path == "/health" and method == "GET":
             try:
                 pressure = Pressure.read()
-                reason = self.admission.reason(pressure)
+                reason = self.admission.reason(pressure) or host_headroom(self.config.get("host_pressure_file"))
                 return 200, {"available": True, "provider": "incus", "pressure": pressure.json(), "admissionReason": reason,
                              "queued": len(self.state.list(["queued"])), "computers": len(self.state.computers()),
                              "schedulerError": self.state.setting("schedulerError")}
@@ -274,6 +285,8 @@ class Broker:
             return 200, self.session(computer, method, target, body if method != "GET" else None, query)
         if len(parts) == 3 and parts[0] == "workspaces":
             project = identifier(parts[1])
+            if parts[2] == "ensure" and method == "POST":
+                return 200, self.ensure_workspace(project)
             if parts[2] == "verify-migration" and method == "POST":
                 files = body["files"]
                 if not isinstance(files, list) or not files:

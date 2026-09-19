@@ -931,6 +931,16 @@ namespace Omnipotent.Services.Projects
 
             creator ??= new ProjectFileActor(ProjectFileActorType.User, "klives", "Klives");
             string projectID = Guid.NewGuid().ToString("N");
+            if (WorkerComputers == null)
+                throw new Computers.ComputerPendingException(WorkerSetup?.Status().Value<string>("reason")
+                    ?? "Project storage is waiting for the Linux worker. No Docker fallback will be created.");
+            // New projects always start on authoritative Linux storage. Old projects retain
+            // their explicit provider until verified migration; defaults cannot migrate them.
+            await WorkerComputers.Client.SendAsync(HttpMethod.Post, "/workspaces/" + projectID + "/ensure", new { });
+            var initialSettings = Settings.Get(projectID);
+            initialSettings.ComputerProvider = "incus";
+            initialSettings.ComputerWorkerIdentity = WorkerComputers.Client.Identity;
+            Settings.Save(initialSettings);
             ProjectFileCommitResult? initialFiles = null;
             Project p;
             try

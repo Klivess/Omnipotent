@@ -11,12 +11,19 @@ namespace Omnipotent.Services.Projects.Computers;
 public sealed class WorkerClient : IDisposable
 {
     private readonly HttpClient http;
-    public WorkerClient(HttpClient http) => this.http = http;
+    public string? Identity { get; }
+    public WorkerClient(HttpClient http, string? identity = null) { this.http = http; Identity = identity; }
 
     public static WorkerClient? FromEnvironment()
     {
         string? path = Environment.GetEnvironmentVariable("PROJECTS_WORKER_CONFIG");
-        if (string.IsNullOrWhiteSpace(path)) return null;
+        if (string.IsNullOrWhiteSpace(path)) path = WorkerBootstrapper.DefaultConfigPath;
+        if (!File.Exists(path)) return null;
+        return FromFile(path);
+    }
+
+    public static WorkerClient FromFile(string path)
+    {
         var config = JObject.Parse(File.ReadAllText(path));
         var uri = new Uri(config.Value<string>("endpoint") ?? throw new InvalidOperationException("Worker endpoint required"));
         if (uri.Scheme != "https") throw new InvalidOperationException("Worker endpoint must use HTTPS");
@@ -36,7 +43,7 @@ public sealed class WorkerClient : IDisposable
             chain.ChainPolicy.ApplicationPolicy.Add(new System.Security.Cryptography.Oid("1.3.6.1.5.5.7.3.1"));
             return chain.Build(certificate);
         };
-        return new WorkerClient(new HttpClient(handler) { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(40) });
+        return new WorkerClient(new HttpClient(handler) { BaseAddress = uri, Timeout = TimeSpan.FromSeconds(40) }, ca.GetCertHashString(System.Security.Cryptography.HashAlgorithmName.SHA256));
     }
 
     public async Task<JToken> SendAsync(HttpMethod method, string path, object? body = null, CancellationToken ct = default)

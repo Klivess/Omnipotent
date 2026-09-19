@@ -200,6 +200,7 @@ namespace Omnipotent.Services.Projects
         public bool ContainersEnabled { get; set; } = Defaults.ContainersEnabled;
         // Set only by the verified migration path, never by generic settings patches.
         public string ComputerProvider { get; set; } = "docker";
+        public string? ComputerWorkerIdentity { get; set; }
         public bool DesktopFirstWebsiteInteraction { get; set; } = Defaults.DesktopFirstWebsiteInteraction;
         public string DesktopImage { get; set; } = Defaults.DesktopImage;
         public int ComputerActionSettleMs { get; set; } = Defaults.ComputerActionSettleMs;

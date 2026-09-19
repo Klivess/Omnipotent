@@ -1195,13 +1195,15 @@ namespace Omnipotent.Services.Projects
                     if (projectID != null && parent.UsesWorker(projectID))
                     {
                         await req.ReturnResponse(Json(parent.WorkerComputers == null
-                            ? new { available = false, reason = "Linux worker is not configured." }
+                            ? new { available = false, reason = parent.WorkerSetup?.Status().Value<string>("reason") ?? "Configured Linux worker is unavailable.", workerSetup = parent.WorkerSetup?.Status() }
                             : await parent.WorkerComputers.HealthAsync()));
                         return;
                     }
-                    await req.ReturnResponse(Json(parent.Desktops == null
+                    var hostHealth = JObject.FromObject(parent.Desktops == null
                         ? new { available = false, reason = "Desktop subsystem is disabled." }
-                        : await parent.Desktops.GetHostHealthAsync()));
+                        : await parent.Desktops.GetHostHealthAsync());
+                    hostHealth["workerSetup"] = parent.WorkerSetup?.Status();
+                    await req.ReturnResponse(Json(hostHealth));
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -1246,6 +1248,17 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
 
+            await parent.RegisterHttpRouteAsync("/projects/computers/setup", async req =>
+            {
+                try
+                {
+                    if (parent.WorkerSetup == null) throw new InvalidOperationException("This host uses an explicitly configured worker.");
+                    parent.WorkerSetup.RequestPrerequisiteSetup();
+                    await req.ReturnResponse(Json(new { started = true, reason = "Windows may show an administrator prompt on the host. Setup never reboots the host automatically." }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             await parent.RegisterHttpRouteAsync("/projects/computers/activate", async req =>
             {
                 try
@@ -1265,6 +1278,7 @@ namespace Omnipotent.Services.Projects
                     _ = new Computers.WorkerWorkspaceBackend(worker.Client).List(project.ProjectID, "", true);
                     var settings = parent.Settings.Get(project.ProjectID);
                     settings.ComputerProvider = "incus";
+                    settings.ComputerWorkerIdentity = parent.WorkerComputers.Client.Identity;
                     parent.Settings.Save(settings);
                     parent.Adapters.ArmAll();
                     await req.ReturnResponse(Json(new { activated = true, provider = "incus", remainsPaused = true, legacyDataRetained = true }));
