@@ -75,6 +75,8 @@ namespace Omnipotent.Services.Projects.Stimulus
         public ContainerDesktopManager? Desktops { get; set; }
         public ProjectStore? Projects { get; set; }
         public ProjectArtifactStore? Artifacts { get; set; }
+        public ProjectFileStore? Files { get; set; }
+        public Computers.IncusComputerProvider? WorkerComputers { get; set; }
 
         /// <summary>Subscribe-to-inbound-mail factory (set by the service when KliveMail is up). Returns an unsubscribe token.</summary>
         public Func<Func<InboundMailStimulus, Task>, IDisposable>? MailSource { get; set; }
@@ -180,6 +182,11 @@ namespace Omnipotent.Services.Projects.Stimulus
         // ── file-watch ──
         private IDisposable ArmFileWatch(StimulusHookRecord hook)
         {
+            if (Files?.IsRemote(hook.ProjectID) == true && WorkerComputers != null)
+            {
+                armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, "Watching authoritative Linux project files.");
+                return new WorkerObservationHook(hook, bus, Files, WorkerComputers, Artifacts, false, log);
+            }
             var spec = ParseSpec(hook.SourceSpecJson);
             string requestedPath = spec["path"]?.Value<string>() ?? "";
             if (string.IsNullOrWhiteSpace(requestedPath))
@@ -295,6 +302,11 @@ namespace Omnipotent.Services.Projects.Stimulus
         // ── screen-diff (pixel-diff gate over a container desktop, §5.3) ──
         private IDisposable ArmScreenDiff(StimulusHookRecord hook)
         {
+            if (Files?.IsRemote(hook.ProjectID) == true && WorkerComputers != null)
+            {
+                armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, "Watching the persistent Linux computer.");
+                return new WorkerObservationHook(hook, bus, Files, WorkerComputers, Artifacts, true, log);
+            }
             if (Desktops == null || Projects == null || Artifacts == null || !OperatingSystem.IsWindows())
                 return SetArm(hook, HookArmState.Error, "Desktop subsystem unavailable — screen-diff cannot observe.");
             armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, "Watching a container desktop for changes.");

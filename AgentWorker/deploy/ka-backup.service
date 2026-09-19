@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up persistent KA computers
+RequiresMountsFor=/srv/ka /mnt/ka-backups
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/ka/backup.env
+ExecStart=/opt/ka/deploy/backup.sh
+Nice=15
+IOSchedulingClass=idle

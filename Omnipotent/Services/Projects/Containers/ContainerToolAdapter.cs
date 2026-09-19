@@ -82,7 +82,7 @@ namespace Omnipotent.Services.Projects.Containers
         /// now reuses the foreground tab, and anything blank, duplicated or cold beyond this cap is
         /// closed automatically.
         /// </summary>
-        internal const int MaxBrowserTabs = 6;
+        internal const int MaxBrowserTabs = 0; // Never automatically close working tabs.
 
         public ComputerCapabilities Capabilities { get; } = new()
         {
@@ -184,7 +184,7 @@ namespace Omnipotent.Services.Projects.Containers
                 doc?.Dispose();
                 return ContainerToolResult.Fail(
                     $"Another action on this desktop has been running for over {visualGateWait.TotalSeconds:0}s and still holds it. "
-                    + "The desktop is wedged rather than busy — do not queue more desktop actions behind it; "
+                    + "The previous action may still be running under load. Do not repeat it; "
                     + "use a non-desktop tool, or report the host as degraded.",
                     ContainerToolFailureKind.Contention);
             }

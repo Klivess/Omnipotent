@@ -13,7 +13,7 @@ namespace Omnipotent.Services.Projects;
 /// remain ordinary files so containers and CLI tools can use them; SQLite supplies provenance,
 /// paging, upload sessions and an audit trail. Direct filesystem changes are reconciled as Unknown.
 /// </summary>
-public sealed class ProjectFileStore
+public sealed partial class ProjectFileStore
 {
     private static readonly string[] ScaffoldDirectories = ["inputs", "shared", "work", "outputs"];
     private static readonly HashSet<string> UnixTextExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -265,6 +265,8 @@ public sealed class ProjectFileStore
         ProjectFileActor actor,
         ProjectFileCommitOptions? commitOptions = null)
     {
+        if (Backend(projectID) != null) return CommitWorkerUpload(sessionID, projectID, actor, commitOptions);
+
         ValidateProjectID(projectID);
         _ = SessionDirectory(sessionID);
         commitOptions ??= new ProjectFileCommitOptions();
@@ -577,6 +579,8 @@ public sealed class ProjectFileStore
 
     public void EnsureProjectScaffold(string projectID)
     {
+        if (Backend(projectID) is { } worker) { foreach (var path in ScaffoldDirectories) worker.Mutate(projectID, "mkdir", path); return; }
+
         ValidateProjectID(projectID);
         var gate = Gate("project:" + projectID);
         gate.Wait();
@@ -601,8 +605,8 @@ public sealed class ProjectFileStore
         var all = LoadEntries(projectID);
         // Managed implementation metadata remains available by explicit path, but it is not
         // project work and should not consume/default-pollute root list_files results.
-        if (directory.Equals(".klive", StringComparison.OrdinalIgnoreCase)
-            || directory.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase))
+        if (!IsRemote(projectID) && (directory.Equals(".klive", StringComparison.OrdinalIgnoreCase)
+            || directory.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase)))
             all.AddRange(LoadManagedMetadataEntries(projectID));
         string prefix = directory.Length == 0 ? "" : directory + "/";
         IEnumerable<ProjectFileEntry> filtered = all.Where(entry =>
@@ -631,8 +635,8 @@ public sealed class ProjectFileStore
     {
         string normalized = NormalizeProjectPath(projectID, path, allowManagedMetadata: true);
         if (reconcile) Reconcile(projectID);
-        if (normalized.Equals(".klive", StringComparison.OrdinalIgnoreCase) ||
-            normalized.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase))
+        if (!IsRemote(projectID) && (normalized.Equals(".klive", StringComparison.OrdinalIgnoreCase) ||
+            normalized.StartsWith(".klive/", StringComparison.OrdinalIgnoreCase)))
             return LoadManagedMetadataEntries(projectID).FirstOrDefault(x =>
                 string.Equals(x.Path, normalized, StringComparison.OrdinalIgnoreCase));
         using var connection = OpenConnection();
@@ -641,6 +645,8 @@ public sealed class ProjectFileStore
 
     public FileStream OpenRead(string projectID, string path)
     {
+        if (Backend(projectID) is { } worker) return worker.ExportRead(projectID, NormalizeProjectPath(projectID, path, allowManagedMetadata: true));
+
         string physical = ResolvePhysicalPath(projectID, path, allowManagedMetadata: true);
         if (!File.Exists(physical)) throw new FileNotFoundException("Project file not found.", path);
         return new FileStream(physical, FileMode.Open, FileAccess.Read, FileShare.Read, 128 * 1024,
@@ -649,6 +655,8 @@ public sealed class ProjectFileStore
 
     public string GetPhysicalFilePath(string projectID, string path)
     {
+        if (IsRemote(projectID)) throw new ProjectFileException("This workspace lives on Linux. Use OpenRead for an explicit export, or computer_terminal for /project files.");
+
         string physical = ResolvePhysicalPath(projectID, path, allowManagedMetadata: true);
         if (!File.Exists(physical)) throw new FileNotFoundException("Project file not found.", path);
         return physical;
@@ -681,6 +689,8 @@ public sealed class ProjectFileStore
 
     public async Task<ProjectFileEntry> WriteTextAsync(string projectID, string path, string content, ProjectFileActor actor, CancellationToken ct = default)
     {
+        if (Backend(projectID) != null) return WriteWorker(projectID, path, content, actor);
+
         string normalized = NormalizeProjectPath(projectID, path);
         string normalizedContent = NormalizeUnixText(normalized, content ?? "");
         byte[] bytes = Encoding.UTF8.GetBytes(normalizedContent);
@@ -737,6 +747,8 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry CreateDirectory(string projectID, string path, ProjectFileActor actor)
     {
+        if (Backend(projectID) is { } worker) { worker.Mutate(projectID, "mkdir", NormalizeProjectPath(projectID, path)); return AttributeWorker(projectID, NormalizeProjectPath(projectID, path), actor, ProjectFileOperation.CreateDirectory); }
+
         string normalized = NormalizeProjectPath(projectID, path);
         var gate = Gate("project:" + projectID);
         gate.Wait();
@@ -766,6 +778,8 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry Move(string projectID, string sourcePath, string destinationPath, ProjectFileActor actor)
     {
+        if (Backend(projectID) is { } worker) { worker.Mutate(projectID, "move", NormalizeProjectPath(projectID, sourcePath), NormalizeProjectPath(projectID, destinationPath)); return AttributeWorker(projectID, NormalizeProjectPath(projectID, destinationPath), actor, ProjectFileOperation.Move); }
+
         string source = NormalizeProjectPath(projectID, sourcePath);
         string destination = NormalizeProjectPath(projectID, destinationPath);
         var gate = Gate("project:" + projectID);
@@ -822,6 +836,8 @@ public sealed class ProjectFileStore
 
     public ProjectFileEntry Copy(string projectID, string sourcePath, string destinationPath, ProjectFileActor actor)
     {
+        if (Backend(projectID) is { } worker) { worker.Mutate(projectID, "copy", NormalizeProjectPath(projectID, sourcePath), NormalizeProjectPath(projectID, destinationPath)); return AttributeWorker(projectID, NormalizeProjectPath(projectID, destinationPath), actor, ProjectFileOperation.Copy); }
+
         string source = NormalizeProjectPath(projectID, sourcePath);
         string destination = NormalizeProjectPath(projectID, destinationPath);
         var gate = Gate("project:" + projectID);
@@ -895,6 +911,8 @@ public sealed class ProjectFileStore
 
     public bool Delete(string projectID, string path, bool recursive, ProjectFileActor actor)
     {
+        if (Backend(projectID) is { } worker) { worker.Mutate(projectID, "delete", NormalizeProjectPath(projectID, path), recursive: recursive); Reconcile(projectID); return true; }
+
         string normalized = NormalizeProjectPath(projectID, path);
         var gate = Gate("project:" + projectID);
         gate.Wait();
@@ -1122,6 +1140,7 @@ public sealed class ProjectFileStore
         bool allowManagedMetadata = false)
     {
         ValidateProjectID(projectID);
+        if (IsRemote(projectID)) return NormalizeRelativePath(ProjectWorkspaceLocator.NormalizeRelative(path), allowRoot, allowManagedMetadata);
         string supplied = (path ?? "").Trim();
         if (Path.IsPathRooted(supplied))
         {
@@ -1224,6 +1243,8 @@ public sealed class ProjectFileStore
 
     private ProjectFileReconcileResult ReconcileCore(string projectID)
     {
+        if (Backend(projectID) is { } worker) return ReconcileWorker(projectID, worker);
+
         string root = EnsureProjectRoot(projectID);
         EnsureNoReparsePoints(root, root);
         var current = new Dictionary<string, (ProjectFileKind kind, long size, DateTime modified)>(StringComparer.OrdinalIgnoreCase);
@@ -1295,6 +1316,8 @@ public sealed class ProjectFileStore
 
     private void GenerateManifest(string projectID)
     {
+        if (IsRemote(projectID)) return; // Metadata remains in SQLite; never create a stale Windows manifest.
+
         try
         {
             string root = EnsureProjectRoot(projectID);
@@ -1581,6 +1604,8 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_session ON upload_items(session_id,p
 
     private string ResolvePhysicalPath(string projectID, string path, bool allowMissingLeaf = false, bool allowManagedMetadata = false)
     {
+        if (IsRemote(projectID)) throw new ProjectFileException("Remote workspace requires the worker API, not a Windows filesystem path.");
+
         ValidateProjectID(projectID);
         string normalized = NormalizeProjectPath(projectID, path, allowManagedMetadata: allowManagedMetadata);
         string root = EnsureProjectRoot(projectID);
@@ -1656,6 +1681,8 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_session ON upload_items(session_id,p
 
     private string EnsureProjectRoot(string projectID)
     {
+        if (IsRemote(projectID)) throw new ProjectFileException("Remote workspace root is /project on the Linux computer.");
+
         string root = ProjectRoot(projectID);
         Directory.CreateDirectory(root);
         return root;

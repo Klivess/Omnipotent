@@ -116,6 +116,12 @@ namespace Omnipotent.Services.Projects.Containers
         /// </summary>
         public async Task<string?> TryBootstrapAsync(string imageTag, CancellationToken ct = default)
         {
+            if (!string.Equals(Environment.GetEnvironmentVariable("PROJECTS_LEGACY_DOCKER_AUTOSTART"), "true", StringComparison.OrdinalIgnoreCase))
+            {
+                var existingProblem = await orchestrator.ProbeDaemonAsync(ct);
+                if (existingProblem != null)
+                    return existingProblem + " Legacy host auto-restarts are disabled; queued computer work must wait for the managed worker migration.";
+            }
             bool daemonUp = await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct, orchestrator.DockerUri);
             if (!daemonUp) return bootstrapper.LastStatus;
 

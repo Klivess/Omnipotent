@@ -1,0 +1,9 @@
+{
+  "listen": "10.78.0.2", "port": 7443, "peer_name": "ka-api",
+  "state": "/srv/ka/state", "projects_root": "/srv/ka/projects",
+  "ca": "/etc/ka/ca.pem", "ca_key": "/etc/ka/ca-key.pem",
+  "cert": "/etc/ka/ka-worker.pem", "key": "/etc/ka/ka-worker-key.pem",
+  "session_client_cert": "/etc/ka/ka-broker.pem", "session_client_key": "/etc/ka/ka-broker-key.pem",
+  "pool": "ka", "image_fingerprint": "REPLACE_WITH_TESTED_64_CHARACTER_IMAGE_FINGERPRINT",
+  "reserve_bytes": 1073741824, "start_bytes": 1610612736, "subnet_prefix": "10.77.0."
+}

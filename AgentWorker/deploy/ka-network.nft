@@ -1,0 +1,15 @@
+table inet ka_isolation {
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname "ka-computers" ct state established,related accept
+    iifname "ka-computers" udp dport { 53, 67 } accept
+    iifname "ka-computers" tcp dport 53 accept
+    iifname "ka-computers" drop
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    iifname "ka-computers" ct state established,related accept
+    iifname "ka-computers" ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 127.0.0.0/8 } drop
+    iifname "ka-computers" meta nfproto ipv6 drop
+  }
+}

@@ -198,7 +198,7 @@ public static class ProjectToolFacade
             }),
 
         ("desktop",
-            "Inspect and operate the agent's isolated Linux desktop. OCR, window state and input operations remain usable by text-only agents; screenshot is offered only when raw image input is enabled.",
+            "Operate your persistent Linux computer: install apps with sudo in terminal, launch them, use desktop icons and native dialogs. Linux worker commands return durable operation/job IDs: queued or running means wait and inspect that ID, not rerun. Slow responses do not justify restarting the computer or host. OCR and input remain available to text-only agents; screenshots require image input.",
             new[]
             {
                 ("ensure_ready", "ensure_desktop_ready"),

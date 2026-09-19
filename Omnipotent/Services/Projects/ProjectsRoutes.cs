@@ -1191,6 +1191,14 @@ namespace Omnipotent.Services.Projects
                 Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computer host health");
                 try
                 {
+                    string? projectID = req.userParameters["projectID"];
+                    if (projectID != null && parent.UsesWorker(projectID))
+                    {
+                        await req.ReturnResponse(Json(parent.WorkerComputers == null
+                            ? new { available = false, reason = "Linux worker is not configured." }
+                            : await parent.WorkerComputers.HealthAsync()));
+                        return;
+                    }
                     await req.ReturnResponse(Json(parent.Desktops == null
                         ? new { available = false, reason = "Desktop subsystem is disabled." }
                         : await parent.Desktops.GetHostHealthAsync()));
@@ -1204,6 +1212,15 @@ namespace Omnipotent.Services.Projects
                 {
                     if (!RequireProject(req, out var project)) return;
                     string? id = (string?)ParseBody(req)?["containerID"];
+                    if (parent.UsesWorker(project!.ProjectID))
+                    {
+                        var records = await parent.ListComputersAsync(project.ProjectID);
+                        var computer = records.FirstOrDefault(c => c.Value<string>("computerID") == id);
+                        if (computer == null) throw new KeyNotFoundException("Computer not found in this project");
+                        await req.ReturnResponse(Json(await parent.WorkerComputers!.Client.SendAsync(HttpMethod.Post,
+                            "/computers/ensure", new { projectID = project.ProjectID, agentID = computer.Value<string>("agentID") })));
+                        return;
+                    }
                     var record = parent.Desktops?.Registry.ForProject(project!.ProjectID)
                         .FirstOrDefault(r => r.ContainerID == id && !r.Lost);
                     if (record == null)
@@ -1218,6 +1235,69 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            await parent.RegisterHttpRouteAsync("/projects/computers", async req =>
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computers");
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    await req.ReturnResponse(Json(await parent.ListComputersAsync(project!.ProjectID)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
+            await parent.RegisterHttpRouteAsync("/projects/computers/activate", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    if (project!.Status != ProjectStatus.Paused || !string.IsNullOrWhiteSpace(parent.Digests.GetDigest(project.ProjectID).ActiveWakeID))
+                        throw new InvalidOperationException("Pause the project and wait for its active wake to end before cutover.");
+                    var worker = parent.WorkerComputers ?? throw new InvalidOperationException("Worker is not configured");
+                    var receipt = await worker.Client.SendAsync(HttpMethod.Get, "/migrations/" + Computers.WorkerClient.Segment(project.ProjectID));
+                    if (receipt.Value<bool?>("verified") != true) throw new InvalidOperationException("Workspace migration has not been verified");
+                    var body = ParseBody(req) ?? new JObject();
+                    if (body.Value<bool?>("canaryVerified") != true)
+                        throw new InvalidOperationException("Verify the canary desktop, terminal, staged files and browser login before cutover.");
+                    if ((await worker.HealthAsync()).Value<bool?>("available") != true)
+                        throw new InvalidOperationException("Worker is not available");
+                    // Verify workspace access before the final atomic settings write. No fallback on failure.
+                    _ = new Computers.WorkerWorkspaceBackend(worker.Client).List(project.ProjectID, "", true);
+                    var settings = parent.Settings.Get(project.ProjectID);
+                    settings.ComputerProvider = "incus";
+                    parent.Settings.Save(settings);
+                    parent.Adapters.ArmAll();
+                    await req.ReturnResponse(Json(new { activated = true, provider = "incus", remainsPaused = true, legacyDataRetained = true }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Owner-only terminal/control front door. Computer ownership and suffix allow-list
+            // are checked here; browsers never receive worker credentials or raw Incus access.
+            await parent.RegisterHttpRouteAsync("/projects/computers/request", async req =>
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Computer operation");
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    var body = ParseBody(req) ?? new JObject();
+                    string id = body.Value<string>("computerID") ?? "";
+                    string target = body.Value<string>("target") ?? "";
+                    string verb = body.Value<string>("method") ?? "GET";
+                    if (!parent.UsesWorker(project!.ProjectID) || parent.WorkerComputers == null)
+                        throw new InvalidOperationException("This computer uses the legacy provider");
+                    if (!(await parent.ListComputersAsync(project.ProjectID)).Any(c => c.Value<string>("computerID") == id))
+                        throw new KeyNotFoundException("Computer does not belong to this project");
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(target, @"^(health|jobs|actions|operations/[A-Za-z0-9_-]+|jobs/[A-Za-z0-9_-]+(?:/input)?)$")
+                        || verb is not ("GET" or "POST")) throw new ArgumentException("Unsupported computer request");
+                    string route = Computers.WorkerClient.ComputerPath(project.ProjectID, id, target);
+                    if (body.Value<long?>("cursor") is long cursor) route += "&cursor=" + Math.Max(0, cursor);
+                    await req.ReturnResponse(Json(await parent.WorkerComputers.Client.SendAsync(new HttpMethod(verb), route,
+                        verb == "GET" ? null : body["payload"] ?? new JObject())));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
             await parent.RegisterHttpRouteAsync("/projects/containers", async req =>
             {
@@ -1225,6 +1305,11 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
+                    if (parent.UsesWorker(project!.ProjectID))
+                    {
+                        await req.ReturnResponse(Json(await parent.ListComputersAsync(project.ProjectID)));
+                        return;
+                    }
                     // Never serve the persisted pre-startup snapshot. This also adopts a surviving
                     // labelled Docker desktop whose registry entry was lost, which is the state in
                     // which an agent can use a desktop that the menu cannot discover.

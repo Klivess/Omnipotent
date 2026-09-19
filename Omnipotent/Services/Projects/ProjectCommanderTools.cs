@@ -1497,6 +1497,7 @@ namespace Omnipotent.Services.Projects
                     string replyTo = ((string?)a["replyTo"] ?? "").Trim();
                     bool isHtml = (bool?)a["html"] ?? false;
                     var attachmentPaths = new List<string>();
+                    using var exports = new Computers.ProjectFileExportScope(Files, project.ProjectID);
                     if (a["attachments"] is JArray attachmentList)
                     {
                         if (Files == null && attachmentList.Count > 0)
@@ -1507,7 +1508,7 @@ namespace Omnipotent.Services.Projects
                             if (relative.Length == 0) continue;
                             try
                             {
-                                attachmentPaths.Add(Files!.GetPhysicalFilePath(project.ProjectID, relative));
+                                attachmentPaths.Add(exports.Resolve(relative));
                             }
                             catch (Exception ex)
                             {
@@ -1766,7 +1767,7 @@ namespace Omnipotent.Services.Projects
                     try
                     {
                         string relative = ProjectWorkspaceLocator.NormalizeRelative(project.ProjectID, supplied);
-                        string host = ProjectWorkspaceLocator.HostPath(project.ProjectID, relative);
+                        string host = Files.IsRemote(project.ProjectID) ? "(Linux worker: use /project or file export)" : ProjectWorkspaceLocator.HostPath(project.ProjectID, relative);
                         string container = ProjectWorkspaceLocator.ContainerPath(relative);
                         var entry = relative.Length == 0 ? null : Files.Stat(project.ProjectID, relative);
                         var sb = new StringBuilder()
@@ -2902,6 +2903,7 @@ namespace Omnipotent.Services.Projects
 
         private string VolumeRoot()
         {
+            if (Files?.IsRemote(project.ProjectID) == true) return "/project";
             string dir = ProjectWorkspaceLocator.HostRoot(project.ProjectID);
             Directory.CreateDirectory(dir);
             return Path.GetFullPath(dir);
@@ -2909,6 +2911,7 @@ namespace Omnipotent.Services.Projects
 
         private (string? path, string? error) ResolveHostWorkingDirectory(string? requested)
         {
+            if (Files?.IsRemote(project.ProjectID) == true) return (null, "This project uses Linux-native storage. Run commands with computer_terminal, or explicitly export files before using host tools.");
             string relative = (requested ?? "").Trim().Replace('\\', '/');
             if (relative.Length == 0 || relative == "/project") return (VolumeRoot(), null);
             if (relative.StartsWith("/project/", StringComparison.Ordinal)) relative = relative[9..];

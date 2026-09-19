@@ -500,7 +500,14 @@ namespace Omnipotent.Services.ComputerControl
             {
                 function = new HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = parameters }
             };
-            object Obj(object properties, params string[] required) => new { type = "object", properties, required };
+            object Obj(object properties, params string[] required)
+            {
+                var fields = JsonSerializer.Deserialize<Dictionary<string, object>>(JsonSerializer.Serialize(properties))!;
+                fields["operationID"] = Str("Linux worker: stable operation ID. Reuse only to inspect/reconnect to the same operation, never for a different action.");
+                fields["inspectOperation"] = new { type = "boolean", description = "Linux worker: inspect the saved operationID without performing the action again." };
+                fields["waitSeconds"] = Num("Linux worker: wait for up to 25 seconds for a result. Ending the wait does not cancel work.");
+                return new { type = "object", properties = fields, required };
+            }
             object Str(string description) => new { type = "string", description };
             object Num(string description) => new { type = "integer", description };
             var stringArray = new { type = "array", items = new { type = "string" } };
@@ -538,7 +545,13 @@ namespace Omnipotent.Services.ComputerControl
                         command = Str("Bash command to run inside the desktop container."),
                         workingDirectory = Str("Optional absolute directory under /project or /home/agent; default /project."),
                         timeoutSeconds = Num("Timeout from 1 to 900 seconds; default 120."),
-                    }, "command")));
+                        jobID = Str("Linux worker: inspect an existing job instead of starting another command."),
+                        cursor = Num("Linux worker: byte cursor from the previous output response."),
+                        input = Str("Linux worker: text to send to the selected job's PTY, including newline when needed."),
+                        interactive = new { type = "boolean", description = "Linux worker: start an interactive Bash session." },
+                        heavy = new { type = "boolean", description = "Linux worker: queue a resource-intensive job until memory headroom is available." },
+                        cancel = new { type = "boolean", description = "Explicitly cancel the selected job. A timeout never cancels automatically." },
+                    })));
             return all.Where(t => capabilities.Supports(t.function.name)).ToList();
         }
     }
