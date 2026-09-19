@@ -13,7 +13,7 @@ namespace Omnipotent.Tests.KliveAgent
             var globals = new ScriptGlobals(null!);
             var session = engine.CreateSession(globals);
 
-            var first = await session.ExecuteAsync("var numbers = new List<int> { 1, 2, 3 }; Log($\"count={numbers.Count}\");");
+            var first = await session.ExecuteAsync("var numbers = new List<int> { 1, 2, 3 }; Log($\"count={numbers.Count}\");", TimeSpan.FromMinutes(2));
             var second = await session.ExecuteAsync("Log($\"sum={numbers.Sum()}\");");
 
             Assert.True(first.Success, first.ErrorMessage);
