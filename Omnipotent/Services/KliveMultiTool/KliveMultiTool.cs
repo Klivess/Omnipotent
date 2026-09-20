@@ -298,18 +298,28 @@ namespace Omnipotent.Services.KliveMultiTool
         {
             var args = new List<object?>();
 
-            foreach (var param in descriptor.MethodParameters)
+            for (int i = 0; i < descriptor.MethodParameters.Length; i++)
             {
-                var kvp = inputs.FirstOrDefault(k => k.Key.Equals(param.Name, StringComparison.OrdinalIgnoreCase));
-                string? rawValue = kvp.Value;
+                var methodParam = descriptor.MethodParameters[i];
+                var param = descriptor.Parameters[i]; // public name + declared default (merged in BuildToolParameter)
+
+                string? rawValue = inputs.FirstOrDefault(k => k.Key.Equals(param.Name, StringComparison.OrdinalIgnoreCase)).Value;
 
                 if (rawValue == null)
                 {
-                    args.Add(param.HasDefaultValue ? param.DefaultValue : GetTypeDefault(param.ParameterType));
+                    // Missing input: honour the declared [KliveParam] default (param.DefaultValue), then
+                    // the C# default. Previously this loop keyed on the raw C# method-parameter name
+                    // instead of the public name the /tools metadata and the missing-required check expose,
+                    // so an input sent under a [KliveParam(DisplayName=...)] name was silently dropped and
+                    // the declared default ignored. Strictly additive: with no DisplayName override and no
+                    // declared default (every shipped tool), behavior is identical.
+                    args.Add(param.DefaultValue != null
+                        ? ConvertToType(param.DefaultValue, methodParam.ParameterType)
+                        : (methodParam.HasDefaultValue ? methodParam.DefaultValue : GetTypeDefault(methodParam.ParameterType)));
                     continue;
                 }
 
-                args.Add(ConvertToType(rawValue, param.ParameterType));
+                args.Add(ConvertToType(rawValue, methodParam.ParameterType));
             }
 
             var invoked = descriptor.MethodInfo.Invoke(descriptor.OwnerTool, args.ToArray());
