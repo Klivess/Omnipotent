@@ -48,7 +48,10 @@ if not existing.exists():
  if len(candidates)!=1: raise RuntimeError('Dedicated LUN 1 data disk is missing or ambiguous')
  d=candidates[0]; disk='/dev/'+d['name']
  if d.get('children') or d.get('fstype') or any(d.get('mountpoints') or []): raise RuntimeError('Data disk is not empty; refusing format')
- if run('wipefs','--no-act','--noheadings','-o','TYPE',disk): raise RuntimeError('Existing disk signature; refusing format')
+ # Ubuntu 24.04's wipefs does not implement lsblk's --output option. Its
+ # no-act output is empty for a blank disk and lists every detected signature
+ # otherwise, which is exactly the conservative ownership check needed here.
+ if run('wipefs','--no-act',disk): raise RuntimeError('Existing disk signature; refusing format')
  subprocess.run(['mkfs.btrfs','-L',label,disk],check=True)
  subprocess.run(['udevadm','settle'],check=True)
  if not existing.exists(): raise RuntimeError('Formatted disk identity unavailable')
@@ -77,11 +80,11 @@ status image 'Building the persistent desktop image; this can take several minut
 if ! incus image info ka-base-debian12 >/dev/null 2>&1; then
     incus image copy images:debian/12/amd64 local: --alias ka-base-debian12
 fi
-incus image info ka-base-debian12 --format json > /etc/ka/base-image.lock.json
+incus image list --format json | python3 -c 'import json,sys; xs=json.load(sys.stdin); print(json.dumps(next(x for x in xs if any(a.get("name")=="ka-base-debian12" for a in x.get("aliases",[])))))' > /etc/ka/base-image.lock.json
 export BASE_IMAGE_FINGERPRINT
 BASE_IMAGE_FINGERPRINT=$(python3 -c 'import json;print(json.load(open("/etc/ka/base-image.lock.json"))["fingerprint"])')
 if ! incus image info ka-computer-candidate >/dev/null 2>&1; then bash "$root/deploy/build-computer.sh"; fi
-incus image info ka-computer-candidate --format json > /etc/ka/computer-image.lock.json
+incus image list --format json | python3 -c 'import json,sys; xs=json.load(sys.stdin); print(json.dumps(next(x for x in xs if any(a.get("name")=="ka-computer-candidate" for a in x.get("aliases",[])))))' > /etc/ka/computer-image.lock.json
 status testing 'Running Linux storage, operation and terminal tests'
 (cd "$root" && python3 -m unittest discover -s tests -v) > /var/lib/ka-bootstrap/tests.log 2>&1
 python3 - "$root/deploy/broker.example.json" <<'PY'

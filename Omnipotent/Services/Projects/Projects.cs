@@ -499,6 +499,13 @@ namespace Omnipotent.Services.Projects
             // scaffold on demand; this best-effort sweep is housekeeping only.
             QueueSharedFileScaffoldRefresh();
 
+            // Worker provisioning and reconciliation are independent of project wake
+            // recovery and optional integrations. Start them as soon as the API and
+            // durable stores exist so a slow directive/mail recovery cannot leave all
+            // computers reporting "disabled" for hours after an application restart.
+            try { InitialiseWorker(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: worker init failed (non-fatal)"); }
+
             // Crash recovery: clear any wake left active by a restart (rehydrate-on-wake safe).
             try { CommanderRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted wakes"); }
@@ -3187,7 +3194,8 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
-                InitialiseWorker();
+                if (WorkerSetup == null && WorkerComputers == null)
+                    InitialiseWorker();
                 if (!OperatingSystem.IsWindows())
                 {
                     ServiceLog("Projects: desktop containers are only wired for the Windows host build (frame encoding uses System.Drawing).");

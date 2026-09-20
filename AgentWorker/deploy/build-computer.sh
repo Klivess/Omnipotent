@@ -38,5 +38,5 @@ incus exec "$name" -- systemctl enable ka-session.service
 # The GUI is started on demand. No browser runs in the template.
 incus stop "$name" --timeout 120
 incus publish "$name" --alias ka-computer-candidate
-incus image info ka-computer-candidate --format json > "$root/build/computer-image.json"
+incus image list --format json | python3 -c 'import json,sys; xs=json.load(sys.stdin); print(json.dumps(next(x for x in xs if any(a.get("name")=="ka-computer-candidate" for a in x.get("aliases",[])))))' > "$root/build/computer-image.json"
 printf '%s\n' "Candidate created. Pin its fingerprint in broker.json only after acceptance tests. Build instance retained: $name"

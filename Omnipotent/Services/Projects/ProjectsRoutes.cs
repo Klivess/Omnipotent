@@ -1259,6 +1259,25 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, KMPermissions.Klives);
 
+            await parent.RegisterHttpRouteAsync("/projects/computers/migrate", async req =>
+            {
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    if (project!.Status != ProjectStatus.Paused || !string.IsNullOrWhiteSpace(parent.Digests.GetDigest(project.ProjectID).ActiveWakeID))
+                        throw new InvalidOperationException("Pause the project and wait for its active wake to end before migration.");
+                    if (parent.UsesWorker(project.ProjectID))
+                        throw new InvalidOperationException("This project already uses the Linux worker.");
+                    var body = ParseBody(req) ?? new JObject();
+                    if (body.Value<bool?>("offlineSource") != true)
+                        throw new InvalidOperationException("Confirm that the legacy computer is offline before migration.");
+                    // The migration is resumable and hash-checked. Do not bind it to the
+                    // HTTP wait: disconnecting a browser must not abandon a verified copy.
+                    await req.ReturnResponse(Json(await parent.MigrateLocalWorkspaceAsync(project.ProjectID)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
             await parent.RegisterHttpRouteAsync("/projects/computers/activate", async req =>
             {
                 try

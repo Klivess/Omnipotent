@@ -55,7 +55,12 @@ class Admission:
     def reason(self, pressure, pending_bytes=0):
         if time.time() - pressure.sampled > 30:
             return "Waiting for fresh worker memory telemetry"
-        if pressure.memory_full_avg10 >= 5:
+        # Hyper-V guests can retain a high PSI full average after boot/image
+        # creation even when most guest memory is available and swap is idle.
+        # Treat PSI as an admission blocker only when usable headroom is also
+        # tight; otherwise a healthy worker can remain queued indefinitely.
+        if (pressure.memory_full_avg10 >= 5 and
+                pressure.available - pending_bytes < self.reserve + self.start):
             return "Waiting for memory pressure to subside; existing work is preserved"
         if pressure.swap_total and pressure.swap_free < pressure.swap_total // 2:
             return "Waiting for swap usage to recover; existing work is preserved"
