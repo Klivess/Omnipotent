@@ -88,7 +88,6 @@ namespace Omnipotent.Services.MemeScraper
                     {
                         try
                         {
-                            InstagramReel reel = new();
                             await Task.Delay(2500);
                             var body = await network.GetResponseBody(new GetResponseBodyCommandSettings
                             {
@@ -101,6 +100,7 @@ namespace Omnipotent.Services.MemeScraper
                                 counter++;
                                 try
                                 {
+                                    InstagramReel reel = new(); // M2 (2026-09-20): fresh object per reel. The single allocation that lived OUTSIDE this loop was shared across iterations, so every reels.Add(reel) appended the same reference and the ShortCode dedup below collapsed an N-reel response to its last reel.
                                     reel.PostID = item.post_id;
                                     reel.OwnerUsername = item.owner.username;
                                     reel.OwnerID = item.owner.id;
