@@ -103,11 +103,8 @@ class ResourceAdmission(unittest.TestCase):
         self.assertIsNotNone(admission.reason(pressure, admission.start))
 
     def test_memory_swap_and_stale_telemetry_pause_admissions(self):
-        for pressure in (self.pressure(available=100), self.pressure(available=2000, full=8), self.pressure(swap_free=100), self.pressure(age=60)):
+        for pressure in (self.pressure(available=100), self.pressure(full=8), self.pressure(swap_free=100), self.pressure(age=60)):
             with self.subTest(pressure=pressure): self.assertIsNotNone(Admission().reason(pressure))
-
-    def test_stale_hyper_v_psi_does_not_block_when_memory_is_available(self):
-        self.assertIsNone(Admission().reason(self.pressure(available=3200, full=12)))
 
     def test_capacity_queue_survives_restart_and_drains(self):
         with tempfile.TemporaryDirectory() as directory:

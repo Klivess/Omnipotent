@@ -32,21 +32,7 @@ public sealed class WorkerBootstrapper
         try
         {
             string file = Path.Combine(root, "setup.json");
-            if (File.Exists(file))
-            {
-                using var reader = new Newtonsoft.Json.JsonTextReader(new StringReader(File.ReadAllText(file)))
-                { DateParseHandling = Newtonsoft.Json.DateParseHandling.None };
-                var status = JObject.Load(reader);
-                if (DateTimeOffset.TryParse(status.Value<string>("updated"), out var updated)
-                    && DateTimeOffset.UtcNow - updated > TimeSpan.FromMinutes(15)
-                    && status.Value<string>("state") is "enabling_hyperv" or "starting")
-                {
-                    status["lastReportedState"] = status["state"]?.DeepClone();
-                    status["state"] = "setup_progress_unknown";
-                    status["reason"] = "Windows setup has not reported progress for over 15 minutes. The worker is not ready. Inspect installer and Windows servicing status; elapsed time alone does not justify restarting or replacing computers.";
-                }
-                return status;
-            }
+            if (File.Exists(file)) return JObject.Parse(File.ReadAllText(file));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Newtonsoft.Json.JsonException)
         { return new JObject { ["state"] = "status_unavailable", ["reason"] = "Worker setup state could not be read. Existing state is preserved." }; }

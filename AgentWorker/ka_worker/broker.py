@@ -27,9 +27,6 @@ class Broker:
         self.state = State(config["state"])
         self.incus = Incus(config.get("incus_socket", "/var/lib/incus/unix.socket"))
         self.workspace = Workspace(config["projects_root"])
-        # Incus maps container uid/gid 0 to the first root subid (1000000 on
-        # the managed worker), so the agent's uid/gid 1000 maps to 1001000.
-        self.project_host_uid = int(config.get("project_host_uid", 1001000))
         self.admission = Admission(config.get("reserve_bytes", 1024 ** 3), config.get("start_bytes", 1536 * 1024 ** 2))
         self.context = ssl.create_default_context(cafile=config["ca"])
         self.context.load_cert_chain(config["session_client_cert"], config["session_client_key"])
@@ -85,12 +82,12 @@ class Broker:
                 raise ValueError("Workspace root cannot be a symlink")
             if not root.exists():
                 subprocess.run(["btrfs", "subvolume", "create", str(root)], check=True, capture_output=True, timeout=30)
-                os.chown(root, self.project_host_uid, self.project_host_uid)
+                os.chown(root, 1000, 1000)
             for folder in ("inputs", "shared", "work", "outputs"):
                 path = root / folder
                 if not path.exists():
                     path.mkdir()
-                    os.chown(path, self.project_host_uid, self.project_host_uid)
+                    os.chown(path, 1000, 1000)
         return {"projectID": project, "ready": True}
 
     def tick(self):
@@ -153,14 +150,14 @@ class Broker:
             created = self.incus.request("POST", "/1.0/instances", {
                 "name": name, "type": "container", "profiles": [],
                 "source": {"type": "image", "fingerprint": self.config["image_fingerprint"]},
-                "config": {"security.privileged": "false",
+                "config": {"security.privileged": "false", "security.idmap.isolated": "true",
                            "boot.autostart": "true", "limits.cpu.priority": "5", "limits.disk.priority": "5",
                            "user.ka.project": record["projectID"], "user.ka.agent": record["agentID"],
                            "raw.lxc": "lxc.cgroup2.memory.high=3221225472\nlxc.cgroup2.memory.oom.group=1"},
                 "devices": {"root": {"type": "disk", "pool": self.config["pool"], "path": "/"},
                             "eth0": {"type": "nic", "network": "ka-computers", "name": "eth0", "ipv4.address": record["address"],
                                      "security.ipv4_filtering": "true", "security.mac_filtering": "true", "security.port_isolation": "true"},
-                            "project": {"type": "disk", "source": str(root), "path": "/project"}}})
+                            "project": {"type": "disk", "source": str(root), "path": "/project", "shift": "true"}}})
             record.update(state="provisioning", incusOperation=created["operation"])
             self.state.save_computer(record)
             return False

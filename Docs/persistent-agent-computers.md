@@ -2,37 +2,35 @@
 
 ## Deployment status
 
-The portable installer completed its first live worker deployment on
-`KLIVESHOMESERVE` on 2026-09-20. It enabled Hyper-V, created the private worker
-network, materialized the pinned Ubuntu 24.04 image, attached a dedicated Btrfs
-data disk, installed Incus, built the desktop image, issued private mTLS
-identities and returned authenticated worker configuration to Windows. The old
-Docker/WSL disks were not unregistered or modified.
+The replacement backend, worker/session services, workspace integration, UI and
+deployment tools are implemented in the working trees. **This is not a report of
+a restored production fleet.** A Linux/Incus end-to-end run, fault tests, browser
+login verification, backup restore and the production capacity soak are required
+before migration. No existing project has been switched by this change.
 
-A disposable unprivileged computer passed the live installation gate: a durable
-terminal command used container-local `sudo`, wrote a persistent project file,
-created a desktop shortcut, launched a graphical editor, exposed its window and
-returned a screenshot. The worker and canary survived an independent worker
-reboot, and the normal broker reconciled the existing computer afterward.
+Automatic host setup is now part of Omnipotent startup and its build/publish
+payload. It no longer requires a prepared VHDX, manually installed Incus, copied
+certificates or a `PROJECTS_WORKER_CONFIG` environment variable. Windows elevation
+and a required reboot are explicit boundaries; neither is disguised as a Docker
+timeout. The real Hyper-V first-boot path has not been executed on this development
+machine, so the implementation is not yet a production deployment verification.
 
-The live pilot host has about 16 GB RAM and four older physical CPU cores. Its
-worker is deliberately allocated 4 GiB and three vCPUs. This validates portable
-setup and functional computer control; it does not satisfy the required
-12-browser/72-hour production capacity gate. That gate still requires the planned
-64 GB, eight-modern-core host and a measured soak. Additional requests queue when
-this pilot lacks headroom.
+Local validation: 121 selected .NET tests, 15 worker tests and four Playwright
+computer tests passed (three Linux-only tests remain skipped on Windows);
+the Nuxt production build, Python compilation and shell syntax checks passed.
+An independent ISO reader verified all three generated NoCloud files, including
+a multi-sector payload. The browser tests use mocked worker connections, so they
+verify UI ownership and job reconnection contracts, not real Incus desktops.
+The new upload regression covers a lost commit response with KeepBoth and verifies
+that retry does not create another copy. These checks do not satisfy the Linux
+fault, restore, native application or 12-computer/72-hour release gates below.
 
-The Incus version on this host cannot use shifted Btrfs disk mounts. Project
-containers therefore share the worker's standard unprivileged UID map while the
-broker exposes only the requesting project's Btrfs subvolume. Containers remain
-unprivileged and receive no Windows, worker-administration or other-project
-mounts.
+Live telemetry checked on 2026-09-19 still reports Docker unavailable on
+`KLIVESHOMESERVE`, Windows build 19042, approximately 16 GB RAM and an i5-3570.
+The live diagnostics include `WSL_E_OS_NOT_SUPPORTED`. The development computer
+is a different Windows 11 computer with 32 GB RAM; it has neither Hyper-V
+management nor a WSL distribution installed. Do not provision the wrong host.
 
-Local validation covers 19 worker reliability tests (three Linux-only skips on
-Windows), the worker bootstrap build, PowerShell parsing and repository diff
-checks. The live smoke test covers the real Incus desktop path. Backup restoration,
-12-computer load, 72-hour soak and full production browser-login verification
-remain release gates and are not inferred from the smoke test.
 ## Runtime and persistence
 
 Windows Omnipotent -> mutually authenticated HTTPS -> Linux worker broker ->
@@ -112,7 +110,6 @@ Owner-authenticated application routes:
 | GET `/projects/computers?projectID=...` | Stable IDs, provider, state and queue reason |
 | GET `/projects/computers/health?projectID=...` | Worker pressure and admission diagnostics |
 | POST `/projects/computers/setup` | Owner starts Windows prerequisite setup/UAC; never reboots Windows |
-| POST `/projects/computers/migrate?projectID=...` | Offline, hash-verified workspace backup and resumable copy |
 | POST `/projects/computers/request?projectID=...` | Scoped action/job submission and inspection |
 | POST `/projects/computers/activate?projectID=...` | Verified, paused-project cutover |
 | Existing `/projects/containers` and desktop WebSockets | Compatibility routing by computer ID |
@@ -156,7 +153,7 @@ worker's privileged workspace API.
    are provisioned automatically; conflicting networks are reported, not replaced.
 3. A native ISO writer creates the NoCloud seed with a pinned SSH host identity,
    key-only bootstrap account and worker payload. The marked VM uses Secure Boot,
-   fixed memory (4 GiB pilot; 40 GiB on a 64 GiB host), automatic startup and graceful
+   fixed memory (6 GiB pilot; 40 GiB on a 64 GiB host), automatic startup and graceful
    shutdown. Its data disk is attached at a recorded SCSI location. Linux accepts
    only an unpartitioned, signature-free disk at that location with the expected
    size, labels it uniquely, formats Btrfs and mounts by UUID. Existing disks and
