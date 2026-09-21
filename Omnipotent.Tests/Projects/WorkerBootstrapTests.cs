@@ -1,4 +1,6 @@
 using Omnipotent.Services.Projects.Computers;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 
 namespace Omnipotent.Tests.Projects;
 
@@ -22,6 +24,32 @@ public sealed class WorkerBootstrapTests : IDisposable
         Assert.Equal("image", bootstrap.Status().Value<string>("state"));
         Assert.Equal(state, File.ReadAllText(Path.Combine(root, "setup.json")));
         Assert.Equal("preserve VM identity", File.ReadAllText(Path.Combine(root, "owner.json")));
+    }
+
+    [Fact]
+    public void PublicOnlyWorkerCaDoesNotRequireItsPrivateKey()
+    {
+        using var caKey = RSA.Create(2048);
+        var caRequest = new CertificateRequest("CN=worker-ca", caKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        caRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, false, 0, true));
+        using var ca = caRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+        using var clientKey = RSA.Create(2048);
+        var clientRequest = new CertificateRequest("CN=ka-api", clientKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var client = clientRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+        string caPath = Path.Combine(root, "ca.pem");
+        string certPath = Path.Combine(root, "client.pem");
+        string keyPath = Path.Combine(root, "client-key.pem");
+        File.WriteAllText(caPath, ca.ExportCertificatePem());
+        File.WriteAllText(certPath, client.ExportCertificatePem());
+        File.WriteAllText(keyPath, clientKey.ExportPkcs8PrivateKeyPem());
+        string config = Path.Combine(root, "client.json");
+        File.WriteAllText(config, Newtonsoft.Json.JsonConvert.SerializeObject(new
+        {
+            endpoint = "https://127.0.0.1:7443", ca = caPath, cert = certPath, key = keyPath,
+        }));
+
+        using var worker = WorkerClient.FromFile(config);
+        Assert.NotNull(worker.Identity);
     }
 
     [Fact]
