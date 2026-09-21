@@ -380,7 +380,7 @@ public static class ProjectToolFacade
         string allowed = string.Join(", ", group.Members.Select(m => m.Op).Distinct(StringComparer.Ordinal));
         string? op = args["op"]?.Type == JTokenType.String ? args["op"]!.Value<string>()?.Trim() : null;
 
-        UnwrapOpNamedPayload(group, args, op, warnings);
+        UnwrapOpNamedPayload(args, op, warnings);
 
         if (string.IsNullOrEmpty(op))
         {
@@ -419,7 +419,7 @@ public static class ProjectToolFacade
     /// rejecting it: the intent is unambiguous, and the rejection previously cost several turns and
     /// counted toward the loop guard.
     /// </summary>
-    private static void UnwrapOpNamedPayload(FoldGroup group, JObject args, string? op, List<string> warnings)
+    private static void UnwrapOpNamedPayload(JObject args, string? op, List<string> warnings)
     {
         foreach (var property in args.Properties().ToList())
         {
@@ -442,16 +442,9 @@ public static class ProjectToolFacade
             {
                 // {op:"find_text", find_text:"x"} — the value belongs to the op's own primary
                 // argument. Resolved against the member schema in NormalizeArgumentsForMember.
-                bool opDeclaresArg = group.Members.Any(m =>
-                    string.Equals(m.Op, op, StringComparison.OrdinalIgnoreCase) &&
-                    canonicalSchemas.Value.TryGetValue(m.CanonicalTool, out var s2) &&
-                    (s2["properties"] as JObject)?.Property(property.Name, StringComparison.OrdinalIgnoreCase) != null);
-                if (!opDeclaresArg)
-                {
-                    args["__opValue"] = property.Value.DeepClone();
-                    property.Remove();
-                    warnings.Add($"Moved the value supplied as '{property.Name}' onto this op's own argument.");
-                }
+                args["__opValue"] = property.Value.DeepClone();
+                property.Remove();
+                warnings.Add($"Moved the value supplied as '{property.Name}' onto this op's own argument.");
             }
         }
     }
