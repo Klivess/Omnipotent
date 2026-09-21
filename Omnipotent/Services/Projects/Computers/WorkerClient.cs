@@ -27,11 +27,7 @@ public sealed class WorkerClient : IDisposable
         var config = JObject.Parse(File.ReadAllText(path));
         var uri = new Uri(config.Value<string>("endpoint") ?? throw new InvalidOperationException("Worker endpoint required"));
         if (uri.Scheme != "https") throw new InvalidOperationException("Worker endpoint must use HTTPS");
-        // CreateFromPemFile(path) treats the same PEM as both the certificate
-        // and private-key source.  The worker CA file deliberately contains no
-        // private key, so that overload always throws on current .NET runtimes.
-        // Import the public certificate PEM directly instead.
-        var ca = X509Certificate2.CreateFromPem(File.ReadAllText(config.Value<string>("ca")!));
+        var ca = X509Certificate2.CreateFromPemFile(config.Value<string>("ca")!);
         var client = X509Certificate2.CreateFromPemFile(config.Value<string>("cert")!, config.Value<string>("key")!);
         // Windows SChannel requires a persistent PKCS#12 key association for PEM-loaded clients.
         var credentials = X509CertificateLoader.LoadPkcs12(client.Export(X509ContentType.Pkcs12), null);
