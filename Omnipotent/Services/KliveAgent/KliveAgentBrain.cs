@@ -1218,7 +1218,8 @@ namespace Omnipotent.Services.KliveAgent
             Action<AgentProgressUpdate>? onProgress = null,
             CancellationToken cancellationToken = default,
             AgentChatRunControl? runControl = null,
-            Action<AgentSteeringMessage>? onSteeringApplied = null)
+            Action<AgentSteeringMessage>? onSteeringApplied = null,
+            IReadOnlyList<AgentAttachment>? messageAttachments = null)
         {
             try
             {
@@ -1227,6 +1228,7 @@ namespace Omnipotent.Services.KliveAgent
                 // shown it "talking" (via onProgress) while its scripts are still running.
                 var progressText = new StringBuilder();
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
+                var cacheRunId = Guid.NewGuid().ToString("N");
 
                 var llmServices = await agentService.GetServicesByType<KliveLLM.KliveLLM>();
                 if (llmServices == null || llmServices.Length == 0)
@@ -1328,6 +1330,49 @@ namespace Omnipotent.Services.KliveAgent
                 int iterationsDone = 0;
 
                 var userPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+                (string text, List<(byte[] data, string mimeType)> images) preparedAttachments;
+                try
+                {
+                    preparedAttachments = await agentService.Attachments.PrepareForModelAsync(
+                        messageAttachments, cancellationToken);
+                }
+                catch (Exception ex) when (ex is ArgumentException or InvalidDataException or System.ComponentModel.Win32Exception)
+                {
+                    return new AgentChatResponse
+                    {
+                        ConversationId = conversation.ConversationId, Success = false,
+                        Response = "I could not read the attachment: " + ex.Message,
+                        ErrorMessage = ex.Message
+                    };
+                }
+                if (!string.IsNullOrEmpty(preparedAttachments.text))
+                    userPrompt += "\n[Files attached to this message]\n" + preparedAttachments.text;
+                if (preparedAttachments.images.Count > 0 && !useToolCalling)
+                    return new AgentChatResponse
+                    {
+                        ConversationId = conversation.ConversationId, Success = false,
+                        Response = "The active model cannot receive image or video attachments. Select a vision-capable remote model with native tool calling.",
+                        ErrorMessage = "Vision input is unavailable."
+                    };
+                if (preparedAttachments.images.Count > 0)
+                {
+                    var modelsToCheck = new[] { fastModel, reasoningModel }
+                        .Where(model => !string.IsNullOrWhiteSpace(model)).Distinct(StringComparer.Ordinal).ToList();
+                    if (string.IsNullOrWhiteSpace(fastModel) || string.IsNullOrWhiteSpace(reasoningModel))
+                        modelsToCheck.Add("");
+                    foreach (string model in modelsToCheck)
+                    {
+                        var capabilities = await llm.GetModelCapabilitiesAsync(
+                            string.IsNullOrEmpty(model) ? null : model, cancellationToken);
+                        if (!capabilities.ImageInput)
+                            return new AgentChatResponse
+                            {
+                                ConversationId = conversation.ConversationId, Success = false,
+                                Response = $"The selected model {(string.IsNullOrEmpty(model) ? "" : model)} does not accept image input. Choose a vision-capable model for images or video.",
+                                ErrorMessage = "The selected model does not accept image input."
+                            };
+                    }
+                }
 
                 // Tool-calling mode: seed the structured session with system + user once; later turns are
                 // appended as tool-results / user-guidance. Text mode: keep the system prompt for iter 0
@@ -1335,7 +1380,10 @@ namespace Omnipotent.Services.KliveAgent
                 if (useToolCalling)
                 {
                     llm.StartToolSession(llmSessionId, systemPrompt);
-                    llm.AppendUserMessageToToolSession(llmSessionId, userPrompt);
+                    if (preparedAttachments.images.Count > 0)
+                        llm.AppendUserContentToToolSession(llmSessionId, userPrompt, preparedAttachments.images,
+                            keepRecentImages: retainedScreenshots, preservePromptPrefix: true);
+                    else llm.AppendUserMessageToToolSession(llmSessionId, userPrompt);
                 }
                 var currentPrompt = userPrompt;
                 string? firstIterationSystemPrompt = systemPrompt;
@@ -1620,6 +1668,11 @@ namespace Omnipotent.Services.KliveAgent
 
                     totalPromptTokens += llmResponse.PromptTokens;
                     totalCompletionTokens += llmResponse.CompletionTokens;
+                    try { agentService.PromptCache.Record(cacheRunId, iteration + 1, llmResponse); }
+                    catch (Exception telemetryError)
+                    {
+                        _ = agentService.ServiceLogError(telemetryError, "KliveAgent prompt-cache telemetry");
+                    }
 
                     // Normalize the model turn into segments (prose + scripts) regardless of channel.
                     // Tool-calling: each tool_call becomes a script segment tagged with its ToolCallId so
@@ -2166,6 +2219,9 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         var role = msg.Role == AgentMessageRole.User ? "User" : "KliveAgent";
                         sb.AppendLine($"[{Data_Handling.TemporalFormat.StampMinute(msg.Timestamp)}] {role}: {msg.Content}");
+                        if (msg.Attachments?.Count > 0)
+                            foreach (var attachment in msg.Attachments)
+                                sb.AppendLine($"[Earlier attachment: {attachment.Name}; local path={agentService.Attachments.PathFor(attachment)}]");
 
                         if (scriptCarryingTurns.Contains(msg))
                         {

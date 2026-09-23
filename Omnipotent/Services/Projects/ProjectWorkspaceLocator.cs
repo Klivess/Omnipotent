@@ -7,12 +7,10 @@ namespace Omnipotent.Services.Projects;
 public static class ProjectWorkspaceLocator
 {
     public const string ContainerRoot = "/project";
-    public static Func<string, bool>? IsRemote { get; set; }
 
     public static string HostRoot(string projectID)
     {
         ValidateProjectID(projectID);
-        if (IsRemote?.Invoke(projectID) == true) throw new InvalidOperationException("The project workspace is on Linux. Use project file tools or computer_terminal; no Windows host path exists.");
         return Path.GetFullPath(Path.Combine(
             OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsVolumesDirectory), projectID));
     }
@@ -41,7 +39,6 @@ public static class ProjectWorkspaceLocator
     public static string NormalizeRelative(string projectID, string? path)
     {
         string supplied = (path ?? "").Trim();
-        if (IsRemote?.Invoke(projectID) == true) return NormalizeRelative(supplied);
         if (Path.IsPathRooted(supplied))
         {
             string root = HostRoot(projectID);

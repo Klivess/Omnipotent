@@ -158,16 +158,18 @@ internal static class ProjectPromptCacheAnalytics
 
     internal static AnalyticsPromptCacheSnapshot Build(
         IEnumerable<ProjectTokenUsageRecord> usage,
-        AnalyticsRange range)
+        AnalyticsRange range,
+        string telemetryVersion = ProjectPromptCacheTelemetry.CurrentVersion)
     {
         var eligible = usage
-            .Where(IsEligible)
+            .Where(record => IsEligible(record, telemetryVersion))
             .OrderBy(record => record.OccurredAt)
             .ThenBy(record => record.Sequence)
             .ToList();
         var measured = eligible.Where(record => record.CacheMetricsAvailable).ToList();
         var result = new AnalyticsPromptCacheSnapshot
         {
+            TelemetryVersion = telemetryVersion,
             Requests = eligible.Count,
             MeasuredRequests = measured.Count,
             MeasurementStartedAt = eligible.Select(record => (DateTime?)record.OccurredAt.ToUniversalTime()).FirstOrDefault(),
@@ -358,11 +360,13 @@ internal static class ProjectPromptCacheAnalytics
         : string.Equals(record.Provider, "OpenRouter", StringComparison.OrdinalIgnoreCase) ? null : record.Provider;
 
     private static bool IsEligible(ProjectTokenUsageRecord record)
+        => IsEligible(record, ProjectPromptCacheTelemetry.CurrentVersion);
+
+    private static bool IsEligible(ProjectTokenUsageRecord record, string telemetryVersion)
         => !string.Equals(record.RecordKind, "cost-adjustment", StringComparison.OrdinalIgnoreCase)
             && record.PromptTokens > 0
             && !string.IsNullOrWhiteSpace(record.Provider)
-            && string.Equals(record.PromptCacheTelemetryVersion,
-                ProjectPromptCacheTelemetry.CurrentVersion, StringComparison.Ordinal);
+            && string.Equals(record.PromptCacheTelemetryVersion, telemetryVersion, StringComparison.Ordinal);
 
     /// <summary>
     /// Whether a journal row carries a provider cache measurement this build is allowed to believe.
@@ -703,7 +707,7 @@ internal static class ProjectPromptCacheAnalytics
         if (result.Requests == 0)
         {
             result.Status = "no-data";
-            result.Verdict = "No post-fix Projects requests are in this range yet.";
+            result.Verdict = "No requests from this telemetry version are in this range yet.";
             return;
         }
         if (result.MeasuredRequests < MinimumReadyRequests

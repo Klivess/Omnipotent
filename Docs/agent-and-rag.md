@@ -60,6 +60,22 @@ What surrounds the loop:
 Access is owner-only: routes require `KMPermissions.Klives`, and over Discord anyone else reaches the
 plain chatbot instead.
 
+The website chat accepts files through the picker or drag and drop. It streams each file to
+`PUT /kliveagent/attachments/upload` with `conversationId`, `name`, and `contentType` query
+parameters, then passes the returned IDs as `attachmentIds` to `POST /kliveagent/chat`.
+Uploads are bound to their conversation, limited to 100 MB each and eight files per message,
+and recorded in durable conversation history. Small text files enter the prompt; other files
+are available to the agent at their local paths. Images enter the vision message directly.
+Video is decoded with the bundled FFmpeg/FFprobe executables (or ones on `PATH`) and sampled
+into up to eight frames across its duration. Image and video turns require a vision-capable
+remote model with native tool calling. The original files remain downloadable through
+`GET /kliveagent/attachments/download`.
+
+Each successful KliveAgent model call also writes provider-reported prompt-cache and latency
+telemetry, without storing prompt content. `GET /kliveagent/stats/prompt-cache?range=30d`
+uses the same cache analytics calculations as Projects; the KliveAgent analytics view shows
+hit rates, reusable-prefix efficiency, provider breakdown, time series, and recent calls.
+
 ## Projects — the long-running task force
 
 Source: [`Omnipotent/Services/Projects/`](../Omnipotent/Services/Projects)

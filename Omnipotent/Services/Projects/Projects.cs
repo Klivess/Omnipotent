@@ -32,7 +32,7 @@ namespace Omnipotent.Services.Projects
     /// Later phases: container fleet + VNC transport (P2), Commander/tiers/budget/vault (P3),
     /// stimulus bus (P4), Discord (P5), KM website section (P6), watchdog + hardening (P7).
     /// </summary>
-    public partial class Projects : OmniService
+    public class Projects : OmniService
     {
         public ProjectStore Store { get; private set; } = null!;
         /// <summary>Persistent shared bytes, provenance, uploads and audit history for every project.</summary>
@@ -931,16 +931,6 @@ namespace Omnipotent.Services.Projects
 
             creator ??= new ProjectFileActor(ProjectFileActorType.User, "klives", "Klives");
             string projectID = Guid.NewGuid().ToString("N");
-            if (WorkerComputers == null)
-                throw new Computers.ComputerPendingException(WorkerSetup?.Status().Value<string>("reason")
-                    ?? "Project storage is waiting for the Linux worker. No Docker fallback will be created.");
-            // New projects always start on authoritative Linux storage. Old projects retain
-            // their explicit provider until verified migration; defaults cannot migrate them.
-            await WorkerComputers.Client.SendAsync(HttpMethod.Post, "/workspaces/" + projectID + "/ensure", new { });
-            var initialSettings = Settings.Get(projectID);
-            initialSettings.ComputerProvider = "incus";
-            initialSettings.ComputerWorkerIdentity = WorkerComputers.Client.Identity;
-            Settings.Save(initialSettings);
             ProjectFileCommitResult? initialFiles = null;
             Project p;
             try
@@ -2022,9 +2012,12 @@ namespace Omnipotent.Services.Projects
                 Directives.List(project.ProjectID, includeResolved: false), actingAgentID, toolName);
             if (directiveViolation != null)
                 return new CommanderToolResult(directiveViolation) { Succeeded = false };
+            string? hostViolation = ProjectHostInfrastructurePolicy.FindViolation(toolName, argsJson);
+            if (hostViolation != null)
+                return new CommanderToolResult(hostViolation) { Succeeded = false };
             var projectSettings = Settings.Get(project.ProjectID);
             string? interactionViolation = ProjectDesktopInteractionPolicy.FindViolation(
-                projectSettings, toolName, argsJson, UsesWorker(project.ProjectID) ? "/project" : ProjectWorkspaceLocator.HostRoot(project.ProjectID));
+                projectSettings, toolName, argsJson, ProjectWorkspaceLocator.HostRoot(project.ProjectID));
             if (interactionViolation != null)
                 return new CommanderToolResult(interactionViolation) { Succeeded = false };
 
@@ -2286,7 +2279,7 @@ namespace Omnipotent.Services.Projects
             if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
                 || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
                 return null;
-            if (!Settings.Get(project.ProjectID).ContainersEnabled || (!UsesWorker(project.ProjectID) && (Desktops == null || !OperatingSystem.IsWindows())))
+            if (!Settings.Get(project.ProjectID).ContainersEnabled || Desktops == null || !OperatingSystem.IsWindows())
                 return null;
             try
             {
@@ -2304,8 +2297,6 @@ namespace Omnipotent.Services.Projects
         private async Task<CommanderToolResult> DispatchComputerToolAsync(
             Project project, string actingAgentID, string toolName, string argsJson, CancellationToken ct)
         {
-            if (UsesWorker(project.ProjectID))
-                return await DispatchWorkerToolAsync(project, actingAgentID, toolName, argsJson, ct);
             if (!Settings.Get(project.ProjectID).ContainersEnabled)
                 return new CommanderToolResult("This project has containers disabled. Enable containers in project settings before desktop work.") { Succeeded = false };
             if (Desktops == null)
@@ -2350,8 +2341,6 @@ namespace Omnipotent.Services.Projects
         private async Task<CommanderToolResult> DispatchEnsureDesktopReadyAsync(
             Project project, string actingAgentID, CancellationToken ct)
         {
-            if (UsesWorker(project.ProjectID))
-                return await DispatchWorkerToolAsync(project, actingAgentID, "computer_screenshot", "{}", ct);
             var settings = Settings.Get(project.ProjectID);
             if (!settings.ContainersEnabled)
             {
@@ -2628,7 +2617,7 @@ namespace Omnipotent.Services.Projects
             {
                 foreach (var rec in Desktops.Registry.ForProject(project.ProjectID))
                 {
-                    try { ServiceLog($"Project completed; computer {rec.ContainerID} retained for explicit owner cleanup."); }
+                    try { await Desktops.DisposeDesktopAsync(rec.ContainerID); }
                     catch (Exception ex) { _ = ServiceLogError(ex, "Projects: desktop teardown failed"); }
                 }
             }
@@ -2992,10 +2981,15 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>Disposes a specific agent's own desktop container(s), if any. Safe no-op without Desktops.</summary>
-        public Task DisposeAgentDesktopAsync(string projectID, string agentID)
+        public async Task DisposeAgentDesktopAsync(string projectID, string agentID)
         {
-            ServiceLog($"Agent {agentID} retired; its computer and installed applications are retained for explicit owner cleanup.");
-            return Task.CompletedTask;
+            if (Desktops == null || string.IsNullOrWhiteSpace(agentID)) return;
+            try
+            {
+                foreach (var rec in Desktops.Registry.ForProject(projectID).Where(r => r.AgentID == agentID))
+                    await Desktops.DisposeDesktopAsync(rec.ContainerID);
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: retire-time desktop dispose failed"); }
         }
 
         /// <summary>
@@ -3010,9 +3004,77 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         private async Task ReapContainersAsync()
         {
-            // LastUsedAt and agent wake state cannot establish that detached jobs are idle.
-            // Reconcile only; never stop or delete a computer by age.
-            if (Desktops != null) await RefreshDesktopRegistryAsync(TimeSpan.FromSeconds(20));
+            if (Desktops == null) return;
+            try
+            {
+                var reg = Desktops.Registry;
+                // Reattach/adopt Docker reality before deleting either registry records or
+                // "orphans". Otherwise a surviving desktop with a temporarily missing registry
+                // entry can be destroyed by cleanup while its resumed agent is still using it.
+                //
+                // Everything below this line DELETES containers, so a partial reconcile is not good
+                // enough — it is exactly the "temporarily missing registry entry" state the comment
+                // above warns about. Nothing waits on this reap (it runs hourly in the background),
+                // so it gets a generous bound rather than the interactive one, and skips the whole
+                // pass if Docker still did not answer in full.
+                if (!await RefreshDesktopRegistryAsync(TimeSpan.FromMinutes(5)))
+                {
+                    ServiceLog("Projects: container reap skipped — the desktop reconcile did not complete, "
+                        + "and pruning a half-reconciled registry would destroy live desktops.");
+                    return;
+                }
+
+                // 1. Prune records still confirmed Lost after live reconciliation.
+                foreach (var lost in reg.All().Where(r => r.Lost))
+                    reg.Remove(lost.ContainerID);
+
+                // 1b. Reap desktop containers Docker still runs but the registry lost track of
+                // (a create that failed after start, a registry reset, etc.). These carry
+                // restart=unless-stopped and would otherwise leak ~2 GB each forever, invisible to
+                // the per-project reap below. Grace period avoids racing an in-flight provision.
+                try { await Desktops.Orchestrator.ReapOrphansAsync(TimeSpan.FromMinutes(10)); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: orphan container reap failed"); }
+
+                int idleHours = await GetIntOmniSetting("Projects_ContainerIdleReapHours", 6);
+                // A desktop unused this long is reaped even while the project stays busy on
+                // text-tier work — the project-idle window above never fires for such a project
+                // (keepalive wakes keep emitting events), so an unused desktop would pin ~2 GB
+                // indefinitely without this. Recreated transparently on the next computer tool.
+                int desktopIdleHours = await GetIntOmniSetting("Projects_DesktopIdleReapHours", 3);
+                foreach (var project in Store.ListProjects())
+                {
+                    var containers = reg.ForProject(project.ProjectID);
+                    if (containers.Count == 0) continue;
+
+                    var digest = Digests.GetDigest(project.ProjectID);
+                    if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID)) continue; // never reap a live wake
+
+                    bool finished = project.Status is ProjectStatus.Completed or ProjectStatus.Archived;
+                    var lastEvt = EventLog.ReadTail(project.ProjectID, 1).LastOrDefault();
+                    bool idle = idleHours > 0 && lastEvt != null &&
+                                DateTime.UtcNow - lastEvt.Timestamp > TimeSpan.FromHours(idleHours);
+                    var activeIDs = new HashSet<string>(
+                        SubAgents.ListActive(project.ProjectID).Select(a => a.AgentID), StringComparer.Ordinal);
+
+                    foreach (var c in containers)
+                    {
+                        bool ownerRetired = IsDesktopOwnerRetired(c.AgentID, activeIDs);
+                        bool desktopIdle = desktopIdleHours > 0 &&
+                                           DateTime.UtcNow - c.LastUsedAt > TimeSpan.FromHours(desktopIdleHours);
+                        if (finished || ownerRetired)
+                        {
+                            try { await Desktops.DisposeDesktopAsync(c.ContainerID); }
+                            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap dispose failed"); }
+                        }
+                        else if ((idle || desktopIdle) && !c.Suspended)
+                        {
+                            try { await Desktops.SuspendDesktopAsync(c.ContainerID); }
+                            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: idle desktop suspension failed"); }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reap failed"); }
         }
 
         internal static bool IsDesktopOwnerRetired(string? agentID, ISet<string> activeIDs) =>
@@ -3187,7 +3249,6 @@ namespace Omnipotent.Services.Projects
         {
             try
             {
-                InitialiseWorker();
                 if (!OperatingSystem.IsWindows())
                 {
                     ServiceLog("Projects: desktop containers are only wired for the Windows host build (frame encoding uses System.Drawing).");
@@ -3234,6 +3295,19 @@ namespace Omnipotent.Services.Projects
 
             _ = Task.Run(async () =>
             {
+                // The reverted Incus system left a SYSTEM task that keeps a 6 GB VM running and
+                // restarts it every two minutes. Remove it before Docker competes for that memory.
+                await LegacyWorkerDecommission.RunOnceAsync(msg => ServiceLog(msg));
+
+                // Idle desktops are stopped in place (files and apps survive) so they hold no RAM.
+                try
+                {
+                    int idleMinutes = await GetIntOmniSetting("Projects_DesktopIdleSuspendMinutes",
+                        (int)DesktopCapacityPolicy.DefaultIdleSuspendAfter.TotalMinutes);
+                    manager.IdleSuspendAfter = TimeSpan.FromMinutes(Math.Max(0, idleMinutes));
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, "Projects: desktop idle setting unavailable; using the default"); }
+
                 // Self-heal the desktop layer at startup: if the Docker daemon is unreachable the
                 // bootstrapper installs/starts Docker Desktop itself (winget → launch → wait) and
                 // auto-builds the desktop image when missing — instead of leaving computer_* tools
@@ -3250,6 +3324,10 @@ namespace Omnipotent.Services.Projects
 
                 try { await manager.ReconcileAsync(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Projects: container reconcile failed"); }
+
+                // From here on recovery and idle release are continuous, not left to the next
+                // agent that happens to trip over a dead daemon.
+                manager.StartSupervision();
             });
             // NOTE: the screen-stream WS route is registered in RegisterWebSocketRoutesAsync (at init,
             // decoupled from this method) so it exists even when Docker/desktops fail to come up.
@@ -3530,11 +3608,6 @@ namespace Omnipotent.Services.Projects
         private async Task StreamContainerScreenAsync(WebSocket socket, NameValueCollection query)
         {
             string containerID = query["containerID"] ?? "";
-            if (containerID.StartsWith("ka-", StringComparison.Ordinal))
-            {
-                await StreamWorkerScreenAsync(socket, containerID, query);
-                return;
-            }
             var transport = Desktops?.GetTransportByContainerID(containerID);
             if (transport == null)
             {
@@ -3548,6 +3621,9 @@ namespace Omnipotent.Services.Projects
             int quality = Math.Clamp(int.TryParse(query["quality"], out var q) ? q : 45, 10, 92);
             int maxWidth = Math.Clamp(int.TryParse(query["maxWidth"], out var mw) ? mw : 1280, 320, 3840);
             int delayMs = Math.Max(33, 1000 / fps);
+            // The overview wall streams every desktop at tile quality; only an interactive viewer
+            // (Klives actually looking at one machine) keeps that desktop from idle suspension.
+            bool interactiveViewer = quality > 45 || maxWidth > 1280;
             string shortID = containerID.Length >= 12 ? containerID[..12] : containerID;
             long lastVersion = -1;
             byte[]? lastJpeg = null;
@@ -3606,6 +3682,7 @@ namespace Omnipotent.Services.Projects
                         continue;
                     }
                     await socket.SendAsync(new ArraySegment<byte>(jpeg), WebSocketMessageType.Binary, true, CancellationToken.None);
+                    if (interactiveViewer) Desktops?.MarkViewed(containerID);
                     if (!sentFirstFrame)
                     {
                         sentFirstFrame = true;
@@ -3639,11 +3716,6 @@ namespace Omnipotent.Services.Projects
         private async Task HandleContainerRemoteInputAsync(WebSocket socket, NameValueCollection query)
         {
             string containerID = query["containerID"] ?? "";
-            if (containerID.StartsWith("ka-", StringComparison.Ordinal))
-            {
-                await HandleWorkerInputAsync(socket, containerID);
-                return;
-            }
             var control = Desktops?.GetRemoteControlByContainerID(containerID);
             if (control == null)
             {

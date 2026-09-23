@@ -44,9 +44,6 @@ namespace Omnipotent.Services.Projects.Containers
         private const int VncContainerPort = 5901;
         /// <summary>Container port for the browser-helper front door (see browser-service.py).</summary>
         private const int BrowserServiceContainerPort = 5902;
-        // ~2 GB per desktop: XFCE + Firefox alone sit near 1 GB, and agents are expected to
-        // apt-install and run real applications on their machines (§4 revised).
-        private const long DefaultMemoryBytes = 2L * 1024 * 1024 * 1024;
         /// <summary>Image label carrying the SHA-256 of the build context, so a changed
         /// Dockerfile/entrypoint triggers a rebuild instead of being silently ignored. The same key
         /// is stamped on containers (see <see cref="ContainerLabels.ContextHash"/>) so a container
@@ -175,6 +172,51 @@ namespace Omnipotent.Services.Projects.Containers
 
         /// <summary>The Docker endpoint this orchestrator targets (for diagnostics).</summary>
         public string DockerUri => dockerUri;
+
+        /// <summary>Total memory of the VM the daemon runs in (Docker's own MemTotal), or 0 when
+        /// the daemon cannot say. This is the ceiling desktop admission is budgeted against.</summary>
+        public async Task<long> GetDaemonMemoryTotalAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                return await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    return (await docker.System.GetSystemInfoAsync(token)).MemTotal;
+                }, TimeSpan.FromSeconds(10), "daemon memory query", ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// CPU use of one container as a share of one core, from a single non-streaming stats call
+        /// (the daemon samples twice about a second apart). Null when it could not be measured, which
+        /// callers must treat as "busy" — an unmeasured desktop is never stopped as idle.
+        /// </summary>
+        public async Task<double?> SampleCpuPercentAsync(string containerID, CancellationToken ct = default)
+        {
+            try
+            {
+                return await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    ContainerStatsResponse? sample = null;
+                    await docker.Containers.GetContainerStatsAsync(containerID,
+                        new ContainerStatsParameters { Stream = false },
+                        new Progress<ContainerStatsResponse>(s => sample = s), token);
+                    // Progress<T> posts asynchronously; give the callback a moment to land.
+                    for (int i = 0; sample == null && i < 20; i++) await Task.Delay(25, token);
+                    if (sample?.CPUStats?.CPUUsage == null || sample.PreCPUStats?.CPUUsage == null) return (double?)null;
+                    return DesktopCapacityPolicy.CpuPercentOfOneCore(
+                        sample.CPUStats.CPUUsage.TotalUsage, sample.PreCPUStats.CPUUsage.TotalUsage,
+                        sample.CPUStats.SystemUsage, sample.PreCPUStats.SystemUsage,
+                        sample.CPUStats.OnlineCPUs);
+                }, TimeSpan.FromSeconds(10), "container CPU sample", ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return null; }
+        }
 
         /// <summary>
         /// Executes one fixed desktop-control operation inside an owned desktop container. This is
@@ -806,7 +848,14 @@ namespace Omnipotent.Services.Projects.Containers
                 },
                 HostConfig = new HostConfig
                 {
-                    Memory = DefaultMemoryBytes,
+                    // Ceilings, not reservations: an idle desktop costs only what it touches, and
+                    // the sum of these ceilings is what DesktopCapacityPolicy admits against.
+                    Memory = DesktopCapacityPolicy.DesktopMemoryLimitBytes,
+                    MemoryReservation = DesktopCapacityPolicy.DesktopMemoryReservationBytes,
+                    MemorySwap = DesktopCapacityPolicy.DesktopMemoryLimitBytes + DesktopCapacityPolicy.DesktopSwapAllowanceBytes,
+                    // Under memory pressure the kernel must pick a desktop process, never dockerd.
+                    OomScoreAdj = DesktopCapacityPolicy.DesktopOomScoreAdj,
+                    PidsLimit = DesktopCapacityPolicy.DesktopPidsLimit,
                     // Ephemeral host port, loopback only — see class remarks on the auth boundary.
                     PortBindings = new Dictionary<string, IList<PortBinding>>
                     {
@@ -1083,6 +1132,7 @@ namespace Omnipotent.Services.Projects.Containers
                 try
                 {
                     var inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, ct);
+                    await AlignMemoryLimitsAsync(docker, record.ContainerID, inspect, ct);
                     int? port = ResolveHostPort(inspect);
                     // Docker reassigns ephemeral published ports on restart, so both must be
                     // re-read together — a stale browser-service port silently sends every action
@@ -1118,6 +1168,39 @@ namespace Omnipotent.Services.Projects.Containers
                 }
             }
             log($"Container reconcile complete: {registry.All().Count(r => !r.Lost)} live desktop(s).");
+        }
+
+        /// <summary>
+        /// Brings a desktop created under an older policy (2 GB, no reservation) onto the current
+        /// ceilings, so admission's arithmetic holds for the whole fleet and not just new machines.
+        /// Best-effort: the kernel may refuse to lower a ceiling below current use, in which case
+        /// the desktop keeps its old limit until it is next stopped.
+        /// </summary>
+        private async Task AlignMemoryLimitsAsync(DockerClient docker, string containerID,
+            ContainerInspectResponse inspect, CancellationToken ct)
+        {
+            var host = inspect.HostConfig;
+            if (host == null) return;
+            long swap = DesktopCapacityPolicy.DesktopMemoryLimitBytes + DesktopCapacityPolicy.DesktopSwapAllowanceBytes;
+            if (host.Memory == DesktopCapacityPolicy.DesktopMemoryLimitBytes
+                && host.MemoryReservation == DesktopCapacityPolicy.DesktopMemoryReservationBytes
+                && host.MemorySwap == swap)
+                return;
+            try
+            {
+                await docker.Containers.UpdateContainerAsync(containerID, new ContainerUpdateParameters
+                {
+                    Memory = DesktopCapacityPolicy.DesktopMemoryLimitBytes,
+                    MemoryReservation = DesktopCapacityPolicy.DesktopMemoryReservationBytes,
+                    MemorySwap = swap,
+                    PidsLimit = DesktopCapacityPolicy.DesktopPidsLimit,
+                }, ct);
+                log($"Desktop {containerID[..Math.Min(12, containerID.Length)]} moved onto the current memory ceilings.");
+            }
+            catch (Exception ex)
+            {
+                log($"Desktop {containerID[..Math.Min(12, containerID.Length)]} kept its previous memory ceiling ({ex.Message}).");
+            }
         }
 
         /// <summary>

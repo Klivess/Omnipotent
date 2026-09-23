@@ -24,6 +24,10 @@ namespace Omnipotent.Services.KliveAgent
         /// KliveAgentServiceTools.</summary>
         public KliveAgentServiceTools ServiceTools { get; private set; }
         public KliveAgentStats Stats { get; private set; } = null!;
+        private KliveAgentAttachments? attachments;
+        public KliveAgentAttachments Attachments => attachments ??= new KliveAgentAttachments();
+        private KliveAgentPromptCache? promptCache;
+        public KliveAgentPromptCache PromptCache => promptCache ??= new KliveAgentPromptCache();
 
         // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
         public KliveAgentCodebaseIndex CodebaseIndex { get; private set; }
@@ -387,7 +391,8 @@ namespace Omnipotent.Services.KliveAgent
             bool messageAlreadyRecorded = false,
             AgentChatRunControl runControl = null,
             Action<AgentSteeringMessage> onSteeringApplied = null,
-            long? expectedServiceGeneration = null)
+            long? expectedServiceGeneration = null,
+            IReadOnlyList<AgentAttachment>? messageAttachments = null)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -431,11 +436,12 @@ namespace Omnipotent.Services.KliveAgent
             });
 
             if (!messageAlreadyRecorded)
-                await RecordAcceptedUserMessageAsync(conversation, requestId, message, senderName);
+                await RecordAcceptedUserMessageAsync(conversation, requestId, message, senderName,
+                    attachments: messageAttachments);
 
             // Process through the brain
             var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress,
-                cancellationToken, runControl, onSteeringApplied);
+                cancellationToken, runControl, onSteeringApplied, messageAttachments);
 
             if (expectedServiceGeneration.HasValue
                 && expectedServiceGeneration.Value != Volatile.Read(ref serviceGeneration))
@@ -608,7 +614,8 @@ namespace Omnipotent.Services.KliveAgent
             string message,
             string conversationId = null,
             string senderName = null,
-            string clientMessageId = null)
+            string clientMessageId = null,
+            IReadOnlyList<AgentAttachment>? messageAttachments = null)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
                 return new AgentChatResponse { Success = false, Response = availabilityMessage, ErrorMessage = availabilityMessage };
@@ -639,7 +646,8 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     var priorSteer = known.SteeringMessages.FirstOrDefault(x => x.ClientMessageId == clientMessageId);
                     string priorPayload = priorSteer?.Message ?? known.UserMessage;
-                    if (!string.Equals(priorPayload?.Trim(), message.Trim(), StringComparison.Ordinal))
+                    if (!string.Equals(priorPayload?.Trim(), message.Trim(), StringComparison.Ordinal)
+                        || !SameAttachments(known.Attachments, messageAttachments))
                         return new AgentChatResponse
                         {
                             Success = false,
@@ -661,7 +669,8 @@ namespace Omnipotent.Services.KliveAgent
                         if (existingUser != null)
                         {
                             if (!string.Equals(
-                                existingUser.Content?.Trim(), message.Trim(), StringComparison.Ordinal))
+                                existingUser.Content?.Trim(), message.Trim(), StringComparison.Ordinal)
+                                || !SameAttachments(existingUser.Attachments, messageAttachments))
                                 return new AgentChatResponse
                                 {
                                     Success = false,
@@ -713,6 +722,13 @@ namespace Omnipotent.Services.KliveAgent
                 // concurrent brain that shares and resets the same provider session.
                 if (activeRunByConversation.TryGetValue(conversationId, out var activeRequestId))
                 {
+                    if (messageAttachments?.Count > 0)
+                        return new AgentChatResponse
+                        {
+                            Success = false, ConversationId = conversationId,
+                            Response = "Wait for the active run to finish before sending attachments.",
+                            ErrorMessage = "Attachments cannot be added to steering."
+                        };
                     var steered = await SteerPendingApiResponseCoreAsync(
                         activeRequestId, message, senderName, clientMessageId);
                     if (steered.Accepted && pendingApiResponses.TryGetValue(activeRequestId, out var active))
@@ -724,6 +740,7 @@ namespace Omnipotent.Services.KliveAgent
                     ConversationId = conversationId,
                     ClientMessageId = clientMessageId,
                     UserMessage = message,
+                    Attachments = messageAttachments?.ToList() ?? new(),
                     SenderName = senderName ?? "API",
                     Response = string.Empty,
                     CancellationSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken.Token),
@@ -746,7 +763,7 @@ namespace Omnipotent.Services.KliveAgent
                     // boundary. Do not launch or return 202 until both writes have completed.
                     acceptedMessageId = await RecordAcceptedUserMessageAsync(
                         conversation, pending.RequestId, message, senderName,
-                        messageId: clientMessageId);
+                        messageId: clientMessageId, attachments: messageAttachments);
                     await PersistRunAsync(pending);
                 }
                 catch (Exception ex)
@@ -809,6 +826,7 @@ namespace Omnipotent.Services.KliveAgent
                             messageAlreadyRecorded: true,
                             runControl: pending.Control,
                             expectedServiceGeneration: runGeneration,
+                            messageAttachments: pending.Attachments,
                             onSteeringApplied: steering =>
                             {
                                 lock (pending)
@@ -1328,7 +1346,8 @@ namespace Omnipotent.Services.KliveAgent
             string requestId,
             string message,
             string senderName,
-            string messageId = null)
+            string messageId = null,
+            IReadOnlyList<AgentAttachment>? attachments = null)
         {
             messageId ??= Guid.NewGuid().ToString("N");
             lock (ConversationSync(conversation.ConversationId))
@@ -1342,6 +1361,7 @@ namespace Omnipotent.Services.KliveAgent
                         RequestId = requestId,
                         Role = AgentMessageRole.User,
                         Content = message,
+                        Attachments = attachments?.ToList() ?? new(),
                         SenderName = senderName,
                         Timestamp = DateTime.UtcNow,
                         DeliveryStatus = "running"
@@ -1407,6 +1427,9 @@ namespace Omnipotent.Services.KliveAgent
             pending.Sequence++;
         }
 
+        private static bool SameAttachments(IEnumerable<AgentAttachment>? left, IEnumerable<AgentAttachment>? right) =>
+            (left ?? []).Select(x => x.Id).SequenceEqual((right ?? []).Select(x => x.Id), StringComparer.Ordinal);
+
         private static AgentPendingChatResponse SnapshotRun(AgentPendingChatResponse source) =>
             SnapshotRun(source, includeFrame: true);
 
@@ -1422,6 +1445,7 @@ namespace Omnipotent.Services.KliveAgent
                     ClientMessageId = source.ClientMessageId,
                     Status = source.Status,
                     UserMessage = source.UserMessage,
+                    Attachments = source.Attachments?.ToList() ?? new(),
                     SenderName = source.SenderName,
                     Response = source.Response,
                     ScriptsExecuted = source.ScriptsExecuted == null
@@ -1685,6 +1709,7 @@ namespace Omnipotent.Services.KliveAgent
                         RequestId = run.RequestId,
                         Role = AgentMessageRole.User,
                         Content = run.UserMessage ?? string.Empty,
+                        Attachments = run.Attachments?.ToList() ?? new(),
                         SenderName = run.SenderName ?? "API",
                         Timestamp = run.CreatedAt,
                         DeliveryStatus = deliveryStatus
@@ -2258,6 +2283,7 @@ namespace Omnipotent.Services.KliveAgent
             RequestId = message.RequestId,
             Role = message.Role,
             Content = message.Content,
+            Attachments = message.Attachments?.ToList() ?? new(),
             Timestamp = message.Timestamp,
             ScriptResult = message.ScriptResult,
             ScriptResults = message.ScriptResults == null

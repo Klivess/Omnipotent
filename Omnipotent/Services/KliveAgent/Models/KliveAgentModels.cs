@@ -215,6 +215,9 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("content")]
         public string Content { get; set; }
 
+        [JsonProperty("attachments")]
+        public List<AgentAttachment> Attachments { get; set; } = new();
+
         [JsonProperty("timestamp")]
         public DateTime Timestamp { get; set; } = DateTime.UtcNow;
 
@@ -703,6 +706,19 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// value returns the original run instead of executing the message twice.</summary>
         [JsonProperty("clientMessageId")]
         public string? ClientMessageId { get; set; }
+
+        [JsonProperty("attachmentIds")]
+        public List<string> AttachmentIds { get; set; } = new();
+    }
+
+    public class AgentAttachment
+    {
+        [JsonProperty("id")] public string Id { get; set; } = "";
+        [JsonProperty("conversationId")] public string ConversationId { get; set; } = "";
+        [JsonProperty("name")] public string Name { get; set; } = "";
+        [JsonProperty("mimeType")] public string MimeType { get; set; } = "application/octet-stream";
+        [JsonProperty("size")] public long Size { get; set; }
+        [JsonProperty("createdAt")] public DateTime CreatedAt { get; set; }
     }
 
     public class AgentChatResponse
@@ -811,6 +827,9 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// conversation file.</summary>
         [JsonProperty("userMessage")]
         public string UserMessage { get; set; }
+
+        [JsonProperty("attachments")]
+        public List<AgentAttachment> Attachments { get; set; } = new();
 
         [JsonProperty("senderName")]
         public string? SenderName { get; set; }

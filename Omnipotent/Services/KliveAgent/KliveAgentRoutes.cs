@@ -24,6 +24,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             await RegisterStatusRoute();
             await RegisterChatRoutes();
+            await RegisterAttachmentRoutes();
             await RegisterCapabilityRoutes();
             await RegisterConversationRoutes();
             await RegisterTaskRoutes();
@@ -94,14 +95,15 @@ namespace Omnipotent.Services.KliveAgent
                 try
                 {
                     var body = JsonConvert.DeserializeObject<AgentChatRequest>(req.userMessageContent);
-                    if (body == null || string.IsNullOrWhiteSpace(body.Message))
+                    if (body != null) body.AttachmentIds ??= new();
+                    if (body == null || (string.IsNullOrWhiteSpace(body.Message) && body.AttachmentIds.Count == 0))
                     {
                         await req.ReturnResponse(
                             JsonConvert.SerializeObject(new { error = "Message is required." }),
                             code: HttpStatusCode.BadRequest);
                         return;
                     }
-                    if (body.Message.Length > 200_000)
+                    if ((body.Message?.Length ?? 0) > 200_000)
                     {
                         await req.ReturnResponse(
                             JsonConvert.SerializeObject(new { error = "Message is too large (maximum 200,000 characters)." }),
@@ -109,16 +111,26 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
+                    string conversationId = body.ConversationId ?? Guid.NewGuid().ToString("N");
+                    var attachments = service.Attachments.Resolve(conversationId, body.AttachmentIds);
                     var response = await service.QueueIncomingApiMessageAsync(
-                        body.Message,
-                        body.ConversationId,
+                        string.IsNullOrWhiteSpace(body.Message) ? "Please inspect the attached files." : body.Message,
+                        conversationId,
                         req.user?.Name ?? "API",
-                        body.ClientMessageId);
+                        body.ClientMessageId, attachments);
 
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(response),
                         code: response.IsPending ? HttpStatusCode.Accepted
                             : response.Success ? HttpStatusCode.OK : HttpStatusCode.BadRequest);
+                }
+                catch (ArgumentException ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+                catch (FileNotFoundException ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
                 catch (Exception ex)
                 {
@@ -282,6 +294,64 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+        }
+
+        private async Task RegisterAttachmentRoutes()
+        {
+            await service.CreateStreamingAPIRoute("/kliveagent/attachments/upload", async req =>
+            {
+                if (!service.TryGetApiAvailability(out var code, out var availability))
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = availability }), code: code);
+                    return;
+                }
+                try
+                {
+                    string conversationId = req.userParameters["conversationId"];
+                    string name = req.userParameters["name"];
+                    string mimeType = req.userParameters["contentType"] ?? "application/octet-stream";
+                    var attachment = await service.Attachments.SaveAsync(conversationId, name, mimeType,
+                        req.RequestBodyStream);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(attachment));
+                }
+                catch (Omnipotent.Services.KliveAPI.KliveAPI.RequestBodyTooLargeException)
+                {
+                    throw;
+                }
+                catch (ArgumentException ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Put, KMPermissions.Klives, KliveAgentAttachments.MaxFileBytes);
+
+            await CreateDurableRoute("/kliveagent/attachments/download", async req =>
+            {
+                try
+                {
+                    var attachment = service.Attachments.Get(req.userParameters["conversationId"], req.userParameters["id"]);
+                    string asciiName = new string(attachment.Name.Select(c => c >= ' ' && c <= '~' && c != '"' && c != '\\' ? c : '_').ToArray());
+                    var headers = new WebHeaderCollection
+                    {
+                        ["Content-Disposition"] = $"attachment; filename=\"{asciiName}\"; filename*=UTF-8''{Uri.EscapeDataString(attachment.Name)}",
+                        ["X-Content-Type-Options"] = "nosniff",
+                    };
+                    await using var source = File.OpenRead(service.Attachments.PathFor(attachment));
+                    await using var destination = req.PrepareStreamResponse("application/octet-stream", source.Length, headers: headers);
+                    await source.CopyToAsync(destination);
+                }
+                catch (FileNotFoundException)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = "Attachment not found." }), code: HttpStatusCode.NotFound);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         private async Task RegisterCapabilityRoutes()
@@ -731,6 +801,20 @@ namespace Omnipotent.Services.KliveAgent
 
         private async Task RegisterStatsRoutes()
         {
+            await CreateDurableRoute("/kliveagent/stats/prompt-cache", async req =>
+            {
+                try
+                {
+                    var result = service.PromptCache.GetSnapshot(req.userParameters["range"], req.userParameters["bucket"]);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(result,
+                        new JsonSerializerSettings { ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver() }));
+                }
+                catch (ArgumentException ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
+
             await CreateRoute("/kliveagent/stats/summary", async (req) =>
             {
                 try

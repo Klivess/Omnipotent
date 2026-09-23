@@ -30,7 +30,22 @@ namespace Omnipotent.Services.Projects.Containers
         // Startup, project resume, and the desktop-list route can all request reconciliation at
         // once. Docker reconciliation mutates the persisted registry, so keep it single-flight.
         private readonly SemaphoreSlim reconcileGate = new(1, 1);
+        // Admission is a check-then-start; hold it across the start so two concurrent requests
+        // cannot both see the last free slot. Evictions only ever TRY other owners' gates.
+        private readonly SemaphoreSlim admissionGate = new(1, 1);
+        // Klives watching or driving a desktop from the website counts as use.
+        private readonly ConcurrentDictionary<string, DateTime> lastViewedUtc = new(StringComparer.Ordinal);
         private readonly string vncHost;
+        private long daemonMemoryTotalBytes;
+        private DateTime daemonMemorySampledUtc = DateTime.MinValue;
+        private System.Threading.Timer? supervisionTimer;
+        private int supervising;
+        private volatile bool daemonAnswering = true;
+        private string? lastDaemonProblem;
+        private DateTime? lastSupervisionUtc;
+
+        /// <summary>Desktops unused this long are stopped in place (0 disables). Set from host settings.</summary>
+        public TimeSpan IdleSuspendAfter { get; set; } = DesktopCapacityPolicy.DefaultIdleSuspendAfter;
 
         public ContainerRegistry Registry => registry;
         public ContainerOrchestrator Orchestrator => orchestrator;
@@ -87,21 +102,210 @@ namespace Omnipotent.Services.Projects.Containers
 
         private readonly ContainerDependencyBootstrapper bootstrapper;
 
-        public async Task<object> GetHostHealthAsync(CancellationToken ct = default) => new
+        public async Task<object> GetHostHealthAsync(CancellationToken ct = default)
         {
-            endpoint = orchestrator.DockerUri,
-            daemonProblem = await ProbeDaemonAsync(ct),
-            recoveryInProgress = bootstrapper.InProgress,
-            recoveryStatus = Environment.GetEnvironmentVariable("PROJECTS_LEGACY_DOCKER_AUTOSTART") == "true"
-                ? bootstrapper.LastStatus
-                : "Legacy Docker restarts are disabled. Persistent Linux worker setup is managed separately; existing Docker disks are preserved.",
-            lastAttemptUtc = bootstrapper.LastAttemptUtc,
-            diagnostics = bootstrapper.LastDiagnostics,
-            computers = registry.All().Select(r => new
+            string? problem = await ProbeDaemonAsync(ct);
+            long memory = problem == null ? await GetDaemonMemoryTotalAsync(ct) : Interlocked.Read(ref daemonMemoryTotalBytes);
+            var live = registry.All().Where(r => !r.Lost).ToList();
+            return new
             {
-                r.ContainerID, r.ProjectID, r.AgentID, r.Lost, r.Suspended, r.LastUsedAt,
-            }).ToArray(),
-        };
+                endpoint = orchestrator.DockerUri,
+                daemonProblem = problem,
+                recoveryInProgress = bootstrapper.InProgress,
+                recoveryStatus = bootstrapper.LastStatus,
+                restartRequired = bootstrapper.RestartRequired,
+                lastAttemptUtc = bootstrapper.LastAttemptUtc,
+                diagnostics = bootstrapper.LastDiagnostics,
+                lastSupervisionUtc,
+                capacity = new
+                {
+                    daemonMemoryGB = Math.Round(memory / (1024.0 * 1024 * 1024), 1),
+                    desktopMemoryLimitGB = Math.Round(DesktopCapacityPolicy.DesktopMemoryLimitBytes / (1024.0 * 1024 * 1024), 2),
+                    maxRunningDesktops = DesktopCapacityPolicy.MaxRunningDesktops(memory),
+                    running = live.Count(r => !r.Suspended),
+                    stopped = live.Count(r => r.Suspended),
+                    idleSuspendMinutes = IdleSuspendAfter.TotalMinutes,
+                },
+                computers = registry.All().Select(r => new
+                {
+                    r.ContainerID, r.ProjectID, r.AgentID, r.Lost, r.Suspended, r.LastUsedAt,
+                }).ToArray(),
+            };
+        }
+
+        private async Task<long> GetDaemonMemoryTotalAsync(CancellationToken ct)
+        {
+            long cached = Interlocked.Read(ref daemonMemoryTotalBytes);
+            if (cached > 0 && DateTime.UtcNow - daemonMemorySampledUtc < TimeSpan.FromMinutes(10)) return cached;
+            long total = await orchestrator.GetDaemonMemoryTotalAsync(ct);
+            if (total > 0)
+            {
+                Interlocked.Exchange(ref daemonMemoryTotalBytes, total);
+                daemonMemorySampledUtc = DateTime.UtcNow;
+                return total;
+            }
+            return cached;
+        }
+
+        /// <summary>
+        /// Continuous supervision. Recovery used to run only when an agent's tool happened to fail
+        /// or at Omnipotent start, so a daemon that died overnight stayed dead until something
+        /// tripped over it — and nothing ever stopped an idle desktop. Every minute this probes the
+        /// daemon (walking the bounded recovery ladder when it is down, then reattaching desktops
+        /// when it returns) and stops desktops that have been idle long enough to release their RAM.
+        /// </summary>
+        public void StartSupervision(TimeSpan? firstRun = null)
+        {
+            supervisionTimer ??= new System.Threading.Timer(_ => _ = SuperviseOnceAsync(), null,
+                firstRun ?? TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(1));
+        }
+
+        internal async Task SuperviseOnceAsync()
+        {
+            if (Interlocked.Exchange(ref supervising, 1) == 1) return; // a slow tick is still running
+            try
+            {
+                lastSupervisionUtc = DateTime.UtcNow;
+                // Generous: a recovery attempt includes Docker Desktop's multi-minute cold start.
+                using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+                string? problem = await ProbeDaemonAsync(cts.Token);
+                if (problem != null)
+                {
+                    if (daemonAnswering || problem != lastDaemonProblem)
+                        log($"Desktop supervisor: Docker daemon unavailable — {problem}");
+                    daemonAnswering = false;
+                    lastDaemonProblem = problem;
+                    string? stillBroken = await TryBootstrapAsync(ProjectSettings.Defaults.DesktopImage, cts.Token);
+                    if (stillBroken != null) return;
+                }
+                if (!daemonAnswering)
+                {
+                    daemonAnswering = true;
+                    lastDaemonProblem = null;
+                    log("Desktop supervisor: Docker daemon answering again — reattaching desktops.");
+                    await ReconcileAsync(cts.Token);
+                }
+                await GetDaemonMemoryTotalAsync(cts.Token);
+                await SuspendIdleDesktopsAsync(cts.Token);
+            }
+            catch (Exception ex) { log($"Desktop supervisor tick failed: {ex.Message}"); }
+            finally { Interlocked.Exchange(ref supervising, 0); }
+        }
+
+        /// <summary>Stops, in place, every desktop idle past <see cref="IdleSuspendAfter"/> that is
+        /// not in use (no action in flight, no input lease, not being watched, CPU quiet).</summary>
+        internal async Task<int> SuspendIdleDesktopsAsync(CancellationToken ct)
+        {
+            if (IdleSuspendAfter <= TimeSpan.Zero) return 0;
+            int stopped = 0;
+            var now = DateTime.UtcNow;
+            foreach (var record in registry.All().Where(r => DesktopCapacityPolicy.IsIdle(r, now, IdleSuspendAfter)).ToList())
+            {
+                if (IsPinned(record)) continue;
+                double? cpu = await orchestrator.SampleCpuPercentAsync(record.ContainerID, ct);
+                if (cpu == null || cpu >= DesktopCapacityPolicy.BusyCpuPercent) continue; // working, or unknown
+                try
+                {
+                    if (await SuspendDesktopAsync(record.ContainerID, ct))
+                    {
+                        stopped++;
+                        log($"Desktop {Short(record.ContainerID)} ({record.ProjectID}/{record.AgentID ?? "shared"}) stopped after {(now - record.LastUsedAt).TotalMinutes:0} idle minutes to release its memory; it resumes on next use.");
+                    }
+                }
+                catch (Exception ex) { log($"Idle desktop {Short(record.ContainerID)} could not be stopped: {ex.Message}"); }
+            }
+            return stopped;
+        }
+
+        /// <summary>Records that Klives is watching or driving a desktop, so it is never stopped under him.</summary>
+        public void MarkViewed(string containerID)
+        {
+            if (!string.IsNullOrEmpty(containerID)) lastViewedUtc[containerID] = DateTime.UtcNow;
+        }
+
+        private bool IsPinned(DesktopContainerRecord record)
+        {
+            if (actionGates.TryGetValue(record.ContainerID, out var gate) && gate.CurrentCount == 0) return true;
+            if (inputLock.CurrentHolder(record.ContainerID) != null) return true;
+            if (lastViewedUtc.TryGetValue(record.ContainerID, out var viewed) && DateTime.UtcNow - viewed < TimeSpan.FromMinutes(5)) return true;
+            string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
+            return provisioningGates.TryGetValue(ownerKey, out var provisioning) && provisioning.CurrentCount == 0;
+        }
+
+        /// <summary>
+        /// Makes room for one more running desktop, stopping least-recently-used idle desktops if the
+        /// fleet's memory ceilings would otherwise exceed Docker's VM. Throws
+        /// <see cref="DesktopCapacityException"/> rather than overcommit: starting anyway is what
+        /// turned a busy host into an unreachable daemon for every project. Caller holds
+        /// <see cref="admissionGate"/>.
+        /// </summary>
+        private async Task AdmitLockedAsync(string? requesterContainerID, CancellationToken ct)
+        {
+            long memory = await GetDaemonMemoryTotalAsync(ct);
+            // A daemon that answers but cannot report its size right now is not evidence the fleet
+            // is full; evicting on missing data would stop every other desktop.
+            if (memory <= 0) return;
+            int slots = DesktopCapacityPolicy.MaxRunningDesktops(memory);
+            var busy = new HashSet<string>(StringComparer.Ordinal);
+            for (int round = 0; round < 4; round++)
+            {
+                var evictions = DesktopCapacityPolicy.ChooseEvictions(registry.All(), slots, requesterContainerID,
+                    DateTime.UtcNow, r => busy.Contains(r.ContainerID) || IsPinned(r));
+                if (evictions == null) break;
+                if (evictions.Count == 0) return;
+                bool allStopped = true;
+                foreach (var victim in evictions)
+                {
+                    double? cpu = await orchestrator.SampleCpuPercentAsync(victim.ContainerID, ct);
+                    if (cpu == null || cpu >= DesktopCapacityPolicy.BusyCpuPercent
+                        || !await TrySuspendForEvictionAsync(victim, ct))
+                    {
+                        busy.Add(victim.ContainerID);
+                        allStopped = false;
+                        continue;
+                    }
+                    log($"Desktop {Short(victim.ContainerID)} ({victim.ProjectID}/{victim.AgentID ?? "shared"}) stopped to make room — {slots} desktop slot(s) on a {memory / (1024.0 * 1024 * 1024):0.#} GB Docker VM.");
+                }
+                if (allStopped) return;
+            }
+
+            var holders = registry.All().Where(r => !r.Lost && !r.Suspended && r.ContainerID != requesterContainerID)
+                .Select(r => $"{r.ProjectID[..Math.Min(8, r.ProjectID.Length)]}/{r.AgentID ?? "shared"}").ToList();
+            throw new DesktopCapacityException(
+                $"All {slots} computer slot(s) on this host are in active use ({string.Join(", ", holders)}). " +
+                "Your computer was not started, so the host stays stable for everyone; its files and apps are intact. " +
+                $"Retry in a few minutes — idle computers are stopped automatically after {IdleSuspendAfter.TotalMinutes:0} minutes. " +
+                "Meanwhile continue with non-desktop work.");
+        }
+
+        private async Task<bool> TrySuspendForEvictionAsync(DesktopContainerRecord record, CancellationToken ct)
+        {
+            string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
+            var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
+            if (!await provisionGate.WaitAsync(0, ct)) return false; // never wait on another owner: no lock cycles
+            try
+            {
+                var actionGate = actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1));
+                if (!await actionGate.WaitAsync(0, ct)) return false;
+                try
+                {
+                    if (record.Suspended) return true;
+                    await orchestrator.SuspendContainerAsync(record, ct);
+                    if (transports.TryRemove(record.ContainerID, out var transport)) transport.Dispose();
+                }
+                finally { actionGate.Release(); }
+            }
+            catch (Exception ex)
+            {
+                log($"Desktop {Short(record.ContainerID)} could not be stopped to make room: {ex.Message}");
+                return false;
+            }
+            finally { provisionGate.Release(); }
+            NotifyDesktopChanged(record, "suspended");
+            return true;
+        }
+
+        private static string Short(string containerID) => containerID[..Math.Min(12, containerID.Length)];
 
         /// <summary>One-line remedy shown to the agent/logs when the desktop layer is unusable.</summary>
         public string SetupHint =>
@@ -118,12 +322,6 @@ namespace Omnipotent.Services.Projects.Containers
         /// </summary>
         public async Task<string?> TryBootstrapAsync(string imageTag, CancellationToken ct = default)
         {
-            if (!string.Equals(Environment.GetEnvironmentVariable("PROJECTS_LEGACY_DOCKER_AUTOSTART"), "true", StringComparison.OrdinalIgnoreCase))
-            {
-                var existingProblem = await orchestrator.ProbeDaemonAsync(ct);
-                if (existingProblem != null)
-                    return existingProblem + " Legacy host auto-restarts are disabled; queued computer work must wait for the managed worker migration.";
-            }
             bool daemonUp = await bootstrapper.EnsureDaemonAsync(orchestrator.ProbeDaemonAsync, ct, orchestrator.DockerUri);
             if (!daemonUp) return bootstrapper.LastStatus;
 
@@ -585,14 +783,26 @@ namespace Omnipotent.Services.Projects.Containers
                     record = existing;
                     if (record.Suspended)
                     {
-                        await orchestrator.ResumeContainerAsync(record, ct);
+                        await admissionGate.WaitAsync(ct);
+                        try
+                        {
+                            await AdmitLockedAsync(record.ContainerID, ct);
+                            await orchestrator.ResumeContainerAsync(record, ct);
+                        }
+                        finally { admissionGate.Release(); }
                         if (transports.TryRemove(record.ContainerID, out var oldTransport)) oldTransport.Dispose();
                         resumed = true;
                     }
                 }
                 else
                 {
-                    record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, targetAgent, ct: ct);
+                    await admissionGate.WaitAsync(ct);
+                    try
+                    {
+                        await AdmitLockedAsync(null, ct);
+                        record = await orchestrator.CreateDesktopContainerAsync(project.ProjectID, targetAgent, ct: ct);
+                    }
+                    finally { admissionGate.Release(); }
                     created = true;
                 }
                 if (!created && DateTime.UtcNow - record.LastUsedAt > TimeSpan.FromMinutes(5))
@@ -716,6 +926,7 @@ namespace Omnipotent.Services.Projects.Containers
         {
             var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost);
             if (record == null) return null;
+            MarkViewed(containerID);
             return (GetTransport(record),
                 actionGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1)),
                 record);
@@ -762,7 +973,13 @@ namespace Omnipotent.Services.Projects.Containers
             await provisionGate.WaitAsync(ct);
             try
             {
-                await orchestrator.ResumeContainerAsync(record, ct);
+                await admissionGate.WaitAsync(ct);
+                try
+                {
+                    if (record.Suspended) await AdmitLockedAsync(record.ContainerID, ct);
+                    await orchestrator.ResumeContainerAsync(record, ct);
+                }
+                finally { admissionGate.Release(); }
                 if (transports.TryRemove(containerID, out var transport)) transport.Dispose();
                 NotifyDesktopChanged(record, "resumed");
             }
@@ -770,10 +987,11 @@ namespace Omnipotent.Services.Projects.Containers
             await WaitForDesktopReadyAsync(record, ct);
         }
 
-        public async Task SuspendDesktopAsync(string containerID, CancellationToken ct = default)
+        /// <summary>Stops an idle desktop in place. Returns true only when it was actually stopped.</summary>
+        public async Task<bool> SuspendDesktopAsync(string containerID, CancellationToken ct = default)
         {
             var record = registry.All().FirstOrDefault(r => r.ContainerID == containerID && !r.Lost);
-            if (record == null || record.Suspended) return;
+            if (record == null || record.Suspended) return false;
             string ownerKey = $"{record.ProjectID}/{record.AgentID ?? "shared"}";
             var provisionGate = provisioningGates.GetOrAdd(ownerKey, _ => new SemaphoreSlim(1, 1));
             await provisionGate.WaitAsync(ct);
@@ -781,14 +999,15 @@ namespace Omnipotent.Services.Projects.Containers
             {
                 // An acquisition since the reaper's snapshot wins over resource cleanup.
                 if (DateTime.UtcNow - record.LastUsedAt < TimeSpan.FromMinutes(5)
-                    || inputLock.CurrentHolder(containerID) != null) return;
+                    || inputLock.CurrentHolder(containerID) != null) return false;
                 var actionGate = actionGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1));
-                if (!await actionGate.WaitAsync(0, ct)) return;
+                if (!await actionGate.WaitAsync(0, ct)) return false;
                 try
                 {
                     await orchestrator.SuspendContainerAsync(record, ct);
                     if (transports.TryRemove(containerID, out var transport)) transport.Dispose();
                     NotifyDesktopChanged(record, "suspended");
+                    return true;
                 }
                 finally { actionGate.Release(); }
             }
@@ -829,5 +1048,11 @@ namespace Omnipotent.Services.Projects.Containers
                     try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
             }
         }
+    }
+
+    /// <summary>A desktop was not started because every slot the host can safely run is in use.</summary>
+    public sealed class DesktopCapacityException : InvalidOperationException
+    {
+        public DesktopCapacityException(string message) : base(message) { }
     }
 }

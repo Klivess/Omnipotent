@@ -6,8 +6,9 @@ namespace Omnipotent.Services.Projects.Containers
     /// <summary>
     /// Self-healing for the desktop-container layer's host dependencies. When the Docker daemon
     /// is unreachable it walks the remediation ladder itself instead of just reporting failure:
-    ///   1. Docker Desktop installed but not running → launch it and wait for the daemon.
-    ///   2. Not installed → install via winget (silent), then launch and wait.
+    ///   1. Not installed → install via winget (silent).
+    ///   2. WSL unable to run on this Windows build → remove the incompatible package, report restart.
+    ///   3. Not running → launch; running with a dead engine → restart Docker's own processes.
     /// Single-flight with a cooldown so repeated tool failures don't spawn parallel installs.
     /// Best-effort by design: a FRESH install can still require WSL2 enablement or a reboot,
     /// which cannot be automated — <see cref="LastStatus"/> always carries the precise state so
@@ -20,7 +21,9 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly SemaphoreSlim gate = new(1, 1);
         private DateTime lastAttemptUtc = DateTime.MinValue;
         private static readonly TimeSpan AttemptCooldown = TimeSpan.FromMinutes(10);
-        private static readonly TimeSpan DaemonStartBudget = TimeSpan.FromMinutes(1);
+        // Docker Desktop's cold start (WSL VM boot + engine) takes minutes on this i5-3570 host. A
+        // one-minute budget declared healthy starts failed and fed the restart churn.
+        private static readonly TimeSpan DaemonStartBudget = TimeSpan.FromMinutes(4);
         private static readonly TimeSpan WingetBudget = TimeSpan.FromMinutes(20);
 
         /// <summary>Human-readable state of the last bootstrap attempt, for tool results and logs.</summary>
@@ -29,6 +32,11 @@ namespace Omnipotent.Services.Projects.Containers
         public bool InProgress { get; private set; }
         public string LastDiagnostics { get; private set; } = "not collected";
         public DateTime? LastAttemptUtc => lastAttemptUtc == DateTime.MinValue ? null : lastAttemptUtc;
+        /// <summary>True while a completed repair needs one Windows restart before Docker can start.</summary>
+        public bool RestartRequired { get; private set; }
+
+        private readonly string markerDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "Omnipotent", "DockerRecovery");
 
         public ContainerDependencyBootstrapper(Action<string> log)
         {
@@ -36,15 +44,22 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         /// <summary>
-        /// Ensures the Docker daemon is running, installing/starting Docker Desktop as needed.
+        /// Ensures the Docker daemon is running, repairing/starting Docker Desktop as needed.
         /// Returns true when the daemon answers the probe. Re-entrant calls while an attempt is
         /// running (or within the cooldown after a failed one) return false immediately with
         /// <see cref="LastStatus"/> explaining why.
+        ///
+        /// Ladder, each rung bounded: (1) WSL health — a WSL package this Windows build cannot run
+        /// is removed and the host is reported as needing one restart; (2) the WSL VM memory cap;
+        /// (3) launch Docker Desktop, or, when it is already running with a dead engine, stop only
+        /// Docker's own processes and service and launch it again; (4) wait for the engine with a
+        /// budget sized for this host's cold start. Never unregisters a distro, resets Docker, or
+        /// restarts Windows.
         /// </summary>
         public async Task<bool> EnsureDaemonAsync(Func<CancellationToken, Task<string?>> probeAsync, CancellationToken ct = default,
             string dockerUri = "npipe://./pipe/docker_engine")
         {
-            if (await probeAsync(ct) == null) { Status("Docker daemon is up."); return true; }
+            if (await probeAsync(ct) == null) { Healthy(); return true; }
             if (!IsLocalDesktopEndpoint(dockerUri))
             {
                 Status($"Configured Docker endpoint {dockerUri} is unavailable. Local Docker Desktop recovery does not apply to this endpoint.");
@@ -61,7 +76,7 @@ namespace Omnipotent.Services.Projects.Containers
                 lastAttemptUtc = DateTime.UtcNow;
 
                 // Re-probe under the gate — the daemon may have come up while we waited.
-                if (await probeAsync(ct) == null) { Status("Docker daemon is up."); return true; }
+                if (await probeAsync(ct) == null) { Healthy(); return true; }
 
                 string? exe = FindDockerDesktopExe();
                 if (exe == null)
@@ -78,7 +93,32 @@ namespace Omnipotent.Services.Projects.Containers
                     Status("Docker Desktop installed.");
                 }
 
-                Status("Starting Docker Desktop…");
+                // (1) Docker Desktop's engine lives in WSL. When WSL itself cannot run, no amount
+                // of relaunching helps — this is the state the host was left in on 2026-09-18.
+                string wslOutput = await ProbeWslAsync(ct);
+                LastDiagnostics = Describe(exe, wslOutput);
+                string? wslRepair = await WslHostCompatibility.RepairIncompatiblePackageAsync(wslOutput, markerDirectory, log, ct);
+                if (wslRepair != null)
+                {
+                    RestartRequired = true;
+                    Status("Docker engine cannot start until Windows restarts once: " + wslRepair);
+                    return false;
+                }
+
+                // (2) Bound the VM before (re)starting it; the cap applies from this start onwards.
+                string? cap = WslHostCompatibility.EnsureMemoryCap(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+                if (cap != null) log($"Desktop bootstrap: {cap}.");
+
+                // (3) Launch, or restart a Docker Desktop whose UI is up but whose engine is dead.
+                // Launching an already-running Docker Desktop only focuses its window, which is why
+                // earlier recovery "attempts" left a wedged engine exactly as it was.
+                bool wasRunning = DockerDesktopProcessesRunning();
+                if (wasRunning)
+                {
+                    Status("Docker Desktop is running but its engine is not answering — restarting Docker Desktop's own processes.");
+                    await StopDockerDesktopAsync(ct);
+                }
+                else Status("Starting Docker Desktop…");
                 try
                 {
                     Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden });
@@ -89,45 +129,22 @@ namespace Omnipotent.Services.Projects.Containers
                     return false;
                 }
 
+                // (4) Wait with a budget sized for a cold WSL + engine start on this host.
                 var deadline = DateTime.UtcNow + DaemonStartBudget;
                 while (DateTime.UtcNow < deadline)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(5), ct);
                     if (await probeAsync(ct) == null)
                     {
-                        Status("Docker daemon is up.");
+                        Healthy(wasRunning ? "Docker daemon recovered after restarting Docker Desktop." : "Docker daemon is up.");
                         lastAttemptUtc = DateTime.MinValue; // success clears the cooldown
                         return true;
                     }
                 }
-                // Use Docker's own bounded restart command when available. Never kill unrelated
-                // WSL workloads, unregister a distro, or infer corruption from a data distro's shell.
-                string cli = Path.Combine(Path.GetDirectoryName(exe)!, "resources", "bin", "docker.exe");
-                if (File.Exists(cli))
-                {
-                    Status("Docker engine is unavailable; attempting one Docker Desktop CLI restart.");
-                    var restart = await RunProcessAsync(cli, new[] { "desktop", "restart" }, TimeSpan.FromSeconds(60), ct);
-                    if (restart.ExitCode == 0)
-                    {
-                        deadline = DateTime.UtcNow + DaemonStartBudget;
-                        while (DateTime.UtcNow < deadline)
-                        {
-                            if (await probeAsync(ct) == null)
-                            {
-                                Status("Docker daemon recovered after Desktop restart.");
-                                return true;
-                            }
-                            await Task.Delay(TimeSpan.FromSeconds(5), ct);
-                        }
-                    }
-                    LastDiagnostics = $"Docker Desktop {FileVersionInfo.GetVersionInfo(exe).FileVersion}; restart: {restart.Output}";
-                }
-                string wsl = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WSL", "wsl.exe");
-                if (!File.Exists(wsl)) wsl = Path.Combine(Environment.SystemDirectory, "wsl.exe");
-                var wslStatus = await RunProcessAsync(wsl, new[] { "--status" }, TimeSpan.FromSeconds(10), ct);
-                LastDiagnostics += $"; WSL status (exit {wslStatus.ExitCode}): {wslStatus.Output}";
-                Status("Docker engine remains unavailable after bounded recovery. " + LastDiagnostics +
-                    " Preserve Docker data. A stopped or non-shell docker-desktop-data distro does not prove corruption; do not unregister it. Check host compatibility and Docker startup logs before choosing a repair.");
+
+                LastDiagnostics = Describe(exe, await ProbeWslAsync(ct));
+                Status($"Docker engine did not answer within {DaemonStartBudget.TotalMinutes:0} minutes of (re)starting Docker Desktop. " +
+                    LastDiagnostics + " Preserve Docker data. The next supervised attempt runs after the cooldown.");
                 return false;
             }
             finally
@@ -177,6 +194,70 @@ namespace Omnipotent.Services.Projects.Containers
             catch (Exception ex) { return (-1, ex.Message); }
         }
 
+        private static readonly string[] DockerDesktopProcessNames =
+        {
+            "Docker Desktop", "com.docker.backend", "com.docker.proxy", "com.docker.dev-envs",
+            "com.docker.extensions", "com.docker.wsl-distro-proxy", "vpnkit", "docker-index",
+        };
+
+        private static bool DockerDesktopProcessesRunning() =>
+            DockerDesktopProcessNames.Take(2).Any(name =>
+            {
+                var found = Process.GetProcessesByName(name);
+                foreach (var p in found) p.Dispose();
+                return found.Length > 0;
+            });
+
+        /// <summary>Stops only Docker Desktop's own processes and service. WSL is left alone.</summary>
+        private async Task StopDockerDesktopAsync(CancellationToken ct)
+        {
+            foreach (string name in DockerDesktopProcessNames)
+            {
+                foreach (var process in Process.GetProcessesByName(name))
+                {
+                    using (process)
+                    {
+                        try { process.Kill(entireProcessTree: true); } catch { }
+                    }
+                }
+            }
+            // The Windows service owns the privileged half; restart it so it is not left in the
+            // "Starting" state it hung in on 2026-09-18. Requires Omnipotent's elevation.
+            var restart = await RunProcessAsync(
+                Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"),
+                new[] { "-NoProfile", "-NonInteractive", "-Command",
+                    "$s = Get-Service -Name 'com.docker.service' -ErrorAction SilentlyContinue; " +
+                    "if ($s) { Restart-Service -Name 'com.docker.service' -Force -ErrorAction Stop; 'restarted' } else { 'absent' }" },
+                TimeSpan.FromSeconds(60), ct);
+            if (restart.ExitCode != 0) log($"Desktop bootstrap: Docker service restart did not complete ({restart.Output}).");
+            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        }
+
+        /// <summary>Both wsl.exe front doors (built-in and standalone package), bounded.</summary>
+        private static async Task<string> ProbeWslAsync(CancellationToken ct)
+        {
+            var outputs = new List<string>();
+            foreach (string wsl in new[]
+            {
+                Path.Combine(Environment.SystemDirectory, "wsl.exe"),
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WSL", "wsl.exe"),
+            }.Where(File.Exists))
+            {
+                var status = await RunProcessAsync(wsl, new[] { "--status" }, TimeSpan.FromSeconds(20), ct);
+                outputs.Add($"{wsl} --status (exit {status.ExitCode}): {status.Output}");
+            }
+            return outputs.Count == 0 ? "wsl.exe not found" : string.Join(" | ", outputs);
+        }
+
+        private static string Describe(string exe, string wslOutput)
+        {
+            string version;
+            try { version = FileVersionInfo.GetVersionInfo(exe).FileVersion ?? "?"; } catch { version = "?"; }
+            string wsl = wslOutput.Replace("\r", " ").Replace("\n", " ").Trim();
+            if (wsl.Length > 600) wsl = wsl[..600] + "…";
+            return $"Docker Desktop {version}; Windows build {Environment.OSVersion.Version.Build}; WSL: {wsl}";
+        }
+
         /// <summary>Locates Docker Desktop.exe in its standard install locations.</summary>
         private static string? FindDockerDesktopExe()
         {
@@ -204,6 +285,12 @@ namespace Omnipotent.Services.Projects.Containers
             if (result.ExitCode == 0) return true;
             Status($"Docker install failed (exit {result.ExitCode}): {result.Output}");
             return false;
+        }
+
+        private void Healthy(string message = "Docker daemon is up.")
+        {
+            RestartRequired = false;
+            Status(message);
         }
 
         private void Status(string s)

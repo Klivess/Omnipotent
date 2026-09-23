@@ -1,3 +1,66 @@
+# Project computer reliability — 23 September 2026 (Docker hardening, Incus removed)
+
+## What broke
+
+Live telemetry (`/projects/computers/health`, five projects' event logs) on KLIVESHOMESERVE
+(Windows 10 19042, 16 GB, i5-3570, Docker Desktop 4.2):
+
+- **Sep 10–11: load flaps.** The daemon went unreachable several times a day, image builds hit
+  i/o timeouts and host shells took 120–180 s. Nothing capped how many 2 GB desktops ran, and an
+  uncapped WSL VM competed with Windows and Omnipotent for the same 16 GB.
+- **Sep 18 onward: "Docker Engine failed to start".** A project agent "repaired" the host through
+  `run_powershell`. It ran `wsl --update` and a Docker Desktop reset, then installed the
+  standalone WSL 2.5.10 MSI. That package does not run below build 19044, so every `wsl.exe` call
+  answers `WSL_E_OS_NOT_SUPPORTED` and Docker's WSL backend cannot start. The daemon pipe has
+  been absent since.
+- **Sep 19–21: Incus.** The Incus migration disabled Docker auto-start/recovery
+  (`PROJECTS_LEGACY_DOCKER_AUTOSTART`) and idle suspension, and provisioned a Hyper-V VM that
+  holds a fixed 6 GB while serving no project.
+
+## Changes
+
+- **Incus removed.** Both Incus commits are reverted: the Docker path, recovery, idle suspension,
+  retired/finished teardown and tab hygiene are back. `LegacyWorkerDecommission` runs once at
+  startup, elevated. It removes the SYSTEM setup task first, then the owned VM and its disks,
+  the private switch and NAT, and `%ProgramData%\Omnipotent\AgentWorker`. It only touches objects
+  carrying the installer's ownership marks.
+- **WSL repair.** When WSL answers `WSL_E_OS_NOT_SUPPORTED` below build 19044, the bootstrapper
+  removes the standalone "Windows Subsystem for Linux" package (never the "…Update" kernel MSI).
+  It never unregisters a distro. It then reports `restartRequired`: **one Windows restart**
+  restores the built-in WSL that ran Docker before Sep 18. Omnipotent never restarts the host.
+- **Real Docker Desktop restart.** Launching an already-running Docker Desktop only focuses its
+  window, and 4.2 has no `docker desktop restart`. A running Docker Desktop with a dead engine
+  now has only its own processes killed and `com.docker.service` restarted, then it is
+  relaunched. The start budget is back to 4 minutes (1 minute was shorter than this host's
+  cold start).
+- **Continuous supervision.** Every minute the daemon is probed. Recovery runs when it is down
+  (single-flight, 10-minute cooldown), and desktops are reattached when it returns. Before this,
+  recovery ran only at startup or when an agent tripped over it.
+- **Memory admission** (`DesktopCapacityPolicy`). Each desktop's hard ceiling is 1.5 GB, plus
+  512 MB swap, a 512 MB soft reservation, OOM score +500 and a 4096 pids limit. The sum of
+  running ceilings never exceeds Docker's VM memory minus 1 GB for the daemon. When a new
+  desktop would overcommit, the least-recently-used idle desktop is stopped in place. If none can
+  be stopped, the request fails cleanly (`DesktopCapacityException`) instead of overcommitting.
+  The VM can no longer reach global OOM, so dockerd cannot be the victim. Existing containers
+  are moved onto the new ceilings during reconcile.
+- **WSL VM cap.** `[wsl2] memory=` is set to host RAM minus 6 GB, clamped to 3–12 GB, only when
+  the owner has not set one.
+- **Idle release.** A desktop unused for `Projects_DesktopIdleSuspendMinutes` (default 20) is
+  stopped in place. It is skipped while an action is in flight, while an input lease is held,
+  while Klives has it open interactively, or while its CPU is at or above 25% of a core. Apps,
+  home files and browser profiles survive; the next computer tool resumes it.
+- **Guardrail** (`ProjectHostInfrastructurePolicy`). Project agents can no longer change WSL, run
+  msiexec, reset or stop Docker Desktop, stop Docker/WSL/Hyper-V services, change Windows
+  features or Hyper-V objects, reboot, remove or prune shared Docker objects, or edit
+  `.wslconfig`/Docker settings. Read-only diagnostics stay allowed.
+- `GET /projects/computers/health` now reports `restartRequired`, supervision time and a
+  `capacity` block (VM memory, slots, running and stopped counts).
+
+## Status
+
+Omnipotent and the test project build. Deployment, the one Windows restart and live
+verification are pending.
+
 # Project computer reliability — 18 September 2026
 
 ## Changes
