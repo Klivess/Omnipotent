@@ -217,9 +217,10 @@ namespace Omnipotent.Services.KliveAPI.Caching
 
         // ── stats ──
 
-        public void RecordHit(string route) => StatFor(route).Hits++;
-        public void RecordMiss(string route) => StatFor(route).Misses++;
-        public void RecordBypass(string route) => StatFor(route).Bypasses++;
+        // Interlocked: concurrent requests on the same route must not lose counts.
+        public void RecordHit(string route) => Interlocked.Increment(ref StatFor(route).Hits);
+        public void RecordMiss(string route) => Interlocked.Increment(ref StatFor(route).Misses);
+        public void RecordBypass(string route) => Interlocked.Increment(ref StatFor(route).Bypasses);
 
         private RouteStat StatFor(string route) => _stats.GetOrAdd(route ?? "/", static _ => new RouteStat());
 

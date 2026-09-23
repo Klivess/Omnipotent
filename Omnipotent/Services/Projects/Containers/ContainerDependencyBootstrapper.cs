@@ -104,6 +104,9 @@ namespace Omnipotent.Services.Projects.Containers
                     Status("Docker engine cannot start until Windows restarts once: " + wslRepair);
                     return false;
                 }
+                // WSL answers normally again; a restart flagged by an earlier attempt is no longer
+                // what stands between the host and a running engine.
+                RestartRequired = false;
 
                 // (2) Bound the VM before (re)starting it; the cap applies from this start onwards.
                 string? cap = WslHostCompatibility.EnsureMemoryCap(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
@@ -208,7 +211,7 @@ namespace Omnipotent.Services.Projects.Containers
                 return found.Length > 0;
             });
 
-        /// <summary>Stops only Docker Desktop's own processes and service. WSL is left alone.</summary>
+        /// <summary>Stops Docker Desktop's own processes, service and WSL distros, for a cold start.</summary>
         private async Task StopDockerDesktopAsync(CancellationToken ct)
         {
             foreach (string name in DockerDesktopProcessNames)
@@ -230,7 +233,50 @@ namespace Omnipotent.Services.Projects.Containers
                     "if ($s) { Restart-Service -Name 'com.docker.service' -Force -ErrorAction Stop; 'restarted' } else { 'absent' }" },
                 TimeSpan.FromSeconds(60), ct);
             if (restart.ExitCode != 0) log($"Desktop bootstrap: Docker service restart did not complete ({restart.Output}).");
+            await ResetDockerWslVmAsync(ct);
             await Task.Delay(TimeSpan.FromSeconds(5), ct);
+        }
+
+        private static readonly HashSet<string> DockerDistros = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "docker-desktop", "docker-desktop-data",
+        };
+
+        /// <summary>
+        /// Killing Docker Desktop's Windows processes leaves its WSL distro running, and a relaunch
+        /// reattaches to it. On 2026-09-23 that distro was "Running" while its init never answered
+        /// ("Waiting for Procd service"), so every restart reattached to the same wedged VM. Docker's
+        /// own distros are always terminated; the whole WSL VM is shut down only when no other
+        /// distro is running, so an unrelated WSL workload is never interrupted.
+        /// </summary>
+        private async Task ResetDockerWslVmAsync(CancellationToken ct)
+        {
+            string wsl = Path.Combine(Environment.SystemDirectory, "wsl.exe");
+            if (!File.Exists(wsl)) return;
+            var list = await RunProcessAsync(wsl, new[] { "-l", "-v" }, TimeSpan.FromSeconds(20), ct);
+            var running = ParseRunningDistros(list.Output);
+            if (running.All(DockerDistros.Contains))
+            {
+                var shutdown = await RunProcessAsync(wsl, new[] { "--shutdown" }, TimeSpan.FromSeconds(60), ct);
+                log($"Desktop bootstrap: WSL VM shut down for a cold Docker start (exit {shutdown.ExitCode}).");
+                return;
+            }
+            foreach (string distro in DockerDistros)
+                await RunProcessAsync(wsl, new[] { "--terminate", distro }, TimeSpan.FromSeconds(30), ct);
+            log($"Desktop bootstrap: terminated Docker's WSL distros; left {string.Join(", ", running.Where(d => !DockerDistros.Contains(d)))} running.");
+        }
+
+        /// <summary>Pure: running distro names from `wsl -l -v` (UTF-16 output arrives with NULs).</summary>
+        internal static List<string> ParseRunningDistros(string output)
+        {
+            var running = new List<string>();
+            foreach (string raw in output.Replace("\0", "").Split('\n'))
+            {
+                var parts = raw.Replace("*", " ").Split(new[] { ' ', '\t', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 3 && parts[^2].Equals("Running", StringComparison.OrdinalIgnoreCase))
+                    running.Add(string.Join(' ', parts[..^2]));
+            }
+            return running;
         }
 
         /// <summary>Both wsl.exe front doors (built-in and standalone package), bounded.</summary>

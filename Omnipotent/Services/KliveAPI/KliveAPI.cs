@@ -33,6 +33,7 @@ using System.Security.Cryptography;
 using OmniDefenceService = Omnipotent.Services.OmniDefence.OmniDefence;
 using Omnipotent.Services.OmniDefence;
 using Omnipotent.Services.KliveAPI.Caching;
+using Omnipotent.Services.KliveAPI.Telemetry;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -238,6 +239,16 @@ namespace Omnipotent.Services.KliveAPI
             internal Caching.ResponseRecording? recording;
             [JsonIgnore]
             internal Stream? streamingRequestBody;
+            // Per-request stage timing (reference type: shared across struct copies).
+            [JsonIgnore]
+            internal RequestTrace? trace;
+
+            /// <summary>
+            /// The request's telemetry trace. Handlers may add named spans, e.g.
+            /// <c>using (req.Trace?.Span("db")) { ... }</c>.
+            /// </summary>
+            [JsonIgnore]
+            public RequestTrace? Trace => trace;
             [JsonIgnore]
             internal RequestBodyAuditState? requestBodyAudit;
 
@@ -267,6 +278,7 @@ namespace Omnipotent.Services.KliveAPI
             public KliveAPI ParentService;
             public async Task ReturnResponse(string response, string contentType = "application/json", NameValueCollection headers = null, HttpStatusCode code = HttpStatusCode.OK)
             {
+                trace?.Enter(TelemetryStage.Encode);
                 try
                 {
                     if (contentType == "application/json")
@@ -287,6 +299,11 @@ namespace Omnipotent.Services.KliveAPI
                         capture.Body = Encoding.UTF8.GetBytes(response);
                         capture.Completed = true;
                         capture.IsBinary = false;
+                        if (trace != null)
+                        {
+                            trace.ResponseRawBytes = trace.ResponseBytes = capture.Body.Length;
+                            trace.Enter(TelemetryStage.Teardown);
+                        }
                         return;
                     }
 
@@ -307,9 +324,9 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     resp.Headers.Set("Access-Control-Allow-Origin", "*");
                     resp.Headers.Set("Access-Control-Expose-Headers", "*");
-                    SetTimingHeaders(resp);
 
                     byte[] buffer = Encoding.UTF8.GetBytes(response);
+                    if (trace != null) trace.ResponseRawBytes = buffer.Length;
 
                     // Cache tee: record the uncompressed response before the ETag/304
                     // and compression branches run, so a fill that answers 304 to its
@@ -325,14 +342,19 @@ namespace Omnipotent.Services.KliveAPI
                     if (req.HttpMethod == "GET" && code == HttpStatusCode.OK
                         && buffer.Length > 0 && buffer.Length <= MaxETagPayloadBytes)
                     {
+                        trace?.Enter(TelemetryStage.ETag);
                         string etag = HttpResponseHelpers.ComputeWeakETag(buffer);
                         resp.Headers.Set("ETag", etag);
                         resp.Headers.Set("Cache-Control", "private, no-cache");
                         if (HttpResponseHelpers.ETagMatches(req.Headers["If-None-Match"], etag))
                         {
+                            SetTimingHeaders(resp);
                             resp.StatusCode = (int)HttpStatusCode.NotModified;
                             resp.ContentLength64 = 0;
+                            trace?.Enter(TelemetryStage.ResponseWrite);
+                            if (trace != null) { trace.NotModified = true; trace.ResponseBytes = 0; }
                             resp.OutputStream.Close();
+                            trace?.Enter(TelemetryStage.Teardown);
                             return;
                         }
                     }
@@ -346,21 +368,29 @@ namespace Omnipotent.Services.KliveAPI
                             var encoding = HttpResponseHelpers.PickEncoding(req.Headers["Accept-Encoding"]);
                             if (encoding != HttpResponseHelpers.ContentEncoding.None)
                             {
+                                trace?.Enter(TelemetryStage.Compress);
                                 byte[] compressed = HttpResponseHelpers.Compress(buffer, encoding);
                                 if (compressed.Length < buffer.Length)
                                 {
                                     buffer = compressed;
                                     resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
                                     recording?.RecordCompressedVariant(encoding, compressed);
+                                    if (trace != null) trace.Encoding = HttpResponseHelpers.EncodingHeaderValue(encoding);
                                 }
                             }
                         }
                     }
 
+                    SetTimingHeaders(resp);
                     resp.ContentLength64 = buffer.Length;
                     resp.StatusCode = (int)code;
-                    using Stream ros = resp.OutputStream;
-                    await ros.WriteAsync(buffer, 0, buffer.Length);
+                    trace?.Enter(TelemetryStage.ResponseWrite);
+                    if (trace != null) trace.ResponseBytes = buffer.Length;
+                    using (Stream ros = resp.OutputStream)
+                    {
+                        await ros.WriteAsync(buffer, 0, buffer.Length);
+                    }
+                    trace?.Enter(TelemetryStage.Teardown);
                 }
                 catch (Exception ex)
                 {
@@ -377,6 +407,7 @@ namespace Omnipotent.Services.KliveAPI
 
                     if (clientGone)
                     {
+                        if (trace != null) trace.ClientDisconnected = true;
                         _ = ParentService.ServiceLog($"Client disconnected before response completed for route: " +
                             $"{context.Request?.RawUrl} ({ex.GetType().Name}: {ex.Message})");
                         if (capture != null)
@@ -415,6 +446,7 @@ namespace Omnipotent.Services.KliveAPI
 
             public async Task ReturnBinaryResponse(byte[] data, string contentType, HttpStatusCode code = HttpStatusCode.OK, NameValueCollection headers = null)
             {
+                trace?.Enter(TelemetryStage.Encode);
                 try
                 {
                     if (capture != null)
@@ -425,6 +457,11 @@ namespace Omnipotent.Services.KliveAPI
                         capture.Body = data;
                         capture.Completed = true;
                         capture.IsBinary = true;
+                        if (trace != null)
+                        {
+                            trace.ResponseRawBytes = trace.ResponseBytes = data?.Length ?? 0;
+                            trace.Enter(TelemetryStage.Teardown);
+                        }
                         return;
                     }
 
@@ -440,9 +477,9 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     resp.Headers.Set("Access-Control-Allow-Origin", "*");
                     resp.Headers.Set("Access-Control-Expose-Headers", "*");
-                    SetTimingHeaders(resp);
 
                     byte[] buffer = data;
+                    if (trace != null) trace.ResponseRawBytes = buffer?.Length ?? 0;
 
                     // Cache tee: binary bodies are caller-owned, so defensively copy.
                     recording?.Record((int)code, contentType, headers, (byte[])(data ?? Array.Empty<byte>()).Clone(), isBinary: true);
@@ -457,23 +494,35 @@ namespace Omnipotent.Services.KliveAPI
                             var encoding = HttpResponseHelpers.PickEncoding(req.Headers["Accept-Encoding"]);
                             if (encoding != HttpResponseHelpers.ContentEncoding.None)
                             {
+                                trace?.Enter(TelemetryStage.Compress);
                                 byte[] compressed = HttpResponseHelpers.Compress(buffer, encoding);
                                 if (compressed.Length < buffer.Length)
                                 {
                                     buffer = compressed;
                                     resp.Headers.Set("Content-Encoding", HttpResponseHelpers.EncodingHeaderValue(encoding));
                                     recording?.RecordCompressedVariant(encoding, compressed);
+                                    if (trace != null) trace.Encoding = HttpResponseHelpers.EncodingHeaderValue(encoding);
                                 }
                             }
                         }
                     }
 
+                    SetTimingHeaders(resp);
                     resp.ContentLength64 = buffer.Length;
-                    using Stream ros = resp.OutputStream;
-                    await ros.WriteAsync(buffer, 0, buffer.Length);
+                    trace?.Enter(TelemetryStage.ResponseWrite);
+                    if (trace != null) trace.ResponseBytes = buffer.Length;
+                    using (Stream ros = resp.OutputStream)
+                    {
+                        await ros.WriteAsync(buffer, 0, buffer.Length);
+                    }
+                    trace?.Enter(TelemetryStage.Teardown);
                 }
                 catch (Exception ex)
                 {
+                    if (trace != null && (ex is HttpListenerException || ex is IOException || ex is ObjectDisposedException))
+                    {
+                        trace.ClientDisconnected = true;
+                    }
                     ParentService.ServiceLogError(ex, "Error while returning binary response for route: " + context.Request.RawUrl);
                 }
             }
@@ -501,6 +550,12 @@ namespace Omnipotent.Services.KliveAPI
                 resp.Headers.Set("Access-Control-Allow-Origin", "*");
                 resp.Headers.Set("Access-Control-Expose-Headers", "*");
                 SetTimingHeaders(resp);
+                if (trace != null)
+                {
+                    trace.ResponseRawBytes = trace.ResponseBytes = Math.Max(0, contentLength);
+                    // Everything after this point is the handler streaming the body.
+                    trace.Enter(TelemetryStage.ResponseWrite);
+                }
                 return resp.OutputStream;
             }
 
@@ -513,8 +568,16 @@ namespace Omnipotent.Services.KliveAPI
             {
                 try
                 {
-                    double ms = requestTimer?.Elapsed.TotalMilliseconds ?? 0;
-                    resp.Headers.Set("Server-Timing", $"app;dur={ms.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
+                    if (trace != null)
+                    {
+                        resp.Headers.Set("Server-Timing", trace.BuildServerTimingHeader());
+                        resp.Headers.Set("X-KliveAPI-Trace", trace.TraceIdHex);
+                    }
+                    else
+                    {
+                        double ms = requestTimer?.Elapsed.TotalMilliseconds ?? 0;
+                        resp.Headers.Set("Server-Timing", $"app;dur={ms.ToString("F1", System.Globalization.CultureInfo.InvariantCulture)}");
+                    }
                     resp.Headers.Set("Timing-Allow-Origin", "*");
                 }
                 catch
@@ -532,6 +595,13 @@ namespace Omnipotent.Services.KliveAPI
 
         private KMProfileManager profileManager;
         private KliveApiStatisticsStore? apiStatistics;
+
+        // ── Request telemetry (per-stage tracing, histograms, materialized views) ──
+        private readonly TelemetryOptions telemetryOptions = new();
+        private ApiTelemetry? telemetry;
+        private RuntimeSampler? runtimeSampler;
+        private long _acceptsTotal;
+        internal ApiTelemetry? Telemetry => telemetry;
 
         // ── Transparent response cache (dependency-versioned, never stale) ──
         private readonly ResponseCache responseCache = new();
@@ -571,6 +641,7 @@ namespace Omnipotent.Services.KliveAPI
                 ContinueListenLoop = true;
                 apiStatistics = new KliveApiStatisticsStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPIStatisticsFile));
                 await apiStatistics.InitializeAsync();
+                StartTelemetry();
 
                 listener = CreateConfiguredListener();
 
@@ -748,6 +819,57 @@ namespace Omnipotent.Services.KliveAPI
                 responseCache.Clear();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { cleared = true }), "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+
+            await TelemetryRoutes.RegisterAsync(this, () => telemetry, () => telemetryDb,
+                route => ControllerLookup.TryGetValue(route, out RouteInfo info) ? info.normalizedMethod : null);
+        }
+
+        private TelemetryDb? telemetryDb;
+
+        /// <summary>
+        /// Creates (once per service start) the telemetry engine, its SQLite store and the
+        /// runtime sampler. Failures degrade to "no telemetry", never to a failed API start.
+        /// </summary>
+        private void StartTelemetry()
+        {
+            try
+            {
+                StopTelemetry();
+                try
+                {
+                    telemetryDb = new TelemetryDb(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPITelemetryDbFile));
+                }
+                catch (Exception ex)
+                {
+                    telemetryDb = null;
+                    ServiceLogError(ex, "Telemetry database unavailable; running telemetry in memory only.");
+                }
+                telemetry = new ApiTelemetry(telemetryOptions, telemetryDb, OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAPIStatisticsFile))
+                {
+                    Log = msg => _ = ServiceLog(msg),
+                };
+                telemetry.Start();
+                runtimeSampler = new RuntimeSampler(telemetry, new RuntimeSampler.Inputs
+                {
+                    InFlight = () => Volatile.Read(ref _inFlightRequests),
+                    AcceptsTotal = () => Interlocked.Read(ref _acceptsTotal),
+                    CacheEntries = () => responseCache.EntryCount,
+                    CacheBytes = () => responseCache.TotalBytes,
+                });
+                runtimeSampler.Start();
+            }
+            catch (Exception ex)
+            {
+                telemetry = null;
+                ServiceLogError(ex, "Failed to start KliveAPI telemetry; continuing without it.");
+            }
+        }
+
+        private void StopTelemetry()
+        {
+            try { runtimeSampler?.Stop(); } catch { }
+            try { telemetry?.Stop(); } catch { }
+            runtimeSampler = null;
         }
 
         /// <summary>
@@ -801,6 +923,7 @@ namespace Omnipotent.Services.KliveAPI
 
             var results = new JObject[paths.Count];
             var tasks = new Task[paths.Count];
+            using var fanOut = req.Trace?.Span("batch-fanout");
             for (int i = 0; i < paths.Count; i++)
             {
                 int index = i;
@@ -856,6 +979,31 @@ namespace Omnipotent.Services.KliveAPI
                 // Batch sub-requests share the direct-GET cache: a hit skips execution
                 // entirely (collapsing to a dictionary lookup), and a fill warmed by
                 // one path accelerates the other.
+                // Each item gets its own child trace (real timing, incl. cache-hit lookups)
+                // so per-route analytics see batched calls without double-counting global
+                // throughput (the outer /batch request is the one global request).
+                RequestTrace? itemTrace = batchReq.trace != null ? RequestTrace.StartNow(TelemetryStage.CacheLookup) : null;
+                if (itemTrace != null)
+                {
+                    itemTrace.ViaBatch = true;
+                    itemTrace.ParentTraceId = batchReq.trace!.TraceId;
+                    itemTrace.Route = normalized;
+                    itemTrace.Method = "GET";
+                    itemTrace.Matched = true;
+                    itemTrace.Origin = batchReq.trace.Origin;
+                    itemTrace.ProfileId = batchReq.user?.UserID;
+                    itemTrace.ProfileName = batchReq.user?.Name;
+                    itemTrace.InFlightAtStart = Volatile.Read(ref _inFlightRequests);
+                    RequestTrace.Current = itemTrace;
+                }
+                void RecordItem(int status)
+                {
+                    if (itemTrace == null) return;
+                    itemTrace.StatusCode = status;
+                    itemTrace.Enter(TelemetryStage.Teardown);
+                    telemetry?.Record(itemTrace);
+                }
+
                 bool cacheable = cacheEnabled && !IsRouteDenylisted(normalized);
                 string? cacheKey = cacheable
                     ? ResponseCache.BuildKey(normalized, subParams, batchReq.user?.UserID)
@@ -867,9 +1015,16 @@ namespace Omnipotent.Services.KliveAPI
                     {
                         responseCache.RecordHit(normalized);
                         apiStatistics?.RecordRequest(normalized, "GET", hit.StatusCode, TimeSpan.Zero, true);
+                        if (itemTrace != null)
+                        {
+                            itemTrace.Cache = TelemetryCacheStatus.Hit;
+                            itemTrace.ResponseRawBytes = itemTrace.ResponseBytes = hit.RawBody.Length;
+                        }
+                        RecordItem(hit.StatusCode);
                         return BuildBatchResultFromParts(result, hit.StatusCode, hit.ContentType, hit.RawBody);
                     }
                     responseCache.RecordMiss(normalized);
+                    if (itemTrace != null) itemTrace.Cache = TelemetryCacheStatus.Miss;
                 }
 
                 // Sub-request is a copy of the batch request writing into a capture buffer.
@@ -879,6 +1034,8 @@ namespace Omnipotent.Services.KliveAPI
                 sub.userMessageBytes = Array.Empty<byte>();
                 sub.userMessageContent = string.Empty;
                 sub.capture = new CapturedResponse();
+                sub.trace = itemTrace;
+                itemTrace?.Enter(TelemetryStage.Handler);
 
                 var itemStopwatch = Stopwatch.StartNew();
                 DependencyScope? scope = cacheable ? CacheDeps.OpenScope() : null;
@@ -895,10 +1052,12 @@ namespace Omnipotent.Services.KliveAPI
                 if (!sub.capture.Completed)
                 {
                     apiStatistics?.RecordRequest(normalized, "GET", 500, itemStopwatch.Elapsed, true);
+                    RecordItem(500);
                     return BatchError(result, 500, "Handler did not produce a response.");
                 }
 
                 apiStatistics?.RecordRequest(normalized, "GET", sub.capture.StatusCode, itemStopwatch.Elapsed, true);
+                RecordItem(sub.capture.StatusCode);
 
                 if (cacheKey != null && scope != null)
                 {
@@ -1078,6 +1237,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             ContinueListenLoop = false;
+            StopTelemetry();
             // Close() (not just Stop()) so http.sys fully releases the URL group. A bare Stop()
             // can leave the "https://+:443/" registration lingering, which then makes the next
             // start (e.g. a crash-restart of this Critical service) fail with
@@ -1644,6 +1804,10 @@ namespace Omnipotent.Services.KliveAPI
                 try
                 {
                     HttpListenerContext context = await listener.GetContextAsync();
+                    // Stopwatch stamp of the accept: the telemetry DispatchQueue stage is
+                    // the gap from here to a pool thread actually starting the request.
+                    long acceptTimestamp = Stopwatch.GetTimestamp();
+                    Interlocked.Increment(ref _acceptsTotal);
                     // Timestamp every accept: a stale value while pings fail means the
                     // listen loop is wedged (not dequeuing from http.sys) rather than a
                     // slow handler downstream.
@@ -1660,7 +1824,7 @@ namespace Omnipotent.Services.KliveAPI
                     // min), so a slow/blocking handler can never stall global acceptance.
                     // Mirrors the /batch handler's existing use of Task.Run for the same
                     // reason ("handlers with synchronous prologues don't serialise each other").
-                    _ = Task.Run(() => ProcessRequestAsync(context));
+                    _ = Task.Run(() => ProcessRequestAsync(context, acceptTimestamp));
                 }
                 catch (Exception ioe)
                 {
@@ -1711,6 +1875,16 @@ namespace Omnipotent.Services.KliveAPI
                     cacheEnabled = !disabled;
                     cacheDenylistPrefixes = ParseDenylist(denylist);
                     responseCache.Configure((long)Math.Max(1, maxMB) * 1024 * 1024, 10_000);
+
+                    // Telemetry kill switches are inverted (…Disabled) for the same reason.
+                    telemetryOptions.Disabled = await GetBoolOmniSetting("KliveAPITelemetryDisabled", defaultValue: false);
+                    telemetryOptions.RumDisabled = await GetBoolOmniSetting("KliveAPITelemetryRumDisabled", defaultValue: false);
+                    telemetryOptions.SlowTraceMs = Math.Max(10, await GetIntOmniSetting("KliveAPITelemetrySlowTraceMs", defaultValue: 1000));
+                    telemetryOptions.SamplesPerRouteMinute = Math.Clamp(await GetIntOmniSetting("KliveAPITelemetryTraceSamplesPerRouteMinute", defaultValue: 2), 0, 60);
+                    telemetryOptions.ApdexTargetMs = Math.Max(1, await GetIntOmniSetting("KliveAPITelemetryApdexTargetMs", defaultValue: 250));
+                    telemetryOptions.Retention1mDays = Math.Clamp(await GetIntOmniSetting("KliveAPITelemetryRetention1mDays", defaultValue: 14), 1, 90);
+                    telemetryOptions.Retention1hDays = Math.Clamp(await GetIntOmniSetting("KliveAPITelemetryRetention1hDays", defaultValue: 400), 8, 3650);
+                    telemetryOptions.TraceRetentionDays = Math.Clamp(await GetIntOmniSetting("KliveAPITelemetryTraceRetentionDays", defaultValue: 7), 1, 90);
                 }
                 catch { /* settings manager may not be ready yet; retry next loop */ }
 
@@ -1756,13 +1930,17 @@ namespace Omnipotent.Services.KliveAPI
         /// </summary>
         private async Task DispatchRouteAsync(RouteInfo routeData, UserRequest request, string route)
         {
+            RequestTrace? trace = request.trace;
             if (!cacheEnabled
                 || NormalizeMethod(request.req.HttpMethod) != "GET"
                 || IsRouteDenylisted(route))
             {
+                trace?.Enter(TelemetryStage.Handler);
                 await routeData.action(request);
                 return;
             }
+
+            trace?.Enter(TelemetryStage.CacheLookup);
 
             string? userId = request.user?.UserID;
             string key = ResponseCache.BuildKey(route, request.userParameters, userId, request.req.Headers["Range"]);
@@ -1777,7 +1955,8 @@ namespace Omnipotent.Services.KliveAPI
                 if (hit != null)
                 {
                     responseCache.RecordHit(route);
-                    await CachedResponseWriter.WriteCachedResponseAsync(request.context, request.req, hit, request.requestTimer);
+                    if (trace != null) trace.Cache = TelemetryCacheStatus.Hit;
+                    await CachedResponseWriter.WriteCachedResponseAsync(request.context, request.req, hit, request.requestTimer, trace);
                     return;
                 }
             }
@@ -1785,11 +1964,13 @@ namespace Omnipotent.Services.KliveAPI
             // Miss (or forced bypass): fill while recording + tracking dependencies.
             if (forceBypass) responseCache.RecordBypass(route);
             else responseCache.RecordMiss(route);
+            if (trace != null) trace.Cache = forceBypass ? TelemetryCacheStatus.Bypass : TelemetryCacheStatus.Miss;
             try { request.context.Response.Headers.Set("X-KliveAPI-Cache", forceBypass ? "BYPASS" : "MISS"); } catch { }
 
             var recording = new ResponseRecording();
             request.recording = recording;
             DependencyScope scope = CacheDeps.OpenScope();
+            trace?.Enter(TelemetryStage.Handler);
             try
             {
                 await routeData.action(request);
@@ -1803,10 +1984,20 @@ namespace Omnipotent.Services.KliveAPI
             catch { /* storing must never affect the already-sent response */ }
         }
 
-        private async Task ProcessRequestAsync(HttpListenerContext context)
+        private async Task ProcessRequestAsync(HttpListenerContext context, long acceptTimestamp = 0)
         {
             Stopwatch requestStopwatch = Stopwatch.StartNew();
-            Interlocked.Increment(ref _inFlightRequests);
+            int inFlightNow = Interlocked.Increment(ref _inFlightRequests);
+            // Trace starts at the accept instant; everything until now was DispatchQueue.
+            RequestTrace? trace = telemetry != null && !telemetryOptions.Disabled
+                ? new RequestTrace(acceptTimestamp != 0 ? acceptTimestamp : Stopwatch.GetTimestamp())
+                : null;
+            if (trace != null)
+            {
+                trace.Enter(TelemetryStage.Prologue);
+                trace.InFlightAtStart = inFlightNow;
+                RequestTrace.Current = trace;
+            }
             bool matchedRoute = false;
             bool shouldRecordStatistics = true;
             string statsRoute = context?.Request?.Url?.AbsolutePath ?? context?.Request?.RawUrl ?? "/";
@@ -1859,6 +2050,7 @@ namespace Omnipotent.Services.KliveAPI
                 request.context = context;
                 request.ParentService = this;
                 request.requestTimer = requestStopwatch;
+                request.trace = trace;
                 request.userParameters = nameValueCollection;
                 request.user = null;
                 request.userMessageBytes = Array.Empty<byte>();
@@ -1869,6 +2061,8 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     shouldRecordStatistics = false;
                     defenceSkipRecord = true;
+                    // Preflights are real client latency but not API work: one pseudo-series.
+                    if (trace != null) trace.SeriesOverride = ApiTelemetry.PreflightSeries;
                     await request.ReturnResponse("", "text/plain", null, HttpStatusCode.OK);
                     return;
                 }
@@ -1876,7 +2070,9 @@ namespace Omnipotent.Services.KliveAPI
                 KMProfileManager.KMProfile? preResolvedUser = null;
                 if (!string.IsNullOrWhiteSpace(defenceAuthHeader))
                 {
+                    trace?.Enter(TelemetryStage.Auth);
                     preResolvedUser = await ResolveRequestUserAsync(req);
+                    trace?.Enter(TelemetryStage.Prologue);
                     if (preResolvedUser != null)
                     {
                         defenceProfileId = preResolvedUser.UserID;
@@ -1891,7 +2087,10 @@ namespace Omnipotent.Services.KliveAPI
                 var defence = TryGetDefence();
                 if (defence != null && !string.IsNullOrEmpty(defenceIp) && !skipDefenceGateForKlives)
                 {
+                    trace?.Enter(TelemetryStage.DefenceGate);
                     var decision = defence.EvaluateRequestGate(defenceIp, route);
+                    trace?.Enter(TelemetryStage.Prologue);
+                    if (decision != IpThreatTracker.GateDecision.Allow && trace != null) trace.Denied = true;
                     if (decision == IpThreatTracker.GateDecision.Block)
                     {
                         defenceOutcome = RequestOutcome.PreBlocked;
@@ -1902,7 +2101,9 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     else if (decision == IpThreatTracker.GateDecision.Tarpit)
                     {
+                        trace?.Enter(TelemetryStage.DefenceDelay);
                         try { await Task.Delay(TimeSpan.FromSeconds(15) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 5000)), cancellationToken.Token); } catch { }
+                        trace?.Enter(TelemetryStage.Prologue);
                         defenceDenyReason = "Tarpit";
                         defenceOutcome = RequestOutcome.PreBlocked;
                         context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
@@ -1923,6 +2124,9 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     shouldRecordStatistics = false;
                     defenceSkipRecord = true;
+                    trace = null; // long-lived sockets would only distort request latency
+                    request.trace = null;
+                    RequestTrace.Current = null;
                     if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
                     {
                         request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
@@ -1972,7 +2176,16 @@ namespace Omnipotent.Services.KliveAPI
 
                     if (ShouldResolveUser(req, routeData.authenticationLevelRequired))
                     {
-                        request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
+                        if (preResolvedUser != null)
+                        {
+                            request.user = preResolvedUser;
+                        }
+                        else
+                        {
+                            trace?.Enter(TelemetryStage.Auth);
+                            request.user = await ResolveRequestUserAsync(req);
+                            trace?.Enter(TelemetryStage.Prologue);
+                        }
                     }
 
                     if (defenceFromWebsite)
@@ -2003,7 +2216,9 @@ namespace Omnipotent.Services.KliveAPI
                         }
                         if (routeData.requestBodyMode == RequestBodyMode.Buffered && CanRequestCarryBody(req.HttpMethod))
                         {
+                            trace?.Enter(TelemetryStage.RequestBodyRead);
                             (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req, routeData.maxBodyBytes);
+                            trace?.Enter(TelemetryStage.Prologue);
                             defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
                             defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
                             (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(
@@ -2103,7 +2318,9 @@ namespace Omnipotent.Services.KliveAPI
                             int recentFailures = defence?.RegisterAuthFailure(defenceIp) ?? 0;
                             if (recentFailures > FastFailAuthFailures)
                             {
+                                trace?.Enter(TelemetryStage.DefenceDelay);
                                 try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
+                                trace?.Enter(TelemetryStage.Prologue);
                             }
                             await DenyRequest(request, DeniedRequestReason.NoProfile, HttpStatusCode.Forbidden);
                         }
@@ -2139,6 +2356,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             catch (Exception ex)
             {
+                if (trace != null) trace.Exception = true;
                 ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
                 defenceOutcome = RequestOutcome.ServerError;
                 try
@@ -2164,6 +2382,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             finally
             {
+                trace?.Enter(TelemetryStage.Teardown);
                 Interlocked.Decrement(ref _inFlightRequests);
                 Interlocked.Exchange(ref _lastRequestCompletedUtcTicks, DateTime.UtcNow.Ticks);
 
@@ -2251,6 +2470,26 @@ namespace Omnipotent.Services.KliveAPI
                         }
                         catch { }
                     }
+                }
+
+                if (trace != null)
+                {
+                    try
+                    {
+                        trace.Route = statsRoute;
+                        trace.Method = statsMethod;
+                        trace.Matched = matchedRoute;
+                        trace.StatusCode = context?.Response?.StatusCode > 0 ? context.Response.StatusCode : (int)HttpStatusCode.InternalServerError;
+                        if (trace.RequestBytes == 0) trace.RequestBytes = defenceBodyLength;
+                        trace.Origin = defenceRequestOrigin;
+                        trace.ProfileId = defenceProfileId;
+                        trace.ProfileName = defenceProfileName;
+                        trace.ProfileRank = defenceProfileRank ?? -1;
+                        trace.DenyReason = defenceDenyReason;
+                        if (defenceOutcome == RequestOutcome.PreBlocked) trace.Denied = true;
+                        telemetry?.Record(trace);
+                    }
+                    catch { /* telemetry must never affect the request */ }
                 }
             }
         }

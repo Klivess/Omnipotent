@@ -32,7 +32,10 @@ Live telemetry (`/projects/computers/health`, five projects' event logs) on KLIV
   window, and 4.2 has no `docker desktop restart`. A running Docker Desktop with a dead engine
   now has only its own processes killed and `com.docker.service` restarted, then it is
   relaunched. The start budget is back to 4 minutes (1 minute was shorter than this host's
-  cold start).
+  cold start). Docker's own WSL distros are terminated too, and the WSL VM is shut down when
+  nothing else runs in it. The first live run after the WSL repair showed why: the
+  `docker-desktop` distro stayed "Running" with a dead init ("Waiting for Procd service"), and
+  every relaunch reattached to it.
 - **Continuous supervision.** Every minute the daemon is probed. Recovery runs when it is down
   (single-flight, 10-minute cooldown), and desktops are reattached when it returns. Before this,
   recovery ran only at startup or when an agent tripped over it.

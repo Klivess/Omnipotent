@@ -196,7 +196,12 @@ namespace Omnipotent.Services.Omniscience
         // use GetOrComputeAsync for list/aggregate routes that re-run the same query.
         internal static async Task GatedRead(UserRequest req, Func<string> buildPayload)
         {
-            if (!await ReadGate.WaitAsync(GateWaitBudget))
+            bool acquired;
+            using (req.Trace?.Span("gate-wait"))
+            {
+                acquired = await ReadGate.WaitAsync(GateWaitBudget);
+            }
+            if (!acquired)
             {
                 await RespondBusy(req);
                 return;
@@ -205,7 +210,10 @@ namespace Omnipotent.Services.Omniscience
             string payload;
             try
             {
-                payload = await Task.Run(buildPayload);
+                using (req.Trace?.Span("query"))
+                {
+                    payload = await Task.Run(buildPayload);
+                }
             }
             finally
             {

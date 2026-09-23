@@ -134,6 +134,17 @@ public class DockerComputerHardeningTests
         Assert.Equal(owned, WslHostCompatibility.WithMemoryCap(owned, 10 * GiB));
     }
 
+    [Fact]
+    public void RunningDistrosAreParsedFromWslsUtf16Listing()
+    {
+        // The live host on 2026-09-23: Docker's distro "Running" with a wedged init.
+        string listing = string.Join("\0", "  NAME                   STATE           VERSION\r\n* wslfix                 Stopped         2\r\n  docker-desktop         Running         2\r\n  docker-desktop-data    Stopped         2\r\n".ToCharArray());
+        Assert.Equal(new[] { "docker-desktop" }, ContainerDependencyBootstrapper.ParseRunningDistros(listing));
+        Assert.Equal(new[] { "Ubuntu", "docker-desktop" }, ContainerDependencyBootstrapper.ParseRunningDistros(
+            "* Ubuntu Running 2\n  docker-desktop Running 2\n"));
+        Assert.Empty(ContainerDependencyBootstrapper.ParseRunningDistros("There are no installed distributions."));
+    }
+
     // ── host-infrastructure guardrail ──
 
     private static string Ps(string script) => JsonConvert.SerializeObject(new { script });

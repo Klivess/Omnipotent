@@ -78,7 +78,7 @@ thread pool (min 128)
    ├─ response cache lookup       dependency-versioned
    ├─ read body                   buffered or streamed, capped
    ├─ handler
-   └─ record statistics + cache fill
+   └─ record statistics + telemetry trace + cache fill
 ```
 
 Two details in that path are load-bearing, and both were bugs first:
@@ -131,6 +131,56 @@ request and persists across restarts: totals, successes, client errors, server e
 mean and max response time, last-request timestamp, and per-day and per-route buckets. This is the
 data behind the dashboard's API tiles, and it is how a regression like the serialisation bug above
 becomes visible as a shape in a chart rather than a vague feeling that things got slower.
+
+## Telemetry
+
+[`Telemetry/`](../Omnipotent/Services/KliveAPI/Telemetry) is the detailed layer on top of the
+statistics above: every request is traced stage by stage, aggregated into mergeable histograms at
+several resolutions, and served to the website's **API telemetry** page (`/administration/api-telemetry`).
+
+**Stages.** A `RequestTrace` is always "in" exactly one stage, and `Enter(stage)` charges the time
+since the last transition to the current one — so stages partition a request's lifetime with no gaps:
+
+| Stage | What it measures |
+|---|---|
+| `queue` | Accept → a pool thread starts the request. Rises under thread-pool starvation. |
+| `prologue` | Route/query parsing, header capture, method and permission checks. |
+| `auth` | Resolving the profile from the Authorization header. |
+| `gate` / `delay` | OmniDefence gate evaluation / its deliberate tarpit sleeps (`delay` is excluded from latency). |
+| `body` | Reading the request body (client upload). |
+| `cache` | Response-cache key + lookup. |
+| `handler` | The handler's own work until it starts emitting a response. |
+| `encode` / `etag` / `compress` | UTF-8/JSON encoding, weak-ETag hashing, Brotli/gzip. |
+| `write` | Handing bytes to http.sys. Only tracks the network for bodies larger than the socket buffer. |
+| `teardown` | Post-response bookkeeping; not client-visible, excluded from latency. |
+
+Handlers can add named spans (`using (req.Trace?.Span("db")) {…}`); Omniscience's `GatedRead` records
+`gate-wait` and `query`. Every response carries a multi-entry `Server-Timing` header
+(`queue;dur=…, handler;dur=…, app;dur=…, trace;desc=<id>`), which browser devtools show directly.
+
+**Client half.** The website observes Resource Timing entries for API calls and beacons
+DNS / TCP / TLS / network-wait / download phases to `POST /KliveAPI/telemetry/rum`. Beacons carrying the
+`trace` id of a kept server trace are joined to it, giving a full browser → server → browser waterfall.
+
+**Aggregation.** `Record()` is one non-blocking channel write. A single engine thread owns all state and
+folds traces into 10 s (global only), 1 m, 1 h and 1 d buckets per series (`METHOD route`, plus
+`*` global, `*batch` batch items, `(denied)`, `(unmatched)`, `(preflight)`). Latency and every stage use
+one fixed log-scale histogram (≤ ±9 % percentile error) so buckets merge exactly across time and series.
+`/batch` items get their own child traces — counted in their route, not in global throughput.
+Denied/tarpitted requests stay out of global latency.
+
+**Persistence.** `SavedData/KliveAPI/Analytics/telemetry.db` (its own SQLite file — never OmniDefence's
+connection). Closed minutes are written each minute; open hour/day buckets are checkpointed every minute
+so a restart resumes them. Kept traces: every request over the slow threshold, every 5xx/disconnect,
+plus N samples per route per minute. Retention and thresholds are OmniSettings
+(`KliveAPITelemetry*`; kill switches `KliveAPITelemetryDisabled`, `KliveAPITelemetryRumDisabled`).
+
+**Serving.** Every standard preset (15m … all) of overview/routes/runtime/rum, plus weekly and health,
+is rebuilt on the engine thread when buckets close and stored pre-serialized and pre-compressed with an
+ETag — a request is a dictionary lookup (usually a 304). Custom ranges/buckets are single-flighted
+engine queries over the in-memory tiers, capped at 300 points; asking for resolution the retained data
+no longer has returns a coarser bucket with `degraded: true` and a `note`, never a slow scan.
+Routes (Klives): `/KliveAPI/telemetry/{overview,routes,route,runtime,rum,weekly,health,live,traces,trace}`.
 
 `OmniDefence` consumes the same request outcomes for abuse tracking. Its writes are deliberately
 never awaited on the request path — doing so once turned a background SQLite write into a
