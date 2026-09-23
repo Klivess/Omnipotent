@@ -170,23 +170,67 @@ namespace Omnipotent.Services.OmniDefence
                         break;
                 }
                 rec.ThreatScore = Math.Clamp(rec.ThreatScore, 0, 1000);
-
-                // Auto-escalation of status (only escalate, never auto-downgrade away from manual states)
-                if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId) && rec.Status != nameof(IpStatus.Blocked) && rec.Status != nameof(IpStatus.Honeypot))
-                {
-                    if (rec.ThreatScore >= AutoBlockScore)
-                    {
-                        rec.Status = nameof(IpStatus.Blocked);
-                        rec.LastBlockReason = $"Auto: threat score reached {rec.ThreatScore:F0}";
-                    }
-                    else if (rec.ThreatScore >= AutoWatchScore && rec.Status == nameof(IpStatus.Normal))
-                    {
-                        rec.Status = nameof(IpStatus.Watch);
-                    }
-                }
+                ApplyAutoEscalation(rec);
             }
             MarkDirty(ip);
             return rec;
+        }
+
+        /// <summary>Auto-escalation of status: only escalates, never downgrades away from manual states. Caller holds lock(rec).</summary>
+        private void ApplyAutoEscalation(IpRecord rec)
+        {
+            if (!string.IsNullOrWhiteSpace(rec.AssociatedProfileId) || rec.Status == nameof(IpStatus.Blocked) || rec.Status == nameof(IpStatus.Honeypot)) return;
+            if (rec.ThreatScore >= AutoBlockScore)
+            {
+                rec.Status = nameof(IpStatus.Blocked);
+                rec.LastBlockReason = $"Auto: threat score reached {rec.ThreatScore:F0}";
+            }
+            else if (rec.ThreatScore >= AutoWatchScore && rec.Status == nameof(IpStatus.Normal))
+            {
+                rec.Status = nameof(IpStatus.Watch);
+            }
+        }
+
+        /// <summary>
+        /// One-off threat-score increase when fingerprinting moves an IP into a malicious
+        /// class. Goes through the same auto-escalation as per-request scoring.
+        /// </summary>
+        public IpRecord? ApplyClassDelta(string ip, double delta)
+        {
+            if (delta == 0) return null;
+            var rec = Get(ip);
+            if (rec == null) return null;
+            lock (rec)
+            {
+                rec.ThreatScore = Math.Clamp(rec.ThreatScore + delta, 0, 1000);
+                ApplyAutoEscalation(rec);
+            }
+            MarkDirty(ip);
+            return rec;
+        }
+
+        private static int Severity(string? status) => status switch
+        {
+            nameof(IpStatus.Watch) => 1,
+            nameof(IpStatus.Tarpit) => 2,
+            nameof(IpStatus.Honeypot) => 3,
+            nameof(IpStatus.Blocked) => 4,
+            _ => 0
+        };
+
+        /// <summary>Raises an IP's status to <paramref name="status"/> unless it is already at least as severe. Returns true if it changed.</summary>
+        public bool EscalateStatus(string ip, IpStatus status, string? reason)
+        {
+            var rec = Get(ip);
+            if (rec == null) return false;
+            lock (rec)
+            {
+                if (Severity(rec.Status) >= Severity(status.ToString())) return false;
+                rec.Status = status.ToString();
+                if (status == IpStatus.Blocked) rec.LastBlockReason = reason;
+            }
+            MarkDirty(ip);
+            return true;
         }
 
         public Task PersistAsync(IpRecord rec)

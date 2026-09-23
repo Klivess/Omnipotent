@@ -32,6 +32,7 @@ using Microsoft.PowerShell.Commands;
 using System.Security.Cryptography;
 using OmniDefenceService = Omnipotent.Services.OmniDefence.OmniDefence;
 using Omnipotent.Services.OmniDefence;
+using Omnipotent.Services.OmniDefence.Fingerprint;
 using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.KliveAPI.Telemetry;
 
@@ -971,6 +972,7 @@ namespace Omnipotent.Services.KliveAPI
                 bool allowed = required == KMProfileManager.KMPermissions.Anybody
                     || (batchReq.user != null && batchReq.user.CanLogin && batchReq.user.KlivesManagementRank >= required);
                 if (!allowed) return BatchError(result, 401, "Insufficient permission.");
+                TryGetDefence()?.NoteBatchRoute(OmniDefenceService.ExtractClientIp(batchReq.req), normalized);
 
                 NameValueCollection subParams = string.IsNullOrEmpty(queryPart)
                     ? new NameValueCollection()
@@ -2022,6 +2024,7 @@ namespace Omnipotent.Services.KliveAPI
             string? defenceBodyText = null;
             bool defenceBodyTruncated = false;
             string? defenceHeadersJson = null;
+            RequestSignals? defenceSignals = null;
             RequestBodyAuditState? defenceBodyAudit = null;
             AuditedRequestBodyStream? streamingBodyStream = null;
             const int MaxStoredBodyBytes = 65536; // 64KB cap for stored body text
@@ -2039,6 +2042,8 @@ namespace Omnipotent.Services.KliveAPI
                 defenceFromWebsite = IsWebsiteClientRequest(req);
                 defenceClientPage = req.Headers["X-Klive-Page"] ?? req.Headers["Referer"];
                 defenceHeadersJson = CaptureHeadersJson(req);
+                // Headers are copied now, while the request is live; the outcome is filled in the finally.
+                defenceSignals = RequestSignals.Capture(req, defenceIp);
                 string defenceAuthHeader = req.Headers["Authorization"] ?? string.Empty;
                 defenceRequestOrigin = defenceFromWebsite ? (string.IsNullOrWhiteSpace(defenceAuthHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile") : "DirectApi";
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
@@ -2467,6 +2472,23 @@ namespace Omnipotent.Services.KliveAPI
                                 HeadersJson = defenceHeadersJson
                             };
                             _ = defence.RecordRequestAsync(row, defenceOutcome);
+
+                            if (defenceSignals != null)
+                            {
+                                defenceSignals.Route = statsRoute;
+                                defenceSignals.Method = statsMethod;
+                                defenceSignals.Query = row.Query;
+                                defenceSignals.StatusCode = statusCode;
+                                defenceSignals.DurationMs = row.DurationMs;
+                                defenceSignals.Outcome = defenceOutcome;
+                                defenceSignals.DenyReason = defenceDenyReason;
+                                defenceSignals.MatchedRoute = matchedRoute;
+                                defenceSignals.RequestOrigin = defenceRequestOrigin;
+                                defenceSignals.ProfileId = defenceProfileId;
+                                defenceSignals.ProfileRank = defenceProfileRank;
+                                defenceSignals.ResponseBytes = trace?.ResponseBytes ?? 0;
+                                defence.OfferFingerprintSignals(defenceSignals);
+                            }
                         }
                         catch { }
                     }

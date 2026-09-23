@@ -10,7 +10,7 @@ namespace Omnipotent.Services.OmniDefence
     /// All <c>/omnidefence/*</c> HTTP routes. Every route requires
     /// <see cref="KMProfileManager.KMPermissions.Klives"/>.
     /// </summary>
-    internal static class OmniDefenceRoutes
+    internal static partial class OmniDefenceRoutes
     {
         private const string DerivedRequestOriginSql = "COALESCE(NULLIF(request_origin, ''), CASE WHEN client_page IS NOT NULL AND client_page <> '' THEN CASE WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'WebsiteProfile' ELSE 'WebsiteNoProfile' END WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'DirectApiProfile' ELSE 'DirectApi' END)";
         private const string RequestSelectSql = "SELECT id, utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, " + DerivedRequestOriginSql + " AS request_origin, client_page FROM requests";
@@ -90,7 +90,9 @@ namespace Omnipotent.Services.OmniDefence
                     topThreat,
                     topAttackers,
                     topRoutes,
-                    originBreakdown
+                    originBreakdown,
+                    classBreakdown = ClassBreakdown(parent),
+                    tagBreakdown = TagBreakdown(parent)
                 };
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(resp), "application/json");
@@ -461,24 +463,27 @@ namespace Omnipotent.Services.OmniDefence
             // Settings (thresholds)
             await parent.CreateAPIRoute("/omnidefence/settings", async req =>
             {
-                var t = parent.Tracker;
+                var st = parent.Settings;
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
-                    autoWatchScore = t.AutoWatchScore,
-                    autoBlockScore = t.AutoBlockScore,
-                    escalation2 = t.Escalation2Threshold,
-                    escalation3 = t.Escalation3Threshold
+                    autoWatchScore = st.AutoWatchScore,
+                    autoBlockScore = st.AutoBlockScore,
+                    escalation2 = st.Escalation2,
+                    escalation3 = st.Escalation3,
+                    fingerprint = await FingerprintSettingsView(parent, st)
                 }), "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
             await parent.CreateAPIRoute("/omnidefence/settings/update", async req =>
             {
                 var body = ParseJsonBody(req);
-                var t = parent.Tracker;
-                if (body.TryGetValue("autoWatchScore", out var w) && w != null) t.AutoWatchScore = Convert.ToInt32(w);
-                if (body.TryGetValue("autoBlockScore", out var b) && b != null) t.AutoBlockScore = Convert.ToInt32(b);
-                if (body.TryGetValue("escalation2", out var e2) && e2 != null) t.Escalation2Threshold = Convert.ToInt32(e2);
-                if (body.TryGetValue("escalation3", out var e3) && e3 != null) t.Escalation3Threshold = Convert.ToInt32(e3);
+                var next = parent.Settings.Clone();
+                if (body.TryGetValue("autoWatchScore", out var w) && w != null) next.AutoWatchScore = Convert.ToInt32(w);
+                if (body.TryGetValue("autoBlockScore", out var b) && b != null) next.AutoBlockScore = Convert.ToInt32(b);
+                if (body.TryGetValue("escalation2", out var e2) && e2 != null) next.Escalation2 = Convert.ToInt32(e2);
+                if (body.TryGetValue("escalation3", out var e3) && e3 != null) next.Escalation3 = Convert.ToInt32(e3);
+                ApplyFingerprintSettings(next, body);
+                await parent.SaveSettingsAsync(next);
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -487,7 +492,7 @@ namespace Omnipotent.Services.OmniDefence
             {
                 string table = (req.userParameters.Get("table") ?? req.userParameters.Get("kind") ?? "requests").ToLowerInvariant();
                 string format = (req.userParameters.Get("format") ?? "json").ToLowerInvariant();
-                if (!new[] { "requests", "auth_events", "profile_actions", "ip_records", "ip_events" }.Contains(table))
+                if (!new[] { "requests", "auth_events", "profile_actions", "ip_records", "ip_events", "ip_fingerprints", "ip_intel", "fp_devices" }.Contains(table))
                 {
                     await req.ReturnResponse("Invalid table", "text/plain", null, HttpStatusCode.BadRequest);
                     return;
@@ -502,6 +507,8 @@ namespace Omnipotent.Services.OmniDefence
                     await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
                 }
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+
+            await RegisterFingerprintRoutesAsync(parent);
         }
 
         // -------- Query builders --------

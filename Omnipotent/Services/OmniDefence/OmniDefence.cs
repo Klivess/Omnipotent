@@ -5,6 +5,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Services.OmniDefence.Fingerprint;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http;
@@ -20,7 +21,7 @@ namespace Omnipotent.Services.OmniDefence
     /// to KliveAPI. Provides Klives-only routes to query/filter the data and
     /// to ban / watch / honeypot / scan attacker IPs.
     /// </summary>
-    public class OmniDefence : OmniService
+    public partial class OmniDefence : OmniService
     {
         private OmniDefenceStore store = null!;
         private IpThreatTracker tracker = null!;
@@ -40,6 +41,18 @@ namespace Omnipotent.Services.OmniDefence
         private readonly ConcurrentDictionary<long, BlockedRegionRow> blockedRegions = new();
         private volatile BlockedRegionRow[] blockedRegionSnapshot = Array.Empty<BlockedRegionRow>();
 
+        // Fingerprinting: per-IP signal aggregation + classification, and external intel.
+        private FingerprintEngine? fingerprints;
+        private IpIntelService? intel;
+        private volatile OmniDefenceSettings settings = new();
+        private readonly CancellationTokenSource intelCts = new();
+
+        // ip-api's free tier allows 45 lookups/minute; stay under it so a burst of new IPs
+        // doesn't earn a ban (a 429 would otherwise read as a failure and cool down 6h).
+        private readonly object geoRateLock = new();
+        private readonly Queue<DateTime> geoRecentLookups = new();
+        private const int GeoLookupsPerMinute = 40;
+
         public OmniDefence()
         {
             name = "OmniDefence";
@@ -49,6 +62,10 @@ namespace Omnipotent.Services.OmniDefence
         public OmniDefenceStore Store => store;
         public IpThreatTracker Tracker => tracker;
         public OmniDefenceScanner Scanner => scanner;
+        public FingerprintEngine? Fingerprints => fingerprints;
+        public IpIntelService? Intel => intel;
+        public OmniDefenceSettings Settings => settings;
+        public string? RobotsTrapRoute => settings.RobotsTrapEnabled ? settings.RobotsTrapPath : null;
 
         protected override async void ServiceMain()
         {
@@ -63,6 +80,7 @@ namespace Omnipotent.Services.OmniDefence
                 ServiceQuitRequest += () => { try { store.ShutdownAsync().GetAwaiter().GetResult(); } catch { } };
 
                 tracker = new IpThreatTracker(store);
+                await LoadSettingsAsync();
                 await tracker.LoadAsync();
                 await BackfillProfileAssociationsAsync();
 
@@ -70,6 +88,7 @@ namespace Omnipotent.Services.OmniDefence
                 {
                     honeypotRoutes[hp.Route] = hp.ResponseKind;
                 }
+                await EnsureRobotsTrapAsync();
 
                 foreach (var region in await store.ListBlockedRegionsAsync())
                 {
@@ -81,6 +100,8 @@ namespace Omnipotent.Services.OmniDefence
 
                 // Periodic flush so threat scores survive restarts.
                 _ = PeriodicFlushLoop();
+
+                await StartFingerprintingAsync();
 
                 await OmniDefenceRoutes.RegisterAsync(this);
             }
@@ -237,7 +258,9 @@ namespace Omnipotent.Services.OmniDefence
             {
                 bool hasDetailedGeo = (!string.IsNullOrWhiteSpace(rec.City) || !string.IsNullOrWhiteSpace(rec.Region) || !string.IsNullOrWhiteSpace(rec.Isp) || !string.IsNullOrWhiteSpace(rec.Org)) && rec.Latitude.HasValue && rec.Longitude.HasValue;
                 bool isKnownPrivate = string.Equals(rec.Country, "Private", StringComparison.OrdinalIgnoreCase) && string.Equals(rec.Asn, "Local", StringComparison.OrdinalIgnoreCase);
-                if (hasDetailedGeo || isKnownPrivate)
+                // Records geolocated before the hosting/proxy/mobile flags existed get one more lookup.
+                bool hasNetworkFlags = rec.IsHosting.HasValue;
+                if (isKnownPrivate || (hasDetailedGeo && hasNetworkFlags))
                 {
                     if (hasDetailedGeo) _ = EnforceBlockedRegionsAsync(rec);
                     return;
@@ -266,7 +289,8 @@ namespace Omnipotent.Services.OmniDefence
                     return;
                 }
 
-                string url = $"http://ip-api.com/json/{rec.Ip}?fields=status,country,countryCode,regionName,city,zip,isp,org,as,lat,lon,timezone,query,message";
+                if (!TryTakeGeoLookupSlot()) return; // over the rate limit: the next request retries
+                string url = $"http://ip-api.com/json/{rec.Ip}?fields=status,country,countryCode,regionName,city,zip,isp,org,as,asname,lat,lon,timezone,mobile,proxy,hosting,query,message";
                 string json = await GeoIpClient.GetStringAsync(url);
                 var result = JsonConvert.DeserializeObject<GeoIpResponse>(json);
                 if (result?.Status == "success")
@@ -281,14 +305,20 @@ namespace Omnipotent.Services.OmniDefence
                         rec.Org = result.Org;
                         rec.Latitude = result.Latitude;
                         rec.Longitude = result.Longitude;
+                        rec.IsHosting = result.Hosting;
+                        rec.IsProxy = result.Proxy;
+                        rec.IsMobile = result.Mobile;
+                        rec.Timezone = result.Timezone;
+                        rec.AsName = result.AsName;
                     }
                     await tracker.PersistAsync(rec);
+                    fingerprints?.Reclassify(rec.Ip);
                     await RecordIpEventAsync(new IpEventRow
                     {
                         UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                         Ip = rec.Ip,
                         Kind = "GeoIP",
-                        Detail = JsonConvert.SerializeObject(new { result.Country, result.CountryCode, result.RegionName, result.City, result.Zip, result.Isp, result.Org, result.Asn, result.Latitude, result.Longitude, result.Timezone })
+                        Detail = JsonConvert.SerializeObject(new { result.Country, result.CountryCode, result.RegionName, result.City, result.Zip, result.Isp, result.Org, result.Asn, result.AsName, result.Latitude, result.Longitude, result.Timezone, result.Hosting, result.Proxy, result.Mobile })
                     });
                     await EnforceBlockedRegionsAsync(rec);
                 }
@@ -362,6 +392,30 @@ namespace Omnipotent.Services.OmniDefence
 
             [JsonProperty("lon")]
             public double? Longitude { get; set; }
+
+            [JsonProperty("asname")]
+            public string? AsName { get; set; }
+
+            [JsonProperty("hosting")]
+            public bool? Hosting { get; set; }
+
+            [JsonProperty("proxy")]
+            public bool? Proxy { get; set; }
+
+            [JsonProperty("mobile")]
+            public bool? Mobile { get; set; }
+        }
+
+        private bool TryTakeGeoLookupSlot()
+        {
+            lock (geoRateLock)
+            {
+                var cutoff = DateTime.UtcNow.AddMinutes(-1);
+                while (geoRecentLookups.Count > 0 && geoRecentLookups.Peek() < cutoff) geoRecentLookups.Dequeue();
+                if (geoRecentLookups.Count >= GeoLookupsPerMinute) return false;
+                geoRecentLookups.Enqueue(DateTime.UtcNow);
+                return true;
+            }
         }
 
         // ------------------------------------------------------------------

@@ -186,6 +186,43 @@ namespace Omnipotent.Services.OmniDefence
                     reason TEXT,
                     created_utc INTEGER NOT NULL,
                     created_by TEXT
+                );",
+
+                // Fingerprinting: full per-IP aggregate as JSON; class/confidence broken out for queries.
+                @"CREATE TABLE IF NOT EXISTS ip_fingerprints (
+                    ip TEXT PRIMARY KEY,
+                    updated_utc INTEGER NOT NULL,
+                    class TEXT,
+                    confidence REAL,
+                    json TEXT NOT NULL
+                );",
+                "CREATE INDEX IF NOT EXISTS ix_ipf_class ON ip_fingerprints(class);",
+
+                // Keyed/slow intel lookups (AbuseIPDB, GreyNoise, rDNS), cached per provider.
+                @"CREATE TABLE IF NOT EXISTS ip_intel (
+                    ip TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    fetched_utc INTEGER NOT NULL,
+                    json TEXT,
+                    PRIMARY KEY (ip, provider)
+                );",
+
+                // Browser-beacon devices: one row per (device, ip) pairing.
+                @"CREATE TABLE IF NOT EXISTS fp_devices (
+                    device_id TEXT NOT NULL,
+                    ip TEXT NOT NULL,
+                    first_seen INTEGER NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    beacons INTEGER DEFAULT 1,
+                    beacon_json TEXT,
+                    PRIMARY KEY (device_id, ip)
+                );",
+                "CREATE INDEX IF NOT EXISTS ix_fpd_ip ON fp_devices(ip);",
+
+                // Durable OmniDefence settings (key/value, JSON values).
+                @"CREATE TABLE IF NOT EXISTS od_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 );"
             };
 
@@ -212,6 +249,16 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("ip_records", "associated_profile_name", "TEXT");
             await EnsureColumnAsync("ip_records", "associated_profile_rank", "INTEGER");
             await EnsureColumnAsync("ip_records", "associated_profile_last_seen_utc", "INTEGER");
+            await EnsureColumnAsync("ip_records", "classification", "TEXT");
+            await EnsureColumnAsync("ip_records", "class_confidence", "REAL");
+            await EnsureColumnAsync("ip_records", "class_tags", "TEXT");
+            await EnsureColumnAsync("ip_records", "class_updated_utc", "INTEGER");
+            await EnsureColumnAsync("ip_records", "is_hosting", "INTEGER");
+            await EnsureColumnAsync("ip_records", "is_proxy", "INTEGER");
+            await EnsureColumnAsync("ip_records", "is_mobile", "INTEGER");
+            await EnsureColumnAsync("ip_records", "reverse_dns", "TEXT");
+            await EnsureColumnAsync("ip_records", "timezone", "TEXT");
+            await EnsureColumnAsync("ip_records", "as_name", "TEXT");
 
             StartAuditFlusher();
         }
@@ -543,74 +590,71 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         // ---------- IP record upsert ----------
-        public Task UpsertIpRecordAsync(IpRecord rec) => WithLockAsync(async conn =>
+        public Task UpsertIpRecordAsync(IpRecord rec) => UpsertIpRecordsAsync(new[] { rec });
+
+        // Geo/intel columns COALESCE so a flush racing an enrichment never erases it;
+        // classification columns overwrite because "no class" is a real state.
+        private static readonly (string Column, string Param, SqliteType Type, bool Coalesce, Func<IpRecord, object?> Get)[] IpRecordColumns =
         {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"INSERT INTO ip_records
-                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, city, region, isp, org, latitude, longitude, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
-                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$city,$region,$isp,$org,$lat,$lon,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
-                ON CONFLICT(ip) DO UPDATE SET
-                    last_seen=excluded.last_seen,
-                    total_requests=excluded.total_requests,
-                    successful_requests=excluded.successful_requests,
-                    unauth_attempts=excluded.unauth_attempts,
-                    deny_count=excluded.deny_count,
-                    threat_score=excluded.threat_score,
-                    status=excluded.status,
-                    country=COALESCE(excluded.country, ip_records.country),
-                    asn=COALESCE(excluded.asn, ip_records.asn),
-                    city=COALESCE(excluded.city, ip_records.city),
-                    region=COALESCE(excluded.region, ip_records.region),
-                    isp=COALESCE(excluded.isp, ip_records.isp),
-                    org=COALESCE(excluded.org, ip_records.org),
-                    latitude=COALESCE(excluded.latitude, ip_records.latitude),
-                    longitude=COALESCE(excluded.longitude, ip_records.longitude),
-                    notes=excluded.notes,
-                    associated_profile_id=COALESCE(excluded.associated_profile_id, ip_records.associated_profile_id),
-                    associated_profile_name=COALESCE(excluded.associated_profile_name, ip_records.associated_profile_name),
-                    associated_profile_rank=COALESCE(excluded.associated_profile_rank, ip_records.associated_profile_rank),
-                    associated_profile_last_seen_utc=COALESCE(excluded.associated_profile_last_seen_utc, ip_records.associated_profile_last_seen_utc),
-                    first_alerted_utc=COALESCE(excluded.first_alerted_utc, ip_records.first_alerted_utc),
-                    last_alerted_utc=excluded.last_alerted_utc,
-                    escalation_level=excluded.escalation_level,
-                    last_block_reason=excluded.last_block_reason,
-                    last_scanned_utc=COALESCE(excluded.last_scanned_utc, ip_records.last_scanned_utc)";
-            cmd.Parameters.AddWithValue("$ip", rec.Ip);
-            cmd.Parameters.AddWithValue("$fs", rec.FirstSeen);
-            cmd.Parameters.AddWithValue("$ls", rec.LastSeen);
-            cmd.Parameters.AddWithValue("$tot", rec.TotalRequests);
-            cmd.Parameters.AddWithValue("$succ", rec.SuccessfulRequests);
-            cmd.Parameters.AddWithValue("$ua", rec.UnauthAttempts);
-            cmd.Parameters.AddWithValue("$dc", rec.DenyCount);
-            cmd.Parameters.AddWithValue("$ts", rec.ThreatScore);
-            cmd.Parameters.AddWithValue("$st", rec.Status);
-            cmd.Parameters.AddWithValue("$co", (object?)rec.Country ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$asn", (object?)rec.Asn ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$city", (object?)rec.City ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$region", (object?)rec.Region ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$isp", (object?)rec.Isp ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$org", (object?)rec.Org ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$lat", (object?)rec.Latitude ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$lon", (object?)rec.Longitude ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$nt", (object?)rec.Notes ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$apid", (object?)rec.AssociatedProfileId ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$apname", (object?)rec.AssociatedProfileName ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$aprank", (object?)rec.AssociatedProfileRank ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$aplast", (object?)rec.AssociatedProfileLastSeenUtc ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$fa", (object?)rec.FirstAlertedUtc ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$la", (object?)rec.LastAlertedUtc ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$el", rec.EscalationLevel);
-            cmd.Parameters.AddWithValue("$lbr", (object?)rec.LastBlockReason ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$lsc", (object?)rec.LastScannedUtc ?? DBNull.Value);
-            await cmd.ExecuteNonQueryAsync();
-        });
+            ("ip", "$ip", SqliteType.Text, false, r => r.Ip),
+            ("first_seen", "$fs", SqliteType.Integer, false, r => r.FirstSeen),
+            ("last_seen", "$ls", SqliteType.Integer, false, r => r.LastSeen),
+            ("total_requests", "$tot", SqliteType.Integer, false, r => r.TotalRequests),
+            ("successful_requests", "$succ", SqliteType.Integer, false, r => r.SuccessfulRequests),
+            ("unauth_attempts", "$ua", SqliteType.Integer, false, r => r.UnauthAttempts),
+            ("deny_count", "$dc", SqliteType.Integer, false, r => r.DenyCount),
+            ("threat_score", "$ts", SqliteType.Real, false, r => r.ThreatScore),
+            ("status", "$st", SqliteType.Text, false, r => r.Status),
+            ("country", "$co", SqliteType.Text, true, r => r.Country),
+            ("asn", "$asn", SqliteType.Text, true, r => r.Asn),
+            ("city", "$city", SqliteType.Text, true, r => r.City),
+            ("region", "$region", SqliteType.Text, true, r => r.Region),
+            ("isp", "$isp", SqliteType.Text, true, r => r.Isp),
+            ("org", "$org", SqliteType.Text, true, r => r.Org),
+            ("latitude", "$lat", SqliteType.Real, true, r => r.Latitude),
+            ("longitude", "$lon", SqliteType.Real, true, r => r.Longitude),
+            ("notes", "$nt", SqliteType.Text, false, r => r.Notes),
+            ("associated_profile_id", "$apid", SqliteType.Text, true, r => r.AssociatedProfileId),
+            ("associated_profile_name", "$apname", SqliteType.Text, true, r => r.AssociatedProfileName),
+            ("associated_profile_rank", "$aprank", SqliteType.Integer, true, r => r.AssociatedProfileRank),
+            ("associated_profile_last_seen_utc", "$aplast", SqliteType.Integer, true, r => r.AssociatedProfileLastSeenUtc),
+            ("first_alerted_utc", "$fa", SqliteType.Integer, true, r => r.FirstAlertedUtc),
+            ("last_alerted_utc", "$la", SqliteType.Integer, false, r => r.LastAlertedUtc),
+            ("escalation_level", "$el", SqliteType.Integer, false, r => r.EscalationLevel),
+            ("last_block_reason", "$lbr", SqliteType.Text, false, r => r.LastBlockReason),
+            ("last_scanned_utc", "$lsc", SqliteType.Integer, true, r => r.LastScannedUtc),
+            ("classification", "$cls", SqliteType.Text, false, r => r.Classification),
+            ("class_confidence", "$clsc", SqliteType.Real, false, r => r.ClassConfidence),
+            ("class_tags", "$clst", SqliteType.Text, false, r => r.ClassTags),
+            ("class_updated_utc", "$clsu", SqliteType.Integer, false, r => r.ClassUpdatedUtc),
+            ("is_hosting", "$host", SqliteType.Integer, true, r => r.IsHosting.HasValue ? (r.IsHosting.Value ? 1 : 0) : null),
+            ("is_proxy", "$prox", SqliteType.Integer, true, r => r.IsProxy.HasValue ? (r.IsProxy.Value ? 1 : 0) : null),
+            ("is_mobile", "$mob", SqliteType.Integer, true, r => r.IsMobile.HasValue ? (r.IsMobile.Value ? 1 : 0) : null),
+            ("reverse_dns", "$rdns", SqliteType.Text, true, r => r.ReverseDns),
+            ("timezone", "$tz", SqliteType.Text, true, r => r.Timezone),
+            ("as_name", "$asname", SqliteType.Text, true, r => r.AsName),
+        };
+
+        private static readonly string IpRecordUpsertSql = BuildIpRecordUpsertSql();
+
+        private static string BuildIpRecordUpsertSql()
+        {
+            string cols = string.Join(", ", IpRecordColumns.Select(c => c.Column));
+            string vals = string.Join(",", IpRecordColumns.Select(c => c.Param));
+            string sets = string.Join(",\n                    ", IpRecordColumns
+                .Where(c => c.Column != "ip" && c.Column != "first_seen")
+                .Select(c => c.Coalesce
+                    ? $"{c.Column}=COALESCE(excluded.{c.Column}, ip_records.{c.Column})"
+                    : $"{c.Column}=excluded.{c.Column}"));
+            return "INSERT INTO ip_records (" + cols + ")\n                VALUES (" + vals + ")\n                ON CONFLICT(ip) DO UPDATE SET\n                    " + sets;
+        }
 
         /// <summary>
         /// Upserts many IP records inside a single transaction, reusing one prepared
-        /// command. This is dramatically faster than calling <see cref="UpsertIpRecordAsync"/>
-        /// per record — each of those is its own transaction (and WAL fsync), so persisting
-        /// a large IP cache one row at a time took many minutes and starved every other
-        /// writer of the shared connection lock (notably login auditing on startup).
+        /// command. This is dramatically faster than one transaction per record — each of
+        /// those is its own WAL fsync, so persisting a large IP cache one row at a time took
+        /// many minutes and starved every other writer of the shared connection lock
+        /// (notably login auditing on startup).
         /// </summary>
         public Task UpsertIpRecordsAsync(IReadOnlyCollection<IpRecord> records) => WithLockAsync(async conn =>
         {
@@ -619,101 +663,213 @@ namespace Omnipotent.Services.OmniDefence
             using var transaction = (SqliteTransaction)await conn.BeginTransactionAsync();
             using var cmd = conn.CreateCommand();
             cmd.Transaction = transaction;
-            cmd.CommandText = @"INSERT INTO ip_records
-                (ip, first_seen, last_seen, total_requests, successful_requests, unauth_attempts, deny_count, threat_score, status, country, asn, city, region, isp, org, latitude, longitude, notes, associated_profile_id, associated_profile_name, associated_profile_rank, associated_profile_last_seen_utc, first_alerted_utc, last_alerted_utc, escalation_level, last_block_reason, last_scanned_utc)
-                VALUES ($ip,$fs,$ls,$tot,$succ,$ua,$dc,$ts,$st,$co,$asn,$city,$region,$isp,$org,$lat,$lon,$nt,$apid,$apname,$aprank,$aplast,$fa,$la,$el,$lbr,$lsc)
-                ON CONFLICT(ip) DO UPDATE SET
-                    last_seen=excluded.last_seen,
-                    total_requests=excluded.total_requests,
-                    successful_requests=excluded.successful_requests,
-                    unauth_attempts=excluded.unauth_attempts,
-                    deny_count=excluded.deny_count,
-                    threat_score=excluded.threat_score,
-                    status=excluded.status,
-                    country=COALESCE(excluded.country, ip_records.country),
-                    asn=COALESCE(excluded.asn, ip_records.asn),
-                    city=COALESCE(excluded.city, ip_records.city),
-                    region=COALESCE(excluded.region, ip_records.region),
-                    isp=COALESCE(excluded.isp, ip_records.isp),
-                    org=COALESCE(excluded.org, ip_records.org),
-                    latitude=COALESCE(excluded.latitude, ip_records.latitude),
-                    longitude=COALESCE(excluded.longitude, ip_records.longitude),
-                    notes=excluded.notes,
-                    associated_profile_id=COALESCE(excluded.associated_profile_id, ip_records.associated_profile_id),
-                    associated_profile_name=COALESCE(excluded.associated_profile_name, ip_records.associated_profile_name),
-                    associated_profile_rank=COALESCE(excluded.associated_profile_rank, ip_records.associated_profile_rank),
-                    associated_profile_last_seen_utc=COALESCE(excluded.associated_profile_last_seen_utc, ip_records.associated_profile_last_seen_utc),
-                    first_alerted_utc=COALESCE(excluded.first_alerted_utc, ip_records.first_alerted_utc),
-                    last_alerted_utc=excluded.last_alerted_utc,
-                    escalation_level=excluded.escalation_level,
-                    last_block_reason=excluded.last_block_reason,
-                    last_scanned_utc=COALESCE(excluded.last_scanned_utc, ip_records.last_scanned_utc)";
-
-            var pIp = cmd.Parameters.Add("$ip", SqliteType.Text);
-            var pFs = cmd.Parameters.Add("$fs", SqliteType.Integer);
-            var pLs = cmd.Parameters.Add("$ls", SqliteType.Integer);
-            var pTot = cmd.Parameters.Add("$tot", SqliteType.Integer);
-            var pSucc = cmd.Parameters.Add("$succ", SqliteType.Integer);
-            var pUa = cmd.Parameters.Add("$ua", SqliteType.Integer);
-            var pDc = cmd.Parameters.Add("$dc", SqliteType.Integer);
-            var pTs = cmd.Parameters.Add("$ts", SqliteType.Real);
-            var pSt = cmd.Parameters.Add("$st", SqliteType.Text);
-            var pCo = cmd.Parameters.Add("$co", SqliteType.Text);
-            var pAsn = cmd.Parameters.Add("$asn", SqliteType.Text);
-            var pCity = cmd.Parameters.Add("$city", SqliteType.Text);
-            var pRegion = cmd.Parameters.Add("$region", SqliteType.Text);
-            var pIsp = cmd.Parameters.Add("$isp", SqliteType.Text);
-            var pOrg = cmd.Parameters.Add("$org", SqliteType.Text);
-            var pLat = cmd.Parameters.Add("$lat", SqliteType.Real);
-            var pLon = cmd.Parameters.Add("$lon", SqliteType.Real);
-            var pNt = cmd.Parameters.Add("$nt", SqliteType.Text);
-            var pApid = cmd.Parameters.Add("$apid", SqliteType.Text);
-            var pApname = cmd.Parameters.Add("$apname", SqliteType.Text);
-            var pAprank = cmd.Parameters.Add("$aprank", SqliteType.Integer);
-            var pAplast = cmd.Parameters.Add("$aplast", SqliteType.Integer);
-            var pFa = cmd.Parameters.Add("$fa", SqliteType.Integer);
-            var pLa = cmd.Parameters.Add("$la", SqliteType.Integer);
-            var pEl = cmd.Parameters.Add("$el", SqliteType.Integer);
-            var pLbr = cmd.Parameters.Add("$lbr", SqliteType.Text);
-            var pLsc = cmd.Parameters.Add("$lsc", SqliteType.Integer);
+            cmd.CommandText = IpRecordUpsertSql;
+            var parameters = IpRecordColumns.Select(c => cmd.Parameters.Add(c.Param, c.Type)).ToArray();
 
             foreach (var rec in records)
             {
                 if (rec == null || string.IsNullOrEmpty(rec.Ip)) continue;
                 lock (rec)
                 {
-                    pIp.Value = rec.Ip;
-                    pFs.Value = rec.FirstSeen;
-                    pLs.Value = rec.LastSeen;
-                    pTot.Value = rec.TotalRequests;
-                    pSucc.Value = rec.SuccessfulRequests;
-                    pUa.Value = rec.UnauthAttempts;
-                    pDc.Value = rec.DenyCount;
-                    pTs.Value = rec.ThreatScore;
-                    pSt.Value = (object?)rec.Status ?? DBNull.Value;
-                    pCo.Value = (object?)rec.Country ?? DBNull.Value;
-                    pAsn.Value = (object?)rec.Asn ?? DBNull.Value;
-                    pCity.Value = (object?)rec.City ?? DBNull.Value;
-                    pRegion.Value = (object?)rec.Region ?? DBNull.Value;
-                    pIsp.Value = (object?)rec.Isp ?? DBNull.Value;
-                    pOrg.Value = (object?)rec.Org ?? DBNull.Value;
-                    pLat.Value = (object?)rec.Latitude ?? DBNull.Value;
-                    pLon.Value = (object?)rec.Longitude ?? DBNull.Value;
-                    pNt.Value = (object?)rec.Notes ?? DBNull.Value;
-                    pApid.Value = (object?)rec.AssociatedProfileId ?? DBNull.Value;
-                    pApname.Value = (object?)rec.AssociatedProfileName ?? DBNull.Value;
-                    pAprank.Value = (object?)rec.AssociatedProfileRank ?? DBNull.Value;
-                    pAplast.Value = (object?)rec.AssociatedProfileLastSeenUtc ?? DBNull.Value;
-                    pFa.Value = (object?)rec.FirstAlertedUtc ?? DBNull.Value;
-                    pLa.Value = (object?)rec.LastAlertedUtc ?? DBNull.Value;
-                    pEl.Value = rec.EscalationLevel;
-                    pLbr.Value = (object?)rec.LastBlockReason ?? DBNull.Value;
-                    pLsc.Value = (object?)rec.LastScannedUtc ?? DBNull.Value;
+                    for (int i = 0; i < IpRecordColumns.Length; i++)
+                    {
+                        parameters[i].Value = IpRecordColumns[i].Get(rec) ?? DBNull.Value;
+                    }
                 }
                 await cmd.ExecuteNonQueryAsync();
             }
 
             await transaction.CommitAsync();
+        });
+
+        // ---------- Fingerprints ----------
+
+        public sealed class FingerprintRow
+        {
+            public string Ip = "";
+            public long UpdatedUtc;
+            public string? Class;
+            public double Confidence;
+            public string Json = "";
+        }
+
+        public Task UpsertFingerprintsAsync(IReadOnlyCollection<FingerprintRow> rows) => WithLockAsync(async conn =>
+        {
+            if (rows == null || rows.Count == 0) return;
+            using var transaction = (SqliteTransaction)await conn.BeginTransactionAsync();
+            using var cmd = conn.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandText = @"INSERT INTO ip_fingerprints (ip, updated_utc, class, confidence, json)
+                VALUES ($ip,$u,$c,$conf,$j)
+                ON CONFLICT(ip) DO UPDATE SET updated_utc=excluded.updated_utc, class=excluded.class, confidence=excluded.confidence, json=excluded.json";
+            var pIp = cmd.Parameters.Add("$ip", SqliteType.Text);
+            var pU = cmd.Parameters.Add("$u", SqliteType.Integer);
+            var pC = cmd.Parameters.Add("$c", SqliteType.Text);
+            var pConf = cmd.Parameters.Add("$conf", SqliteType.Real);
+            var pJ = cmd.Parameters.Add("$j", SqliteType.Text);
+            foreach (var row in rows)
+            {
+                pIp.Value = row.Ip;
+                pU.Value = row.UpdatedUtc;
+                pC.Value = (object?)row.Class ?? DBNull.Value;
+                pConf.Value = row.Confidence;
+                pJ.Value = row.Json;
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await transaction.CommitAsync();
+        });
+
+        public Task<List<FingerprintRow>> LoadFingerprintsAsync() => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT ip, updated_utc, class, confidence, json FROM ip_fingerprints";
+            var list = new List<FingerprintRow>();
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                list.Add(new FingerprintRow
+                {
+                    Ip = rdr.GetString(0),
+                    UpdatedUtc = rdr.IsDBNull(1) ? 0 : rdr.GetInt64(1),
+                    Class = rdr.IsDBNull(2) ? null : rdr.GetString(2),
+                    Confidence = rdr.IsDBNull(3) ? 0 : rdr.GetDouble(3),
+                    Json = rdr.IsDBNull(4) ? "{}" : rdr.GetString(4)
+                });
+            }
+            return list;
+        });
+
+        public sealed class AuditRowForBackfill
+        {
+            public long Id;
+            public long UtcTs;
+            public string Ip = "";
+            public string? Method;
+            public string? Route;
+            public string? Query;
+            public int Status;
+            public string? UserAgent;
+            public string? Origin;
+            public string? ProfileId;
+            public int? ProfileRank;
+            public bool Matched;
+            public string? DenyReason;
+            public string? HeadersJson;
+        }
+
+        /// <summary>Max audit-row id, for sizing the fingerprint backfill window.</summary>
+        public Task<long> MaxRequestIdAsync() => ScalarLongAsync("SELECT COALESCE(MAX(id),0) FROM requests", new());
+
+        /// <summary>One chunk of audit rows in id order (fingerprint backfill). Each chunk is its own read.</summary>
+        public Task<List<AuditRowForBackfill>> ReadRequestChunkAsync(long afterId, int limit) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT id, utc_ts, ip, method, route, query, status_code, user_agent, request_origin, profile_id, profile_rank, matched_route, deny_reason, headers_json
+                FROM requests WHERE id > $after AND ip IS NOT NULL AND ip <> '' ORDER BY id LIMIT $lim";
+            cmd.Parameters.AddWithValue("$after", afterId);
+            cmd.Parameters.AddWithValue("$lim", limit);
+            var list = new List<AuditRowForBackfill>(limit);
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                list.Add(new AuditRowForBackfill
+                {
+                    Id = rdr.GetInt64(0),
+                    UtcTs = rdr.IsDBNull(1) ? 0 : rdr.GetInt64(1),
+                    Ip = rdr.GetString(2),
+                    Method = rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                    Route = rdr.IsDBNull(4) ? null : rdr.GetString(4),
+                    Query = rdr.IsDBNull(5) ? null : rdr.GetString(5),
+                    Status = rdr.IsDBNull(6) ? 0 : rdr.GetInt32(6),
+                    UserAgent = rdr.IsDBNull(7) ? null : rdr.GetString(7),
+                    Origin = rdr.IsDBNull(8) ? null : rdr.GetString(8),
+                    ProfileId = rdr.IsDBNull(9) ? null : rdr.GetString(9),
+                    ProfileRank = rdr.IsDBNull(10) ? null : rdr.GetInt32(10),
+                    Matched = !rdr.IsDBNull(11) && rdr.GetInt64(11) != 0,
+                    DenyReason = rdr.IsDBNull(12) ? null : rdr.GetString(12),
+                    HeadersJson = rdr.IsDBNull(13) ? null : rdr.GetString(13)
+                });
+            }
+            return list;
+        });
+
+        // ---------- Intel cache ----------
+
+        public Task UpsertIntelAsync(string ip, string provider, long fetchedUtc, string? json) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO ip_intel (ip, provider, fetched_utc, json) VALUES ($ip,$p,$f,$j)
+                ON CONFLICT(ip, provider) DO UPDATE SET fetched_utc=excluded.fetched_utc, json=excluded.json";
+            cmd.Parameters.AddWithValue("$ip", ip);
+            cmd.Parameters.AddWithValue("$p", provider);
+            cmd.Parameters.AddWithValue("$f", fetchedUtc);
+            cmd.Parameters.AddWithValue("$j", (object?)json ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        });
+
+        public Task<List<(string Ip, string Provider, long FetchedUtc, string? Json)>> LoadIntelAsync(long minFetchedUtc) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT ip, provider, fetched_utc, json FROM ip_intel WHERE fetched_utc >= $min";
+            cmd.Parameters.AddWithValue("$min", minFetchedUtc);
+            var list = new List<(string, string, long, string?)>();
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                list.Add((rdr.GetString(0), rdr.GetString(1), rdr.GetInt64(2), rdr.IsDBNull(3) ? null : rdr.GetString(3)));
+            }
+            return list;
+        });
+
+        // ---------- Beacon devices ----------
+
+        public Task UpsertDeviceAsync(string deviceId, string ip, long seenUtc, string? beaconJson) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"INSERT INTO fp_devices (device_id, ip, first_seen, last_seen, beacons, beacon_json) VALUES ($d,$ip,$t,$t,1,$j)
+                ON CONFLICT(device_id, ip) DO UPDATE SET last_seen=excluded.last_seen, beacons=fp_devices.beacons+1, beacon_json=excluded.beacon_json";
+            cmd.Parameters.AddWithValue("$d", deviceId);
+            cmd.Parameters.AddWithValue("$ip", ip);
+            cmd.Parameters.AddWithValue("$t", seenUtc);
+            cmd.Parameters.AddWithValue("$j", (object?)beaconJson ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
+        });
+
+        public Task<List<Dictionary<string, object?>>> DevicesForIpAsync(string ip)
+            => QueryAsync("SELECT device_id, ip, first_seen, last_seen, beacons, beacon_json FROM fp_devices WHERE ip=$ip ORDER BY last_seen DESC LIMIT 50", new() { ["$ip"] = ip });
+
+        public Task<List<Dictionary<string, object?>>> IpsForDevicesAsync(IEnumerable<string> deviceIds)
+        {
+            var ids = deviceIds.Take(20).ToList();
+            if (ids.Count == 0) return Task.FromResult(new List<Dictionary<string, object?>>());
+            var parameters = new Dictionary<string, object?>();
+            var names = new List<string>();
+            for (int i = 0; i < ids.Count; i++) { names.Add("$d" + i); parameters["$d" + i] = ids[i]; }
+            return QueryAsync($"SELECT device_id, ip, first_seen, last_seen, beacons FROM fp_devices WHERE device_id IN ({string.Join(",", names)}) ORDER BY last_seen DESC LIMIT 200", parameters);
+        }
+
+        // ---------- Settings ----------
+
+        public Task<Dictionary<string, string>> LoadSettingsAsync() => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT key, value FROM od_settings";
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                if (!rdr.IsDBNull(1)) map[rdr.GetString(0)] = rdr.GetString(1);
+            }
+            return map;
+        });
+
+        public Task SetSettingAsync(string key, string? value) => WithLockAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "INSERT INTO od_settings (key, value) VALUES ($k,$v) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$v", (object?)value ?? DBNull.Value);
+            await cmd.ExecuteNonQueryAsync();
         });
 
         public Task<IpRecord?> GetIpRecordAsync(string ip) => WithReadAsync(async conn =>
@@ -921,7 +1077,17 @@ namespace Omnipotent.Services.OmniDefence
                 LastAlertedUtc = rdr["last_alerted_utc"] is DBNull ? null : Convert.ToInt64(rdr["last_alerted_utc"]),
                 EscalationLevel = Convert.ToInt32(rdr["escalation_level"] ?? 0),
                 LastBlockReason = rdr["last_block_reason"] as string,
-                LastScannedUtc = rdr["last_scanned_utc"] is DBNull ? null : Convert.ToInt64(rdr["last_scanned_utc"])
+                LastScannedUtc = rdr["last_scanned_utc"] is DBNull ? null : Convert.ToInt64(rdr["last_scanned_utc"]),
+                Classification = rdr["classification"] as string,
+                ClassConfidence = rdr["class_confidence"] is DBNull ? null : Convert.ToDouble(rdr["class_confidence"]),
+                ClassTags = rdr["class_tags"] as string,
+                ClassUpdatedUtc = rdr["class_updated_utc"] is DBNull ? null : Convert.ToInt64(rdr["class_updated_utc"]),
+                IsHosting = rdr["is_hosting"] is DBNull ? null : Convert.ToInt64(rdr["is_hosting"]) != 0,
+                IsProxy = rdr["is_proxy"] is DBNull ? null : Convert.ToInt64(rdr["is_proxy"]) != 0,
+                IsMobile = rdr["is_mobile"] is DBNull ? null : Convert.ToInt64(rdr["is_mobile"]) != 0,
+                ReverseDns = rdr["reverse_dns"] as string,
+                Timezone = rdr["timezone"] as string,
+                AsName = rdr["as_name"] as string
             };
         }
     }
@@ -1013,6 +1179,21 @@ namespace Omnipotent.Services.OmniDefence
         public int EscalationLevel;
         public string? LastBlockReason;
         public long? LastScannedUtc;
+
+        // Fingerprint classification (written by FingerprintEngine).
+        public string? Classification;
+        public double? ClassConfidence;
+        /// <summary>Comma-separated tags, e.g. "Datacenter:AWS,SpoofedUA".</summary>
+        public string? ClassTags;
+        public long? ClassUpdatedUtc;
+
+        // Network intel from ip-api (hosting/proxy/mobile flags, reverse DNS, tz).
+        public bool? IsHosting;
+        public bool? IsProxy;
+        public bool? IsMobile;
+        public string? ReverseDns;
+        public string? Timezone;
+        public string? AsName;
     }
 
     public class HoneypotRouteRow
