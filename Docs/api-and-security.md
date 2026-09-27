@@ -176,11 +176,14 @@ plus N samples per route per minute. Retention and thresholds are OmniSettings
 (`KliveAPITelemetry*`; kill switches `KliveAPITelemetryDisabled`, `KliveAPITelemetryRumDisabled`).
 
 **Serving.** Every standard preset (15m … all) of overview/routes/runtime/rum, plus weekly and health,
-is rebuilt on the engine thread when buckets close and stored pre-serialized and pre-compressed with an
-ETag — a request is a dictionary lookup (usually a 304). Custom ranges/buckets are single-flighted
-engine queries over the in-memory tiers, capped at 300 points; asking for resolution the retained data
-no longer has returns a coarser bucket with `degraded: true` and a `note`, never a slow scan.
-Routes (Klives): `/KliveAPI/telemetry/{overview,routes,route,runtime,rum,weekly,health,live,traces,trace}`.
+is rebuilt by the telemetry engine and stored pre-serialized and pre-compressed with an ETag. Long-range
+presets refresh every minute, and the live view refreshes every second. Custom range and route queries
+are queued into a bounded background build cache; an uncached request gets a small `202` response and
+the website retries it. Active custom views refresh in the background. Trace lists, trace details, and
+route exemplars have separate bounded background snapshot workers, so HTTP handlers do not query SQLite.
+Asking for resolution the retained data no longer has returns a coarser bucket with `degraded: true`
+and a `note`. Routes (Klives):
+`/KliveAPI/telemetry/{overview,routes,route,runtime,rum,weekly,health,live,traces,trace}`.
 
 `OmniDefence` consumes the same request outcomes for abuse tracking. Its writes are deliberately
 never awaited on the request path — doing so once turned a background SQLite write into a

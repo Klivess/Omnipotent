@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Serialization;
 using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Services.Tripwires
@@ -9,6 +10,11 @@ namespace Omnipotent.Services.Tripwires
     {
         private readonly string connectionString;
         private readonly SemaphoreSlim writeLock = new(1, 1);
+        private static readonly JsonSerializerSettings SummaryJsonSettings = new()
+        {
+            ContractResolver = new CamelCasePropertyNamesContractResolver(),
+            NullValueHandling = NullValueHandling.Include,
+        };
 
         public string DbPath { get; }
 
@@ -42,6 +48,7 @@ CREATE TABLE IF NOT EXISTS tripwires (
     last_tripped_utc TEXT NULL,
     last_discord_utc TEXT NULL,
     total_trips INTEGER NOT NULL DEFAULT 0,
+    retained_event_count INTEGER NOT NULL DEFAULT 0,
     settings_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tripwire_targets (
@@ -54,6 +61,7 @@ CREATE TABLE IF NOT EXISTS tripwire_targets (
     archived INTEGER NOT NULL DEFAULT 0,
     sort_order INTEGER NOT NULL DEFAULT 0,
     trip_count INTEGER NOT NULL DEFAULT 0,
+    retained_event_count INTEGER NOT NULL DEFAULT 0,
     created_utc TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tripwire_events (
@@ -85,12 +93,31 @@ CREATE TABLE IF NOT EXISTS tripwire_events (
 );
 CREATE INDEX IF NOT EXISTS idx_tripwire_targets_tripwire ON tripwire_targets(tripwire_id, sort_order);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tripwire_targets_token ON tripwire_targets(token);
+CREATE INDEX IF NOT EXISTS idx_tripwires_created ON tripwires(created_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_tripwire_events_tripwire_time ON tripwire_events(tripwire_id, tripped_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_tripwire_events_target_time ON tripwire_events(target_id, tripped_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_tripwire_events_tripwire_target_time ON tripwire_events(tripwire_id, target_id, tripped_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(tripwire_id, visitor_hash, tripped_utc DESC);
+CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
+    tripwire_id TEXT PRIMARY KEY REFERENCES tripwires(id) ON DELETE CASCADE,
+    generated_utc TEXT NOT NULL,
+    summary_json TEXT NOT NULL
+);
 ", ct);
             if (!await ColumnExistsAsync(conn, "tripwire_targets", "archived", ct))
                 await ExecuteAsync(conn, "ALTER TABLE tripwire_targets ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;", ct);
+            if (!await ColumnExistsAsync(conn, "tripwires", "retained_event_count", ct))
+            {
+                await ExecuteAsync(conn, "ALTER TABLE tripwires ADD COLUMN retained_event_count INTEGER NOT NULL DEFAULT 0;", ct);
+                await ExecuteAsync(conn, @"UPDATE tripwires SET retained_event_count=
+                    (SELECT COUNT(*) FROM tripwire_events WHERE tripwire_id=tripwires.id);", ct);
+            }
+            if (!await ColumnExistsAsync(conn, "tripwire_targets", "retained_event_count", ct))
+            {
+                await ExecuteAsync(conn, "ALTER TABLE tripwire_targets ADD COLUMN retained_event_count INTEGER NOT NULL DEFAULT 0;", ct);
+                await ExecuteAsync(conn, @"UPDATE tripwire_targets SET retained_event_count=
+                    (SELECT COUNT(*) FROM tripwire_events WHERE target_id=tripwire_targets.id);", ct);
+            }
         }
 
         public async Task<List<TripwireRecord>> ListAsync(CancellationToken ct = default)
@@ -200,6 +227,17 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
                     target.TripCount = 0;
                     await InsertTargetAsync(conn, tx, target, ct);
                     tripwire.Targets.Add(target);
+                }
+
+                await using (var snapshot = conn.CreateCommand())
+                {
+                    snapshot.Transaction = tx;
+                    snapshot.CommandText = @"INSERT INTO tripwire_summary_snapshots
+                        (tripwire_id,generated_utc,summary_json) VALUES($id,$generated,$summary)";
+                    snapshot.Parameters.AddWithValue("$id", tripwire.Id);
+                    snapshot.Parameters.AddWithValue("$generated", Iso(now));
+                    snapshot.Parameters.AddWithValue("$summary", JsonConvert.SerializeObject(new TripwireSummary(), SummaryJsonSettings));
+                    await snapshot.ExecuteNonQueryAsync(ct);
                 }
 
                 await tx.CommitAsync(ct);
@@ -314,13 +352,13 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
                 await using (var resetTargets = conn.CreateCommand())
                 {
                     resetTargets.Transaction = tx;
-                    resetTargets.CommandText = "UPDATE tripwire_targets SET trip_count=0 WHERE tripwire_id=$id";
+                    resetTargets.CommandText = "UPDATE tripwire_targets SET trip_count=0,retained_event_count=0 WHERE tripwire_id=$id";
                     resetTargets.Parameters.AddWithValue("$id", id);
                     await resetTargets.ExecuteNonQueryAsync(ct);
                 }
                 await using var reset = conn.CreateCommand();
                 reset.Transaction = tx;
-                reset.CommandText = "UPDATE tripwires SET total_trips=0,last_tripped_utc=NULL WHERE id=$id";
+                reset.CommandText = "UPDATE tripwires SET total_trips=0,retained_event_count=0,last_tripped_utc=NULL WHERE id=$id";
                 reset.Parameters.AddWithValue("$id", id);
                 bool found = await reset.ExecuteNonQueryAsync(ct) > 0;
                 await tx.CommitAsync(ct);
@@ -382,7 +420,8 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
                 await using (var updateTarget = conn.CreateCommand())
                 {
                     updateTarget.Transaction = tx;
-                    updateTarget.CommandText = "UPDATE tripwire_targets SET trip_count=trip_count+1 WHERE id=$id";
+                    updateTarget.CommandText = @"UPDATE tripwire_targets SET trip_count=trip_count+1,
+                        retained_event_count=retained_event_count+1 WHERE id=$id";
                     updateTarget.Parameters.AddWithValue("$id", target.Id);
                     await updateTarget.ExecuteNonQueryAsync(ct);
                 }
@@ -390,6 +429,7 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
                 {
                     updateTripwire.Transaction = tx;
                     updateTripwire.CommandText = @"UPDATE tripwires SET total_trips=total_trips+1,
+                        retained_event_count=retained_event_count+1,
                         last_tripped_utc=$time WHERE id=$id";
                     updateTripwire.Parameters.AddWithValue("$id", tripwire.Id);
                     updateTripwire.Parameters.AddWithValue("$time", Iso(item.TrippedUtc));
@@ -460,12 +500,14 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
             var page = new TripwireEventPage { Limit = limit, Offset = offset };
             await using (var count = conn.CreateCommand())
             {
-                count.CommandText = "SELECT COUNT(*) FROM tripwire_events WHERE tripwire_id=$id"
-                    + (string.IsNullOrWhiteSpace(targetId) ? "" : " AND target_id=$target");
+                count.CommandText = string.IsNullOrWhiteSpace(targetId)
+                    ? "SELECT retained_event_count FROM tripwires WHERE id=$id"
+                    : "SELECT retained_event_count FROM tripwire_targets WHERE tripwire_id=$id AND id=$target";
                 count.Parameters.AddWithValue("$id", tripwireId);
                 if (!string.IsNullOrWhiteSpace(targetId)) count.Parameters.AddWithValue("$target", targetId);
-                page.Total = Convert.ToInt64(await count.ExecuteScalarAsync(ct));
+                page.Total = Convert.ToInt64(await count.ExecuteScalarAsync(ct) ?? 0L);
             }
+            if (offset >= page.Total) return page;
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = @"SELECT e.id,e.tripwire_id,e.target_id,t.label,t.destination_url,e.tripped_utc,
@@ -524,6 +566,65 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
             return result;
         }
 
+        public async Task<TripwireSummary?> GetSummarySnapshotAsync(string tripwireId, CancellationToken ct = default)
+        {
+            var json = await GetSummarySnapshotJsonAsync(tripwireId, ct);
+            return json == null ? null : JsonConvert.DeserializeObject<TripwireSummary>(json);
+        }
+
+        public async Task<string?> GetSummarySnapshotJsonAsync(string tripwireId, CancellationToken ct = default)
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT generated_utc,summary_json FROM tripwire_summary_snapshots WHERE tripwire_id=$id";
+            cmd.Parameters.AddWithValue("$id", tripwireId);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) return null;
+            if (!DateTimeOffset.TryParse(reader.GetString(0), out var generatedUtc)) return null;
+            TimeSpan age = DateTimeOffset.UtcNow - generatedUtc;
+            return age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(3)
+                ? reader.GetString(1) : null;
+        }
+
+        public async Task RefreshSummarySnapshotAsync(string tripwireId, CancellationToken ct = default)
+        {
+            // All aggregation happens in the background caller, never in the summary route.
+            var summary = await GetSummaryAsync(tripwireId, ct);
+            await WithWriteLockAsync(async conn =>
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"INSERT INTO tripwire_summary_snapshots
+                    (tripwire_id,generated_utc,summary_json)
+                    SELECT id,$generated,$summary FROM tripwires WHERE id=$id
+                    ON CONFLICT(tripwire_id) DO UPDATE SET
+                        generated_utc=excluded.generated_utc,summary_json=excluded.summary_json";
+                cmd.Parameters.AddWithValue("$id", tripwireId);
+                cmd.Parameters.AddWithValue("$generated", Iso(DateTimeOffset.UtcNow));
+                cmd.Parameters.AddWithValue("$summary", JsonConvert.SerializeObject(summary, SummaryJsonSettings));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }, ct);
+        }
+
+        public async Task<List<string>> ListTripwireIdsAsync(CancellationToken ct = default)
+        {
+            var ids = new List<string>();
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT id FROM tripwires";
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) ids.Add(reader.GetString(0));
+            return ids;
+        }
+
+        public async Task<bool> ExistsAsync(string tripwireId, CancellationToken ct = default)
+        {
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM tripwires WHERE id=$id LIMIT 1";
+            cmd.Parameters.AddWithValue("$id", tripwireId);
+            return await cmd.ExecuteScalarAsync(ct) != null;
+        }
+
         public async Task CleanupExpiredEventsAsync(CancellationToken ct = default)
         {
             var tripwires = await ListAsync(ct);
@@ -532,11 +633,47 @@ CREATE INDEX IF NOT EXISTS idx_tripwire_events_visitor_time ON tripwire_events(t
                 var cutoff = DateTimeOffset.UtcNow.AddDays(-tripwire.Settings.RetentionDays);
                 await WithWriteLockAsync(async conn =>
                 {
-                    await using var cmd = conn.CreateCommand();
-                    cmd.CommandText = "DELETE FROM tripwire_events WHERE tripwire_id=$id AND tripped_utc < $cutoff";
-                    cmd.Parameters.AddWithValue("$id", tripwire.Id);
-                    cmd.Parameters.AddWithValue("$cutoff", Iso(cutoff));
-                    await cmd.ExecuteNonQueryAsync(ct);
+                    await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+                    var expiredByTarget = new Dictionary<string, long>(StringComparer.Ordinal);
+                    await using (var count = conn.CreateCommand())
+                    {
+                        count.Transaction = tx;
+                        count.CommandText = @"SELECT target_id,COUNT(*) FROM tripwire_events
+                            WHERE tripwire_id=$id AND tripped_utc < $cutoff GROUP BY target_id";
+                        count.Parameters.AddWithValue("$id", tripwire.Id);
+                        count.Parameters.AddWithValue("$cutoff", Iso(cutoff));
+                        await using var reader = await count.ExecuteReaderAsync(ct);
+                        while (await reader.ReadAsync(ct)) expiredByTarget.Add(reader.GetString(0), reader.GetInt64(1));
+                    }
+                    if (expiredByTarget.Count == 0) return;
+                    await using (var delete = conn.CreateCommand())
+                    {
+                        delete.Transaction = tx;
+                        delete.CommandText = "DELETE FROM tripwire_events WHERE tripwire_id=$id AND tripped_utc < $cutoff";
+                        delete.Parameters.AddWithValue("$id", tripwire.Id);
+                        delete.Parameters.AddWithValue("$cutoff", Iso(cutoff));
+                        await delete.ExecuteNonQueryAsync(ct);
+                    }
+                    foreach (var (targetId, expired) in expiredByTarget)
+                    {
+                        await using var target = conn.CreateCommand();
+                        target.Transaction = tx;
+                        target.CommandText = @"UPDATE tripwire_targets SET
+                            retained_event_count=MAX(0,retained_event_count-$expired) WHERE id=$id";
+                        target.Parameters.AddWithValue("$id", targetId);
+                        target.Parameters.AddWithValue("$expired", expired);
+                        await target.ExecuteNonQueryAsync(ct);
+                    }
+                    await using (var update = conn.CreateCommand())
+                    {
+                        update.Transaction = tx;
+                        update.CommandText = @"UPDATE tripwires SET
+                            retained_event_count=MAX(0,retained_event_count-$expired) WHERE id=$id";
+                        update.Parameters.AddWithValue("$id", tripwire.Id);
+                        update.Parameters.AddWithValue("$expired", expiredByTarget.Values.Sum());
+                        await update.ExecuteNonQueryAsync(ct);
+                    }
+                    await tx.CommitAsync(ct);
                 }, ct);
             }
         }

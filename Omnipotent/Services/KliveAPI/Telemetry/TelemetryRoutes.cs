@@ -18,13 +18,12 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
 {
     /// <summary>
     /// HTTP surface of the telemetry engine. Every aggregate read is answered from a
-    /// materialized, pre-compressed view when it is a plain preset (a dictionary lookup +
-    /// memcpy, usually a 304), otherwise from a single-flighted engine query over the
-    /// in-memory tiers. None of these routes are ever stored in the response cache.
+    /// materialized, pre-compressed view. Missing custom views are queued for the
+    /// background engine and answered with 202; a handler never computes analytics.
+    /// None of these routes are stored in the general response cache.
     /// </summary>
     internal static class TelemetryRoutes
     {
-        private static readonly ConcurrentDictionary<string, Lazy<Task<CacheEntry>>> InFlight = new(StringComparer.Ordinal);
         private static readonly ConcurrentDictionary<string, (long Minute, int Count)> RumRate = new(StringComparer.Ordinal);
         private const int RumSamplesPerProfileMinute = 1200;
         private const long MaxPhaseMs = 600_000;
@@ -34,7 +33,8 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         /// on every call: the route table outlives a KliveAPI service restart, while the
         /// engine is recreated, so capturing an instance here would pin a stopped one.
         /// </summary>
-        public static async Task RegisterAsync(KliveAPI api, Func<ApiTelemetry?> engine, Func<TelemetryDb?> database, Func<string, string?> routeMethod)
+        public static async Task RegisterAsync(KliveAPI api, Func<ApiTelemetry?> engine,
+            Func<TelemetryDb?> database, Func<TelemetryTraceViews?> traceViews, Func<string, string?> routeMethod)
         {
             var klives = KMProfileManager.KMPermissions.Klives;
 
@@ -58,8 +58,8 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             await api.CreateRoute("/KliveAPI/telemetry/weekly", With((req, tel) => ServeView(req, tel, "weekly")), HttpMethod.Get, klives);
             await api.CreateRoute("/KliveAPI/telemetry/health", With((req, tel) => ServeView(req, tel, "health")), HttpMethod.Get, klives);
             await api.CreateRoute("/KliveAPI/telemetry/live", With(ServeLive), HttpMethod.Get, klives);
-            await api.CreateRoute("/KliveAPI/telemetry/traces", With((req, tel) => ServeTraces(req, tel, database())), HttpMethod.Get, klives);
-            await api.CreateRoute("/KliveAPI/telemetry/trace", req => ServeTrace(req, database()), HttpMethod.Get, klives);
+            await api.CreateRoute("/KliveAPI/telemetry/traces", With((req, tel) => ServeTraces(req, tel, database(), traceViews())), HttpMethod.Get, klives);
+            await api.CreateRoute("/KliveAPI/telemetry/trace", req => ServeTrace(req, database(), traceViews()), HttpMethod.Get, klives);
             // Any signed-in website user reports their own client timings.
             await api.CreateBufferedRoute("/KliveAPI/telemetry/rum", With((req, tel) => IngestRum(req, tel, routeMethod)), HttpMethod.Post,
                 KMProfileManager.KMPermissions.Guest, 32 * 1024);
@@ -76,14 +76,13 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
                 return;
             }
 
-            CacheEntry? entry = q.IsPreset && !q.HasFilters ? tel.TryGetView(q.ViewKey) : null;
-            string source = "VIEW";
+            CacheEntry? entry = tel.TryGetQueryView(q);
             if (entry == null)
             {
-                source = "QUERY";
-                entry = await SingleFlight(q.CacheKey, () => tel.QueryAsync(q));
+                await Pending(req);
+                return;
             }
-            await WriteEntry(req, entry, source);
+            await WriteEntry(req, entry, "VIEW");
         }
 
         /// <summary>
@@ -94,7 +93,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         {
             if (req.capture != null)
             {
-                return req.ReturnResponse(Encoding.UTF8.GetString(entry.RawBody), "application/json");
+                return req.ReturnResponse(Encoding.UTF8.GetString(entry.RawBody), "application/json", null, (HttpStatusCode)entry.StatusCode);
             }
             return CachedResponseWriter.WriteCachedResponseAsync(req.context, req.req, entry, req.requestTimer, req.Trace, source);
         }
@@ -114,52 +113,47 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         private static async Task ServeLive(UserRequest req, ApiTelemetry tel)
         {
             CacheDeps.MarkUncacheable("live telemetry tick");
-            byte[]? tick = tel.LiveTick;
-            await req.ReturnResponse(tick == null ? "{}" : Encoding.UTF8.GetString(tick), "application/json");
+            CacheEntry? entry = tel.TryGetView("live");
+            if (entry == null) { await Pending(req); return; }
+            await WriteEntry(req, entry, "VIEW");
         }
 
-        private static async Task<CacheEntry> SingleFlight(string key, Func<Task<CacheEntry>> compute)
-        {
-            var lazy = InFlight.GetOrAdd(key, _ => new Lazy<Task<CacheEntry>>(compute, LazyThreadSafetyMode.ExecutionAndPublication));
-            try
-            {
-                return await lazy.Value;
-            }
-            finally
-            {
-                InFlight.TryRemove(new(key, lazy));
-            }
-        }
+        private static Task Pending(UserRequest req) => req.ReturnResponse(
+            "{\"pending\":true}", "application/json",
+            new NameValueCollection { ["Retry-After"] = "1", ["Cache-Control"] = "no-store" }, HttpStatusCode.Accepted);
 
         // ─── traces ───
 
-        private static async Task ServeTraces(UserRequest req, ApiTelemetry tel, TelemetryDb? db)
+        private static async Task ServeTraces(UserRequest req, ApiTelemetry tel, TelemetryDb? db, TelemetryTraceViews? views)
         {
             CacheDeps.MarkUncacheable("trace list");
-            if (db == null)
+            if (db == null || views == null)
             {
                 await req.ReturnResponse("{\"traces\":[],\"persisted\":false}", "application/json");
                 return;
             }
             NameValueCollection p = req.userParameters;
-            long now = tel.NowMs();
-            long from = now - 86_400_000, to = now + 60_000;
-            string? range = p["range"];
-            if (!string.IsNullOrEmpty(range) && TelemetryQuery.Presets.Contains(range) && range != "all")
-                from = now - TelemetryQuery.PresetDurationMs(range);
-            else if (range == "all") from = 0;
-            if (p["from"] is string f && TelemetryQuery.TryParseInstant(f, out long fm)) from = fm;
-            if (p["to"] is string t && TelemetryQuery.TryParseInstant(t, out long tm)) to = tm;
-
+            string range = p["range"] ?? "24h";
+            if (!TelemetryQuery.Presets.Contains(range)) range = "24h";
+            long? from = p["from"] is string f && TelemetryQuery.TryParseInstant(f, out long fm) ? fm : null;
+            long? to = p["to"] is string t && TelemetryQuery.TryParseInstant(t, out long tm) ? tm : null;
             string? route = string.IsNullOrWhiteSpace(p["route"]) ? null : p["route"]!.Trim();
             string? method = string.IsNullOrWhiteSpace(p["method"]) ? null : p["method"]!.Trim().ToUpperInvariant();
-            long? minMicros = double.TryParse(p["minMs"], NumberStyles.Float, CultureInfo.InvariantCulture, out double minMs) ? (long)(minMs * 1000) : null;
+            if (route?.Length > 512 || method?.Length > 16)
+            {
+                await req.ReturnResponse("{\"error\":\"Trace filter too long.\"}", "application/json", null, HttpStatusCode.BadRequest);
+                return;
+            }
+            long? minMicros = double.TryParse(p["minMs"], NumberStyles.Float, CultureInfo.InvariantCulture, out double minMs)
+                && double.IsFinite(minMs) && minMs >= 0 && minMs <= 600_000 ? (long)(minMs * 1000) : null;
             int? statusMin = int.TryParse(p["status"], out int st) ? st : null;
             string sort = p["sort"] == "slowest" ? "slowest" : "recent";
-            int limit = int.TryParse(p["limit"], out int l) ? l : 100;
+            int limit = Math.Clamp(int.TryParse(p["limit"], out int l) ? l : 100, 1, 500);
 
-            var rows = await Task.Run(() => db.QueryTraces(route, method, minMicros, statusMin, from, to, sort, limit));
-            await req.ReturnResponse(BuildTraceListJson(rows, now, from, to), "application/json");
+            var query = new TelemetryTraceViews.ListQuery(range, from, to, route, method, minMicros, statusMin, sort, limit);
+            CacheEntry? entry = views.TryGetList(query);
+            if (entry == null) { await Pending(req); return; }
+            await WriteEntry(req, entry, "VIEW");
         }
 
         internal static string BuildTraceListJson(System.Collections.Generic.IEnumerable<TelemetryDb.TraceRow> rows, long now, long from, long to)
@@ -184,24 +178,19 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
 
         }
 
-        private static async Task ServeTrace(UserRequest req, TelemetryDb? db)
+        private static async Task ServeTrace(UserRequest req, TelemetryDb? db, TelemetryTraceViews? views)
         {
             CacheDeps.MarkUncacheable("trace detail");
             string? idText = req.userParameters["id"];
-            if (db == null || string.IsNullOrWhiteSpace(idText)
+            if (db == null || views == null || string.IsNullOrWhiteSpace(idText)
                 || !long.TryParse(idText, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out long id))
             {
                 await req.ReturnResponse("{\"error\":\"Unknown trace.\"}", "application/json", null, HttpStatusCode.NotFound);
                 return;
             }
-            var row = await Task.Run(() => db.GetTrace(id));
-            if (row == null)
-            {
-                await req.ReturnResponse("{\"error\":\"Trace not found (it may not be flushed yet, or was pruned).\"}", "application/json", null, HttpStatusCode.NotFound);
-                return;
-            }
-
-            await req.ReturnResponse(BuildTraceJson(row), "application/json");
+            CacheEntry? entry = views.TryGetDetail(id);
+            if (entry == null) { await Pending(req); return; }
+            await WriteEntry(req, entry, "VIEW");
         }
 
         internal static string BuildTraceJson(TelemetryDb.TraceRow row)

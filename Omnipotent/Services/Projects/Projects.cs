@@ -111,7 +111,10 @@ namespace Omnipotent.Services.Projects
         /// <summary>"What would this have cost at these prices?" — re-prices the recorded usage
         /// journal per project and per agent against prices Klives supplies.</summary>
         public ProjectCostSimulatorService CostSimulator { get; private set; } = null!;
+        public ProjectCostSimulatorMaterializer CostSimulatorSnapshots { get; private set; } = null!;
+        public ProjectListMaterializer ListSnapshots { get; private set; } = null!;
         public ProjectOverviewService Overview { get; private set; } = null!;
+        public ProjectOverviewMaterializer OverviewSnapshots { get; private set; } = null!;
         /// <summary>Versioned Grand Plan — the strategic north star Klives approves before work begins.</summary>
         public ProjectGrandPlanStore GrandPlans { get; private set; } = null!;
         /// <summary>What each retired agent was holding when its slot was taken away. Klives can lower
@@ -382,9 +385,15 @@ namespace Omnipotent.Services.Projects
             GrandPlans = new ProjectGrandPlanStore(msg => ServiceLog(msg));
             Analytics = new ProjectAnalyticsService(Store, Budget, EventLog, SubAgents, Councils, TokenUsage,
                 message => ServiceLog(message));
-            CostSimulator = new ProjectCostSimulatorService(Store, TokenUsage, SubAgents,
+            CostSimulator = new ProjectCostSimulatorService(Store, TokenUsage, SubAgents);
+            CostSimulatorSnapshots = new ProjectCostSimulatorMaterializer(CostSimulator,
                 message => ServiceLog(message));
+            await CostSimulatorSnapshots.LoadAsync();
+            ListSnapshots = new ProjectListMaterializer(routes.BuildListJson, message => ServiceLog(message));
+            await ListSnapshots.LoadAsync();
             Overview = new ProjectOverviewService(this);
+            OverviewSnapshots = new ProjectOverviewMaterializer(Overview, message => ServiceLog(message));
+            await OverviewSnapshots.LoadAsync();
             CouncilRunner = new ProjectCouncilRunner(Councils, EventLog, msg => ServiceLog(msg))
             {
                 QueryAsync = async (pid, sid, sys, user, routes, maxTokens, ct) =>
@@ -490,6 +499,9 @@ namespace Omnipotent.Services.Projects
             // but none of them is a prerequisite for reading or controlling a project.
             SetInitializationStage("Projects API ready");
             httpApiReady = true;
+            OverviewSnapshots.Start(cancellationToken.Token);
+            CostSimulatorSnapshots.Start(cancellationToken.Token);
+            ListSnapshots.Start(cancellationToken.Token);
             ServiceLog("Projects: API ready; continuing recovery and integrations in the background.");
             await RegisterWebSocketRoutesAsync();
 

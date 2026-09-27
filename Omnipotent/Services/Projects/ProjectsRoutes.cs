@@ -1,6 +1,7 @@
 ﻿using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.Projects.Stimulus;
 using System.Collections.Concurrent;
 using System.Collections.Specialized;
@@ -35,7 +36,7 @@ namespace Omnipotent.Services.Projects
             // Enums travel as strings ("Active", not 1) — the website compares/lowercases them.
             Converters = { new Newtonsoft.Json.Converters.StringEnumConverter() },
         };
-        private static string Json(object o) => JsonConvert.SerializeObject(o, CamelCase);
+        internal static string Json(object o) => JsonConvert.SerializeObject(o, CamelCase);
 
         /// <summary>The request's JSON body as an object, or null when there isn't one.</summary>
         private static Newtonsoft.Json.Linq.JObject? ParseBody(Services.KliveAPI.KliveAPI.UserRequest req)
@@ -54,7 +55,13 @@ namespace Omnipotent.Services.Projects
         {
             await parent.RegisterHttpRouteAsync("/projects/overview", async req =>
             {
-                try { await req.ReturnResponse(Json(parent.Overview.Get(req.userParameters?.Get("range") ?? "24h"))); }
+                try
+                {
+                    CacheDeps.MarkUncacheable("project overview materialized response");
+                    string? json = parent.OverviewSnapshots.Get(req.userParameters?.Get("range") ?? "24h");
+                    await req.ReturnResponse(json ?? "{\"pending\":true}",
+                        code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
+                }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -84,8 +91,10 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
-                    var list = parent.Store.ListProjects().Select(ToSummary).ToList();
-                    await req.ReturnResponse(Json(list));
+                    CacheDeps.MarkUncacheable("project list materialized response");
+                    string? json = parent.ListSnapshots.Get();
+                    await req.ReturnResponse(json ?? "{\"pending\":true}",
+                        code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -854,13 +863,26 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
+                    CacheDeps.MarkUncacheable("project cost simulator materialized response");
                     string range = req.userParameters?.Get("range") ?? "30d";
                     bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
                     bool includeArchived = !string.Equals(
                         req.userParameters?.Get("includeArchived"), "0", StringComparison.Ordinal);
-                    await req.ReturnResponse(Json(parent.CostSimulator.Get(range, forceRefresh: fresh,
-                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
-                        includeArchived: includeArchived)));
+                    long.TryParse(req.userParameters?.Get("after"), NumberStyles.Integer,
+                        CultureInfo.InvariantCulture, out long after);
+                    var result = parent.CostSimulatorSnapshots.Read(range,
+                        req.userParameters?.Get("from"), req.userParameters?.Get("to"),
+                        includeArchived, fresh, after);
+                    if (result.Busy)
+                        await req.ReturnResponse(Json(new { error = "Too many cost simulator builds are queued. Try again shortly." }),
+                            code: HttpStatusCode.TooManyRequests);
+                    else if (result.Pending)
+                        await req.ReturnResponse(Json(new { pending = true,
+                            after = result.After.ToString(CultureInfo.InvariantCulture),
+                            from = result.FromUtc, to = result.ToUtc }),
+                            code: HttpStatusCode.Accepted);
+                    else
+                        await req.ReturnResponse(result.Json!);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
@@ -1781,10 +1803,11 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// One row of the fleet list. This runs once per project on every refresh, and the website
-        /// refreshes on any project's event, so every field here is served from an in-memory
-        /// projection — no ledger/runtime/gate file is opened and no event log is walked.
+        /// One row of the fleet list, built by the materializer off the HTTP path. Most fields
+        /// come from store projections; cold stores can still open files in the background.
         /// </summary>
+        internal string BuildListJson() => Json(parent.Store.ListProjects().Select(ToSummary).ToList());
+
         private object ToSummary(Project p)
         {
             var spend = parent.Budget.GetSpend(p.ProjectID);

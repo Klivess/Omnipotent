@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -244,7 +245,7 @@ namespace Omnipotent.Services.Omniscience
         /// Retry-After is honest here: the work that would have served this request is
         /// usually still running and will have populated the cache by then.
         /// </summary>
-        private static async Task RespondBusy(UserRequest req)
+        internal static async Task RespondBusy(UserRequest req)
         {
             var headers = new System.Collections.Specialized.NameValueCollection { { "Retry-After", "2" } };
             await req.ReturnResponse(
@@ -282,7 +283,8 @@ namespace Omnipotent.Services.Omniscience
             // the site never asked for — its real query always missed the warm
             // cache and paid the full messages scan).
             RegisterWarmTarget("sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
-            RegisterWarmTarget("stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
+            service.RouteSnapshots.Register("stats/overview", "stats-overview.json",
+                TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(3), BuildOverviewPayload);
             RegisterWarmTarget("profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
             RegisterWarmTarget("persons|s=|p=|r=|l=60|o=0", TimeSpan.FromSeconds(45),
                 () => BuildPersonsPayload(null, null, null, 60, 0));
@@ -354,6 +356,7 @@ namespace Omnipotent.Services.Omniscience
                         return;
                     }
                     InvalidateCachePrefix("sources");
+                    service.RouteSnapshots.MarkDirty("stats/overview");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, self_id = selfId, self_username = selfName }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -371,6 +374,7 @@ namespace Omnipotent.Services.Omniscience
                     }
                     await service.Discord.RemoveSourceAsync(sourceId);
                     InvalidateCachePrefix("sources");
+                    service.RouteSnapshots.MarkDirty("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -576,6 +580,7 @@ namespace Omnipotent.Services.Omniscience
                     InvalidateCachePrefix("persons|");
                     InvalidateCachePrefix("profile-targets");
                     InvalidateCachePrefix("stats/overview");
+                    service.RouteSnapshots.MarkDirty("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -656,12 +661,10 @@ namespace Omnipotent.Services.Omniscience
             {
                 try
                 {
-                    // SQLite has no fast row-count metadata; each COUNT(*) here scans the
-                    // full table. With millions of messages a single overview call took
-                    // long enough to wedge KliveAPI when several tabs/refresh cycles
-                    // overlapped. Cache the entire payload — staleness up to ~60s on a
-                    // bot-internal dashboard is fine.
-                    await CachedRead(req, "stats/overview", TimeSpan.FromSeconds(60), BuildOverviewPayload);
+                    CacheDeps.MarkUncacheable("overview has an age-bounded background snapshot");
+                    string? payload = service.RouteSnapshots.TryGet("stats/overview");
+                    if (payload == null) await RespondBusy(req);
+                    else await req.ReturnResponse(payload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, KMPermissions.Klives);
@@ -692,9 +695,9 @@ namespace Omnipotent.Services.Omniscience
         }
 
         // ── cached payload builders ──
-        // These build the raw JSON string for the matching cached route. They are
-        // shared between the route handler (via CachedRead) and the background
-        // cache warmer (StartCacheWarmer) so the dashboard never sees a cold cache.
+        // These build raw JSON strings for cached routes and background snapshots.
+        // Overview runs only in the snapshot worker; other cached routes may still
+        // use the general cache warmer or build on a cold request.
 
         private string BuildSourcesPayload()
         {

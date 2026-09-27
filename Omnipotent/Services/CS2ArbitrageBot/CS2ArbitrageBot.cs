@@ -21,6 +21,44 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public SteamAPIWrapper steamAPIWrapper;
         public CSFloatWrapper csFloatWrapper;
         public Scanalytics scanalytics;
+        private readonly SemaphoreSlim analyticsRefreshRequested = new(0, 1);
+        private sealed class AnalyticsSnapshot
+        {
+            public DateTime GeneratedAtUtc { get; set; }
+            public string? Json { get; set; }
+        }
+        private AnalyticsSnapshot? analyticsSnapshot;
+        private AnalyticsSnapshot? balanceHistorySnapshot;
+        private AnalyticsSnapshot? liquidityPlanSnapshot;
+        internal static bool IsAnalyticsSnapshotFresh(DateTime generatedAtUtc, DateTime nowUtc)
+        {
+            TimeSpan age = nowUtc - generatedAtUtc;
+            return age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(3);
+        }
+        private string? CurrentAnalyticsJson()
+        {
+            AnalyticsSnapshot? snapshot = Volatile.Read(ref analyticsSnapshot);
+            return snapshot != null && IsAnalyticsSnapshotFresh(snapshot.GeneratedAtUtc, DateTime.UtcNow)
+                ? snapshot.Json : null;
+        }
+        private static bool IsBalanceHistorySnapshotFresh(DateTime generatedAtUtc, DateTime nowUtc)
+        {
+            TimeSpan age = nowUtc - generatedAtUtc;
+            return age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(5);
+        }
+        private string? CurrentBalanceHistoryJson()
+        {
+            AnalyticsSnapshot? snapshot = Volatile.Read(ref balanceHistorySnapshot);
+            return snapshot != null && IsBalanceHistorySnapshotFresh(snapshot.GeneratedAtUtc, DateTime.UtcNow)
+                ? snapshot.Json : null;
+        }
+        private string? CurrentLiquidityPlanJson()
+        {
+            AnalyticsSnapshot? snapshot = Volatile.Read(ref liquidityPlanSnapshot);
+            TimeSpan age = snapshot == null ? TimeSpan.MaxValue : DateTime.UtcNow - snapshot.GeneratedAtUtc;
+            return snapshot != null && age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(12)
+                ? snapshot.Json : null;
+        }
         private CS2LiquidityFinder liquidityFinder;
         public CSFloatWrapper.CSFloatAccountInformation csfloatAccountInformation;
 
@@ -53,6 +91,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             csFloatWrapper = new CSFloatWrapper(this, csfloatAPIKey);
             liquidityFinder = new CS2LiquidityFinder(this);
             scanalytics = new Scanalytics(this);
+            await LoadAnalyticsSnapshotAsync();
+            await LoadBalanceHistorySnapshotAsync();
+            await LoadLiquidityPlanSnapshotAsync();
+            _ = Task.Run(() => RefreshAnalyticsLoopAsync(cancellationToken.Token));
+            _ = Task.Run(() => RefreshBalanceHistoryLoopAsync(cancellationToken.Token));
+            _ = Task.Run(() => RefreshLiquidityPlanLoopAsync(cancellationToken.Token));
             await CreateRoutes();
 
             await steamAPIWrapper.SteamAPIWrapperInitialisation();
@@ -508,7 +552,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 //Find price difference
                 Scanalytics.ScannedComparison comparison = new Scanalytics.ScannedComparison(snipe, correspondingListing, DateTime.Now, await scanalytics.ExpectedSteamToCSFloatConversionPercentage());
 
-                if (scanalytics.AllScannedComparisonsInHistory.Where(k => k.CSFloatListing.ItemListingID == snipe.ItemListingID).Any())
+                if (scanalytics.HasScannedComparison(snipe.ItemListingID))
                 {
                     ServiceLog($"Snipe for {snipe.ItemMarketHashName} already exists in history, skipping.");
                     return null;
@@ -516,7 +560,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 else
                 {
                     await scanalytics.SaveScannedComparison(comparison);
-                    scanalytics.AllScannedComparisonsInHistory.Add(comparison);
+                    if (!scanalytics.TryAddScannedComparison(comparison)) return null;
+                    QueueAnalyticsRefresh();
                 }
                 if ((comparison.PredictedOverallArbitrageGain - 1) * 100 > MinimumPercentReturnToSnipe)
                 {
@@ -658,25 +703,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             await CreateAPIRoute("/cs2arbitragebot/getscanalytics", async (request) =>
             {
-                try
-                {
-                    if (cachedAnalytics == null || lastAnalyticsUpdate == null || DateTime.Now - lastAnalyticsUpdate > analyticsCacheDuration)
-                    {
-                        cachedAnalytics = new ScannedComparisonAnalytics(
-                            scanalytics.AllScannedComparisonsInHistory,
-                            scanalytics.AllPurchasedListingsInHistory,
-                            await scanalytics.ExpectedSteamToCSFloatConversionPercentage()
-                        );
-                        lastAnalyticsUpdate = DateTime.Now;
-                    }
-
-                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedAnalytics), code: HttpStatusCode.OK);
-                }
-                catch (Exception e)
-                {
-                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = e.Message }), code: HttpStatusCode.InternalServerError);
-                    ServiceLogError(e, "Error in /cs2arbitragebot/getscanalytics route.");
-                }
+                string? json = CurrentAnalyticsJson();
+                await request.ReturnResponse(json ?? "{\"pending\":true}",
+                    code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
             }, HttpMethod.Get, KMPermissions.Guest);
 
             await CreateAPIRoute("/cs2arbitragebot/scanresults", async (request) =>
@@ -696,13 +725,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    if (cachedLiquidityPlan == null || lastLiquidityPlanUpdate == null || DateTime.Now - lastLiquidityPlanUpdate > liquidityPlanCacheDuration)
-                    {
-                        cachedLiquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult());
-                        lastLiquidityPlanUpdate = DateTime.Now;
-                    }
-
-                    await request.ReturnResponse(JsonConvert.SerializeObject(cachedLiquidityPlan), code: HttpStatusCode.OK);
+                    string? json = CurrentLiquidityPlanJson();
+                    await request.ReturnResponse(json ?? "{\"error\":\"Liquidity plan is refreshing.\"}",
+                        code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -715,8 +740,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    var logs = await scanalytics.GetAllLogsOfCSFloatAndSteamBalance();
-                    await request.ReturnResponse(JsonConvert.SerializeObject(logs), code: HttpStatusCode.OK);
+                    string? json = CurrentBalanceHistoryJson();
+                    await request.ReturnResponse(json ?? "{\"error\":\"Balance history is refreshing.\"}",
+                        code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
                 }
                 catch (Exception e)
                 {
@@ -726,12 +752,192 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             }, HttpMethod.Get, KMPermissions.Guest);
         }
 
-        private ScannedComparisonAnalytics cachedAnalytics;
-        private DateTime? lastAnalyticsUpdate;
-        private readonly TimeSpan analyticsCacheDuration = TimeSpan.FromMinutes(5);
+        internal void QueueAnalyticsRefresh()
+        {
+            try { analyticsRefreshRequested.Release(); }
+            catch (SemaphoreFullException) { /* A refresh is already queued. */ }
+        }
 
-        private object cachedLiquidityPlan;
-        private DateTime? lastLiquidityPlanUpdate;
-        private readonly TimeSpan liquidityPlanCacheDuration = TimeSpan.FromMinutes(5);
+        private string AnalyticsSnapshotPath => Path.Combine(
+            OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLabsDirectory),
+            "scanalytics.snapshot.json");
+
+        private string BalanceHistorySnapshotPath => Path.Combine(
+            OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLabsDirectory),
+            "balance-history.snapshot.json");
+
+        private string LiquidityPlanSnapshotPath => Path.Combine(
+            OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLabsDirectory),
+            "liquidity-plan.snapshot.json");
+
+        private async Task LoadLiquidityPlanSnapshotAsync()
+        {
+            try
+            {
+                if (!File.Exists(LiquidityPlanSnapshotPath)) return;
+                AnalyticsSnapshot? saved = JsonConvert.DeserializeObject<AnalyticsSnapshot>(
+                    await File.ReadAllTextAsync(LiquidityPlanSnapshotPath));
+                if (!string.IsNullOrWhiteSpace(saved?.Json))
+                    Volatile.Write(ref liquidityPlanSnapshot, saved);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Could not load the saved CS2 liquidity plan snapshot.", false);
+            }
+        }
+
+        private async Task RefreshLiquidityPlanLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var source = await scanalytics.GetLatestLiquiditySearchResult();
+                    ct.ThrowIfCancellationRequested();
+                    if (source != null)
+                    {
+                        var snapshot = new AnalyticsSnapshot
+                        {
+                            Json = JsonConvert.SerializeObject(scanalytics.ProduceLiquidityPlanAsync(source)),
+                            GeneratedAtUtc = DateTime.UtcNow
+                        };
+                        string path = LiquidityPlanSnapshotPath;
+                        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                        string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                        try
+                        {
+                            await File.WriteAllTextAsync(temporary, JsonConvert.SerializeObject(snapshot), ct);
+                            File.Move(temporary, path, overwrite: true);
+                        }
+                        finally
+                        {
+                            try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+                        }
+                        Volatile.Write(ref liquidityPlanSnapshot, snapshot);
+                    }
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Could not refresh the CS2 liquidity plan snapshot.", false);
+                }
+
+                try { await Task.Delay(TimeSpan.FromMinutes(5), ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+        }
+
+        private async Task LoadBalanceHistorySnapshotAsync()
+        {
+            try
+            {
+                if (!File.Exists(BalanceHistorySnapshotPath)) return;
+                AnalyticsSnapshot? saved = JsonConvert.DeserializeObject<AnalyticsSnapshot>(
+                    await File.ReadAllTextAsync(BalanceHistorySnapshotPath));
+                if (!string.IsNullOrWhiteSpace(saved?.Json)
+                    && IsBalanceHistorySnapshotFresh(saved.GeneratedAtUtc, DateTime.UtcNow))
+                    Volatile.Write(ref balanceHistorySnapshot, saved);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Could not load the saved CS2 balance history snapshot.", false);
+            }
+        }
+
+        private async Task RefreshBalanceHistoryLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var logs = await scanalytics.GetAllLogsOfCSFloatAndSteamBalance();
+                    ct.ThrowIfCancellationRequested();
+                    var snapshot = new AnalyticsSnapshot
+                    {
+                        Json = JsonConvert.SerializeObject(logs),
+                        GeneratedAtUtc = DateTime.UtcNow
+                    };
+                    string path = BalanceHistorySnapshotPath;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    try
+                    {
+                        await File.WriteAllTextAsync(temporary, JsonConvert.SerializeObject(snapshot), ct);
+                        File.Move(temporary, path, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+                    }
+                    Volatile.Write(ref balanceHistorySnapshot, snapshot);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Could not refresh the CS2 balance history snapshot.", false);
+                }
+
+                try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+        }
+
+        private async Task LoadAnalyticsSnapshotAsync()
+        {
+            try
+            {
+                if (!File.Exists(AnalyticsSnapshotPath)) return;
+                AnalyticsSnapshot? saved = JsonConvert.DeserializeObject<AnalyticsSnapshot>(
+                    await File.ReadAllTextAsync(AnalyticsSnapshotPath));
+                if (!string.IsNullOrWhiteSpace(saved?.Json)
+                    && IsAnalyticsSnapshotFresh(saved.GeneratedAtUtc, DateTime.UtcNow))
+                    Volatile.Write(ref analyticsSnapshot, saved);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Could not load the saved CS2 analytics snapshot.", false);
+            }
+        }
+
+        private async Task RefreshAnalyticsLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    // Copy the mutable histories before the expensive calculation. A concurrent
+                    // update may cause this attempt to fail; the next background pass retries it.
+                    var (comparisons, purchases) = scanalytics.SnapshotHistories();
+                    double coefficient = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
+                    ct.ThrowIfCancellationRequested();
+                    string json = JsonConvert.SerializeObject(new ScannedComparisonAnalytics(
+                        comparisons, purchases, coefficient));
+                    var snapshot = new AnalyticsSnapshot { Json = json, GeneratedAtUtc = DateTime.UtcNow };
+
+                    string path = AnalyticsSnapshotPath;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    try
+                    {
+                        await File.WriteAllTextAsync(temporary, JsonConvert.SerializeObject(snapshot), ct);
+                        File.Move(temporary, path, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+                    }
+                    Volatile.Write(ref analyticsSnapshot, snapshot);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, "Could not refresh the CS2 analytics snapshot.", false);
+                }
+
+                try { await analyticsRefreshRequested.WaitAsync(TimeSpan.FromSeconds(30), ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+        }
+
     }
 }

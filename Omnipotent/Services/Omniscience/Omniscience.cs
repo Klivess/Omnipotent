@@ -10,6 +10,7 @@ using Omnipotent.Services.Omniscience.Radar;
 using Omnipotent.Services.Omniscience.Replica;
 using Omnipotent.Services.Omniscience.Scheduling;
 using Omnipotent.Services.Omniscience.Search;
+using Omnipotent.Services.KliveAPI.Caching;
 using System;
 using System.IO;
 using System.Net.Http;
@@ -50,6 +51,7 @@ namespace Omnipotent.Services.Omniscience
         public ReplicaFidelity ReplicaFidelity { get; private set; } = null!;
         public ImportWatcher Imports { get; private set; } = null!;
         public DailyBriefing Briefing { get; private set; } = null!;
+        internal OmniscienceBackgroundSnapshots RouteSnapshots { get; private set; } = null!;
 
         public HttpClient Http { get; private set; } = null!;
 
@@ -68,6 +70,10 @@ namespace Omnipotent.Services.Omniscience
 
             Db = new OmniscienceDb();
             Db.Migrate();
+            RouteSnapshots = new OmniscienceBackgroundSnapshots(
+                Path.Combine(Path.GetDirectoryName(Db.DbPath)!, "route-snapshots"),
+                (key, ex) => { _ = ServiceLogError(ex, $"[Omniscience] Snapshot {key} refresh failed.", false); });
+            ServiceQuitRequest += RouteSnapshots.Dispose;
 
             // Recency weighting for analytics/profiling: floored exponential decay so 6+
             // year old corpora stay audible while recent behaviour dominates.
@@ -148,17 +154,18 @@ namespace Omnipotent.Services.Omniscience
             var deductionRoutes = new DeductionRoutes(this);
             await deductionRoutes.RegisterRoutes();
             await ReplicaFidelity.RegisterRoutes();
-            // Compose() runs several time-filtered aggregates over the full messages /
-            // qa_pairs tables, and the dashboard batch requests this on every refresh —
-            // cache + warm it so the batch never waits on it. A 5-minute TTL is fine
-            // for a 24-hour digest.
-            OmniscienceRoutes.RegisterWarmTarget("briefing/preview", TimeSpan.FromMinutes(5), ComposeBriefingPayload);
+            // The preview is built on its own background loop; requests only read
+            // the last completed, age-bounded snapshot.
+            RouteSnapshots.Register("briefing/preview", "briefing-preview.json",
+                TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(15), ComposeBriefingPayload);
             await CreateAPIRoute("/omniscience/briefing/preview", async req =>
             {
                 try
                 {
-                    // Compose-only: renders the digest for the console WITHOUT sending a DM.
-                    await OmniscienceRoutes.CachedRead(req, "briefing/preview", TimeSpan.FromMinutes(5), ComposeBriefingPayload);
+                    CacheDeps.MarkUncacheable("briefing preview has an age-bounded background snapshot");
+                    string? payload = RouteSnapshots.TryGet("briefing/preview");
+                    if (payload == null) await OmniscienceRoutes.RespondBusy(req);
+                    else await req.ReturnResponse(payload);
                 }
                 catch (Exception ex)
                 {
@@ -205,7 +212,7 @@ namespace Omnipotent.Services.Omniscience
             await ServiceLog("[Omniscience] Online.");
         }
 
-        // Shared by the /omniscience/briefing/preview route and its warm target.
+        // Runs only in the briefing snapshot's background worker.
         private string ComposeBriefingPayload()
         {
             return new Newtonsoft.Json.Linq.JObject(

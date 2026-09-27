@@ -3,6 +3,7 @@ using Newtonsoft.Json;
 using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Contracts;
+using System.Globalization;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
 {
@@ -23,6 +24,27 @@ namespace Omnipotent.Services.OmniTrader.Persistence
         public DateTime? StartedUtc { get; set; }
         public DateTime? FinishedUtc { get; set; }
         public bool CancellationRequested { get; set; }
+    }
+
+    /// <summary>The fields shown in the jobs list, without the potentially enormous result arrays.</summary>
+    public sealed class BacktestJobSummaryRow
+    {
+        public required string Id { get; init; }
+        public required string StrategyClass { get; init; }
+        public required BacktestConfig Config { get; init; }
+        public BacktestJobStatus Status { get; init; }
+        public double ProgressPct { get; init; }
+        public int? CandlesTotal { get; init; }
+        public int? CandlesDone { get; init; }
+        public DateTime QueuedUtc { get; init; }
+        public DateTime? StartedUtc { get; init; }
+        public DateTime? FinishedUtc { get; init; }
+        public string? Error { get; init; }
+        public decimal? TotalPnLPercent { get; init; }
+        public decimal? WinRate { get; init; }
+        public decimal? SharpeRatio { get; init; }
+        public decimal? MaxDrawdownPercent { get; init; }
+        public int? TotalTrades { get; init; }
     }
 
     public sealed class BacktestJobRepository
@@ -153,6 +175,68 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             var output = new List<BacktestJobRow>();
             while (await reader.ReadAsync(ct)) output.Add(Map(reader));
+            return output;
+        }
+
+        /// <summary>
+        /// The list needs five summary metrics. SQLite extracts their compact source fields without
+        /// transferring and deserializing Trades, EquityCurve, Candles, and validation data for every
+        /// completed job. Derived metrics are calculated here so older stored results work too.
+        /// The full result remains available through GetAsync for the single-job route.
+        /// </summary>
+        public async Task<List<BacktestJobSummaryRow>> ListRecentSummariesAsync(int limit = 50,
+            CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await db.OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT id, strategy_class, config_json, status, progress_pct,
+                       candles_total, candles_done, queued_utc, started_utc, finished_utc, error,
+                       result_json IS NOT NULL AS has_result,
+                       json_extract(result_json, '$.InitialEquity', '$.FinalEquity',
+                           '$.WinningTrades', '$.TotalTrades', '$.SharpeRatio',
+                           '$.MaxDrawdownPercent') AS metrics
+                FROM backtest_jobs ORDER BY queued_utc DESC LIMIT $l";
+            cmd.Parameters.AddWithValue("$l", limit);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            var output = new List<BacktestJobSummaryRow>();
+            while (await reader.ReadAsync(ct))
+            {
+                var config = JsonConvert.DeserializeObject<BacktestConfig>(reader.GetString(2))
+                    ?? throw new InvalidOperationException("Bad config_json in backtest_jobs row");
+                bool hasResult = reader.GetBoolean(11);
+                decimal?[] metrics = hasResult && !reader.IsDBNull(12)
+                    ? JsonConvert.DeserializeObject<decimal?[]>(reader.GetString(12)) ?? new decimal?[6]
+                    : new decimal?[6];
+                if (metrics.Length != 6) throw new InvalidOperationException("Bad result_json metrics in backtest_jobs row");
+                decimal initialEquity = metrics[0] ?? 0m;
+                decimal finalEquity = metrics[1] ?? 0m;
+                int winningTrades = (int)(metrics[2] ?? 0m);
+                int totalTrades = (int)(metrics[3] ?? 0m);
+                output.Add(new BacktestJobSummaryRow
+                {
+                    Id = reader.GetString(0),
+                    StrategyClass = reader.GetString(1),
+                    Config = config,
+                    Status = ParseStatus(reader.GetString(3)),
+                    ProgressPct = reader.GetDouble(4),
+                    CandlesTotal = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                    CandlesDone = reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                    QueuedUtc = DateTime.Parse(reader.GetString(7), CultureInfo.InvariantCulture).ToUniversalTime(),
+                    StartedUtc = reader.IsDBNull(8) ? null : DateTime.Parse(reader.GetString(8), CultureInfo.InvariantCulture).ToUniversalTime(),
+                    FinishedUtc = reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture).ToUniversalTime(),
+                    Error = reader.IsDBNull(10) ? null : reader.GetString(10),
+                    TotalPnLPercent = hasResult
+                        ? initialEquity == 0m ? 0m : (finalEquity - initialEquity) / initialEquity * 100m
+                        : null,
+                    WinRate = hasResult
+                        ? totalTrades == 0 ? 0m : (decimal)winningTrades / totalTrades * 100m
+                        : null,
+                    SharpeRatio = hasResult ? metrics[4] ?? 0m : null,
+                    MaxDrawdownPercent = hasResult ? metrics[5] ?? 0m : null,
+                    TotalTrades = hasResult ? totalTrades : null
+                });
+            }
             return output;
         }
 

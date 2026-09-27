@@ -1,4 +1,6 @@
 using System.Security.Cryptography.X509Certificates;
+using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveMail.Persistence;
 using Omnipotent.Services.KliveMail.Smtp;
@@ -20,6 +22,23 @@ namespace Omnipotent.Services.KliveMail
 
         private KliveMailRoutes routes = null!;
         private SmtpServer.SmtpServer? smtpServer;
+        private readonly SemaphoreSlim statsRefreshRequested = new(0, 1);
+        private MailSummarySnapshot? currentSummary;
+        private readonly string? statsSnapshotPathOverride;
+
+        internal string? StatsSnapshotJson => FreshSummary()?.StatsJson;
+        internal string? MailboxesSnapshotJson => FreshSummary()?.MailboxesJson;
+
+        private string StatsSnapshotPath => statsSnapshotPathOverride ?? Path.Combine(
+            OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveMailDirectory), "mail-summary.snapshot.json");
+
+        private MailSummarySnapshot? FreshSummary()
+        {
+            var snapshot = Volatile.Read(ref currentSummary);
+            if (snapshot == null) return null;
+            TimeSpan age = DateTime.UtcNow - snapshot.GeneratedAtUtc;
+            return age >= TimeSpan.FromMinutes(-1) && age <= TimeSpan.FromMinutes(2) ? snapshot : null;
+        }
 
         public KliveMail()
         {
@@ -36,6 +55,9 @@ namespace Omnipotent.Services.KliveMail
                 Db = new KliveMailDb();
                 await Db.InitialiseAsync();
                 Repo = new KliveMailRepository(Db);
+
+                await LoadStatsSnapshotAsync();
+                _ = Task.Run(() => RefreshStatsLoopAsync(cancellationToken.Token));
 
                 routes = new KliveMailRoutes(this);
                 await routes.RegisterRoutes();
@@ -136,6 +158,7 @@ namespace Omnipotent.Services.KliveMail
         // Called by the message store once a message is persisted.
         internal void RaiseMailStored(Models.StoredMessage message)
         {
+            QueueStatsRefresh();
             var handler = MailStored;
             if (handler == null) return;
             try { handler(message); }
@@ -240,6 +263,7 @@ namespace Omnipotent.Services.KliveMail
                 };
                 copy.RawSize = (copy.BodyText ?? "").Length;
                 await Repo.InsertMessageAsync(copy, ct);
+                QueueStatsRefresh();
             }
             catch (Exception ex)
             {
@@ -255,5 +279,90 @@ namespace Omnipotent.Services.KliveMail
 
         public async Task LogStoreError(Exception ex)
             => await ServiceLogError(ex, "KliveMail: error storing inbound message.");
+
+        internal void QueueStatsRefresh()
+        {
+            try { statsRefreshRequested.Release(); }
+            catch (SemaphoreFullException) { /* A refresh is already queued. */ }
+        }
+
+        internal KliveMail(string snapshotPath) : this() => statsSnapshotPathOverride = snapshotPath;
+
+        internal async Task LoadStatsSnapshotAsync()
+        {
+            try
+            {
+                if (!File.Exists(StatsSnapshotPath)) return;
+                var saved = JsonConvert.DeserializeObject<MailSummarySnapshot>(
+                    await File.ReadAllTextAsync(StatsSnapshotPath));
+                if (string.IsNullOrWhiteSpace(saved?.StatsJson) || string.IsNullOrWhiteSpace(saved.MailboxesJson)
+                    || saved.GeneratedAtUtc > DateTime.UtcNow.AddMinutes(1)
+                    || DateTime.UtcNow - saved.GeneratedAtUtc > TimeSpan.FromMinutes(2))
+                    return;
+                Volatile.Write(ref currentSummary, saved);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "KliveMail: could not load the saved mail summary.", false);
+            }
+        }
+
+        private async Task RefreshStatsLoopAsync(CancellationToken ct)
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                bool failed = false;
+                try
+                {
+                    // Both database scans and JSON creation happen only on this background task.
+                    var (total, unread, trash) = await Repo.GetStatsAsync(ct);
+                    var mailboxes = await Repo.ListMailboxesAsync(ct);
+                    var snapshot = new MailSummarySnapshot
+                    {
+                        GeneratedAtUtc = DateTime.UtcNow,
+                        StatsJson = JsonConvert.SerializeObject(new { total, unread, trash }),
+                        MailboxesJson = JsonConvert.SerializeObject(new
+                        {
+                            all = new { total, unread }, trash, mailboxes
+                        })
+                    };
+                    string path = StatsSnapshotPath;
+                    string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                    try
+                    {
+                        await File.WriteAllTextAsync(temporary, JsonConvert.SerializeObject(snapshot), ct);
+                        File.Move(temporary, path, overwrite: true);
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(temporary)) File.Delete(temporary); } catch { }
+                    }
+
+                    // Strings are immutable. A request takes one atomic reference read and never
+                    // opens SQLite or waits for a refresh to complete.
+                    Volatile.Write(ref currentSummary, snapshot);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    failed = true;
+                    await ServiceLogError(ex, "KliveMail: could not refresh the mail summary.", false);
+                }
+
+                try
+                {
+                    await statsRefreshRequested.WaitAsync(
+                        failed ? TimeSpan.FromSeconds(30) : TimeSpan.FromSeconds(5), ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            }
+        }
+
+        private sealed class MailSummarySnapshot
+        {
+            public DateTime GeneratedAtUtc { get; set; }
+            public string? StatsJson { get; set; }
+            public string? MailboxesJson { get; set; }
+        }
     }
 }

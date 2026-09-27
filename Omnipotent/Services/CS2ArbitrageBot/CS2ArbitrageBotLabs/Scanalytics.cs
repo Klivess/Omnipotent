@@ -17,6 +17,28 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         public List<ScannedComparison> AllScannedComparisonsInHistory;
         public List<PurchasedListing> AllPurchasedListingsInHistory;
         public List<ScanResults> AllScanResultsInHistory;
+        private readonly object historyLock = new();
+        public (List<ScannedComparison> Comparisons, List<PurchasedListing> Purchases) SnapshotHistories()
+        {
+            lock (historyLock)
+                return (new List<ScannedComparison>(AllScannedComparisonsInHistory),
+                    new List<PurchasedListing>(AllPurchasedListingsInHistory));
+        }
+        public bool HasScannedComparison(string listingId)
+        {
+            lock (historyLock)
+                return AllScannedComparisonsInHistory.Any(k => k.CSFloatListing.ItemListingID == listingId);
+        }
+        public bool TryAddScannedComparison(ScannedComparison comparison)
+        {
+            lock (historyLock)
+            {
+                if (AllScannedComparisonsInHistory.Any(k => k.CSFloatListing.ItemListingID == comparison.CSFloatListing.ItemListingID))
+                    return false;
+                AllScannedComparisonsInHistory.Add(comparison);
+                return true;
+            }
+        }
         private CS2ArbitrageBot parent;
         public Scanalytics(CS2ArbitrageBot parent)
         {
@@ -462,7 +484,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         }
         public async Task LoadScannedComparisons()
         {
-            AllScannedComparisonsInHistory = new List<ScannedComparison>();
+            var loaded = new List<ScannedComparison>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
             if (Directory.Exists(path))
             {
@@ -472,15 +494,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     {
                         string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
                         ScannedComparison comparison = JsonConvert.DeserializeObject<ScannedComparison>(content);
-                        AllScannedComparisonsInHistory.Add(comparison);
+                        loaded.Add(comparison);
                     }
                     catch (Exception e) { }
                 }
             }
+            lock (historyLock) AllScannedComparisonsInHistory = loaded;
         }
         public async Task LoadPurchasedItems()
         {
-            AllPurchasedListingsInHistory = new List<PurchasedListing>();
+            var loaded = new List<PurchasedListing>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
             if (Directory.Exists(path))
             {
@@ -490,11 +513,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     {
                         string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
                         PurchasedListing comparison = JsonConvert.DeserializeObject<PurchasedListing>(content);
-                        AllPurchasedListingsInHistory.Add(comparison);
+                        loaded.Add(comparison);
                     }
                     catch (Exception e) { }
                 }
             }
+            lock (historyLock) AllPurchasedListingsInHistory = loaded;
         }
         public async Task SavePurchasedListing(PurchasedListing purchasedListing)
         {
@@ -507,18 +531,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
         }
         public async Task UpdatePurchasedListing(PurchasedListing purchasedListing)
         {
-            if (AllPurchasedListingsInHistory.Where(k => k.CSFloatListingID == purchasedListing.CSFloatListingID).Any())
+            lock (historyLock)
             {
-                //if it already exists
-                //replace it
                 AllPurchasedListingsInHistory.RemoveAll(k => k.CSFloatListingID == purchasedListing.CSFloatListingID);
                 AllPurchasedListingsInHistory.Add(purchasedListing);
             }
-            else
-            {
-                AllPurchasedListingsInHistory.Add(purchasedListing);
-            }
             await SavePurchasedListing(purchasedListing);
+            parent.QueueAnalyticsRefresh();
         }
         public async Task SaveScanResult(ScanResults scanResult)
         {
@@ -590,6 +609,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             //Try saying that 3 times lol
             filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(liquidSearchResult, Formatting.Indented));
+            parent.QueueAnalyticsRefresh();
         }
         /*
         public async Task UpdateLiquiditySearch(LiquiditySearchResult scanResult)
@@ -749,7 +769,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     bal = bal * (float)item.PredictedOverallArbitrageGain;
                 }
                 TotalExpectedProfitPercent = ((bal / 100) - 1) * 100;
-                FirstListingDateRecorded = comparisons.Min(c => c.LastUpdate);
+                FirstListingDateRecorded = comparisons.Count > 0
+                    ? comparisons.Min(c => c.LastUpdate) : default;
                 AnalyticsGeneratedAt = DateTime.Now;
 
                 AllPurchasedItems = purchasedListings;

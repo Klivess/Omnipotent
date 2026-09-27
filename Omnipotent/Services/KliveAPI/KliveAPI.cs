@@ -821,11 +821,13 @@ namespace Omnipotent.Services.KliveAPI
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { cleared = true }), "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
-            await TelemetryRoutes.RegisterAsync(this, () => telemetry, () => telemetryDb,
+            await TelemetryRoutes.RegisterAsync(this, () => telemetry, () => telemetryDb, () => telemetryTraceViews,
                 route => ControllerLookup.TryGetValue(route, out RouteInfo info) ? info.normalizedMethod : null);
         }
 
         private TelemetryDb? telemetryDb;
+        private TelemetryTraceViews? telemetryTraceViews;
+        private TelemetryExemplarViews? telemetryExemplarViews;
 
         /// <summary>
         /// Creates (once per service start) the telemetry engine, its SQLite store and the
@@ -849,7 +851,14 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     Log = msg => _ = ServiceLog(msg),
                 };
+                if (telemetryDb != null)
+                {
+                    telemetryExemplarViews = new TelemetryExemplarViews(telemetryDb, () => telemetry?.NowMs() ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                    telemetry.SetExemplarViews(telemetryExemplarViews);
+                }
                 telemetry.Start();
+                if (telemetryDb != null)
+                    telemetryTraceViews = new TelemetryTraceViews(telemetryDb, () => telemetry?.NowMs() ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 runtimeSampler = new RuntimeSampler(telemetry, new RuntimeSampler.Inputs
                 {
                     InFlight = () => Volatile.Read(ref _inFlightRequests),
@@ -870,7 +879,11 @@ namespace Omnipotent.Services.KliveAPI
         {
             try { runtimeSampler?.Stop(); } catch { }
             try { telemetry?.Stop(); } catch { }
+            try { telemetryTraceViews?.Dispose(); } catch { }
+            try { telemetryExemplarViews?.Dispose(); } catch { }
             runtimeSampler = null;
+            telemetryTraceViews = null;
+            telemetryExemplarViews = null;
         }
 
         /// <summary>

@@ -1,6 +1,4 @@
-using System.Collections.Concurrent;
 using Newtonsoft.Json;
-using Omnipotent.Services.KliveAPI.Caching;
 
 namespace Omnipotent.Services.Projects;
 
@@ -92,100 +90,106 @@ public sealed class CostSimulationSnapshot
 /// </summary>
 public sealed class ProjectCostSimulatorService
 {
+    internal static readonly string[] DefaultRanges =
+        ["1h", "6h", "24h", "7d", "30d", "90d", "365d", "all"];
     private readonly ProjectStore projects;
     private readonly ProjectTokenUsageStore usage;
     private readonly ProjectSubAgentManager agents;
-    private readonly Action<string> log;
-    private readonly ConcurrentDictionary<string, CostSimulationSnapshot> cache = new(StringComparer.Ordinal);
 
     public ProjectCostSimulatorService(
         ProjectStore projects,
         ProjectTokenUsageStore usage,
-        ProjectSubAgentManager agents,
-        Action<string>? log = null)
+        ProjectSubAgentManager agents)
     {
         this.projects = projects;
         this.usage = usage;
         this.agents = agents;
-        this.log = log ?? (_ => { });
     }
 
-    public CostSimulationSnapshot Get(
-        string? rangeKey,
-        DateTime? utcNow = null,
-        bool forceRefresh = false,
-        string? fromUtc = null,
-        string? toUtc = null,
-        bool includeArchived = true)
+    /// <summary>One journal read per project builds every standard range. Only background workers call this.</summary>
+    internal IReadOnlyDictionary<string, CostSimulationSnapshot> BuildDefaultSnapshots()
+        => BuildDefaultSnapshots(projects.ListProjects(),
+            (projectID, from, to) => usage.EnumerateRange(projectID, from, to),
+            projectID => agents.ListActive(projectID), DateTime.UtcNow);
+
+    internal static IReadOnlyDictionary<string, CostSimulationSnapshot> BuildDefaultSnapshots(
+        IReadOnlyList<Project> allProjects,
+        Func<string, DateTime, DateTime, IEnumerable<ProjectTokenUsageRecord>> enumerateUsage,
+        Func<string, IReadOnlyList<ProjectAgentRecord>> listAgents,
+        DateTime now)
     {
-        if (forceRefresh) CacheDeps.MarkUncacheable("forced cost simulator refresh");
-        DateTime now = (utcNow ?? DateTime.UtcNow).ToUniversalTime();
-        var allProjects = projects.ListProjects();
-        if (!includeArchived)
-            allProjects = allProjects.Where(p => p.Status != ProjectStatus.Archived).ToList();
         DateTime earliest = allProjects.Count == 0
             ? now.Date
             : allProjects.Min(p => p.CreatedAt).ToUniversalTime();
-        var range = ProjectAnalyticsCalculator.ResolveRange(rangeKey, earliest, now, fromUtc, toUtc);
-
-        string cacheKey = ProjectAnalyticsService.SnapshotCacheKey(
-            "cost-simulator:" + includeArchived, range);
-        if (!forceRefresh
-            && cache.TryGetValue(cacheKey, out var cached)
-            && cached.GeneratedAt.ToUniversalTime() <= now
-            && ProjectAnalyticsService.SnapshotTimeBucket(cached.GeneratedAt) ==
-               ProjectAnalyticsService.SnapshotTimeBucket(now))
-        {
-            CacheDeps.NoteTimeBucket(ProjectAnalyticsService.SnapshotTtl);
-            return cached;
-        }
-
+        var activeProjects = allProjects.Where(p => p.Status != ProjectStatus.Archived).ToList();
+        DateTime activeEarliest = activeProjects.Count == 0
+            ? now.Date : activeProjects.Min(p => p.CreatedAt).ToUniversalTime();
+        var ranges = DefaultRanges.Select(key => ProjectAnalyticsCalculator.ResolveRange(key, earliest, now)).ToArray();
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var rows = new CostSimulationProject[allProjects.Count];
-        // Every project's journal is its own file, so the scan parallelises cleanly. Bound it the
-        // same way the portfolio build does rather than handing the whole box to one report.
+        var rows = ranges.Select(_ => new CostSimulationProject[allProjects.Count]).ToArray();
+        // The usage store streams a complete JSONL journal to reach any window. Parse it once,
+        // then feed the bounded set of range accumulators in memory.
         Parallel.For(0, allProjects.Count, new ParallelOptions
         {
-            MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount)),
+            MaxDegreeOfParallelism = Math.Max(1, Math.Min(2, Environment.ProcessorCount)),
         }, index =>
         {
             var project = allProjects[index];
-            try
+            var roster = listAgents(project.ProjectID);
+            var accumulators = ranges.Select(_ =>
+                new ProjectCostSimulatorCalculator.ProjectAccumulator(project, roster)).ToArray();
+            foreach (var record in enumerateUsage(project.ProjectID, earliest, now))
             {
-                rows[index] = ProjectCostSimulatorCalculator.BuildProject(
-                    project,
-                    usage.EnumerateRange(project.ProjectID, range.FromUtc, range.ToUtc),
-                    agents.ListActive(project.ProjectID));
+                DateTime occurredAt = record.OccurredAt.ToUniversalTime();
+                for (int r = 0; r < ranges.Length; r++)
+                    if (occurredAt >= ranges[r].FromUtc && occurredAt <= ranges[r].ToUtc)
+                        accumulators[r].Add(record);
             }
-            catch (Exception ex)
-            {
-                log($"Cost simulator could not read {project.ProjectID}: {ex.Message}");
-                rows[index] = new CostSimulationProject
-                {
-                    ProjectID = project.ProjectID,
-                    Name = project.Name,
-                    Status = project.Status.ToString(),
-                };
-            }
+            for (int r = 0; r < ranges.Length; r++) rows[r][index] = accumulators[r].Complete();
         });
-
-        var snapshot = ProjectCostSimulatorCalculator.BuildSnapshot(rows, range, now);
         stopwatch.Stop();
-        snapshot.BuildDurationMs = stopwatch.ElapsedMilliseconds;
-        if (!utcNow.HasValue) snapshot.GeneratedAt = DateTime.UtcNow;
-        cache[cacheKey] = snapshot;
-        TrimCache(now);
-        if (!forceRefresh) CacheDeps.NoteTimeBucket(ProjectAnalyticsService.SnapshotTtl);
-        return snapshot;
+        var result = new Dictionary<string, CostSimulationSnapshot>(StringComparer.Ordinal);
+        for (int r = 0; r < ranges.Length; r++)
+        {
+            string key = DefaultRanges[r];
+            var all = ProjectCostSimulatorCalculator.BuildSnapshot(rows[r], ranges[r], now);
+            all.BuildDurationMs = stopwatch.ElapsedMilliseconds;
+            result[ProjectCostSimulatorMaterializer.Key(key, true)] = all;
+
+            var activeRange = key == "all"
+                ? ProjectAnalyticsCalculator.ResolveRange(key, activeEarliest, now) : ranges[r];
+            var active = ProjectCostSimulatorCalculator.BuildSnapshot(
+                rows[r].Where(row => row.Status != ProjectStatus.Archived.ToString()).ToArray(),
+                activeRange, now);
+            active.BuildDurationMs = stopwatch.ElapsedMilliseconds;
+            result[ProjectCostSimulatorMaterializer.Key(key, false)] = active;
+        }
+        return result;
     }
 
-    private void TrimCache(DateTime now)
+    /// <summary>Custom windows are queued and built by one bounded background worker.</summary>
+    internal CostSimulationSnapshot BuildCustom(AnalyticsRange range, bool includeArchived)
     {
-        if (cache.Count <= 64) return;
-        DateTime staleBefore = now.AddMinutes(-10);
-        foreach (var entry in cache)
-            if (entry.Value.GeneratedAt < staleBefore)
-                cache.TryRemove(entry.Key, out _);
+        DateTime now = DateTime.UtcNow;
+        var allProjects = projects.ListProjects();
+        if (!includeArchived)
+            allProjects = allProjects.Where(p => p.Status != ProjectStatus.Archived).ToList();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var rows = new CostSimulationProject[allProjects.Count];
+        Parallel.For(0, allProjects.Count, new ParallelOptions
+        {
+            MaxDegreeOfParallelism = Math.Max(1, Math.Min(2, Environment.ProcessorCount)),
+        }, index =>
+        {
+            var project = allProjects[index];
+            rows[index] = ProjectCostSimulatorCalculator.BuildProject(project,
+                usage.EnumerateRange(project.ProjectID, range.FromUtc, range.ToUtc),
+                agents.ListActive(project.ProjectID));
+        });
+        stopwatch.Stop();
+        var snapshot = ProjectCostSimulatorCalculator.BuildSnapshot(rows, range, now);
+        snapshot.BuildDurationMs = stopwatch.ElapsedMilliseconds;
+        return snapshot;
     }
 }
 
@@ -196,17 +200,31 @@ internal static class ProjectCostSimulatorCalculator
         IEnumerable<ProjectTokenUsageRecord> usage,
         IReadOnlyList<ProjectAgentRecord> roster)
     {
-        var row = new CostSimulationProject
-        {
-            ProjectID = project.ProjectID,
-            Name = project.Name,
-            Status = project.Status.ToString(),
-        };
-        var rosterByID = new Dictionary<string, ProjectAgentRecord>(StringComparer.OrdinalIgnoreCase);
-        foreach (var agent in roster) rosterByID[agent.AgentID] = agent;
-        var byAgent = new Dictionary<string, CostSimulationAgent>(StringComparer.OrdinalIgnoreCase);
+        var accumulator = new ProjectAccumulator(project, roster);
+        foreach (var record in usage) accumulator.Add(record);
+        return accumulator.Complete();
+    }
 
-        foreach (var record in usage)
+    internal sealed class ProjectAccumulator
+    {
+        private readonly CostSimulationProject row;
+        private readonly Dictionary<string, ProjectAgentRecord> rosterByID =
+            new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CostSimulationAgent> byAgent =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        internal ProjectAccumulator(Project project, IReadOnlyList<ProjectAgentRecord> roster)
+        {
+            row = new CostSimulationProject
+            {
+                ProjectID = project.ProjectID,
+                Name = project.Name,
+                Status = project.Status.ToString(),
+            };
+            foreach (var agent in roster) rosterByID[agent.AgentID] = agent;
+        }
+
+        internal void Add(ProjectTokenUsageRecord record)
         {
             string agentID = string.IsNullOrWhiteSpace(record.AgentID) ? "system" : record.AgentID;
             if (!byAgent.TryGetValue(agentID, out var agentRow))
@@ -237,7 +255,7 @@ internal static class ProjectCostSimulatorCalculator
             {
                 agentRow.ActualCostUsd += record.CostUsd;
                 row.ActualCostUsd += record.CostUsd;
-                continue;
+                return;
             }
 
             long cacheRead = record.CacheMetricsAvailable
@@ -249,8 +267,8 @@ internal static class ProjectCostSimulatorCalculator
                 : 0;
             long output = Math.Max(0, record.CompletionTokens);
 
-            Add(agentRow, input, cacheRead, cacheWrite, output, record);
-            Add(row, input, cacheRead, cacheWrite, output, record);
+            ProjectCostSimulatorCalculator.Add(agentRow, input, cacheRead, cacheWrite, output, record);
+            ProjectCostSimulatorCalculator.Add(row, input, cacheRead, cacheWrite, output, record);
 
             string model = string.IsNullOrWhiteSpace(record.Model) ? "unknown" : record.Model;
             if (!row.ModelTally.TryGetValue(model, out var modelRow))
@@ -259,11 +277,14 @@ internal static class ProjectCostSimulatorCalculator
             if (input + cacheRead + output > 0) modelRow.Requests++;
         }
 
-        row.Agents = byAgent.Values
-            .OrderByDescending(a => a.TotalTokens)
-            .ThenBy(a => a.Label, StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        return row;
+        internal CostSimulationProject Complete()
+        {
+            row.Agents = byAgent.Values
+                .OrderByDescending(a => a.TotalTokens)
+                .ThenBy(a => a.Label, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            return row;
+        }
     }
 
     private static void Add(

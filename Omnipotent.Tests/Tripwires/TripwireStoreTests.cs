@@ -1,3 +1,4 @@
+using Microsoft.Data.Sqlite;
 using Omnipotent.Services.Tripwires;
 
 namespace Omnipotent.Tests.Tripwires;
@@ -81,6 +82,122 @@ public sealed class TripwireStoreTests : IDisposable
         Assert.Equal(originalToken, updated.Targets.Single(target => target.Id == tripwire.Targets[0].Id).Token);
         Assert.Null(await store.ResolveTokenAsync(removedToken));
         Assert.Equal(2, updated.Targets.Count);
+    }
+
+    [Fact]
+    public async Task SummarySnapshot_IsPrecomputedAndSurvivesReopeningTheStore()
+    {
+        string dbPath = Path.Combine(directory, "tripwires.db");
+        using (var store = await CreateStoreAsync())
+        {
+            var tripwire = await store.CreateAsync("Summary", "Klives", new TripwireSettings(), new[]
+            {
+                new TripwireTarget { Label = "Main", DestinationUrl = "https://example.com" },
+            });
+            Assert.Equal(0, (await store.GetSummarySnapshotAsync(tripwire.Id))!.TotalTrips);
+
+            await store.RecordEventAsync(tripwire, tripwire.Targets[0],
+                NewEvent(tripwire, tripwire.Targets[0], "visitor", DateTimeOffset.UtcNow), 60);
+            Assert.Equal(0, (await store.GetSummarySnapshotAsync(tripwire.Id))!.TotalTrips);
+
+            await store.RefreshSummarySnapshotAsync(tripwire.Id);
+            var snapshot = await store.GetSummarySnapshotAsync(tripwire.Id);
+            Assert.Equal(1, snapshot!.TotalTrips);
+            Assert.Equal(1, snapshot.UniqueTrips);
+            Assert.Equal(1, snapshot.TripsLast24Hours);
+            Assert.Contains("\"totalTrips\":1", await store.GetSummarySnapshotJsonAsync(tripwire.Id));
+        }
+
+        using var reopened = new TripwireStore(dbPath);
+        await reopened.InitialiseAsync();
+        string id = (await reopened.ListTripwireIdsAsync()).Single();
+        Assert.Equal(1, (await reopened.GetSummarySnapshotAsync(id))!.TotalTrips);
+        Assert.True(await reopened.DeleteAsync(id));
+        Assert.Null(await reopened.GetSummarySnapshotAsync(id));
+    }
+
+    [Fact]
+    public async Task ExpiredSummarySnapshot_IsNotServed()
+    {
+        using var store = await CreateStoreAsync();
+        var tripwire = await store.CreateAsync("Summary freshness", "Klives", new TripwireSettings(), new[]
+        {
+            new TripwireTarget { Label = "Main", DestinationUrl = "https://example.com" },
+        });
+        await using (var conn = new SqliteConnection($"Data Source={store.DbPath}"))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "UPDATE tripwire_summary_snapshots SET generated_utc=$old WHERE tripwire_id=$id";
+            cmd.Parameters.AddWithValue("$old", DateTimeOffset.UtcNow.AddMinutes(-4).ToString("O"));
+            cmd.Parameters.AddWithValue("$id", tripwire.Id);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        Assert.Null(await store.GetSummarySnapshotJsonAsync(tripwire.Id));
+        await store.RefreshSummarySnapshotAsync(tripwire.Id);
+        Assert.NotNull(await store.GetSummarySnapshotJsonAsync(tripwire.Id));
+    }
+
+    [Fact]
+    public async Task EventPageTotals_TrackRetainedRowsAfterCleanupAndClear()
+    {
+        using var store = await CreateStoreAsync();
+        var tripwire = await store.CreateAsync("Retention", "Klives", new TripwireSettings { RetentionDays = 1 }, new[]
+        {
+            new TripwireTarget { Label = "Old", DestinationUrl = "https://example.com/old" },
+            new TripwireTarget { Label = "Recent", DestinationUrl = "https://example.com/recent" },
+        });
+        await store.RecordEventAsync(tripwire, tripwire.Targets[0],
+            NewEvent(tripwire, tripwire.Targets[0], "old", DateTimeOffset.UtcNow.AddDays(-2)), 60);
+        await store.RecordEventAsync(tripwire, tripwire.Targets[1],
+            NewEvent(tripwire, tripwire.Targets[1], "recent", DateTimeOffset.UtcNow), 60);
+        Assert.Equal(2, (await store.GetEventsAsync(tripwire.Id, null, 100, 0)).Total);
+
+        await store.CleanupExpiredEventsAsync();
+        Assert.Equal(1, (await store.GetEventsAsync(tripwire.Id, null, 100, 0)).Total);
+        Assert.Equal(0, (await store.GetEventsAsync(tripwire.Id, tripwire.Targets[0].Id, 100, 0)).Total);
+        Assert.Equal(1, (await store.GetEventsAsync(tripwire.Id, tripwire.Targets[1].Id, 100, 0)).Total);
+        Assert.Empty((await store.GetEventsAsync(tripwire.Id, null, 100, int.MaxValue)).Items);
+
+        Assert.True(await store.ClearEventsAsync(tripwire.Id));
+        Assert.Equal(0, (await store.GetEventsAsync(tripwire.Id, null, 100, 0)).Total);
+        Assert.Equal(0, (await store.GetEventsAsync(tripwire.Id, tripwire.Targets[1].Id, 100, 0)).Total);
+    }
+
+    [Fact]
+    public async Task Initialise_MigratesExistingEventCounts()
+    {
+        string dbPath = Path.Combine(directory, "tripwires.db");
+        string tripwireId;
+        string targetId;
+        using (var store = await CreateStoreAsync())
+        {
+            var tripwire = await store.CreateAsync("Legacy", "Klives", new TripwireSettings(), new[]
+            {
+                new TripwireTarget { Label = "Main", DestinationUrl = "https://example.com" },
+            });
+            tripwireId = tripwire.Id;
+            targetId = tripwire.Targets[0].Id;
+            await store.RecordEventAsync(tripwire, tripwire.Targets[0],
+                NewEvent(tripwire, tripwire.Targets[0], "visitor", DateTimeOffset.UtcNow), 60);
+        }
+
+        await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+        {
+            await conn.OpenAsync();
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"DROP TABLE tripwire_summary_snapshots;
+                ALTER TABLE tripwires DROP COLUMN retained_event_count;
+                ALTER TABLE tripwire_targets DROP COLUMN retained_event_count;";
+            await cmd.ExecuteNonQueryAsync();
+        }
+
+        using var migrated = new TripwireStore(dbPath);
+        await migrated.InitialiseAsync();
+        Assert.Equal(1, (await migrated.GetEventsAsync(tripwireId, null, 100, 0)).Total);
+        Assert.Equal(1, (await migrated.GetEventsAsync(tripwireId, targetId, 100, 0)).Total);
+        await migrated.RefreshSummarySnapshotAsync(tripwireId);
+        Assert.Equal(1, (await migrated.GetSummarySnapshotAsync(tripwireId))!.TotalTrips);
     }
 
     [Theory]

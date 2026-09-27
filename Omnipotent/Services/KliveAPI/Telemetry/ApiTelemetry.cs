@@ -33,9 +33,9 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
     ///   traces → per-series, per-tier buckets (10s/1m/1h/1d, UTC aligned)
     ///   bucket closes → persistence batches (handed to a separate DB writer thread)
     ///   bucket closes → rebuilt materialized views (pre-serialized + pre-compressed)
-    ///   ad-hoc queries → computed from in-memory tiers only, bounded in points
-    /// Readers only ever touch <see cref="_views"/> (immutable entries swapped atomically)
-    /// or await a query the engine thread answers.
+    ///   ad-hoc queries → bounded background materialization from in-memory tiers
+    /// Readers only touch immutable published entries; HTTP handlers never wait for
+    /// an aggregate build on the engine thread.
     /// </summary>
     internal sealed partial class ApiTelemetry : IDisposable
     {
@@ -59,6 +59,9 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         private readonly Channel<RumSample> _rumChannel;
         private readonly ConcurrentQueue<double[]> _runtimeSamples = new();
         private readonly ConcurrentQueue<QueryWork> _queries = new();
+        private readonly ConcurrentQueue<TelemetryQuery> _snapshotBuilds = new();
+        private readonly ConcurrentDictionary<string, byte> _snapshotPending = new(StringComparer.Ordinal);
+        private int _snapshotPendingCount;
         private readonly ManualResetEventSlim _wake = new(false);
 
         private long _recorded, _dropped, _rumReceived, _rumDropped, _folded;
@@ -76,15 +79,20 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
 
         // ── views (read lock-free from request threads) ──
         private readonly ConcurrentDictionary<string, CacheEntry> _views = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, long> _viewPublishedAt = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, QuerySnapshot> _queryViews = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, long> _routeViewLastAccess = new(StringComparer.Ordinal);
         private readonly Dictionary<string, double> _viewBuildMs = new(StringComparer.Ordinal);
         private long _viewEpoch;
         private long _lastViewBuildUtcMs;
+        private long _lastLongViewBuildUtcMs;
         private byte[]? _liveTick;
+        private TelemetryExemplarViews? _exemplarViews;
         private long _lastLiveUtcMs;
 
         /// <summary>Latest 1-second live tick (JSON), for the live stream / live route.</summary>
         public byte[]? LiveTick => Volatile.Read(ref _liveTick);
+        internal void SetExemplarViews(TelemetryExemplarViews views) => Volatile.Write(ref _exemplarViews, views);
 
         // ── persistence ──
         private readonly TelemetryDb? _db;
@@ -220,9 +228,17 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             if (now - _lastLiveUtcMs >= 1000)
             {
                 _lastLiveUtcMs = now;
-                try { Volatile.Write(ref _liveTick, BuildLive(now)); } catch { }
+                try
+                {
+                    byte[] tick = BuildLive(now);
+                    Volatile.Write(ref _liveTick, tick);
+                    PublishView("live", tick);
+                }
+                catch { }
             }
             ProcessQueries();
+            RefreshActiveQueryViews();
+            ProcessSnapshotBuilds(4);
             EvictColdRouteViews();
         }
 
@@ -441,7 +457,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             None = 0,
             Short = 1,   // 15m / 1h / 6h — every 10 s close
             Medium = 2,  // 24h / 7d + weekly — every minute close
-            Long = 4,    // 30d / 90d / 1y / all — every hour close
+            Long = 4,    // 30d / 90d / 1y / all — every minute
             All = 7,
         }
 
@@ -492,6 +508,9 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
                 PruneMemory(TelemetryTier.D1, nowMs);
             }
 
+            // The long windows used to remain 60 minutes behind while the site was
+            // otherwise active. Refresh them once a minute from the in-memory tiers.
+            if (nowMs - _lastLongViewBuildUtcMs >= 60_000) dirty |= ViewGroup.Long;
             // Short views also refresh on a 10 s cadence even when idle (honest AsOf + live tail).
             if (dirty == ViewGroup.None && nowMs - _lastViewBuildUtcMs >= 10_000) dirty |= ViewGroup.Short;
             return dirty;
@@ -740,11 +759,116 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         public CacheEntry? TryGetView(string key)
         {
             if (!_views.TryGetValue(key, out CacheEntry? entry)) return null;
-            if (key.StartsWith("route|", StringComparison.Ordinal)) _routeViewLastAccess[key] = NowMs();
+            long now = NowMs();
+            long maxAgeMs = key == "live" ? 5_000 : 120_000;
+            if (!_viewPublishedAt.TryGetValue(key, out long builtAt)
+                || now - builtAt > maxAgeMs || builtAt - now > 60_000)
+                return null;
+            if (key.StartsWith("route|", StringComparison.Ordinal)) _routeViewLastAccess[key] = now;
             return entry;
         }
 
+        private sealed class QuerySnapshot
+        {
+            public required TelemetryQuery Query;
+            public required CacheEntry Entry;
+            public long BuiltAtMs;
+            public long LastAccessMs;
+        }
+
+        /// <summary>
+        /// HTTP reads a published answer only. A missing or aging custom answer is
+        /// queued for the engine thread, with a hard cap on distinct pending keys.
+        /// The caller can return 202 immediately on the first miss.
+        /// </summary>
+        public CacheEntry? TryGetQueryView(TelemetryQuery query)
+        {
+            if (query.IsPreset && !query.HasFilters)
+            {
+                CacheEntry? preset = TryGetView(query.ViewKey);
+                if (preset != null) return preset;
+            }
+
+            string key = query.CacheKey;
+            long now = NowMs();
+            if (_queryViews.TryGetValue(key, out QuerySnapshot? snapshot))
+            {
+                Interlocked.Exchange(ref snapshot.LastAccessMs, now);
+                bool moving = query.TouchesNow(now) || query.Kind == TelemetryQueryKind.Route;
+                if (moving && now - snapshot.BuiltAtMs > 120_000)
+                {
+                    QueueSnapshotBuild(query);
+                    return null;
+                }
+                if (moving
+                    && now - snapshot.BuiltAtMs >= (query.TouchesNow(now) ? 10_000 : 30_000))
+                    QueueSnapshotBuild(query);
+                return snapshot.Entry;
+            }
+            QueueSnapshotBuild(query);
+            return null;
+        }
+
+        private void QueueSnapshotBuild(TelemetryQuery query)
+        {
+            if (!_snapshotPending.TryAdd(query.CacheKey, 0)) return;
+            if (Interlocked.Increment(ref _snapshotPendingCount) > 64)
+            {
+                Interlocked.Decrement(ref _snapshotPendingCount);
+                _snapshotPending.TryRemove(query.CacheKey, out _);
+                return;
+            }
+            _snapshotBuilds.Enqueue(query);
+            _wake.Set();
+        }
+
+        private void ProcessSnapshotBuilds(int maxBuilds)
+        {
+            for (int n = 0; n < maxBuilds && _snapshotBuilds.TryDequeue(out TelemetryQuery? query); n++)
+            {
+                try
+                {
+                    CacheEntry entry = ComputeQueryEntry(query);
+                    if (entry.RawBody.Length >= 1024)
+                    {
+                        entry.GetVariant(HttpResponseHelpers.ContentEncoding.Brotli);
+                        entry.GetVariant(HttpResponseHelpers.ContentEncoding.Gzip);
+                    }
+                    long now = NowMs();
+                    _queryViews[query.CacheKey] = new QuerySnapshot { Query = query, Entry = entry, BuiltAtMs = now, LastAccessMs = now };
+                }
+                catch (Exception ex) { Log?.Invoke("Telemetry snapshot build failed: " + ex.Message); }
+                finally
+                {
+                    _snapshotPending.TryRemove(query.CacheKey, out _);
+                    Interlocked.Decrement(ref _snapshotPendingCount);
+                }
+            }
+            if (_queryViews.Count > 128)
+            {
+                foreach (var old in _queryViews.OrderBy(kv => Interlocked.Read(ref kv.Value.LastAccessMs)).Take(_queryViews.Count - 128))
+                    _queryViews.TryRemove(old.Key, out _);
+            }
+        }
+
+        private void RefreshActiveQueryViews()
+        {
+            long now = NowMs();
+            int scheduled = 0;
+            foreach (QuerySnapshot snapshot in _queryViews.Values)
+            {
+                if (scheduled >= 4) break;
+                if (now - Interlocked.Read(ref snapshot.LastAccessMs) > 5 * 60_000) continue;
+                bool current = snapshot.Query.TouchesNow(now);
+                if (!current && snapshot.Query.Kind != TelemetryQueryKind.Route) continue;
+                if (now - snapshot.BuiltAtMs < (current ? 10_000 : 30_000)) continue;
+                QueueSnapshotBuild(snapshot.Query);
+                scheduled++;
+            }
+        }
+
         internal IEnumerable<string> ViewKeys => _views.Keys;
+        internal int PendingSnapshotBuilds => _snapshotPending.Count;
 
         private void PublishView(string key, byte[] json)
         {
@@ -757,6 +881,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
                 entry.GetVariant(HttpResponseHelpers.ContentEncoding.Gzip);
             }
             _views[key] = entry;
+            _viewPublishedAt[key] = NowMs();
         }
 
         private void EvictColdRouteViews()
@@ -767,6 +892,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
                 if (now - last < 30 * 60_000) continue;
                 _routeViewLastAccess.TryRemove(key, out _);
                 _views.TryRemove(key, out _);
+                _viewPublishedAt.TryRemove(key, out _);
             }
         }
 
@@ -809,7 +935,10 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         private CacheEntry ComputeQueryEntry(TelemetryQuery q)
         {
             string key = q.CacheKey;
-            long epoch = q.TouchesNow(NowMs()) ? Interlocked.Read(ref _viewEpoch) : -1;
+            // Route exemplars arrive from a separate SQLite reader after the first
+            // aggregate build, including for historical windows.
+            long epoch = q.TouchesNow(NowMs()) || q.Kind == TelemetryQueryKind.Route
+                ? Interlocked.Read(ref _viewEpoch) : -1;
             if (_queryCache.TryGetValue(key, out var cached) && cached.Epoch == epoch) return cached.Entry;
 
             var sw = Stopwatch.StartNew();

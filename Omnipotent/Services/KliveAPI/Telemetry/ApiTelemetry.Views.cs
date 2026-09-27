@@ -177,6 +177,8 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             if (group.HasFlag(ViewGroup.Medium)) presets.AddRange(new[] { "24h", "7d" });
             if (group.HasFlag(ViewGroup.Long)) presets.AddRange(new[] { "30d", "90d", "1y", "all" });
 
+            if (group.HasFlag(ViewGroup.Medium)) PrewarmTopRoutes(now);
+
             foreach (string preset in presets)
             {
                 foreach (TelemetryQueryKind kind in new[] { TelemetryQueryKind.Overview, TelemetryQueryKind.Routes, TelemetryQueryKind.Runtime, TelemetryQueryKind.Rum })
@@ -190,7 +192,6 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             {
                 var weekly = new TelemetryQuery { Kind = TelemetryQueryKind.Weekly, RangeKey = "30d" };
                 TimedPublish("weekly", () => BuildQuery(weekly));
-                PrewarmTopRoutes(now);
             }
 
             // Warm per-route views follow the cadence of their preset.
@@ -204,6 +205,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
 
             TimedPublish("health", BuildHealth);
             _lastViewBuildUtcMs = now;
+            if (group.HasFlag(ViewGroup.Long)) _lastLongViewBuildUtcMs = now;
         }
 
         private void PrewarmTopRoutes(long now)
@@ -211,7 +213,9 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             var q = new TelemetryQuery { Kind = TelemetryQueryKind.Routes, RangeKey = "24h" };
             Window w = PlanWindow(q, now, routeClass: true, hasS10: false);
             var totals = _req[(int)w.Tier].MergeAllSeries(w.From, w.To, s => !IsLongLived(s));
-            foreach (var (series, _) in totals.OrderByDescending(kv => kv.Value.Latency.Sum).Take(10))
+            // Keep the engine's scheduled work bounded; less common routes are
+            // materialized by the bounded background queue on first navigation.
+            foreach (var (series, _) in totals.OrderByDescending(kv => kv.Value.Latency.Sum).Take(20))
             {
                 string key = $"route|{series}|24h";
                 _routeViewLastAccess.TryAdd(key, now);
@@ -316,7 +320,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
                 }
                 else
                 {
-                    WriteExemplars(j, series, w);
+                    WriteExemplars(j, series, q, w);
                 }
                 j.WriteEndObject();
             }
@@ -604,18 +608,20 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             j.WriteEndArray();
         }
 
-        private void WriteExemplars(Utf8JsonWriter j, string series, Window w)
+        private void WriteExemplars(Utf8JsonWriter j, string series, TelemetryQuery query, Window w)
         {
             j.WritePropertyName("exemplars");
             j.WriteStartArray();
-            if (_db != null && !IsLongLived(series))
+            if (!IsLongLived(series))
             {
                 int sp = series.IndexOf(' ');
                 string method = sp > 0 ? series[..sp] : "GET";
                 string route = sp > 0 ? series[(sp + 1)..] : series;
                 try
                 {
-                    var rows = _db.QueryTraces(route, method, null, null, w.From, w.To, "slowest", 12)
+                    var persisted = Volatile.Read(ref _exemplarViews)?.TryGet(series, query, w.From, w.To)
+                        ?? Array.Empty<TelemetryDb.TraceRow>();
+                    var rows = persisted
                         .Concat(_pendingTraces.Where(t => t.Route == route && t.Method == method && t.Ts >= w.From))
                         .GroupBy(t => t.Id).Select(g => g.First())
                         .OrderByDescending(t => t.TotalMicros).Take(12);

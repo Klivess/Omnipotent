@@ -212,6 +212,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     OmniscienceRoutes.InvalidateCachePrefix("targets/suggestions");
                     OmniscienceRoutes.InvalidateCachePrefix("profile-targets");
                     OmniscienceRoutes.InvalidateCachePrefix("stats/overview");
+                    service.RouteSnapshots.MarkDirty("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -330,6 +331,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     finally { service.Db.WriteLock.Release(); }
                     OmniscienceRoutes.InvalidateCachePrefix("deduction/status");
                     OmniscienceRoutes.InvalidateCachePrefix("stats/overview");
+                    service.RouteSnapshots.MarkDirty("stats/overview");
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }

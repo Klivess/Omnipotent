@@ -1,0 +1,10 @@
+{
+  "collectedUtc": "2026-09-27T02:52:45Z",
+  "route": "/KliveAPI/telemetry/traces",
+  "query": "range=24h&sort=slowest&limit=100",
+  "status": 200,
+  "wallMs": 6702.5,
+  "handlerMs": 6607.7,
+  "bodyBytes": 25378,
+  "note": "Timing only. Trace bodies and identifiers were not saved."
+}

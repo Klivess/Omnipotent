@@ -119,6 +119,11 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
 
             string? method = p?["method"];
             string? route = p?["route"];
+            if (route?.Length > 512 || method?.Length > 16)
+            {
+                error = "'route' or 'method' is too long.";
+                return false;
+            }
             if (kind == TelemetryQueryKind.Route)
             {
                 if (string.IsNullOrWhiteSpace(route)) { error = "'route' is required."; return false; }

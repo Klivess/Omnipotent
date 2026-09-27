@@ -27,7 +27,7 @@ namespace Omnipotent.Services.OmniTrader.Api
     /// <c>Klives</c>, and the genuinely dangerous actions additionally require a typed confirmation
     /// token so a mis-click cannot arm live trading or unwind a book.
     /// </summary>
-    public sealed class FirmRoutes
+    public sealed partial class FirmRoutes
     {
         /// <summary>
         /// How far behind wall-clock a firm figure is allowed to be.
@@ -72,7 +72,11 @@ namespace Omnipotent.Services.OmniTrader.Api
         private readonly OmniTrader parent;
         private FirmContext Firm => parent.Firm;
 
-        public FirmRoutes(OmniTrader parent) => this.parent = parent;
+        public FirmRoutes(OmniTrader parent)
+        {
+            this.parent = parent;
+            LoadOverviewSnapshotFromDisk();
+        }
 
         public async Task RegisterAsync()
         {
@@ -93,87 +97,15 @@ namespace Omnipotent.Services.OmniTrader.Api
         {
             await Get("/api/omnitrader/firm/overview", async req =>
             {
-                var portfolio = await Firm.Portfolio.BuildAsync();
-                var health = await Firm.Health.EvaluateAsync();
-                var alerts = await Firm.Alerts.ListAsync(openOnly: true, limit: 50);
-                var awaiting = await Firm.OrderRepo.ListAwaitingApprovalAsync();
-                var unknown = await Firm.OrderRepo.ListUnknownAsync();
-                var breaks = await Firm.Reconciliation.ListOpenBreaksAsync();
-                var deployments = await parent.DeploymentRepo.ListAllAsync();
-
-                // The command centre needs a baseline, not just a level: a firm value with no
-                // reference point cannot be read as good, bad or unremarkable.
                 int trendDays = ParseInt(req.userParameters.Get("trendDays"), 30, 1, 365);
-                DateTime asOf = FirmNowUtc();
-                var trend = BuildValueTrend(
-                    await Firm.Portfolio.ValueSeriesAsync(asOf.AddDays(-trendDays)), trendDays);
-
-                await Json(req, new
+                string? body = GetOverviewSnapshot(trendDays);
+                if (body == null)
                 {
-                    AsOfUtc = asOf,
-                    // Every figure here is real money. Simulated totals travel in their own block so
-                    // the two can be shown side by side but never accidentally added together.
-                    Portfolio = new
-                    {
-                        portfolio.ReportingCurrency,
-                        portfolio.TotalValue,
-                        portfolio.Cash,
-                        portfolio.InventoryValue,
-                        portfolio.DerivativeEquity,
-                        portfolio.DerivativeNotional,
-                        portfolio.GrossExposure,
-                        portfolio.NetExposure,
-                        portfolio.UnrealizedPnL,
-                        portfolio.RealizedPnLToday,
-                        portfolio.CostsToday,
-                        Positions = portfolio.Real.Positions,
-                        portfolio.HasRealAccounts,
-                        portfolio.Warnings
-                    },
-                    Simulated = new
-                    {
-                        portfolio.Simulated.TotalValue,
-                        portfolio.Simulated.Cash,
-                        portfolio.Simulated.InventoryValue,
-                        portfolio.Simulated.UnrealizedPnL,
-                        portfolio.Simulated.GrossExposure,
-                        portfolio.Simulated.Positions,
-                        RealizedPnLToday = portfolio.SimulatedRealizedPnLToday
-                    },
-                    Health = new { health.TradingPermitted, health.Summary, health.Blockers },
-                    Controls = new
-                    {
-                        Firm.Emergency.SafeModeActive,
-                        Firm.Emergency.SafeModeReason,
-                        Firm.Emergency.SafeModeSinceUtc,
-                        KillSwitches = Firm.Emergency.Active.Select(k => new { k.Key, k.Reason, k.TriggeredBy, k.TriggeredUtc, k.Automatic })
-                    },
-                    Exceptions = new
-                    {
-                        AwaitingApproval = awaiting.Count,
-                        UnknownOrders = unknown.Count,
-                        MaterialBreaks = breaks.Count(b => b.Material),
-                        CriticalAlerts = alerts.Count(a => a.Severity == AlertSeverity.Critical),
-                        UnacknowledgedCritical = alerts.Count(a => a.NeedsAcknowledgement)
-                    },
-                    Alerts = alerts.Take(20).Select(AlertDto),
-                    Venues = Firm.Venues.All.Select(v => new
-                    {
-                        Venue = v.Venue.ToString(),
-                        Environment = v.Environment.ToString(),
-                        v.IsConfigured,
-                        v.Capabilities.DisplayName,
-                        Exposure = v.Capabilities.Exposure.ToString(),
-                        OrderPathHealthy = SafeOrderPath(v)
-                    }),
-                    Strategies = new
-                    {
-                        Total = parent.StrategyRegistry.All.Count,
-                        Running = deployments.Count(d => d.Status == DeploymentStatus.Running),
-                        Deployments = deployments.Count
-                    },
-                    Trend = trend
-                });
+                    await req.ReturnResponse("{\"Error\":\"Firm overview snapshot is warming or stale.\"}",
+                        "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                await req.ReturnResponse(body, "application/json");
             });
 
             await Get("/api/omnitrader/firm/environments", async req =>
@@ -692,53 +624,14 @@ namespace Omnipotent.Services.OmniTrader.Api
         {
             await Get("/api/omnitrader/firm/risk", async req =>
             {
-                var state = await Firm.Portfolio.BuildRiskStateAsync();
-                var operations = await Firm.Orders.BuildOperationalStateAsync(null);
-                var decisions = await Firm.RiskRepo.ListRecentAsync(50);
-                await Json(req, new
+                string? body = GetRiskSnapshot();
+                if (body == null)
                 {
-                    Limits = Firm.Limits,
-                    Portfolio = new
-                    {
-                        state.GrossExposure,
-                        state.NetExposure,
-                        state.Equity,
-                        state.PeakEquity,
-                        state.DailyRealizedPnL,
-                        state.DrawdownPercent,
-                        state.AvailableFunds,
-                        ExposureByInstrument = state.ExposureByInstrument,
-                        ExposureByVenue = state.ExposureByVenue.ToDictionary(k => k.Key.ToString(), v => v.Value),
-                        state.DailyPnLByStrategy,
-                        state.FreeInventory
-                    },
-                    Operations = operations,
-                    Controls = new
-                    {
-                        Firm.Emergency.SafeModeActive,
-                        Firm.Emergency.SafeModeReason,
-                        Firm.Emergency.SafeModeSinceUtc,
-                        Firm.Emergency.SafeModeTriggeredBy,
-                        KillSwitches = Firm.Emergency.Active
-                    },
-                    // Utilisation is what an operator actually reads: how close each limit is to biting.
-                    Utilisation = new
-                    {
-                        Gross = Pct(state.GrossExposure, Firm.Limits.MaxGrossExposure),
-                        Net = Pct(Math.Abs(state.NetExposure), Firm.Limits.MaxNetExposure),
-                        DailyLoss = Pct(Math.Abs(Math.Min(0m, state.DailyRealizedPnL)), Firm.Limits.MaxFirmDailyLoss),
-                        Drawdown = Pct(state.DrawdownPercent, Firm.Limits.MaxDrawdownPercent)
-                    },
-                    RecentDecisions = decisions.Select(d => new
-                    {
-                        d.Id,
-                        d.ProposalId,
-                        Verdict = d.Verdict.ToString(),
-                        d.DecidedUtc,
-                        d.Summary,
-                        Failures = d.Failures.Select(f => new { Layer = f.Layer.ToString(), f.Rule, Severity = f.Severity.ToString(), f.Detail, f.Observed, f.Limit })
-                    })
-                });
+                    await req.ReturnResponse("{\"Error\":\"Firm risk snapshot is warming or stale.\"}",
+                        "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                await req.ReturnResponse(body, "application/json");
             });
 
             await Post("/api/omnitrader/firm/risk/limits", async req =>
@@ -747,6 +640,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 if (dto == null) { await Bad(req, "invalid limits body"); return; }
                 await Firm.UpdateLimitsAsync(dto);
                 await Firm.Audit.AppendAsync(Actor(req), "risk.limits_changed", "firm", null, dto);
+                NotifyRiskMutation();
                 await Json(req, Firm.Limits);
             });
 
@@ -757,6 +651,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 if (enable) Firm.Emergency.EnterSafeMode(reason, Actor(req));
                 else Firm.Emergency.ExitSafeMode(Actor(req));
                 await Firm.Audit.AppendAsync(Actor(req), enable ? "risk.safe_mode_entered" : "risk.safe_mode_cleared", "firm", reason);
+                NotifyRiskMutation();
                 await Json(req, new { Firm.Emergency.SafeModeActive, Firm.Emergency.SafeModeReason });
             });
 
@@ -770,6 +665,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 {
                     bool released = Firm.Emergency.Release(kind, dto.Scope ?? "", Actor(req));
                     await Firm.Audit.AppendAsync(Actor(req), "risk.killswitch_released", $"{kind}:{dto.Scope}", dto.Reason);
+                    NotifyRiskMutation();
                     await Json(req, new { Released = released, Active = Firm.Emergency.Active });
                     return;
                 }
@@ -782,6 +678,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     TriggeredBy = Actor(req)
                 });
                 await Firm.Audit.AppendAsync(Actor(req), "risk.killswitch_engaged", $"{kind}:{dto.Scope}", dto.Reason);
+                NotifyRiskMutation();
                 await Json(req, new { Engaged = true, Active = Firm.Emergency.Active });
             });
 
@@ -867,6 +764,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
                 await Firm.Audit.AppendAsync(Actor(req), "risk.exposure_reduced", venueFilter ?? "firm",
                     $"{affected.Count} position(s)", results);
+                NotifyRiskMutation();
                 await Json(req, new { Requested = affected.Count, Results = results });
             });
         }
@@ -1607,26 +1505,48 @@ namespace Omnipotent.Services.OmniTrader.Api
             var totals = series
                 .Select(p => new FirmValueTrendPoint { Ts = p.Ts, Value = p.TotalValue })
                 .OrderBy(p => p.Ts)
-                .ToList();
+                .ToArray();
+            return BuildValueTrendFromOrdered(totals, 0, windowDays, DateTime.UtcNow);
+        }
 
-            if (totals.Count == 0)
+        private static FirmValueTrend BuildValueTrendFromOrdered(
+            IReadOnlyList<FirmValueTrendPoint> totals, int start, int windowDays, DateTime nowUtc)
+        {
+            int count = totals.Count - start;
+            if (count == 0)
                 return new FirmValueTrend { WindowDays = windowDays };
 
             // Keep at most ~120 points: enough shape for a wide chart, small enough to stay cheap.
             const int MaxPoints = 120;
-            var points = totals;
-            if (totals.Count > MaxPoints)
+            List<FirmValueTrendPoint> points;
+            if (count > MaxPoints)
             {
-                double step = (double)totals.Count / MaxPoints;
+                double step = (double)count / MaxPoints;
                 points = Enumerable.Range(0, MaxPoints)
-                    .Select(i => totals[Math.Min(totals.Count - 1, (int)(i * step))])
+                    .Select(i => totals[Math.Min(totals.Count - 1, start + (int)(i * step))])
                     .ToList();
                 points[^1] = totals[^1];
             }
+            else points = totals.Skip(start).ToList();
 
             decimal latest = totals[^1].Value;
-            var dayAgo = totals.LastOrDefault(p => p.Ts <= DateTime.UtcNow.AddHours(-24));
+            FirmValueTrendPoint? dayAgo = null;
+            DateTime dayAgoCutoff = nowUtc.AddHours(-24);
+            for (int i = totals.Count - 1; i >= start; i--)
+            {
+                if (totals[i].Ts > dayAgoCutoff) continue;
+                dayAgo = totals[i];
+                break;
+            }
             decimal? change = dayAgo == null ? null : latest - dayAgo.Value;
+
+            decimal peak = totals[start].Value, trough = peak;
+            for (int i = start + 1; i < totals.Count; i++)
+            {
+                decimal value = totals[i].Value;
+                if (value > peak) peak = value;
+                if (value < trough) trough = value;
+            }
 
             return new FirmValueTrend
             {
@@ -1635,9 +1555,9 @@ namespace Omnipotent.Services.OmniTrader.Api
                 Change24h = change,
                 ChangePercent24h = change.HasValue && dayAgo!.Value != 0m
                     ? Math.Round(change.Value / Math.Abs(dayAgo.Value) * 100m, 2) : null,
-                PeakValue = totals.Max(p => p.Value),
-                TroughValue = totals.Min(p => p.Value),
-                FirstUtc = totals[0].Ts,
+                PeakValue = peak,
+                TroughValue = trough,
+                FirstUtc = totals[start].Ts,
                 LastUtc = totals[^1].Ts
             };
         }

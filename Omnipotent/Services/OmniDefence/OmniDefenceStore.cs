@@ -94,6 +94,7 @@ namespace Omnipotent.Services.OmniDefence
                 );",
                 "CREATE INDEX IF NOT EXISTS ix_requests_ts ON requests(utc_ts);",
                 "CREATE INDEX IF NOT EXISTS ix_requests_ip ON requests(ip);",
+                "CREATE INDEX IF NOT EXISTS ix_requests_ip_ts ON requests(ip, utc_ts DESC);",
                 "CREATE INDEX IF NOT EXISTS ix_requests_profile ON requests(profile_id);",
                 "CREATE INDEX IF NOT EXISTS ix_requests_route ON requests(route);",
 
@@ -110,6 +111,7 @@ namespace Omnipotent.Services.OmniDefence
                 );",
                 "CREATE INDEX IF NOT EXISTS ix_auth_ts ON auth_events(utc_ts);",
                 "CREATE INDEX IF NOT EXISTS ix_auth_ip ON auth_events(ip);",
+                "CREATE INDEX IF NOT EXISTS ix_auth_ip_ts ON auth_events(ip, utc_ts DESC);",
                 "CREATE INDEX IF NOT EXISTS ix_auth_type ON auth_events(type);",
 
                 @"CREATE TABLE IF NOT EXISTS profile_actions (
@@ -169,6 +171,7 @@ namespace Omnipotent.Services.OmniDefence
                 );",
                 "CREATE INDEX IF NOT EXISTS ix_ipe_ts ON ip_events(utc_ts);",
                 "CREATE INDEX IF NOT EXISTS ix_ipe_ip ON ip_events(ip);",
+                "CREATE INDEX IF NOT EXISTS ix_ipe_ip_ts ON ip_events(ip, utc_ts DESC);",
 
                 @"CREATE TABLE IF NOT EXISTS honeypot_routes (
                     route TEXT PRIMARY KEY,
@@ -341,6 +344,22 @@ namespace Omnipotent.Services.OmniDefence
             {
                 readGate.Release();
             }
+        }
+
+        /// <summary>Read for background snapshots. A saturated pool or slow scan has a firm
+        /// deadline, so one search cannot monopolize readers for minutes.</summary>
+        private async Task<T> WithBoundedReadAsync<T>(Func<SqliteConnection, CancellationToken, Task<T>> work,
+            CancellationToken cancellationToken)
+        {
+            if (!await readGate.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken))
+                throw new TimeoutException("OmniDefence read pool is busy.");
+            try
+            {
+                using var conn = new SqliteConnection(readConnectionString);
+                await conn.OpenAsync(cancellationToken);
+                return await work(conn, cancellationToken);
+            }
+            finally { readGate.Release(); }
         }
 
         // ---------- Request audit queue ----------
@@ -942,6 +961,59 @@ namespace Omnipotent.Services.OmniDefence
             }
             return list;
         });
+
+        public Task<List<Dictionary<string, object?>>> QueryBoundedAsync(string sql,
+            Dictionary<string, object?> parameters, CancellationToken cancellationToken)
+            => WithBoundedReadAsync((conn, ct) => QueryOnConnectionAsync(conn, sql, parameters, ct),
+                cancellationToken);
+
+        /// <summary>All IP detail reads share one bounded pool slot and one SQLite connection.</summary>
+        public Task<(IpRecord? Record, List<Dictionary<string, object?>> RecentRequests,
+            List<Dictionary<string, object?>> Events, List<Dictionary<string, object?>> Auth)>
+            GetIpDetailBoundedAsync(string ip, string requestSelectSql, CancellationToken cancellationToken)
+            => WithBoundedReadAsync(async (conn, ct) =>
+            {
+                IpRecord? record = null;
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT * FROM ip_records WHERE ip=$ip";
+                    cmd.CommandTimeout = 10;
+                    cmd.Parameters.AddWithValue("$ip", ip);
+                    using var reader = await cmd.ExecuteReaderAsync(ct);
+                    if (await reader.ReadAsync(ct)) record = ReadIpRecord(reader);
+                }
+                var parameters = new Dictionary<string, object?> { ["$ip"] = ip };
+                var recentRequests = await QueryOnConnectionAsync(conn,
+                    requestSelectSql + " WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200", parameters, ct);
+                var events = await QueryOnConnectionAsync(conn,
+                    "SELECT * FROM ip_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200", parameters, ct);
+                var auth = await QueryOnConnectionAsync(conn,
+                    "SELECT * FROM auth_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200", parameters, ct);
+                return (record, recentRequests, events, auth);
+            }, cancellationToken);
+
+        private static async Task<List<Dictionary<string, object?>>> QueryOnConnectionAsync(
+            SqliteConnection conn, string sql, Dictionary<string, object?> parameters,
+            CancellationToken cancellationToken)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.CommandTimeout = 10;
+            foreach (var kv in parameters) cmd.Parameters.AddWithValue(kv.Key, kv.Value ?? DBNull.Value);
+            var list = new List<Dictionary<string, object?>>();
+            using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                var row = new Dictionary<string, object?>(reader.FieldCount);
+                for (int i = 0; i < reader.FieldCount; i++)
+                {
+                    object value = reader.GetValue(i);
+                    row[reader.GetName(i)] = value is DBNull ? null : value;
+                }
+                list.Add(row);
+            }
+            return list;
+        }
 
         public Task<long> ScalarLongAsync(string sql, Dictionary<string, object?> parameters)
             => WithReadAsync(async conn =>

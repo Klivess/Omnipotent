@@ -32,28 +32,16 @@ namespace Omnipotent.Services.KliveMail
 
         private async Task HandleStats(UserRequest req)
         {
-            try
-            {
-                var (total, unread, trash) = await Repo.GetStatsAsync();
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { total, unread, trash }));
-            }
-            catch (Exception ex) { await Fail(req, ex); }
+            string? json = service.StatsSnapshotJson;
+            await req.ReturnResponse(json ?? "{\"pending\":true}",
+                code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
         }
 
         private async Task HandleListMailboxes(UserRequest req)
         {
-            try
-            {
-                var mailboxes = await Repo.ListMailboxesAsync();
-                var (total, unread, trash) = await Repo.GetStatsAsync();
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
-                {
-                    all = new { total, unread },
-                    trash,
-                    mailboxes
-                }));
-            }
-            catch (Exception ex) { await Fail(req, ex); }
+            string? json = service.MailboxesSnapshotJson;
+            await req.ReturnResponse(json ?? "{\"pending\":true}",
+                code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
         }
 
         private async Task HandleCreateMailbox(UserRequest req)
@@ -68,6 +56,7 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
                 var ok = await Repo.CreateMailboxAsync(address, displayName);
+                if (ok) service.QueueStatsRefresh();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = ok, address = KliveMailRepository.NormalizeAddress(address) }));
             }
             catch (Exception ex) { await Fail(req, ex); }
@@ -84,6 +73,7 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
                 var ok = await Repo.DeleteMailboxAsync(address);
+                if (ok) service.QueueStatsRefresh();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = ok }));
             }
             catch (Exception ex) { await Fail(req, ex); }
@@ -124,7 +114,7 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
 
-                if (!msg.IsRead) await Repo.SetReadAsync(id, true);
+                if (!msg.IsRead && await Repo.SetReadAsync(id, true)) service.QueueStatsRefresh();
                 var thread = await Repo.GetThreadAsync(msg.ThreadId);
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
@@ -191,6 +181,7 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
                 var ok = await Repo.SetReadAsync(id, read);
+                if (ok) service.QueueStatsRefresh();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = ok }));
             }
             catch (Exception ex) { await Fail(req, ex); }
@@ -207,6 +198,7 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
                 var ok = await Repo.SoftDeleteAsync(id);
+                if (ok) service.QueueStatsRefresh();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = ok }));
             }
             catch (Exception ex) { await Fail(req, ex); }

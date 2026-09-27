@@ -11,10 +11,14 @@ namespace Omnipotent.Services.OmniTrader.Persistence
         public string DbPath { get; }
 
         public OmniTraderDb()
+            : this(Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniTraderDirectory), "omnitrader.db"))
         {
-            string dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniTraderDirectory);
-            Directory.CreateDirectory(dir);
-            DbPath = Path.Combine(dir, "omnitrader.db");
+        }
+
+        internal OmniTraderDb(string dbPath)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath))!);
+            DbPath = dbPath;
 
             connectionString = new SqliteConnectionStringBuilder
             {

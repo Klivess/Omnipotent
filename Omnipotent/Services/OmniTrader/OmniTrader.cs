@@ -108,16 +108,27 @@ namespace Omnipotent.Services.OmniTrader
                 Firm = new FirmContext(this);
                 firmRoutes = new FirmRoutes(this);
                 await firmRoutes.RegisterAsync();
+                bool firmStarted = false;
                 try
                 {
                     await Firm.StartAsync();
+                    firmStarted = true;
                 }
                 catch (Exception ex)
                 {
                     await ServiceLogError(ex, "Firm layer failed to start — trading authority is unavailable");
                 }
 
+                // The command-centre view is built independently of HTTP requests. Keep
+                // the last completed snapshot available while the next refresh runs.
+                if (firmStarted)
+                {
+                    firmRoutes.StartOverviewSnapshotLoop(cancellationToken.Token);
+                    firmRoutes.StartRiskSnapshotLoop(cancellationToken.Token);
+                }
+
                 await SessionManager.RecoverAsync();
+                routes.StartListSnapshotLoops(cancellationToken.Token);
 
                 await ServiceLog($"OmniTrader started. DB={Db.DbPath}. Strategies={StrategyRegistry.All.Count}. "
                     + $"Kraken={(IsKrakenConfigured ? "configured" : "not configured")}. "

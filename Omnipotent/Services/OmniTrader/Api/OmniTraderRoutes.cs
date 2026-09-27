@@ -7,7 +7,7 @@ using System.Net;
 
 namespace Omnipotent.Services.OmniTrader.Api
 {
-    public sealed class OmniTraderRoutes
+    public sealed partial class OmniTraderRoutes
     {
         private readonly OmniTrader parent;
 
@@ -43,25 +43,14 @@ namespace Omnipotent.Services.OmniTrader.Api
 
             await parent.CreateAPIRoute("/api/omnitrader/deployments", async req =>
             {
-                var deployments = await parent.DeploymentRepo.ListAllAsync();
-                var dtos = deployments.Select(d => new
+                string? body = GetDeploymentListSnapshot();
+                if (body == null)
                 {
-                    d.Id,
-                    d.StrategyClass,
-                    d.Config.Symbol,
-                    Interval = d.Config.Interval.ToString(),
-                    Mode = d.Mode.ToString(),
-                    Status = d.Status.ToString(),
-                    Armed = parent.SessionManager.IsDeploymentArmed(d.Id),
-                    d.EquityInitial,
-                    d.EquityCurrent,
-                    PnLPercent = d.EquityInitial == 0 ? 0 : (d.EquityCurrent - d.EquityInitial) / d.EquityInitial * 100m,
-                    d.CreatedUtc,
-                    d.ArmedLiveUtc,
-                    d.PausedUtc,
-                    d.Error
-                }).ToList();
-                await req.ReturnResponse(JsonConvert.SerializeObject(dtos));
+                    await req.ReturnResponse("{\"Error\":\"Deployment snapshot is warming or stale.\"}",
+                        "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                await req.ReturnResponse(body, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment", async req =>
@@ -231,6 +220,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                         ?? throw new Exception("Invalid body");
                     var config = dto.ToDeploymentConfig();
                     string id = await parent.SessionManager.CreateDeploymentAsync(config);
+                    NotifyDeploymentMutation();
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Id = id, Mode = config.Mode.ToString() }));
                 }
                 catch (Exception ex)
@@ -250,6 +240,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     return;
                 }
                 bool ok = await parent.SessionManager.ArmLiveAsync(id);
+                if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Armed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -258,6 +249,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 bool ok = await parent.SessionManager.PauseAsync(id);
+                if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Paused = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -266,6 +258,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 bool ok = await parent.SessionManager.ResumeAsync(id);
+                if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Resumed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -274,6 +267,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 bool ok = await parent.SessionManager.KillAsync(id);
+                if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Killed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -282,36 +276,20 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 await parent.SessionManager.DeleteAsync(id);
+                NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Deleted = true }));
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtests", async req =>
             {
-                var jobs = await parent.BacktestJobRepo.ListRecentAsync(50);
-                var dtos = jobs.Select(j => new
+                string? body = GetBacktestListSnapshot();
+                if (body == null)
                 {
-                    j.Id,
-                    j.StrategyClass,
-                    j.Config.Coin,
-                    j.Config.Currency,
-                    Interval = j.Config.Interval.ToString(),
-                    j.Config.CandleCount,
-                    Status = j.Status.ToString(),
-                    j.ProgressPct,
-                    j.CandlesTotal,
-                    j.CandlesDone,
-                    j.QueuedUtc,
-                    j.StartedUtc,
-                    j.FinishedUtc,
-                    j.Error,
-                    // At-a-glance summary metrics (null until the job has a result).
-                    TotalPnLPercent = j.Result?.TotalPnLPercent,
-                    WinRate = j.Result?.WinRate,
-                    SharpeRatio = j.Result?.SharpeRatio,
-                    MaxDrawdownPercent = j.Result?.MaxDrawdownPercent,
-                    TotalTrades = j.Result?.TotalTrades
-                }).ToList();
-                await req.ReturnResponse(JsonConvert.SerializeObject(dtos));
+                    await req.ReturnResponse("{\"Error\":\"Backtest snapshot is warming or stale.\"}",
+                        "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                await req.ReturnResponse(body, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtest", async req =>
@@ -345,6 +323,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     var dto = JsonConvert.DeserializeObject<CreateBacktestDto>(req.userMessageContent ?? "")
                         ?? throw new Exception("Invalid body");
                     string id = await parent.BacktestQueue.EnqueueAsync(dto.ToBacktestConfig());
+                    NotifyBacktestMutation();
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { JobId = id }));
                 }
                 catch (Exception ex)
@@ -359,6 +338,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 await parent.BacktestJobRepo.RequestCancelAsync(id);
+                NotifyBacktestMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Requested = true }));
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 

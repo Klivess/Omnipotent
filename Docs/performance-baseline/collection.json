@@ -1,0 +1,31 @@
+{
+  "collectedUtc": "2026-09-27T03:00:26.0887751Z",
+  "routeSeries24h": 78,
+  "routeSeries7d": 128,
+  "routeSeries30d": 128,
+  "routeSeries90d": 128,
+  "routeSeries1y": 128,
+  "routeSeriesAll": 128,
+  "files": [
+    "collection.json",
+    "endpoint-timings.json",
+    "health.json",
+    "overview-24h.json",
+    "overview-30d.json",
+    "overview-7d.json",
+    "routes-15m.json",
+    "routes-1h.json",
+    "routes-1y.json",
+    "routes-24h.json",
+    "routes-30d.json",
+    "routes-6h.json",
+    "routes-7d.json",
+    "routes-90d.json",
+    "routes-all.json",
+    "rum-24h.json",
+    "rum-7d.json",
+    "runtime-24h.json",
+    "runtime-7d.json",
+    "weekly.json"
+  ]
+}

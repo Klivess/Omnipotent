@@ -1,0 +1,260 @@
+[
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=15m",
+    "status": 200,
+    "wallMs": 270.0,
+    "bodyBytes": 8017,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=1h",
+    "status": 200,
+    "wallMs": 99.1,
+    "bodyBytes": 27144,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=6h",
+    "status": 200,
+    "wallMs": 110.3,
+    "bodyBytes": 49169,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=24h",
+    "status": 200,
+    "wallMs": 94.6,
+    "bodyBytes": 54703,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.2"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=7d",
+    "status": 200,
+    "wallMs": 106.6,
+    "bodyBytes": 81101,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, handler;dur=0.1, app;dur=0.2"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=30d",
+    "status": 200,
+    "wallMs": 118.5,
+    "bodyBytes": 81746,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.2"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=90d",
+    "status": 200,
+    "wallMs": 115.7,
+    "bodyBytes": 79760,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=1y",
+    "status": 200,
+    "wallMs": 122.5,
+    "bodyBytes": 78686,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=all",
+    "status": 200,
+    "wallMs": 132.0,
+    "bodyBytes": 78862,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/overview",
+    "query": "range=24h",
+    "status": 200,
+    "wallMs": 90.2,
+    "bodyBytes": 68065,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/overview",
+    "query": "range=7d",
+    "status": 200,
+    "wallMs": 156.6,
+    "bodyBytes": 80835,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/overview",
+    "query": "range=30d",
+    "status": 200,
+    "wallMs": 88.6,
+    "bodyBytes": 110999,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/runtime",
+    "query": "range=24h",
+    "status": 200,
+    "wallMs": 95.6,
+    "bodyBytes": 24741,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.2"
+  },
+  {
+    "route": "/KliveAPI/telemetry/runtime",
+    "query": "range=7d",
+    "status": 200,
+    "wallMs": 77.7,
+    "bodyBytes": 35894,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/rum",
+    "query": "range=24h",
+    "status": 200,
+    "wallMs": 81.6,
+    "bodyBytes": 13977,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/rum",
+    "query": "range=7d",
+    "status": 200,
+    "wallMs": 87.5,
+    "bodyBytes": 16065,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/weekly",
+    "query": "",
+    "status": 200,
+    "wallMs": 98.4,
+    "bodyBytes": 2147,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/health",
+    "query": "",
+    "status": 200,
+    "wallMs": 81.3,
+    "bodyBytes": 2515,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/live",
+    "query": "",
+    "status": 200,
+    "wallMs": 86.7,
+    "bodyBytes": 279,
+    "cache": null,
+    "serverTiming": "prologue;dur=0.1, app;dur=0.2"
+  },
+  {
+    "route": "/KliveAPI/telemetry/route",
+    "query": "range=24h&route=%2Fomnidefence%2Foverview&method=GET",
+    "status": 200,
+    "wallMs": 97.8,
+    "bodyBytes": 48797,
+    "cache": [
+      "VIEW"
+    ],
+    "serverTiming": "prologue;dur=0.1, app;dur=0.1"
+  },
+  {
+    "route": "/KliveAPI/telemetry/routes",
+    "query": "range=7d&method=GET",
+    "status": 200,
+    "wallMs": 117.2,
+    "bodyBytes": 72438,
+    "cache": [
+      "QUERY"
+    ],
+    "serverTiming": "prologue;dur=0.1, handler;dur=5.9, compress;dur=0.4, app;dur=6.4"
+  },
+  {
+    "route": "/KliveAPI/telemetry/route",
+    "query": "range=7d&route=%2Fprojects%2Flist&method=GET",
+    "status": 200,
+    "wallMs": 399.0,
+    "bodyBytes": 61590,
+    "cache": [
+      "QUERY"
+    ],
+    "serverTiming": "prologue;dur=0.1, handler;dur=307.3, compress;dur=0.1, app;dur=307.5"
+  },
+  {
+    "route": "/KliveAPI/telemetry/traces",
+    "query": "range=24h&sort=slowest&limit=100",
+    "status": 200,
+    "wallMs": 90.5,
+    "bodyBytes": 25353,
+    "cache": null,
+    "serverTiming": "prologue;dur=0.1, handler;dur=5.1, encode;dur=1.0, etag;dur=0.1, compress;dur=0.1, app;dur=6.4"
+  },
+  {
+    "route": "/KliveAPI/telemetry/trace",
+    "query": "[redacted]",
+    "status": 200,
+    "wallMs": 87.8,
+    "bodyBytes": 1384,
+    "cache": null,
+    "serverTiming": "prologue;dur=0.1, handler;dur=0.3, encode;dur=0.1, compress;dur=0.1, app;dur=0.5"
+  }
+]

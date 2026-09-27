@@ -1,4 +1,5 @@
 using System.Collections.Specialized;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
@@ -15,6 +16,7 @@ namespace Omnipotent.Services.Tripwires
     public sealed class TripwireService : OmniService
     {
         private readonly TripwireGeoResolver geoResolver = new();
+        private readonly ConcurrentDictionary<string, byte> dirtySummaries = new(StringComparer.Ordinal);
         private byte[] visitorKey = Array.Empty<byte>();
 
         public TripwireStore Store { get; private set; } = null!;
@@ -33,8 +35,19 @@ namespace Omnipotent.Services.Tripwires
                 await Store.InitialiseAsync(cancellationToken.Token);
                 ServiceQuitRequest += () => Store.Dispose();
                 visitorKey = LoadOrCreateVisitorKey();
+                foreach (string id in await Store.ListTripwireIdsAsync(cancellationToken.Token))
+                {
+                    try { await Store.RefreshSummarySnapshotAsync(id, cancellationToken.Token); }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+                    catch (Exception ex)
+                    {
+                        MarkSummaryDirty(id);
+                        _ = ServiceLogError(ex, $"Initial tripwire summary refresh failed for {id}.", false);
+                    }
+                }
                 await new TripwireRoutes(this).RegisterRoutes();
                 _ = Task.Run(() => CleanupLoopAsync(cancellationToken.Token));
+                _ = Task.Run(() => SummaryRefreshLoopAsync(cancellationToken.Token));
                 await ServiceLog($"Tripwires ready. DB={Store.DbPath}; public redirect route=/t.");
             }
             catch (Exception ex) { await ServiceLogError(ex, "Tripwire service startup failed."); }
@@ -129,6 +142,9 @@ namespace Omnipotent.Services.Tripwires
                 recorded = new TripwireRecordResult();
             }
 
+            if (recorded.Accepted)
+                MarkSummaryDirty(tripwire.Id);
+
             await ReturnRedirectAsync(req, target.DestinationUrl, settings.RedirectStatusCode);
 
             if (recorded.Accepted)
@@ -159,6 +175,7 @@ namespace Omnipotent.Services.Tripwires
                         item.Latitude = resolved.Latitude; item.Longitude = resolved.Longitude;
                         item.Timezone = resolved.Timezone;
                         await Store.UpdateGeoAsync(item.Id, resolved, ct);
+                        MarkSummaryDirty(tripwire.Id);
                     }
                 }
 
@@ -279,12 +296,53 @@ namespace Omnipotent.Services.Tripwires
         {
             while (!ct.IsCancellationRequested)
             {
-                try { await Store.CleanupExpiredEventsAsync(ct); }
+                try
+                {
+                    await Store.CleanupExpiredEventsAsync(ct);
+                    foreach (string id in await Store.ListTripwireIdsAsync(ct)) MarkSummaryDirty(id);
+                }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex) { _ = ServiceLogError(ex, "Tripwire retention cleanup failed.", false); }
                 try { await Task.Delay(TimeSpan.FromHours(6), ct); }
                 catch (OperationCanceledException) { break; }
             }
+        }
+
+        internal void MarkSummaryDirty(string tripwireId) => dirtySummaries[tripwireId] = 0;
+
+        private async Task SummaryRefreshLoopAsync(CancellationToken ct)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            DateTimeOffset nextFullRefresh = DateTimeOffset.UtcNow.AddMinutes(1);
+            try
+            {
+                while (await timer.WaitForNextTickAsync(ct))
+                {
+                    try
+                    {
+                        bool full = DateTimeOffset.UtcNow >= nextFullRefresh;
+                        if (full) nextFullRefresh = DateTimeOffset.UtcNow.AddMinutes(1);
+                        IEnumerable<string> ids = full
+                            ? await Store.ListTripwireIdsAsync(ct)
+                            : dirtySummaries.Keys.ToArray();
+                        foreach (string id in ids)
+                        {
+                            // Remove before computing so a hit during the refresh remains queued.
+                            dirtySummaries.TryRemove(id, out _);
+                            try { await Store.RefreshSummarySnapshotAsync(id, ct); }
+                            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                            catch (Exception ex)
+                            {
+                                MarkSummaryDirty(id);
+                                _ = ServiceLogError(ex, $"Tripwire summary refresh failed for {id}.", false);
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+                    catch (Exception ex) { _ = ServiceLogError(ex, "Tripwire summary scheduler failed.", false); }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         }
 
         internal static bool TryNormalizeDestination(string? value, out string destination)

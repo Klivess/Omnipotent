@@ -1,6 +1,8 @@
 using Newtonsoft.Json;
 using Omnipotent.Profiles;
 using Omnipotent.Services.KliveAPI;
+using Omnipotent.Services.KliveAPI.Caching;
+using System.Collections.Specialized;
 using System.Net;
 using System.Text;
 
@@ -20,90 +22,31 @@ namespace Omnipotent.Services.OmniDefence
             // Overview
             await parent.CreateAPIRoute("/omnidefence/overview", async req =>
             {
-                long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                long day = now - 86400;
-                long week = now - 86400 * 7;
-
-                long reqs24h = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t",
-                    new() { ["$t"] = day });
-                long totalRequests = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM requests",
-                    new());
-                long reqs7d = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t",
-                    new() { ["$t"] = week });
-                long denied24h = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM requests WHERE utc_ts >= $t AND (deny_reason IS NOT NULL OR status_code >= 400)",
-                    new() { ["$t"] = day });
-                long totalDenied = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM requests WHERE deny_reason IS NOT NULL OR status_code >= 400",
-                    new());
-                long unauth24h = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM auth_events WHERE utc_ts >= $t AND type IN ('UnauthRoute','InsufficientClearance','InvalidPassword','WebsiteNoProfile','WebsiteInvalidProfile')",
-                    new() { ["$t"] = day });
-                long totalAuthEvents = await parent.Store.ScalarLongAsync(
-                    "SELECT COUNT(*) FROM auth_events",
-                    new());
-
-                int blocked = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Blocked));
-                int watched = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Watch));
-                int honey = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Honeypot));
-                int tarpit = parent.Tracker.All().Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Tarpit));
-
-                var topAttackers = parent.Tracker.All()
-                    .Where(r => string.IsNullOrWhiteSpace(r.AssociatedProfileId))
-                    .OrderByDescending(r => r.ThreatScore)
-                    .Take(10)
-                    .Select(r => new { ip = r.Ip, score = r.ThreatScore, status = r.Status, unauth = r.UnauthAttempts, country = r.Country, attacker = true });
-
-                var topThreat = parent.Tracker.All()
-                    .Where(r => string.IsNullOrWhiteSpace(r.AssociatedProfileId))
-                    .OrderByDescending(r => r.ThreatScore)
-                    .Select(r => new { ip = r.Ip, score = r.ThreatScore, status = r.Status, unauth = r.UnauthAttempts, country = r.Country, asn = r.Asn, attacker = true })
-                    .FirstOrDefault();
-
-                var topRoutes = await parent.Store.QueryAsync(
-                    "SELECT route, COUNT(*) AS hits FROM requests WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC LIMIT 10",
-                    new() { ["$t"] = day });
-
-                var originBreakdown = await parent.Store.QueryAsync(
-                    $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
-                    new() { ["$t"] = day });
-
-                var resp = new
+                CacheDeps.MarkUncacheable("precomputed OmniDefence overview");
+                string? json = parent.OverviewJson;
+                if (json == null)
                 {
-                    requests24h = reqs24h,
-                    totalRequests,
-                    requests7d = reqs7d,
-                    denied24h,
-                    totalDenied,
-                    authFailures24h = unauth24h,
-                    unauth24h,
-                    totalAuthEvents,
-                    blockedIps = blocked,
-                    watchedIps = watched,
-                    honeypotIps = honey,
-                    tarpitIps = tarpit,
-                    totalIps = parent.Tracker.All().Count(),
-                    knownIps = parent.Tracker.All().Count(),
-                    topThreat,
-                    topAttackers,
-                    topRoutes,
-                    originBreakdown,
-                    classBreakdown = ClassBreakdown(parent),
-                    tagBreakdown = TagBreakdown(parent)
-                };
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(resp), "application/json");
+                    await req.ReturnResponse("{\"pending\":true}", "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                await req.ReturnResponse(json, "application/json");
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
             // Requests filtered query
             await parent.CreateAPIRoute("/omnidefence/requests", async req =>
             {
-                var (sql, parameters) = BuildRequestsQuery(req);
-                var rows = await parent.Store.QueryAsync(sql, parameters);
-                await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
+                CacheDeps.MarkUncacheable("precomputed OmniDefence request list");
+                if (new[] { "ip", "profile", "route", "status", "method", "origin" }
+                    .Any(name => req.userParameters.Get(name)?.Length > 256))
+                {
+                    await req.ReturnResponse("{\"error\":\"Filter is too long.\"}", "application/json", null, HttpStatusCode.BadRequest);
+                    return;
+                }
+                var (sql, parameters) = BuildRequestsQuery(req.userParameters);
+                string key = RequestsKey(sql, parameters);
+                ReadSnapshotReply reply = parent.ReadSnapshots.GetOrQueue(key, false,
+                    async ct => JsonConvert.SerializeObject(await parent.Store.QueryBoundedAsync(sql, parameters, ct)));
+                await SendReadSnapshot(req, reply);
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
             // Single request detail (full body, headers, query, etc.)
@@ -176,34 +119,26 @@ namespace Omnipotent.Services.OmniDefence
             // IP detail
             await parent.CreateAPIRoute("/omnidefence/ip", async req =>
             {
+                CacheDeps.MarkUncacheable("precomputed OmniDefence IP detail");
                 string? ip = req.userParameters.Get("ip");
-                if (string.IsNullOrWhiteSpace(ip))
+                if (string.IsNullOrWhiteSpace(ip) || ip.Length > 128)
                 {
-                    await req.ReturnResponse("Missing ip", "text/plain", null, HttpStatusCode.BadRequest);
+                    await req.ReturnResponse("Missing or invalid ip", "text/plain", null, HttpStatusCode.BadRequest);
                     return;
                 }
-                var record = parent.Tracker.Get(ip) ?? await parent.Store.GetIpRecordAsync(ip);
-
-                // Three independent indexed lookups. They used to run back-to-back, each
-                // re-acquiring the store's single lock; on the read pool they overlap.
-                var recentReqsTask = parent.Store.QueryAsync(
-                    RequestSelectSql + " WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
-                    new() { ["$ip"] = ip });
-                var eventsTask = parent.Store.QueryAsync(
-                    "SELECT * FROM ip_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
-                    new() { ["$ip"] = ip });
-                var authTask = parent.Store.QueryAsync(
-                    "SELECT * FROM auth_events WHERE ip=$ip ORDER BY utc_ts DESC LIMIT 200",
-                    new() { ["$ip"] = ip });
-                await Task.WhenAll(recentReqsTask, eventsTask, authTask);
-
-                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                string key = OmniDefenceReadSnapshotCache.KeyFor("ip", ip);
+                ReadSnapshotReply reply = parent.ReadSnapshots.GetOrQueue(key, true, async ct =>
                 {
-                    record,
-                    recentRequests = recentReqsTask.Result,
-                    events = eventsTask.Result,
-                    auth = authTask.Result
-                }), "application/json");
+                    var detail = await parent.Store.GetIpDetailBoundedAsync(ip, RequestSelectSql, ct);
+                    return JsonConvert.SerializeObject(new
+                    {
+                        record = parent.Tracker.Get(ip) ?? detail.Record,
+                        recentRequests = detail.RecentRequests,
+                        events = detail.Events,
+                        auth = detail.Auth
+                    });
+                });
+                await SendReadSnapshot(req, reply);
             }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
 
             // Block
@@ -226,6 +161,7 @@ namespace Omnipotent.Services.OmniDefence
                     ActorProfileName = req.user?.Name,
                     Detail = reason
                 });
+                parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 _ = parent.SendBlockNotificationAsync(rec, req.user?.Name ?? "Unknown");
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
@@ -274,6 +210,7 @@ namespace Omnipotent.Services.OmniDefence
                     ActorProfileId = req.user?.UserID,
                     ActorProfileName = req.user?.Name
                 });
+                parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -287,6 +224,7 @@ namespace Omnipotent.Services.OmniDefence
                 parent.Tracker.SetNotes(ip, note);
                 var rec = parent.Tracker.GetOrCreate(ip);
                 await parent.Tracker.PersistAsync(rec);
+                parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -314,6 +252,7 @@ namespace Omnipotent.Services.OmniDefence
                     ActorProfileName = req.user?.Name,
                     Detail = JsonConvert.SerializeObject(new { open = result.OpenPorts, probed = result.ProbedPorts, durationMs = result.Duration.TotalMilliseconds, error = result.Error })
                 });
+                parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
             }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
 
@@ -511,6 +450,99 @@ namespace Omnipotent.Services.OmniDefence
             await RegisterFingerprintRoutesAsync(parent);
         }
 
+        /// <summary>
+        /// Runs only on the overview refresh worker. Keep all aggregation and database
+        /// access here, never in the HTTP handler above.
+        /// </summary>
+        internal static async Task<string> BuildOverviewJsonAsync(OmniDefence parent)
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long day = now - 86400;
+            long week = now - 86400 * 7;
+
+            // The old overview traversed the ever-growing requests table five
+            // times. One conditional aggregate preserves the counters with a
+            // single scan, and all of it runs only in the snapshot worker.
+            var requestCountsTask = parent.Store.QueryAsync(@"
+                SELECT COUNT(*) AS totalRequests,
+                    COALESCE(SUM(CASE WHEN utc_ts >= $day THEN 1 ELSE 0 END), 0) AS requests24h,
+                    COALESCE(SUM(CASE WHEN utc_ts >= $week THEN 1 ELSE 0 END), 0) AS requests7d,
+                    COALESCE(SUM(CASE WHEN deny_reason IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0) AS totalDenied,
+                    COALESCE(SUM(CASE WHEN utc_ts >= $day AND (deny_reason IS NOT NULL OR status_code >= 400) THEN 1 ELSE 0 END), 0) AS denied24h
+                FROM requests", new() { ["$day"] = day, ["$week"] = week });
+            var authCountsTask = parent.Store.QueryAsync(@"
+                SELECT COUNT(*) AS totalAuthEvents,
+                    COALESCE(SUM(CASE WHEN utc_ts >= $day AND type IN
+                        ('UnauthRoute','InsufficientClearance','InvalidPassword','WebsiteNoProfile','WebsiteInvalidProfile')
+                        THEN 1 ELSE 0 END), 0) AS unauth24h
+                FROM auth_events", new() { ["$day"] = day });
+
+            // Enumerate the concurrent tracker once instead of repeatedly sorting it.
+            var ips = parent.Tracker.All().ToArray();
+            int blocked = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Blocked));
+            int watched = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Watch));
+            int honey = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Honeypot));
+            int tarpit = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Tarpit));
+            var attackers = ips.Where(r => string.IsNullOrWhiteSpace(r.AssociatedProfileId))
+                .OrderByDescending(r => r.ThreatScore).Take(10).ToArray();
+            var topAttackers = attackers.Select(r => new
+            {
+                ip = r.Ip, score = r.ThreatScore, status = r.Status,
+                unauth = r.UnauthAttempts, country = r.Country, attacker = true
+            });
+            var topThreat = attackers.Take(1).Select(r => new
+            {
+                ip = r.Ip, score = r.ThreatScore, status = r.Status,
+                unauth = r.UnauthAttempts, country = r.Country, asn = r.Asn, attacker = true
+            }).FirstOrDefault();
+
+            var topRoutesTask = parent.Store.QueryAsync(
+                "SELECT route, COUNT(*) AS hits FROM requests WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC LIMIT 10",
+                new() { ["$t"] = day });
+            var originBreakdownTask = parent.Store.QueryAsync(
+                $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
+                new() { ["$t"] = day });
+            await Task.WhenAll(requestCountsTask, authCountsTask, topRoutesTask, originBreakdownTask);
+            var requestCounts = requestCountsTask.Result[0];
+            var authCounts = authCountsTask.Result[0];
+            long Count(Dictionary<string, object?> row, string key) => Convert.ToInt64(row[key] ?? 0);
+            long reqs24h = Count(requestCounts, "requests24h");
+            long totalRequests = Count(requestCounts, "totalRequests");
+            long reqs7d = Count(requestCounts, "requests7d");
+            long denied24h = Count(requestCounts, "denied24h");
+            long totalDenied = Count(requestCounts, "totalDenied");
+            long unauth24h = Count(authCounts, "unauth24h");
+            long totalAuthEvents = Count(authCounts, "totalAuthEvents");
+            var topRoutes = topRoutesTask.Result;
+            var originBreakdown = originBreakdownTask.Result;
+
+            var resp = new
+            {
+                asOfUtc = DateTimeOffset.UtcNow,
+                requests24h = reqs24h,
+                totalRequests,
+                requests7d = reqs7d,
+                denied24h,
+                totalDenied,
+                authFailures24h = unauth24h,
+                unauth24h,
+                totalAuthEvents,
+                blockedIps = blocked,
+                watchedIps = watched,
+                honeypotIps = honey,
+                tarpitIps = tarpit,
+                totalIps = ips.Length,
+                knownIps = ips.Length,
+                topThreat,
+                topAttackers,
+                topRoutes,
+                originBreakdown,
+                classBreakdown = ClassBreakdown(parent),
+                tagBreakdown = TagBreakdown(parent)
+            };
+            return JsonConvert.SerializeObject(resp);
+        }
+
         // -------- Query builders --------
 
         private static List<IpRecord> FilterIpRecords(IEnumerable<IpRecord> records, string? status, double minScore, string? query, int limit, int offset)
@@ -538,21 +570,43 @@ namespace Omnipotent.Services.OmniDefence
 
         private static bool Contains(string? source, string query) => source?.Contains(query, StringComparison.OrdinalIgnoreCase) == true;
 
-        private static (string sql, Dictionary<string, object?> p) BuildRequestsQuery(KliveAPI.KliveAPI.UserRequest req)
+        internal static void WarmDefaultRequests(OmniDefence parent)
+        {
+            var input = new NameValueCollection { ["limit"] = "250" };
+            var (sql, parameters) = BuildRequestsQuery(input);
+            parent.ReadSnapshots.GetOrQueue(RequestsKey(sql, parameters), false,
+                async ct => JsonConvert.SerializeObject(await parent.Store.QueryBoundedAsync(sql, parameters, ct)),
+                pinned: true);
+        }
+
+        private static string RequestsKey(string sql, Dictionary<string, object?> parameters) =>
+            OmniDefenceReadSnapshotCache.KeyFor("requests", sql + "|" + JsonConvert.SerializeObject(
+                parameters.OrderBy(pair => pair.Key, StringComparer.Ordinal).ToArray()));
+
+        private static Task SendReadSnapshot(KliveAPI.KliveAPI.UserRequest req, ReadSnapshotReply reply)
+        {
+            if (reply.State == ReadSnapshotState.Ready)
+                return req.ReturnResponse(reply.Json!, "application/json");
+            var headers = new NameValueCollection { ["Retry-After"] = "1", ["Cache-Control"] = "no-store" };
+            return req.ReturnResponse("{\"pending\":true}", "application/json", headers,
+                reply.State == ReadSnapshotState.Pending ? HttpStatusCode.Accepted : HttpStatusCode.ServiceUnavailable);
+        }
+
+        private static (string sql, Dictionary<string, object?> p) BuildRequestsQuery(NameValueCollection input)
         {
             var sb = new StringBuilder(RequestSelectSql + " WHERE 1=1");
             var p = new Dictionary<string, object?>();
-            string? ip = req.userParameters.Get("ip");
-            string? profile = req.userParameters.Get("profile");
-            string? route = req.userParameters.Get("route");
-            string? statusCode = req.userParameters.Get("status");
-            string? method = req.userParameters.Get("method");
-            string? origin = req.userParameters.Get("origin");
-            string? from = req.userParameters.Get("from");
-            string? to = req.userParameters.Get("to");
-            string? denyOnly = req.userParameters.Get("denyOnly");
-            int limit = int.TryParse(req.userParameters.Get("limit"), out var l) ? Math.Clamp(l, 1, 5000) : 500;
-            int offset = int.TryParse(req.userParameters.Get("offset"), out var o) ? Math.Max(0, o) : 0;
+            string? ip = input.Get("ip");
+            string? profile = input.Get("profile");
+            string? route = input.Get("route");
+            string? statusCode = input.Get("status");
+            string? method = input.Get("method");
+            string? origin = input.Get("origin");
+            string? from = input.Get("from");
+            string? to = input.Get("to");
+            string? denyOnly = input.Get("denyOnly");
+            int limit = int.TryParse(input.Get("limit"), out var l) ? Math.Clamp(l, 1, 5000) : 500;
+            int offset = int.TryParse(input.Get("offset"), out var o) ? Math.Clamp(o, 0, 100_000) : 0;
 
             if (!string.IsNullOrWhiteSpace(ip)) { sb.Append(" AND ip LIKE $ip"); p["$ip"] = "%" + ip + "%"; }
             if (!string.IsNullOrWhiteSpace(profile)) { sb.Append(" AND (profile_id=$pid OR profile_name LIKE $pname)"); p["$pid"] = profile; p["$pname"] = "%" + profile + "%"; }
@@ -668,6 +722,7 @@ namespace Omnipotent.Services.OmniDefence
                 ActorProfileName = req.user?.Name,
                 Detail = detail
             });
+            parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
             await req.ReturnResponse("{\"ok\":true}", "application/json");
         }
 

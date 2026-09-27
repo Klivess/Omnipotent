@@ -25,6 +25,8 @@ namespace Omnipotent.Services.OmniDefence
     {
         private OmniDefenceStore store = null!;
         private IpThreatTracker tracker = null!;
+        private OmniDefenceOverviewSnapshot? overviewSnapshot;
+        private OmniDefenceReadSnapshotCache? readSnapshots;
         private OmniDefenceScanner scanner = new();
         private static readonly HttpClient GeoIpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
 
@@ -61,6 +63,9 @@ namespace Omnipotent.Services.OmniDefence
 
         public OmniDefenceStore Store => store;
         public IpThreatTracker Tracker => tracker;
+        internal string? OverviewJson => overviewSnapshot?.CurrentJson;
+        internal OmniDefenceReadSnapshotCache ReadSnapshots => readSnapshots
+            ?? throw new InvalidOperationException("OmniDefence read snapshots are not running.");
         public OmniDefenceScanner Scanner => scanner;
         public FingerprintEngine? Fingerprints => fingerprints;
         public IpIntelService? Intel => intel;
@@ -97,6 +102,29 @@ namespace Omnipotent.Services.OmniDefence
                 RefreshBlockedRegionSnapshot();
 
                 await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
+
+                // The overview is expensive to aggregate. Load a recent durable body
+                // immediately, then keep rebuilding it on a single background worker.
+                string overviewPath = Path.Combine(
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory),
+                    "overview.snapshot.json");
+                var snapshot = new OmniDefenceOverviewSnapshot(overviewPath,
+                    () => OmniDefenceRoutes.BuildOverviewJsonAsync(this),
+                    ex => _ = ServiceLogError(ex, "OmniDefence overview refresh failed."));
+                overviewSnapshot = snapshot;
+                snapshot.LoadFromDisk();
+                var refreshCts = new CancellationTokenSource();
+                ServiceQuitRequest += () => refreshCts.Cancel();
+                _ = Task.Run(() => snapshot.RunAsync(refreshCts.Token));
+
+                var reads = new OmniDefenceReadSnapshotCache(Path.Combine(
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory), "read-snapshots"),
+                    ex => _ = ServiceLogError(ex, "OmniDefence read snapshot refresh failed."));
+                readSnapshots = reads;
+                var readCts = new CancellationTokenSource();
+                ServiceQuitRequest += () => readCts.Cancel();
+                reads.Start(readCts.Token);
+                OmniDefenceRoutes.WarmDefaultRequests(this);
 
                 // Periodic flush so threat scores survive restarts.
                 _ = PeriodicFlushLoop();

@@ -151,6 +151,41 @@ public class ProjectCostSimulatorTests
         Assert.Equal(-0.4, snapshot.Totals.ActualCostUsd, 6);
     }
 
+    [Fact]
+    public void DefaultSnapshots_ReadEachJournalOnceAndSeparateArchivedProjects()
+    {
+        var active = NewProject("active", "Active");
+        var archived = NewProject("archived", "Archived");
+        archived.Status = ProjectStatus.Archived;
+        archived.CreatedAt = Now.AddDays(-100);
+        var recentActive = Usage("commander", 100, 0, 0, 0, 0.01);
+        recentActive.OccurredAt = Now.AddMinutes(-30);
+        var oldActive = Usage("commander", 50, 0, 0, 0, 0.01);
+        oldActive.OccurredAt = Now.AddDays(-40);
+        var recentArchived = Usage("commander", 200, 0, 0, 0, 0.02);
+        recentArchived.OccurredAt = Now.AddMinutes(-30);
+        int scans = 0;
+
+        var snapshots = ProjectCostSimulatorService.BuildDefaultSnapshots(
+            new[] { active, archived },
+            (id, _, _) =>
+            {
+                Interlocked.Increment(ref scans);
+                return id == "active"
+                    ? new[] { recentActive, oldActive }
+                    : new[] { recentArchived };
+            },
+            _ => Array.Empty<ProjectAgentRecord>(), Now);
+
+        Assert.Equal(2, scans);
+        Assert.Equal(300, snapshots[ProjectCostSimulatorMaterializer.Key("1h", true)].Totals.TotalTokens);
+        Assert.Equal(100, snapshots[ProjectCostSimulatorMaterializer.Key("1h", false)].Totals.TotalTokens);
+        Assert.Equal(300, snapshots[ProjectCostSimulatorMaterializer.Key("30d", true)].Totals.TotalTokens);
+        Assert.Equal(350, snapshots[ProjectCostSimulatorMaterializer.Key("90d", true)].Totals.TotalTokens);
+        Assert.Equal(active.CreatedAt.Date,
+            snapshots[ProjectCostSimulatorMaterializer.Key("all", false)].Range.FromUtc);
+    }
+
     private static Project NewProject(string id, string name) => new()
     {
         ProjectID = id,

@@ -57,6 +57,7 @@ namespace Omnipotent.Services.Tripwires
                     var settings = ParseSettings(body["settings"], new TripwireSettings());
                     string createdBy = req.user?.Name ?? "Klives";
                     var created = await service.Store.CreateAsync(name, createdBy, settings, targets);
+                    service.MarkSummaryDirty(created.Id);
                     await req.ReturnResponse(Json(Present(created)), code: HttpStatusCode.Created);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
@@ -101,7 +102,7 @@ namespace Omnipotent.Services.Tripwires
                 {
                     CacheDeps.MarkUncacheable("live tripwire event data");
                     string id = RequireId(req.userParameters?.Get("id"));
-                    if (await service.Store.GetAsync(id) == null) { await req.ReturnResponse("Tripwire not found.", code: HttpStatusCode.NotFound); return; }
+                    if (!await service.Store.ExistsAsync(id)) { await req.ReturnResponse("Tripwire not found.", code: HttpStatusCode.NotFound); return; }
                     string? target = Clean(req.userParameters?.Get("targetId"), 64);
                     int limit = Int(req.userParameters?.Get("limit"), 100);
                     int offset = Int(req.userParameters?.Get("offset"), 0);
@@ -117,8 +118,15 @@ namespace Omnipotent.Services.Tripwires
                 {
                     CacheDeps.MarkUncacheable("live tripwire summary data");
                     string id = RequireId(req.userParameters?.Get("id"));
-                    if (await service.Store.GetAsync(id) == null) { await req.ReturnResponse("Tripwire not found.", code: HttpStatusCode.NotFound); return; }
-                    await req.ReturnResponse(Json(await service.Store.GetSummaryAsync(id)));
+                    string? summary = await service.Store.GetSummarySnapshotJsonAsync(id);
+                    if (summary == null)
+                    {
+                        bool exists = await service.Store.ExistsAsync(id);
+                        await req.ReturnResponse(exists ? "Tripwire summary is preparing." : "Tripwire not found.",
+                            code: exists ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.NotFound);
+                        return;
+                    }
+                    await req.ReturnResponse(summary);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
@@ -130,6 +138,7 @@ namespace Omnipotent.Services.Tripwires
                 {
                     string id = RequireId((string?)ParseBody(req.userMessageContent)["id"]);
                     bool cleared = await service.Store.ClearEventsAsync(id);
+                    if (cleared) service.MarkSummaryDirty(id);
                     await req.ReturnResponse(Json(new { cleared }), code: cleared ? HttpStatusCode.OK : HttpStatusCode.NotFound);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
