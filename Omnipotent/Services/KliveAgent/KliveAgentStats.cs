@@ -54,6 +54,14 @@ namespace Omnipotent.Services.KliveAgent
         private readonly ConcurrentDictionary<string, CapabilityBucket> _capabilities = new(StringComparer.OrdinalIgnoreCase);
         // Failure category (CS-code / "Runtime:<Type>" / coarse fallback) -> count. Powers BuildScriptFailureBreakdown().
         private readonly ConcurrentDictionary<string, long> _scriptErrorCodes = new(StringComparer.Ordinal);
+        private readonly object _performanceLock = new();
+        private readonly Dictionary<string, PerformanceStage> _performanceStages = new(StringComparer.Ordinal);
+        private readonly List<PerformanceRunSnapshot> _recentPerformance = new();
+        private long _performanceRuns;
+        private long _performanceTotalMs;
+        private long _performanceMaxMs;
+        private long _performanceSucceeded;
+        private long _performanceStopped;
 
         public async Task InitializeAsync()
         {
@@ -112,6 +120,17 @@ namespace Omnipotent.Services.KliveAgent
                 foreach (var kv in snapshot.ScriptErrorCodes ?? new Dictionary<string, long>())
                 {
                     if (!string.IsNullOrWhiteSpace(kv.Key)) _scriptErrorCodes[kv.Key] = kv.Value;
+                }
+                lock (_performanceLock)
+                {
+                    _performanceRuns = snapshot.PerformanceRuns;
+                    _performanceTotalMs = snapshot.PerformanceTotalMs;
+                    _performanceMaxMs = snapshot.PerformanceMaxMs;
+                    _performanceSucceeded = snapshot.PerformanceSucceeded;
+                    _performanceStopped = snapshot.PerformanceStopped;
+                    foreach (var kv in snapshot.PerformanceStages ?? new())
+                        _performanceStages[kv.Key] = kv.Value;
+                    _recentPerformance.AddRange((snapshot.RecentPerformance ?? new()).TakeLast(100));
                 }
             }
             catch
@@ -262,6 +281,58 @@ namespace Omnipotent.Services.KliveAgent
             QueueSave();
         }
 
+        /// <summary>Stores bounded, content-free latency traces and lifetime stage totals.</summary>
+        public void RecordPerformance(PerformanceRunSnapshot run)
+        {
+            lock (_performanceLock)
+            {
+                _performanceRuns++;
+                _performanceTotalMs += run.DurationMs;
+                _performanceMaxMs = Math.Max(_performanceMaxMs, run.DurationMs);
+                if (run.Outcome == "completed") _performanceSucceeded++;
+                if (run.Outcome == "stopped") _performanceStopped++;
+                foreach (var (name, stage) in run.Stages)
+                {
+                    if (!_performanceStages.TryGetValue(name, out var total))
+                        _performanceStages[name] = total = new PerformanceStage();
+                    total.Count += stage.Count;
+                    total.TotalMs += stage.TotalMs;
+                    total.MaxMs = Math.Max(total.MaxMs, stage.MaxMs);
+                }
+                _recentPerformance.Add(run);
+                if (_recentPerformance.Count > 100) _recentPerformance.RemoveRange(0, _recentPerformance.Count - 100);
+            }
+            QueueSave();
+        }
+
+        public object GetPerformanceSummary()
+        {
+            lock (_performanceLock)
+            {
+                var recentDurations = _recentPerformance.Select(run => run.DurationMs).Order().ToArray();
+                long Percentile(double p) => recentDurations.Length == 0 ? 0
+                    : recentDurations[(int)Math.Ceiling(p * recentDurations.Length) - 1];
+                return new
+                {
+                    measuredRuns = _performanceRuns,
+                    completedRuns = _performanceSucceeded,
+                    stoppedRuns = _performanceStopped,
+                    failedRuns = _performanceRuns - _performanceSucceeded - _performanceStopped,
+                    avgDurationMs = _performanceRuns > 0 ? Math.Round((double)_performanceTotalMs / _performanceRuns) : 0,
+                    maxDurationMs = _performanceMaxMs,
+                    recentP50DurationMs = Percentile(0.50),
+                    recentP95DurationMs = Percentile(0.95),
+                    stages = _performanceStages.OrderByDescending(kv => kv.Value.TotalMs).Select(kv => new
+                    {
+                        name = kv.Key, calls = kv.Value.Count, totalMs = kv.Value.TotalMs,
+                        avgMs = kv.Value.Count > 0 ? Math.Round((double)kv.Value.TotalMs / kv.Value.Count) : 0,
+                        maxMs = kv.Value.MaxMs
+                    }).ToList(),
+                    recent = _recentPerformance.AsEnumerable().Reverse().ToList()
+                };
+            }
+        }
+
         private static bool IsCompileCode(string code) =>
             code == "Compile"
             || (code.Length >= 3 && code.StartsWith("CS", StringComparison.Ordinal) && char.IsDigit(code[2]));
@@ -328,6 +399,16 @@ namespace Omnipotent.Services.KliveAgent
                         .ToList(),
                     ScriptErrorCodes = _scriptErrorCodes.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal)
                 };
+                lock (_performanceLock)
+                {
+                    snapshot.PerformanceRuns = _performanceRuns;
+                    snapshot.PerformanceTotalMs = _performanceTotalMs;
+                    snapshot.PerformanceMaxMs = _performanceMaxMs;
+                    snapshot.PerformanceSucceeded = _performanceSucceeded;
+                    snapshot.PerformanceStopped = _performanceStopped;
+                    snapshot.PerformanceStages = _performanceStages.ToDictionary(kv => kv.Key, kv => kv.Value.Copy(), StringComparer.Ordinal);
+                    snapshot.RecentPerformance = _recentPerformance.ToList();
+                }
 
                 string tempPath = persistencePath + ".tmp";
                 string json = JsonConvert.SerializeObject(snapshot, Formatting.Indented);
@@ -462,7 +543,8 @@ namespace Omnipotent.Services.KliveAgent
                 dailyHistory,
                 weeklyHistory,
                 monthlyHistory,
-                topCapabilities
+                topCapabilities,
+                performance = GetPerformanceSummary()
             };
         }
 
@@ -561,6 +643,13 @@ namespace Omnipotent.Services.KliveAgent
             public List<MonthBucket> Months { get; set; } = new();
             public List<CapabilityBucket> Capabilities { get; set; } = new();
             public Dictionary<string, long> ScriptErrorCodes { get; set; } = new();
+            public long PerformanceRuns { get; set; }
+            public long PerformanceTotalMs { get; set; }
+            public long PerformanceMaxMs { get; set; }
+            public long PerformanceSucceeded { get; set; }
+            public long PerformanceStopped { get; set; }
+            public Dictionary<string, PerformanceStage> PerformanceStages { get; set; } = new();
+            public List<PerformanceRunSnapshot> RecentPerformance { get; set; } = new();
         }
 
         /// <summary>Shared metric fields for every time bucket (day/week/month). New fields default to

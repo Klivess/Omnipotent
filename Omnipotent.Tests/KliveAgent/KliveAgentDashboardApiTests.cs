@@ -1,5 +1,7 @@
 using Omnipotent.Services.KliveAgent;
 using Omnipotent.Services.KliveAgent.Models;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 
 namespace Omnipotent.Tests.KliveAgent;
 
@@ -23,6 +25,31 @@ public class KliveAgentDashboardApiTests
         Assert.Equal(10_000, summary.TodayTotalTokens);
         Assert.Equal(7, summary.TodayIterations);
         Assert.Equal(0.102, summary.TodayEstimatedCostUsd, 4);
+    }
+
+    [Fact]
+    public void PerformanceSummary_RecordsStageCallsAndContentFreeRecentRuns()
+    {
+        var stats = new KliveAgentStats(Path.Combine(
+            Path.GetTempPath(), "omnipotent-tests", Guid.NewGuid().ToString("N"), "stats.json"));
+        var run = new KliveAgentPerformance { Outcome = "completed" };
+        run.Add("model", 800);
+        run.Add("model", 1200);
+        run.Add("script", 250);
+        stats.RecordPerformance(run.Snapshot(2, 100, 50));
+
+        var json = JObject.Parse(JsonConvert.SerializeObject(stats.GetSummary(),
+            new JsonSerializerSettings { ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver() }));
+        var performance = json["performance"]!;
+        Assert.Equal(1, (int)performance["measuredRuns"]!);
+        Assert.Equal(1, (int)performance["completedRuns"]!);
+        Assert.True((long)performance["recentP95DurationMs"]! >= (long)performance["recentP50DurationMs"]!);
+        var model = performance["stages"]!.Single(s => (string?)s["name"] == "model");
+        Assert.Equal(2, (int)model["calls"]!);
+        Assert.Equal(2000, (int)model["totalMs"]!);
+        Assert.Equal(1200, (int)model["maxMs"]!);
+        Assert.Equal(2, (int)performance["recent"]![0]!["iterations"]!);
+        Assert.Equal(150, (int)performance["recent"]![0]!["promptTokens"]! + (int)performance["recent"]![0]!["completionTokens"]!);
     }
 
     [Theory]

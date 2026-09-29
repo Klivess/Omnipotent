@@ -833,7 +833,8 @@ namespace Omnipotent.Services.KliveAgent
             {
                 try
                 {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.GetSummary()));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.GetSummary(),
+                        new JsonSerializerSettings { ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver() }));
                 }
                 catch (Exception ex)
                 {

@@ -1221,6 +1221,12 @@ namespace Omnipotent.Services.KliveAgent
             Action<AgentSteeringMessage>? onSteeringApplied = null,
             IReadOnlyList<AgentAttachment>? messageAttachments = null)
         {
+            var performance = new KliveAgentPerformance();
+            var preparationTimer = System.Diagnostics.Stopwatch.StartNew();
+            bool preparationRecorded = false;
+            int totalPromptTokens = 0;
+            int totalCompletionTokens = 0;
+            int iterationsDone = 0;
             try
             {
                 var turnStopwatch = System.Diagnostics.Stopwatch.StartNew();
@@ -1278,7 +1284,9 @@ namespace Omnipotent.Services.KliveAgent
                 // model's context window and start hallucinating stale state).
                 int retainedScreenshots = Math.Max(1, await agentService.GetIntOmniSetting("KliveAgent_MaxRetainedScreenshots", 3));
 
-                var systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
+                string systemPrompt;
+                using (performance.Measure("systemPrompt"))
+                    systemPrompt = await BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled);
                 var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;
 
                 // The Service Surface: dedicated tools for the pinned services plus the two universals,
@@ -1288,7 +1296,11 @@ namespace Omnipotent.Services.KliveAgent
                 // request.
                 if (toolDefinitions != null && agentService.ServiceTools != null)
                 {
-                    try { toolDefinitions.AddRange(await agentService.ServiceTools.BuildToolDefinitionsAsync()); }
+                    try
+                    {
+                        using (performance.Measure("toolDefinitions"))
+                            toolDefinitions.AddRange(await agentService.ServiceTools.BuildToolDefinitionsAsync());
+                    }
                     catch (Exception ex) { await agentService.ServiceLogError(ex, "Failed to build service tools; continuing without them."); }
                 }
 
@@ -1325,16 +1337,15 @@ namespace Omnipotent.Services.KliveAgent
                 int maxRunMinutes = await agentService.GetIntOmniSetting("KliveAgent_MaxRunMinutes", 30);
                 int maxLlmRetries = Math.Max(0, await agentService.GetIntOmniSetting("KliveAgent_MaxLlmRetries", 2));
 
-                int totalPromptTokens = 0;
-                int totalCompletionTokens = 0;
-                int iterationsDone = 0;
-
-                var userPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+                string userPrompt;
+                using (performance.Measure("conversationPrompt"))
+                    userPrompt = BuildUserPrompt(conversation, userMessage, senderName);
                 (string text, List<(byte[] data, string mimeType)> images) preparedAttachments;
                 try
                 {
-                    preparedAttachments = await agentService.Attachments.PrepareForModelAsync(
-                        messageAttachments, cancellationToken);
+                    using (performance.Measure("attachments"))
+                        preparedAttachments = await agentService.Attachments.PrepareForModelAsync(
+                            messageAttachments, cancellationToken);
                 }
                 catch (Exception ex) when (ex is ArgumentException or InvalidDataException or System.ComponentModel.Win32Exception)
                 {
@@ -1511,6 +1522,7 @@ namespace Omnipotent.Services.KliveAgent
                 // stats — exactly like a normal finish, but flagged unsuccessful with a "stopped" note.
                 AgentChatResponse BuildStoppedResponse()
                 {
+                    performance.Outcome = "stopped";
                     var partial = progressText.ToString().Trim();
                     var finalText = partial.Length > 0
                         ? partial + "\n\n_(Run stopped before completion.)_"
@@ -1537,6 +1549,8 @@ namespace Omnipotent.Services.KliveAgent
                 // answer, or when the stuck-detector trips (same error 3x, or same script
                 // body re-run). This lets the agent take as many steps as a complex task
                 // genuinely requires without an artificial ceiling on its cognition.
+                performance.Add("preparation", preparationTimer.ElapsedMilliseconds);
+                preparationRecorded = true;
                 for (int iteration = 0; ; iteration++)
                 {
                     iterationsDone = iteration + 1;
@@ -1596,12 +1610,17 @@ namespace Omnipotent.Services.KliveAgent
                     // it immediately (keyed by call id) so its I/O overlaps with the model still generating
                     // the rest of the turn. #6's pre-launch below reuses these tasks instead of re-running.
                     var speculativeTasks = new System.Collections.Concurrent.ConcurrentDictionary<string, Task<(bool ok, string output)>>();
+                    async Task<(bool ok, string output)> RunNativeToolMeasuredAsync(string name, string? content)
+                    {
+                        using (performance.Measure("nativeTool"))
+                            return await RunNativeToolAsync(sharedGlobals, name, content);
+                    }
                     void OnToolCallComplete(HFWrapper.HFToolCall tc)
                     {
                         var name = tc?.function?.name;
                         if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(tc!.id)) return;
                         if (!IsParallelSafeNativeTool(name, tc.function?.arguments)) return;   // only read-only native tools are safe to start early
-                        speculativeTasks.TryAdd(tc.id, RunNativeToolAsync(sharedGlobals, name, tc.function?.arguments));
+                        speculativeTasks.TryAdd(tc.id, RunNativeToolMeasuredAsync(name, tc.function?.arguments));
                     }
 
                     // Brain-level retry: the transport backs off on transient HTTP errors, but an exception
@@ -1612,21 +1631,32 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         try
                         {
-                            if (useToolCalling)
+                            var modelTimer = System.Diagnostics.Stopwatch.StartNew();
+                            int firstTokenSeen = 0;
+                            Action<string> measuredTokenSink = token =>
                             {
-                                // The structured session already holds system + user + any prior tool turns.
-                                // Klives is sitting there waiting on this one, so it is never parked
-                                // behind autonomous background work.
-                                llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete,
-                                    workClass: KliveLLM.AIRouterWorkClass.Interactive);
-                            }
-                            else
+                                if (!string.IsNullOrEmpty(token) && System.Threading.Interlocked.Exchange(ref firstTokenSeen, 1) == 0)
+                                    performance.Add("firstToken", modelTimer.ElapsedMilliseconds);
+                                tokenSink?.Invoke(token);
+                            };
+                            using (performance.Measure("model"))
                             {
-                                // Pass system prompt only on iteration 0 so it is set as the LLM session's
-                                // system role message once — not re-injected into every user turn.
-                                llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                                    systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: tokenSink, thinkingOverride: thinkingForThisCall);
-                                firstIterationSystemPrompt = null; // don't resend
+                                if (useToolCalling)
+                                {
+                                    // The structured session already holds system + user + any prior tool turns.
+                                    // Klives is sitting there waiting on this one, so it is never parked
+                                    // behind autonomous background work.
+                                    llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: measuredTokenSink, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete,
+                                        workClass: KliveLLM.AIRouterWorkClass.Interactive);
+                                }
+                                else
+                                {
+                                    // Pass system prompt only on iteration 0 so it is set as the LLM session's
+                                    // system role message once — not re-injected into every user turn.
+                                    llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
+                                        systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: measuredTokenSink, thinkingOverride: thinkingForThisCall);
+                                    firstIterationSystemPrompt = null; // don't resend
+                                }
                             }
                             break;
                         }
@@ -1636,6 +1666,7 @@ namespace Omnipotent.Services.KliveAgent
                         }
                         catch (Exception llmEx)
                         {
+                            performance.Add("modelError", 0);
                             if (llmAttempt >= maxLlmRetries)
                             {
                                 return new AgentChatResponse
@@ -1646,8 +1677,13 @@ namespace Omnipotent.Services.KliveAgent
                                     ErrorMessage = llmEx.ToString()
                                 };
                             }
+                            performance.Add("modelRetry", 0);
                             ReportProgress("thinking", $"_…transient error, retrying (attempt {llmAttempt + 2})_");
-                            try { await Task.Delay(TimeSpan.FromSeconds(1.5 * (llmAttempt + 1)), cancellationToken); }
+                            try
+                            {
+                                using (performance.Measure("retryBackoff"))
+                                    await Task.Delay(TimeSpan.FromSeconds(1.5 * (llmAttempt + 1)), cancellationToken);
+                            }
                             catch (OperationCanceledException) { return BuildStoppedResponse(); }
                         }
                     }
@@ -1837,6 +1873,7 @@ namespace Omnipotent.Services.KliveAgent
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
                             turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
+                        performance.Outcome = "completed";
 
                         // NOTE: We deliberately do NOT auto-save "task completed" summaries here.
                         // Memory is for durable facts about reality (who Klives is, how a service
@@ -1912,12 +1949,13 @@ namespace Omnipotent.Services.KliveAgent
                                 ComputerToolResult cr;
                                 if (sharedGlobals.GetService("HostControlManager") is HostControlManager hcm)
                                 {
-                                    cr = await hcm.ExecuteToolAsync(segment.ToolName, segment.Content, cancellationToken, hcp =>
-                                    {
-                                        var act = hcp.Activity == null ? null
-                                            : new AgentActivityEvent { Iteration = iteration + 1, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
-                                        ReportProgress("running", hcp.Note, act, frame: hcp.AnnotatedFrameJpeg, approval: hcp.Approval);
-                                    });
+                                    using (performance.Measure("computerTool"))
+                                        cr = await hcm.ExecuteToolAsync(segment.ToolName, segment.Content, cancellationToken, hcp =>
+                                        {
+                                            var act = hcp.Activity == null ? null
+                                                : new AgentActivityEvent { Iteration = iteration + 1, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
+                                            ReportProgress("running", hcp.Note, act, frame: hcp.AnnotatedFrameJpeg, approval: hcp.Approval);
+                                        });
                                 }
                                 else
                                 {
@@ -1965,8 +2003,11 @@ namespace Omnipotent.Services.KliveAgent
                             // progress channel; the per-script 30s cap never applies.
                             if (IsWaitTool(segment.ToolName))
                             {
-                                var (wok, wtext) = await RunWaitForAsync(segment.Content, cancellationToken, note =>
-                                    ReportProgress("waiting", note, new AgentActivityEvent { Iteration = iteration + 1, Kind = "wait", Text = note }));
+                                (bool wok, string wtext) waitResult;
+                                using (performance.Measure("waitTool"))
+                                    waitResult = await RunWaitForAsync(segment.Content, cancellationToken, note =>
+                                        ReportProgress("waiting", note, new AgentActivityEvent { Iteration = iteration + 1, Kind = "wait", Text = note }));
+                                var (wok, wtext) = waitResult;
                                 if (!wok) errorCountThisIter++;
 
                                 var wt = KliveAgentContextBudget.TruncateToTokens(wtext ?? string.Empty,
@@ -1990,7 +2031,7 @@ namespace Omnipotent.Services.KliveAgent
                             if (prelaunchedTools.TryGetValue(segment, out var preTask))
                                 (memOk, memOut) = await preTask;        // parallel-safe read-only tool: started up front
                             else
-                                (memOk, memOut) = await RunNativeToolAsync(sharedGlobals, segment.ToolName, segment.Content); // write tool: serial, in order
+                                (memOk, memOut) = await RunNativeToolMeasuredAsync(segment.ToolName, segment.Content); // write tool: serial, in order
                             if (!memOk) errorCountThisIter++;
 
                             var memText = KliveAgentContextBudget.TruncateToTokens(memOut ?? string.Empty,
@@ -2018,6 +2059,7 @@ namespace Omnipotent.Services.KliveAgent
                         scriptCountThisIter++;
 
                         var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty, scriptTimeout);
+                        performance.Add("script", result.ExecutionTimeMs);
                         allScriptsExecuted.Add(result);
 
                         // Stream the just-completed script (code + output) to the UI as it lands, with a
@@ -2148,6 +2190,11 @@ namespace Omnipotent.Services.KliveAgent
                     Success = false,
                     ErrorMessage = ex.ToString()
                 };
+            }
+            finally
+            {
+                if (!preparationRecorded) performance.Add("preparation", preparationTimer.ElapsedMilliseconds);
+                agentService.Stats.RecordPerformance(performance.Snapshot(iterationsDone, totalPromptTokens, totalCompletionTokens));
             }
         }
 
