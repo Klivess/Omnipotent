@@ -810,6 +810,30 @@ namespace Omnipotent.Services.KliveAgent.Models
 
     public class AgentPendingChatResponse
     {
+        private TaskCompletionSource<long> progressChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Called while holding this run's lock. Wake every waiting client on the same
+        /// revision; a fresh signal makes reconnects race-free.</summary>
+        internal void AdvanceRevision()
+        {
+            Sequence++;
+            var changed = progressChanged;
+            progressChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            changed.TrySetResult(Sequence);
+        }
+
+        internal async Task WaitForChangeAsync(long afterSequence, int waitMs, CancellationToken cancellationToken = default)
+        {
+            Task changed;
+            lock (this)
+            {
+                if (Sequence > afterSequence || Status != AgentTaskStatus.Running || CompletedAt != null || waitMs <= 0) return;
+                changed = progressChanged.Task;
+            }
+            try { await changed.WaitAsync(TimeSpan.FromMilliseconds(Math.Clamp(waitMs, 1, 20_000)), cancellationToken); }
+            catch (TimeoutException) { }
+        }
+
         [JsonProperty("requestId")]
         public string RequestId { get; set; } = Guid.NewGuid().ToString("N");
 

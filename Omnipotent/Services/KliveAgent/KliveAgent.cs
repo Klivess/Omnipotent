@@ -56,8 +56,10 @@ namespace Omnipotent.Services.KliveAgent
         private long serviceGeneration;
         private string initializationMessage = "KliveAgent is initializing.";
         // 0..100 setup progress for the website's loading bar; 100 == ready to talk. Advanced step-by-step
-        // through ServiceMain so the bar reflects the (codebase-index-dominated) warmup actually happening.
+        // through ServiceMain so the bar reflects the chat prerequisites actually warming up.
         private volatile int initializationProgress = 0;
+        private volatile int codebaseProgress;
+        private volatile string codebaseMessage = "Codebase intelligence is warming up.";
 
         // Discord DM handler delegate — set by KliveBotDiscord when agent is active.
         // Args: (messageContent, channelId, authorDiscordId). KliveAgent only serves Klives over Discord.
@@ -163,6 +165,11 @@ namespace Omnipotent.Services.KliveAgent
             Interlocked.Exchange(ref durableStateReady, 0);
             initializationProgress = 0;
             initializationMessage = "KliveAgent is initializing.";
+            CodebaseIndex = null;
+            SymbolGraph = null;
+            RepoMap = null;
+            codebaseProgress = 0;
+            codebaseMessage = "Codebase intelligence is warming up.";
 
             // Status must exist even when the feature is disabled, otherwise the website polls a
             // nonexistent endpoint forever instead of showing a truthful disabled state.
@@ -268,22 +275,7 @@ namespace Omnipotent.Services.KliveAgent
                 ServiceTools = new KliveAgentServiceTools(this);
                 PublishServiceCapabilities();
 
-                // Initialize codebase intelligence (spec Ch. 3, 4, 7) — the slowest part of warmup.
-                SetInitProgress(55, "Indexing the codebase…");
-                var codebaseRoot = ResolveCodebaseRoot();
-                var indexCacheDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory);
-                CodebaseIndex = new KliveAgentCodebaseIndex(codebaseRoot, indexCacheDir);
-                await CodebaseIndex.InitializeAsync();
-                if (Superseded()) return;
-
-                SetInitProgress(75, "Building the symbol graph…");
-                SymbolGraph = new KliveAgentSymbolGraph(CodebaseIndex);
-                await SymbolGraph.BuildAsync();
-                if (Superseded()) return;
-
                 SetInitProgress(88, "Preparing the agent brain…");
-                RepoMap = new KliveAgentRepoMap(CodebaseIndex, SymbolGraph);
-
                 brain = new KliveAgentBrain(this, scriptEngine, Memory);
 
                 // Set up Discord DM handler
@@ -291,6 +283,9 @@ namespace Omnipotent.Services.KliveAgent
 
                 SetInitProgress(100, "KliveAgent is ready.");
                 Interlocked.Exchange(ref initializationState, InitializationStateReady);
+                // Chat needs the durable state, memory and execution surface. Build optional code
+                // intelligence in the background so a cold repository cannot block conversation.
+                _ = Task.Run(() => WarmCodebaseAsync(serviceToken, generation), serviceToken);
 
                 // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
                 _ = RunPendingRunWatchdogAsync(serviceToken);
@@ -299,7 +294,7 @@ namespace Omnipotent.Services.KliveAgent
                 // came due while offline fire on the first tick with an explicit lateness note.
                 Scheduler.StartLoop(serviceToken);
 
-                await ServiceLog("[KliveAgent] Initialized and ready. All systems nominal.");
+                await ServiceLog("[KliveAgent] Chat is ready; codebase intelligence is warming in the background.");
             }
             catch (Exception ex)
             {
@@ -309,6 +304,49 @@ namespace Omnipotent.Services.KliveAgent
                 await ServiceLogError(ex, "[KliveAgent] Initialization failed.");
             }
         }
+
+        private async Task WarmCodebaseAsync(CancellationToken serviceToken, long generation)
+        {
+            bool Current() => !serviceToken.IsCancellationRequested && generation == Volatile.Read(ref serviceGeneration);
+            if (!Current()) return;
+            try
+            {
+                var index = new KliveAgentCodebaseIndex(ResolveCodebaseRoot(),
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentIndexDirectory));
+                codebaseProgress = 10;
+                codebaseMessage = "Indexing the codebase…";
+                await index.InitializeAsync(serviceToken);
+                if (!Current()) return;
+                codebaseProgress = 75;
+                codebaseMessage = "Building the symbol graph…";
+                var graph = new KliveAgentSymbolGraph(index);
+                await graph.BuildAsync(serviceToken);
+                if (!Current()) return;
+                // Publish complete subsystems; queries never see a half-built initial index.
+                CodebaseIndex = index;
+                SymbolGraph = graph;
+                RepoMap = new KliveAgentRepoMap(index, graph);
+                codebaseProgress = 100;
+                codebaseMessage = "Codebase intelligence is ready.";
+                await ServiceLog("[KliveAgent] Codebase intelligence is ready.");
+            }
+            catch (OperationCanceledException) when (!Current()) { }
+            catch (Exception ex)
+            {
+                if (!Current()) return;
+                codebaseProgress = -1;
+                codebaseMessage = "Codebase intelligence failed to warm up; direct file tools remain available.";
+                await ServiceLogError(ex, "[KliveAgent] Background codebase initialization failed.");
+            }
+        }
+
+        public object GetCodebaseInitializationStatus() => new
+        {
+            ready = codebaseProgress == 100,
+            state = codebaseProgress < 0 ? "failed" : codebaseProgress == 100 ? "ready" : "starting",
+            progress = Math.Max(0, codebaseProgress),
+            message = codebaseMessage
+        };
 
         public bool TryGetApiAvailability(out HttpStatusCode statusCode, out string message)
         {
@@ -450,9 +488,7 @@ namespace Omnipotent.Services.KliveAgent
             await CompleteConversationTurnAsync(conversation, requestId, response,
                 cancellationToken.IsCancellationRequested ? "cancelled" : response.Success ? "completed" : "failed");
 
-            // Persist after every turn so a crash never loses recent messages (the Discord path used
-            // to persist only every 5th message, dropping up to ~5 turns on an unexpected restart).
-            await PersistConversationAsync(conversation);
+            // CompleteConversationTurnAsync already awaited the durable conversation write.
 
             return response;
             }
@@ -967,6 +1003,13 @@ namespace Omnipotent.Services.KliveAgent
             return pendingResponse == null ? null : SnapshotRun(pendingResponse);
         }
 
+        public async Task<AgentPendingChatResponse?> WaitForPendingApiResponseAsync(string requestId, long afterSequence, int waitMs)
+        {
+            if (!pendingApiResponses.TryGetValue(requestId, out var pending)) return null;
+            await pending.WaitForChangeAsync(afterSequence, waitMs, cancellationToken.Token);
+            return SnapshotRun(pending);
+        }
+
         public List<AgentPendingChatResponse> GetPendingApiResponses(
             string conversationId = null, bool includeCompleted = true)
         {
@@ -1424,7 +1467,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             pending.LastProgressAt = DateTime.UtcNow;
             pending.UpdatedAt = DateTime.UtcNow;
-            pending.Sequence++;
+            pending.AdvanceRevision();
         }
 
         private static bool SameAttachments(IEnumerable<AgentAttachment>? left, IEnumerable<AgentAttachment>? right) =>

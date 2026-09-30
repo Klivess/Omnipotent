@@ -65,13 +65,13 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Load from disk cache then incrementally update only changed files.</summary>
-        public async Task InitializeAsync()
+        public async Task InitializeAsync(CancellationToken cancellationToken = default)
         {
-            await buildLock.WaitAsync();
+            await buildLock.WaitAsync(cancellationToken);
             try
             {
                 LoadCacheFromDisk();
-                await IncrementalRebuildAsync();
+                await IncrementalRebuildAsync(cancellationToken);
                 IsBuilt = true;
             }
             finally
@@ -82,22 +82,26 @@ namespace Omnipotent.Services.KliveAgent
             // Background rebuild every 6 minutes
             _ = Task.Run(async () =>
             {
-                while (true)
+                try
                 {
-                    await Task.Delay(TimeSpan.FromMinutes(6));
-                    await RebuildAsync();
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromMinutes(6), cancellationToken);
+                        await RebuildAsync(cancellationToken);
+                    }
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
             });
         }
 
         /// <summary>Full rebuild of the entire index.</summary>
-        public async Task RebuildAsync()
+        public async Task RebuildAsync(CancellationToken cancellationToken = default)
         {
-            await buildLock.WaitAsync();
+            await buildLock.WaitAsync(cancellationToken);
             try
             {
-                fileData.Clear();
-                await IncrementalRebuildAsync();
+                lock (fileData) fileData.Clear();
+                await IncrementalRebuildAsync(cancellationToken);
                 IsBuilt = true;
             }
             finally
@@ -187,15 +191,22 @@ namespace Omnipotent.Services.KliveAgent
         /// Import edge graph: sourceFile → list of files it depends on (via using-directives).
         /// Used by KliveAgentSymbolGraph to build PageRank.
         /// </summary>
-        public Dictionary<string, List<string>> GetImportEdges()
+        public Dictionary<string, List<string>> GetImportEdges(CancellationToken cancellationToken = default)
         {
             var nsToFiles = BuildNamespaceToFilesMap();
             var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
 
             lock (fileData)
             {
+                // Preserve the first-definition resolution while avoiding a complete symbol scan
+                // for every referenced identifier in every file.
+                var definitions = new Dictionary<string, CodeSymbolEntry>(StringComparer.OrdinalIgnoreCase);
+                foreach (var symbol in fileData.Values.SelectMany(f => f.Symbols))
+                    if (symbol.Kind == CodeSymbolKind.Type) definitions.TryAdd(symbol.Name, symbol);
+
                 foreach (var (path, data) in fileData)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     var deps = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
                     foreach (var ns in data.UsingNamespaces)
@@ -213,12 +224,7 @@ namespace Omnipotent.Services.KliveAgent
                     // Also add identifier-level reference edges
                     foreach (var identifier in data.ReferencedIdentifiers)
                     {
-                        var defEntry = fileData.Values
-                            .SelectMany(fd => fd.Symbols)
-                            .FirstOrDefault(s => s.Kind == CodeSymbolKind.Type &&
-                                                  s.Name.Equals(identifier, StringComparison.OrdinalIgnoreCase));
-
-                        if (defEntry != null &&
+                        if (definitions.TryGetValue(identifier, out var defEntry) &&
                             !defEntry.FilePath.Equals(path, StringComparison.OrdinalIgnoreCase))
                         {
                             deps.Add(defEntry.FilePath);
@@ -234,19 +240,41 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Internal build logic ──
 
-        private async Task IncrementalRebuildAsync()
+        private static readonly HashSet<string> IgnoredSourceDirectories = new(StringComparer.OrdinalIgnoreCase)
+        { "bin", "obj", "node_modules", ".git", ".vs", ".nuxt", ".output", ".idea" };
+
+        internal static IEnumerable<string> EnumerateSourceFiles(string root, CancellationToken cancellationToken = default)
+        {
+            var pending = new Stack<string>();
+            pending.Push(root);
+            var options = new EnumerationOptions { IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint };
+            while (pending.TryPop(out var directory))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                foreach (var file in Directory.EnumerateFiles(directory, "*.cs", options))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    yield return file;
+                }
+                foreach (var child in Directory.EnumerateDirectories(directory, "*", options))
+                    if (!IgnoredSourceDirectories.Contains(Path.GetFileName(child))) pending.Push(child);
+            }
+        }
+
+        private async Task IncrementalRebuildAsync(CancellationToken cancellationToken)
         {
             if (!Directory.Exists(codebaseRoot)) return;
 
-            var allFiles = Directory.EnumerateFiles(codebaseRoot, "*.cs", SearchOption.AllDirectories)
-                .Where(f => !f.Contains("\\obj\\", StringComparison.OrdinalIgnoreCase) &&
-                             !f.Contains("/obj/", StringComparison.OrdinalIgnoreCase) &&
-                             !f.Contains("\\bin\\", StringComparison.OrdinalIgnoreCase) &&
-                             !f.Contains("/bin/", StringComparison.OrdinalIgnoreCase))
-                .ToList();
-
-            var tasks = allFiles.Select(file => Task.Run(() =>
+            var allFiles = EnumerateSourceFiles(codebaseRoot, cancellationToken).ToList();
+            // Leave workers available for model streaming and chat. A Task.Run per source file
+            // previously flooded the pool with Roslyn parses during cold starts and refreshes.
+            await Parallel.ForEachAsync(allFiles, new ParallelOptions
             {
+                MaxDegreeOfParallelism = Math.Clamp(Environment.ProcessorCount / 2, 1, 4),
+                CancellationToken = cancellationToken
+            }, (file, token) =>
+            {
+                token.ThrowIfCancellationRequested();
                 try
                 {
                     var relPath = Path.GetRelativePath(codebaseRoot, file).Replace('\\', '/');
@@ -257,7 +285,7 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         if (fileData.TryGetValue(relPath, out var cached) &&
                             cached.LastModifiedTicks == modTime)
-                            return;
+                            return ValueTask.CompletedTask;
                     }
 
                     var data = ParseFile(file, relPath, modTime);
@@ -268,9 +296,8 @@ namespace Omnipotent.Services.KliveAgent
                     }
                 }
                 catch { /* skip unparseable files */ }
-            })).ToList();
-
-            await Task.WhenAll(tasks);
+                return ValueTask.CompletedTask;
+            });
 
             // Remove entries for deleted files
             lock (fileData)

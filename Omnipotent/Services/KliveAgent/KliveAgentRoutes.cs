@@ -82,7 +82,8 @@ namespace Omnipotent.Services.KliveAgent
             await service.CreateAPIRoute("/kliveagent/status", async (req) =>
             {
                 var (ready, state, progress, message) = service.GetInitializationStatus();
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message }));
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message,
+                    codebase = service.GetCodebaseInitializationStatus() }));
             }, HttpMethod.Get, KMPermissions.Klives);
         }
 
@@ -154,8 +155,10 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
+                    long.TryParse(req.userParameters["afterSequence"], NumberStyles.Integer, CultureInfo.InvariantCulture, out long afterSequence);
+                    int.TryParse(req.userParameters["waitMs"], NumberStyles.Integer, CultureInfo.InvariantCulture, out int waitMs);
                     var pendingResponse = !string.IsNullOrWhiteSpace(requestId)
-                        ? service.GetPendingApiResponse(requestId)
+                        ? await service.WaitForPendingApiResponseAsync(requestId, afterSequence, Math.Clamp(waitMs, 0, 20_000))
                         : service.GetLatestConversationRun(conversationId);
                     if (pendingResponse == null)
                     {
@@ -165,7 +168,11 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(pendingResponse));
+                    await req.ReturnResponse(JsonConvert.SerializeObject(pendingResponse), headers: new WebHeaderCollection
+                    {
+                        ["Cache-Control"] = "no-store",
+                        ["X-Klive-Pending-Wait"] = "supported"
+                    });
                 }
                 catch (Exception ex)
                 {

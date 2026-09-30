@@ -28,12 +28,12 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Build or rebuild the graph and run base PageRank.</summary>
-        public async Task BuildAsync()
+        public async Task BuildAsync(CancellationToken cancellationToken = default)
         {
-            await graphLock.WaitAsync();
+            await graphLock.WaitAsync(cancellationToken);
             try
             {
-                var edges = index.GetImportEdges();
+                var edges = index.GetImportEdges(cancellationToken);
 
                 outEdges = new Dictionary<string, List<string>>(edges, StringComparer.OrdinalIgnoreCase);
 
@@ -41,6 +41,7 @@ namespace Omnipotent.Services.KliveAgent
                 inEdges = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
                 foreach (var (src, dests) in outEdges)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (!inEdges.ContainsKey(src))
                         inEdges[src] = new List<string>();
 
@@ -60,7 +61,7 @@ namespace Omnipotent.Services.KliveAgent
                     if (!inEdges.ContainsKey(n)) inEdges[n] = new List<string>();
                 }
 
-                basePageRankScores = RunPageRank(allNodes, personalizationSeeds: null);
+                basePageRankScores = RunPageRank(allNodes, personalizationSeeds: null, cancellationToken: cancellationToken);
                 isBuilt = true;
             }
             finally
@@ -107,7 +108,8 @@ namespace Omnipotent.Services.KliveAgent
             List<string> nodes,
             IEnumerable<string>? personalizationSeeds,
             double dampingFactor = 0.85,
-            int iterations = 50)
+            int iterations = 50,
+            CancellationToken cancellationToken = default)
         {
             if (nodes.Count == 0)
                 return new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
@@ -140,6 +142,7 @@ namespace Omnipotent.Services.KliveAgent
 
             for (int iter = 0; iter < iterations; iter++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var next = new Dictionary<string, double>(n, StringComparer.OrdinalIgnoreCase);
 
                 foreach (var v in nodes)

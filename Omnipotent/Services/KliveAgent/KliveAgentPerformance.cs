@@ -15,6 +15,11 @@ public sealed class KliveAgentPerformance
 
     public IDisposable Measure(string stage) => new StageTimer(this, stage);
 
+    public async Task<T> MeasureAsync<T>(string stage, Func<Task<T>> operation)
+    {
+        using (Measure(stage)) return await operation();
+    }
+
     public void Add(string stage, long durationMs)
     {
         lock (_lock)
