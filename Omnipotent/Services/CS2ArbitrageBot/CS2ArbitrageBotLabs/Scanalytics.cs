@@ -1,129 +1,287 @@
-﻿using Markdig.Renderers.Html;
-using Microsoft.AspNetCore.Authorization.Infrastructure;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
+using Omnipotent.Services.CS2ArbitrageBot.Engine;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
-using System.Management.Automation;
-using System.Management.Automation.Language;
-using System.Runtime.Intrinsics.X86;
 using System.Text;
 using static Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs.CS2LiquidityFinder;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 {
+    /// <summary>
+    /// The bot's analytics and purchase ledger.
+    ///
+    /// Storage is bounded. The previous version wrote one indented JSON file (with a full Steam order book)
+    /// per CSFloat listing ever evaluated, kept every one in memory, and read them all — synchronously, on
+    /// the service thread — before the service registered its routes. After a year of scanning that load
+    /// is why /cs2arbitragebot/* answered "Route not found". Now: purchases (small) are kept in full,
+    /// evaluations feed a running aggregate, and only notable evaluations are logged (daily JSONL, rotated).
+    /// Legacy ScannedComparisons/ScanResults folders are left untouched on disk and never loaded.
+    /// </summary>
     public class Scanalytics
     {
-        public List<ScannedComparison> AllScannedComparisonsInHistory;
-        public List<PurchasedListing> AllPurchasedListingsInHistory;
-        public List<ScanResults> AllScanResultsInHistory;
+        public List<PurchasedListing> AllPurchasedListingsInHistory { get; private set; } = new();
         private readonly object historyLock = new();
-        public (List<ScannedComparison> Comparisons, List<PurchasedListing> Purchases) SnapshotHistories()
-        {
-            lock (historyLock)
-                return (new List<ScannedComparison>(AllScannedComparisonsInHistory),
-                    new List<PurchasedListing>(AllPurchasedListingsInHistory));
-        }
-        public bool HasScannedComparison(string listingId)
-        {
-            lock (historyLock)
-                return AllScannedComparisonsInHistory.Any(k => k.CSFloatListing.ItemListingID == listingId);
-        }
-        public bool TryAddScannedComparison(ScannedComparison comparison)
-        {
-            lock (historyLock)
-            {
-                if (AllScannedComparisonsInHistory.Any(k => k.CSFloatListing.ItemListingID == comparison.CSFloatListing.ItemListingID))
-                    return false;
-                AllScannedComparisonsInHistory.Add(comparison);
-                return true;
-            }
-        }
-        private CS2ArbitrageBot parent;
+        private readonly CS2ArbitrageBot parent;
+
+        private ScanAggregate aggregate = new();
+        private bool aggregateDirty;
+        private readonly LinkedList<OpportunityEvaluation> recentNotable = new();
+        private readonly List<OpportunityEvaluation> pendingNotableLog = new();
+        private List<ScanCycleSummary> recentCycles = new();
+        private bool cyclesDirty;
+
+        public const int RecentNotableCapacity = 300;
+        public const int RecentCycleCapacity = 500;
+        public const int NotableLogRetentionDays = 30;
+        /// <summary>Evaluations within this distance of a buy threshold are logged in full.</summary>
+        public const double NotableRoiMargin = 0.10;
+
         public Scanalytics(CS2ArbitrageBot parent)
         {
             this.parent = parent;
-            AllScannedComparisonsInHistory = new List<ScannedComparison>();
-            AllPurchasedListingsInHistory = new();
-            AllScanResultsInHistory = new List<ScanResults>();
-            SetUpScanalytics();
-            LoadScannedComparisons().Wait();
-            LoadPurchasedItems().Wait();
-            LoadScanResults().Wait();
         }
 
-        private async void SetUpScanalytics()
+        private static string LabsDirectory => OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLabsDirectory);
+        private static string AggregatePath => Path.Combine(LabsDirectory, "scan-aggregate.json");
+        private static string CyclesPath => Path.Combine(LabsDirectory, "scan-cycles.json");
+        private static string NotableDirectory => Path.Combine(LabsDirectory, "NotableEvaluations");
+
+        // ───────────────────────────── Loading ─────────────────────────────
+
+        /// <summary>Loads the small state files. Never touches the legacy per-listing folders.</summary>
+        public async Task LoadAsync()
         {
-            parent.GetTimeManagerService().TaskDue += TimeManager_TaskDue;
-            if ((await parent.GetTimeManagerService().GetTask("RecordCSFloatAndSteamBalance")) == null)
+            var loadedPurchases = await JsonFiles<PurchasedListing>(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory));
+            lock (historyLock) AllPurchasedListingsInHistory = loadedPurchases.Where(p => p != null && !string.IsNullOrEmpty(p.CSFloatListingID)).ToList();
+
+            try
             {
-                RecordAccountInfoAsync();
+                if (File.Exists(AggregatePath))
+                    aggregate = JsonConvert.DeserializeObject<ScanAggregate>(await File.ReadAllTextAsync(AggregatePath)) ?? new ScanAggregate();
             }
+            catch (Exception ex) { await parent.ServiceLogError(ex, "Couldn't read the CS2 scan aggregate; starting a new one.", false); }
+            try
+            {
+                if (File.Exists(CyclesPath))
+                    recentCycles = JsonConvert.DeserializeObject<List<ScanCycleSummary>>(await File.ReadAllTextAsync(CyclesPath)) ?? new();
+            }
+            catch (Exception ex) { await parent.ServiceLogError(ex, "Couldn't read the CS2 scan cycle summaries.", false); }
         }
 
-        public async Task<List<CSFloatAndSteamBalance>> GetAllLogsOfCSFloatAndSteamBalance()
+        private static async Task<List<T>> JsonFiles<T>(string directory)
         {
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
-            List<CSFloatAndSteamBalance> balances = new();
-            if (Directory.Exists(path))
+            var result = new List<T>();
+            if (!Directory.Exists(directory)) return result;
+            foreach (string file in Directory.EnumerateFiles(directory, "*.json"))
             {
-                foreach (string file in Directory.GetFiles(path, "*.json"))
+                try
                 {
-                    try
-                    {
-                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
-                        CSFloatAndSteamBalance balance = JsonConvert.DeserializeObject<CSFloatAndSteamBalance>(content);
-                        balances.Add(balance);
-                    }
-                    catch (Exception e)
-                    {
-                        parent.ServiceLogError(e, "Error loading CSFloat and Steam balance log.");
-                    }
+                    var item = JsonConvert.DeserializeObject<T>(await File.ReadAllTextAsync(file));
+                    if (item != null) result.Add(item);
+                }
+                catch { /* a corrupt file must not block startup */ }
+            }
+            return result;
+        }
+
+        /// <summary>Counts legacy per-listing files (reported on the status route; nothing is read or deleted).</summary>
+        public static long CountLegacyFiles(CancellationToken ct)
+        {
+            long count = 0;
+            foreach (string dir in new[] { OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory, OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory })
+            {
+                string path = OmniPaths.GetPath(dir);
+                if (!Directory.Exists(path)) continue;
+                foreach (var _ in Directory.EnumerateFiles(path))
+                {
+                    if (ct.IsCancellationRequested) return count;
+                    count++;
                 }
             }
-            return balances;
+            return count;
         }
 
-        private async Task RecordAccountInfoAsync()
+        // ───────────────────────────── Evaluations ─────────────────────────────
+
+        public void RecordEvaluation(OpportunityEvaluation evaluation, EvaluationSettings settings)
+        {
+            lock (historyLock)
+            {
+                aggregate.Record(evaluation);
+                aggregateDirty = true;
+                double nearestThreshold = Math.Min(settings.MinimumSteamRoiPercent, settings.MinimumRelistRoiPercent) / 100.0;
+                if (evaluation.ShouldBuy || evaluation.BestRoi >= nearestThreshold - NotableRoiMargin)
+                {
+                    recentNotable.AddFirst(evaluation);
+                    while (recentNotable.Count > RecentNotableCapacity) recentNotable.RemoveLast();
+                    pendingNotableLog.Add(evaluation);
+                }
+            }
+        }
+
+        public void RecordPurchaseOutcome(bool purchased)
+        {
+            lock (historyLock)
+            {
+                aggregate.RecordPurchaseAttempt(purchased);
+                aggregateDirty = true;
+            }
+        }
+
+        public List<OpportunityEvaluation> RecentNotable(int max = 100)
+        {
+            lock (historyLock) return recentNotable.Take(max).ToList();
+        }
+
+        public void RecordCycle(ScanCycleSummary cycle)
+        {
+            lock (historyLock)
+            {
+                recentCycles.Add(cycle);
+                if (recentCycles.Count > RecentCycleCapacity) recentCycles.RemoveRange(0, recentCycles.Count - RecentCycleCapacity);
+                cyclesDirty = true;
+            }
+        }
+
+        public List<ScanCycleSummary> RecentCycles(int max = RecentCycleCapacity)
+        {
+            lock (historyLock) return recentCycles.Skip(Math.Max(0, recentCycles.Count - max)).ToList();
+        }
+
+        public ScanAggregate SnapshotAggregate()
+        {
+            lock (historyLock) return JsonConvert.DeserializeObject<ScanAggregate>(JsonConvert.SerializeObject(aggregate))!;
+        }
+
+        public ScannedComparisonAnalytics BuildAnalytics(double conversionCoefficient)
+        {
+            ScanAggregate copy;
+            List<PurchasedListing> purchases;
+            lock (historyLock)
+            {
+                copy = JsonConvert.DeserializeObject<ScanAggregate>(JsonConvert.SerializeObject(aggregate))!;
+                purchases = new List<PurchasedListing>(AllPurchasedListingsInHistory);
+            }
+            return new ScannedComparisonAnalytics(copy, purchases, conversionCoefficient);
+        }
+
+        /// <summary>Persists dirty state. Called on a timer and at shutdown.</summary>
+        public async Task FlushAsync()
+        {
+            string? aggregateJson = null, cyclesJson = null;
+            List<OpportunityEvaluation> notable;
+            lock (historyLock)
+            {
+                if (aggregateDirty) { aggregateJson = JsonConvert.SerializeObject(aggregate); aggregateDirty = false; }
+                if (cyclesDirty) { cyclesJson = JsonConvert.SerializeObject(recentCycles); cyclesDirty = false; }
+                notable = new List<OpportunityEvaluation>(pendingNotableLog);
+                pendingNotableLog.Clear();
+            }
+            Directory.CreateDirectory(LabsDirectory);
+            if (aggregateJson != null) await parent.GetDataHandler().WriteToFile(AggregatePath, aggregateJson);
+            if (cyclesJson != null) await parent.GetDataHandler().WriteToFile(CyclesPath, cyclesJson);
+            if (notable.Count > 0)
+            {
+                Directory.CreateDirectory(NotableDirectory);
+                var byDay = notable.GroupBy(e => e.EvaluatedAtUtc.ToString("yyyy-MM-dd"));
+                foreach (var day in byDay)
+                {
+                    var sb = new StringBuilder();
+                    foreach (var e in day) sb.AppendLine(JsonConvert.SerializeObject(e, Formatting.None));
+                    await parent.GetDataHandler().AppendContentToFile(Path.Combine(NotableDirectory, day.Key + ".jsonl"), sb.ToString());
+                }
+                PruneNotableLogs();
+            }
+        }
+
+        private static void PruneNotableLogs()
         {
             try
             {
-                CSFloatAndSteamBalance info = new();
-                parent.csfloatAccountInformation = await parent.csFloatWrapper.GetAccountInformation();
-                info.CSFloatUsableBalanceInPounds = Convert.ToDouble(parent.csfloatAccountInformation.BalanceInPounds);
-                info.CSFloatPendingBalanceInPounds = Convert.ToDouble(parent.csfloatAccountInformation.PendingBalanceInPounds);
-                info.CSFloatTotalBalanceInPounds = Convert.ToDouble(info.CSFloatUsableBalanceInPounds) + Convert.ToDouble(info.CSFloatPendingBalanceInPounds);
-                SteamAPIProfileWrapper.SteamBalance steamBal = (await parent.steamAPIWrapper.profileWrapper.GetSteamBalance()).Value;
-                info.SteamUsableBalanceInPounds = steamBal.UsableBalanceInPounds;
-                info.SteamPendingBalanceInPounds = steamBal.PendingBalanceInPounds;
-                info.SteamTotalBalanceInPounds = info.SteamUsableBalanceInPounds + info.SteamPendingBalanceInPounds;
-                info.DateTimeOfBalanceRecord = DateTime.Now;
-                info.CSFloatProfileStatistics = parent.csfloatAccountInformation.Statistics;
-                info.CSFloatFee = parent.csfloatAccountInformation.Fee;
-                info.CSFloatWithdrawFee = parent.csfloatAccountInformation.WithdrawFee;
-
-                string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
-                string filename = $"AccountInfo{DateTime.Now.ToString("yyyy-MM-dd")}.json";
-                //Ensure filename's name can actually be saved as a file's name
-                filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-                await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(info, Formatting.Indented));
-                parent.ServiceLog($"Recorded account info: {info.CSFloatUsableBalanceInPounds} CSFloat, {info.SteamUsableBalanceInPounds} Steam.");
-
-                await parent.ServiceCreateScheduledTask(DateTime.Today.AddDays(1).AddHours(12), "RecordCSFloatAndSteamBalance", "CS2ArbitrageLabs", "Record daily balances of CSFloat account and Steam account.", false);
+                DateTime cutoff = DateTime.UtcNow.Date.AddDays(-NotableLogRetentionDays);
+                foreach (string file in Directory.EnumerateFiles(NotableDirectory, "*.jsonl"))
+                {
+                    if (DateTime.TryParse(Path.GetFileNameWithoutExtension(file), out var day) && day < cutoff) File.Delete(file);
+                }
             }
-            catch (Exception ex)
-            {
-                parent.ServiceLogError(ex, "Error recording account info.");
-                await parent.ServiceCreateScheduledTask(DateTime.Today.AddDays(1).AddHours(12), "RecordCSFloatAndSteamBalance", "CS2ArbitrageLabs", "Record daily balances of CSFloat account and Steam account after an error.", false);
-            }
+            catch { /* best effort */ }
         }
 
-        private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
+        // ───────────────────────────── Purchases ─────────────────────────────
+
+        public bool HasPurchased(string csfloatListingId)
         {
-            if (e.taskName == "RecordCSFloatAndSteamBalance")
+            lock (historyLock) return AllPurchasedListingsInHistory.Any(p => p.CSFloatListingID == csfloatListingId);
+        }
+
+        public List<PurchasedListing> PurchasesSnapshot()
+        {
+            lock (historyLock) return new List<PurchasedListing>(AllPurchasedListingsInHistory);
+        }
+
+        public async Task SavePurchasedListing(PurchasedListing purchasedListing)
+        {
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
+            string filename = purchasedListing.ItemMarketHashName + purchasedListing.CSFloatListingID + "id.json";
+            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(purchasedListing, Formatting.Indented));
+        }
+
+        public async Task UpdatePurchasedListing(PurchasedListing purchasedListing)
+        {
+            lock (historyLock)
             {
-                RecordAccountInfoAsync();
+                AllPurchasedListingsInHistory.RemoveAll(k => k.CSFloatListingID == purchasedListing.CSFloatListingID);
+                AllPurchasedListingsInHistory.Add(purchasedListing);
             }
+            await SavePurchasedListing(purchasedListing);
+            parent.QueueAnalyticsRefresh();
+        }
+
+        // ───────────────────────────── Balances ─────────────────────────────
+
+        public async Task<List<CSFloatAndSteamBalance>> GetAllLogsOfCSFloatAndSteamBalance()
+        {
+            var balances = await JsonFiles<CSFloatAndSteamBalance>(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory));
+            return balances.OrderBy(b => b.DateTimeOfBalanceRecord).ToList();
+        }
+
+        /// <summary>Records today's balances. A missing Steam balance carries the last known value forward.</summary>
+        public async Task RecordAccountInfoAsync()
+        {
+            var info = new CSFloatAndSteamBalance();
+            var account = await parent.csFloatWrapper.GetAccountInformation();
+            parent.csfloatAccountInformation = account;
+            info.CSFloatUsableBalanceInPounds = account.BalanceInPounds;
+            info.CSFloatPendingBalanceInPounds = account.PendingBalanceInPounds;
+            info.CSFloatTotalBalanceInPounds = info.CSFloatUsableBalanceInPounds + info.CSFloatPendingBalanceInPounds;
+            info.CSFloatProfileStatistics = account.Statistics;
+            info.CSFloatFee = account.Fee;
+            info.CSFloatWithdrawFee = account.WithdrawFee;
+
+            SteamAPIProfileWrapper.SteamBalance? steam = null;
+            try { steam = await parent.steamAPIWrapper.profileWrapper.GetSteamBalance(); }
+            catch (Exception ex) { await parent.ServiceLogError(ex, "Steam balance unavailable for the daily record.", false); }
+            if (steam is { } s)
+            {
+                info.SteamUsableBalanceInPounds = s.UsableBalanceInPounds;
+                info.SteamPendingBalanceInPounds = s.PendingBalanceInPounds;
+            }
+            else
+            {
+                var last = (await GetAllLogsOfCSFloatAndSteamBalance()).LastOrDefault();
+                info.SteamUsableBalanceInPounds = last?.SteamUsableBalanceInPounds ?? 0;
+                info.SteamPendingBalanceInPounds = last?.SteamPendingBalanceInPounds ?? 0;
+                info.SteamBalanceCarriedForward = true;
+            }
+            info.SteamTotalBalanceInPounds = info.SteamUsableBalanceInPounds + info.SteamPendingBalanceInPounds;
+            info.DateTimeOfBalanceRecord = DateTime.Now;
+
+            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
+            string filename = string.Join("-", $"AccountInfo{DateTime.Now:yyyy-MM-dd}.json".Split(Path.GetInvalidFileNameChars()));
+            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(info, Formatting.Indented));
+            await parent.ServiceLog($"Recorded account info: £{info.CSFloatUsableBalanceInPounds:F2} CSFloat, £{info.SteamUsableBalanceInPounds:F2} Steam{(info.SteamBalanceCarriedForward ? " (carried forward)" : "")}.");
         }
 
         public class CSFloatAndSteamBalance
@@ -134,21 +292,25 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public double SteamUsableBalanceInPounds { get; set; }
             public double SteamPendingBalanceInPounds { get; set; }
             public double SteamTotalBalanceInPounds { get; set; }
+            public bool SteamBalanceCarriedForward { get; set; }
 
             public DateTime DateTimeOfBalanceRecord { get; set; }
-            public CSFloatWrapper.Statistics CSFloatProfileStatistics { get; set; }
+            public CSFloatWrapper.Statistics CSFloatProfileStatistics { get; set; } = new();
             public double CSFloatFee;
             public double CSFloatWithdrawFee;
         }
 
+        // ───────────────────────────── Conversion plan (KM "liquidity plan") ─────────────────────────────
 
         public class LiquidityPlan
         {
             public DateTime ProductionDateOfLiquiditySearchResultUsed;
             public List<ContainerGap> Top10Gaps = new();
-            public Dictionary<string, List<LiquidityPlanBuyTactics>> BuyOrderTacticsAndCorrespondingReturns;
-            public Dictionary<string, SteamPriceHistoryDataPoint> OptimalPurchasePointsForEachContainerGap;
-            public string LiquidityPlanDescription;
+            public Dictionary<string, List<LiquidityPlanBuyTactics>> BuyOrderTacticsAndCorrespondingReturns = new();
+            public Dictionary<string, SteamPriceHistoryDataPoint> OptimalPurchasePointsForEachContainerGap = new();
+            public string LiquidityPlanDescription = "";
+            public double ConversionCoefficientUsed;
+            public string ConversionBasis = "";
 
             public struct LiquidityPlanBuyTactics
             {
@@ -159,187 +321,121 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 public SteamPriceHistoryDataPoint LastTimeSoldAtThisPriceOrBelow;
             }
         }
-        public async Task<double> ExpectedSteamToCSFloatConversionPercentage()
+
+        /// <summary>
+        /// Turns the conversion model into the plan the KM page and Discord command show: which items to buy
+        /// on Steam (and at what price) to carry Steam wallet funds back to CSFloat.
+        /// </summary>
+        public static LiquidityPlan BuildLiquidityPlan(ConversionModelSnapshot model, IReadOnlyDictionary<string, List<SteamPricePoint>> histories, double gbpPerUsd)
         {
-            try
+            var plan = new LiquidityPlan
             {
-                LiquidityPlan liquidityPlan = ProduceLiquidityPlanAsync(await GetLatestLiquiditySearchResult(), 10);
-                if (liquidityPlan.Top10Gaps.Count > 0)
-                {
-                    //Get the gap of the Top 10 Gaps which has the highest quantity sold in the last 5 days
-                    var fiveDaysAgo = DateTime.UtcNow.AddDays(-5);
-                    var gapWithHighestQuantitySold = liquidityPlan.Top10Gaps
-                        .Where(g => g.priceHistory != null)
-                        .OrderByDescending(g => g.priceHistory
-                            .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
-                            .Sum(p => p.QuantitySold))
-                        .FirstOrDefault();
-
-                    if (gapWithHighestQuantitySold.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded > 0.85)
-                    {
-                        return 0.85;
-                    }
-                    return gapWithHighestQuantitySold.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
-                }
-                else
-                {
-                    return 0.75;
-                }
-            }
-            catch (Exception e)
+                ProductionDateOfLiquiditySearchResultUsed = model.ComputedAtUtc,
+                ConversionCoefficientUsed = model.Coefficient,
+                ConversionBasis = model.Basis,
+            };
+            foreach (var converter in model.Converters.Where(c => c.Coefficient > 0).Take(10))
             {
-                return 0.75;
-            }
-        }
-
-        public LiquidityPlan ProduceLiquidityPlanAsync(LiquiditySearchResult liquiditySearchResult, double? maxPrice = null)
-        {
-            LiquidityPlan plan = new();
-            try
-            {
-                plan.ProductionDateOfLiquiditySearchResultUsed = liquiditySearchResult.DateOfSearch;
-
-                // Remove all ContainerGaps in AllGapsFound which have a return coefficient of Infinity  
-                List<ContainerGap> filteredGaps = liquiditySearchResult.AllGapsFound
-                    .Where(g => g.ReturnCoefficientFromSteamtoCSFloat != double.PositiveInfinity)
+                histories.TryGetValue(converter.MarketHashName, out var history);
+                var points = (history ?? new List<SteamPricePoint>())
+                    .Select(p => new SteamPriceHistoryDataPoint { DateTimeRecorded = p.TimeUtc, PriceInPounds = p.MedianPriceGbp, QuantitySold = p.Purchases })
                     .ToList();
-
-                // Remove all ContainerGaps with a steam price greater than half of the current steamwallet balance.  
-                if (maxPrice == null)
+                double csfloatSaleCents = converter.CSFloatAverageSaleCents > 0 ? converter.CSFloatAverageSaleCents : converter.CSFloatMinAskCents;
+                int csfloatPence = ArbitrageMath.UsdCentsToPenceFloor((long)Math.Floor(csfloatSaleCents), gbpPerUsd);
+                double steamPounds = (converter.SteamUnitCostPence > 0 ? converter.SteamUnitCostPence : converter.SteamLowestSellPence) / 100.0;
+                var gap = new ContainerGap
                 {
-                    if (parent.steamBalance != null)
+                    csfloatContainer = new Container
                     {
-                        maxPrice = parent.steamBalance.Value.UsableBalanceInPounds;
-                    }
-                }
-                filteredGaps = filteredGaps
-                    .Where(g => g.steamListing.CheapestSellOrderPriceInPounds < (maxPrice))
-                    .ToList();
+                        MarketHashName = converter.MarketHashName,
+                        PriceInCents = (int)Math.Round(csfloatSaleCents),
+                        PriceInPence = csfloatPence,
+                        PriceInPounds = csfloatPence / 100.0,
+                        ImageURL = "",
+                        containerType = ContainerType.WeaponCase,
+                    },
+                    steamListing = new SteamAPIWrapper.ItemListing
+                    {
+                        Name = converter.MarketHashName,
+                        CheapestSellOrderPriceInPence = converter.SteamLowestSellPence,
+                        CheapestSellOrderPriceInPounds = converter.SteamLowestSellPence / 100.0,
+                        HighestBuyOrderPriceInPence = converter.SteamHighestBuyPence,
+                        HighestBuyOrderPriceInPounds = converter.SteamHighestBuyPence / 100.0,
+                        PriceText = "£" + (converter.SteamLowestSellPence / 100.0).ToString("F2"),
+                        ListingURL = "https://steamcommunity.com/market/listings/730/" + Uri.EscapeDataString(converter.MarketHashName),
+                        SellListings = converter.SteamSellOrderCount.ToString(),
+                    },
+                    ReturnCoefficientFromSteamtoCSFloat = steamPounds > 0 ? (csfloatPence / 100.0) / steamPounds : 0,
+                    ReturnCoefficientFromSteamToCSFloatTaxIncluded = converter.Coefficient,
+                    priceHistory = points.Where(p => p.DateTimeRecorded >= DateTime.UtcNow.AddDays(-14)).ToList(),
+                    IdealCSFloatSellPriceInCents = (int)Math.Round(csfloatSaleCents),
+                    IdealCSFloatSellPriceInPence = csfloatPence,
+                    IdealCSFloatSellPriceInPounds = csfloatPence / 100.0,
+                    // Buying with a buy order one penny over the current best one is usually filled within days.
+                    IdealPriceToPurchaseOnSteamInPounds = converter.SteamHighestBuyPence > 0 ? (converter.SteamHighestBuyPence + 1) / 100.0 : steamPounds,
+                };
+                gap.IdealReturnCoefficientFromSteamtoCSFloat = gap.IdealPriceToPurchaseOnSteamInPounds > 0 ? gap.csfloatContainer.PriceInPounds / gap.IdealPriceToPurchaseOnSteamInPounds : 0;
+                gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded = gap.IdealReturnCoefficientFromSteamtoCSFloat * 0.98;
+                plan.Top10Gaps.Add(gap);
 
-                // Remove all ContainerGaps that do not meet the liquidity requirement of at least 500 items sold in the last 5 days  
-                var fiveDaysAgo = DateTime.UtcNow.AddDays(-5);
-                filteredGaps = filteredGaps
-                   .Where(g => g.priceHistory != null &&
-                               g.priceHistory
-                                   .Where(p => p.DateTimeRecorded >= fiveDaysAgo)
-                                   .Sum(p => p.QuantitySold) >= 500)
-                   .ToList();
-
-                // Sort the gaps by Ideal return coefficient  
-                filteredGaps = filteredGaps
-                    .OrderByDescending(g => g.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded)
-                    .ToList();
-
-                // Take the top 10 and set it to plan.Top10Gaps  
-                plan.Top10Gaps = filteredGaps.Take(10).ToList();
-
-                // Create a dictionary of the price needed to buy for 90% profit  
-                plan.BuyOrderTacticsAndCorrespondingReturns = new();
-                foreach (var gap in plan.Top10Gaps)
+                var tactics = new List<LiquidityPlan.LiquidityPlanBuyTactics>();
+                for (int i = 84; i < 100; i++)
                 {
-                    List<LiquidityPlan.LiquidityPlanBuyTactics> tacticsList = new();
-                    for (int i = 84; i < 100; i++)
+                    double coefficient = i / 100.0;
+                    double buyAt = gap.csfloatContainer.PriceInPounds * 0.98 / coefficient;
+                    var match = points.Where(p => p.PriceInPounds <= buyAt).OrderByDescending(p => p.DateTimeRecorded).FirstOrDefault();
+                    tactics.Add(new LiquidityPlan.LiquidityPlanBuyTactics
                     {
-                        LiquidityPlan.LiquidityPlanBuyTactics tactic = new();
-                        double returnCoeff = i / 100.0;
-                        double priceNeededToBuyOnSteam = Convert.ToDouble((gap.csfloatContainer.PriceInPounds / 1.02) / returnCoeff);
-                        tactic.ReturnCoefficient = returnCoeff;
-                        tactic.ItemMarketHashName = gap.csfloatContainer.MarketHashName;
-                        tactic.PriceNeededToBuyOnSteam = priceNeededToBuyOnSteam;
-                        tactic.PriceNeededToSellOnCSFloat = gap.csfloatContainer.PriceInPounds;
-
-                        // Look for the latest (datetime wise) time that gap.priceHistory has a price below to priceNeededToBuyOnSteam  
-                        var matchingPricePoint = gap.priceHistory != null
-                            ? gap.priceHistory
-                                .Where(p => p.PriceInPounds <= priceNeededToBuyOnSteam)
-                                .OrderByDescending(p => p.DateTimeRecorded)
-                                .FirstOrDefault()
-                            : default;
-
-                        tactic.LastTimeSoldAtThisPriceOrBelow = matchingPricePoint;
-                        tacticsList.Add(tactic);
-                    }
-                    plan.BuyOrderTacticsAndCorrespondingReturns.Add(gap.csfloatContainer.MarketHashName, tacticsList);
+                        ItemMarketHashName = converter.MarketHashName,
+                        ReturnCoefficient = coefficient,
+                        PriceNeededToBuyOnSteam = buyAt,
+                        PriceNeededToSellOnCSFloat = gap.csfloatContainer.PriceInPounds,
+                        LastTimeSoldAtThisPriceOrBelow = match,
+                    });
                 }
-
-                plan.OptimalPurchasePointsForEachContainerGap = GetOptimalPurchasePoints(plan);
-
-                // Build description string  
-                var sb = new StringBuilder();
-                foreach (var kvp in plan.OptimalPurchasePointsForEachContainerGap)
-                {
-                    string name = kvp.Key;
-                    var dp = kvp.Value;
-                    var tactic = plan.BuyOrderTacticsAndCorrespondingReturns[name]
-                        .FirstOrDefault(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded == dp.DateTimeRecorded
-                                          && Math.Abs(t.LastTimeSoldAtThisPriceOrBelow.PriceInPence - dp.PriceInPence) < 0.01);
-
-                    if (tactic.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded != default)
-                    {
-                        sb.AppendLine(
-                            $"Item: {name} — Buy at £{tactic.PriceNeededToBuyOnSteam:F2} for a return of {tactic.ReturnCoefficient:P0} " +
-                            $"(last seen {dp.DateTimeRecorded:yyyy-MM-dd}).");
-                    }
-                }
-                plan.LiquidityPlanDescription = sb.ToString().TrimEnd();
+                plan.BuyOrderTacticsAndCorrespondingReturns[converter.MarketHashName] = tactics;
             }
-            catch (Exception ex)
+            plan.OptimalPurchasePointsForEachContainerGap = GetOptimalPurchasePoints(plan);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Steam→CSFloat conversion coefficient: {model.Coefficient:P1} ({model.Basis}).");
+            foreach (var gap in plan.Top10Gaps.Take(5))
             {
-                // Log the error and rethrow it for higher-level handling  
-                parent.ServiceLogError(ex, $"Error in ProduceLiquidityPlan");
-                throw;
+                sb.AppendLine($"Item: {gap.csfloatContainer.MarketHashName} — buy on Steam at ≤ £{gap.IdealPriceToPurchaseOnSteamInPounds:F2}, sell on CSFloat at ~£{gap.csfloatContainer.PriceInPounds:F2} " +
+                              $"(returns {gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded:P0} buying at the ask, {gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded:P0} via buy order).");
             }
-
-            //Omit everything but the last 2 weeks of pricehistory for each containergap in Top10Gaps
-            var twoWeeksAgo = DateTime.UtcNow.AddDays(-14);
-            var updatedGaps = new List<ContainerGap>();
-            foreach (var gap in plan.Top10Gaps)
-            {
-                var updatedGap = gap; // Create a copy of the gap object  
-                updatedGap.priceHistory = updatedGap.priceHistory != null
-                    ? updatedGap.priceHistory
-                        .Where(p => p.DateTimeRecorded >= twoWeeksAgo)
-                        .ToList()
-                    : new List<SteamPriceHistoryDataPoint>();
-                updatedGaps.Add(updatedGap);
-            }
-            plan.Top10Gaps = updatedGaps; // Replace the original list with the updated list  
-
+            plan.LiquidityPlanDescription = sb.ToString().TrimEnd();
             return plan;
         }
+
         public static Dictionary<string, SteamPriceHistoryDataPoint> GetOptimalPurchasePoints(LiquidityPlan plan)
         {
             var optimalPoints = new Dictionary<string, SteamPriceHistoryDataPoint>();
             var now = DateTime.UtcNow;
-
             foreach (var kvp in plan.BuyOrderTacticsAndCorrespondingReturns)
             {
                 var scored = kvp.Value
                     .Where(t => t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded != default)
                     .Select(t =>
                     {
-                        var last = t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded;
-                        var daysSince = (now - last).TotalDays;
-                        // score = (return × quantity) penalized by age
-                        double score = (t.ReturnCoefficient * t.LastTimeSoldAtThisPriceOrBelow.QuantitySold)
-                                       / (1.0 + daysSince);
+                        var daysSince = (now - t.LastTimeSoldAtThisPriceOrBelow.DateTimeRecorded).TotalDays;
+                        double score = (t.ReturnCoefficient * t.LastTimeSoldAtThisPriceOrBelow.QuantitySold) / (1.0 + daysSince);
                         return new { DataPoint = t.LastTimeSoldAtThisPriceOrBelow, Score = score, Age = daysSince };
                     })
                     .ToList();
-
-                // Prefer those seen within the last 7 days
                 var recent = scored.Where(x => x.Age <= 7).ToList();
                 var candidates = recent.Any() ? recent : scored;
-
-                if (candidates.Any())
-                {
-                    var best = candidates.OrderByDescending(x => x.Score).First().DataPoint;
-                    optimalPoints[kvp.Key] = best;
-                }
+                if (candidates.Any()) optimalPoints[kvp.Key] = candidates.OrderByDescending(x => x.Score).First().DataPoint;
             }
-
             return optimalPoints;
         }
+
+        /// <summary>Kept for callers of the old API: the current model coefficient (no disk I/O any more).</summary>
+        public Task<double> ExpectedSteamToCSFloatConversionPercentage() => Task.FromResult(parent.CurrentConversionCoefficient);
+
+        // ───────────────────────────── Data shapes ─────────────────────────────
+
+        /// <summary>Strategy stages. Values are persisted and shown by the KM site — only ever append.</summary>
         public enum StrategicStages
         {
             WaitingForCSFloatSellerToAcceptSale,
@@ -349,12 +445,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             WaitingForMarketSaleOnSteam,
             WaitingForConversionItemsToPurchase,
             WaitingForConversionItemsToSell,
-            StrategyCompleted
+            StrategyCompleted,
+            /// <summary>The CSFloat trade was cancelled or failed; the purchase was refunded.</summary>
+            TradeCancelled,
+            /// <summary>Relisted on CSFloat after trade protection; waiting for a buyer.</summary>
+            WaitingForCSFloatResale,
         }
+
         public class PurchasedListing
         {
-            public ScannedComparison comparison;
-            public string CSFloatListingID;
+            public ScannedComparison comparison = null!;
+            public string CSFloatListingID = "";
             public int ExpectedAbsoluteProfitInPence;
             public float ExpectedAbsoluteProfitInPounds;
             public float ExpectedProfitPercentage;
@@ -372,294 +473,201 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public DateTime TimeOfConvertToRealFunds;
             public DateTime TimeOfCollectedRevenue;
 
-            public string CSFloatToSteamTradeOfferLink;
+            public string CSFloatToSteamTradeOfferLink = "";
 
             public float ItemFloatValue;
-            public string ItemMarketHashName;
+            public string ItemMarketHashName = "";
 
             public float ActualSalePriceOnSteam;
 
             public StrategicStages CurrentStrategicStage;
+
+            // ── v2 fields (absent in old files → defaults) ──
+            /// <summary>"SteamMarket" or "CSFloatRelist" — the exit chosen at purchase time.</summary>
+            public string PlannedExit = nameof(ExitRoute.SteamMarket);
+            public int PurchasePriceCents;
+            public int PurchaseCostPence;
+            public int ExpectedNetCashPence;
+            public double ConversionCoefficientAtPurchase;
+            public string PurchaseSource = "";
+            public string LastTradeState = "";
+            public int SaleAttempts;
+            public DateTime LastSaleAttemptUtc;
+            public string CSFloatResaleListingID = "";
+            public int CSFloatResalePriceCents;
+            public string Notes = "";
         }
+
+        /// <summary>A CSFloat listing paired with Steam data at evaluation time (persisted inside purchases).</summary>
         public class ScannedComparison
         {
-            public string ItemMarketHashName;
-            public string PriceTextCSFloat;
-            public string PriceTextSteamMarket;
+            public string ItemMarketHashName = "";
+            public string PriceTextCSFloat = "";
+            public string PriceTextSteamMarket = "";
             public double RawArbitrageGain;
             public double ArbitrageGainAfterSteamTax;
             public double PredictedOverallArbitrageGain;
-            public string CSFloatURL;
-            public string SteamListingURL;
+            public string CSFloatURL = "";
+            public string SteamListingURL = "";
             public CSFloatWrapper.ItemListing CSFloatListing;
             public SteamAPIWrapper.ItemListing SteamListing;
             public DateTime LastUpdate;
+
+            [JsonConstructor]
+            public ScannedComparison() { }
 
             public ScannedComparison(CSFloatWrapper.ItemListing csfloatListing, SteamAPIWrapper.ItemListing steamListing, DateTime lastUpdate, double expectedConversionCoeff)
             {
                 ItemMarketHashName = csfloatListing.ItemMarketHashName;
                 PriceTextCSFloat = csfloatListing.PriceText;
                 PriceTextSteamMarket = steamListing.PriceText;
-
-
-                double percentageDifference = Convert.ToDouble((steamListing.HighestBuyOrderPriceInPounds / csfloatListing.PriceInPounds));
-                double gainAfterSteamTax = (((steamListing.HighestBuyOrderPriceInPounds / 1.15) / csfloatListing.PriceInPounds));
-                double predictedOverallGain = (((((steamListing.HighestBuyOrderPriceInPounds / 1.15)) * expectedConversionCoeff) / csfloatListing.PriceInPounds));
-
-                RawArbitrageGain = percentageDifference;
-                ArbitrageGainAfterSteamTax = gainAfterSteamTax; // Assuming 15% Steam tax
-                PredictedOverallArbitrageGain = predictedOverallGain; // Placeholder for future calculations
+                double cost = Math.Max(0.01, csfloatListing.PriceInPounds);
+                double receives = ArbitrageMath.SteamSellerReceives(steamListing.HighestBuyOrderPriceInPence) / 100.0;
+                RawArbitrageGain = steamListing.HighestBuyOrderPriceInPounds / cost;
+                ArbitrageGainAfterSteamTax = receives / cost;
+                PredictedOverallArbitrageGain = receives * expectedConversionCoeff / cost;
                 CSFloatURL = csfloatListing.ListingURL;
                 SteamListingURL = steamListing.ListingURL;
                 CSFloatListing = csfloatListing;
                 SteamListing = steamListing;
                 LastUpdate = lastUpdate;
             }
-        }
-        public enum ScanStrategy
-        {
-            SearchingThroughCSFloatHighestDiscount,
-            SearchingThroughCSFloatNewest,
 
-        }
-        public class ScanResults
-        {
-            public string ScanID;
-            public List<ScanStrategyResult> ScanStrategyResults;
-            public ScannedComparisonAnalytics Analytics;
-            public ScanResults()
+            public static ScannedComparison FromEvaluation(CSFloatListing listing, SteamOrderBook? book, OpportunityEvaluation evaluation, double gbpPerUsd)
             {
-                ScanID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-                ScanStrategyResults = new List<ScanStrategyResult>();
+                var csfloat = CSFloatWrapper.ToLegacyItemListing(listing, gbpPerUsd);
+                var steam = SteamAPIWrapper.ItemListing.FromOrderBook(book, listing.MarketHashName, listing.ImageUrl);
+                var comparison = new ScannedComparison(csfloat, steam, evaluation.EvaluatedAtUtc, evaluation.ConversionCoefficient);
+                comparison.PredictedOverallArbitrageGain = 1 + evaluation.BestRoi;
+                return comparison;
+            }
+        }
+
+        /// <summary>One feed poll / sweep / structural pass, for the scanresults route.</summary>
+        public class ScanCycleSummary
+        {
+            public DateTime StartedUtc { get; set; }
+            public double DurationMs { get; set; }
+            public string Strategy { get; set; } = "";
+            public int ListingsReturned { get; set; }
+            public int NewListings { get; set; }
+            public int Evaluated { get; set; }
+            public int SteamLookups { get; set; }
+            public int Prefiltered { get; set; }
+            public int Opportunities { get; set; }
+            public int Purchased { get; set; }
+            public int Errors { get; set; }
+            public bool CoverageGap { get; set; }
+            public double BestRoi { get; set; }
+            public string? BestItem { get; set; }
+            public string? Note { get; set; }
+        }
+
+        /// <summary>Running totals behind the KM analytics page. O(1) memory regardless of history length.</summary>
+        public class ScanAggregate
+        {
+            public int Version { get; set; } = 2;
+            public DateTime StartedUtc { get; set; } = DateTime.UtcNow;
+            public long TotalEvaluated { get; set; }
+            public long[] BucketCounts { get; set; } = new long[5];
+            public double[] BucketSteamPriceSums { get; set; } = new double[5];
+            public long PositiveCount { get; set; }
+            public long NegativeCount { get; set; }
+            public double ProfitableFloatSum { get; set; }
+            public long ProfitableFloatCount { get; set; }
+            public double ProfitablePriceSum { get; set; }
+            public double ProfitableGainSum { get; set; }
+            public double UnprofitableFloatSum { get; set; }
+            public long UnprofitableFloatCount { get; set; }
+            public double UnprofitablePriceSum { get; set; }
+            public double? HighestRoi { get; set; }
+            public string HighestRoiItem { get; set; } = "None";
+            public DateTime? HighestRoiAtUtc { get; set; }
+            public long QualifiedOpportunities { get; set; }
+            /// <summary>Sum of ln(1+ROI) over qualified opportunities (compounded expected return).</summary>
+            public double QualifiedLogReturnSum { get; set; }
+            public long PurchaseAttempts { get; set; }
+            public long Purchases { get; set; }
+            public long SteamExitBest { get; set; }
+            public long RelistExitBest { get; set; }
+            public Dictionary<string, DailyCounts> Daily { get; set; } = new();
+
+            public class DailyCounts
+            {
+                public long Evaluated { get; set; }
+                public long Qualified { get; set; }
+                public long Purchased { get; set; }
+                public double BestRoi { get; set; } = -1;
             }
 
-            public void ProduceOverallAnalytics(double ExpectedSteamToCSFloatConversionPercentage)
-            {
-                List<ScannedComparison> totalComparisons = new();
-                List<PurchasedListing> purchasedListings = new();
+            public static int BucketOf(double roi) => roi < 0 ? 0 : roi < 0.05 ? 1 : roi < 0.10 ? 2 : roi < 0.20 ? 3 : 4;
 
-                foreach (var strategyResult in ScanStrategyResults)
+            public void Record(OpportunityEvaluation e)
+            {
+                bool available = e.Steam.Available || e.Relist.Available;
+                double roi = available ? e.BestRoi : -1;
+                TotalEvaluated++;
+                int bucket = BucketOf(roi);
+                BucketCounts[bucket]++;
+                BucketSteamPriceSums[bucket] += e.SteamHighestBuyOrderPence / 100.0;
+                double pricePounds = e.CostPence / 100.0;
+                if (roi > 0)
                 {
-                    totalComparisons.AddRange(strategyResult.ScannedComparisons);
-                    purchasedListings.AddRange(strategyResult.PurchasedListings);
+                    PositiveCount++;
+                    ProfitablePriceSum += pricePounds;
+                    ProfitableGainSum += 1 + roi;
+                    if (e.FloatValue is double f) { ProfitableFloatSum += f; ProfitableFloatCount++; }
                 }
-                //remove all duplicates, where duplicates are defined as having the same CSFloatListing.ItemListingID
-                totalComparisons = totalComparisons.GroupBy(c => c.CSFloatListing.ItemListingID).Select(g => g.First()).ToList();
-                purchasedListings = purchasedListings.GroupBy(c => c.CSFloatListingID).Select(g => g.First()).ToList();
-                Analytics = new ScannedComparisonAnalytics(totalComparisons, purchasedListings, ExpectedSteamToCSFloatConversionPercentage);
+                else
+                {
+                    NegativeCount++;
+                    UnprofitablePriceSum += pricePounds;
+                    if (e.FloatValue is double f) { UnprofitableFloatSum += f; UnprofitableFloatCount++; }
+                }
+                if (available && (HighestRoi == null || roi > HighestRoi))
+                {
+                    HighestRoi = roi;
+                    HighestRoiItem = e.MarketHashName;
+                    HighestRoiAtUtc = e.EvaluatedAtUtc;
+                }
+                if (e.ShouldBuy)
+                {
+                    QualifiedOpportunities++;
+                    QualifiedLogReturnSum += Math.Log(1 + Math.Max(-0.99, roi));
+                    if (e.BestRoute == ExitRoute.SteamMarket) SteamExitBest++;
+                    if (e.BestRoute == ExitRoute.CSFloatRelist) RelistExitBest++;
+                }
+                var day = Day(e.EvaluatedAtUtc);
+                day.Evaluated++;
+                if (e.ShouldBuy) day.Qualified++;
+                if (available && roi > day.BestRoi) day.BestRoi = roi;
             }
-        }
-        public class ScanStrategyResult
-        {
-            public string ParentScanID;
-            public string ScanStrategyResultID;
-            public ScanStrategy StrategyUsed;
-            public string StrategyUsedString;
-            public List<ScannedComparison> ScannedComparisons;
-            public List<PurchasedListing> PurchasedListings;
-            public ScannedComparisonAnalytics Analytics;
-            public int DuplicateListingsFound;
-            public int ErrorsOccurred;
 
-            public ScanStrategyResult()
+            public void RecordPurchaseAttempt(bool purchased)
             {
-                ScanStrategyResultID = RandomGeneration.GenerateRandomLengthOfNumbers(20);
-                ScannedComparisons = new List<ScannedComparison>();
-                PurchasedListings = new List<PurchasedListing>();
+                PurchaseAttempts++;
+                if (purchased)
+                {
+                    Purchases++;
+                    Day(DateTime.UtcNow).Purchased++;
+                }
             }
 
-            public void ProduceAnalytics(double ExpectedSteamToCSFloatConversionPercentage)
+            private DailyCounts Day(DateTime utc)
             {
-                Analytics = new ScannedComparisonAnalytics(ScannedComparisons, PurchasedListings, ExpectedSteamToCSFloatConversionPercentage);
-            }
-        }
-        public async Task SaveScannedComparison(ScannedComparison scannedComparison)
-        {
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
-            string filename = scannedComparison.ItemMarketHashName + scannedComparison.CSFloatListing.ItemListingID.ToString() + "id.json";
-            //Ensure filename's name can actually be saved as a file's name
-            //Try saying that 3 times lol
-            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scannedComparison, Formatting.Indented));
-        }
-        public async Task LoadScannedComparisons()
-        {
-            var loaded = new List<ScannedComparison>();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScannedComparisonsDirectory);
-            if (Directory.Exists(path))
-            {
-                foreach (string file in Directory.GetFiles(path, "*.json"))
+                string key = utc.ToString("yyyy-MM-dd");
+                if (!Daily.TryGetValue(key, out var counts))
                 {
-                    try
-                    {
-                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
-                        ScannedComparison comparison = JsonConvert.DeserializeObject<ScannedComparison>(content);
-                        loaded.Add(comparison);
-                    }
-                    catch (Exception e) { }
+                    counts = new DailyCounts();
+                    Daily[key] = counts;
+                    if (Daily.Count > 90)
+                        foreach (var old in Daily.Keys.OrderBy(k => k).Take(Daily.Count - 90).ToList()) Daily.Remove(old);
                 }
-            }
-            lock (historyLock) AllScannedComparisonsInHistory = loaded;
-        }
-        public async Task LoadPurchasedItems()
-        {
-            var loaded = new List<PurchasedListing>();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
-            if (Directory.Exists(path))
-            {
-                foreach (string file in Directory.GetFiles(path, "*.json"))
-                {
-                    try
-                    {
-                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
-                        PurchasedListing comparison = JsonConvert.DeserializeObject<PurchasedListing>(content);
-                        loaded.Add(comparison);
-                    }
-                    catch (Exception e) { }
-                }
-            }
-            lock (historyLock) AllPurchasedListingsInHistory = loaded;
-        }
-        public async Task SavePurchasedListing(PurchasedListing purchasedListing)
-        {
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotPurchasedItemsDirectory);
-            string filename = purchasedListing.ItemMarketHashName + purchasedListing.comparison.CSFloatListing.ItemListingID.ToString() + "id.json";
-            //Ensure filename's name can actually be saved as a file's name
-            //Try saying that 3 times lol
-            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(purchasedListing, Formatting.Indented));
-        }
-        public async Task UpdatePurchasedListing(PurchasedListing purchasedListing)
-        {
-            lock (historyLock)
-            {
-                AllPurchasedListingsInHistory.RemoveAll(k => k.CSFloatListingID == purchasedListing.CSFloatListingID);
-                AllPurchasedListingsInHistory.Add(purchasedListing);
-            }
-            await SavePurchasedListing(purchasedListing);
-            parent.QueueAnalyticsRefresh();
-        }
-        public async Task SaveScanResult(ScanResults scanResult)
-        {
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
-            string filename = $"ScanResult{scanResult.ScanID}id.json";
-            //Ensure filename's name can actually be saved as a file's name
-            //Try saying that 3 times lol
-            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(scanResult, Formatting.Indented));
-        }
-        public async Task UpdateScanResult(ScanResults scanResult)
-        {
-            if (AllScanResultsInHistory.Where(k => k.ScanID == scanResult.ScanID).Any())
-            {
-                //if it already exists
-                //replace it
-                AllScanResultsInHistory.RemoveAll(k => k.ScanID == scanResult.ScanID);
-                AllScanResultsInHistory.Add(scanResult);
-            }
-            else
-            {
-                AllScanResultsInHistory.Add(scanResult);
-            }
-            await SaveScanResult(scanResult);
-        }
-        public async Task LoadScanResults()
-        {
-            AllScanResultsInHistory = new List<ScanResults>();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotScanResultsDirectory);
-            if (Directory.Exists(path))
-            {
-                foreach (string file in Directory.GetFiles(path, "*.json"))
-                {
-                    try
-                    {
-                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
-                        ScanResults comparison = JsonConvert.DeserializeObject<ScanResults>(content);
-                        AllScanResultsInHistory.Add(comparison);
-                    }
-                    catch (Exception e) { }
-                }
+                return counts;
             }
         }
-        /*
-        public async Task LoadLiquiditySearches()
-        {
-            AllLiquiditySearchesInHistory = new();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
-            if (Directory.Exists(path))
-            {
-                foreach (string file in Directory.GetFiles(path, "*.json"))
-                {
-                    try
-                    {
-                        string content = await parent.GetDataHandler().ReadDataFromFile(file, true);
-                        var comparison = JsonConvert.DeserializeObject<LiquiditySearchResult>(content);
-                        AllLiquiditySearchesInHistory.Add(comparison);
-                    }
-                    catch (Exception e) { }
-                }
-            }
-        }
-        */
-        public async Task SaveLiquiditySearch(LiquiditySearchResult liquidSearchResult)
-        {
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
-            string filename = $"LiquidSearch{DateTime.Now.ToString("D")}{liquidSearchResult.LiquiditySearchID}id.json";
-            //Ensure filename's name can actually be saved as a file's name
-            //Try saying that 3 times lol
-            filename = string.Join("-", filename.Split(Path.GetInvalidFileNameChars()));
-            await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(liquidSearchResult, Formatting.Indented));
-            parent.QueueAnalyticsRefresh();
-        }
-        /*
-        public async Task UpdateLiquiditySearch(LiquiditySearchResult scanResult)
-        {
-            if (AllLiquiditySearchesInHistory.Where(k => k.LiquiditySearchID == scanResult.LiquiditySearchID).Any())
-            {
-                //if it already exists
-                //replace it
-                AllLiquiditySearchesInHistory.RemoveAll(k => k.LiquiditySearchID == scanResult.LiquiditySearchID);
-                AllLiquiditySearchesInHistory.Add(scanResult);
-            }
-            else
-            {
-                AllLiquiditySearchesInHistory.Add(scanResult);
-            }
-            await SaveLiquiditySearch(scanResult);
-        }
-        */
-        public async Task<LiquiditySearchResult> GetLatestLiquiditySearchResult()
-        {
-            DateTime dateTime = DateTime.MinValue;
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotLiquiditySearchesDirectory);
-            string[] files = Directory.GetFiles(path);
-            string filePath = "";
-            foreach (var item in files)
-            {
-                DateTime fileDate = File.GetCreationTime(item);
-                if (fileDate > dateTime)
-                {
-                    dateTime = fileDate;
-                    filePath = item;
-                }
-            }
-            if (filePath != "")
-            {
-                try
-                {
-                    string content = await parent.GetDataHandler().ReadDataFromFile(filePath, true);
-                    var comparison = JsonConvert.DeserializeObject<LiquiditySearchResult>(content);
-                    return comparison;
-                }
-                catch (Exception e)
-                {
-                    parent.ServiceLogError(e, "Error loading latest liquidity search result.");
-                    throw e;
-                }
-            }
-            return null;
-        }
-        //Scanned Comparisons Analytics
+
+        /// <summary>The KM website's analytics DTO (field names are its contract).</summary>
         public class ScannedComparisonAnalytics
         {
             public int NumberOfListingsBelow0PercentGain { get; set; }
@@ -675,7 +683,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public int TotalListingsScanned { get; set; }
 
             public double HighestPredictedGainFoundSoFar { get; set; }
-            public string NameOfItemWithHighestPredictedGain { get; set; }
+            public string NameOfItemWithHighestPredictedGain { get; set; } = "None";
             public int CountListingsWithPositiveGain { get; set; }
             public int CountListingsWithNegativeGain { get; set; }
             public double PercentageChanceOfFindingPositiveGainListing { get; set; }
@@ -686,117 +694,100 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
             public double MeanGainOfProfitableListings;
 
-            public float TotalExpectedProfitPercent { get; set; } // This will be calculated based on the expected gain and the number of listings
+            /// <summary>Compounded expected return of every qualifying opportunity, in percent.</summary>
+            public float TotalExpectedProfitPercent { get; set; }
 
             public DateTime FirstListingDateRecorded { get; set; }
 
             public DateTime AnalyticsGeneratedAt;
 
-            public List<PurchasedListing> AllPurchasedItems;
-            public List<TimeSpan> TimeTakenToPurchaseAllPurchasedItems;
+            public List<PurchasedListing> AllPurchasedItems = new();
+            public List<TimeSpan> TimeTakenToPurchaseAllPurchasedItems = new();
 
             public double CurrentExpectedReturnCoefficientOfSteamToCSFloat;
 
+            // v2 additions
+            public long QualifiedOpportunities { get; set; }
+            public long PurchaseAttempts { get; set; }
+            public long Purchases { get; set; }
+            public Dictionary<string, ScanAggregate.DailyCounts> Daily { get; set; } = new();
+
+            [JsonConstructor]
+            public ScannedComparisonAnalytics() { }
+
+            /// <summary>Legacy constructor (tests and old callers) over raw comparisons.</summary>
             public ScannedComparisonAnalytics(List<ScannedComparison> data, List<PurchasedListing> purchasedListings, double currentExpectedReturnCoefficientOfSteamToCSFloat)
             {
-                List<ScannedComparison> comparisons = data;
-                List<ScannedComparison> comparisonsBelow0PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).ToList();
-                List<ScannedComparison> comparisonsBetween0and5PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1 && c.PredictedOverallArbitrageGain < 1.05).ToList();
-                List<ScannedComparison> comparisonsBetween5and10PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1.05 && c.PredictedOverallArbitrageGain < 1.1).ToList();
-                List<ScannedComparison> comparisonsBetween10and20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1.1 && c.PredictedOverallArbitrageGain < 1.2).ToList();
-                List<ScannedComparison> comparisonsAbove20PercentGain = comparisons.Where(c => c.PredictedOverallArbitrageGain >= 1.2).ToList();
-                NumberOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count;
-                MeanPriceOfListingsBelow0PercentGain = comparisonsBelow0PercentGain.Count > 0 ? comparisonsBelow0PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
-                NumberOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count;
-                MeanPriceOfListingsBetween0And5PercentGain = comparisonsBetween0and5PercentGain.Count > 0 ? comparisonsBetween0and5PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
-                NumberOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count;
-                MeanPriceOfListingsBetween5And10PercentGain = comparisonsBetween5and10PercentGain.Count > 0 ? comparisonsBetween5and10PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
-                NumberOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count;
-                MeanPriceOfListingsBetween10And20PercentGain = comparisonsBetween10and20PercentGain.Count > 0 ? comparisonsBetween10and20PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
-                NumberOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count;
-                MeanPriceOfListingsAbove20PercentGain = comparisonsAbove20PercentGain.Count > 0 ? comparisonsAbove20PercentGain.Average(c => c.SteamListing.HighestBuyOrderPriceInPounds) : 0;
-                TotalListingsScanned = comparisons.Count;
-
-                if (comparisons.Count > 0)
+                var aggregate = new ScanAggregate();
+                foreach (var c in data)
                 {
-                    HighestPredictedGainFoundSoFar = comparisons.Max(c => c.PredictedOverallArbitrageGain);
-                    NameOfItemWithHighestPredictedGain = comparisons.FirstOrDefault(c => c.PredictedOverallArbitrageGain == HighestPredictedGainFoundSoFar)?.ItemMarketHashName ?? "Unknown";
-                    CountListingsWithPositiveGain = comparisons.Count(c => c.PredictedOverallArbitrageGain > 1);
-                    CountListingsWithNegativeGain = comparisons.Count(c => c.PredictedOverallArbitrageGain < 1);
-                    PercentageChanceOfFindingPositiveGainListing = (double)CountListingsWithPositiveGain / TotalListingsScanned * 100;
-                    try
+                    aggregate.Record(new OpportunityEvaluation
                     {
-                        MeanFloatValueOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 1).Average(c => c.CSFloatListing.FloatValue);
-                        MeanPriceOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 1).Average(c => c.SteamListing.HighestBuyOrderPriceInPounds);
-                        MeanGainOfProfitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain > 1).Average(c => c.PredictedOverallArbitrageGain);
-                    }
-                    catch (Exception ex)
-                    {
-                        MeanFloatValueOfProfitableListings = 0;
-                        MeanPriceOfProfitableListings = 0;
-                        MeanGainOfProfitableListings = 0;
-                    }
-
-                    try
-                    {
-                        MeanPriceOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).Average(c => c.SteamListing.HighestBuyOrderPriceInPounds);
-                        MeanFloatValueOfUnprofitableListings = comparisons.Where(c => c.PredictedOverallArbitrageGain < 1).Average(c => c.CSFloatListing.FloatValue);
-                    }
-                    catch (Exception ex)
-                    {
-                        MeanPriceOfUnprofitableListings = 0;
-                        MeanFloatValueOfUnprofitableListings = 0;
-                    }
+                        MarketHashName = c.ItemMarketHashName,
+                        BestRoi = c.PredictedOverallArbitrageGain - 1,
+                        CostPence = c.CSFloatListing.PriceInPence,
+                        FloatValue = c.CSFloatListing.FloatValue,
+                        SteamHighestBuyOrderPence = c.SteamListing.HighestBuyOrderPriceInPence,
+                        EvaluatedAtUtc = c.LastUpdate,
+                        Steam = new ExitEstimate { Available = true, Route = ExitRoute.SteamMarket, Roi = c.PredictedOverallArbitrageGain - 1 },
+                    });
                 }
-                else
+                if (data.Count > 0) aggregate.StartedUtc = data.Min(c => c.LastUpdate);
+                Fill(aggregate, purchasedListings, currentExpectedReturnCoefficientOfSteamToCSFloat, data.Count == 0);
+            }
+
+            public ScannedComparisonAnalytics(ScanAggregate aggregate, List<PurchasedListing> purchasedListings, double currentExpectedReturnCoefficientOfSteamToCSFloat)
+            {
+                Fill(aggregate, purchasedListings, currentExpectedReturnCoefficientOfSteamToCSFloat, aggregate.TotalEvaluated == 0);
+            }
+
+            private void Fill(ScanAggregate a, List<PurchasedListing> purchasedListings, double coefficient, bool empty)
+            {
+                double Mean(double sum, long count) => count > 0 ? sum / count : 0;
+                NumberOfListingsBelow0PercentGain = (int)a.BucketCounts[0];
+                NumberOfListingsBetween0And5PercentGain = (int)a.BucketCounts[1];
+                NumberOfListingsBetween5And10PercentGain = (int)a.BucketCounts[2];
+                NumberOfListingsBetween10And20PercentGain = (int)a.BucketCounts[3];
+                NumberOfListingsAbove20PercentGain = (int)a.BucketCounts[4];
+                MeanPriceOfListingsBelow0PercentGain = Mean(a.BucketSteamPriceSums[0], a.BucketCounts[0]);
+                MeanPriceOfListingsBetween0And5PercentGain = Mean(a.BucketSteamPriceSums[1], a.BucketCounts[1]);
+                MeanPriceOfListingsBetween5And10PercentGain = Mean(a.BucketSteamPriceSums[2], a.BucketCounts[2]);
+                MeanPriceOfListingsBetween10And20PercentGain = Mean(a.BucketSteamPriceSums[3], a.BucketCounts[3]);
+                MeanPriceOfListingsAbove20PercentGain = Mean(a.BucketSteamPriceSums[4], a.BucketCounts[4]);
+                TotalListingsScanned = (int)Math.Min(int.MaxValue, a.TotalEvaluated);
+
+                if (empty)
                 {
                     HighestPredictedGainFoundSoFar = 0;
                     NameOfItemWithHighestPredictedGain = "None";
-                    CountListingsWithPositiveGain = 0;
-                    CountListingsWithNegativeGain = 0;
-                    PercentageChanceOfFindingPositiveGainListing = 0;
-                    MeanFloatValueOfProfitableListings = 0;
-                    MeanPriceOfProfitableListings = 0;
-                    MeanPriceOfUnprofitableListings = 0;
-                    MeanFloatValueOfUnprofitableListings = 0;
-                    MeanGainOfProfitableListings = 0;
+                    FirstListingDateRecorded = default;
                 }
-
-                //Calculate total profit
-                float bal = 100;
-                foreach (var item in comparisons.Where(c => c.PredictedOverallArbitrageGain > 1).Where(c => (c.PredictedOverallArbitrageGain - 1) > CS2ArbitrageBot.MinimumPercentReturnToSnipe))
+                else
                 {
-                    bal = bal * (float)item.PredictedOverallArbitrageGain;
+                    HighestPredictedGainFoundSoFar = a.HighestRoi is double best ? 1 + best : 0;
+                    NameOfItemWithHighestPredictedGain = a.HighestRoiItem;
+                    FirstListingDateRecorded = a.StartedUtc;
                 }
-                TotalExpectedProfitPercent = ((bal / 100) - 1) * 100;
-                FirstListingDateRecorded = comparisons.Count > 0
-                    ? comparisons.Min(c => c.LastUpdate) : default;
+                CountListingsWithPositiveGain = (int)Math.Min(int.MaxValue, a.PositiveCount);
+                CountListingsWithNegativeGain = (int)Math.Min(int.MaxValue, a.NegativeCount);
+                PercentageChanceOfFindingPositiveGainListing = a.TotalEvaluated > 0 ? a.PositiveCount * 100.0 / a.TotalEvaluated : 0;
+                MeanFloatValueOfProfitableListings = Mean(a.ProfitableFloatSum, a.ProfitableFloatCount);
+                MeanPriceOfProfitableListings = Mean(a.ProfitablePriceSum, a.PositiveCount);
+                MeanGainOfProfitableListings = Mean(a.ProfitableGainSum, a.PositiveCount);
+                MeanFloatValueOfUnprofitableListings = Mean(a.UnprofitableFloatSum, a.UnprofitableFloatCount);
+                MeanPriceOfUnprofitableListings = Mean(a.UnprofitablePriceSum, a.NegativeCount);
+                TotalExpectedProfitPercent = (float)((Math.Exp(Math.Min(50, a.QualifiedLogReturnSum)) - 1) * 100);
                 AnalyticsGeneratedAt = DateTime.Now;
-
                 AllPurchasedItems = purchasedListings;
-
-                try
-                {
-                    CurrentExpectedReturnCoefficientOfSteamToCSFloat = currentExpectedReturnCoefficientOfSteamToCSFloat;
-                }
-                catch (Exception e) { }
-
-                TimeTakenToPurchaseAllPurchasedItems = new();
-                foreach (var item in purchasedListings)
-                {
-                    try
-                    {
-                        if (item.comparison.CSFloatListing.DateTimeListingCreated != DateTime.MinValue && item.TimeOfPurchase != DateTime.MinValue)
-                        {
-                            TimeSpan timeTaken = item.TimeOfPurchase - item.comparison.CSFloatListing.DateTimeListingCreated;
-                            TimeTakenToPurchaseAllPurchasedItems.Add(timeTaken);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-
-                    }
-                }
+                CurrentExpectedReturnCoefficientOfSteamToCSFloat = coefficient;
+                QualifiedOpportunities = a.QualifiedOpportunities;
+                PurchaseAttempts = a.PurchaseAttempts;
+                Purchases = a.Purchases;
+                Daily = a.Daily;
+                TimeTakenToPurchaseAllPurchasedItems = purchasedListings
+                    .Where(p => p.comparison != null && p.comparison.CSFloatListing.DateTimeListingCreated != default && p.TimeOfPurchase != default)
+                    .Select(p => p.TimeOfPurchase.ToUniversalTime() - p.comparison.CSFloatListing.DateTimeListingCreated.ToUniversalTime())
+                    .ToList();
             }
         }
     }

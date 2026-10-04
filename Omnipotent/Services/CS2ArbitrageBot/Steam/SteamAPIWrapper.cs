@@ -1,46 +1,45 @@
-﻿using Newtonsoft.Json.Linq;
 using Newtonsoft.Json;
-using static System.Net.Mime.MediaTypeNames;
-using System.Drawing;
-using System.Net.Http.Headers;
-using System.Net;
 using Omnipotent.Data_Handling;
-using Omnipotent.Logging;
-using Json.More;
-using System.Text.RegularExpressions;
+using Omnipotent.Services.CS2ArbitrageBot.Engine;
+using System.Drawing;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 {
+    /// <summary>
+    /// Steam market access for the bot. Prices come from <see cref="SteamMarketClient"/> (paced, cached,
+    /// anonymous); this class owns the logged-in profile wrapper and the legacy item_nameid table that
+    /// feeds the histogram fallback.
+    /// </summary>
     public class SteamAPIWrapper
     {
         public CS2ArbitrageBot parent;
         public SteamAPIProfileWrapper profileWrapper;
-        private Dictionary<string, int> CS2NameIDTable;
+        public SteamMarketClient Market { get; }
+        private volatile Dictionary<string, int> CS2NameIDTable = new(StringComparer.Ordinal);
         public string SteamIDOfSteamClient = "76561198048900350";
-        public int SentRequests = 0;
+        public int SentRequests => (int)Math.Min(int.MaxValue, Interlocked.Read(ref Market.Requests));
 
-        string cs2NameIDTablePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDirectory), "cs2nameIDtables.json");
+        private readonly string cs2NameIDTablePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDirectory), "cs2nameIDtables.json");
+        public const string NameIdTableUrl = "https://raw.githubusercontent.com/somespecialone/steam-item-name-ids/refs/heads/master/data/cs2.json";
 
-        public SteamAPIWrapper(CS2ArbitrageBot parent)
+        public SteamAPIWrapper(CS2ArbitrageBot parent, TimeSpan steamRequestSpacing)
         {
             this.parent = parent;
+            profileWrapper = new SteamAPIProfileWrapper(this);
+            Market = new SteamMarketClient(
+                () => parent.UsdExchangeRates,
+                name => CS2NameIDTable.TryGetValue(name, out int id) ? id : null,
+                steamRequestSpacing,
+                message => parent.NoteSteamIssue(message));
         }
 
+        /// <summary>Logs in (SteamKit2 refresh token) and loads the nameid table. Prices work without either.</summary>
         public async Task SteamAPIWrapperInitialisation()
         {
-            profileWrapper = new SteamAPIProfileWrapper(this);
-            await profileWrapper.InitialiseLogin();
-            if (!File.Exists(cs2NameIDTablePath))
-            {
-                await DownloadCS2ItemNameIDTable();
-            }
             await LoadCS2ItemNameIDTable();
-            parent.GetTimeManagerService().TaskDue += TimeManager_TaskDue;
+            await profileWrapper.InitialiseLogin();
         }
-        private void TimeManager_TaskDue(object? sender, Service_Manager.TimeManager.ScheduledTask e)
-        {
 
-        }
         public enum FloatType
         {
             FactoryNew,
@@ -49,6 +48,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             WellWorn,
             BattleScarred
         }
+
+        /// <summary>Legacy price shape. Kept because purchased-item files and the KM site use it.</summary>
         public struct ItemListing
         {
             public string Name;
@@ -63,356 +64,94 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             public FloatType floatType;
             public Color NameColor;
             public string ListingURL;
-        }
 
-        public const string CS2APPID = "730";
-        public const string ItemImageURLPrefix = "https://community.fastly.steamstatic.com/economy/image/";
-
-        public async Task DownloadCS2ItemNameIDTable()
-        {
-            parent.ServiceLog("Downloading CS2 Item Name ID Table...");
-
-            string url = "https://raw.githubusercontent.com/somespecialone/steam-item-name-ids/refs/heads/master/data/cs2.json";
-            WebClient wc = new();
-            wc.DownloadFile(new Uri(url), cs2NameIDTablePath);
-
-            parent.ServiceLog("CS2 Item Name ID Table downloaded successfully.");
-
-            parent.ServiceCreateScheduledTask(DateTime.Now.AddDays(3), "DownloadCS2ItemIDTables", "SteamAPIWrapper", "To ensure that ItemNameID table is up to date.");
-        }
-        public async Task AddToNameIDTable(string itemHashName, int itemID)
-        {
-            parent.ServiceLog("Adding " + itemHashName + "'s item id " + itemID + " to table and saving.");
-            //Check if already exists first
-            if (CS2NameIDTable.ContainsKey(itemHashName))
+            public static ItemListing FromOrderBook(SteamOrderBook? book, string marketHashName, string imageUrl = "")
             {
-                //Update it
-                CS2NameIDTable[itemHashName] = itemID;
-            }
-            else
-            {
-                //Add it
-                CS2NameIDTable.Add(itemHashName, itemID);
-            }
-            //Save to disk
-            string json = JsonConvert.SerializeObject(CS2NameIDTable, Formatting.Indented);
-            await parent.GetDataHandler().WriteToFile(cs2NameIDTablePath, json);
-        }
-        public async Task LoadCS2ItemNameIDTable()
-        {
-            parent.ServiceLog("Loading CS2 Item Name ID Table from disk...");
-            string path = cs2NameIDTablePath;
-            if (File.Exists(path))
-            {
-                string json = await parent.GetDataHandler().ReadDataFromFile(path, true);
-                CS2NameIDTable = JsonConvert.DeserializeObject<Dictionary<string, int>>(json);
-                parent.ServiceLog("CS2 Item Name ID Table loaded successfully.");
-            }
-            else
-            {
-                parent.ServiceLogError("CS2 Item Name ID Table file not found. Downloading it first.");
-                DownloadCS2ItemNameIDTable();
-                await LoadCS2ItemNameIDTable();
+                var listing = new ItemListing
+                {
+                    Name = marketHashName,
+                    ImageURL = imageUrl,
+                    ListingURL = "https://steamcommunity.com/market/listings/730/" + Uri.EscapeDataString(marketHashName),
+                    floatType = FloatTypeOf(marketHashName),
+                    BuyAndSellOrders = new BuyAndSellOrders { BuyOrders = new(), SellOrders = new() },
+                };
+                if (book != null)
+                {
+                    listing.HighestBuyOrderPriceInPence = book.HighestBuyOrderPence;
+                    listing.HighestBuyOrderPriceInPounds = book.HighestBuyOrderPence / 100.0;
+                    listing.CheapestSellOrderPriceInPence = book.LowestSellOrderPence;
+                    listing.CheapestSellOrderPriceInPounds = book.LowestSellOrderPence / 100.0;
+                    listing.SellListings = book.SellOrderCount.ToString();
+                    foreach (var level in book.BuyLevels.Take(10)) listing.BuyAndSellOrders.BuyOrders[level.PricePence / 100.0] = level.Quantity;
+                    foreach (var level in book.SellLevels.Take(10)) listing.BuyAndSellOrders.SellOrders[level.PricePence / 100.0] = level.Quantity;
+                }
+                listing.PriceText = "£" + listing.HighestBuyOrderPriceInPounds.ToString("F2");
+                return listing;
             }
         }
-        public async Task<ItemListing> GetItemOnMarket(string itemHashName)
-        {
-            ItemListing listing = new();
 
-            string url = $"https://steamcommunity.com/market/listings/{CS2APPID}/{itemHashName}/render?currency=2";
-            HttpRequestMessage message = new();
-            message.Method = HttpMethod.Get;
-            message.RequestUri = new Uri(url);
-            var proxy = new WebProxy();
-            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            //Use Proxy
-            HttpClient client = new();
-            HttpResponseMessage result = await client.SendAsync(message);
-            SentRequests++;
-            string strResponse = await result.Content.ReadAsStringAsync();
-            if (result.IsSuccessStatusCode)
-            {
-                dynamic json = JsonConvert.DeserializeObject(strResponse);
-                listing.Name = itemHashName;
-                var jsonObj = JObject.Parse(strResponse);
-                JObject listingInfo = json["listinginfo"];
-                string firstKey = listingInfo.Properties().First().Name;
-                JObject firstListing = (JObject)listingInfo[firstKey];
-                listing.CheapestSellOrderPriceInPence = Convert.ToInt32(firstListing["converted_price"]) + Convert.ToInt32(firstListing["converted_fee"]);
-                listing.CheapestSellOrderPriceInPounds = Convert.ToDouble(listing.CheapestSellOrderPriceInPence) / 100;
-                listing.SellListings = "999";
-                listing.ListingURL = $"https://steamcommunity.com/market/listings/730/{itemHashName.Replace(" ", "%20")}";
-                try
-                {
-                    var assets = jsonObj["assets"]
-    .Children<JProperty>().First().Value
-    .Children<JProperty>().First().Value
-    .Children<JProperty>().First().Value;
-                    listing.ImageURL = ItemImageURLPrefix + assets["icon_url"];
-                    listing.NameColor = ColorTranslator.FromHtml("#" + assets["name_color"]);
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError($"Failed to get image URL for item {itemHashName}. Exception: {ex.Message}");
-                }
-                if (listing.Name.Contains("Field-Tested"))
-                {
-                    listing.floatType = FloatType.FieldTested;
-                }
-                else if (listing.Name.Contains("Minimal"))
-                {
-                    listing.floatType = FloatType.MinimalWear;
-                }
-                else if (listing.Name.Contains("Well-Worn"))
-                {
-                    listing.floatType = FloatType.WellWorn;
-                }
-                else if (listing.Name.Contains("Battle-Scarred"))
-                {
-                    listing.floatType = FloatType.BattleScarred;
-                }
-                else
-                {
-                    listing.floatType = FloatType.FactoryNew;
-                }
-
-                //Get Buy And Sell Orders;
-                //Check if itemHashName exists in CS2NameIDTable
-                if (!CS2NameIDTable.ContainsKey(itemHashName))
-                {
-                    parent.ServiceLog("Item not found in CS2NameIDTable. Attempting to get NameID via Steam listing HTML.");
-                    string nameid = await GetItemNameIDViaListingPage(listing.ListingURL);
-                    if (string.IsNullOrWhiteSpace(nameid))
-                    {
-                        parent.ServiceLogError($"Could not determine item_nameid for {itemHashName}. Skipping buy order lookup.");
-                        return listing;
-                    }
-                    await AddToNameIDTable(itemHashName, Convert.ToInt32(nameid));
-                }
-                BuyAndSellOrders buyAndSellOrders = await GetAllBuyOrdersOfItem(CS2NameIDTable[itemHashName].ToString());
-                listing.BuyAndSellOrders = buyAndSellOrders;
-                listing.HighestBuyOrderPriceInPence = Convert.ToInt32(buyAndSellOrders.BuyOrders.OrderByDescending(k => k.Key).FirstOrDefault().Key * 100);
-                listing.HighestBuyOrderPriceInPounds = Convert.ToDouble(listing.HighestBuyOrderPriceInPence) / 100;
-                listing.PriceText = "£" + listing.HighestBuyOrderPriceInPounds.ToString();
-            }
-            else
-            {
-                if (result.StatusCode == HttpStatusCode.TooManyRequests)
-                {
-                    const int maxRetries = 100;
-                    var rand = new Random();
-                    parent.ServiceLog("Ratelimited by Steam. Starting exponential backoff retries.");
-
-                    for (int attempt = 1; attempt <= maxRetries; attempt++)
-                    {
-                        double backoffSeconds = Math.Pow(2, attempt); // 2, 4, 8, ...
-                        double jitter = rand.NextDouble(); // 0..1s jitter
-                        var delay = TimeSpan.FromSeconds(backoffSeconds + jitter);
-                        parent.ServiceLog($"Retry {attempt}/{maxRetries} in {delay.TotalSeconds:F1}s...");
-                        await Task.Delay(delay);
-
-                        // resend request asynchronously using a fresh HttpRequestMessage (HttpRequestMessage cannot be reused)
-                        HttpClient retryClient = new();
-                        var retryMessage = new HttpRequestMessage(HttpMethod.Get, url);
-                        retryMessage.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                        result = await retryClient.SendAsync(retryMessage);
-                        SentRequests++;
-
-                        if (result.IsSuccessStatusCode)
-                        {
-                            // Successful — re-run the method to parse a fresh response
-                            return await GetItemOnMarket(itemHashName);
-                        }
-
-                        // If we got a non-429 error, abort retries and log below
-                        if (result.StatusCode != HttpStatusCode.TooManyRequests)
-                            break;
-                    }
-
-                    // If we get here, retries exhausted or a non-429 error occurred
-                    string retryResponse = string.Empty;
-                    try { retryResponse = await result.Content.ReadAsStringAsync(); } catch { }
-                    parent.ServiceLogError($"Failed to get item from the steam market after retries. Status Code: {result.StatusCode} Response: {retryResponse}");
-                    return listing;
-                }
-                else
-                {
-                    parent.ServiceLogError($"Failed to get item from the steam market. \n\n Status Code: {result.StatusCode} Response: {strResponse}");
-                    return listing;
-                }
-            }
-            return listing;
-        }
-        public async Task<List<ItemListing>> GetAllMarketListings(int countToLoad, int startPage = 0)
-        {
-            //Each query can only load 100 items. We need to split countToLoad into multiple queries.
-            List<int> queries = [];
-            int loading = countToLoad;
-            while (loading > 0)
-            {
-                if (loading > 100)
-                {
-                    queries.Add(100);
-                    loading -= 100;
-                }
-                else
-                {
-                    queries.Add(loading);
-                    loading = 0;
-                }
-            }
-            List<ItemListing> listings = new();
-            parent.ServiceLog($"Getting {countToLoad} listings from the steam market.");
-            for (int i = 0; i < 1; i++)
-            {
-                string url = $"https://steamcommunity.com/market/search/render/?query=&start={queries[i] + i * 100 + startPage}&count={queries[i]}&search_descriptions=0&appid=730&norender=1";
-                //Create HTTP Message
-                HttpRequestMessage message = new();
-                message.Method = HttpMethod.Get;
-                message.RequestUri = new Uri(url);
-                HttpClient client = new();
-                var result = client.Send(message);
-                SentRequests++;
-                if (result.IsSuccessStatusCode)
-                {
-                    //Parse Response
-                    string response = await result.Content.ReadAsStringAsync();
-                    //Parse JSON
-                    dynamic json = JsonConvert.DeserializeObject(response);
-                    foreach (dynamic item in json.results)
-                    {
-                        ItemListing listing = new();
-                        listing.Name = item.name;
-                        //Remove field-tested, well worn etc from name
-                        listing.Name = listing.Name.Replace("Field-Tested", "").Replace("Minimal Wear", "").Replace("Well-Worn", "").Replace("Battle-Scarred", "").Replace("Factory New", "").Trim();
-                        //Remove parenthesis from name
-                        listing.Name = listing.Name.Replace("(", "").Replace(")", "").Trim();
-                        listing.CheapestSellOrderPriceInPence = Convert.ToInt32(Math.Round(Convert.ToDouble(item.sell_price) * parent.ExchangeRate));
-                        listing.CheapestSellOrderPriceInPounds = Convert.ToDouble(listing.CheapestSellOrderPriceInPence) / 100;
-                        listing.SellListings = item.sell_listings;
-                        listing.PriceText = "£" + listing.CheapestSellOrderPriceInPounds.ToString();
-                        listing.ImageURL = ItemImageURLPrefix + item.asset_description.icon_url;
-                        listing.NameColor = ColorTranslator.FromHtml("#" + item.asset_description.name_color);
-                        if (listing.Name.Contains("Field-Tested"))
-                        {
-                            listing.floatType = FloatType.FieldTested;
-                        }
-                        else if (listing.Name.Contains("Minimal"))
-                        {
-                            listing.floatType = FloatType.MinimalWear;
-                        }
-                        else if (listing.Name.Contains("Well-Worn"))
-                        {
-                            listing.floatType = FloatType.WellWorn;
-                        }
-                        else if (listing.Name.Contains("Battle-Scarred"))
-                        {
-                            listing.floatType = FloatType.BattleScarred;
-                        }
-                        else
-                        {
-                            listing.floatType = FloatType.FactoryNew;
-                        }
-                        listings.Add(listing);
-                    }
-                    parent.ServiceLog($"{listings.Count} listings out of {countToLoad} listings acquired from the steam market.");
-                }
-                else if (result.StatusCode == HttpStatusCode.TooManyRequests)
-                {
-                    parent.ServiceLog("Ratelimited by Steam... Waiting 1 second and trying again.");
-                    await Task.Delay(1000);
-                    i--;
-                }
-                else
-                {
-                    parent.ServiceLog("Failed to get listings from the steam market.");
-                    throw new Exception("Failed to get listings from the steam market.");
-                }
-            }
-            return listings;
-        }
         public struct BuyAndSellOrders
         {
             public Dictionary<double, int> BuyOrders;
             public Dictionary<double, int> SellOrders;
         }
-        public async Task<BuyAndSellOrders> GetAllBuyOrdersOfItem(string itemID)
+
+        public const string CS2APPID = "730";
+        public const string ItemImageURLPrefix = "https://community.fastly.steamstatic.com/economy/image/";
+
+        public static FloatType FloatTypeOf(string marketHashName) =>
+            marketHashName.Contains("Field-Tested") ? FloatType.FieldTested :
+            marketHashName.Contains("Minimal Wear") ? FloatType.MinimalWear :
+            marketHashName.Contains("Well-Worn") ? FloatType.WellWorn :
+            marketHashName.Contains("Battle-Scarred") ? FloatType.BattleScarred : FloatType.FactoryNew;
+
+        /// <summary>
+        /// Current Steam prices for an item (≤ <paramref name="maxAge"/> old, default 2 minutes). Throws when
+        /// Steam has no data at all, so callers never mistake "unknown" for "worth £0".
+        /// </summary>
+        public async Task<ItemListing> GetItemOnMarket(string itemHashName, TimeSpan? maxAge = null, RequestPriority priority = RequestPriority.High)
         {
-            Dictionary<double, int> buyOrders = new();
-            Dictionary<double, int> sellOrders = new();
-            string url = $"https://steamcommunity.com/market/itemordershistogram?country=GB&language=english&currency=2&item_nameid={itemID}";
-            HttpRequestMessage message = new();
-            message.Method = HttpMethod.Get;
-            message.RequestUri = new Uri(url);
-            message.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-            HttpClient client = new();
-            var result = await client.SendAsync(message);
-            SentRequests++;
-            if (result.IsSuccessStatusCode)
-            {
-                string response = await result.Content.ReadAsStringAsync();
-                dynamic json = JsonConvert.DeserializeObject(response);
-                foreach (var item in json.buy_order_graph)
-                {
-                    double price = Convert.ToDouble(item[0]);
-                    int amount = Convert.ToInt32(item[1]);
-                    buyOrders.Add(price, amount); //Otherwise, add a new entry
-                }
-                foreach (var item in json.sell_order_graph)
-                {
-                    double price = Convert.ToDouble(item[0]);
-                    int amount = Convert.ToInt32(item[1]);
-                    sellOrders.Add(price, amount); //Otherwise, add a new entry
-                }
-            }
-            else
-            {
-                parent.ServiceLogError($"Failed to get buy orders for item {itemID}. Status Code: {result.StatusCode}");
-            }
-            BuyAndSellOrders orders = new()
-            {
-                BuyOrders = buyOrders,
-                SellOrders = sellOrders
-            };
-            return orders;
+            var book = await Market.GetOrderBookAsync(itemHashName, maxAge ?? TimeSpan.FromMinutes(2), priority, parent.ServiceCancellation);
+            if (book == null) throw new InvalidOperationException($"No Steam market data for {itemHashName}: {Market.LastError}");
+            return ItemListing.FromOrderBook(book, itemHashName);
         }
-        public async Task<string> GetItemNameIDViaListingPage(string steamListingUrl)
+
+        // ───────────────────────────── item_nameid table (legacy fallback) ─────────────────────────────
+
+        public async Task LoadCS2ItemNameIDTable()
         {
             try
             {
-                const int maxAttempts = 4;
-                for (int attempt = 1; attempt <= maxAttempts; attempt++)
+                bool stale = !File.Exists(cs2NameIDTablePath) || File.GetLastWriteTimeUtc(cs2NameIDTablePath) < DateTime.UtcNow.AddDays(-30);
+                if (stale) await DownloadCS2ItemNameIDTable();
+                if (File.Exists(cs2NameIDTablePath))
                 {
-                    HttpClient client = new();
-                    HttpResponseMessage response = await client.GetAsync(steamListingUrl);
-
-                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
-                    {
-                        parent.ServiceLogError($"Rate-limited fetching listing page for nameid (attempt {attempt}/{maxAttempts}).");
-                        await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
-                        continue;
-                    }
-
-                    string html = await response.Content.ReadAsStringAsync();
-                    Match itemNameIdMatch = Regex.Match(html, @"Market_LoadOrderSpread\(\s*(\d+)\s*\)", RegexOptions.IgnoreCase);
-                    if (itemNameIdMatch.Success)
-                    {
-                        string itemNameId = itemNameIdMatch.Groups[1].Value;
-                        parent.ServiceLog("Found nameid " + itemNameId + " for url: " + steamListingUrl);
-                        return itemNameId;
-                    }
-
-                    parent.ServiceLogError($"Could not parse item_nameid from listing page HTML for {steamListingUrl}. Attempt {attempt}/{maxAttempts}.");
-                    await Task.Delay(TimeSpan.FromSeconds(attempt));
+                    var table = JsonConvert.DeserializeObject<Dictionary<string, int>>(await File.ReadAllTextAsync(cs2NameIDTablePath));
+                    if (table != null) CS2NameIDTable = new Dictionary<string, int>(table, StringComparer.Ordinal);
+                    await parent.ServiceLog($"CS2 item_nameid table loaded ({CS2NameIDTable.Count} items) for the histogram fallback.", false);
                 }
-
-                throw new Exception("Failed to retrieve item_nameid from Steam listing page after retries.");
-
             }
             catch (Exception ex)
             {
-                LogErrorStatic("Main Thread", ex, "Error retrieving Steam item nameid from listing page.");
-                return string.Empty;
+                await parent.ServiceLogError(ex, "Couldn't load the CS2 item_nameid table; the legacy Steam fallback is unavailable.", false);
+            }
+        }
+
+        public async Task DownloadCS2ItemNameIDTable()
+        {
+            try
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+                string json = await http.GetStringAsync(NameIdTableUrl);
+                var parsed = JsonConvert.DeserializeObject<Dictionary<string, int>>(json);
+                if (parsed == null || parsed.Count < 1000) throw new FormatException($"nameid table only had {parsed?.Count ?? 0} entries");
+                Directory.CreateDirectory(Path.GetDirectoryName(cs2NameIDTablePath)!);
+                await parent.GetDataHandler().WriteToFile(cs2NameIDTablePath, json);
+                await parent.ServiceLog("CS2 item_nameid table downloaded.", false);
+            }
+            catch (Exception ex)
+            {
+                await parent.ServiceLogError(ex, "Couldn't download the CS2 item_nameid table.", false);
             }
         }
     }

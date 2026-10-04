@@ -248,9 +248,8 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
             var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
-            var scanalytics = cs2Service.scanalytics;
-
-            var liquidityPlan = scanalytics.ProduceLiquidityPlanAsync(await scanalytics.GetLatestLiquiditySearchResult(), cs2Service.steamBalance.Value.TotalBalanceInPounds);
+            // Computed every 3 hours by the conversion model (Engine/ConversionModel.cs).
+            var liquidityPlan = cs2Service.CurrentLiquidityPlan;
 
 
             try
@@ -279,7 +278,7 @@ namespace Omnipotent.Services.KliveBot_Discord
                         var gap = gaps[j];
                         sb.AppendLine($"**{j + 1}. {gap.csfloatContainer.MarketHashName}**");
                         sb.AppendLine($"• CSFloat Price: £{gap.csfloatContainer.PriceInPounds:F2} (¢{gap.csfloatContainer.PriceInCents})");
-                        sb.AppendLine($"• Steam Cheapest Sell Order: £{(gap.steamListing.CheapestSellOrderPriceInPence):F2}");
+                        sb.AppendLine($"• Steam Cheapest Sell Order: £{gap.steamListing.CheapestSellOrderPriceInPounds:F2}");
                         sb.AppendLine($"• Return Coefficient (Steam → CSFloat): {gap.ReturnCoefficientFromSteamtoCSFloat:F3} ({gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded:F3} tax-included)");
                         sb.AppendLine($"• Ideal CSFloat Sell Price: £{gap.IdealCSFloatSellPriceInPounds:F2}");
                         sb.AppendLine($"• Ideal Steam Purchase Price: £{gap.IdealPriceToPurchaseOnSteamInPounds:F2}");
@@ -341,13 +340,8 @@ namespace Omnipotent.Services.KliveBot_Discord
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.DeferredChannelMessageWithSource);
                 var cs2Service = (CS2ArbitrageBot.CS2ArbitrageBot)(await parent.GetServicesByType<CS2ArbitrageBot.CS2ArbitrageBot>())[0];
                 var scanalytics = cs2Service.scanalytics;
-                // Fix: Pass the required third argument (currentExpectedReturnCoefficientOfSteamToCSFloat)
-                double currentExpectedReturnCoefficient = await scanalytics.ExpectedSteamToCSFloatConversionPercentage();
-                CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics analytics =
-                    new CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics(
-                        scanalytics.AllScannedComparisonsInHistory,
-                        scanalytics.AllPurchasedListingsInHistory,
-                        currentExpectedReturnCoefficient);
+                double currentExpectedReturnCoefficient = cs2Service.CurrentConversionCoefficient;
+                CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics.ScannedComparisonAnalytics analytics = scanalytics.BuildAnalytics(currentExpectedReturnCoefficient);
 
                 string report = $@"
         [Arbitrage Analytics Report - Generated at {analytics.AnalyticsGeneratedAt}]
@@ -366,14 +360,16 @@ namespace Omnipotent.Services.KliveBot_Discord
         Listings with Positive Gain: {analytics.CountListingsWithPositiveGain}
         Listings with Negative Gain: {analytics.CountListingsWithNegativeGain}
         **Chance of Positive Gain: {analytics.PercentageChanceOfFindingPositiveGainListing:F2}%**
-        Avg Gain of Profitable Listings: {analytics.MeanGainOfProfitableListings:F2}%
+        Avg Gain of Profitable Listings: {(analytics.MeanGainOfProfitableListings > 0 ? (analytics.MeanGainOfProfitableListings - 1) * 100 : 0):F2}%
         Avg Float (Profitable): {analytics.MeanFloatValueOfProfitableListings:F5}
         Avg Price (Profitable): £{analytics.MeanPriceOfProfitableListings:F2}
         Avg Float (Unprofitable): {analytics.MeanFloatValueOfUnprofitableListings:F5}
         Avg Price (Unprofitable): £{analytics.MeanPriceOfUnprofitableListings:F2}
 
         --- Expected Returns ---
-        Expected Return of All Snipes: {Math.Round((analytics.TotalExpectedProfitPercent - 1) * 100, 2)}%
+        Qualifying Opportunities: {analytics.QualifiedOpportunities} (bought {analytics.Purchases} of {analytics.PurchaseAttempts} attempts)
+        Compounded Return of All Qualifying Opportunities: {Math.Round(analytics.TotalExpectedProfitPercent, 2)}%
+        Steam→CSFloat Conversion Coefficient: {currentExpectedReturnCoefficient:F3}
 
         --- Top Opportunity ---
         Highest Predicted Gain Found: {Math.Round((analytics.HighestPredictedGainFoundSoFar - 1) * 100, 2)}%

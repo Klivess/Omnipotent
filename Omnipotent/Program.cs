@@ -110,13 +110,13 @@ namespace Omnipotent
                 if (!OmniPaths.CheckIfOnServer())
                 {
                     //omniServiceManager.CreateAndStartNewMonitoredOmniService(new TestService());
-                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot(kliveApi));
                 }
 
                 if (OmniPaths.CheckIfOnServer())
                 {
                     var lastUpdate = OmniPaths.LastOmnipotentUpdate;
-                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot());
+                    omniServiceManager.CreateAndStartNewMonitoredOmniService(new CS2ArbitrageBot(kliveApi));
                     ((KliveBotDiscord)(omniServiceManager.GetServiceByClassType<KliveBotDiscord>().GetAwaiter().GetResult())[0]).SendMessageToKlives("**Omnipotent online!** Last updated: " + lastUpdate.ToString() + " (" + lastUpdate.Humanize() + ")");
                 }
                 if (args.Any())

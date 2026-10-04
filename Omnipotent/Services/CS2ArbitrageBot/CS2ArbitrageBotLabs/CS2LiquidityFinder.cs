@@ -1,20 +1,19 @@
-﻿using Omnipotent.Data_Handling;
-using Omnipotent.Services.CS2ArbitrageBot.CSFloat;
 using Omnipotent.Services.CS2ArbitrageBot.Steam;
-using System.ComponentModel;
-using System.Globalization;
-using System.Reflection.Metadata.Ecma335;
 
 namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 {
+    /// <summary>
+    /// Data shapes and price-history helpers for the Steam→CSFloat "liquidity plan".
+    ///
+    /// The daily container-only search that used to live here is replaced by Engine/ConversionModel, which
+    /// ranks every commodity item, verifies converters against real CSFloat sales, and runs every 3 hours.
+    /// (The old search fetched price history from /market/pricehistory, which needs a login and returned
+    /// 400 for this anonymous client — so every candidate was filtered out and the bot silently fell back
+    /// to a hard-coded 0.75 coefficient.) These types are kept because the KM website's plan view and the
+    /// Discord command consume them.
+    /// </summary>
     public class CS2LiquidityFinder
     {
-        public CS2ArbitrageBot parent;
-        public CS2LiquidityFinder(CS2ArbitrageBot parent)
-        {
-            this.parent = parent;
-        }
-
         public enum ContainerType
         {
             WeaponCase,
@@ -50,188 +49,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public double IdealReturnCoefficientFromSteamtoCSFloat;
             public double IdealReturnCoefficientFromSteamToCSFloatTaxIncluded;
         }
-        public async Task<List<Container>> GetAllWeaponCasePricesInPoundsOnCSFloat()
-        {
-            try
-            {
-                List<Container> weaponCases = new List<Container>();
-                string url = "https://csfloat.com/api/v1/schema/browse?type=containers";
-                var response = await parent.csFloatWrapper.Client.GetAsync(url);
-                if (response.IsSuccessStatusCode)
-                {
-                    string content = await response.Content.ReadAsStringAsync();
-                    dynamic json = Newtonsoft.Json.JsonConvert.DeserializeObject(content);
-                    foreach (dynamic weaponCaseList in json.data)
-                    {
-                        ContainerType type;
-                        if (weaponCaseList.type == "weapon_case")
-                        {
-                            type = ContainerType.WeaponCase;
-                        }
-                        else if (weaponCaseList.type == "sticker_capsule")
-                        {
-                            type = ContainerType.StickerCapsule;
-                        }
-                        else if (weaponCaseList.type == "autograph_capsule")
-                        {
-                            type = ContainerType.AutographCapsule;
-                        }
-                        else if (weaponCaseList.type == "weapon_case_souvenirpkg")
-                        {
-                            type = ContainerType.SouvenirPackage;
-                        }
-                        else
-                        {
-                            continue;
-                        }
-                        foreach (dynamic item in weaponCaseList.items)
-                        {
-                            Container container = new();
-                            container.MarketHashName = item.market_hash_name;
-                            container.PriceInCents = item.price;
-                            container.PriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(container.PriceInCents * parent.ExchangeRate)));
-                            container.PriceInPounds = Convert.ToDouble(container.PriceInPence) / 100;
-                            container.ImageURL = item.image;
-                            container.containerType = type;
-                            weaponCases.Add(container);
-                        }
-                    }
-                    return weaponCases;
-                }
-                else
-                {
-                    if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
-                    {
-                        await Task.Delay(5000);
-                        return await GetAllWeaponCasePricesInPoundsOnCSFloat();
-                    }
-                    else
-                    {
-                        parent.ServiceLogError($"Failed to fetch weapon cases from CSFloat. Status Code: {response.StatusCode} Content: {response.Content.ReadAsStringAsync().Result}");
-                        return null;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                parent.ServiceLogError(ex, "Error in GetAllWeaponCasePricesInPoundsOnCSFloat");
-                return null;
-            }
-        }
-        public async Task<LiquiditySearchResult> CompareCSFloatContainersToSteamContainers()
-        {
-            var startTime = DateTime.UtcNow;
-            try
-            {
-                List<ContainerGap> gaps = new List<ContainerGap>();
-                var getallWeaponCases = await GetAllWeaponCasePricesInPoundsOnCSFloat();
-                foreach (var item in getallWeaponCases)
-                {
-                    try
-                    {
-                        ContainerGap gap;
-                        SteamAPIWrapper.ItemListing listing = await parent.steamAPIWrapper.GetItemOnMarket(item.MarketHashName);
-                        gap.csfloatContainer = item;
-                        gap.steamListing = listing;
-                        double returnCoefficient = 0;
-                        returnCoefficient = Convert.ToDouble(item.PriceInPounds / listing.CheapestSellOrderPriceInPounds);
-                        gap.ReturnCoefficientFromSteamtoCSFloat = returnCoefficient;
 
-                        //If the return coefficient is Infinity, break this iteration and continue
-                        if (double.IsInfinity(returnCoefficient) || double.IsNaN(returnCoefficient))
-                        {
-                            parent.ServiceLogError($"Return coefficient for {item.MarketHashName} is Infinity or NaN, skipping this item.");
-                            continue;
-                        }
-                        gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded = returnCoefficient / 1.02;
-                        //Linear regression has shown this to be the best fit for the CSFloat price prediction
-                        //                              y=1.09215x+0.000318599
-                        //nvm dont use linear regression line       
-                        gap.IdealCSFloatSellPriceInCents = Convert.ToInt32(item.PriceInCents * 1.05);
-                        gap.IdealCSFloatSellPriceInPence = Convert.ToInt32(Math.Ceiling(Convert.ToDecimal(gap.IdealCSFloatSellPriceInCents * parent.ExchangeRate)));
-                        gap.IdealCSFloatSellPriceInPounds = Convert.ToDouble(gap.IdealCSFloatSellPriceInPence) / 100;
-
-                        gap.priceHistory = await GetPriceHistoryOfSteamItem(item.MarketHashName);
-                        try
-                        {
-                            gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds / 1.05;
-
-                        }
-                        catch (Exception x)
-                        {
-                            gap.IdealPriceToPurchaseOnSteamInPounds = gap.steamListing.CheapestSellOrderPriceInPounds;
-                        }
-                        gap.IdealReturnCoefficientFromSteamtoCSFloat = Convert.ToDouble(gap.csfloatContainer.PriceInPounds / gap.IdealPriceToPurchaseOnSteamInPounds);
-                        gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded = gap.IdealReturnCoefficientFromSteamtoCSFloat / 1.02;
-                        gaps.Add(gap);
-                    }
-                    catch (Exception ex)
-                    {
-                        parent.ServiceLogError(ex, $"Error processing item: {item.MarketHashName}");
-                        continue; // Skip this item if there's an error
-                    }
-                }
-
-                // Analytics
-                var result = new LiquiditySearchResult();
-                result.LiquiditySearchID = RandomGeneration.GenerateRandomLengthOfNumbers(10);
-                result.AllGapsFound = gaps;
-                result.DateOfSearch = DateTime.UtcNow;
-                result.TotalContainersAnalyzed = gaps.Count;
-                result.TimeToCompleteSearch = DateTime.UtcNow - startTime;
-
-                if (gaps.Count > 0)
-                {
-                    result.HighestReturnCoefficientFound = gaps.OrderByDescending(g => g.ReturnCoefficientFromSteamtoCSFloat).First();
-                    result.WorstReturnCoefficientFound = gaps.OrderBy(g => g.ReturnCoefficientFromSteamtoCSFloat).First();
-                    result.Top5ReturnCoefficients = gaps.OrderByDescending(g => g.ReturnCoefficientFromSteamtoCSFloat).Take(5).ToList();
-
-                    var returnCoefficients = gaps.Select(g => g.ReturnCoefficientFromSteamtoCSFloat).ToList();
-                    result.AverageReturnCoefficient = returnCoefficients.Average();
-
-                    var sortedCoefficients = returnCoefficients.OrderBy(x => x).ToList();
-                    int mid = sortedCoefficients.Count / 2;
-                    result.MedianReturnCoefficient = sortedCoefficients.Count % 2 == 0
-                        ? (sortedCoefficients[mid - 1] + sortedCoefficients[mid]) / 2.0
-                        : sortedCoefficients[mid];
-
-                    double avg = result.AverageReturnCoefficient;
-                    result.StandardDeviationReturnCoefficient = Math.Sqrt(returnCoefficients.Sum(x => Math.Pow(x - avg, 2)) / returnCoefficients.Count);
-
-                    double threshold = 1.1; // Example threshold, adjust as needed
-                    result.CountAboveThreshold = returnCoefficients.Count(x => x > threshold);
-
-                    // Average price history volatility: mean of standard deviation of price history for each gap
-                    var volatilities = gaps
-                        .Where(g => g.priceHistory != null && g.priceHistory.Count > 1)
-                        .Select(g =>
-                        {
-                            var prices = g.priceHistory.Select(p => p.PriceInPounds).ToList();
-                            double mean = prices.Average();
-                            return Math.Sqrt(prices.Sum(p => Math.Pow(p - mean, 2)) / prices.Count);
-                        }).ToList();
-                    result.AveragePriceHistoryVolatility = volatilities.Count > 0 ? volatilities.Average() : 0.0;
-                }
-                else
-                {
-                    result.HighestReturnCoefficientFound = default;
-                    result.WorstReturnCoefficientFound = default;
-                    result.Top5ReturnCoefficients = new List<ContainerGap>();
-                    result.AverageReturnCoefficient = 0;
-                    result.MedianReturnCoefficient = 0;
-                    result.StandardDeviationReturnCoefficient = 0;
-                    result.CountAboveThreshold = 0;
-                    result.AveragePriceHistoryVolatility = 0;
-                }
-
-                return result;
-            }
-            catch (Exception ex)
-            {
-                parent.ServiceLogError(ex, "Error in CompareCSFloatContainersToSteamContainers");
-                return default;
-            }
-        }
         public struct SteamPriceHistoryDataPoint
         {
             public DateTime DateTimeRecorded;
@@ -239,116 +57,26 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public double PriceInPence => Convert.ToDouble(Math.Ceiling(PriceInPounds * 100));
             public int QuantitySold;
         }
-        public async Task<List<SteamPriceHistoryDataPoint>?> GetPriceHistoryOfSteamItem(string marketHashName)
-        {
-            try
-            {
-                const int maxAttempts = 4;
-                string encodedName = Uri.EscapeDataString(marketHashName);
-                string url = $"https://steamcommunity.com/market/pricehistory/?appid=730&market_hash_name={encodedName}&currency=2";
 
-                string? content = null;
-                for (int attempt = 1; attempt <= maxAttempts; attempt++)
-                {
-                    HttpClient client = new();
-                    HttpResponseMessage response = await client.GetAsync(url);
-                    content = await response.Content.ReadAsStringAsync();
-
-                    if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
-                    {
-                        parent.ServiceLogError($"Steam pricehistory rate-limited for {marketHashName} (attempt {attempt}/{maxAttempts}).");
-                        await Task.Delay(TimeSpan.FromSeconds(2 * attempt));
-                        continue;
-                    }
-
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        parent.ServiceLogError($"Failed to fetch Steam price history for {marketHashName}. Status: {response.StatusCode} Body: {content}");
-                        return null;
-                    }
-
-                    break;
-                }
-
-                if (string.IsNullOrWhiteSpace(content))
-                {
-                    return null;
-                }
-
-                dynamic priceHistory = Newtonsoft.Json.JsonConvert.DeserializeObject(content);
-                if (priceHistory?.prices == null)
-                {
-                    return null;
-                }
-
-                List<SteamPriceHistoryDataPoint> historyDataPoints = new List<SteamPriceHistoryDataPoint>();
-
-                foreach (var dataPoint in priceHistory.prices)
-                {
-                    string dateString = Convert.ToString(dataPoint[0]);
-                    string priceString = Convert.ToString(dataPoint[1]);
-                    string qtyString = Convert.ToString(dataPoint[2]);
-
-                    if (!DateTime.TryParse(dateString, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTime recordedAt))
-                    {
-                        continue;
-                    }
-
-                    if (!double.TryParse(priceString, NumberStyles.Any, CultureInfo.InvariantCulture, out double priceInCurrencyUnits))
-                    {
-                        if (!double.TryParse(priceString, NumberStyles.Any, CultureInfo.GetCultureInfo("en-GB"), out priceInCurrencyUnits))
-                        {
-                            continue;
-                        }
-                    }
-
-                    if (!int.TryParse(qtyString, NumberStyles.Any, CultureInfo.InvariantCulture, out int quantitySold))
-                    {
-                        quantitySold = 0;
-                    }
-
-                    SteamPriceHistoryDataPoint point = new SteamPriceHistoryDataPoint
-                    {
-                        DateTimeRecorded = recordedAt,
-                        PriceInPounds = priceInCurrencyUnits,
-                        QuantitySold = quantitySold
-                    };
-                    historyDataPoints.Add(point);
-                }
-
-                return historyDataPoints;
-            }
-            catch (Exception ex)
-            {
-                parent.ServiceLogError(ex, $"Error fetching price history for item: {marketHashName}");
-                return null;
-            }
-        }
-
-        //Price of steam items tend to oscillate. This function finds the points of minimum price in past price history data.
-        //window param: The number of points to consider on each side of the current point to determine if it is a local minimum.
-        //minProminence param: The minimum difference between the current point and the highest point on either side to consider it a local minimum.
+        /// <summary>
+        /// Local minima of a price series. <paramref name="window"/> points on each side must not be lower;
+        /// <paramref name="minProminence"/> is how far the price must rise on both sides to count.
+        /// </summary>
         public static IEnumerable<SteamPriceHistoryDataPoint> GetPriceBottoms(
-        IEnumerable<SteamPriceHistoryDataPoint> rawPoints,
-        int window = 3,
-        double minProminence = 0.0)
+            IEnumerable<SteamPriceHistoryDataPoint>? rawPoints,
+            int window = 3,
+            double minProminence = 0.0)
         {
             if (rawPoints == null) yield break;
-
-            var points = rawPoints
-                .OrderBy(p => p.DateTimeRecorded)
-                .ToList();
-
-            if (points.Count < window * 2 + 1) yield break;
             if (window < 1) window = 1;
+            var points = rawPoints.OrderBy(p => p.DateTimeRecorded).ToList();
+            if (points.Count < window * 2 + 1) yield break;
 
             for (int i = window; i < points.Count - window; i++)
             {
                 double cur = points[i].PriceInPounds;
-
                 double leftMin = double.MaxValue, rightMin = double.MaxValue;
                 double leftMax = double.MinValue, rightMax = double.MinValue;
-
                 for (int j = i - window; j < i; j++)
                 {
                     double v = points[j].PriceInPounds;
@@ -361,55 +89,30 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                     if (v < rightMin) rightMin = v;
                     if (v > rightMax) rightMax = v;
                 }
-
-                bool isLocalMin =
-                    cur <= leftMin && cur <= rightMin &&
-                    (points[i - 1].PriceInPounds > cur || points[i + 1].PriceInPounds > cur);
-
+                bool isLocalMin = cur <= leftMin && cur <= rightMin &&
+                                  (points[i - 1].PriceInPounds > cur || points[i + 1].PriceInPounds > cur);
                 if (!isLocalMin) continue;
-
                 double prominence = Math.Min(leftMax - cur, rightMax - cur);
                 if (prominence + 1e-12 < minProminence) continue;
-
                 yield return points[i];
             }
         }
+
+        /// <summary>
+        /// The lowest price that traded meaningful volume (≥5% of the last 5 days' sales in one point), capped
+        /// at the latest price — a buy-order price likely to fill. 0 when there is no history.
+        /// (The previous version started from 0 and only ever lowered it, so it always returned 0.)
+        /// </summary>
         public static double FindIdealPriceToPlaceBuyOrder(List<SteamPriceHistoryDataPoint> dataPoints)
         {
-            double lowestPrice = 0;
-            float quantitySoldOverLast5Days = dataPoints
-                .Where(k => k.DateTimeRecorded > DateTime.UtcNow.AddDays(-5))
-                .Sum(k => k.QuantitySold);
-            foreach (var item in dataPoints.OrderBy(k => k.PriceInPounds))
-            {
-                if (item.QuantitySold > 0.05 * quantitySoldOverLast5Days && item.PriceInPounds < lowestPrice)
-                {
-                    lowestPrice = item.PriceInPounds;
-                }
-            }
-            if (dataPoints.OrderByDescending(k => k.DateTimeRecorded).ToList()[0].PriceInPounds < lowestPrice)
-            {
-                lowestPrice = dataPoints.OrderByDescending(k => k.DateTimeRecorded).ToList()[0].PriceInPounds;
-            }
-            return lowestPrice;
-        }
-        public class LiquiditySearchResult
-        {
-            public List<ContainerGap> AllGapsFound;
-            public DateTime DateOfSearch;
-            public ContainerGap HighestReturnCoefficientFound;
-            public string LiquiditySearchID;
-
-            // Analytics
-            public double AverageReturnCoefficient;
-            public double MedianReturnCoefficient;
-            public double StandardDeviationReturnCoefficient;
-            public int TotalContainersAnalyzed;
-            public int CountAboveThreshold;
-            public ContainerGap WorstReturnCoefficientFound;
-            public TimeSpan TimeToCompleteSearch;
-            public List<ContainerGap> Top5ReturnCoefficients;
-            public double AveragePriceHistoryVolatility;
+            if (dataPoints == null || dataPoints.Count == 0) return 0;
+            DateTime cutoff = dataPoints.Max(p => p.DateTimeRecorded).AddDays(-5);
+            var recent = dataPoints.Where(p => p.DateTimeRecorded >= cutoff).ToList();
+            double volume = recent.Sum(p => p.QuantitySold);
+            double latest = dataPoints.OrderByDescending(p => p.DateTimeRecorded).First().PriceInPounds;
+            var meaningful = recent.Where(p => p.QuantitySold >= 0.05 * volume && p.PriceInPounds > 0).ToList();
+            double lowest = meaningful.Count > 0 ? meaningful.Min(p => p.PriceInPounds) : latest;
+            return Math.Min(lowest, latest);
         }
     }
 }

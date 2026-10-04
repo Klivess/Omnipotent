@@ -106,6 +106,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             bool moreItems = true;
             string? foundButNotMarketableAssetId = null;
 
+            int throttled = 0;
             while (moreItems)
             {
                 string url = $"https://steamcommunity.com/inventory/{steamID}/{SteamAPIWrapper.CS2APPID}/2?l=english&count=75";
@@ -114,12 +115,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     url += $"&start_assetid={lastAssetId}";
                 }
 
-                HttpClient client = new();
-                client.DefaultRequestHeaders.Add("Cookie", cookieString);
-                HttpResponseMessage response = await client.GetAsync(url);
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.TryAddWithoutValidation("Cookie", cookieString);
+                using HttpResponseMessage response = await CommunityHttp.SendAsync(request);
 
                 if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
                 {
+                    if (++throttled > 5)
+                    {
+                        parent.parent.ServiceLogError("Steam inventory stayed rate limited after 5 attempts; giving up for now.");
+                        return null;
+                    }
                     parent.parent.ServiceLog("Steam inventory rate limited, waiting 30 seconds...");
                     await Task.Delay(30000);
                     continue;
@@ -215,10 +221,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 return false;
             }
 
-            int sellerReceivesInPence = (int)Math.Floor(salePriceInPence / 1.15);
+            // sellitem's "price" is what the seller receives. Steam's fee rounding means floor(price/1.15)
+            // can land a penny above the buy order and leave the item listed instead of sold.
+            int sellerReceivesInPence = Omnipotent.Services.CS2ArbitrageBot.Engine.ArbitrageMath.SteamSellerReceives(salePriceInPence);
+            if (sellerReceivesInPence <= 0)
+            {
+                parent.parent.ServiceLogError($"Refusing to list {purchasedListing.ItemMarketHashName}: sale price {salePriceInPence}p leaves nothing after Steam fees.");
+                return false;
+            }
             string url = "https://steamcommunity.com/market/sellitem/";
 
-            HttpClient client = new();
+            using HttpClient client = new() { Timeout = TimeSpan.FromSeconds(30) };
             client.DefaultRequestHeaders.Add("Cookie", cookieString);
             client.DefaultRequestHeaders.Add("Referer", $"https://steamcommunity.com/profiles/{GetEffectiveSteamId()}/inventory");
 
@@ -336,52 +349,105 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             return null;
         }
 
+        /// <summary>Shared pooled client for logged-in community requests (cookies are set per request).</summary>
+        private static readonly HttpClient CommunityHttp = new(new SocketsHttpHandler
+        {
+            AutomaticDecompression = System.Net.DecompressionMethods.All,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+            UseCookies = false,
+            AllowAutoRedirect = false,
+        })
+        { Timeout = TimeSpan.FromSeconds(30) };
+
+        /// <summary>
+        /// Wallet balance. Primary source is the Web API the redesigned Steam site itself uses
+        /// (IUserAccountService/GetClientWalletDetails, authorised by the SteamKit2 access token); the old
+        /// market-page HTML scrape is the fallback. Returns null (never throws) when both fail.
+        /// </summary>
         public async Task<SteamBalance?> GetSteamBalance()
         {
-            SteamBalance bal;
-            if (await CheckIfCommunityCookieStringWorks())
+            try
             {
-                string cookieString = await ProduceCommunityCookieString();
-                string url = "https://steamcommunity.com/market/";
-                HttpClient client = new();
-                client.DefaultRequestHeaders.Add("Cookie", cookieString);
-                HttpResponseMessage response = await client.GetAsync(url);
-                if (response.IsSuccessStatusCode)
-                {
-                    string content = await response.Content.ReadAsStringAsync();
-                    try
-                    {
-
-
-                        //string pendingBalanceString = content.Substring(content.IndexOf(">Pending:"), content.IndexOf(">Pending:") + 15).Replace(">Pending: £", "").Trim();
-                        string usableBalanceIdentifier = "Wallet balance <span id=\"marketWalletBalanceAmount\">£";
-                        string usableBalanceString = content.Substring(content.IndexOf(usableBalanceIdentifier));
-                        usableBalanceString = usableBalanceString.Substring(0, usableBalanceString.IndexOf("</span>")).Replace(usableBalanceIdentifier, "").Trim();
-
-                        bal.UsableBalanceInPounds = (float)Convert.ToDouble(usableBalanceString); // Replace with actual parsing logic
-                        bal.PendingBalanceInPounds = 0; // Replace with actual parsing logic
-                        bal.TotalBalanceInPounds = bal.UsableBalanceInPounds + bal.PendingBalanceInPounds;
-                        return bal;
-                    }
-                    catch (Exception ex)
-                    {
-                        parent.parent.ServiceLogError($"Failed to parse Steam balance: {ex.Message}");
-                        await parent.parent.ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", "Failed to parse Steam balance HTML. Parser could have finally broken?");
-                        return null;
-                    }
-                }
-                else
-                {
-                    string content = await response.Content.ReadAsStringAsync();
-                    parent.parent.ServiceLogError($"Failed to retrieve Steam balance, status code was not 200. Code: {response.StatusCode} Response: {content}");
-                    return null;
-                }
+                var viaApi = await GetSteamBalanceViaWebApi();
+                if (viaApi != null) return viaApi;
             }
-            else
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError($"Steam wallet Web API lookup failed: {ex.Message}");
+            }
+
+            if (!await CheckIfCommunityCookieStringWorks())
             {
                 parent.parent.ServiceLogError("Not logged in, so can't get steam balance.");
                 return null;
             }
+            try
+            {
+                string cookieString = await ProduceCommunityCookieString();
+                using var request = new HttpRequestMessage(HttpMethod.Get, "https://steamcommunity.com/market/");
+                request.Headers.TryAddWithoutValidation("Cookie", cookieString);
+                using var response = await CommunityHttp.SendAsync(request);
+                string content = await response.Content.ReadAsStringAsync();
+                if (!response.IsSuccessStatusCode)
+                {
+                    parent.parent.ServiceLogError($"Failed to retrieve Steam balance page ({(int)response.StatusCode}).");
+                    return null;
+                }
+                double? pounds = ParseWalletBalanceFromMarketHtml(content);
+                if (pounds == null)
+                {
+                    parent.parent.ServiceLogError("Steam balance not found in the market page HTML (layout changed?).");
+                    return null;
+                }
+                return new SteamBalance { UsableBalanceInPounds = pounds.Value, PendingBalanceInPounds = 0, TotalBalanceInPounds = pounds.Value };
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError($"Failed to read Steam balance: {ex.Message}");
+                return null;
+            }
+        }
+
+        private async Task<SteamBalance?> GetSteamBalanceViaWebApi()
+        {
+            if (!await EnsureSteamAuthAsync() || string.IsNullOrWhiteSpace(steamAccessToken)) return null;
+            using var request = new HttpRequestMessage(HttpMethod.Post,
+                "https://api.steampowered.com/IUserAccountService/GetClientWalletDetails/v1/?access_token=" + Uri.EscapeDataString(steamAccessToken));
+            request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["include_balance_in_usd"] = "false",
+                ["wallet_region"] = "1",
+                ["include_formatted_balance"] = "true",
+            });
+            using var response = await CommunityHttp.SendAsync(request);
+            string body = await response.Content.ReadAsStringAsync();
+            if (!response.IsSuccessStatusCode) return null;
+            return ParseWalletDetails(body);
+        }
+
+        /// <summary>Parses GetClientWalletDetails: balance / delayed_balance are minor units (pence for a GBP wallet).</summary>
+        internal static SteamBalance? ParseWalletDetails(string body)
+        {
+            var root = Newtonsoft.Json.Linq.JObject.Parse(body);
+            var r = root["response"] as Newtonsoft.Json.Linq.JObject ?? root;
+            if (r["balance"] == null) return null;
+            if (r["has_wallet"] != null && r.Value<bool?>("has_wallet") == false) return null;
+            long balance = long.TryParse(r["balance"]!.ToString(), out var b) ? b : 0;
+            long delayed = r["delayed_balance"] != null && long.TryParse(r["delayed_balance"]!.ToString(), out var d) ? d : 0;
+            return new SteamBalance
+            {
+                UsableBalanceInPounds = balance / 100.0,
+                PendingBalanceInPounds = delayed / 100.0,
+                TotalBalanceInPounds = (balance + delayed) / 100.0,
+            };
+        }
+
+        internal static double? ParseWalletBalanceFromMarketHtml(string content)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(content, @"id=""marketWalletBalanceAmount""[^>]*>\s*[^\d<]*([\d.,]+)");
+            if (!match.Success) return null;
+            string number = match.Groups[1].Value.Replace(",", "");
+            return double.TryParse(number, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double pounds) ? pounds : null;
         }
 
         public async Task InitialiseLogin()
@@ -777,6 +843,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             string steamLoginSecure = Uri.EscapeDataString($"{GetEffectiveSteamId()}||{steamAccessToken}");
             return $"sessionid={steamSessionId}; steamLoginSecure={steamLoginSecure}; steamRememberLogin=true";
         }
+        private static async Task<bool> ProfileRedirectProvesLogin(string cookieString)
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, "https://steamcommunity.com/my/");
+                request.Headers.TryAddWithoutValidation("Cookie", cookieString);
+                using var response = await CommunityHttp.SendAsync(request);
+                string location = response.Headers.Location?.ToString() ?? "";
+                return (int)response.StatusCode is >= 300 and < 400
+                       && (location.Contains("/profiles/", StringComparison.OrdinalIgnoreCase) || location.Contains("/id/", StringComparison.OrdinalIgnoreCase))
+                       && !location.Contains("login", StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public async Task<bool> CheckIfCommunityCookieStringWorks(bool reLogin = true)
         {
             string url = "https://steamcommunity.com/market/mylistings?start=0&count=1";
@@ -784,18 +868,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                HttpClient client = new();
                 string cookieString = await ProduceCommunityCookieString();
                 if (string.IsNullOrEmpty(cookieString))
                 {
                     return false;
                 }
 
-                client.DefaultRequestHeaders.Add("Cookie", cookieString);
                 try
                 {
-                    HttpResponseMessage response = await client.GetAsync(url);
+                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                    request.Headers.TryAddWithoutValidation("Cookie", cookieString);
+                    using HttpResponseMessage response = await CommunityHttp.SendAsync(request);
                     if (response.IsSuccessStatusCode)
+                    {
+                        return true;
+                    }
+                    // The May 2026 market redesign may retire this probe; a logged-in profile redirect
+                    // (/my/ → /profiles/{id} or /id/{name}, never /login) proves the cookies still work.
+                    if (await ProfileRedirectProvesLogin(cookieString))
                     {
                         return true;
                     }
