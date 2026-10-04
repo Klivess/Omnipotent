@@ -1,28 +1,29 @@
-﻿using JetBrains.Annotations;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
-using OpenQA.Selenium.Chrome;
-using OpenQA.Selenium.DevTools;
-using OpenQA.Selenium.DevTools.V145.Network;
-using System.IO;
-using System.Linq.Expressions;
-using System.Net;
-using static Microsoft.ApplicationInsights.MetricDimensionNames.TelemetryContext;
+using Omnipotent.Services.MemeScraper.Scraping;
 
 namespace Omnipotent.Services.MemeScraper
 {
     public class MemeScraperSources
     {
         MemeScraper parent;
-        public List<InstagramSource> InstagramSources;
+        private readonly object gate = new();
+        private List<InstagramSource> instagramSources = new();
         public List<Niche> AllNiches;
+
         public MemeScraperSources(MemeScraper parent)
         {
             this.parent = parent;
-            InstagramSources = new List<InstagramSource>();
             AllNiches = new List<Niche>();
             LoadAllInstagramSources().Wait();
         }
+
+        /// <summary>Snapshot of all sources (safe to enumerate/serialize while scrapes update them).</summary>
+        public List<InstagramSource> InstagramSources
+        {
+            get { lock (gate) return new List<InstagramSource>(instagramSources); }
+        }
+
         public class Source
         {
             public string SourceID;
@@ -45,6 +46,20 @@ namespace Omnipotent.Services.MemeScraper
             public float AverageLikes;
             public float AverageComments;
             public List<AccountTopHashtag> AccountTopHashtags;
+
+            // ── Scrape health (all UTC). Lets the website/KliveAgent see a source that has stopped
+            // producing reels instead of it silently scraping nothing for months. ──
+            public DateTime? NextScrapeDueUtc;
+            public DateTime? LastScrapeAttemptUtc;
+            public DateTime? LastSuccessfulScrapeUtc;
+            public int ConsecutiveScrapeFailures;
+            public string? LastScrapeError;
+            /// <summary>Which providers were tried and what each said, e.g. "inflact: ok, 24 reels, 2 page(s)".</summary>
+            public string? LastScrapeSummary;
+            public int LastScrapeReelsFound;
+            public int LastScrapeReelsDownloaded;
+            public int LastScrapeDownloadFailures;
+            public long TotalReelsDownloaded;
 
             public struct AccountTopHashtag
             {
@@ -71,6 +86,7 @@ namespace Omnipotent.Services.MemeScraper
         {
             AllNiches = new List<Niche>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory);
+            Directory.CreateDirectory(path);
             string[] files = Directory.GetFiles(path, "*.json");
             foreach (var file in files)
             {
@@ -86,18 +102,21 @@ namespace Omnipotent.Services.MemeScraper
                 }
             }
         }
+
         public async Task LoadAllInstagramSources()
         {
-            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory));
-            foreach (var file in files)
+            string directory = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory);
+            Directory.CreateDirectory(directory);
+            var loaded = new List<InstagramSource>();
+            foreach (var file in Directory.GetFiles(directory, "*.json"))
             {
                 try
                 {
                     string content = await parent.GetDataHandler().ReadDataFromFile(file);
                     InstagramSource source = JsonConvert.DeserializeObject<InstagramSource>(content);
-                    if (source != null)
+                    if (source != null && !string.IsNullOrEmpty(source.AccountID))
                     {
-                        InstagramSources.Add(source);
+                        loaded.Add(source);
                     }
                 }
                 catch (Exception ex)
@@ -105,135 +124,149 @@ namespace Omnipotent.Services.MemeScraper
                     parent.ServiceLogError($"Error loading Instagram source from file {file}: {ex.Message}");
                 }
             }
+            lock (gate) instagramSources = loaded;
         }
+
         public async Task SaveInstagramSource(InstagramSource source)
         {
             string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory), source.AccountID + ".json");
-            await parent.GetDataHandler().WriteToFile(filePath, JsonConvert.SerializeObject(source, Formatting.Indented));
+            string json;
+            lock (source) json = JsonConvert.SerializeObject(source, Formatting.Indented);
+            await parent.GetDataHandler().WriteToFile(filePath, json);
         }
 
         public async Task UpdateInstagramSource(InstagramSource source)
         {
-            //Replace the existing source in the list if it exists
-            var existingSource = InstagramSources.FirstOrDefault(s => s.AccountID == source.AccountID);
-            if (existingSource != null)
+            lock (gate)
             {
-                InstagramSources.Remove(existingSource);
+                //Replace the existing source in the list if it exists
+                instagramSources.RemoveAll(s => s.AccountID == source.AccountID);
+                instagramSources.Add(source);
             }
-            InstagramSources.Add(source);
             //Save the updated source to file
             await SaveInstagramSource(source);
         }
+
+        /// <summary>
+        /// Registers an Instagram account as a source. Looks it up via inflact, falling back to
+        /// Instagram's own profile page, with a hard timeout — the previous version spun in
+        /// <c>while (!dataAcquired)</c> forever if inflact never answered, holding a Chrome open.
+        /// Re-adding an existing username updates its flags/niches instead of duplicating it.
+        /// </summary>
         public async Task<InstagramSource> ProduceNewInstagramSource(string username, bool DownloadReels, bool DownloadPosts, List<Niche> Niches)
         {
-            InstagramSource source = new();
+            username = NormalizeUsername(username);
+            if (string.IsNullOrEmpty(username)) throw new ArgumentException("No Instagram username given.");
 
-
-            var seleniumObject = (await parent.GetSeleniumManager()).CreateSeleniumObject("ProduceNewInstagramSource");
-            seleniumObject.AddArgumentToOptions("--headless"); // Run in headless mode  
-            var driver = seleniumObject.UseChromeDriver();
-
-
-            var devTools = driver as IDevTools;
-            var session = devTools.GetDevToolsSession();
-            var network = new NetworkAdapter(session);
-            await network.Enable(new EnableCommandSettings());
-
-            bool dataAcquired = false;
-
-            network.ResponseReceived += async (sender, e) =>
+            var existing = InstagramSources.FirstOrDefault(s => string.Equals(s.Username, username, StringComparison.OrdinalIgnoreCase));
+            if (existing != null)
             {
-                try
+                lock (existing)
                 {
-                    if (e.Response.Url.StartsWith("https://inflact.com/downloader/api/downloader/profile/?lang=en"))
-                    {
-                        await Task.Delay(5000);
-                        var body = await network.GetResponseBody(new GetResponseBodyCommandSettings
-                        {
-                            RequestId = e.RequestId
-                        });
-
-                        string content = body.Body;
-                        dynamic jsonData = JsonConvert.DeserializeObject(content);
-                        source.SourceID = Guid.NewGuid().ToString();
-                        source.Username = jsonData.data.profile.username;
-                        source.AccountID = jsonData.data.profile.id;
-                        source.Followers = jsonData.data.profile.edge_followed_by.count;
-                        source.FullName = jsonData.data.profile.full_name;
-                        source.ProfilePictureUrl = jsonData.data.profile.profile_pic_download_url;
-                        source.Bio = jsonData.data.profile.biography;
-                        source.DownloadReels = DownloadReels;
-                        source.DownloadPosts = DownloadPosts;
-                        source.AverageLikes = jsonData.data.avg_likes;
-                        source.AverageComments = jsonData.data.avg_comments;
-                        source.AccountTopHashtags = new List<InstagramSource.AccountTopHashtag>();
-                        foreach (var hashtag in jsonData.data.hashtags)
-                        {
-                            InstagramSource.AccountTopHashtag tag;
-                            tag.Hashtag = hashtag.name;
-                            tag.Count = hashtag.count;
-                            tag.InflactHashtagUrl = hashtag.url;
-                            source.AccountTopHashtags.Add(tag);
-                        }
-
-                        source.DateTimeAdded = DateTime.Now;
-                        source.LastUpdated = DateTime.Now;
-                        source.Niches = Niches;
-                        dataAcquired = true;
-                    }
+                    existing.DownloadReels = DownloadReels;
+                    existing.DownloadPosts = DownloadPosts;
+                    existing.Niches = Niches;
+                    existing.LastUpdated = DateTime.Now;
+                    existing.NextScrapeDueUtc = DateTime.UtcNow;
                 }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError(ex, $"Error processing response in ProduceNewInstagramSource");
-                }
-            };
-
-
-            driver.Navigate().GoToUrl($"https://inflact.com/instagram-downloader/?profile={username}");
-            while (dataAcquired == false)
-            {
-                await Task.Delay(100);
+                await SaveInstagramSource(existing);
+                parent.WakeScheduler();
+                return existing;
             }
+
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(6));
+            var profile = await parent.instagramScrapeUtilities.FetchProfileAsync(username, timeout.Token);
+
+            var duplicate = InstagramSources.FirstOrDefault(s => s.AccountID == profile.AccountID);
+            if (duplicate != null)
+            {
+                // Same account under a new handle (renamed): keep one source, update the username.
+                lock (duplicate)
+                {
+                    duplicate.Username = string.IsNullOrEmpty(profile.Username) ? username : profile.Username;
+                    duplicate.DownloadReels = DownloadReels;
+                    duplicate.DownloadPosts = DownloadPosts;
+                    duplicate.Niches = Niches;
+                    duplicate.LastUpdated = DateTime.Now;
+                    duplicate.NextScrapeDueUtc = DateTime.UtcNow;
+                }
+                await SaveInstagramSource(duplicate);
+                parent.WakeScheduler();
+                return duplicate;
+            }
+
+            InstagramSource source = new()
+            {
+                SourceID = Guid.NewGuid().ToString(),
+                Username = string.IsNullOrEmpty(profile.Username) ? username : profile.Username,
+                AccountID = profile.AccountID,
+                Followers = profile.Followers,
+                FullName = profile.FullName,
+                ProfilePictureUrl = profile.ProfilePictureUrl,
+                Bio = profile.Bio,
+                DownloadReels = DownloadReels,
+                DownloadPosts = DownloadPosts,
+                AverageLikes = profile.AverageLikes,
+                AverageComments = profile.AverageComments,
+                AccountTopHashtags = profile.Hashtags.Select(h => new InstagramSource.AccountTopHashtag
+                {
+                    Hashtag = h.Name,
+                    Count = h.Count,
+                    InflactHashtagUrl = h.Url,
+                }).ToList(),
+                DateTimeAdded = DateTime.Now,
+                LastUpdated = DateTime.Now,
+                Niches = Niches,
+                NextScrapeDueUtc = DateTime.UtcNow.AddMinutes(2),
+            };
             await SaveInstagramSource(source);
-            InstagramSources.Add(source);
-
-            await parent.ServiceCreateScheduledTask(DateTime.Now.AddMinutes(30), "ScrapeAllInstagramPostsFromSource" + source.AccountID, "Meme Scraping", $"Go through all of {source.Username} posts and download them.", false, source.AccountID);
-
-            (await parent.GetSeleniumManager()).StopUsingSeleniumObject(seleniumObject);
+            lock (gate) instagramSources.Add(source);
+            parent.WakeScheduler();
             return source;
+        }
+
+        /// <summary>"@Name", "instagram.com/name/", "https://www.instagram.com/name/reels/" → "name".</summary>
+        public static string NormalizeUsername(string? input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return "";
+            var s = input.Trim();
+            var marker = s.IndexOf("instagram.com/", StringComparison.OrdinalIgnoreCase);
+            if (marker >= 0) s = s.Substring(marker + "instagram.com/".Length);
+            s = s.Split('?', '#')[0].Trim('/').Split('/')[0];
+            return s.TrimStart('@').Trim();
+        }
+
+        /// <summary>True while this exact source object is still registered (not deleted or replaced).</summary>
+        public bool IsRegistered(InstagramSource source)
+        {
+            lock (gate) return instagramSources.Contains(source);
         }
 
         public InstagramSource GetInstagramSourceByID(string id)
         {
-            try
-            {
-                return InstagramSources.Where(k => k.AccountID == id).ToArray()[0];
-            }
-            catch (Exception ex)
-            {
-                return null; // Return null if an error occurs
-            }
+            lock (gate) return instagramSources.FirstOrDefault(k => k.AccountID == id);
         }
 
         public async Task DeleteInstagramSource(InstagramSource source, bool DeleteAssociatedMemes)
         {
+            if (source == null) return;
             string filePath = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory), source.AccountID + ".json");
-            InstagramSources.RemoveAt(InstagramSources.Select(k => k.AccountID).ToList().IndexOf(source.AccountID));
-            parent.GetDataHandler().DeleteFile(filePath);
+            lock (gate) instagramSources.RemoveAll(k => k.AccountID == source.AccountID);
+            await parent.GetDataHandler().DeleteFile(filePath);
             if (DeleteAssociatedMemes)
             {
                 // Delete all associated memes
-                foreach (var memePath in parent.mediaManager.allScrapedReels.Where(k => k.OwnerUsername == source.Username))
+                var removed = parent.mediaManager.RemoveReels(k => k.OwnerUsername == source.Username);
+                foreach (var meme in removed)
                 {
                     try
                     {
-                        parent.GetDataHandler().DeleteFile(memePath.GetInstagramReelVideoFilePath());
-                        parent.GetDataHandler().DeleteFile(memePath.GetInstagramReelInfoFilePath());
-                        parent.mediaManager.allScrapedReels.Remove(memePath);
+                        await parent.GetDataHandler().DeleteFile(meme.GetInstagramReelVideoFilePath());
+                        await parent.GetDataHandler().DeleteFile(meme.GetInstagramReelInfoFilePath());
                     }
                     catch (Exception e)
                     {
-
+                        parent.ServiceLogError(e, $"Couldn't delete files for reel {meme.PostID}");
                     }
                 }
             }

@@ -11,7 +11,8 @@ namespace Omnipotent.Services.SeleniumManager
     public class SeleniumManager : OmniService
     {
         private SeleniumManagerRoutes routes;
-        private ConcurrentBag<SeleniumObject> currentActiveSeleniumInstances;
+        // Keyed by reference so StopUsingSeleniumObject removes exactly the instance it was given.
+        private ConcurrentDictionary<SeleniumObject, byte> currentActiveSeleniumInstances = new();
 
         public class SeleniumObject
         {
@@ -56,6 +57,12 @@ namespace Omnipotent.Services.SeleniumManager
                 options.AddArgument(argument);
             }
 
+            /// <summary>Full access to the options (excluded switches, page-load strategy, prefs) before the driver starts.</summary>
+            public void ConfigureOptions(Action<ChromeOptions> configure)
+            {
+                configure(options);
+            }
+
             public ChromeDriver UseChromeDriver()
             {
                 lastActivity = DateTime.Now;
@@ -66,16 +73,18 @@ namespace Omnipotent.Services.SeleniumManager
                 return driver;
             }
 
-            internal async void CloseDriver()
+            internal void CloseDriver()
             {
-                inactivityCts?.Cancel();
+                try { inactivityCts?.Cancel(); } catch (ObjectDisposedException) { }
                 inactivityCts?.Dispose();
                 inactivityCts = null;
-                if (driver is not null)
+                var closing = Interlocked.Exchange(ref driver, null);
+                if (closing is not null)
                 {
-                    driver.Quit();
-                    driver.Dispose();
-                    driver = null;
+                    // Quit throws when Chrome/chromedriver already died; this was async void, so that
+                    // throw was unobservable and could take the process down.
+                    try { closing.Quit(); } catch { }
+                    try { closing.Dispose(); } catch { }
                 }
             }
 
@@ -107,8 +116,7 @@ namespace Omnipotent.Services.SeleniumManager
         protected override async void ServiceMain()
         {
             routes = new SeleniumManagerRoutes(this);
-            currentActiveSeleniumInstances = new ConcurrentBag<SeleniumObject>();
-            routes.CreateRoutes();
+                        routes.CreateRoutes();
         }
 
         public SeleniumObject CreateSeleniumObject(string name, TimeSpan? worstCaseSessionDuration = null)
@@ -116,32 +124,32 @@ namespace Omnipotent.Services.SeleniumManager
             var newSeleniumObject = new SeleniumObject(worstCaseSessionDuration);
             newSeleniumObject.objectID = (ulong)DateTime.Now.Ticks;
             newSeleniumObject.name = name;
-            currentActiveSeleniumInstances.Add(newSeleniumObject);
+            currentActiveSeleniumInstances[newSeleniumObject] = 0;
             return newSeleniumObject;
         }
 
         public List<SeleniumObject> GetCurrentActiveSeleniumInstances()
         {
-            return currentActiveSeleniumInstances.ToList();
+            return currentActiveSeleniumInstances.Keys.ToList();
         }
 
         public List<SeleniumObject> GetSeleniumInstancesByID(ulong objectID)
         {
-            return currentActiveSeleniumInstances.Where(x => x.objectID == objectID).ToList();
+            return currentActiveSeleniumInstances.Keys.Where(x => x.objectID == objectID).ToList();
         }
 
         public List<SeleniumObject> GetSeleniumInstancesByName(string name)
         {
-            return currentActiveSeleniumInstances.Where(x => x.name == name).ToList();
+            return currentActiveSeleniumInstances.Keys.Where(x => x.name == name).ToList();
         }
 
         public void StopUsingSeleniumObject(SeleniumObject seleniumObject)
         {
-            var selenium = currentActiveSeleniumInstances.TryTake(out seleniumObject);
-            if (selenium)
-            {
-                seleniumObject.CloseDriver();
-            }
+            // This used ConcurrentBag.TryTake(out seleniumObject), which takes an ARBITRARY bag item and
+            // overwrites the argument: it closed some other caller's browser and leaked the one passed in.
+            if (seleniumObject == null) return;
+            currentActiveSeleniumInstances.TryRemove(seleniumObject, out _);
+            seleniumObject.CloseDriver();
         }
     }
 }

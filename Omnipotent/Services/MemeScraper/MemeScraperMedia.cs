@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using System.Security.Cryptography;
 
@@ -7,20 +7,87 @@ namespace Omnipotent.Services.MemeScraper
     public class MemeScraperMedia
     {
         MemeScraper parent;
-        public List<InstagramScrapeUtilities.InstagramReel> allScrapedReels;
+        private readonly object gate = new();
+        private List<InstagramScrapeUtilities.InstagramReel> reels = new();
+        private readonly HashSet<string> knownPostIds = new();
+        private readonly HashSet<string> knownShortCodes = new();
+
         public MemeScraperMedia(MemeScraper parent)
         {
             this.parent = parent;
-            // Constructor logic if needed
-            allScrapedReels = new List<InstagramScrapeUtilities.InstagramReel>();
             LoadAllScrapedInstagramReels().Wait();
+        }
 
+        /// <summary>
+        /// Snapshot of every scraped reel. A copy, so OmniGram/OmniTumblr/OmniTube can enumerate it
+        /// while a scrape is adding reels (the old shared List threw "collection was modified").
+        /// Mutate through <see cref="TryAddReel"/> / <see cref="RemoveReels"/>, not this list.
+        /// </summary>
+        public List<InstagramScrapeUtilities.InstagramReel> allScrapedReels
+        {
+            get { lock (gate) return new List<InstagramScrapeUtilities.InstagramReel>(reels); }
+        }
+
+        public int Count
+        {
+            get { lock (gate) return reels.Count; }
+        }
+
+        public bool IsKnown(string? postId, string? shortCode)
+        {
+            lock (gate)
+            {
+                return (!string.IsNullOrEmpty(postId) && knownPostIds.Contains(postId))
+                    || (!string.IsNullOrEmpty(shortCode) && knownShortCodes.Contains(shortCode));
+            }
+        }
+
+        /// <summary>Adds the reel unless one with the same post id or shortcode is already held.</summary>
+        public bool TryAddReel(InstagramScrapeUtilities.InstagramReel reel)
+        {
+            lock (gate)
+            {
+                if (IsKnownLocked(reel)) return false;
+                reels.Add(reel);
+                Index(reel);
+                return true;
+            }
+        }
+
+        public List<InstagramScrapeUtilities.InstagramReel> RemoveReels(Func<InstagramScrapeUtilities.InstagramReel, bool> predicate)
+        {
+            lock (gate)
+            {
+                var removed = reels.Where(predicate).ToList();
+                if (removed.Count == 0) return removed;
+                reels = reels.Except(removed).ToList();
+                RebuildIndexLocked();
+                return removed;
+            }
+        }
+
+        private bool IsKnownLocked(InstagramScrapeUtilities.InstagramReel reel) =>
+            (!string.IsNullOrEmpty(reel.PostID) && knownPostIds.Contains(reel.PostID))
+            || (!string.IsNullOrEmpty(reel.ShortCode) && knownShortCodes.Contains(reel.ShortCode));
+
+        private void Index(InstagramScrapeUtilities.InstagramReel reel)
+        {
+            if (!string.IsNullOrEmpty(reel.PostID)) knownPostIds.Add(reel.PostID);
+            if (!string.IsNullOrEmpty(reel.ShortCode)) knownShortCodes.Add(reel.ShortCode);
+        }
+
+        private void RebuildIndexLocked()
+        {
+            knownPostIds.Clear();
+            knownShortCodes.Clear();
+            foreach (var reel in reels) Index(reel);
         }
 
         private async Task LoadAllScrapedInstagramReels()
         {
-            allScrapedReels = new List<InstagramScrapeUtilities.InstagramReel>();
+            var loaded = new List<InstagramScrapeUtilities.InstagramReel>();
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
+            Directory.CreateDirectory(path);
             var files = Directory.GetFiles(path, "*.json");
             foreach (var item in files)
             {
@@ -30,13 +97,18 @@ namespace Omnipotent.Services.MemeScraper
                     var reel = JsonConvert.DeserializeObject<InstagramScrapeUtilities.InstagramReel>(json);
                     if (reel != null)
                     {
-                        allScrapedReels.Add(reel);
+                        loaded.Add(reel);
                     }
                 }
                 catch (Exception ex)
                 {
                     parent.ServiceLogError(ex, "Error loading AllScrapedInstagramReel json");
                 }
+            }
+            lock (gate)
+            {
+                reels = loaded;
+                RebuildIndexLocked();
             }
         }
 
@@ -51,13 +123,18 @@ namespace Omnipotent.Services.MemeScraper
                 }
                 string filePath = Path.Combine(path, $"Reel{reel.PostID}.json");
                 string json = JsonConvert.SerializeObject(reel, Formatting.Indented);
-                await File.WriteAllTextAsync(filePath, json);
+                // Temp + move: a crash mid-write must not leave a half-written JSON that fails to load.
+                string temp = filePath + ".tmp";
+                await File.WriteAllTextAsync(temp, json);
+                File.Move(temp, filePath, overwrite: true);
             }
             catch (Exception ex)
             {
                 parent.ServiceLogError(ex, "Error saving Instagram reel");
+                throw;
             }
         }
+
         public async Task RemoveDuplicateReelsByVideoContentAsync()
         {
             var path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
@@ -97,7 +174,8 @@ namespace Omnipotent.Services.MemeScraper
             }
 
             // Remove duplicates from memory
-            allScrapedReels = hashToReel.Values.ToList();
+            var duplicates = new HashSet<InstagramScrapeUtilities.InstagramReel>(duplicateReels);
+            RemoveReels(duplicates.Contains);
 
             // Delete duplicate JSON files
             foreach (var reel in duplicateReels)
