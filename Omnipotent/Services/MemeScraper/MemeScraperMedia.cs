@@ -12,10 +12,10 @@ namespace Omnipotent.Services.MemeScraper
         private readonly HashSet<string> knownPostIds = new();
         private readonly HashSet<string> knownShortCodes = new();
 
+        /// <summary>Cheap: call <see cref="LoadAllScrapedInstagramReels"/> to populate.</summary>
         public MemeScraperMedia(MemeScraper parent)
         {
             this.parent = parent;
-            LoadAllScrapedInstagramReels().Wait();
         }
 
         /// <summary>
@@ -83,32 +83,18 @@ namespace Omnipotent.Services.MemeScraper
             foreach (var reel in reels) Index(reel);
         }
 
-        private async Task LoadAllScrapedInstagramReels()
+        public async Task LoadAllScrapedInstagramReels()
         {
-            var loaded = new List<InstagramScrapeUtilities.InstagramReel>();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
-            Directory.CreateDirectory(path);
-            var files = Directory.GetFiles(path, "*.json");
-            foreach (var item in files)
-            {
-                try
-                {
-                    string json = await File.ReadAllTextAsync(item);
-                    var reel = JsonConvert.DeserializeObject<InstagramScrapeUtilities.InstagramReel>(json);
-                    if (reel != null)
-                    {
-                        loaded.Add(reel);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError(ex, "Error loading AllScrapedInstagramReel json");
-                }
-            }
+            var result = await JsonDirectoryLoader.LoadAsync<InstagramScrapeUtilities.InstagramReel>(
+                OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory));
             lock (gate)
             {
-                reels = loaded;
+                reels = result.Items;
                 RebuildIndexLocked();
+            }
+            if (result.Failures > 0)
+            {
+                _ = parent.ServiceLogError($"Couldn't load {result.Failures} reel file(s), e.g. {result.FirstError}");
             }
         }
 

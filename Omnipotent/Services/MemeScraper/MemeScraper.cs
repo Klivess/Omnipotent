@@ -43,16 +43,27 @@ namespace Omnipotent.Services.MemeScraper
         private int queuedScrapes;
         private DateTime? lastSchedulerTickUtc;
         private string schedulerState = "starting";
+        // Completes once sources, niches and reels are loaded; data-backed routes wait on it briefly.
+        private readonly TaskCompletionSource dataReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly System.Diagnostics.Stopwatch startupClock = new();
+        private static readonly TimeSpan DataWaitTimeout = TimeSpan.FromSeconds(20);
 
         public static readonly TimeSpan SchedulerPollInterval = TimeSpan.FromMinutes(5);
         public const int FailuresBeforeAlert = 3;
         private const int DownloadParallelism = 3;
         private const string LegacyTaskPrefix = "ScrapeAllInstagramPostsFromSource";
 
-        public MemeScraper()
+        public MemeScraper() : this(null) { }
+
+        /// <summary>
+        /// Program.cs hands over the KliveAPI instance (as it does for Projects) so route registration
+        /// never has to find it in the service list while other services are still being added.
+        /// </summary>
+        public MemeScraper(Omnipotent.Services.KliveAPI.KliveAPI? kliveApi)
         {
             name = "MemeScraper";
             threadAnteriority = ThreadAnteriority.Standard;
+            routeApi = kliveApi;
         }
 
         public sealed class ScrapeReport
@@ -104,26 +115,38 @@ namespace Omnipotent.Services.MemeScraper
 
         protected override async void ServiceMain()
         {
+            startupClock.Start();
+            // Routes first. Registering one is a dictionary insert, but they used to be created only
+            // after every source/niche/reel file had been read one at a time through DataUtil's queue,
+            // so /memescraper/* didn't exist for the whole load. Data-backed routes now hold a request
+            // until loading finishes (bounded by DataWaitTimeout) instead.
+            instagramScrapeUtilities = new InstagramScrapeUtilities(this);
+            downloader = new ReelDownloader();
+            _ = CreateRoutes();
+
             try
             {
-                SourceManager = new MemeScraperSources(this);
-                await SourceManager.LoadNiches();
-                instagramScrapeUtilities = new InstagramScrapeUtilities(this);
-                mediaManager = new MemeScraperMedia(this);
+                schedulerState = "loading data";
+                var sources = new MemeScraperSources(this);
+                var media = new MemeScraperMedia(this);
+                await Task.WhenAll(sources.LoadAllInstagramSources(), sources.LoadNiches(), media.LoadAllScrapedInstagramReels());
+                // Published only once loaded: OmniGram/OmniTumblr/OmniTube treat a non-null mediaManager as ready.
+                SourceManager = sources;
+                mediaManager = media;
                 memeScraperLabs = new(this);
-                downloader = new ReelDownloader();
+                dataReady.TrySetResult();
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "MemeScraper failed to load its data; scraping is disabled until restart.", true);
                 schedulerState = "failed to start: " + ex.Message;
+                dataReady.TrySetException(ex);
+                await ServiceLogError(ex, "MemeScraper failed to load its data; scraping is disabled until restart.", true);
                 return;
             }
 
             GetTimeManagerService().TaskDue += TimeManager_TaskDue;
-            _ = CreateRoutes();
             _ = Task.Run(SchedulerLoopAsync);
-            await ServiceLog($"MemeScraper ready: {SourceManager.InstagramSources.Count} Instagram sources, {mediaManager.Count} reels on disk.");
+            await ServiceLog($"MemeScraper data loaded in {startupClock.ElapsedMilliseconds} ms: {SourceManager.InstagramSources.Count} Instagram sources, {SourceManager.AllNiches.Count} niches, {mediaManager.Count} reels.");
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
@@ -465,13 +488,25 @@ namespace Omnipotent.Services.MemeScraper
             if (routeApi == null)
             {
                 var deadline = DateTime.UtcNow.AddSeconds(90);
-                while ((routeApi = GetActiveServices().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault()) == null)
+                while ((routeApi = FindKliveApi()) == null)
                 {
                     if (DateTime.UtcNow >= deadline) throw new InvalidOperationException("KliveAPI did not appear within 90s; MemeScraper routes are unavailable.");
-                    await Task.Delay(250);
+                    await Task.Delay(100);
                 }
             }
             await routeApi.CreateRoute(path, handler, method, permission);
+        }
+
+        /// <summary>
+        /// Fallback lookup when no instance was injected. The service list is a plain List that
+        /// Program.cs is still appending to during startup, so enumeration can throw; treat that as
+        /// "not found yet" and let the caller retry.
+        /// </summary>
+        private Omnipotent.Services.KliveAPI.KliveAPI? FindKliveApi()
+        {
+            try { return GetActiveServices().ToArray().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault(); }
+            catch (InvalidOperationException) { return null; }
+            catch (ArgumentException) { return null; }
         }
 
         private async Task CreateRoutes()
@@ -521,7 +556,8 @@ namespace Omnipotent.Services.MemeScraper
             {
                 try
                 {
-                    await RegisterRouteAsync(path, Guard(path, handler), method, permission);
+                    // Health must answer during startup (it reports the loading state); the rest need data.
+                    await RegisterRouteAsync(path, Guard(path, handler, requiresData: path != "/memescraper/scraperHealth"), method, permission);
                     registered++;
                 }
                 catch (Exception ex)
@@ -529,17 +565,25 @@ namespace Omnipotent.Services.MemeScraper
                     await ServiceLogError(ex, $"MemeScraper: failed to register route {path}");
                 }
             }
-            await ServiceLog($"MemeScraper: {registered}/{routes.Length} HTTP routes registered.", false);
+            await ServiceLog($"MemeScraper: {registered}/{routes.Length} HTTP routes registered {startupClock.ElapsedMilliseconds} ms after start.", false);
         }
 
         /// <summary>Uniform error envelope so one route's bug never takes the request down unanswered.</summary>
-        private Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Guard(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler) => async request =>
+        private Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Guard(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, bool requiresData = true) => async request =>
         {
             try
             {
-                if (SourceManager == null || mediaManager == null)
+                if (requiresData && !dataReady.Task.IsCompleted)
                 {
-                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = "MemeScraper is still starting." }), code: HttpStatusCode.ServiceUnavailable);
+                    // Loading takes seconds; hold the request rather than fail a page that opened mid-startup.
+                    await Task.WhenAny(dataReady.Task, Task.Delay(DataWaitTimeout));
+                }
+                if (requiresData && !dataReady.Task.IsCompletedSuccessfully)
+                {
+                    string why = dataReady.Task.IsFaulted
+                        ? "MemeScraper failed to load its data: " + dataReady.Task.Exception?.GetBaseException().Message
+                        : "MemeScraper is still loading its data; try again in a moment.";
+                    await request.ReturnResponse(JsonConvert.SerializeObject(new { error = why }), code: HttpStatusCode.ServiceUnavailable);
                     return;
                 }
                 await handler(request);
@@ -766,17 +810,19 @@ namespace Omnipotent.Services.MemeScraper
 
         public object BuildHealthSnapshot()
         {
-            var sources = SourceManager.InstagramSources;
+            // Answers during startup too, so every manager may still be null here.
+            var sources = SourceManager?.InstagramSources ?? new List<MemeScraperSources.InstagramSource>();
             return new
             {
                 GeneratedUtc = DateTime.UtcNow,
+                DataLoaded = dataReady.Task.IsCompletedSuccessfully,
                 OnServer = OmniPaths.CheckIfOnServer(),
                 SchedulerState = schedulerState,
                 LastSchedulerTickUtc = lastSchedulerTickUtc,
                 NextScrapeDueUtc = sources.Where(s => s.DownloadReels).Min(s => s.NextScrapeDueUtc),
                 CurrentScrape = currentScrape,
-                ReelsOnDisk = mediaManager.Count,
-                Providers = instagramScrapeUtilities.GetProviderHealth(),
+                ReelsOnDisk = mediaManager?.Count ?? 0,
+                Providers = instagramScrapeUtilities?.GetProviderHealth() ?? new List<InstagramScrapeUtilities.ProviderHealth>(),
                 FailingSources = sources.Count(s => s.ConsecutiveScrapeFailures > 0),
                 Sources = sources.OrderBy(s => s.NextScrapeDueUtc).Select(s => new
                 {

@@ -11,11 +11,11 @@ namespace Omnipotent.Services.MemeScraper
         private List<InstagramSource> instagramSources = new();
         public List<Niche> AllNiches;
 
+        /// <summary>Cheap: call <see cref="LoadNiches"/> and <see cref="LoadAllInstagramSources"/> to populate.</summary>
         public MemeScraperSources(MemeScraper parent)
         {
             this.parent = parent;
             AllNiches = new List<Niche>();
-            LoadAllInstagramSources().Wait();
         }
 
         /// <summary>Snapshot of all sources (safe to enumerate/serialize while scrapes update them).</summary>
@@ -84,47 +84,24 @@ namespace Omnipotent.Services.MemeScraper
 
         public async Task LoadNiches()
         {
-            AllNiches = new List<Niche>();
-            string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory);
-            Directory.CreateDirectory(path);
-            string[] files = Directory.GetFiles(path, "*.json");
-            foreach (var file in files)
+            var result = await JsonDirectoryLoader.LoadAsync<Niche>(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperNichesDirectory));
+            AllNiches = result.Items;
+            if (result.Failures > 0)
             {
-                try
-                {
-                    string content = await parent.GetDataHandler().ReadDataFromFile(file);
-                    Niche niche = JsonConvert.DeserializeObject<Niche>(content);
-                    AllNiches.Add(niche);
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError($"Error loading niche from file {file}: {ex.Message}");
-                }
+                _ = parent.ServiceLogError($"Couldn't load {result.Failures} niche file(s), e.g. {result.FirstError}");
             }
         }
 
         public async Task LoadAllInstagramSources()
         {
-            string directory = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory);
-            Directory.CreateDirectory(directory);
-            var loaded = new List<InstagramSource>();
-            foreach (var file in Directory.GetFiles(directory, "*.json"))
+            var result = await JsonDirectoryLoader.LoadAsync<InstagramSource>(
+                OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperInstagramSourcesDirectory),
+                source => !string.IsNullOrEmpty(source.AccountID));
+            lock (gate) instagramSources = result.Items;
+            if (result.Failures > 0)
             {
-                try
-                {
-                    string content = await parent.GetDataHandler().ReadDataFromFile(file);
-                    InstagramSource source = JsonConvert.DeserializeObject<InstagramSource>(content);
-                    if (source != null && !string.IsNullOrEmpty(source.AccountID))
-                    {
-                        loaded.Add(source);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    parent.ServiceLogError($"Error loading Instagram source from file {file}: {ex.Message}");
-                }
+                _ = parent.ServiceLogError($"Couldn't load {result.Failures} Instagram source file(s), e.g. {result.FirstError}");
             }
-            lock (gate) instagramSources = loaded;
         }
 
         public async Task SaveInstagramSource(InstagramSource source)

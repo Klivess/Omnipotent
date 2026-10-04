@@ -226,3 +226,51 @@ namespace Omnipotent.Tests.MemeScraper
         }
     }
 }
+
+namespace Omnipotent.Tests.MemeScraper
+{
+    public class JsonDirectoryLoaderTests : IDisposable
+    {
+        private readonly string dir = Path.Combine(Path.GetTempPath(), "memescraper-loader-" + Guid.NewGuid().ToString("N"));
+
+        public void Dispose()
+        {
+            try { Directory.Delete(dir, true); } catch { }
+        }
+
+        private sealed class Item
+        {
+            public string Name = "";
+            public bool Keep = true;
+        }
+
+        [Fact]
+        public async Task LoadsInFileOrderCountsCorruptFilesAndAppliesTheFilter()
+        {
+            Directory.CreateDirectory(dir);
+            for (int i = 0; i < 300; i++)
+            {
+                File.WriteAllText(Path.Combine(dir, $"Item{i:D4}.json"), $"{{\"Name\":\"n{i:D4}\",\"Keep\":{(i % 50 == 0 ? "false" : "true")}}}");
+            }
+            File.WriteAllText(Path.Combine(dir, "Item9998.json"), "{ not json");
+            File.WriteAllText(Path.Combine(dir, "Item9999.json"), "null");
+            File.WriteAllText(Path.Combine(dir, "ignored.txt"), "{}");
+
+            var result = await Omnipotent.Services.MemeScraper.JsonDirectoryLoader.LoadAsync<Item>(dir, item => item.Keep);
+
+            var expected = Enumerable.Range(0, 300).Where(i => i % 50 != 0).Select(i => $"n{i:D4}").ToList();
+            Assert.Equal(expected, result.Items.Select(i => i.Name).ToList()); // parallel load, sequential order
+            Assert.Equal(1, result.Failures);
+            Assert.StartsWith("Item9998.json", result.FirstError);
+        }
+
+        [Fact]
+        public async Task MissingDirectoryIsCreatedAndEmpty()
+        {
+            var result = await Omnipotent.Services.MemeScraper.JsonDirectoryLoader.LoadAsync<Item>(dir);
+            Assert.Empty(result.Items);
+            Assert.Equal(0, result.Failures);
+            Assert.True(Directory.Exists(dir));
+        }
+    }
+}
